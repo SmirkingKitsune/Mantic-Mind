@@ -1,0 +1,31 @@
+{
+  "name": "mantic-mind",
+  "version": "0.1.0",
+  "dependencies": [
+    {
+      "name": "ftxui",
+      "version>=": "5.0.0"
+    },
+    {
+      "name": "sqlitecpp",
+      "version>=": "3.3.1"
+    },
+    {
+      "name": "cpp-httplib",
+      "version>=": "0.15.3"
+    },
+    {
+      "name": "nlohmann-json",
+      "version>=": "3.11.3"
+    },
+    {
+      "name": "spdlog",
+      "version>=": "1.14.1"
+    },
+    {
+      "name": "openssl",
+      "version>=": "3.3.0"
+    }
+  ],
+  "builtin-baseline": "1940ee77e81573713c0d364c42f5990172198be1"
+}

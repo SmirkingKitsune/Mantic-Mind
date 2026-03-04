@@ -1,0 +1,53 @@
+# Build artifacts
+/build/
+/out/
+/cmake-build-*/
+
+# vcpkg installed packages
+/vcpkg_installed/
+
+# Local runtime config copies
+/mantic-mind.toml
+/mantic-mind-control.toml
+
+# Runtime data
+/data/*
+!/data/agents/
+/data/agents/*
+!/data/agents/.gitkeep
+/logs/
+/models/
+*.gguf
+
+# Local third-party checkouts
+/external/llama.cpp/
+
+# IDE / editor
+/.vscode/
+/.idea/
+*.user
+*.suo
+*.sln.docstates
+/CMakeSettings.json
+/.vs/
+
+# Compiled objects / binaries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.exe
+*.pdb
+
+# CMake generated
+/CMakeCache.txt
+/CMakeFiles/
+/cmake_install.cmake
+/Makefile
+/install_manifest.txt
+
+# OS
+.DS_Store
+Thumbs.db

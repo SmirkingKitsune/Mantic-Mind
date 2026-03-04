@@ -1,0 +1,29 @@
+# mantic-mind-control configuration
+# Copy this file next to the mantic-mind-control executable.
+# Environment variables override any value set here.
+
+# ── Network ────────────────────────────────────────────────────────────────────
+# Port the REST + SSE API listens on.
+listen_port = 9090
+
+# ── Storage ────────────────────────────────────────────────────────────────────
+# Root data directory — agent databases live under {data_dir}/agents/{uuid}/agent.db
+data_dir = "data"
+
+# Directory containing .gguf model files for distribution to nodes.
+models_dir = "models"
+
+# ── Node Health Polling ────────────────────────────────────────────────────────
+# How often (seconds) to poll registered nodes for health metrics.
+node_health_poll_interval_s = 30
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+log_file = "logs/mantic-mind-control.log"
+
+# ── Discovery & Pairing ────────────────────────────────────────────────────────
+# UDP port to listen on for node discovery broadcasts.
+# discovery_port = 7072
+
+# Pre-shared key for automatic PSK pairing.
+# Set the same value on both node and control to skip the PIN dialog.
+# pairing_key = ""

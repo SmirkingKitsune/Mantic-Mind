@@ -1,0 +1,59 @@
+# mantic-mind node configuration
+# Copy this file next to the mantic-mind executable.
+# Environment variables override any value set here.
+
+# ── Network ────────────────────────────────────────────────────────────────────
+# Port this node listens on for control + infer requests.
+listen_port = 7070
+
+# URL of the mantic-mind-control process.
+# Leave empty to run the node standalone (no registration).
+control_url = ""
+
+# Bearer token to authenticate with the control server.
+control_api_key = ""
+
+# URL this node is reachable at from the control server.
+# Defaults to http://127.0.0.1:<listen_port> if not set.
+# self_url = "http://192.168.1.10:7070"
+
+# ── llama-server ───────────────────────────────────────────────────────────────
+# Full path to the llama-server binary (or just "llama-server" if on PATH).
+# Tip: run tools/update-llama-cpp.sh --build (or .ps1 -Build) to pull latest
+# llama.cpp and produce llama-server, then set this to that absolute path.
+llama_server_path = "llama-server"
+
+# Port llama-server listens on (must not conflict with listen_port).
+llama_port = 8080
+
+# Port range for concurrent llama-server processes (one per slot).
+llama_port_range_start = 8080
+llama_port_range_end   = 8090
+
+# Maximum number of concurrent model slots (llama-server processes).
+max_slots = 4
+
+# ── Storage ────────────────────────────────────────────────────────────────────
+# Directory scanned recursively for .gguf model files.
+models_dir = "models"
+
+data_dir = "data"
+
+# Directory for KV cache checkpoint files (suspend/resume).
+kv_cache_dir = "data/kv_cache"
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+log_file = "logs/mantic-mind.log"
+
+# ── Authentication ────────────────────────────────────────────────────────────
+# Pre-set API key for this node.  If empty, one is generated on each startup
+# and printed to the UI.
+# api_key = "change-me"
+
+# ── Discovery & Pairing ────────────────────────────────────────────────────────
+# UDP port used for node discovery broadcasts.
+# discovery_port = 7072
+
+# Pre-shared key for automatic PSK pairing.
+# Set the same value on both node and control to skip the PIN dialog.
+# pairing_key = ""
