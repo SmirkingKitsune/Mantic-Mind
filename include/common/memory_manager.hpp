@@ -1,8 +1,8 @@
 #pragma once
 
 #include "common/models.hpp"
-#include <vector>
 #include <string>
+#include <vector>
 
 namespace mm {
 
@@ -23,9 +23,12 @@ public:
                                                   const std::vector<Message>& messages,
                                                   const AgentConfig& cfg);
 
-    // Retrieve memories ranked by importance * recency score (up to max).
-    std::vector<Memory> get_relevant_memories(const AgentConfig& cfg,
-                                               int max = 20) const;
+    // Retrieve global memories relevant to the current conversation, using
+    // model-assisted selection over the highest-ranked candidates.
+    std::vector<Memory> get_relevant_memories(const ConvId& conv_id,
+                                              const AgentConfig& cfg,
+                                              int max_candidates = 40,
+                                              int max_selected = 8) const;
 
     // Format memory list into a string for system-prompt injection.
     static std::string format_memories_for_context(const std::vector<Memory>& memories);

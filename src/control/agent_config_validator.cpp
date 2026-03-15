@@ -97,11 +97,14 @@ AgentValidationResult validate_agent_config(const AgentConfig& cfg,
                       "Tools are enabled, but no executable tools are currently available unless Memories is also enabled.");
         }
 
-        if (cfg.tools_enabled && !model_info.supports_tool_calls) {
+        if (cfg.tools_enabled &&
+            model_info.metadata_found &&
+            !model_info.supports_tool_calls &&
+            !model_info.used_filename_heuristics) {
             add_issue(result,
                       ValidationSeverity::Warning,
                       "tools_enabled",
-                      "The selected model does not appear to advertise tool-call support.");
+                      "GGUF metadata did not advertise tool-call support for this model. Some models can still use tools if their prompt template supports them, so verify with a quick test chat.");
         }
 
         if (cfg.reasoning_enabled && !model_info.supports_reasoning) {

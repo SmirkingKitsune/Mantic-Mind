@@ -198,7 +198,9 @@ ModelCapabilityInfo inspect_model_capabilities(const std::string& model_path,
             if (tmpl.find("tool_call") != std::string::npos ||
                 tmpl.find("[TOOL_CALLS]") != std::string::npos ||
                 tmpl.find("python_tag") != std::string::npos ||
-                tmpl.find("function_call") != std::string::npos) {
+                tmpl.find("function_call") != std::string::npos ||
+                tmpl.find("tool_response") != std::string::npos ||
+                tmpl.find("tools_in_user_message") != std::string::npos) {
                 info.supports_tool_calls = true;
             }
             if (tmpl.find("<think>") != std::string::npos ||

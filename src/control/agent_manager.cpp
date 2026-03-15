@@ -25,8 +25,11 @@ void AgentManager::load_all() {
 
         AgentId agent_id = entry.path().filename().string();
         try {
-            AgentDB temp(agent_id, data_dir_);
-            AgentConfig cfg = temp.load_config();
+            AgentConfig cfg;
+            {
+                AgentDB temp(agent_id, data_dir_);
+                cfg = temp.load_config();
+            } // temp is destroyed here, releasing its SQLite connection
             if (cfg.id.empty() || cfg.name.empty()) continue;
 
             auto agent = std::make_unique<Agent>(cfg, data_dir_);

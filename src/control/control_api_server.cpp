@@ -54,7 +54,6 @@ bool ControlApiServer::listen(uint16_t port) {
     MM_INFO("ControlApiServer listening on port {}", port);
     return server_->listen("0.0.0.0", port);
 }
-
 void ControlApiServer::stop() { server_->stop(); }
 
 void ControlApiServer::set_log_callback(LogCallback cb) { log_cb_ = std::move(cb); }
@@ -285,7 +284,7 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     std::vector<Memory> memories;
     if (cfg.memories_enabled) {
         MemoryManager mem_mgr(db, real_llama);
-        memories = mem_mgr.get_relevant_memories(cfg);
+        memories = mem_mgr.get_relevant_memories(conv_id, cfg);
     }
 
     // 8. Set up tool executor for memory tools

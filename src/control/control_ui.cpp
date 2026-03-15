@@ -47,7 +47,7 @@ ControlUI::ControlUI(NodeRegistry& registry,
 
 ControlUI::~ControlUI() = default;
 
-// ── log (thread-safe) ─────────────────────────────────────────────────────────
+//
 
 void ControlUI::log(LogLevel level, const std::string& message) {
     {
@@ -59,7 +59,7 @@ void ControlUI::log(LogLevel level, const std::string& message) {
     refresh();
 }
 
-// ── refresh / quit (thread-safe) ──────────────────────────────────────────────
+//
 
 void ControlUI::refresh() {
     std::function<void()> fn;
@@ -77,7 +77,7 @@ void ControlUI::quit() {
     if (fn) fn();
 }
 
-// ── run ───────────────────────────────────────────────────────────────────────
+//
 
 void ControlUI::run() {
     using namespace ftxui;
@@ -90,15 +90,15 @@ void ControlUI::run() {
         refresh_fn_ = [&screen]() { screen.PostEvent(Event::Custom); };
     }
 
-    // ── UI State ──────────────────────────────────────────────────────────────
+    //
 
     int tab_index = 0;
 
-    // Nodes tab — discovered (unregistered)
+    //
     int  disc_sel      = 0;
     std::vector<std::string> disc_entries;
 
-    // Nodes tab — connected (registered)
+    //
     int  node_sel      = 0;
     std::vector<std::string> node_entries;
 
@@ -176,7 +176,7 @@ void ControlUI::run() {
     std::vector<bool>         fb_entry_is_dir;
     int fb_sel = 0;
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    //
 
     auto gauge_row = [](const std::string& label, float pct,
                         const std::string& detail) -> Element {
@@ -261,7 +261,7 @@ void ControlUI::run() {
         });
     };
 
-    // ── File browser helpers ──────────────────────────────────────────────────
+    //
 
     auto refresh_fb = [&]() {
         fb_display_names.clear();
@@ -270,7 +270,7 @@ void ControlUI::run() {
         fb_sel = 0;
 
         if (fb_current_path.empty()) {
-            // ── Drives list view ─────────────────────────────────────────────
+            //
             // Probe every possible drive letter; works on Windows without
             // needing <windows.h>, and safely produces nothing on Linux/macOS.
             for (char c = 'A'; c <= 'Z'; ++c) {
@@ -291,10 +291,10 @@ void ControlUI::run() {
             return;
         }
 
-        // ── Normal directory view ─────────────────────────────────────────────
+        //
         bool at_root = (fb_current_path == fb_current_path.root_path());
         if (at_root) {
-            // At drive root — offer escape to the drives list.
+            //
             fb_display_names.push_back("[~] Drives");
             fb_entry_paths.push_back(fs::path{});   // empty = drives sentinel
             fb_entry_is_dir.push_back(true);
@@ -387,7 +387,7 @@ void ControlUI::run() {
         ed_validation_issues = std::move(validation.issues);
     };
 
-    // ── Tab 1: Nodes components ───────────────────────────────────────────────
+    //
 
     // Discovered (unregistered) nodes section
     auto disc_menu    = Menu(&disc_entries, &disc_sel, MenuOption::Vertical());
@@ -396,14 +396,14 @@ void ControlUI::run() {
         if (disc_sel < 0 || disc_sel >= static_cast<int>(dns.size())) return;
         pair_url = dns[disc_sel].url;
         if (!pairing_key_.empty()) {
-            // PSK mode — pair automatically (start + complete in one call)
+            //
             auto key = registry_.pair_node(pair_url, pairing_key_);
             if (!key.empty())
                 log(LogLevel::Info, "Paired with " + pair_url + " (PSK)");
             else
                 log(LogLevel::Error, "PSK pairing failed for " + pair_url);
         } else {
-            // PIN mode — send pair-request NOW so node generates and shows the PIN,
+            //
             // then open the PIN entry modal for the user to read it from the node TUI.
             pair_nonce = registry_.start_pair(pair_url);
             if (pair_nonce.empty()) {
@@ -462,7 +462,7 @@ void ControlUI::run() {
 
     auto nodes_comp  = Container::Vertical({disc_comp, nodes_section});
 
-    // ── Add Manually Modal ────────────────────────────────────────────────────
+    //
 
     InputOption url_iopt; url_iopt.multiline = false;
     url_iopt.placeholder = "http://hostname:7070";
@@ -492,7 +492,7 @@ void ControlUI::run() {
         }) | border | size(WIDTH, EQUAL, 54);
     });
 
-    // ── PIN Entry Modal ───────────────────────────────────────────────────────
+    //
 
     InputOption pin_iopt; pin_iopt.multiline = false;
     pin_iopt.placeholder = "000000";
@@ -533,10 +533,10 @@ void ControlUI::run() {
         lines.push_back(text(" " + agent_validation_title) | bold | hcenter);
         lines.push_back(separator());
         if (agent_validation_lines.empty()) {
-            lines.push_back(text(" Validation failed.") | color(Color::Red));
+            lines.push_back(paragraph(" Validation failed.") | color(Color::Red));
         } else {
             for (const auto& line : agent_validation_lines) {
-                lines.push_back(text(" - " + line) | color(Color::Red));
+                lines.push_back(paragraph(" - " + line) | color(Color::Red));
             }
         }
         lines.push_back(separator());
@@ -544,7 +544,7 @@ void ControlUI::run() {
         return vbox(std::move(lines)) | border | size(WIDTH, EQUAL, 78);
     });
 
-    // ── Tab 2: Agents components ──────────────────────────────────────────────
+    //
 
     auto agent_menu   = Menu(&agent_entries, &agent_sel, MenuOption::Vertical());
     auto btn_new_a    = Button("[+] New", [&] {
@@ -660,7 +660,17 @@ void ControlUI::run() {
             if (ed_id_orig.empty()) agents_.create_agent(cfg);
             else                    agents_.update_agent(ed_id_orig, cfg);
         } catch (const std::exception& e) {
-            log(LogLevel::Error, std::string("Agent save failed: ") + e.what());
+            const std::string err = e.what();
+            log(LogLevel::Error, std::string("Agent save failed: ") + err);
+            agent_validation_title = "Agent Save Failed";
+            agent_validation_lines = {err};
+            const std::string err_low = util::to_lower(err);
+            if (err_low.find("locked") != std::string::npos ||
+                err_low.find("busy") != std::string::npos) {
+                agent_validation_lines.push_back(
+                    "Hint: another mantic-mind-control process may be using the same data directory. Stop duplicates and retry.");
+            }
+            show_agent_validation_modal = true;
             return;
         }
         show_editor = false;
@@ -683,7 +693,7 @@ void ControlUI::run() {
     auto agent_edit_m = Maybe(editor_comp,     [&]() { return  show_editor; });
     auto agents_comp  = Container::Stacked({agent_list_m, agent_edit_m});
 
-    // ── File browser modal ────────────────────────────────────────────────────
+    //
 
     auto fb_menu   = Menu(&fb_display_names, &fb_sel, MenuOption::Vertical());
     auto fb_menu_m = Maybe(fb_menu, [&]() { return !fb_display_names.empty(); });
@@ -706,7 +716,9 @@ void ControlUI::run() {
             ed_ctx_s = std::to_string(ed_model_info.n_ctx_train);
         }
         ed_reasoning = ed_model_info.supports_reasoning;
-        ed_tools = ed_model_info.supports_tool_calls;
+        if (ed_model_info.supports_tool_calls) {
+            ed_tools = true;
+        }
         refresh_editor_validation();
         show_file_browser = false;
     };
@@ -750,12 +762,12 @@ void ControlUI::run() {
         }) | border | size(WIDTH, EQUAL, 72);
     });
 
-    // ── Tab 3: Activity components ────────────────────────────────────────────
+    //
 
     auto filter_toggle = Toggle(&filter_labels, &log_filter);
     auto activity_comp = Container::Vertical({filter_toggle});
 
-    // ── Tab 4: Chat components ────────────────────────────────────────────────
+    //
 
     InputOption chat_iopt;
     chat_iopt.multiline = false;
@@ -985,7 +997,7 @@ void ControlUI::run() {
     auto chat_btn_row = Container::Horizontal({btn_chat_send, btn_chat_clear});
     auto chat_comp = Container::Vertical({chat_agent_menu_m, chat_input_comp, chat_btn_row});
 
-    // ── Tab 5: Curation components ────────────────────────────────────────────
+    //
 
     auto cur_agent_menu = Menu(&cur_agent_entries, &cur_agent_sel, MenuOption::Vertical());
     auto cur_conv_menu  = Menu(&cur_conv_entries, &cur_conv_sel, MenuOption::Vertical());
@@ -1196,22 +1208,22 @@ void ControlUI::run() {
         }) | border | size(WIDTH, EQUAL, 60);
     });
 
-    // ── Per-tab Renderers ─────────────────────────────────────────────────────
+    //
 
     // Tab 1
     auto nodes_renderer = Renderer(nodes_comp, [&]() {
-        // ── Discovered nodes (unregistered) ──────────────────────────────────
+        //
         auto dns = registry_.get_discovered_nodes();
         disc_entries.resize(dns.size());
         for (size_t i = 0; i < dns.size(); ++i)
-            disc_entries[i] = dns[i].url + "  [" + dns[i].node_id.substr(0, 8) + "…]";
+            disc_entries[i] = dns[i].url + "  [" + dns[i].node_id.substr(0, 8) + "...]";
         // Clamp: when empty, leave sel at 0 (Maybe wrapper prevents menu access)
         if (!dns.empty() && disc_sel >= static_cast<int>(dns.size()))
             disc_sel = static_cast<int>(dns.size()) - 1;
         else if (dns.empty())
             disc_sel = 0;
 
-        // ── Connected (registered) nodes ──────────────────────────────────────
+        //
         auto ns = registry_.list_nodes();
         node_entries.resize(ns.size());
         for (size_t i = 0; i < ns.size(); ++i) {
@@ -1277,7 +1289,7 @@ void ControlUI::run() {
                 text(" Discovered Nodes") | bold,
                 separator(),
                 dns.empty()
-                    ? text("  Listening for nodes…") | color(Color::GrayDark)
+                    ? text("  Listening for nodes...") | color(Color::GrayDark)
                     : (disc_menu->Render() | yframe | flex),
                 disc_btns->Render(),
             }) | size(HEIGHT, LESS_THAN, 10) | border,
@@ -1302,7 +1314,7 @@ void ControlUI::run() {
         for (size_t i = 0; i < cs.size(); ++i) {
             auto& a  = cs[i];
             auto model_disp = a.model_path.empty() ? "no model"
-                : (a.model_path.size() > 22 ? a.model_path.substr(0, 22) + "…"
+                : (a.model_path.size() > 22 ? a.model_path.substr(0, 22) + "..."
                                              : a.model_path);
             agent_entries[i] = a.name + "  (" + model_disp + ")";
         }
@@ -1315,7 +1327,7 @@ void ControlUI::run() {
             Elements warning_lines;
             for (const auto& issue : ed_validation_issues) {
                 if (issue.severity != ValidationSeverity::Warning) continue;
-                warning_lines.push_back(text(" - " + issue.field + ": " + issue.message) | color(Color::Yellow));
+                warning_lines.push_back(paragraph(" - " + issue.field + ": " + issue.message) | color(Color::Yellow));
             }
             if (warning_lines.empty()) {
                 warning_lines.push_back(text(" No current warnings.") | color(Color::GrayDark));
@@ -1328,11 +1340,11 @@ void ControlUI::run() {
             if (!ed_tools) {
                 tool_lines.push_back(text(" Tools disabled.") | color(Color::GrayDark));
             } else if (!ed_memories) {
-                tool_lines.push_back(text(" No executable tools until Memories is enabled.") | color(Color::Yellow));
+                tool_lines.push_back(paragraph(" No executable tools until Memories is enabled.") | color(Color::Yellow));
             } else {
                 for (const auto& tool : local_tools) {
                     tool_lines.push_back(text(" - " + tool.name) | color(Color::Cyan));
-                    tool_lines.push_back(text("   " + tool.description) | color(Color::GrayDark));
+                    tool_lines.push_back(paragraph("   " + tool.description) | color(Color::GrayDark));
                 }
             }
 
@@ -1384,8 +1396,8 @@ void ControlUI::run() {
                                  ed_model_info.supports_reasoning,
                                  ed_model_info.metadata_found,
                                  ed_model_info.used_filename_heuristics)),
-                        text(" Source: " +
-                             (ed_model_info.source_path.empty() ? "(unresolved)" : ed_model_info.source_path))
+                        paragraph(" Source: " +
+                                  (ed_model_info.source_path.empty() ? "(unresolved)" : ed_model_info.source_path))
                             | color(Color::GrayDark),
                         separator(),
                         text(" Available Tools:") | bold,
@@ -1420,7 +1432,7 @@ void ControlUI::run() {
                       text(a.model_path.empty() ? "(none)" : a.model_path) | bold}),
                 hbox({text("  System : "),
                       text(a.system_prompt.empty() ? "(none)"
-                               : a.system_prompt.substr(0, 60) + "…")
+                               : a.system_prompt.substr(0, 60) + "...")
                           | color(Color::Cyan)}),
                 hbox({text("  ctx    : "),
                       text(std::to_string(a.llama_settings.ctx_size) + " tokens")}),
@@ -1820,7 +1832,7 @@ void ControlUI::run() {
         });
     });
 
-    // ── Main tab container + top-level renderer ───────────────────────────────
+    //
 
     auto main_tabs = Container::Tab(
         {nodes_renderer, agents_renderer, activity_renderer, chat_renderer, curation_renderer}, &tab_index);
@@ -1849,7 +1861,7 @@ void ControlUI::run() {
         }) | border;
     });
 
-    // ── Key handling (1/2/3/4/5 switch tabs, q/Esc quit or go back) ──────────
+    //
 
     auto root = CatchEvent(top_renderer, [&](Event ev) {
         if (show_add_node || show_pin_entry || show_agent_validation_modal ||
@@ -1877,7 +1889,7 @@ void ControlUI::run() {
         return false;
     });
 
-    // ── Modal overlays ────────────────────────────────────────────────────────
+    //
 
     auto with_add    = Modal(root,        modal_renderer,     &show_add_node);
     auto with_pin    = Modal(with_add,    pin_modal_renderer, &show_pin_entry);
@@ -1885,7 +1897,7 @@ void ControlUI::run() {
     auto with_fb     = Modal(with_agent_validation, fb_renderer_comp,   &show_file_browser);
     auto final_comp  = Modal(with_fb,     cur_delete_modal_renderer, &show_cur_delete_confirm);
 
-    // ── Background ticker at 2 fps (state polls + animations) ────────────────
+    //
 
     std::atomic<bool> ticker_running{true};
     std::thread ticker([&] {

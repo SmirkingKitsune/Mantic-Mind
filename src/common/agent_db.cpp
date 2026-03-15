@@ -5,12 +5,14 @@
 #include <SQLiteCpp/SQLiteCpp.h>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <filesystem>
 #include <stdexcept>
+#include <thread>
 
 namespace mm {
 
-// ── Anonymous helpers ─────────────────────────────────────────────────────────
+//
 namespace {
 
 // nlohmann ADL picks up mm::to_json / mm::from_json automatically.
@@ -30,6 +32,32 @@ std::vector<std::string> deserialize_strings(const std::string& s) {
     catch (const std::exception& e) { MM_DEBUG("deserialize_strings: {}", e.what()); return {}; }
 }
 
+bool is_transient_sqlite_lock(const SQLite::Exception& e) {
+    const std::string msg = util::to_lower(e.what());
+    return msg.find("locked") != std::string::npos ||
+           msg.find("busy") != std::string::npos;
+}
+
+template <typename Fn>
+void run_with_sqlite_retry(const char* operation, Fn&& fn) {
+    constexpr int kMaxAttempts = 5;
+    constexpr auto kRetryDelay = std::chrono::milliseconds(150);
+
+    for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
+        try {
+            fn();
+            return;
+        } catch (const SQLite::Exception& e) {
+            if (!is_transient_sqlite_lock(e) || attempt == kMaxAttempts) {
+                throw;
+            }
+            MM_WARN("AgentDB {} hit a transient SQLite lock (attempt {}/{}): {}",
+                    operation, attempt, kMaxAttempts, e.what());
+            std::this_thread::sleep_for(kRetryDelay);
+        }
+    }
+}
+
 Message row_to_message(SQLite::Statement& q) {
     Message m;
     m.role          = message_role_from_string(q.getColumn("role").getText());
@@ -44,7 +72,7 @@ Message row_to_message(SQLite::Statement& q) {
 
 } // namespace
 
-// ── Construction ──────────────────────────────────────────────────────────────
+//
 AgentDB::AgentDB(const AgentId& agent_id, const std::string& data_dir)
     : agent_id_(agent_id)
 {
@@ -57,12 +85,17 @@ AgentDB::AgentDB(const AgentId& agent_id, const std::string& data_dir)
         SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE
     );
 
-    db_->exec("PRAGMA journal_mode=WAL");
-    db_->exec("PRAGMA foreign_keys=ON");
-    db_->exec("PRAGMA synchronous=NORMAL");
-    db_->exec("PRAGMA cache_size=-8000"); // 8 MB page cache
+    run_with_sqlite_retry("init_pragmas", [&] {
+        db_->exec("PRAGMA journal_mode=WAL");
+        db_->exec("PRAGMA foreign_keys=ON");
+        db_->exec("PRAGMA synchronous=NORMAL");
+        db_->exec("PRAGMA cache_size=-8000"); // 8 MB page cache
+        db_->exec("PRAGMA busy_timeout=5000");
+    });
 
-    run_migrations();
+    run_with_sqlite_retry("run_migrations", [&] {
+        run_migrations();
+    });
 }
 
 AgentDB::~AgentDB() = default;
@@ -83,7 +116,7 @@ void AgentDB::run_migrations() {
         return q.executeStep();
     };
 
-    // ── v1: initial schema ───────────────────────────────────────────────────
+    //
     if (!has_version(1)) {
         SQLite::Transaction tx(*db_);
 
@@ -165,7 +198,7 @@ void AgentDB::run_migrations() {
         tx.commit();
     }
 
-    // ── v2: local_memories table + rename memories → global_memories ─────────
+    //
     if (!has_version(2)) {
         SQLite::Transaction tx(*db_);
 
@@ -181,7 +214,7 @@ void AgentDB::run_migrations() {
         )");
         db_->exec("CREATE INDEX IF NOT EXISTS idx_local_mem_conv ON local_memories(conversation_id)");
 
-        // Migrate memories → global_memories (with updated_at_ms column)
+        //
         db_->exec(R"(
             CREATE TABLE IF NOT EXISTS global_memories (
                 id              TEXT    PRIMARY KEY,
@@ -193,19 +226,23 @@ void AgentDB::run_migrations() {
             )
         )");
 
-        // Copy existing data if the old table exists
+        // Copy existing data if the old table exists.
+        // The check statement must be finalized before DROP TABLE, otherwise
+        // the open cursor on sqlite_master causes SQLITE_LOCKED.
+        bool has_old_memories = false;
         {
             SQLite::Statement check(*db_,
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='memories'");
-            if (check.executeStep()) {
-                db_->exec(R"(
-                    INSERT OR IGNORE INTO global_memories
-                        (id, content, source_conv_id, importance, created_at_ms, updated_at_ms)
-                    SELECT id, content, source_conv_id, importance, created_at_ms, created_at_ms
-                    FROM memories
-                )");
-                db_->exec("DROP TABLE memories");
-            }
+            has_old_memories = check.executeStep();
+        }
+        if (has_old_memories) {
+            db_->exec(R"(
+                INSERT OR IGNORE INTO global_memories
+                    (id, content, source_conv_id, importance, created_at_ms, updated_at_ms)
+                SELECT id, content, source_conv_id, importance, created_at_ms, created_at_ms
+                FROM memories
+            )");
+            db_->exec("DROP TABLE memories");
         }
 
         // Drop old index if it exists, create new one
@@ -217,60 +254,64 @@ void AgentDB::run_migrations() {
     }
 }
 
-// ── AgentConfig ───────────────────────────────────────────────────────────────
+//
 void AgentDB::save_config(const AgentConfig& cfg) {
     std::lock_guard g(mutex_);
-    SQLite::Statement q(*db_, R"(
-        INSERT INTO agent_config
-            (id, name, model_path, system_prompt,
-             ctx_size, n_gpu_layers, n_threads, temperature, top_p,
-             max_tokens, flash_attn, extra_args_json,
-             reasoning_enabled, memories_enabled, tools_enabled,
-             preferred_node_id, updated_at_ms)
-        VALUES
-            (:id,:name,:model_path,:system_prompt,
-             :ctx_size,:n_gpu_layers,:n_threads,:temperature,:top_p,
-             :max_tokens,:flash_attn,:extra_args_json,
-             :reasoning,:memories,:tools,
-             :preferred_node_id,:now)
-        ON CONFLICT(id) DO UPDATE SET
-            name              = excluded.name,
-            model_path        = excluded.model_path,
-            system_prompt     = excluded.system_prompt,
-            ctx_size          = excluded.ctx_size,
-            n_gpu_layers      = excluded.n_gpu_layers,
-            n_threads         = excluded.n_threads,
-            temperature       = excluded.temperature,
-            top_p             = excluded.top_p,
-            max_tokens        = excluded.max_tokens,
-            flash_attn        = excluded.flash_attn,
-            extra_args_json   = excluded.extra_args_json,
-            reasoning_enabled = excluded.reasoning_enabled,
-            memories_enabled  = excluded.memories_enabled,
-            tools_enabled     = excluded.tools_enabled,
-            preferred_node_id = excluded.preferred_node_id,
-            updated_at_ms     = excluded.updated_at_ms
-    )");
-
     const auto& s = cfg.llama_settings;
-    q.bind(":id",              cfg.id);
-    q.bind(":name",            cfg.name);
-    q.bind(":model_path",      cfg.model_path);
-    q.bind(":system_prompt",   cfg.system_prompt);
-    q.bind(":ctx_size",        s.ctx_size);
-    q.bind(":n_gpu_layers",    s.n_gpu_layers);
-    q.bind(":n_threads",       s.n_threads);
-    q.bind(":temperature",     static_cast<double>(s.temperature));
-    q.bind(":top_p",           static_cast<double>(s.top_p));
-    q.bind(":max_tokens",      s.max_tokens);
-    q.bind(":flash_attn",      s.flash_attn ? 1 : 0);
-    q.bind(":extra_args_json", serialize(s.extra_args));
-    q.bind(":reasoning",       cfg.reasoning_enabled ? 1 : 0);
-    q.bind(":memories",        cfg.memories_enabled  ? 1 : 0);
-    q.bind(":tools",           cfg.tools_enabled     ? 1 : 0);
-    q.bind(":preferred_node_id", cfg.preferred_node_id);
-    q.bind(":now",             util::now_ms());
-    q.exec();
+    const auto extra_args_json = serialize(s.extra_args);
+
+    run_with_sqlite_retry("save_config", [&] {
+        SQLite::Statement q(*db_, R"(
+            INSERT INTO agent_config
+                (id, name, model_path, system_prompt,
+                 ctx_size, n_gpu_layers, n_threads, temperature, top_p,
+                 max_tokens, flash_attn, extra_args_json,
+                 reasoning_enabled, memories_enabled, tools_enabled,
+                 preferred_node_id, updated_at_ms)
+            VALUES
+                (:id,:name,:model_path,:system_prompt,
+                 :ctx_size,:n_gpu_layers,:n_threads,:temperature,:top_p,
+                 :max_tokens,:flash_attn,:extra_args_json,
+                 :reasoning,:memories,:tools,
+                 :preferred_node_id,:now)
+            ON CONFLICT(id) DO UPDATE SET
+                name              = excluded.name,
+                model_path        = excluded.model_path,
+                system_prompt     = excluded.system_prompt,
+                ctx_size          = excluded.ctx_size,
+                n_gpu_layers      = excluded.n_gpu_layers,
+                n_threads         = excluded.n_threads,
+                temperature       = excluded.temperature,
+                top_p             = excluded.top_p,
+                max_tokens        = excluded.max_tokens,
+                flash_attn        = excluded.flash_attn,
+                extra_args_json   = excluded.extra_args_json,
+                reasoning_enabled = excluded.reasoning_enabled,
+                memories_enabled  = excluded.memories_enabled,
+                tools_enabled     = excluded.tools_enabled,
+                preferred_node_id = excluded.preferred_node_id,
+                updated_at_ms     = excluded.updated_at_ms
+        )");
+
+        q.bind(":id",                cfg.id);
+        q.bind(":name",              cfg.name);
+        q.bind(":model_path",        cfg.model_path);
+        q.bind(":system_prompt",     cfg.system_prompt);
+        q.bind(":ctx_size",          s.ctx_size);
+        q.bind(":n_gpu_layers",      s.n_gpu_layers);
+        q.bind(":n_threads",         s.n_threads);
+        q.bind(":temperature",       static_cast<double>(s.temperature));
+        q.bind(":top_p",             static_cast<double>(s.top_p));
+        q.bind(":max_tokens",        s.max_tokens);
+        q.bind(":flash_attn",        s.flash_attn ? 1 : 0);
+        q.bind(":extra_args_json",   extra_args_json);
+        q.bind(":reasoning",         cfg.reasoning_enabled ? 1 : 0);
+        q.bind(":memories",          cfg.memories_enabled ? 1 : 0);
+        q.bind(":tools",             cfg.tools_enabled ? 1 : 0);
+        q.bind(":preferred_node_id", cfg.preferred_node_id);
+        q.bind(":now",               util::now_ms());
+        q.exec();
+    });
 }
 
 AgentConfig AgentDB::load_config() const {
@@ -303,7 +344,7 @@ AgentConfig AgentDB::load_config() const {
     return cfg;
 }
 
-// ── Conversations ─────────────────────────────────────────────────────────────
+//
 ConvId AgentDB::create_conversation(const std::string& title) {
     return create_conversation(title, "");
 }
@@ -458,7 +499,7 @@ std::optional<ConvId> AgentDB::get_active_conversation_id() const {
     return std::string(q.getColumn(0).getText());
 }
 
-// ── Messages ──────────────────────────────────────────────────────────────────
+//
 void AgentDB::append_message(const ConvId& conv_id,
                               const Message& msg,
                               int sequence_num) {
@@ -518,7 +559,7 @@ int AgentDB::get_total_tokens(const ConvId& conv_id) const {
     return q.getColumn(0).getInt();
 }
 
-// ── Global memories ───────────────────────────────────────────────────────────
+//
 void AgentDB::add_memory(const Memory& mem) {
     std::lock_guard g(mutex_);
     int64_t now = util::now_ms();
@@ -621,7 +662,7 @@ std::vector<Memory> AgentDB::search_memories(const std::string& query, int limit
     return out;
 }
 
-// ── Local memories ────────────────────────────────────────────────────────────
+//
 void AgentDB::add_local_memory(const LocalMemory& mem) {
     std::lock_guard g(mutex_);
     int64_t now = util::now_ms();

@@ -14,12 +14,25 @@
 #include <atomic>
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <thread>
 #include <vector>
+#include <functional>
+#include <memory>
 
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#else
+#  include <fcntl.h>
+#  include <sys/file.h>
+#  include <unistd.h>
+#endif
 // ── Config loading ─────────────────────────────────────────────────────────────
 // Priority: config file < environment variables.
 
@@ -110,9 +123,87 @@ static mm::ControlConfig load_config(
 
 // ── main ──────────────────────────────────────────────────────────────────────
 
+namespace {
+
+class ProcessSingletonLock {
+public:
+    ~ProcessSingletonLock() {
+#ifdef _WIN32
+        if (handle_) {
+            ReleaseMutex(handle_);
+            CloseHandle(handle_);
+        }
+#else
+        if (fd_ >= 0) {
+            flock(fd_, LOCK_UN);
+            close(fd_);
+        }
+#endif
+    }
+
+    ProcessSingletonLock(const ProcessSingletonLock&) = delete;
+    ProcessSingletonLock& operator=(const ProcessSingletonLock&) = delete;
+
+    static std::unique_ptr<ProcessSingletonLock> try_acquire(const std::string& data_dir,
+                                                             uint16_t port) {
+        const std::string key = data_dir + "|" + std::to_string(port);
+        const std::string suffix = std::to_string(std::hash<std::string>{}(key));
+
+#ifdef _WIN32
+        const std::string mutex_name = "Global\\mantic-mind-control-" + suffix;
+        HANDLE handle = CreateMutexA(nullptr, TRUE, mutex_name.c_str());
+        if (!handle || GetLastError() == ERROR_ALREADY_EXISTS) {
+            if (handle) CloseHandle(handle);
+            return nullptr;
+        }
+
+        auto lock = std::unique_ptr<ProcessSingletonLock>(new ProcessSingletonLock());
+        lock->handle_ = handle;
+        return lock;
+#else
+        const std::string lock_path = "/tmp/mantic-mind-control-" + suffix + ".lock";
+        int fd = open(lock_path.c_str(), O_CREAT | O_RDWR, 0600);
+        if (fd < 0) return nullptr;
+        if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+            close(fd);
+            return nullptr;
+        }
+
+        auto lock = std::unique_ptr<ProcessSingletonLock>(new ProcessSingletonLock());
+        lock->fd_ = fd;
+        return lock;
+#endif
+    }
+
+private:
+    ProcessSingletonLock() = default;
+
+#ifdef _WIN32
+    HANDLE handle_ = nullptr;
+#else
+    int fd_ = -1;
+#endif
+};
+
+} // namespace
 int main() {
     std::string cfg_path;
     auto cfg = load_config(&cfg_path);
+
+    std::error_code data_ec;
+    std::filesystem::path data_dir_abs =
+        std::filesystem::absolute(cfg.data_dir, data_ec);
+    const std::string lock_data_dir =
+        data_ec ? cfg.data_dir : data_dir_abs.lexically_normal().string();
+    auto instance_lock =
+        ProcessSingletonLock::try_acquire(lock_data_dir, cfg.listen_port);
+    if (!instance_lock) {
+        std::fprintf(stderr,
+                     "Another mantic-mind-control instance appears to be running for data_dir='%s' and port=%u.\n",
+                     cfg.data_dir.c_str(),
+                     static_cast<unsigned>(cfg.listen_port));
+        return 1;
+    }
 
     // Ensure models directory exists.
     {
