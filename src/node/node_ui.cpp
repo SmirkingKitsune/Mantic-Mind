@@ -120,7 +120,6 @@ void NodeUI::run() {
         auto active_agent = state_.get_active_agent();
         auto node_id      = state_.get_node_id();
         auto last_error   = state_.get_last_error();
-        auto llama_path   = state_.get_llama_server_path();
         auto upd          = state_.get_llama_update_state();
         auto rt           = state_.get_llama_runtime_summary();
         auto api_keys     = state_.get_api_keys();
@@ -174,6 +173,45 @@ void NodeUI::run() {
         std::string gpu_detail;
         if (metrics.gpu_vram_total_mb > 0)
             gpu_detail = mb_str(metrics.gpu_vram_used_mb) + " / " + mb_str(metrics.gpu_vram_total_mb);
+
+        auto short_commit = [](const std::string& s) -> std::string {
+            if (s.empty()) return "?";
+            return s.size() > 10 ? s.substr(0, 10) : s;
+        };
+
+        std::string runtime_summary = upd.status.empty() ? "idle" : upd.status;
+        runtime_summary += rt.update_available ? " | update available" : " | up-to-date";
+
+        if (!rt.installed_commit.empty() || !rt.remote_commit.empty()) {
+            runtime_summary += " | ";
+            runtime_summary += short_commit(rt.installed_commit);
+            runtime_summary += " -> ";
+            runtime_summary += short_commit(rt.remote_commit);
+        }
+
+        if (!upd.message.empty()) {
+            runtime_summary += " | ";
+            runtime_summary += upd.message;
+        }
+
+        if (!rt.remote_error.empty()) {
+            runtime_summary += " | remote: ";
+            runtime_summary += rt.remote_error;
+        }
+
+        if (!last_error.empty()) {
+            runtime_summary += " | error: ";
+            runtime_summary += last_error;
+        }
+
+        Color runtime_color = Color::GrayDark;
+        if (upd.status == "failed" || !last_error.empty() || !rt.remote_error.empty()) {
+            runtime_color = Color::RedLight;
+        } else if (upd.status == "running" || rt.update_available) {
+            runtime_color = Color::Yellow;
+        } else if (upd.status == "succeeded") {
+            runtime_color = Color::Green;
+        }
 
         if (!registered) {
             // ── Waiting state ─────────────────────────────────────────────────
@@ -251,26 +289,10 @@ void NodeUI::run() {
             text(""),
             hbox({text("Model    "), text(loaded_model.empty() ? "(none)" : loaded_model) | bold}),
             hbox({text("Agent    "), text(active_agent.empty() ? "(none)" : active_agent) | bold}),
-            hbox({text("Llama    "), text(llama_path.empty() ? "(none)" : llama_path) | bold}),
-            hbox({text("Updater  "),
-                  text(upd.status.empty() ? "idle" : upd.status)
-                      | (upd.status == "failed"
-                             ? color(Color::RedLight)
-                             : (upd.status == "succeeded"
-                                    ? color(Color::Green)
-                                    : color(Color::Yellow)))}),
-            hbox({text("Update   "),
-                  text(upd.message.empty() ? "(none)" : upd.message) | color(Color::GrayDark)}),
-            hbox({text("Version  "),
-                  text((rt.installed_commit.empty() ? "?" : rt.installed_commit) + " -> "
-                       + (rt.remote_commit.empty() ? "?" : rt.remote_commit))
-                      | color(Color::GrayDark)}),
-            hbox({text("Need upd "),
-                  text(rt.update_available ? "yes" : "no")
-                      | (rt.update_available ? color(Color::Yellow) : color(Color::Green))}),
-            hbox({text("Error    "),
-                  text(last_error.empty() ? "(none)" : last_error)
-                  | (last_error.empty() ? color(Color::GrayDark) : color(Color::RedLight))}),
+            hbox({
+                text("Runtime  "),
+                paragraph(runtime_summary) | color(runtime_color) | flex,
+            }),
         }) | flex;
 
         // Health panel
