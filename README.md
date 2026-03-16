@@ -71,6 +71,8 @@ cp tools/mantic-mind-control.toml .   # edit locally as needed
 ./mantic-mind-control
 ```
 
+`mantic-mind-control` enforces a single running instance per `(data_dir, listen_port)` pair. Starting a duplicate exits with an error.
+
 ### 2. Run a node
 
 ```sh
@@ -101,7 +103,13 @@ curl -N -X POST http://localhost:9090/v1/agents/<id>/chat \
 
 ## Configuration
 
-Both executables look for a `.toml` config file in the working directory, then override any value with a matching environment variable.
+Config loading order:
+
+1. `MM_NODE_CONFIG_FILE` / `MM_CONTROL_CONFIG_FILE` (binary-specific override)
+2. `MM_CONFIG_FILE` (shared override)
+3. Search for `mantic-mind.toml` / `mantic-mind-control.toml` from the current directory upward (up to 10 parent directories)
+
+After file loading, matching environment variables override config values.
 
 ### `mantic-mind.toml` — node config
 
@@ -110,12 +118,16 @@ Both executables look for a `.toml` config file in the working directory, then o
 | `listen_port` | `MM_LISTEN_PORT` | `7070` | Node API port |
 | `control_url` | `MM_CONTROL_URL` | *(empty)* | Control base URL |
 | `control_api_key` | `MM_CONTROL_API_KEY` | *(empty)* | Bearer token for control |
-| `self_url` | `MM_SELF_URL` | `http://127.0.0.1:<port>` | This node's public URL |
 | `llama_server_path` | `MM_LLAMA_PATH` | `llama-server` | llama-server binary |
-| `llama path cache` | `MM_LLAMA_PATH_CACHE_FILE` | `data/llama_server_path.txt` | persisted resolved llama-server path used when config is default/unresolved |
 | `llama_port` | `MM_LLAMA_PORT` | `8080` | Internal llama-server port |
+| `llama_port_range_start` | `MM_LLAMA_PORT_RANGE_START` | `8080` | First port in the per-slot llama-server range |
+| `llama_port_range_end` | `MM_LLAMA_PORT_RANGE_END` | `8090` | Last port in the per-slot llama-server range |
+| `max_slots` | `MM_MAX_SLOTS` | `4` | Maximum concurrent model slots/processes |
 | `models_dir` | `MM_MODELS_DIR` | `models` | Scanned for `.gguf` files |
-| `api_key` | `MM_API_KEY` | *(generated)* | Pre-set node API key |
+| `data_dir` | `MM_DATA_DIR` | `data` | Node runtime data root |
+| `kv_cache_dir` | `MM_KV_CACHE_DIR` | `data/kv_cache` | KV cache checkpoint directory |
+| `pairing_key` | `MM_PAIRING_KEY` | *(empty)* | PSK for automatic node/control pairing |
+| `discovery_port` | `MM_DISCOVERY_PORT` | `7072` | UDP discovery port |
 | `log_file` | `MM_LOG_FILE` | `logs/mantic-mind.log` | Log file |
 
 ### `mantic-mind-control.toml` — control config
@@ -124,9 +136,22 @@ Both executables look for a `.toml` config file in the working directory, then o
 |---|---|---|---|
 | `listen_port` | `MM_CONTROL_PORT` | `9090` | API server port |
 | `data_dir` | `MM_DATA_DIR` | `data` | Agent database root |
+| `models_dir` | `MM_MODELS_DIR` | `models` | Model distribution root |
 | `node_health_poll_interval_s` | `MM_POLL_INTERVAL_S` | `30` | Health poll interval |
-| `chat queue wait ms` | `MM_CHAT_QUEUE_WAIT_MS` | `180000` | how long chat waits for next available node before failing |
+| `pairing_key` | `MM_PAIRING_KEY` | *(empty)* | PSK for automatic node/control pairing |
+| `discovery_port` | `MM_DISCOVERY_PORT` | `7072` | UDP discovery port |
 | `log_file` | `MM_LOG_FILE` | `logs/mantic-mind-control.log` | Log file |
+
+Additional env-only settings:
+
+| Env var | Scope | Description |
+|---|---|---|
+| `MM_SELF_URL` | node | Public URL advertised to control (defaults to `http://127.0.0.1:<listen_port>`) |
+| `MM_API_KEY` | node | Initial node API key (generated if omitted) |
+| `MM_LLAMA_PATH_CACHE_FILE` | node | Path to persisted resolved `llama-server` binary path |
+| `MM_LLAMA_REPO_URL` | node | Optional llama.cpp git remote for updater jobs |
+| `MM_LLAMA_INSTALL_ROOT` | node | Optional install root for updater jobs |
+| `MM_LLAMA_UPDATER_LOG_DIR` | node | Optional log directory for updater jobs |
 
 ## REST API
 
