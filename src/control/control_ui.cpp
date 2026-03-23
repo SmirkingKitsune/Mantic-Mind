@@ -106,7 +106,7 @@ void ControlUI::run() {
     bool show_add_node  = false;
     bool show_pin_entry = false;
     bool show_agent_validation_modal = false;
-    std::string add_url, add_key;
+    std::string add_url;
     std::string pin_input, pair_url, pair_nonce;
 
     // Agents tab
@@ -415,7 +415,8 @@ void ControlUI::run() {
         }
     }, ButtonOption::Simple());
     auto btn_add_manual = Button("[+] Add Manually", [&] {
-        add_url.clear(); add_key.clear(); show_add_node = true;
+        add_url.clear();
+        show_add_node = true;
     }, ButtonOption::Simple());
     auto disc_btns    = Container::Horizontal({btn_pair, btn_add_manual});
     // Maybe wrapper: disc_menu is excluded from the component tree (events + render)
@@ -466,27 +467,40 @@ void ControlUI::run() {
 
     InputOption url_iopt; url_iopt.multiline = false;
     url_iopt.placeholder = "http://hostname:7070";
-    InputOption key_iopt; key_iopt.multiline = false;
-    key_iopt.placeholder = "api-key";
-
     auto modal_url    = Input(&add_url, url_iopt);
-    auto modal_key    = Input(&add_key, key_iopt);
     auto modal_ok     = Button("  Connect  ", [&] {
-        if (!add_url.empty() && !add_key.empty())
-            registry_.add_node(add_url, add_key);
+        if (!add_url.empty()) {
+            if (!pairing_key_.empty()) {
+                auto key = registry_.pair_node(add_url, pairing_key_);
+                if (!key.empty()) {
+                    log(LogLevel::Info, "Paired with " + add_url + " (PSK)");
+                } else {
+                    log(LogLevel::Error, "PSK pairing failed for " + add_url);
+                }
+            } else {
+                pair_url = add_url;
+                pair_nonce = registry_.start_pair(pair_url);
+                if (pair_nonce.empty()) {
+                    log(LogLevel::Error, "Could not reach node for pairing: " + pair_url);
+                } else {
+                    pin_input.clear();
+                    show_pin_entry = true;
+                }
+            }
+        }
         show_add_node = false;
     }, ButtonOption::Simple());
     auto modal_cancel = Button("  Cancel  ", [&] { show_add_node = false; },
                                ButtonOption::Simple());
     auto modal_btns   = Container::Horizontal({modal_ok, modal_cancel});
-    auto modal_inputs = Container::Vertical({modal_url, modal_key, modal_btns});
+    auto modal_inputs = Container::Vertical({modal_url, modal_btns});
 
     auto modal_renderer = Renderer(modal_inputs, [&]() {
         return vbox({
             text(" Add Node Manually ") | bold | hcenter,
             separator(),
             hbox({text(" URL : "), modal_url->Render() | flex}),
-            hbox({text(" Key : "), modal_key->Render() | flex}),
+            text(" Uses pairing (PIN or configured PSK)") | color(Color::GrayDark),
             separator(),
             modal_btns->Render() | hcenter,
         }) | border | size(WIDTH, EQUAL, 54);
@@ -1249,11 +1263,50 @@ void ControlUI::run() {
                            ? mb_str(n.metrics.gpu_vram_used_mb) + "/" +
                              mb_str(n.metrics.gpu_vram_total_mb)
                            : std::string{};
-            detail = vbox({
+            int slot_ready = 0;
+            int slot_loading = 0;
+            int slot_suspending = 0;
+            int slot_suspended = 0;
+            int slot_error = 0;
+            for (const auto& s : n.slots) {
+                switch (s.state) {
+                    case SlotState::Ready:      ++slot_ready; break;
+                    case SlotState::Loading:    ++slot_loading; break;
+                    case SlotState::Suspending: ++slot_suspending; break;
+                    case SlotState::Suspended:  ++slot_suspended; break;
+                    case SlotState::Error:      ++slot_error; break;
+                    case SlotState::Empty:
+                    default:
+                        break;
+                }
+            }
+            const int slot_in_use = slot_ready + slot_loading + slot_suspending + slot_error;
+            const int slot_available = std::max(0, n.max_slots - slot_in_use);
+
+            auto compact_id = [](const std::string& s, size_t max_len = 8) -> std::string {
+                if (s.empty()) return "-";
+                return s.size() <= max_len ? s : s.substr(0, max_len);
+            };
+            auto compact_model = [](const std::string& p) -> std::string {
+                if (p.empty()) return "(none)";
+                std::string name = std::filesystem::path(p).filename().string();
+                if (name.empty()) name = p;
+                if (name.size() > 28) name = name.substr(0, 28) + "...";
+                return name;
+            };
+
+            Elements detail_rows = {
                 hbox({text("  URL     : "), text(n.url) | bold}),
                 hbox({text("  Platform: "), text(n.platform.empty() ? "-" : n.platform)}),
                 hbox({text("  Model   : "),
                       text(n.loaded_model.empty() ? "(none)" : n.loaded_model) | bold}),
+                hbox({text("  Slots   : "),
+                      text(std::to_string(slot_in_use) + "/" + std::to_string(n.max_slots)
+                           + " in use  (ready " + std::to_string(slot_ready)
+                           + ", loading " + std::to_string(slot_loading)
+                           + ", suspended " + std::to_string(slot_suspended)
+                           + ", available " + std::to_string(slot_available) + ")")
+                          | bold}),
                 hbox({text("  Llama   : "),
                       text(n.llama_server_path.empty() ? "(unknown)" : n.llama_server_path)
                           | color(Color::GrayDark)}),
@@ -1279,7 +1332,34 @@ void ControlUI::run() {
                 gauge_row("  CPU", n.metrics.cpu_percent, ""),
                 gauge_row("  RAM", n.metrics.ram_percent, ram),
                 gauge_row("  GPU", n.metrics.gpu_percent, gpu),
-            });
+                separator(),
+                text("  Slot occupancy:") | bold,
+            };
+
+            if (n.slots.empty()) {
+                detail_rows.push_back(text("    (no tracked slots)") | color(Color::GrayDark));
+            } else {
+                constexpr size_t kMaxSlotLines = 6;
+                size_t shown = 0;
+                for (const auto& s : n.slots) {
+                    if (shown >= kMaxSlotLines) break;
+                    const std::string state_txt = to_string(s.state);
+                    const std::string slot_txt = compact_id(s.id, 10);
+                    const std::string agent_txt = compact_id(s.assigned_agent, 12);
+                    const std::string model_txt = compact_model(s.model_path);
+                    detail_rows.push_back(
+                        text("    [" + state_txt + "] slot:" + slot_txt +
+                             " agent:" + agent_txt + " model:" + model_txt));
+                    ++shown;
+                }
+                if (n.slots.size() > shown) {
+                    detail_rows.push_back(
+                        text("    ... +" + std::to_string(n.slots.size() - shown) + " more slot(s)")
+                        | color(Color::GrayDark));
+                }
+            }
+
+            detail = vbox(std::move(detail_rows));
         } else {
             detail = text("  No connected nodes.") | color(Color::GrayDark);
         }

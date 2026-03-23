@@ -92,10 +92,11 @@ namespace {
 // localhost on the node machine and not reachable from the control process.
 class NodeProxyLlamaClient : public LlamaCppClient {
 public:
-    NodeProxyLlamaClient(std::string node_url, std::string api_key)
+    NodeProxyLlamaClient(std::string node_url, std::string api_key, std::string slot_id = {})
         : LlamaCppClient(node_url)
         , node_url_(std::move(node_url))
         , api_key_(std::move(api_key))
+        , slot_id_(std::move(slot_id))
     {}
 
     Message complete(const InferenceRequest& req) override {
@@ -107,10 +108,13 @@ public:
         result.timestamp_ms = util::now_ms();
 
         InferenceRequest req_copy = req;
-        req_copy.stream = true; // node API always streams
+        req_copy.stream = req.stream;
+
+        nlohmann::json body = nlohmann::json(req_copy);
+        if (!slot_id_.empty()) body["slot_id"] = slot_id_;
 
         bool ok = cli.stream_post("/api/node/infer",
-            nlohmann::json(req_copy),
+            body,
             [&result](const std::string& data) -> bool {
                 if (data == "[DONE]") return true;
                 try {
@@ -143,7 +147,25 @@ public:
 private:
     std::string node_url_;
     std::string api_key_;
+    std::string slot_id_;
 };
+
+bool contains_prefill_thinking_incompatibility(const std::string& text) {
+    const std::string lowered = util::to_lower(text);
+    return lowered.find("assistant response prefill is incompatible with enable_thinking")
+        != std::string::npos;
+}
+
+void enforce_prefill_safe_tail(std::vector<Message>& messages) {
+    if (messages.empty()) return;
+    if (messages.back().role != MessageRole::Assistant) return;
+
+    Message m;
+    m.role = MessageRole::User;
+    m.content = "Continue with the next response based on the latest context.";
+    m.timestamp_ms = util::now_ms();
+    messages.push_back(std::move(m));
+}
 
 } // namespace
 
@@ -258,6 +280,7 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     NodeInfo node;
     try { node = registry_.get_node(schedule_result->node_id); }
     catch (const std::exception& e) {
+        scheduler_.mark_agent_idle(agent_id);
         MM_WARN("handle_chat: node '{}' disappeared after routing: {}",
                 schedule_result->node_id, e.what());
         done_cb(conv_id, false, std::string("node lookup failed: ") + e.what());
@@ -273,7 +296,7 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     // 5. Real LLM client routed through the node API.
     //    (llama-server is bound to localhost on the node machine; control
     //     cannot reach it directly — all LLM calls go via /api/node/infer.)
-    NodeProxyLlamaClient real_llama(node.url, node.api_key);
+    NodeProxyLlamaClient real_llama(node.url, node.api_key, active_slot_id);
 
     // 6. Compact the conversation if it is approaching context limits.
     //    may_compact() creates a new conversation with a summary if >80% full.
@@ -298,6 +321,7 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     std::string final_thinking_content;
     int         final_total_tokens = 0;
     const int64_t infer_start_ms = util::now_ms();
+    bool        force_prefill_safe = false;
 
     for (int tool_round = 0; tool_round < kMaxToolRounds; ++tool_round) {
         // Build context fresh each round (local memories may have changed)
@@ -335,12 +359,20 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
         HttpClient node_cli(node.url);
         node_cli.set_bearer_token(node.api_key);
 
-        nlohmann::json infer_body = nlohmann::json(infer_req);
-        infer_body["slot_id"] = active_slot_id;
+        auto reset_infer_state = [&]() {
+            assistant_content.clear();
+            thinking_content.clear();
+            total_tokens = 0;
+            finish_reason.clear();
+            infer_done_seen = false;
+            stream_had_error = false;
+            stream_error_message.clear();
+            infer_http_status = 0;
+            infer_http_body.clear();
+            accumulated_tool_calls.clear();
+        };
 
-        bool stream_ok = node_cli.stream_post("/api/node/infer",
-            infer_body,
-            [&](const std::string& data) -> bool {
+        auto stream_cb = [&](const std::string& data) -> bool {
                 if (data == "[DONE]") return true;
                 try {
                     auto j = nlohmann::json::parse(data);
@@ -374,19 +406,34 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
                     MM_WARN("handle_chat: SSE parse error: {}", e.what());
                 }
                 return true;
-            },
-            &infer_http_status,
-            &infer_http_body);
+        };
 
-        // Handle stream errors
-        if (!stream_ok) {
-            if (infer_done_seen && !stream_had_error) {
-                MM_WARN("handle_chat: node infer transport ended non-successfully after done event;"
-                        " accepting completion (agent='{}', conv='{}')",
-                        agent_id, conv_id);
-                stream_ok = true;
-            } else {
-                if (infer_http_status > 0) {
+        auto run_infer_once = [&](bool stream_mode) -> bool {
+            InferenceRequest req_to_send = infer_req;
+            req_to_send.stream = stream_mode;
+            if (force_prefill_safe) {
+                enforce_prefill_safe_tail(req_to_send.messages);
+            }
+            nlohmann::json infer_body = nlohmann::json(req_to_send);
+            infer_body["slot_id"] = active_slot_id;
+            return node_cli.stream_post(
+                "/api/node/infer",
+                infer_body,
+                stream_cb,
+                &infer_http_status,
+                &infer_http_body
+            );
+        };
+
+        auto finalize_attempt = [&](bool transport_ok) -> bool {
+            bool ok_now = transport_ok;
+            if (!ok_now) {
+                if (infer_done_seen && !stream_had_error) {
+                    MM_WARN("handle_chat: node infer transport ended non-successfully after done event;"
+                            " accepting completion (agent='{}', conv='{}')",
+                            agent_id, conv_id);
+                    ok_now = true;
+                } else if (infer_http_status > 0) {
                     std::string body = util::trim(infer_http_body);
                     if (body.size() > 400) body = body.substr(0, 400) + "...";
                     failure_reason = "node infer failed (HTTP " + std::to_string(infer_http_status) + ")";
@@ -395,13 +442,46 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
                     failure_reason = "node infer stream failed (connection error or non-2xx)";
                 }
             }
+            if (stream_had_error) {
+                ok_now = false;
+                MM_WARN("handle_chat: node infer stream error for agent '{}': {}",
+                        agent_id, stream_error_message);
+                failure_reason = stream_error_message.empty()
+                    ? "node reported infer stream error" : stream_error_message;
+            }
+            return ok_now;
+        };
+
+        static constexpr int kMaxStreamAttempts = 3;
+        bool stream_ok = false;
+        for (int attempt = 1; attempt <= kMaxStreamAttempts; ++attempt) {
+            reset_infer_state();
+            const bool transport_ok = run_infer_once(true);
+            stream_ok = finalize_attempt(transport_ok);
+            if (stream_ok) break;
+
+            if (contains_prefill_thinking_incompatibility(failure_reason)
+                || contains_prefill_thinking_incompatibility(infer_http_body)
+                || contains_prefill_thinking_incompatibility(stream_error_message)) {
+                force_prefill_safe = true;
+            }
+
+            if (attempt < kMaxStreamAttempts) {
+                const int backoff_ms = 250 * attempt;
+                MM_WARN("handle_chat: retrying stream infer for agent '{}' in {} ms (attempt {}/{})",
+                        agent_id, backoff_ms, attempt + 1, kMaxStreamAttempts);
+                std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+            }
         }
-        if (stream_had_error) {
-            stream_ok = false;
-            MM_WARN("handle_chat: node infer stream error for agent '{}': {}",
-                    agent_id, stream_error_message);
-            failure_reason = stream_error_message.empty()
-                ? "node reported infer stream error" : stream_error_message;
+
+        if (!stream_ok) {
+            reset_infer_state();
+            const bool non_stream_transport_ok = run_infer_once(false);
+            const bool non_stream_ok = finalize_attempt(non_stream_transport_ok);
+            if (non_stream_ok) {
+                MM_WARN("handle_chat: recovered with non-stream infer fallback (agent='{}')", agent_id);
+                stream_ok = true;
+            }
         }
 
         if (!stream_ok) {
@@ -610,7 +690,7 @@ void ControlApiServer::queue_global_recall(const AgentId& agent_id,
         recall_ctx.push_back(recall_prompt);
 
         // Run tool call loop (internal, not streamed to client)
-        NodeProxyLlamaClient recall_llama(ni.url, ni.api_key);
+        NodeProxyLlamaClient recall_llama(ni.url, ni.api_key, sched_result->slot_id);
         static constexpr int kMaxRecallRounds = 5;
 
         for (int round = 0; round < kMaxRecallRounds; ++round) {
@@ -727,7 +807,19 @@ void ControlApiServer::register_routes() {
     server_->Get("/v1/agents", [this](const Request& /*req*/, Response& res) {
         auto configs = agents_.list_agents();
         nlohmann::json arr = nlohmann::json::array();
-        for (auto& c : configs) arr.push_back(nlohmann::json(c));
+        for (auto& c : configs) {
+            nlohmann::json j = c;
+            auto placement = scheduler_.get_placement(c.id);
+            if (placement) {
+                j["placement"] = *placement;
+                j["status"] = placement->suspended
+                    ? "suspended"
+                    : (placement->is_active ? "active" : "idle");
+            } else {
+                j["status"] = "unplaced";
+            }
+            arr.push_back(std::move(j));
+        }
         res.set_content(arr.dump(), "application/json");
     });
 
@@ -771,7 +863,14 @@ void ControlApiServer::register_routes() {
         nlohmann::json j = cfg;
         // Include placement info if available.
         auto placement = scheduler_.get_placement(id);
-        if (placement) j["placement"] = *placement;
+        if (placement) {
+            j["placement"] = *placement;
+            j["status"] = placement->suspended
+                ? "suspended"
+                : (placement->is_active ? "active" : "idle");
+        } else {
+            j["status"] = "unplaced";
+        }
         j["node_compatibility"] = compute_node_compat(cfg);
         res.set_content(j.dump(), "application/json");
     });
@@ -1068,7 +1167,7 @@ void ControlApiServer::register_routes() {
 
         try {
             NodeInfo node = registry_.get_node(sched_result->node_id);
-            NodeProxyLlamaClient real_llama(node.url, node.api_key);
+            NodeProxyLlamaClient real_llama(node.url, node.api_key, sched_result->slot_id);
             ConversationManager conv_mgr(a->db(), real_llama);
             ConvId new_id = conv_mgr.force_compact(cid, cfg);
             mark_idle();
@@ -1194,7 +1293,7 @@ void ControlApiServer::register_routes() {
 
                 try {
                     NodeInfo node = registry_.get_node(sched_result->node_id);
-                    NodeProxyLlamaClient ext_llama(node.url, node.api_key);
+                    NodeProxyLlamaClient ext_llama(node.url, node.api_key, sched_result->slot_id);
                     MemoryManager mem_mgr(a_local->db(), ext_llama);
                     mem_mgr.extract_and_store_memories_from_messages(conv_id, selected, cfg);
                     mark_idle();

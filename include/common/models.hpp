@@ -212,6 +212,13 @@ struct NodeInfo {
     std::vector<StoredModel> stored_models;
     int64_t                  disk_free_mb = 0;
     int                      max_slots    = 1;
+    int                      slot_in_use = 0;
+    int                      slot_available = 0;
+    int                      slot_ready = 0;
+    int                      slot_loading = 0;
+    int                      slot_suspending = 0;
+    int                      slot_suspended = 0;
+    int                      slot_error = 0;
     std::string              llama_server_path;
 
     // Node-managed llama.cpp updater status
@@ -623,6 +630,13 @@ inline void to_json(nlohmann::json& j, const NodeInfo& n) {
           {"stored_models", n.stored_models},
           {"disk_free_mb",  n.disk_free_mb},
           {"max_slots",     n.max_slots},
+          {"slot_in_use",   n.slot_in_use},
+          {"slot_available", n.slot_available},
+          {"slot_ready",    n.slot_ready},
+          {"slot_loading",  n.slot_loading},
+          {"slot_suspending", n.slot_suspending},
+          {"slot_suspended", n.slot_suspended},
+          {"slot_error",    n.slot_error},
           {"llama_server_path",        n.llama_server_path},
           {"llama_update_running",     n.llama_update_running},
           {"llama_update_status",      n.llama_update_status},
@@ -654,6 +668,13 @@ inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     if (j.contains("stored_models")) j.at("stored_models").get_to(n.stored_models);
     if (j.contains("disk_free_mb"))  j.at("disk_free_mb").get_to(n.disk_free_mb);
     if (j.contains("max_slots"))     j.at("max_slots").get_to(n.max_slots);
+    if (j.contains("slot_in_use"))   j.at("slot_in_use").get_to(n.slot_in_use);
+    if (j.contains("slot_available")) j.at("slot_available").get_to(n.slot_available);
+    if (j.contains("slot_ready"))    j.at("slot_ready").get_to(n.slot_ready);
+    if (j.contains("slot_loading"))  j.at("slot_loading").get_to(n.slot_loading);
+    if (j.contains("slot_suspending")) j.at("slot_suspending").get_to(n.slot_suspending);
+    if (j.contains("slot_suspended")) j.at("slot_suspended").get_to(n.slot_suspended);
+    if (j.contains("slot_error"))    j.at("slot_error").get_to(n.slot_error);
     if (j.contains("llama_server_path")) j.at("llama_server_path").get_to(n.llama_server_path);
     if (j.contains("llama_update_running"))     j.at("llama_update_running").get_to(n.llama_update_running);
     if (j.contains("llama_update_status"))      j.at("llama_update_status").get_to(n.llama_update_status);

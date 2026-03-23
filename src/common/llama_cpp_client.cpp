@@ -122,6 +122,16 @@ std::vector<Message> normalize_for_strict_chat_template(const std::vector<Messag
         out.insert(out.begin(), std::move(lead));
     }
 
+    // Avoid ending on an assistant turn. Some providers treat a trailing
+    // assistant message as response prefill and reject it when thinking mode
+    // is enabled.
+    if (!out.empty() && out.back().role == MessageRole::Assistant) {
+        Message tail;
+        tail.role = MessageRole::User;
+        tail.content = "Continue with the next response based on the latest context.";
+        out.push_back(std::move(tail));
+    }
+
     std::vector<Message> normalized;
     if (!system_context.empty()) {
         Message sys;
@@ -308,6 +318,21 @@ Message LlamaCppClient::complete(const InferenceRequest& req) {
         m.content      = msg.value("content", std::string{});
         m.token_count  = j.value("usage", nlohmann::json{}).value("completion_tokens", 0);
         m.timestamp_ms = util::now_ms();
+
+        if (msg.contains("tool_calls") && msg["tool_calls"].is_array()) {
+            for (const auto& tc : msg["tool_calls"]) {
+                ToolCall parsed;
+                parsed.id = tc.value("id", std::string{});
+                if (tc.contains("function") && tc["function"].is_object()) {
+                    const auto& fn = tc["function"];
+                    parsed.function_name = fn.value("name", std::string{});
+                    parsed.arguments_json = fn.value("arguments", std::string{});
+                }
+                if (!parsed.function_name.empty()) {
+                    m.tool_calls.push_back(std::move(parsed));
+                }
+            }
+        }
 
         // Strip thinking if present in non-streaming response
         std::string think_buf;

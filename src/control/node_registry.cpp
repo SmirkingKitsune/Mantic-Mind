@@ -80,7 +80,29 @@ void NodeRegistry::update_node_slots(const NodeId& id,
                                       const std::vector<SlotInfo>& slots) {
     std::lock_guard<std::mutex> g(mutex_);
     auto it = nodes_.find(id);
-    if (it != nodes_.end()) it->second.slots = slots;
+    if (it == nodes_.end()) return;
+
+    it->second.slots = slots;
+    it->second.slot_ready = 0;
+    it->second.slot_loading = 0;
+    it->second.slot_suspending = 0;
+    it->second.slot_suspended = 0;
+    it->second.slot_error = 0;
+    for (const auto& s : slots) {
+        switch (s.state) {
+            case SlotState::Ready:      ++it->second.slot_ready; break;
+            case SlotState::Loading:    ++it->second.slot_loading; break;
+            case SlotState::Suspending: ++it->second.slot_suspending; break;
+            case SlotState::Suspended:  ++it->second.slot_suspended; break;
+            case SlotState::Error:      ++it->second.slot_error; break;
+            case SlotState::Empty:
+            default:
+                break;
+        }
+    }
+    it->second.slot_in_use = it->second.slot_ready + it->second.slot_loading
+                           + it->second.slot_suspending + it->second.slot_error;
+    it->second.slot_available = std::max(0, it->second.max_slots - it->second.slot_in_use);
 }
 
 void NodeRegistry::update_node_storage(const NodeId& id,
@@ -425,6 +447,20 @@ bool NodeRegistry::ping_node(NodeInfo& info) {
                 info.disk_free_mb = sj["disk_free_mb"].get<int64_t>();
             if (sj.contains("max_slots"))
                 info.max_slots = sj["max_slots"].get<int>();
+            if (sj.contains("slot_in_use"))
+                info.slot_in_use = sj["slot_in_use"].get<int>();
+            if (sj.contains("slot_available"))
+                info.slot_available = sj["slot_available"].get<int>();
+            if (sj.contains("slot_ready"))
+                info.slot_ready = sj["slot_ready"].get<int>();
+            if (sj.contains("slot_loading"))
+                info.slot_loading = sj["slot_loading"].get<int>();
+            if (sj.contains("slot_suspending"))
+                info.slot_suspending = sj["slot_suspending"].get<int>();
+            if (sj.contains("slot_suspended"))
+                info.slot_suspended = sj["slot_suspended"].get<int>();
+            if (sj.contains("slot_error"))
+                info.slot_error = sj["slot_error"].get<int>();
             if (sj.contains("llama_server_path"))
                 info.llama_server_path = sj["llama_server_path"].get<std::string>();
             if (sj.contains("llama_update_running"))
@@ -459,6 +495,30 @@ bool NodeRegistry::ping_node(NodeInfo& info) {
                 info.llama_update_reason = sj["llama_update_reason"].get<std::string>();
             if (sj.contains("llama_update_log_path"))
                 info.llama_update_log_path = sj["llama_update_log_path"].get<std::string>();
+
+            // Backfill occupancy counts when a node returns only raw slots.
+            if (!sj.contains("slot_in_use")) {
+                info.slot_ready = 0;
+                info.slot_loading = 0;
+                info.slot_suspending = 0;
+                info.slot_suspended = 0;
+                info.slot_error = 0;
+                for (const auto& s : info.slots) {
+                    switch (s.state) {
+                        case SlotState::Ready:      ++info.slot_ready; break;
+                        case SlotState::Loading:    ++info.slot_loading; break;
+                        case SlotState::Suspending: ++info.slot_suspending; break;
+                        case SlotState::Suspended:  ++info.slot_suspended; break;
+                        case SlotState::Error:      ++info.slot_error; break;
+                        case SlotState::Empty:
+                        default:
+                            break;
+                    }
+                }
+                info.slot_in_use = info.slot_ready + info.slot_loading
+                                 + info.slot_suspending + info.slot_error;
+                info.slot_available = std::max(0, info.max_slots - info.slot_in_use);
+            }
         } catch (const std::exception& e) {
             MM_WARN("NodeRegistry: status parse error for {}: {}", info.id, e.what());
         }
@@ -528,6 +588,13 @@ void NodeRegistry::poll_all_nodes() {
                 it->second.stored_models = info.stored_models;
                 it->second.disk_free_mb  = info.disk_free_mb;
                 it->second.max_slots     = info.max_slots;
+                it->second.slot_in_use   = info.slot_in_use;
+                it->second.slot_available = info.slot_available;
+                it->second.slot_ready    = info.slot_ready;
+                it->second.slot_loading  = info.slot_loading;
+                it->second.slot_suspending = info.slot_suspending;
+                it->second.slot_suspended = info.slot_suspended;
+                it->second.slot_error    = info.slot_error;
                 it->second.llama_server_path = info.llama_server_path;
                 it->second.llama_update_running     = info.llama_update_running;
                 it->second.llama_update_status      = info.llama_update_status;

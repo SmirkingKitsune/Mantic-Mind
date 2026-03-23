@@ -118,6 +118,7 @@ void NodeUI::run() {
         auto metrics      = state_.get_metrics();
         auto loaded_model = state_.get_loaded_model();
         auto active_agent = state_.get_active_agent();
+        auto slots        = state_.get_slots();
         auto node_id      = state_.get_node_id();
         auto last_error   = state_.get_last_error();
         auto upd          = state_.get_llama_update_state();
@@ -283,17 +284,74 @@ void NodeUI::run() {
         }
 
         // ── Connected state ───────────────────────────────────────────────────
+        int slot_ready = 0;
+        int slot_loading = 0;
+        int slot_suspending = 0;
+        int slot_suspended = 0;
+        int slot_error = 0;
+        for (const auto& s : slots) {
+            switch (s.state) {
+                case SlotState::Ready:      ++slot_ready; break;
+                case SlotState::Loading:    ++slot_loading; break;
+                case SlotState::Suspending: ++slot_suspending; break;
+                case SlotState::Suspended:  ++slot_suspended; break;
+                case SlotState::Error:      ++slot_error; break;
+                case SlotState::Empty:
+                default:
+                    break;
+            }
+        }
+        const int slot_in_use = slot_ready + slot_loading + slot_suspending + slot_error;
+
+        auto compact_id = [](const std::string& s, size_t n = 8) -> std::string {
+            if (s.empty()) return "-";
+            return s.size() <= n ? s : s.substr(0, n);
+        };
+        auto compact_model = [](const std::string& p) -> std::string {
+            if (p.empty()) return "(none)";
+            std::string name = std::filesystem::path(p).filename().string();
+            if (name.empty()) name = p;
+            if (name.size() > 26) name = name.substr(0, 26) + "...";
+            return name;
+        };
+
         // Status panel
-        auto status_panel = vbox({
+        Elements status_rows = {
             text("Status") | bold | underlined,
             text(""),
             hbox({text("Model    "), text(loaded_model.empty() ? "(none)" : loaded_model) | bold}),
             hbox({text("Agent    "), text(active_agent.empty() ? "(none)" : active_agent) | bold}),
+            hbox({text("Slots    "),
+                  text(std::to_string(slot_in_use) + " active  (ready " + std::to_string(slot_ready)
+                       + ", loading " + std::to_string(slot_loading)
+                       + ", suspended " + std::to_string(slot_suspended) + ")")
+                      | bold}),
             hbox({
                 text("Runtime  "),
                 paragraph(runtime_summary) | color(runtime_color) | flex,
             }),
-        }) | flex;
+        };
+        if (!slots.empty()) {
+            status_rows.push_back(text(" "));
+            status_rows.push_back(text("Slots Detail") | color(Color::GrayDark));
+            constexpr size_t kMaxSlotLines = 4;
+            size_t shown = 0;
+            for (const auto& s : slots) {
+                if (shown >= kMaxSlotLines) break;
+                status_rows.push_back(
+                    text("  [" + to_string(s.state) + "] slot:" + compact_id(s.id, 10) +
+                         " agent:" + compact_id(s.assigned_agent, 12) +
+                         " model:" + compact_model(s.model_path))
+                    | color(Color::GrayDark));
+                ++shown;
+            }
+            if (slots.size() > shown) {
+                status_rows.push_back(
+                    text("  ... +" + std::to_string(slots.size() - shown) + " more")
+                    | color(Color::GrayDark));
+            }
+        }
+        auto status_panel = vbox(std::move(status_rows)) | flex;
 
         // Health panel
         auto health_panel = vbox({

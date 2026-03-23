@@ -127,6 +127,27 @@ void NodeApiServer::register_routes() {
         }
         auto slots = slot_mgr_.get_slot_info();
         auto stored = model_storage_.list_models();
+        const int max_slots = static_cast<int>(slot_mgr_.max_slots());
+
+        int ready_slots = 0;
+        int loading_slots = 0;
+        int suspending_slots = 0;
+        int suspended_slots = 0;
+        int error_slots = 0;
+        for (const auto& s : slots) {
+            switch (s.state) {
+                case SlotState::Ready:      ++ready_slots; break;
+                case SlotState::Loading:    ++loading_slots; break;
+                case SlotState::Suspending: ++suspending_slots; break;
+                case SlotState::Suspended:  ++suspended_slots; break;
+                case SlotState::Error:      ++error_slots; break;
+                case SlotState::Empty:
+                default:
+                    break;
+            }
+        }
+        const int in_use_slots = ready_slots + loading_slots + suspending_slots + error_slots;
+        const int available_slots = std::max(0, max_slots - in_use_slots);
 
         nlohmann::json j;
         j["node_id"]       = state_.get_node_id();
@@ -134,7 +155,14 @@ void NodeApiServer::register_routes() {
         j["stored_models"] = stored;
         j["disk_free_mb"]  = model_storage_.free_space_mb();
         j["health"]        = state_.get_metrics();
-        j["max_slots"]     = static_cast<int>(slot_mgr_.max_slots());
+        j["max_slots"]     = max_slots;
+        j["slot_in_use"]   = in_use_slots;
+        j["slot_available"] = available_slots;
+        j["slot_ready"]    = ready_slots;
+        j["slot_loading"]  = loading_slots;
+        j["slot_suspending"] = suspending_slots;
+        j["slot_suspended"] = suspended_slots;
+        j["slot_error"]    = error_slots;
         j["llama_server_path"] = slot_mgr_.llama_server_path();
         j["llama_server_path_state"] = state_.get_llama_server_path();
 
@@ -158,15 +186,18 @@ void NodeApiServer::register_routes() {
         j["llama_update_reason"]     = rt.update_reason;
         j["llama_update_log_path"]   = rt.last_log_path;
 
-        // Backwards compat: set loaded_model from first ready slot
+        // Backwards compat: set single-model fields from first ready slot.
         std::string first_model;
+        std::string first_agent;
         for (const auto& s : slots) {
             if (s.state == SlotState::Ready) {
                 first_model = s.model_path;
+                first_agent = s.assigned_agent;
                 break;
             }
         }
         j["loaded_model"]  = first_model;
+        j["active_agent"]  = first_agent;
 
         res.set_content(j.dump(), "application/json");
     });
@@ -330,6 +361,7 @@ void NodeApiServer::register_routes() {
                 auto slots_info = slot_mgr_.get_slot_info();
                 state_.set_slots(slots_info);
                 state_.set_loaded_model(model_path);
+                if (!agent_id.empty()) state_.set_active_agent(agent_id);
                 state_.set_last_error("");
 
                 // Find the effective_ctx_size for the newly loaded slot.
@@ -438,6 +470,8 @@ void NodeApiServer::register_routes() {
                 if (!detail.empty()) err["detail"] = detail;
                 res.set_content(err.dump(), "application/json");
             } else {
+                state_.set_loaded_model(model_path);
+                if (!agent_id.empty()) state_.set_active_agent(agent_id);
                 state_.set_last_error("");
                 res.set_content(
                     nlohmann::json{{"status","restored"},{"slot_id", slot_id}}.dump(),
@@ -632,19 +666,24 @@ void NodeApiServer::register_routes() {
             return;
         }
 
-        // Find the right LlamaCppClient
-        LlamaCppClient* client = nullptr;
-        if (!slot_id.empty()) {
-            client = slot_mgr_.get_client(slot_id);
-        } else {
-            // Backwards compat: use first ready slot
-            auto slots = slot_mgr_.get_slot_info();
+        auto slots = slot_mgr_.get_slot_info();
+
+        // Resolve selected slot.
+        std::string selected_slot_id = slot_id;
+        if (selected_slot_id.empty()) {
+            // Backwards compat: use first ready slot.
             for (const auto& s : slots) {
                 if (s.state == SlotState::Ready) {
-                    client = slot_mgr_.get_client(s.id);
+                    selected_slot_id = s.id;
                     break;
                 }
             }
+        }
+
+        // Find the right LlamaCppClient.
+        LlamaCppClient* client = nullptr;
+        if (!selected_slot_id.empty()) {
+            client = slot_mgr_.get_client(selected_slot_id);
         }
 
         if (!client) {
@@ -656,18 +695,21 @@ void NodeApiServer::register_routes() {
         // Shared context between LLM worker and SSE provider
         auto ctx = std::make_shared<SseInferCtx>();
 
-        // Look up agent for this slot and start streaming text tracking
-        {
-            std::string agent_for_slot;
-            auto slots = slot_mgr_.get_slot_info();
-            for (const auto& s : slots) {
-                if (s.id == slot_id) {
-                    agent_for_slot = s.assigned_agent;
-                    break;
-                }
+        // Look up agent for this slot and start streaming text tracking.
+        std::string agent_for_slot;
+        std::string model_for_slot;
+        for (const auto& s : slots) {
+            if (s.id == selected_slot_id) {
+                agent_for_slot = s.assigned_agent;
+                model_for_slot = s.model_path;
+                break;
             }
-            state_.start_streaming_text(slot_id, agent_for_slot);
         }
+        slot_mgr_.touch_slot(selected_slot_id);
+        state_.set_slots(slot_mgr_.get_slot_info());
+        if (!model_for_slot.empty()) state_.set_loaded_model(model_for_slot);
+        state_.start_streaming_text(selected_slot_id, agent_for_slot);
+        if (!agent_for_slot.empty()) state_.set_active_agent(agent_for_slot);
 
         // Fire the LLM call on a background thread
         std::thread([this, client, infer_req, ctx]() {
@@ -679,44 +721,86 @@ void NodeApiServer::register_routes() {
             };
 
             try {
-                client->stream_complete(infer_req,
-                    [this, emit_line](const InferenceChunk& c) {
-                        nlohmann::json j;
-                        if (!c.thinking_delta.empty()) {
-                            j = {{"type","thinking"},{"content", c.thinking_delta}};
-                            state_.append_streaming_text("", c.thinking_delta);
-                        } else if (!c.delta_content.empty()) {
-                            j = {{"type","delta"},{"content", c.delta_content}};
-                            state_.append_streaming_text(c.delta_content, "");
-                        } else if (c.tool_call_delta) {
-                            auto& tc = *c.tool_call_delta;
-                            j = {{"type","tool_call"},{"name", tc.function_name},
-                                 {"arguments", tc.arguments_json}};
-                        } else if (c.is_done) {
-                            j = {{"type","done"},
-                                 {"tokens_used", c.tokens_used},
-                                 {"finish_reason", c.finish_reason}};
-                            state_.finish_streaming_text(c.finish_reason, c.tokens_used);
-                        }
-                        if (!j.is_null()) {
-                            emit_line("data: " + safe_json_dump(j) + "\n\n", c.is_done);
-                        } else if (c.is_done) {
+                if (infer_req.stream) {
+                    client->stream_complete(infer_req,
+                        [this, emit_line](const InferenceChunk& c) {
+                            nlohmann::json j;
+                            if (!c.thinking_delta.empty()) {
+                                j = {{"type","thinking"},{"content", c.thinking_delta}};
+                                state_.append_streaming_text("", c.thinking_delta);
+                            } else if (!c.delta_content.empty()) {
+                                j = {{"type","delta"},{"content", c.delta_content}};
+                                state_.append_streaming_text(c.delta_content, "");
+                            } else if (c.tool_call_delta) {
+                                auto& tc = *c.tool_call_delta;
+                                j = {{"type","tool_call"},{"name", tc.function_name},
+                                     {"arguments", tc.arguments_json}};
+                            } else if (c.is_done) {
+                                j = {{"type","done"},
+                                     {"tokens_used", c.tokens_used},
+                                     {"finish_reason", c.finish_reason}};
+                                state_.finish_streaming_text(c.finish_reason, c.tokens_used);
+                            }
+                            if (!j.is_null()) {
+                                emit_line("data: " + safe_json_dump(j) + "\n\n", c.is_done);
+                            } else if (c.is_done) {
+                                emit_line("data: " + safe_json_dump(nlohmann::json{
+                                    {"type", "done"},
+                                    {"tokens_used", c.tokens_used},
+                                    {"finish_reason", c.finish_reason}
+                                }) + "\n\n", true);
+                                state_.finish_streaming_text(c.finish_reason, c.tokens_used);
+                            }
+                        },
+                        [this, emit_line](const std::string& err) {
+                            state_.finish_streaming_text("error", 0);
                             emit_line("data: " + safe_json_dump(nlohmann::json{
-                                {"type", "done"},
-                                {"tokens_used", c.tokens_used},
-                                {"finish_reason", c.finish_reason}
+                                {"type","error"},
+                                {"message", err}
                             }) + "\n\n", true);
-                            state_.finish_streaming_text(c.finish_reason, c.tokens_used);
                         }
-                    },
-                    [this, emit_line](const std::string& err) {
+                    );
+                } else {
+                    Message full = client->complete(infer_req);
+                    if (full.role != MessageRole::Assistant) {
                         state_.finish_streaming_text("error", 0);
                         emit_line("data: " + safe_json_dump(nlohmann::json{
-                            {"type","error"},
-                            {"message", err}
+                            {"type", "error"},
+                            {"message", "non-stream inference failed"}
                         }) + "\n\n", true);
+                        return;
                     }
-                );
+                    if (!full.thinking_text.empty()) {
+                        state_.append_streaming_text("", full.thinking_text);
+                        emit_line("data: " + safe_json_dump(nlohmann::json{
+                            {"type", "thinking"},
+                            {"content", full.thinking_text}
+                        }) + "\n\n", false);
+                    }
+                    if (!full.content.empty()) {
+                        state_.append_streaming_text(full.content, "");
+                        emit_line("data: " + safe_json_dump(nlohmann::json{
+                            {"type", "delta"},
+                            {"content", full.content}
+                        }) + "\n\n", false);
+                    }
+                    for (const auto& tc : full.tool_calls) {
+                        emit_line("data: " + safe_json_dump(nlohmann::json{
+                            {"type", "tool_call"},
+                            {"name", tc.function_name},
+                            {"arguments", tc.arguments_json}
+                        }) + "\n\n", false);
+                    }
+                    const std::string finish_reason = full.content.empty() && full.tool_calls.empty()
+                        ? "empty"
+                        : "stop";
+                    state_.finish_streaming_text(finish_reason, full.token_count);
+                    emit_line("data: " + safe_json_dump(nlohmann::json{
+                        {"type", "done"},
+                        {"tokens_used", full.token_count},
+                        {"finish_reason", finish_reason}
+                    }) + "\n\n", true);
+                }
             } catch (const std::exception& e) {
                 MM_ERROR("NodeApiServer infer worker exception: {}", e.what());
                 state_.set_last_error(std::string("infer worker exception: ") + e.what());

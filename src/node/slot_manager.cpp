@@ -343,6 +343,17 @@ LlamaCppClient* SlotManager::get_client(const SlotId& slot_id) {
     return nullptr;
 }
 
+bool SlotManager::touch_slot(const SlotId& slot_id) {
+    std::lock_guard lock(mutex_);
+    for (auto& s : slots_) {
+        if (s->id == slot_id) {
+            s->last_active_ms = util::now_ms();
+            return true;
+        }
+    }
+    return false;
+}
+
 std::vector<SlotInfo> SlotManager::get_slot_info() const {
     std::lock_guard lock(mutex_);
     std::vector<SlotInfo> result;

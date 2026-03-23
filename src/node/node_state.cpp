@@ -54,7 +54,20 @@ void NodeState::set_active_agent(const std::string& a) { std::lock_guard<std::mu
 
 // ── Multi-slot tracking ──────────────────────────────────────────────────────
 std::vector<SlotInfo> NodeState::get_slots() const { std::lock_guard<std::mutex> g(mutex_); return slots_; }
-void NodeState::set_slots(const std::vector<SlotInfo>& slots) { std::lock_guard<std::mutex> g(mutex_); slots_ = slots; }
+void NodeState::set_slots(const std::vector<SlotInfo>& slots) {
+    std::lock_guard<std::mutex> g(mutex_);
+    slots_ = slots;
+
+    // Keep legacy single-model/agent fields aligned with multi-slot state.
+    loaded_model_.clear();
+    active_agent_.clear();
+    for (const auto& s : slots_) {
+        if (s.state != SlotState::Ready) continue;
+        if (loaded_model_.empty()) loaded_model_ = s.model_path;
+        if (active_agent_.empty()) active_agent_ = s.assigned_agent;
+        if (!loaded_model_.empty() && !active_agent_.empty()) break;
+    }
+}
 
 // ── Metrics ────────────────────────────────────────────────────────────────────
 NodeHealthMetrics NodeState::get_metrics() const { std::lock_guard<std::mutex> g(mutex_); return metrics_; }

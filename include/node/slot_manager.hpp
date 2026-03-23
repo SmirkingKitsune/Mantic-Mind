@@ -62,6 +62,9 @@ public:
     /// Get the LlamaCppClient for a specific slot (for inference).
     LlamaCppClient* get_client(const SlotId& slot_id);
 
+    /// Update last-active timestamp for a slot when it is selected for work.
+    bool touch_slot(const SlotId& slot_id);
+
     /// Get info for all slots.
     std::vector<SlotInfo> get_slot_info() const;
 
