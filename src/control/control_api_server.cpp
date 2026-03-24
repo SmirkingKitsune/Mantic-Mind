@@ -779,7 +779,7 @@ void ControlApiServer::register_routes() {
         return auth_header.substr(kBearer.size());
     };
 
-    auto require_node_auth = [this, &extract_bearer](const Request& req, Response& res) -> bool {
+    auto require_node_auth = [this, extract_bearer](const Request& req, Response& res) -> bool {
         const std::string token = extract_bearer(req.get_header_value("Authorization"));
         if (token.empty()) {
             res.status = 401;
@@ -878,7 +878,7 @@ void ControlApiServer::register_routes() {
 
     // ── GET /v1/nodes ─────────────────────────────────────────────────────────
     // ── GET /api/control/models  (node-authenticated) ─────────────────────────
-    server_->Get("/api/control/models", [this, &require_node_auth, &build_control_catalog](const Request& req, Response& res) {
+    server_->Get("/api/control/models", [this, require_node_auth, build_control_catalog](const Request& req, Response& res) {
         if (!require_node_auth(req, res)) return;
         auto catalog = build_control_catalog();
         res.set_content(nlohmann::json{{"models", catalog.models}}.dump(), "application/json");
@@ -886,7 +886,7 @@ void ControlApiServer::register_routes() {
 
     // ── GET /api/control/models/:filename/content  (node-authenticated) ───────
     server_->Get("/api/control/models/:filename/content",
-                 [this, &require_node_auth, &build_control_catalog](const Request& req, Response& res) {
+                 [this, require_node_auth, build_control_catalog](const Request& req, Response& res) {
         if (!require_node_auth(req, res)) return;
 
         std::string filename = canonical_model_filename(req.path_params.at("filename"));
@@ -942,7 +942,7 @@ void ControlApiServer::register_routes() {
 
     // ── GET /v1/agents ────────────────────────────────────────────────────────
     // ── GET /v1/models ────────────────────────────────────────────────────────
-    server_->Get("/v1/models", [this, &build_control_catalog](const Request& /*req*/, Response& res) {
+    server_->Get("/v1/models", [this, build_control_catalog](const Request& /*req*/, Response& res) {
         auto catalog = build_control_catalog();
         res.set_content(nlohmann::json{{"models", catalog.models}}.dump(), "application/json");
     });
