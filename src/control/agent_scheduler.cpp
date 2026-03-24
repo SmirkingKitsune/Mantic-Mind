@@ -124,26 +124,13 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         }
     }
 
-    // 3c. Any node has VRAM → distribute model, then load.
+    // 3c. Any node has VRAM -> try load (node can auto-pull), then push fallback.
     auto vram_nodes = registry_.nodes_with_available_vram(vram_needed);
     for (const auto& node : vram_nodes) {
         // Check if model is on this node already.
         bool has_model = false;
         for (const auto& m : node.stored_models) {
             if (m.model_path == model_filename) { has_model = true; break; }
-        }
-
-        if (!has_model) {
-            // For local nodes, we can pass the path directly.
-            if (!is_local_node(node.url)) {
-                MM_INFO("AgentScheduler: distributing model {} to node {}",
-                        model_filename, node.id);
-                if (!distributor_.upload_model(node.id, model_filename)) {
-                    MM_WARN("AgentScheduler: model upload failed for node {}",
-                            node.id);
-                    continue;
-                }
-            }
         }
 
         auto slot_id = load_agent_on_node(cfg, node.id);
@@ -156,6 +143,28 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
             p.last_active_ms = p.placed_at_ms;
             placements_[cfg.id] = p;
             return ScheduleResult{node.id, *slot_id};
+        }
+
+        // Fallback path: if remote and model wasn't present, try control push then retry load.
+        if (!has_model && !is_local_node(node.url)) {
+            MM_INFO("AgentScheduler: load failed on node {}; trying distributor push fallback for {}",
+                    node.id, model_filename);
+            if (distributor_.upload_model(node.id, model_filename)) {
+                slot_id = load_agent_on_node(cfg, node.id);
+                if (slot_id) {
+                    AgentPlacement p;
+                    p.agent_id       = cfg.id;
+                    p.node_id        = node.id;
+                    p.slot_id        = *slot_id;
+                    p.placed_at_ms   = util::now_ms();
+                    p.last_active_ms = p.placed_at_ms;
+                    placements_[cfg.id] = p;
+                    return ScheduleResult{node.id, *slot_id};
+                }
+            } else {
+                MM_WARN("AgentScheduler: model distributor fallback failed for node {}",
+                        node.id);
+            }
         }
     }
 
@@ -376,8 +385,9 @@ std::optional<SlotId> AgentScheduler::restore_agent_on_node(
         const std::string model_filename = canonical_model_filename(cfg.model_path);
         std::string model_ref = model_filename;
         if (is_local_node(node.url)) {
-            auto local_path = fs::path(models_dir_) / model_filename;
-            if (fs::exists(local_path)) model_ref = local_path.string();
+            const std::string local_path =
+                resolve_model_path_for_metadata(cfg.model_path, models_dir_);
+            if (!local_path.empty()) model_ref = local_path;
         }
         for (int attempt = 0; attempt < 3; ++attempt) {
             nlohmann::json body = {
@@ -438,9 +448,9 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
         // For local nodes, pass full local path when available; for remote, pass filename.
         std::string model_ref = model_filename;
         if (is_local_node(node.url)) {
-            auto local_path = fs::path(models_dir_) / model_filename;
-            if (fs::exists(local_path))
-                model_ref = local_path.string();
+            const std::string local_path =
+                resolve_model_path_for_metadata(cfg.model_path, models_dir_);
+            if (!local_path.empty()) model_ref = local_path;
         }
 
         // Warn about large ctx_size before sending the request.

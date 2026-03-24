@@ -255,14 +255,23 @@ void ControlUI::run() {
 
         control_catalog_filenames.clear();
         std::set<std::string> unique_names;
-        std::error_code ec;
-        if (!models_dir_.empty() && fs::exists(models_dir_, ec)) {
-            for (const auto& entry : fs::recursive_directory_iterator(models_dir_, ec)) {
-                if (!entry.is_regular_file()) continue;
-                std::string ext = util::to_lower(entry.path().extension().string());
-                if (ext != ".gguf") continue;
-                const std::string name = entry.path().filename().string();
-                if (is_safe_model_filename(name)) unique_names.insert(name);
+
+        HttpClient cli(control_base_url_);
+        auto resp = cli.get("/v1/models");
+        if (!resp.ok()) {
+            node_model_action_status = "control catalog refresh failed: " + parse_api_error(resp);
+        } else {
+            try {
+                auto j = nlohmann::json::parse(resp.body);
+                if (j.contains("models")) {
+                    auto models = j["models"].get<std::vector<StoredModel>>();
+                    for (const auto& m : models) {
+                        const std::string name = canonical_model_filename(m.model_path);
+                        if (is_safe_model_filename(name)) unique_names.insert(name);
+                    }
+                }
+            } catch (const std::exception& e) {
+                node_model_action_status = std::string("control catalog parse error: ") + e.what();
             }
         }
 

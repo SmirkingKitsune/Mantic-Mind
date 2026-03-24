@@ -23,9 +23,11 @@ std::vector<std::string> expand_model_shards(const std::string& filename);
 // List GGUF files under models_dir recursively with hashes/sizes/shard metadata.
 std::vector<StoredModel> list_models_in_dir(const std::string& models_dir);
 
+// Inspect one GGUF file path and return catalog metadata keyed by basename.
+std::optional<StoredModel> inspect_model_file(const std::string& model_file_path);
+
 // Lookup one model by canonical filename in models_dir.
 std::optional<StoredModel> find_model_in_dir(const std::string& models_dir,
                                              const std::string& filename);
 
 } // namespace mm
-
