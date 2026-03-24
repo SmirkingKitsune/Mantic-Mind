@@ -31,6 +31,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <unordered_map>
 
 namespace mm {
 
@@ -778,7 +779,7 @@ void ControlApiServer::register_routes() {
         return auth_header.substr(kBearer.size());
     };
 
-    auto require_node_auth = [this, &extract_bearer](const Request& req, Response& res) -> bool {
+    auto require_node_auth = [this, extract_bearer](const Request& req, Response& res) -> bool {
         const std::string token = extract_bearer(req.get_header_value("Authorization"));
         if (token.empty()) {
             res.status = 401;
@@ -791,6 +792,60 @@ void ControlApiServer::register_routes() {
             return false;
         }
         return true;
+    };
+
+    struct ControlCatalogSnapshot {
+        std::vector<StoredModel> models;
+        std::unordered_map<std::string, StoredModel> by_filename;
+        std::unordered_map<std::string, std::string> path_by_filename;
+    };
+
+    auto build_control_catalog = [this](bool include_hash) -> ControlCatalogSnapshot {
+        ControlCatalogSnapshot out;
+
+        auto add_file = [&](const std::string& file_path,
+                            const std::string& source_tag) {
+            auto meta = inspect_model_file(file_path, include_hash);
+            if (!meta) return;
+            const std::string filename = canonical_model_filename(meta->model_path);
+            if (!is_safe_model_filename(filename)) return;
+
+            auto pit = out.path_by_filename.find(filename);
+            if (pit != out.path_by_filename.end()) {
+                if (pit->second != file_path) {
+                    MM_WARN("Control catalog: duplicate filename '{}' from {}; keeping {}",
+                            filename, source_tag, pit->second);
+                }
+                return;
+            }
+
+            meta->model_path = filename;
+            out.path_by_filename[filename] = file_path;
+            out.by_filename[filename] = *meta;
+        };
+
+        std::error_code ec;
+        if (!models_dir_.empty() && std::filesystem::exists(models_dir_, ec)) {
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(models_dir_, ec)) {
+                if (!entry.is_regular_file()) continue;
+                add_file(entry.path().string(), "models_dir");
+            }
+        }
+
+        const auto agent_cfgs = agents_.list_agents();
+        for (const auto& cfg : agent_cfgs) {
+            const std::string resolved = resolve_model_path_for_metadata(cfg.model_path, models_dir_);
+            if (resolved.empty()) continue;
+            add_file(resolved, "agent:" + cfg.id);
+        }
+
+        out.models.reserve(out.by_filename.size());
+        for (const auto& [_, m] : out.by_filename) out.models.push_back(m);
+        std::sort(out.models.begin(), out.models.end(),
+                  [](const StoredModel& a, const StoredModel& b) {
+                      return a.model_path < b.model_path;
+                  });
+        return out;
     };
 
     // ── POST /api/control/register-node ───────────────────────────────────────
@@ -823,15 +878,15 @@ void ControlApiServer::register_routes() {
 
     // ── GET /v1/nodes ─────────────────────────────────────────────────────────
     // ── GET /api/control/models  (node-authenticated) ─────────────────────────
-    server_->Get("/api/control/models", [this, &require_node_auth](const Request& req, Response& res) {
+    server_->Get("/api/control/models", [this, require_node_auth, build_control_catalog](const Request& req, Response& res) {
         if (!require_node_auth(req, res)) return;
-        auto models = list_models_in_dir(models_dir_);
-        res.set_content(nlohmann::json{{"models", models}}.dump(), "application/json");
+        auto catalog = build_control_catalog(/*include_hash=*/true);
+        res.set_content(nlohmann::json{{"models", catalog.models}}.dump(), "application/json");
     });
 
     // ── GET /api/control/models/:filename/content  (node-authenticated) ───────
     server_->Get("/api/control/models/:filename/content",
-                 [this, &require_node_auth](const Request& req, Response& res) {
+                 [this, require_node_auth, build_control_catalog](const Request& req, Response& res) {
         if (!require_node_auth(req, res)) return;
 
         std::string filename = canonical_model_filename(req.path_params.at("filename"));
@@ -841,29 +896,21 @@ void ControlApiServer::register_routes() {
             return;
         }
 
-        auto meta = find_model_in_dir(models_dir_, filename);
-        if (!meta) {
+        auto catalog = build_control_catalog(/*include_hash=*/true);
+        auto mit = catalog.by_filename.find(filename);
+        if (mit == catalog.by_filename.end()) {
             res.status = 404;
             res.set_content(R"({"error":"model not found"})", "application/json");
             return;
         }
-
-        std::filesystem::path resolved_path;
-        std::error_code ec;
-        for (const auto& entry : std::filesystem::recursive_directory_iterator(models_dir_, ec)) {
-            if (!entry.is_regular_file()) continue;
-            if (entry.path().filename().string() == filename) {
-                resolved_path = entry.path();
-                break;
-            }
-        }
-        if (resolved_path.empty()) {
+        auto pit = catalog.path_by_filename.find(filename);
+        if (pit == catalog.path_by_filename.end()) {
             res.status = 404;
             res.set_content(R"({"error":"model file path could not be resolved"})", "application/json");
             return;
         }
 
-        auto file = std::make_shared<std::ifstream>(resolved_path.string(), std::ios::binary);
+        auto file = std::make_shared<std::ifstream>(pit->second, std::ios::binary);
         if (!file->is_open()) {
             res.status = 404;
             res.set_content(R"({"error":"model file could not be opened"})", "application/json");
@@ -871,8 +918,8 @@ void ControlApiServer::register_routes() {
         }
 
         res.set_header("X-Model-Filename", filename);
-        res.set_header("X-Model-SHA256", meta->sha256);
-        res.set_header("X-Model-Size-Bytes", std::to_string(meta->size_bytes));
+        res.set_header("X-Model-SHA256", mit->second.sha256);
+        res.set_header("X-Model-Size-Bytes", std::to_string(mit->second.size_bytes));
         res.set_chunked_content_provider(
             "application/octet-stream",
             [file](size_t /*offset*/, DataSink& sink) -> bool {
@@ -895,9 +942,9 @@ void ControlApiServer::register_routes() {
 
     // ── GET /v1/agents ────────────────────────────────────────────────────────
     // ── GET /v1/models ────────────────────────────────────────────────────────
-    server_->Get("/v1/models", [this](const Request& /*req*/, Response& res) {
-        auto models = list_models_in_dir(models_dir_);
-        res.set_content(nlohmann::json{{"models", models}}.dump(), "application/json");
+    server_->Get("/v1/models", [this, build_control_catalog](const Request& /*req*/, Response& res) {
+        auto catalog = build_control_catalog(/*include_hash=*/false);
+        res.set_content(nlohmann::json{{"models", catalog.models}}.dump(), "application/json");
     });
 
     // ── GET /v1/nodes/:id/models ──────────────────────────────────────────────
@@ -912,11 +959,15 @@ void ControlApiServer::register_routes() {
             return;
         }
 
-        HttpClient cli(node.url);
-        cli.set_bearer_token(node.api_key);
-        auto storage = cli.get("/api/node/storage");
-        if (storage.ok()) {
-            res.set_content(storage.body, "application/json");
+        auto [host, port] = util::parse_url(node.url);
+        httplib::Client quick_cli(host, port);
+        quick_cli.set_connection_timeout(1);
+        quick_cli.set_read_timeout(2);
+        quick_cli.set_write_timeout(2);
+        httplib::Headers headers = {{"Authorization", "Bearer " + node.api_key}};
+        auto storage = quick_cli.Get("/api/node/storage", headers);
+        if (storage && storage->status >= 200 && storage->status < 300) {
+            res.set_content(storage->body, "application/json");
             return;
         }
 

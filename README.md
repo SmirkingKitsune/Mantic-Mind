@@ -156,6 +156,7 @@ Additional env-only settings:
 Model reference contract:
 
 - Prefer catalog filenames for `agent.model_path` (example: `llama3.gguf`).
+- Control catalog includes GGUF files discovered in `models_dir` plus resolvable GGUF files referenced by agent `model_path`.
 - Legacy absolute paths are still accepted, but control normalizes to `basename(model_path)` for placement and distribution decisions.
 - Node pull/delete APIs reject path traversal and non-filename model references.
 

@@ -250,19 +250,28 @@ void ControlUI::run() {
 
     auto refresh_control_catalog = [&](bool force) {
         const int64_t now_ms = util::now_ms();
-        if (!force && (now_ms - control_catalog_cached_at_ms) < 5000) return;
+        if (!force && (now_ms - control_catalog_cached_at_ms) < 30000) return;
         control_catalog_cached_at_ms = now_ms;
 
         control_catalog_filenames.clear();
         std::set<std::string> unique_names;
-        std::error_code ec;
-        if (!models_dir_.empty() && fs::exists(models_dir_, ec)) {
-            for (const auto& entry : fs::recursive_directory_iterator(models_dir_, ec)) {
-                if (!entry.is_regular_file()) continue;
-                std::string ext = util::to_lower(entry.path().extension().string());
-                if (ext != ".gguf") continue;
-                const std::string name = entry.path().filename().string();
-                if (is_safe_model_filename(name)) unique_names.insert(name);
+
+        HttpClient cli(control_base_url_);
+        auto resp = cli.get("/v1/models");
+        if (!resp.ok()) {
+            node_model_action_status = "control catalog refresh failed: " + parse_api_error(resp);
+        } else {
+            try {
+                auto j = nlohmann::json::parse(resp.body);
+                if (j.contains("models")) {
+                    auto models = j["models"].get<std::vector<StoredModel>>();
+                    for (const auto& m : models) {
+                        const std::string name = canonical_model_filename(m.model_path);
+                        if (is_safe_model_filename(name)) unique_names.insert(name);
+                    }
+                }
+            } catch (const std::exception& e) {
+                node_model_action_status = std::string("control catalog parse error: ") + e.what();
             }
         }
 
@@ -279,7 +288,7 @@ void ControlUI::run() {
         const int64_t now_ms = util::now_ms();
         if (!force &&
             node_id == node_models_cached_node_id &&
-            (now_ms - node_models_cached_at_ms) < 3000) {
+            (now_ms - node_models_cached_at_ms) < 10000) {
             return;
         }
         node_models_cached_node_id = node_id;

@@ -59,6 +59,42 @@ std::string compute_sha256(const std::string& filepath) {
     return ss.str();
 }
 
+std::optional<StoredModel> build_model_meta(const fs::path& file_path,
+                                            bool include_hash) {
+    std::error_code ec;
+    if (!fs::exists(file_path, ec) || !fs::is_regular_file(file_path, ec)) {
+        return std::nullopt;
+    }
+
+    std::string ext = file_path.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (ext != ".gguf") return std::nullopt;
+
+    StoredModel m;
+    m.model_path = file_path.filename().string();
+    m.size_bytes = static_cast<int64_t>(fs::file_size(file_path, ec));
+    if (ec) m.size_bytes = 0;
+    if (include_hash) {
+        m.sha256 = compute_sha256(file_path.string());
+    }
+
+    static const std::regex shard_re(
+        R"(.*-(\d{5})-of-(\d{5})\.gguf$)", std::regex::icase);
+    std::smatch match;
+    if (std::regex_match(m.model_path, match, shard_re)) {
+        try {
+            m.shard_count = std::stoi(match[2].str());
+        } catch (...) {
+            m.shard_count = 1;
+        }
+    } else {
+        m.shard_count = 1;
+    }
+
+    return m;
+}
+
 } // namespace
 
 std::string canonical_model_filename(const std::string& model_ref) {
@@ -130,32 +166,9 @@ std::vector<StoredModel> list_models_in_dir(const std::string& models_dir) {
     if (!fs::exists(models_dir, ec)) return result;
 
     for (const auto& entry : fs::recursive_directory_iterator(models_dir, ec)) {
-        if (!entry.is_regular_file()) continue;
-
-        std::string ext = entry.path().extension().string();
-        std::transform(ext.begin(), ext.end(), ext.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (ext != ".gguf") continue;
-
-        StoredModel m;
-        m.model_path = entry.path().filename().string();
-        m.size_bytes = static_cast<int64_t>(entry.file_size(ec));
-        m.sha256 = compute_sha256(entry.path().string());
-
-        static const std::regex shard_re(
-            R"(.*-(\d{5})-of-(\d{5})\.gguf$)", std::regex::icase);
-        std::smatch match;
-        if (std::regex_match(m.model_path, match, shard_re)) {
-            try {
-                m.shard_count = std::stoi(match[2].str());
-            } catch (...) {
-                m.shard_count = 1;
-            }
-        } else {
-            m.shard_count = 1;
-        }
-
-        result.push_back(std::move(m));
+        auto m = build_model_meta(entry.path(), /*include_hash=*/true);
+        if (!m) continue;
+        result.push_back(std::move(*m));
     }
 
     std::sort(result.begin(), result.end(),
@@ -163,6 +176,12 @@ std::vector<StoredModel> list_models_in_dir(const std::string& models_dir) {
                   return a.model_path < b.model_path;
               });
     return result;
+}
+
+std::optional<StoredModel> inspect_model_file(const std::string& model_file_path,
+                                              bool include_hash) {
+    if (model_file_path.empty()) return std::nullopt;
+    return build_model_meta(fs::path(model_file_path), include_hash);
 }
 
 std::optional<StoredModel> find_model_in_dir(const std::string& models_dir,
