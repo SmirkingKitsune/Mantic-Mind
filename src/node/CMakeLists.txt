@@ -3,6 +3,7 @@ add_executable(mantic-mind
     llama_runtime_manager.cpp
     llama_server_process.cpp
     model_storage.cpp
+    model_puller.cpp
     node_api_server.cpp
     node_state.cpp
     node_ui.cpp

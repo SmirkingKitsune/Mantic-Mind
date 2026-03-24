@@ -2,6 +2,7 @@
 #include "control/node_registry.hpp"
 #include "common/http_client.hpp"
 #include "common/logger.hpp"
+#include "common/model_catalog.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -10,7 +11,6 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
-#include <regex>
 #include <sstream>
 #include <vector>
 
@@ -101,26 +101,7 @@ bool ModelDistributor::delete_model_on_node(const NodeId& node_id,
 std::vector<std::string> ModelDistributor::detect_shards(
     const std::string& filename)
 {
-    static const std::regex shard_re(
-        R"((.*)-(\d{5})-of-(\d{5})\.gguf$)", std::regex::icase);
-    std::smatch match;
-    std::string fname = filename;
-
-    if (std::regex_match(fname, match, shard_re)) {
-        std::string base = match[1].str();
-        int count = std::stoi(match[3].str());
-        std::vector<std::string> shards;
-        shards.reserve(static_cast<size_t>(count));
-        for (int i = 1; i <= count; ++i) {
-            std::ostringstream ss;
-            ss << base << "-" << std::setw(5) << std::setfill('0') << i
-               << "-of-" << std::setw(5) << std::setfill('0') << count << ".gguf";
-            shards.push_back(ss.str());
-        }
-        return shards;
-    }
-
-    return {filename};
+    return expand_model_shards(filename);
 }
 
 bool ModelDistributor::upload_single_file(const NodeId& node_id,

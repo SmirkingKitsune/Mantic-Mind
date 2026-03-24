@@ -3,8 +3,10 @@
 #include "node/node_state.hpp"
 #include "node/slot_manager.hpp"
 #include "node/model_storage.hpp"
+#include "node/model_puller.hpp"
 #include "common/http_server.hpp"
 #include "common/llama_cpp_client.hpp"
+#include "common/model_catalog.hpp"
 #include "common/models.hpp"
 #include "common/logger.hpp"
 #include "common/pairing.hpp"
@@ -22,6 +24,7 @@
 #include <thread>
 
 namespace mm {
+namespace fs = std::filesystem;
 
 namespace {
 
@@ -71,17 +74,42 @@ nlohmann::json runtime_status_json(const LlamaRuntimeStatus& s) {
     };
 }
 
+std::string resolve_load_model_path(const std::string& model_ref,
+                                    const ModelStorage& storage) {
+    const std::string cleaned = sanitize_path_for_runtime(model_ref);
+    if (cleaned.empty()) return {};
+
+    std::error_code ec;
+    fs::path direct(cleaned);
+    if (fs::exists(direct, ec) && fs::is_regular_file(direct, ec)) {
+        return direct.string();
+    }
+
+    const std::string canonical = canonical_model_filename(cleaned);
+    if (is_safe_model_filename(canonical)) {
+        fs::path in_models_dir(storage.model_path(canonical));
+        ec.clear();
+        if (fs::exists(in_models_dir, ec) && fs::is_regular_file(in_models_dir, ec)) {
+            return in_models_dir.string();
+        }
+    }
+    return {};
+}
+
 } // namespace
 
 NodeApiServer::NodeApiServer(NodeState& state,
                              SlotManager& slot_mgr,
                              ModelStorage& model_storage,
                              LlamaRuntimeManager& runtime_mgr,
+                             std::string control_url,
                              std::string pairing_key)
     : state_(state)
     , slot_mgr_(slot_mgr)
     , model_storage_(model_storage)
+    , model_puller_(std::make_unique<ModelPuller>(model_storage_, state_, control_url))
     , runtime_mgr_(runtime_mgr)
+    , control_url_(std::move(control_url))
     , pairing_key_(std::move(pairing_key))
     , server_(std::make_unique<HttpServer>())
 {}
@@ -127,6 +155,8 @@ void NodeApiServer::register_routes() {
         }
         auto slots = slot_mgr_.get_slot_info();
         auto stored = model_storage_.list_models();
+        const int64_t disk_free_mb = model_storage_.free_space_mb();
+        state_.set_storage(stored, disk_free_mb);
         const int max_slots = static_cast<int>(slot_mgr_.max_slots());
 
         int ready_slots = 0;
@@ -153,7 +183,7 @@ void NodeApiServer::register_routes() {
         j["node_id"]       = state_.get_node_id();
         j["slots"]         = slots;
         j["stored_models"] = stored;
-        j["disk_free_mb"]  = model_storage_.free_space_mb();
+        j["disk_free_mb"]  = disk_free_mb;
         j["health"]        = state_.get_metrics();
         j["max_slots"]     = max_slots;
         j["slot_in_use"]   = in_use_slots;
@@ -304,6 +334,7 @@ void NodeApiServer::register_routes() {
             res.status = 401; return;
         }
         auto models = model_storage_.list_models();
+        state_.set_storage(models, model_storage_.free_space_mb());
         res.set_content(nlohmann::json{{"models", models}}.dump(), "application/json");
     });
 
@@ -312,9 +343,12 @@ void NodeApiServer::register_routes() {
         if (!check_auth(req.get_header_value("Authorization"))) {
             res.status = 401; return;
         }
+        auto stored = model_storage_.list_models();
+        auto disk_free = model_storage_.free_space_mb();
+        state_.set_storage(stored, disk_free);
         nlohmann::json j;
-        j["disk_free_mb"]  = model_storage_.free_space_mb();
-        j["stored_models"] = model_storage_.list_models();
+        j["disk_free_mb"]  = disk_free;
+        j["stored_models"] = stored;
         res.set_content(j.dump(), "application/json");
     });
 
@@ -325,7 +359,7 @@ void NodeApiServer::register_routes() {
         }
         try {
             auto j = nlohmann::json::parse(req.body);
-            std::string model_path = j.value("model_path", std::string{});
+            std::string model_ref  = j.value("model_path", std::string{});
             std::string agent_id   = j.value("agent_id",   std::string{});
             LlamaSettings settings;
             if (j.contains("settings")) settings = j["settings"].get<LlamaSettings>();
@@ -340,10 +374,32 @@ void NodeApiServer::register_routes() {
                         desired_llama);
             }
 
-            if (model_path.empty()) {
+            if (model_ref.empty()) {
                 res.status = 400;
                 state_.set_last_error("model_path required");
                 res.set_content(R"({"error":"model_path required"})", "application/json");
+                return;
+            }
+
+            const std::string canonical = canonical_model_filename(model_ref);
+            nlohmann::json pull_result;
+            std::string model_path = resolve_load_model_path(model_ref, model_storage_);
+            if (model_path.empty() && is_safe_model_filename(canonical) && model_puller_) {
+                model_puller_->pull_model(canonical, /*force=*/false, &pull_result);
+                model_path = resolve_load_model_path(canonical, model_storage_);
+                state_.set_storage(model_storage_.list_models(), model_storage_.free_space_mb());
+            }
+            if (model_path.empty()) {
+                res.status = 404;
+                nlohmann::json err = {
+                    {"error", "model file not found on node"},
+                    {"model_path", model_ref},
+                    {"model_filename", canonical},
+                    {"detail", "model missing locally; pull from control failed or unavailable"}
+                };
+                if (!pull_result.is_null() && !pull_result.empty()) err["transfer"] = pull_result;
+                state_.set_last_error("model file not found on node");
+                res.set_content(err.dump(), "application/json");
                 return;
             }
 
@@ -353,8 +409,10 @@ void NodeApiServer::register_routes() {
                 nlohmann::json err = {{"error", "failed to load model"}};
                 auto detail = slot_mgr_.last_error();
                 err["llama_server_path"] = slot_mgr_.llama_server_path();
+                err["model_path"] = model_path;
                 state_.set_last_error(detail.empty() ? "failed to load model" : detail);
                 if (!detail.empty()) err["detail"] = detail;
+                if (!pull_result.is_null() && !pull_result.empty()) err["transfer"] = pull_result;
                 res.set_content(err.dump(), "application/json");
             } else {
                 // Update NodeState for UI
@@ -375,7 +433,10 @@ void NodeApiServer::register_routes() {
                 res.set_content(
                     nlohmann::json{{"status","loaded"},
                                    {"slot_id", slot_id},
-                                   {"effective_ctx_size", effective_ctx}}.dump(),
+                                   {"effective_ctx_size", effective_ctx},
+                                   {"model_path", model_path},
+                                   {"model_filename", canonical},
+                                   {"transfer", pull_result}}.dump(),
                     "application/json");
             }
         } catch (const std::exception& e) {
@@ -492,14 +553,13 @@ void NodeApiServer::register_routes() {
 
         std::string filename    = req.get_header_value("X-Model-Filename");
         std::string sha256      = req.get_header_value("X-Model-SHA256");
-        std::string shard_idx_s = req.get_header_value("X-Shard-Index");
-        std::string shard_cnt_s = req.get_header_value("X-Shard-Count");
 
-        if (filename.empty()) {
+        if (filename.empty() || !is_safe_model_filename(canonical_model_filename(filename))) {
             res.status = 400;
-            res.set_content(R"({"error":"X-Model-Filename header required"})", "application/json");
+            res.set_content(R"({"error":"valid X-Model-Filename header required"})", "application/json");
             return;
         }
+        filename = canonical_model_filename(filename);
 
         // Write the raw body as a chunk at offset 0 (or the specified offset)
         std::string offset_s = req.get_header_value("X-Chunk-Offset");
@@ -528,7 +588,47 @@ void NodeApiServer::register_routes() {
         nlohmann::json resp;
         resp["status"] = "written";
         resp["verified"] = verified;
+        state_.set_storage(model_storage_.list_models(), model_storage_.free_space_mb());
         res.set_content(resp.dump(), "application/json");
+    });
+
+    // ── POST /api/node/models/pull ────────────────────────────────────────────
+    server_->Post("/api/node/models/pull", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401; return;
+        }
+        try {
+            auto j = nlohmann::json::parse(req.body);
+            std::string model_filename = canonical_model_filename(
+                j.value("model_filename", std::string{}));
+            bool force = j.value("force", false);
+            if (!is_safe_model_filename(model_filename)) {
+                res.status = 400;
+                res.set_content(R"({"error":"valid model_filename required"})", "application/json");
+                return;
+            }
+
+            nlohmann::json pull_result;
+            const bool ok = model_puller_ && model_puller_->pull_model(model_filename, force, &pull_result);
+            state_.set_storage(model_storage_.list_models(), model_storage_.free_space_mb());
+            if (!ok) {
+                res.status = 502;
+                if (pull_result.is_null()) {
+                    pull_result = nlohmann::json{
+                        {"status", "failed"},
+                        {"error", "model pull failed"}
+                    };
+                }
+                res.set_content(pull_result.dump(), "application/json");
+                return;
+            }
+
+            if (!pull_result.contains("status")) pull_result["status"] = "downloaded";
+            res.set_content(pull_result.dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+        }
     });
 
     // ── DELETE /api/node/models/:filename ─────────────────────────────────────
@@ -536,8 +636,14 @@ void NodeApiServer::register_routes() {
         if (!check_auth(req.get_header_value("Authorization"))) {
             res.status = 401; return;
         }
-        std::string filename = req.path_params.at("filename");
+        std::string filename = canonical_model_filename(req.path_params.at("filename"));
+        if (!is_safe_model_filename(filename)) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid filename"})", "application/json");
+            return;
+        }
         if (model_storage_.delete_model(filename)) {
+            state_.set_storage(model_storage_.list_models(), model_storage_.free_space_mb());
             res.set_content(R"({"status":"deleted"})", "application/json");
         } else {
             res.status = 404;

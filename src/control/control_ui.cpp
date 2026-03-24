@@ -6,6 +6,7 @@
 #include "common/agent_db.hpp"
 #include "common/gguf_metadata.hpp"
 #include "common/http_client.hpp"
+#include "common/model_catalog.hpp"
 #include "common/models.hpp"
 #include "common/logger.hpp"
 #include "common/tool_executor.hpp"
@@ -101,6 +102,17 @@ void ControlUI::run() {
     //
     int  node_sel      = 0;
     std::vector<std::string> node_entries;
+    int  catalog_sel   = 0;
+    std::vector<std::string> catalog_entries;
+    int  node_model_sel = 0;
+    std::vector<std::string> node_model_entries;
+    std::vector<std::string> control_catalog_filenames;
+    std::string node_models_cached_node_id;
+    std::vector<StoredModel> node_models_cached;
+    int64_t node_models_cached_disk_free_mb = 0;
+    int64_t node_models_cached_at_ms = 0;
+    int64_t control_catalog_cached_at_ms = 0;
+    std::string node_model_action_status;
 
     // Modals
     bool show_add_node  = false;
@@ -234,6 +246,82 @@ void ControlUI::run() {
             return body;
         }
         return "(empty response body)";
+    };
+
+    auto refresh_control_catalog = [&](bool force) {
+        const int64_t now_ms = util::now_ms();
+        if (!force && (now_ms - control_catalog_cached_at_ms) < 5000) return;
+        control_catalog_cached_at_ms = now_ms;
+
+        control_catalog_filenames.clear();
+        std::set<std::string> unique_names;
+        std::error_code ec;
+        if (!models_dir_.empty() && fs::exists(models_dir_, ec)) {
+            for (const auto& entry : fs::recursive_directory_iterator(models_dir_, ec)) {
+                if (!entry.is_regular_file()) continue;
+                std::string ext = util::to_lower(entry.path().extension().string());
+                if (ext != ".gguf") continue;
+                const std::string name = entry.path().filename().string();
+                if (is_safe_model_filename(name)) unique_names.insert(name);
+            }
+        }
+
+        control_catalog_filenames.assign(unique_names.begin(), unique_names.end());
+        if (!control_catalog_filenames.empty() &&
+            catalog_sel >= static_cast<int>(control_catalog_filenames.size())) {
+            catalog_sel = static_cast<int>(control_catalog_filenames.size()) - 1;
+        } else if (control_catalog_filenames.empty()) {
+            catalog_sel = 0;
+        }
+    };
+
+    auto refresh_node_storage_cache = [&](const NodeId& node_id, bool force) {
+        const int64_t now_ms = util::now_ms();
+        if (!force &&
+            node_id == node_models_cached_node_id &&
+            (now_ms - node_models_cached_at_ms) < 3000) {
+            return;
+        }
+        node_models_cached_node_id = node_id;
+        node_models_cached_at_ms = now_ms;
+
+        node_models_cached.clear();
+        node_models_cached_disk_free_mb = 0;
+        if (node_id.empty()) return;
+
+        HttpClient cli(control_base_url_);
+        auto resp = cli.get("/v1/nodes/" + node_id + "/models");
+        if (!resp.ok()) {
+            node_model_action_status = "refresh failed for node storage (HTTP " +
+                                       std::to_string(resp.status) + ")";
+            return;
+        }
+
+        try {
+            auto j = nlohmann::json::parse(resp.body);
+            if (j.contains("stored_models"))
+                node_models_cached = j["stored_models"].get<std::vector<StoredModel>>();
+            if (j.contains("disk_free_mb"))
+                node_models_cached_disk_free_mb = j["disk_free_mb"].get<int64_t>();
+        } catch (const std::exception& e) {
+            node_model_action_status = std::string("refresh parse error: ") + e.what();
+            return;
+        }
+
+        if (!node_models_cached.empty() &&
+            node_model_sel >= static_cast<int>(node_models_cached.size())) {
+            node_model_sel = static_cast<int>(node_models_cached.size()) - 1;
+        } else if (node_models_cached.empty()) {
+            node_model_sel = 0;
+        }
+    };
+
+    auto selected_catalog_filename = [&]() -> std::string {
+        if (catalog_sel < 0 ||
+            catalog_sel >= static_cast<int>(control_catalog_filenames.size())) {
+            return {};
+        }
+        return control_catalog_filenames[static_cast<size_t>(catalog_sel)];
     };
 
     auto set_curation_status = [&](const std::string& status, const std::string& error) {
@@ -461,7 +549,86 @@ void ControlUI::run() {
     auto node_btns    = Container::Horizontal({btn_upd_n, btn_chk_n, btn_rem_n});
     auto nodes_section = Container::Vertical({node_menu_m, node_btns});
 
-    auto nodes_comp  = Container::Vertical({disc_comp, nodes_section});
+    auto catalog_menu = Menu(&catalog_entries, &catalog_sel, MenuOption::Vertical());
+    auto catalog_menu_m = Maybe(catalog_menu, [&]() { return !catalog_entries.empty(); });
+    auto node_models_menu = Menu(&node_model_entries, &node_model_sel, MenuOption::Vertical());
+    auto node_models_menu_m = Maybe(node_models_menu, [&]() { return !node_model_entries.empty(); });
+
+    auto pull_catalog_to_node = [&]() {
+        auto ns = registry_.list_nodes();
+        if (node_sel < 0 || node_sel >= static_cast<int>(ns.size())) {
+            node_model_action_status = "no node selected";
+            return;
+        }
+        const std::string filename = selected_catalog_filename();
+        if (!is_safe_model_filename(filename)) {
+            node_model_action_status = "select a valid catalog model first";
+            return;
+        }
+
+        HttpClient cli(control_base_url_);
+        auto resp = cli.post("/v1/nodes/" + ns[node_sel].id + "/models/pull",
+                             nlohmann::json{{"model_filename", filename}});
+        if (!resp.ok()) {
+            node_model_action_status = "pull failed: " + parse_api_error(resp);
+            log(LogLevel::Error,
+                "Node model pull failed on " + ns[node_sel].id + ": " + node_model_action_status);
+            return;
+        }
+
+        node_model_action_status = "pull requested: " + filename;
+        log(LogLevel::Info, "Requested node pull: " + filename + " -> " + ns[node_sel].id);
+        refresh_node_storage_cache(ns[node_sel].id, true);
+    };
+
+    auto delete_model_on_node = [&]() {
+        auto ns = registry_.list_nodes();
+        if (node_sel < 0 || node_sel >= static_cast<int>(ns.size())) {
+            node_model_action_status = "no node selected";
+            return;
+        }
+        if (node_model_sel < 0 || node_model_sel >= static_cast<int>(node_models_cached.size())) {
+            node_model_action_status = "no node model selected";
+            return;
+        }
+
+        const std::string filename = canonical_model_filename(
+            node_models_cached[static_cast<size_t>(node_model_sel)].model_path);
+        if (!is_safe_model_filename(filename)) {
+            node_model_action_status = "selected model has invalid filename";
+            return;
+        }
+
+        HttpClient cli(control_base_url_);
+        auto resp = cli.del("/v1/nodes/" + ns[node_sel].id + "/models/" + filename);
+        if (!resp.ok()) {
+            node_model_action_status = "delete failed: " + parse_api_error(resp);
+            log(LogLevel::Error,
+                "Node model delete failed on " + ns[node_sel].id + ": " + node_model_action_status);
+            return;
+        }
+
+        node_model_action_status = "deleted from node: " + filename;
+        log(LogLevel::Info, "Deleted node model copy: " + filename + " from " + ns[node_sel].id);
+        refresh_node_storage_cache(ns[node_sel].id, true);
+    };
+
+    auto btn_pull_model_n = Button("[P] Pull Model", [&] { pull_catalog_to_node(); }, ButtonOption::Simple());
+    auto btn_del_model_n  = Button("[D] Delete Model", [&] { delete_model_on_node(); }, ButtonOption::Simple());
+    auto btn_refresh_models_n = Button("[R] Refresh Models", [&] {
+        refresh_control_catalog(true);
+        auto ns = registry_.list_nodes();
+        if (node_sel >= 0 && node_sel < static_cast<int>(ns.size())) {
+            refresh_node_storage_cache(ns[node_sel].id, true);
+        }
+        node_model_action_status = "refreshed model views";
+    }, ButtonOption::Simple());
+    auto node_model_btns = Container::Horizontal(
+        {btn_pull_model_n, btn_del_model_n, btn_refresh_models_n});
+    auto node_model_section = Container::Vertical(
+        {catalog_menu_m, node_models_menu_m, node_model_btns});
+
+    auto nodes_comp  = Container::Vertical({disc_comp, nodes_section, node_model_section});
 
     //
 
@@ -1255,6 +1422,32 @@ void ControlUI::run() {
         else if (ns.empty())
             node_sel = 0;
 
+        refresh_control_catalog(false);
+        catalog_entries = control_catalog_filenames;
+        if (!catalog_entries.empty() && catalog_sel >= static_cast<int>(catalog_entries.size()))
+            catalog_sel = static_cast<int>(catalog_entries.size()) - 1;
+        else if (catalog_entries.empty())
+            catalog_sel = 0;
+
+        if (!ns.empty() && node_sel >= 0 && node_sel < static_cast<int>(ns.size())) {
+            refresh_node_storage_cache(ns[node_sel].id, false);
+        } else {
+            node_models_cached_node_id.clear();
+            node_models_cached.clear();
+            node_models_cached_disk_free_mb = 0;
+            node_model_sel = 0;
+        }
+
+        node_model_entries.resize(node_models_cached.size());
+        for (size_t i = 0; i < node_models_cached.size(); ++i) {
+            const auto& m = node_models_cached[i];
+            node_model_entries[i] = m.model_path + "  (" + mb_str(m.size_bytes / (1024 * 1024)) + ")";
+        }
+        if (!node_model_entries.empty() && node_model_sel >= static_cast<int>(node_model_entries.size()))
+            node_model_sel = static_cast<int>(node_model_entries.size()) - 1;
+        else if (node_model_entries.empty())
+            node_model_sel = 0;
+
         Element detail;
         if (!ns.empty() && node_sel < static_cast<int>(ns.size())) {
             auto& n  = ns[node_sel];
@@ -1328,6 +1521,10 @@ void ControlUI::run() {
                 hbox({text("  Update msg: "),
                       text(n.llama_update_message.empty() ? "(none)" : n.llama_update_message)
                           | color(Color::GrayDark)}),
+                hbox({text("  Storage : "),
+                      text(std::to_string(node_models_cached.size()) + " model(s), free " +
+                           mb_str(node_models_cached_disk_free_mb))
+                          | color(Color::GrayDark)}),
                 separator(),
                 gauge_row("  CPU", n.metrics.cpu_percent, ""),
                 gauge_row("  RAM", n.metrics.ram_percent, ram),
@@ -1359,6 +1556,28 @@ void ControlUI::run() {
                 }
             }
 
+            detail_rows.push_back(separator());
+            detail_rows.push_back(text("  Stored models on selected node:") | bold);
+            if (node_models_cached.empty()) {
+                detail_rows.push_back(text("    (none)") | color(Color::GrayDark));
+            } else {
+                constexpr size_t kMaxModelLines = 8;
+                size_t shown = 0;
+                for (const auto& m : node_models_cached) {
+                    if (shown >= kMaxModelLines) break;
+                    detail_rows.push_back(
+                        text("    - " + compact_model(m.model_path) +
+                             " (" + mb_str(m.size_bytes / (1024 * 1024)) + ")")
+                        | color(Color::GrayDark));
+                    ++shown;
+                }
+                if (node_models_cached.size() > shown) {
+                    detail_rows.push_back(
+                        text("    ... +" + std::to_string(node_models_cached.size() - shown) + " more")
+                        | color(Color::GrayDark));
+                }
+            }
+
             detail = vbox(std::move(detail_rows));
         } else {
             detail = text("  No connected nodes.") | color(Color::GrayDark);
@@ -1381,6 +1600,34 @@ void ControlUI::run() {
                     : (node_menu->Render() | yframe | flex),
                 node_btns->Render(),
             }) | size(HEIGHT, LESS_THAN, 10) | border,
+            vbox({
+                text(" Model Management") | bold,
+                separator(),
+                hbox({
+                    vbox({
+                        text(" Control Catalog") | bold,
+                        separator(),
+                        catalog_entries.empty()
+                            ? (text("  (no .gguf files in control models_dir)") | color(Color::GrayDark))
+                            : (catalog_menu->Render() | yframe | flex),
+                    }) | size(WIDTH, EQUAL, 58) | border,
+                    separator(),
+                    vbox({
+                        text(" Selected Node Inventory") | bold,
+                        separator(),
+                        node_model_entries.empty()
+                            ? (text("  (no models on selected node)") | color(Color::GrayDark))
+                            : (node_models_menu->Render() | yframe | flex),
+                    }) | border | flex,
+                }) | size(HEIGHT, LESS_THAN, 14) | flex,
+                separator(),
+                node_model_btns->Render(),
+                node_model_action_status.empty()
+                    ? text("  p:pull selected catalog model  d:delete selected node model")
+                        | color(Color::GrayDark)
+                    : text("  " + node_model_action_status)
+                        | color(Color::Yellow),
+            }) | border,
             separator(),
             detail,
         });
@@ -1954,6 +2201,23 @@ void ControlUI::run() {
             if (ev == Event::Character('5')) { tab_index = 4; return true; }
             if (ev == Event::Character('u') && tab_index == 0) {
                 trigger_node_update(true);
+                return true;
+            }
+            if (ev == Event::Character('p') && tab_index == 0) {
+                pull_catalog_to_node();
+                return true;
+            }
+            if (ev == Event::Character('d') && tab_index == 0) {
+                delete_model_on_node();
+                return true;
+            }
+            if (ev == Event::Character('r') && tab_index == 0) {
+                refresh_control_catalog(true);
+                auto ns = registry_.list_nodes();
+                if (node_sel >= 0 && node_sel < static_cast<int>(ns.size())) {
+                    refresh_node_storage_cache(ns[node_sel].id, true);
+                }
+                node_model_action_status = "refreshed model views";
                 return true;
             }
         }

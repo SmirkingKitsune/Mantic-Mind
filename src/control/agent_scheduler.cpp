@@ -3,6 +3,8 @@
 #include "control/model_distributor.hpp"
 #include "common/http_client.hpp"
 #include "common/logger.hpp"
+#include "common/model_catalog.hpp"
+#include "common/gguf_metadata.hpp"
 #include "common/util.hpp"
 
 #include <nlohmann/json.hpp>
@@ -40,6 +42,11 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     }
 
     int64_t vram_needed = estimate_vram_mb(cfg.model_path);
+    const std::string model_filename = canonical_model_filename(cfg.model_path);
+    if (model_filename != cfg.model_path) {
+        MM_WARN("AgentScheduler: agent {} model_path '{}' treated as catalog filename '{}'",
+                cfg.id, cfg.model_path, model_filename);
+    }
 
     // 2. Suspended placement? Try to restore.
     if (pit != placements_.end() && pit->second.suspended) {
@@ -101,8 +108,7 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     }
 
     // 3b. Any node has model stored + VRAM?
-    auto stored_nodes = registry_.nodes_with_model_stored(
-        fs::path(cfg.model_path).filename().string());
+    auto stored_nodes = registry_.nodes_with_model_stored(model_filename);
     for (const auto& node : stored_nodes) {
         if (node.id == cfg.preferred_node_id) continue; // already tried
         auto slot_id = load_agent_on_node(cfg, node.id);
@@ -121,8 +127,6 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     // 3c. Any node has VRAM → distribute model, then load.
     auto vram_nodes = registry_.nodes_with_available_vram(vram_needed);
     for (const auto& node : vram_nodes) {
-        std::string model_filename = fs::path(cfg.model_path).filename().string();
-
         // Check if model is on this node already.
         bool has_model = false;
         for (const auto& m : node.stored_models) {
@@ -293,14 +297,9 @@ bool AgentScheduler::is_local_node(const std::string& node_url) {
 }
 
 int64_t AgentScheduler::estimate_vram_mb(const std::string& model_path) const {
-    // Try local file first.
     std::error_code ec;
-    auto sz = fs::file_size(model_path, ec);
-    if (ec) {
-        // Try in models_dir.
-        auto local = fs::path(models_dir_) / fs::path(model_path).filename();
-        sz = fs::file_size(local, ec);
-    }
+    const std::string resolved = resolve_model_path_for_metadata(model_path, models_dir_);
+    auto sz = fs::file_size(resolved.empty() ? model_path : resolved, ec);
     if (ec) return 2048; // Conservative default: 2 GB
     return static_cast<int64_t>(static_cast<double>(sz) * 1.2 / (1024.0 * 1024.0));
 }
@@ -374,9 +373,15 @@ std::optional<SlotId> AgentScheduler::restore_agent_on_node(
         auto node = registry_.get_node(node_id);
         HttpClient cli(node.url);
         cli.set_bearer_token(node.api_key);
+        const std::string model_filename = canonical_model_filename(cfg.model_path);
+        std::string model_ref = model_filename;
+        if (is_local_node(node.url)) {
+            auto local_path = fs::path(models_dir_) / model_filename;
+            if (fs::exists(local_path)) model_ref = local_path.string();
+        }
         for (int attempt = 0; attempt < 3; ++attempt) {
             nlohmann::json body = {
-                {"model_path",    cfg.model_path},
+                {"model_path",    model_ref},
                 {"settings",      cfg.llama_settings},
                 {"kv_cache_path", placement.kv_cache_node_path},
                 {"agent_id",      cfg.id}
@@ -429,11 +434,11 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
                     cfg.id, node_id);
         }
 
-        // For local nodes, pass the full local path; for remote, use the filename
-        // (the node will look in its own models_dir).
-        std::string model_ref = cfg.model_path;
+        const std::string model_filename = canonical_model_filename(cfg.model_path);
+        // For local nodes, pass full local path when available; for remote, pass filename.
+        std::string model_ref = model_filename;
         if (is_local_node(node.url)) {
-            auto local_path = fs::path(models_dir_) / fs::path(cfg.model_path).filename();
+            auto local_path = fs::path(models_dir_) / model_filename;
             if (fs::exists(local_path))
                 model_ref = local_path.string();
         }
@@ -447,6 +452,7 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
                     "load may fail or be slow", cfg.id, cfg.llama_settings.ctx_size);
         }
 
+        bool attempted_pull = false;
         for (int attempt = 0; attempt < 3; ++attempt) {
             nlohmann::json body = {
                 {"model_path", model_ref},
@@ -484,6 +490,27 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
                     MM_INFO("AgentScheduler: load-model still constrained on node {}; evicted remaining slots and retrying",
                             node_id);
                     continue;
+                }
+            }
+
+            // If the node reports a missing model, ask node to pull from control and retry.
+            if (!attempted_pull) {
+                const std::string lower = util::to_lower(resp.body);
+                if (resp.status == 404 ||
+                    lower.find("model file not found") != std::string::npos ||
+                    lower.find("model missing locally") != std::string::npos ||
+                    lower.find("no such file") != std::string::npos) {
+                    auto pull = cli.post("/api/node/models/pull",
+                                         nlohmann::json{{"model_filename", model_filename},
+                                                        {"force", false}});
+                    attempted_pull = true;
+                    if (pull.ok()) {
+                        MM_INFO("AgentScheduler: node {} pulled model {}; retrying load",
+                                node_id, model_filename);
+                        continue;
+                    }
+                    MM_WARN("AgentScheduler: node {} failed to pull model {} (HTTP {})",
+                            node_id, model_filename, pull.status);
                 }
             }
 
