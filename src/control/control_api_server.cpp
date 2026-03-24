@@ -800,12 +800,12 @@ void ControlApiServer::register_routes() {
         std::unordered_map<std::string, std::string> path_by_filename;
     };
 
-    auto build_control_catalog = [this]() -> ControlCatalogSnapshot {
+    auto build_control_catalog = [this](bool include_hash) -> ControlCatalogSnapshot {
         ControlCatalogSnapshot out;
 
         auto add_file = [&](const std::string& file_path,
                             const std::string& source_tag) {
-            auto meta = inspect_model_file(file_path);
+            auto meta = inspect_model_file(file_path, include_hash);
             if (!meta) return;
             const std::string filename = canonical_model_filename(meta->model_path);
             if (!is_safe_model_filename(filename)) return;
@@ -880,7 +880,7 @@ void ControlApiServer::register_routes() {
     // ── GET /api/control/models  (node-authenticated) ─────────────────────────
     server_->Get("/api/control/models", [this, require_node_auth, build_control_catalog](const Request& req, Response& res) {
         if (!require_node_auth(req, res)) return;
-        auto catalog = build_control_catalog();
+        auto catalog = build_control_catalog(/*include_hash=*/true);
         res.set_content(nlohmann::json{{"models", catalog.models}}.dump(), "application/json");
     });
 
@@ -896,7 +896,7 @@ void ControlApiServer::register_routes() {
             return;
         }
 
-        auto catalog = build_control_catalog();
+        auto catalog = build_control_catalog(/*include_hash=*/true);
         auto mit = catalog.by_filename.find(filename);
         if (mit == catalog.by_filename.end()) {
             res.status = 404;
@@ -943,7 +943,7 @@ void ControlApiServer::register_routes() {
     // ── GET /v1/agents ────────────────────────────────────────────────────────
     // ── GET /v1/models ────────────────────────────────────────────────────────
     server_->Get("/v1/models", [this, build_control_catalog](const Request& /*req*/, Response& res) {
-        auto catalog = build_control_catalog();
+        auto catalog = build_control_catalog(/*include_hash=*/false);
         res.set_content(nlohmann::json{{"models", catalog.models}}.dump(), "application/json");
     });
 
@@ -959,11 +959,15 @@ void ControlApiServer::register_routes() {
             return;
         }
 
-        HttpClient cli(node.url);
-        cli.set_bearer_token(node.api_key);
-        auto storage = cli.get("/api/node/storage");
-        if (storage.ok()) {
-            res.set_content(storage.body, "application/json");
+        auto [host, port] = util::parse_url(node.url);
+        httplib::Client quick_cli(host, port);
+        quick_cli.set_connection_timeout(1);
+        quick_cli.set_read_timeout(2);
+        quick_cli.set_write_timeout(2);
+        httplib::Headers headers = {{"Authorization", "Bearer " + node.api_key}};
+        auto storage = quick_cli.Get("/api/node/storage", headers);
+        if (storage && storage->status >= 200 && storage->status < 300) {
+            res.set_content(storage->body, "application/json");
             return;
         }
 

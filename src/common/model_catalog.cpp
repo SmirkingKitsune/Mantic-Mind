@@ -59,7 +59,8 @@ std::string compute_sha256(const std::string& filepath) {
     return ss.str();
 }
 
-std::optional<StoredModel> build_model_meta(const fs::path& file_path) {
+std::optional<StoredModel> build_model_meta(const fs::path& file_path,
+                                            bool include_hash) {
     std::error_code ec;
     if (!fs::exists(file_path, ec) || !fs::is_regular_file(file_path, ec)) {
         return std::nullopt;
@@ -74,7 +75,9 @@ std::optional<StoredModel> build_model_meta(const fs::path& file_path) {
     m.model_path = file_path.filename().string();
     m.size_bytes = static_cast<int64_t>(fs::file_size(file_path, ec));
     if (ec) m.size_bytes = 0;
-    m.sha256 = compute_sha256(file_path.string());
+    if (include_hash) {
+        m.sha256 = compute_sha256(file_path.string());
+    }
 
     static const std::regex shard_re(
         R"(.*-(\d{5})-of-(\d{5})\.gguf$)", std::regex::icase);
@@ -163,7 +166,7 @@ std::vector<StoredModel> list_models_in_dir(const std::string& models_dir) {
     if (!fs::exists(models_dir, ec)) return result;
 
     for (const auto& entry : fs::recursive_directory_iterator(models_dir, ec)) {
-        auto m = build_model_meta(entry.path());
+        auto m = build_model_meta(entry.path(), /*include_hash=*/true);
         if (!m) continue;
         result.push_back(std::move(*m));
     }
@@ -175,9 +178,10 @@ std::vector<StoredModel> list_models_in_dir(const std::string& models_dir) {
     return result;
 }
 
-std::optional<StoredModel> inspect_model_file(const std::string& model_file_path) {
+std::optional<StoredModel> inspect_model_file(const std::string& model_file_path,
+                                              bool include_hash) {
     if (model_file_path.empty()) return std::nullopt;
-    return build_model_meta(fs::path(model_file_path));
+    return build_model_meta(fs::path(model_file_path), include_hash);
 }
 
 std::optional<StoredModel> find_model_in_dir(const std::string& models_dir,

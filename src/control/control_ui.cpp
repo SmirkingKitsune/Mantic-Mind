@@ -250,7 +250,7 @@ void ControlUI::run() {
 
     auto refresh_control_catalog = [&](bool force) {
         const int64_t now_ms = util::now_ms();
-        if (!force && (now_ms - control_catalog_cached_at_ms) < 5000) return;
+        if (!force && (now_ms - control_catalog_cached_at_ms) < 30000) return;
         control_catalog_cached_at_ms = now_ms;
 
         control_catalog_filenames.clear();
@@ -288,7 +288,7 @@ void ControlUI::run() {
         const int64_t now_ms = util::now_ms();
         if (!force &&
             node_id == node_models_cached_node_id &&
-            (now_ms - node_models_cached_at_ms) < 3000) {
+            (now_ms - node_models_cached_at_ms) < 10000) {
             return;
         }
         node_models_cached_node_id = node_id;
