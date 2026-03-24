@@ -16,6 +16,8 @@
 #include "common/logger.hpp"
 #include "common/util.hpp"
 #include "common/sse_infer_ctx.hpp"
+#include "common/gguf_metadata.hpp"
+#include "common/model_catalog.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -27,6 +29,8 @@
 #include <cstdlib>
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
+#include <memory>
 
 namespace mm {
 
@@ -746,8 +750,9 @@ void ControlApiServer::register_routes() {
     // Helper: compute node_compatibility info for an agent config.
     auto compute_node_compat = [this](const AgentConfig& cfg) -> nlohmann::json {
         int64_t estimated_vram = 2048; // conservative default
+        const std::string resolved = resolve_model_path_for_metadata(cfg.model_path, models_dir_);
         std::error_code ec;
-        auto sz = std::filesystem::file_size(cfg.model_path, ec);
+        auto sz = std::filesystem::file_size(resolved.empty() ? cfg.model_path : resolved, ec);
         if (!ec) {
             estimated_vram = static_cast<int64_t>(
                 static_cast<double>(sz) * 1.2 / (1024.0 * 1024.0));
@@ -765,6 +770,27 @@ void ControlApiServer::register_routes() {
             {"compatible_nodes",   static_cast<int>(compatible.size())},
             {"total_nodes",        total_connected}
         };
+    };
+
+    auto extract_bearer = [](const std::string& auth_header) -> std::string {
+        static const std::string kBearer = "Bearer ";
+        if (auth_header.rfind(kBearer, 0) != 0) return {};
+        return auth_header.substr(kBearer.size());
+    };
+
+    auto require_node_auth = [this, &extract_bearer](const Request& req, Response& res) -> bool {
+        const std::string token = extract_bearer(req.get_header_value("Authorization"));
+        if (token.empty()) {
+            res.status = 401;
+            res.set_content(R"({"error":"missing bearer token"})", "application/json");
+            return false;
+        }
+        if (!registry_.find_node_by_api_key(token).has_value()) {
+            res.status = 401;
+            res.set_content(R"({"error":"invalid node api key"})", "application/json");
+            return false;
+        }
+        return true;
     };
 
     // ── POST /api/control/register-node ───────────────────────────────────────
@@ -796,6 +822,70 @@ void ControlApiServer::register_routes() {
     });
 
     // ── GET /v1/nodes ─────────────────────────────────────────────────────────
+    // ── GET /api/control/models  (node-authenticated) ─────────────────────────
+    server_->Get("/api/control/models", [this, &require_node_auth](const Request& req, Response& res) {
+        if (!require_node_auth(req, res)) return;
+        auto models = list_models_in_dir(models_dir_);
+        res.set_content(nlohmann::json{{"models", models}}.dump(), "application/json");
+    });
+
+    // ── GET /api/control/models/:filename/content  (node-authenticated) ───────
+    server_->Get("/api/control/models/:filename/content",
+                 [this, &require_node_auth](const Request& req, Response& res) {
+        if (!require_node_auth(req, res)) return;
+
+        std::string filename = canonical_model_filename(req.path_params.at("filename"));
+        if (!is_safe_model_filename(filename)) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid filename"})", "application/json");
+            return;
+        }
+
+        auto meta = find_model_in_dir(models_dir_, filename);
+        if (!meta) {
+            res.status = 404;
+            res.set_content(R"({"error":"model not found"})", "application/json");
+            return;
+        }
+
+        std::filesystem::path resolved_path;
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(models_dir_, ec)) {
+            if (!entry.is_regular_file()) continue;
+            if (entry.path().filename().string() == filename) {
+                resolved_path = entry.path();
+                break;
+            }
+        }
+        if (resolved_path.empty()) {
+            res.status = 404;
+            res.set_content(R"({"error":"model file path could not be resolved"})", "application/json");
+            return;
+        }
+
+        auto file = std::make_shared<std::ifstream>(resolved_path.string(), std::ios::binary);
+        if (!file->is_open()) {
+            res.status = 404;
+            res.set_content(R"({"error":"model file could not be opened"})", "application/json");
+            return;
+        }
+
+        res.set_header("X-Model-Filename", filename);
+        res.set_header("X-Model-SHA256", meta->sha256);
+        res.set_header("X-Model-Size-Bytes", std::to_string(meta->size_bytes));
+        res.set_chunked_content_provider(
+            "application/octet-stream",
+            [file](size_t /*offset*/, DataSink& sink) -> bool {
+                char buf[64 * 1024];
+                file->read(buf, static_cast<std::streamsize>(sizeof(buf)));
+                std::streamsize n = file->gcount();
+                if (n > 0) {
+                    return sink.write(buf, static_cast<size_t>(n));
+                }
+                return false;
+            });
+    });
+
     server_->Get("/v1/nodes", [this](const Request& /*req*/, Response& res) {
         auto nodes = registry_.list_nodes();
         nlohmann::json arr = nlohmann::json::array();
@@ -804,6 +894,109 @@ void ControlApiServer::register_routes() {
     });
 
     // ── GET /v1/agents ────────────────────────────────────────────────────────
+    // ── GET /v1/models ────────────────────────────────────────────────────────
+    server_->Get("/v1/models", [this](const Request& /*req*/, Response& res) {
+        auto models = list_models_in_dir(models_dir_);
+        res.set_content(nlohmann::json{{"models", models}}.dump(), "application/json");
+    });
+
+    // ── GET /v1/nodes/:id/models ──────────────────────────────────────────────
+    server_->Get("/v1/nodes/:id/models", [this](const Request& req, Response& res) {
+        const std::string node_id = req.path_params.at("id");
+        NodeInfo node;
+        try {
+            node = registry_.get_node(node_id);
+        } catch (...) {
+            res.status = 404;
+            res.set_content(R"({"error":"node not found"})", "application/json");
+            return;
+        }
+
+        HttpClient cli(node.url);
+        cli.set_bearer_token(node.api_key);
+        auto storage = cli.get("/api/node/storage");
+        if (storage.ok()) {
+            res.set_content(storage.body, "application/json");
+            return;
+        }
+
+        nlohmann::json body = {
+            {"stored_models", node.stored_models},
+            {"disk_free_mb", node.disk_free_mb},
+            {"warning", "node storage endpoint unavailable; returning last known snapshot"}
+        };
+        res.status = 200;
+        res.set_content(body.dump(), "application/json");
+    });
+
+    // ── POST /v1/nodes/:id/models/pull ────────────────────────────────────────
+    server_->Post("/v1/nodes/:id/models/pull", [this](const Request& req, Response& res) {
+        const std::string node_id = req.path_params.at("id");
+        NodeInfo node;
+        try {
+            node = registry_.get_node(node_id);
+        } catch (...) {
+            res.status = 404;
+            res.set_content(R"({"error":"node not found"})", "application/json");
+            return;
+        }
+
+        try {
+            auto j = nlohmann::json::parse(req.body);
+            std::string model_filename = canonical_model_filename(
+                j.value("model_filename", std::string{}));
+            bool force = j.value("force", false);
+            if (!is_safe_model_filename(model_filename)) {
+                res.status = 400;
+                res.set_content(R"({"error":"valid model_filename required"})", "application/json");
+                return;
+            }
+
+            HttpClient cli(node.url);
+            cli.set_bearer_token(node.api_key);
+            auto pull = cli.post("/api/node/models/pull",
+                                 nlohmann::json{{"model_filename", model_filename},
+                                                {"force", force}});
+            res.status = pull.status == 0 ? 502 : pull.status;
+            res.set_content(pull.body.empty()
+                                ? nlohmann::json{{"error", "node pull request failed"}}.dump()
+                                : pull.body,
+                            "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+        }
+    });
+
+    // ── DELETE /v1/nodes/:id/models/:filename ─────────────────────────────────
+    server_->Delete("/v1/nodes/:id/models/:filename", [this](const Request& req, Response& res) {
+        const std::string node_id = req.path_params.at("id");
+        std::string filename = canonical_model_filename(req.path_params.at("filename"));
+        if (!is_safe_model_filename(filename)) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid filename"})", "application/json");
+            return;
+        }
+
+        NodeInfo node;
+        try {
+            node = registry_.get_node(node_id);
+        } catch (...) {
+            res.status = 404;
+            res.set_content(R"({"error":"node not found"})", "application/json");
+            return;
+        }
+
+        HttpClient cli(node.url);
+        cli.set_bearer_token(node.api_key);
+        auto del = cli.del("/api/node/models/" + filename);
+        res.status = del.status == 0 ? 502 : del.status;
+        res.set_content(del.body.empty()
+                            ? nlohmann::json{{"error", "node delete request failed"}}.dump()
+                            : del.body,
+                        "application/json");
+    });
+
     server_->Get("/v1/agents", [this](const Request& /*req*/, Response& res) {
         auto configs = agents_.list_agents();
         nlohmann::json arr = nlohmann::json::array();

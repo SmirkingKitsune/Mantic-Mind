@@ -1,6 +1,7 @@
 #include "common/config_file.hpp"
 #include "common/http_client.hpp"
 #include "common/logger.hpp"
+#include "common/model_catalog.hpp"
 #include "common/node_discovery.hpp"
 #include "common/util.hpp"
 #include "node/model_storage.hpp"
@@ -354,6 +355,7 @@ int main() {
                              cfg.kv_cache_dir);
 
     mm::ModelStorage model_storage(cfg.models_dir);
+    state.set_storage(model_storage.list_models(), model_storage.free_space_mb());
 
     const char* repo_url_env = std::getenv("MM_LLAMA_REPO_URL");
     const char* install_root_env = std::getenv("MM_LLAMA_INSTALL_ROOT");
@@ -399,7 +401,8 @@ int main() {
 
     // ── API server ────────────────────────────────────────────────────────────
 
-    mm::NodeApiServer api_server(state, slot_mgr, model_storage, llama_runtime, cfg.pairing_key);
+    mm::NodeApiServer api_server(state, slot_mgr, model_storage, llama_runtime,
+                                 cfg.control_url, cfg.pairing_key);
 
     std::thread api_thread([&]() {
         if (!api_server.listen(cfg.listen_port))
@@ -428,17 +431,77 @@ int main() {
 
     // ── UI ────────────────────────────────────────────────────────────────────
 
-    mm::NodeUI ui(state, cfg.listen_port, [&]() {
-        mm::HttpClient self("http://127.0.0.1:" + std::to_string(cfg.listen_port));
-        self.set_bearer_token(initial_key);
-        auto r = self.post("/api/node/llama/update",
-                           nlohmann::json{{"build", true}, {"force", false}});
-        if (!r.ok()) {
-            MM_WARN("NodeUI update request failed (HTTP {}): {}", r.status, r.body);
-            return;
-        }
-        MM_INFO("NodeUI update request accepted: {}", r.body);
-    });
+    mm::NodeUI ui(
+        state,
+        cfg.listen_port,
+        [&]() {
+            mm::HttpClient self("http://127.0.0.1:" + std::to_string(cfg.listen_port));
+            self.set_bearer_token(initial_key);
+            auto r = self.post("/api/node/llama/update",
+                               nlohmann::json{{"build", true}, {"force", false}});
+            if (!r.ok()) {
+                MM_WARN("NodeUI update request failed (HTTP {}): {}", r.status, r.body);
+                return;
+            }
+            MM_INFO("NodeUI update request accepted: {}", r.body);
+        },
+        [&](const std::string& model_filename, std::string* out_message) -> bool {
+            const std::string filename = mm::canonical_model_filename(model_filename);
+            if (!mm::is_safe_model_filename(filename)) {
+                if (out_message) *out_message = "invalid model filename";
+                return false;
+            }
+
+            mm::HttpClient self("http://127.0.0.1:" + std::to_string(cfg.listen_port));
+            self.set_bearer_token(initial_key);
+            auto r = self.post("/api/node/models/pull",
+                               nlohmann::json{{"model_filename", filename}, {"force", false}});
+            if (!r.ok()) {
+                std::string msg = "pull failed (HTTP " + std::to_string(r.status) + ")";
+                try {
+                    auto j = nlohmann::json::parse(r.body);
+                    std::string err = j.value("error", std::string{});
+                    if (!err.empty()) msg += ": " + err;
+                } catch (...) {}
+                if (out_message) *out_message = msg;
+                return false;
+            }
+
+            std::string msg = "pulled " + filename;
+            try {
+                auto j = nlohmann::json::parse(r.body);
+                int downloaded = j.value("downloaded", 0);
+                int skipped = j.value("skipped", 0);
+                msg = "pull ok: downloaded " + std::to_string(downloaded) +
+                      ", skipped " + std::to_string(skipped);
+            } catch (...) {}
+            if (out_message) *out_message = msg;
+            return true;
+        },
+        [&](const std::string& model_filename, std::string* out_message) -> bool {
+            const std::string filename = mm::canonical_model_filename(model_filename);
+            if (!mm::is_safe_model_filename(filename)) {
+                if (out_message) *out_message = "invalid model filename";
+                return false;
+            }
+
+            mm::HttpClient self("http://127.0.0.1:" + std::to_string(cfg.listen_port));
+            self.set_bearer_token(initial_key);
+            auto r = self.del("/api/node/models/" + filename);
+            if (!r.ok()) {
+                std::string msg = "delete failed (HTTP " + std::to_string(r.status) + ")";
+                try {
+                    auto j = nlohmann::json::parse(r.body);
+                    std::string err = j.value("error", std::string{});
+                    if (!err.empty()) msg += ": " + err;
+                } catch (...) {}
+                if (out_message) *out_message = msg;
+                return false;
+            }
+
+            if (out_message) *out_message = "deleted " + filename;
+            return true;
+        });
     ui_ptr = &ui;
 
     // ── Reconnection loop ─────────────────────────────────────────────────────

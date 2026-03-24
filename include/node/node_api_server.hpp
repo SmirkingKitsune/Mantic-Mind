@@ -10,6 +10,7 @@ namespace mm {
 class NodeState;
 class SlotManager;
 class ModelStorage;
+class ModelPuller;
 class HttpServer;
 class LlamaRuntimeManager;
 
@@ -22,6 +23,7 @@ public:
                   SlotManager& slot_mgr,
                   ModelStorage& model_storage,
                   LlamaRuntimeManager& runtime_mgr,
+                  std::string control_url = {},
                   std::string pairing_key = {});
     ~NodeApiServer();
 
@@ -33,7 +35,9 @@ private:
     NodeState&     state_;
     SlotManager&   slot_mgr_;
     ModelStorage&  model_storage_;
+    std::unique_ptr<ModelPuller> model_puller_;
     LlamaRuntimeManager& runtime_mgr_;
+    std::string    control_url_;
     std::string    pairing_key_;
     std::unique_ptr<HttpServer> server_;
 

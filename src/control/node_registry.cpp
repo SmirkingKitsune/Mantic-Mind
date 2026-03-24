@@ -52,6 +52,14 @@ std::vector<NodeInfo> NodeRegistry::list_nodes() const {
     return out;
 }
 
+std::optional<NodeInfo> NodeRegistry::find_node_by_api_key(const std::string& api_key) const {
+    std::lock_guard<std::mutex> g(mutex_);
+    for (const auto& [_, n] : nodes_) {
+        if (n.api_key == api_key) return n;
+    }
+    return std::nullopt;
+}
+
 void NodeRegistry::set_node_loaded_model(const NodeId& id, const std::string& model) {
     std::lock_guard<std::mutex> g(mutex_);
     auto it = nodes_.find(id);

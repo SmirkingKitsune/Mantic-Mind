@@ -69,6 +69,22 @@ void NodeState::set_slots(const std::vector<SlotInfo>& slots) {
     }
 }
 
+std::vector<StoredModel> NodeState::get_stored_models() const {
+    std::lock_guard<std::mutex> g(mutex_);
+    return stored_models_;
+}
+
+int64_t NodeState::get_models_disk_free_mb() const {
+    std::lock_guard<std::mutex> g(mutex_);
+    return models_disk_free_mb_;
+}
+
+void NodeState::set_storage(const std::vector<StoredModel>& models, int64_t disk_free_mb) {
+    std::lock_guard<std::mutex> g(mutex_);
+    stored_models_ = models;
+    models_disk_free_mb_ = disk_free_mb;
+}
+
 // ── Metrics ────────────────────────────────────────────────────────────────────
 NodeHealthMetrics NodeState::get_metrics() const { std::lock_guard<std::mutex> g(mutex_); return metrics_; }
 void NodeState::update_metrics(const NodeHealthMetrics& m) {

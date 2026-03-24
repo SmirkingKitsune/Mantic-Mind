@@ -6,6 +6,7 @@
 #include <vector>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <atomic>
@@ -28,6 +29,7 @@ public:
     // Returns copy of NodeInfo (throws if not found).
     NodeInfo get_node(const NodeId& id) const;
     std::vector<NodeInfo> list_nodes() const;
+    std::optional<NodeInfo> find_node_by_api_key(const std::string& api_key) const;
 
     // Update the loaded_model field for a node (deprecated — kept for backwards compat).
     void set_node_loaded_model(const NodeId& id, const std::string& model_path);

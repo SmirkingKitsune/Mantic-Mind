@@ -80,6 +80,10 @@ public:
     // ── Multi-slot tracking ─────────────────────────────────────────────────
     std::vector<SlotInfo> get_slots() const;
     void                  set_slots(const std::vector<SlotInfo>& slots);
+    std::vector<StoredModel> get_stored_models() const;
+    int64_t                 get_models_disk_free_mb() const;
+    void                    set_storage(const std::vector<StoredModel>& models,
+                                        int64_t disk_free_mb);
 
     // ── Health metrics ────────────────────────────────────────────────────────
     NodeHealthMetrics get_metrics() const;
@@ -134,6 +138,8 @@ private:
     std::string                  loaded_model_;
     std::string                  active_agent_;
     std::vector<SlotInfo>        slots_;
+    std::vector<StoredModel>     stored_models_;
+    int64_t                      models_disk_free_mb_ = 0;
     NodeHealthMetrics            metrics_;
     std::string                  last_error_;
     std::string                  llama_server_path_;

@@ -301,7 +301,7 @@ bool LlamaRuntimeManager::refresh_versions_locked(bool force_remote, std::string
     status_.installed_commit.clear();
     if (has_repo) {
         int rc = 0;
-        std::string cmd = "git -C " + quote_shell_arg(repo_dir.string()) + " rev-parse --short HEAD";
+        std::string cmd = "git -C " + quote_shell_arg(repo_dir.string()) + " rev-parse HEAD";
         auto out = run_command_capture_stdout(cmd, &rc);
         if (rc == 0) status_.installed_commit = mm::util::trim(out);
     }

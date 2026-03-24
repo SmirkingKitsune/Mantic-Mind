@@ -14,6 +14,7 @@ set(MM_COMMON_SOURCES
     pairing.cpp
     node_discovery.cpp
     gguf_metadata.cpp
+    model_catalog.cpp
 )
 
 add_library(mm_common STATIC ${MM_COMMON_SOURCES})

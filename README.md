@@ -93,7 +93,7 @@ The node TUI shows the generated API key. In the control TUI, press **`[+] Add N
 # Create
 curl -X POST http://localhost:9090/v1/agents \
   -H "Content-Type: application/json" \
-  -d '{"name":"assistant","model_path":"/models/llama3.gguf"}' | jq
+  -d '{"name":"assistant","model_path":"llama3.gguf"}' | jq
 
 # Chat (streaming SSE)
 curl -N -X POST http://localhost:9090/v1/agents/<id>/chat \
@@ -153,6 +153,12 @@ Additional env-only settings:
 | `MM_LLAMA_INSTALL_ROOT` | node | Optional install root for updater jobs |
 | `MM_LLAMA_UPDATER_LOG_DIR` | node | Optional log directory for updater jobs |
 
+Model reference contract:
+
+- Prefer catalog filenames for `agent.model_path` (example: `llama3.gguf`).
+- Legacy absolute paths are still accepted, but control normalizes to `basename(model_path)` for placement and distribution decisions.
+- Node pull/delete APIs reject path traversal and non-filename model references.
+
 ## REST API
 
 ### Node API (`Authorization: Bearer <node-api-key>`)
@@ -160,31 +166,43 @@ Additional env-only settings:
 ```
 POST   /api/node/load-model         { model_path, settings }
 POST   /api/node/unload-model
-POST   /api/node/infer              { InferenceRequest }     → SSE
-POST   /api/node/llama/update       { build?: bool, force?: bool } → starts node-side updater
-POST   /api/node/llama/check-update {}                        → refreshes version check
-GET    /api/node/llama/status       → runtime/update/version status
-GET    /api/node/llama/jobs/{id}/log?offset=&limit=          → updater log slices
-GET    /api/node/health             → NodeHealthMetrics
-GET    /api/node/status             → { node_id, loaded_model, ... }
-GET    /api/node/models             → { models: [{path, name, size_mb}] }
+POST   /api/node/infer              { InferenceRequest }     -> SSE
+POST   /api/node/models/pull        { model_filename, force? }
+DELETE /api/node/models/{filename}  (node-local delete only)
+POST   /api/node/llama/update       { build?: bool, force?: bool } -> starts node-side updater
+POST   /api/node/llama/check-update {}                        -> refreshes version check
+GET    /api/node/llama/status       -> runtime/update/version status
+GET    /api/node/llama/jobs/{id}/log?offset=&limit=          -> updater log slices
+GET    /api/node/health             -> NodeHealthMetrics
+GET    /api/node/status             -> { node_id, loaded_model, ... }
+GET    /api/node/models             -> { models: [{path, name, size_mb}] }
+GET    /api/node/storage            -> { disk_free_mb, stored_models }
 POST   /api/node/api-keys           { key }
 DELETE /api/node/api-keys/{key}
 ```
 
-### Node → Control handshake
+### Node -> Control handshake
 
 ```
 POST   /api/control/register-node  { node_url, api_key, platform }
-                                   → { node_id, accepted }
+                                   -> { node_id, accepted }
 ```
+
+### Control Internal API (node-authenticated bearer token)
+
+```
+GET    /api/control/models
+GET    /api/control/models/{filename}/content   (streamed GGUF bytes with hash/size headers)
+```
+
+Bearer auth rule: token must match a registered node `api_key` in `NodeRegistry`.
 
 ### External Client API
 
 ```
 GET/POST       /v1/agents
 GET/PUT/DELETE /v1/agents/{id}
-POST           /v1/agents/{id}/chat               { message, conversation_id? } → SSE
+POST           /v1/agents/{id}/chat               { message, conversation_id? } -> SSE
 GET/POST       /v1/agents/{id}/conversations
 GET/DELETE     /v1/agents/{id}/conversations/{cid}
 POST           /v1/agents/{id}/conversations/{cid}/activate
@@ -193,6 +211,10 @@ GET            /v1/agents/{id}/memories
 PUT/DELETE     /v1/agents/{id}/memories/{mid}
 POST           /v1/agents/{id}/memories/extract   { conversation_id, start_index, end_index, context_before? }
 GET            /v1/nodes
+GET            /v1/models
+GET            /v1/nodes/{id}/models
+POST           /v1/nodes/{id}/models/pull         { model_filename, force? }
+DELETE         /v1/nodes/{id}/models/{filename}
 ```
 
 ### SSE Chat Events
@@ -235,6 +257,9 @@ mantic-mind  (:7070)
 |---|---|
 | `1` / `2` / `3` / `4` / `5` | Switch tabs (Nodes / Agents / Activity / Chat / Curation) |
 | `u` (Nodes tab) | Trigger llama.cpp update on selected node |
+| `p` (Nodes tab) | Pull selected control catalog model to selected node |
+| `d` (Nodes tab) | Delete selected model from selected node |
+| `r` (Nodes tab) | Refresh model catalog and selected node inventory |
 | `q` | Quit |
 | `Esc` | Close modal / editor / quit |
 
@@ -244,3 +269,5 @@ Node TUI extras:
 - `PgUp` / `PgDn`: faster log scrolling
 - `End`: jump back to live tail
 - `u`: run node-side llama.cpp updater (status includes persistent updater log path)
+- `p`: prompt for model filename and pull from control
+- `d`: prompt for model filename and delete local copy
