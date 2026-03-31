@@ -528,7 +528,7 @@ void ControlUI::run() {
         if (node_sel < 0 || node_sel >= static_cast<int>(ns.size())) return;
         const auto& n = ns[node_sel];
         std::string msg;
-        bool ok = registry_.request_llama_update(n.id, build, &msg);
+        bool ok = registry_.request_llama_update(n.id, build, false, &msg);
         if (ok) {
             log(LogLevel::Info, "Update started on node " + n.id + ": " + msg);
         } else {

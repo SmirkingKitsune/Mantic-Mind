@@ -45,8 +45,16 @@ AgentValidationResult validate_agent_config(const AgentConfig& cfg,
     if (cfg.llama_settings.ctx_size <= 0) {
         add_issue(result, ValidationSeverity::Error, "llama_settings.ctx_size", "ctx_size must be greater than 0.");
     }
-    if (cfg.llama_settings.max_tokens <= 0) {
-        add_issue(result, ValidationSeverity::Error, "llama_settings.max_tokens", "max_tokens must be greater than 0.");
+    if (cfg.llama_settings.max_tokens == -1) {
+        add_issue(result,
+                  ValidationSeverity::Warning,
+                  "llama_settings.max_tokens",
+                  "max_tokens is -1 (unlimited generation). Responses may run indefinitely until stopped.");
+    } else if (cfg.llama_settings.max_tokens <= 0) {
+        add_issue(result,
+                  ValidationSeverity::Error,
+                  "llama_settings.max_tokens",
+                  "max_tokens must be greater than 0, or -1 for unlimited generation.");
     }
     if (cfg.llama_settings.top_p <= 0.0f || cfg.llama_settings.top_p > 1.0f || !std::isfinite(cfg.llama_settings.top_p)) {
         add_issue(result, ValidationSeverity::Error, "llama_settings.top_p", "top_p must be within (0, 1].");

@@ -88,6 +88,7 @@ public:
     // Returns true if the node accepted the update job.
     bool request_llama_update(const NodeId& id,
                               bool build = true,
+                              bool force = false,
                               std::string* out_message = nullptr);
     bool request_llama_check_update(const NodeId& id,
                                     std::string* out_message = nullptr);

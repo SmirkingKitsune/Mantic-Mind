@@ -101,6 +101,70 @@ curl -N -X POST http://localhost:9090/v1/agents/<id>/chat \
   -d '{"message":"Hello!"}'
 ```
 
+## CLI Mode (Terminal Assistant)
+
+Both binaries now support explicit mode selection:
+
+```sh
+./mantic-mind --mode tui   # default
+./mantic-mind --mode cli   # interactive REPL
+./mantic-mind --mode cli --output json
+
+./mantic-mind-control --mode tui   # default
+./mantic-mind-control --mode cli   # interactive REPL
+./mantic-mind-control --mode cli --output json
+```
+
+Use `--help` on either binary for full command help:
+
+```sh
+./mantic-mind --help
+./mantic-mind-control --help
+```
+
+### Assistant-oriented CLI flow
+
+```sh
+# Terminal 1: control CLI
+./mantic-mind-control --mode cli --output text
+
+# Terminal 2: node CLI
+./mantic-mind --mode cli --output text
+```
+
+Example control CLI session:
+
+```text
+mm-control> nodes discovered
+mm-control> nodes pair psk http://127.0.0.1:7070 my-shared-key
+mm-control> nodes llama check <node_id>
+mm-control> models list
+mm-control> agents create {"name":"assistant","model_path":"llama3.gguf"}
+mm-control> agents list
+mm-control> chat send <agent_id> "Hello from CLI mode"
+mm-control> activity tail 50
+```
+
+Example node CLI session:
+
+```text
+mm-node> status
+mm-node> metrics
+mm-node> slots
+mm-node> models list
+mm-node> llama check-update
+mm-node> logs tail 100
+```
+
+For automation-friendly output:
+
+```sh
+./mantic-mind-control --mode cli --output json
+./mantic-mind --mode cli --output json
+```
+
+`--output json` emits one JSON object per command result. Streaming `chat send` emits JSON event lines (`delta`, `thinking`, `tool_call`, `done`) followed by a deterministic completion object.
+
 ## Configuration
 
 Config loading order:
@@ -178,8 +242,11 @@ GET    /api/node/health             -> NodeHealthMetrics
 GET    /api/node/status             -> { node_id, loaded_model, ... }
 GET    /api/node/models             -> { models: [{path, name, size_mb}] }
 GET    /api/node/storage            -> { disk_free_mb, stored_models }
+GET    /api/node/logs?tail=n        -> { lines: [...] }
+GET    /api/node/api-keys           -> { keys: [...] }
 POST   /api/node/api-keys           { key }
 DELETE /api/node/api-keys/{key}
+GET    /api/node/pair-status        -> { pending, mode?, expires_ms?, challenge?, pin? }
 ```
 
 ### Node -> Control handshake
@@ -212,10 +279,19 @@ GET            /v1/agents/{id}/memories
 PUT/DELETE     /v1/agents/{id}/memories/{mid}
 POST           /v1/agents/{id}/memories/extract   { conversation_id, start_index, end_index, context_before? }
 GET            /v1/nodes
+POST           /v1/nodes                            { url, api_key, platform? }
+DELETE         /v1/nodes/{id}
+GET            /v1/nodes/discovered
+POST           /v1/nodes/pair/start                 { url }
+POST           /v1/nodes/pair/complete              { url, nonce, pin_or_psk }
+POST           /v1/nodes/pair/psk                   { url, psk? }   (falls back to MM_PAIRING_KEY)
+POST           /v1/nodes/{id}/llama/check-update
+POST           /v1/nodes/{id}/llama/update          { build?, force? }
 GET            /v1/models
 GET            /v1/nodes/{id}/models
 POST           /v1/nodes/{id}/models/pull         { model_filename, force? }
 DELETE         /v1/nodes/{id}/models/{filename}
+GET            /v1/activity?tail=n&level=info|warn|error|0|1|2
 ```
 
 ### SSE Chat Events

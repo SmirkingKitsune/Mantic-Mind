@@ -316,6 +316,7 @@ std::string NodeRegistry::pair_node(const std::string& url,
 
 bool NodeRegistry::request_llama_update(const NodeId& id,
                                         bool build,
+                                        bool force,
                                         std::string* out_message) {
     NodeInfo info;
     {
@@ -332,7 +333,7 @@ bool NodeRegistry::request_llama_update(const NodeId& id,
     cli.set_bearer_token(info.api_key);
 
     auto res = cli.post("/api/node/llama/update",
-                        nlohmann::json{{"build", build}, {"force", false}});
+                        nlohmann::json{{"build", build}, {"force", force}});
     if (!res.ok()) {
         if (out_message) {
             std::string msg = "HTTP " + std::to_string(res.status);

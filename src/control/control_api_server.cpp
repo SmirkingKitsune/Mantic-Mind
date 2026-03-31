@@ -63,8 +63,22 @@ void ControlApiServer::stop() { server_->stop(); }
 
 void ControlApiServer::set_log_callback(LogCallback cb) { log_cb_ = std::move(cb); }
 
-void ControlApiServer::activity_log(int level, const std::string& message) {
+void ControlApiServer::publish_activity(int level, const std::string& message) {
+    nlohmann::json entry = {
+        {"timestamp_ms", util::now_ms()},
+        {"level", level},
+        {"message", message}
+    };
+    {
+        std::lock_guard<std::mutex> lk(activity_mutex_);
+        if (activity_entries_.size() >= kMaxActivityEntries) activity_entries_.pop_front();
+        activity_entries_.push_back(entry);
+    }
     if (log_cb_) log_cb_(level, message);
+}
+
+void ControlApiServer::activity_log(int level, const std::string& message) {
+    publish_activity(level, message);
 }
 
 ControlApiServer::LocalChatResult ControlApiServer::chat_local(
@@ -933,11 +947,187 @@ void ControlApiServer::register_routes() {
             });
     });
 
+    server_->Get("/v1/nodes/discovered", [this](const Request& /*req*/, Response& res) {
+        auto discovered = registry_.get_discovered_nodes();
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& d : discovered) {
+            arr.push_back(nlohmann::json{
+                {"url", d.url},
+                {"node_id", d.node_id},
+                {"last_seen_ms", d.last_seen_ms}
+            });
+        }
+        res.set_content(arr.dump(), "application/json");
+    });
+
+    server_->Post("/v1/nodes", [this](const Request& req, Response& res) {
+        try {
+            auto j = nlohmann::json::parse(req.body);
+            const std::string url = util::trim(j.value("url", std::string{}));
+            const std::string api_key = util::trim(j.value("api_key", std::string{}));
+            const std::string platform = util::trim(j.value("platform", std::string{}));
+            if (url.empty() || api_key.empty()) {
+                res.status = 400;
+                res.set_content(R"({"error":"url and api_key required"})", "application/json");
+                return;
+            }
+            const NodeId node_id = registry_.add_node(url, api_key, platform);
+            publish_activity(0, "Node added via API: " + node_id + " @ " + url);
+            res.status = 201;
+            res.set_content(nlohmann::json{{"node_id", node_id}}.dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+        }
+    });
+
+    server_->Delete("/v1/nodes/:id", [this](const Request& req, Response& res) {
+        const std::string node_id = req.path_params.at("id");
+        try {
+            registry_.get_node(node_id);
+        } catch (...) {
+            res.status = 404;
+            res.set_content(R"({"error":"node not found"})", "application/json");
+            return;
+        }
+        registry_.remove_node(node_id);
+        publish_activity(0, "Node removed via API: " + node_id);
+        res.set_content(R"({"status":"removed"})", "application/json");
+    });
+
+    server_->Post("/v1/nodes/pair/start", [this](const Request& req, Response& res) {
+        try {
+            auto j = nlohmann::json::parse(req.body);
+            const std::string url = util::trim(j.value("url", std::string{}));
+            if (url.empty()) {
+                res.status = 400;
+                res.set_content(R"({"error":"url required"})", "application/json");
+                return;
+            }
+            std::string nonce = registry_.start_pair(url);
+            if (nonce.empty()) {
+                res.status = 502;
+                res.set_content(R"({"error":"pair start failed"})", "application/json");
+                return;
+            }
+            publish_activity(0, "Pair start requested for " + url);
+            res.set_content(nlohmann::json{{"nonce", nonce}}.dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+        }
+    });
+
+    server_->Post("/v1/nodes/pair/complete", [this](const Request& req, Response& res) {
+        try {
+            auto j = nlohmann::json::parse(req.body);
+            const std::string url = util::trim(j.value("url", std::string{}));
+            const std::string nonce = util::trim(j.value("nonce", std::string{}));
+            const std::string pin_or_psk = util::trim(j.value("pin_or_psk", std::string{}));
+            if (url.empty() || nonce.empty() || pin_or_psk.empty()) {
+                res.status = 400;
+                res.set_content(R"({"error":"url, nonce, and pin_or_psk required"})", "application/json");
+                return;
+            }
+            std::string key = registry_.complete_pair(url, nonce, pin_or_psk);
+            if (key.empty()) {
+                res.status = 502;
+                res.set_content(R"({"error":"pair complete failed"})", "application/json");
+                return;
+            }
+            publish_activity(0, "Pair complete accepted for " + url);
+            res.set_content(nlohmann::json{{"api_key", key}}.dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+        }
+    });
+
+    server_->Post("/v1/nodes/pair/psk", [this](const Request& req, Response& res) {
+        try {
+            auto j = nlohmann::json::parse(req.body);
+            const std::string url = util::trim(j.value("url", std::string{}));
+            std::string psk = util::trim(j.value("psk", std::string{}));
+            if (url.empty()) {
+                res.status = 400;
+                res.set_content(R"({"error":"url required"})", "application/json");
+                return;
+            }
+            if (psk.empty()) {
+                const char* env_psk = std::getenv("MM_PAIRING_KEY");
+                if (env_psk && *env_psk) psk = env_psk;
+            }
+            if (psk.empty()) {
+                res.status = 400;
+                res.set_content(nlohmann::json{{"error", "psk required (or set MM_PAIRING_KEY)"}}.dump(),
+                                "application/json");
+                return;
+            }
+            std::string key = registry_.pair_node(url, psk);
+            if (key.empty()) {
+                res.status = 502;
+                res.set_content(R"({"error":"psk pair failed"})", "application/json");
+                return;
+            }
+            publish_activity(0, "PSK pair accepted for " + url);
+            res.set_content(nlohmann::json{{"api_key", key}}.dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+        }
+    });
+
     server_->Get("/v1/nodes", [this](const Request& /*req*/, Response& res) {
         auto nodes = registry_.list_nodes();
         nlohmann::json arr = nlohmann::json::array();
         for (auto& n : nodes) arr.push_back(nlohmann::json(n));
         res.set_content(arr.dump(), "application/json");
+    });
+
+    server_->Get("/v1/activity", [this](const Request& req, Response& res) {
+        int tail = 20;
+        if (req.has_param("tail")) {
+            try {
+                tail = std::stoi(req.get_param_value("tail"));
+            } catch (...) {
+                res.status = 400;
+                res.set_content(R"({"error":"tail must be an integer"})", "application/json");
+                return;
+            }
+        }
+        if (tail < 1) tail = 1;
+        if (tail > 5000) tail = 5000;
+
+        int level_filter = -1;
+        if (req.has_param("level")) {
+            std::string raw = util::to_lower(util::trim(req.get_param_value("level")));
+            if (raw == "info" || raw == "0") level_filter = 0;
+            else if (raw == "warn" || raw == "warning" || raw == "1") level_filter = 1;
+            else if (raw == "error" || raw == "2") level_filter = 2;
+            else {
+                res.status = 400;
+                res.set_content(R"({"error":"level must be info|warn|error|0|1|2"})", "application/json");
+                return;
+            }
+        }
+
+        std::vector<nlohmann::json> filtered;
+        {
+            std::lock_guard<std::mutex> lk(activity_mutex_);
+            filtered.reserve(activity_entries_.size());
+            for (const auto& entry : activity_entries_) {
+                if (level_filter >= 0) {
+                    const int lv = entry.value("level", 0);
+                    if (lv != level_filter) continue;
+                }
+                filtered.push_back(entry);
+            }
+        }
+        const int total = static_cast<int>(filtered.size());
+        const int start = std::max(0, total - tail);
+        nlohmann::json out = nlohmann::json::array();
+        for (int i = start; i < total; ++i) out.push_back(filtered[static_cast<std::size_t>(i)]);
+        res.set_content(nlohmann::json{{"entries", out}}.dump(), "application/json");
     });
 
     // ── GET /v1/agents ────────────────────────────────────────────────────────
@@ -948,6 +1138,50 @@ void ControlApiServer::register_routes() {
     });
 
     // ── GET /v1/nodes/:id/models ──────────────────────────────────────────────
+    server_->Post("/v1/nodes/:id/llama/check-update", [this](const Request& req, Response& res) {
+        const std::string node_id = req.path_params.at("id");
+        std::string message;
+        const bool ok = registry_.request_llama_check_update(node_id, &message);
+        if (!ok) {
+            const std::string lowered = util::to_lower(message);
+            res.status = lowered.find("node not found") != std::string::npos ? 404 : 502;
+            res.set_content(nlohmann::json{{"error", message.empty() ? "check-update failed" : message}}.dump(),
+                            "application/json");
+            return;
+        }
+        publish_activity(0, "Node llama check-update requested: " + node_id);
+        res.set_content(nlohmann::json{{"ok", true}, {"message", message}}.dump(), "application/json");
+    });
+
+    server_->Post("/v1/nodes/:id/llama/update", [this](const Request& req, Response& res) {
+        const std::string node_id = req.path_params.at("id");
+        bool build = true;
+        bool force = false;
+        if (!req.body.empty()) {
+            try {
+                auto j = nlohmann::json::parse(req.body);
+                build = j.value("build", true);
+                force = j.value("force", false);
+            } catch (const std::exception& e) {
+                res.status = 400;
+                res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+                return;
+            }
+        }
+
+        std::string message;
+        const bool ok = registry_.request_llama_update(node_id, build, force, &message);
+        if (!ok) {
+            const std::string lowered = util::to_lower(message);
+            res.status = lowered.find("node not found") != std::string::npos ? 404 : 502;
+            res.set_content(nlohmann::json{{"error", message.empty() ? "update failed" : message}}.dump(),
+                            "application/json");
+            return;
+        }
+        publish_activity(0, "Node llama update requested: " + node_id);
+        res.set_content(nlohmann::json{{"ok", true}, {"message", message}}.dump(), "application/json");
+    });
+
     server_->Get("/v1/nodes/:id/models", [this](const Request& req, Response& res) {
         const std::string node_id = req.path_params.at("id");
         NodeInfo node;

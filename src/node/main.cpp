@@ -1,4 +1,5 @@
 #include "common/config_file.hpp"
+#include "common/cli_repl.hpp"
 #include "common/http_client.hpp"
 #include "common/logger.hpp"
 #include "common/model_catalog.hpp"
@@ -18,10 +19,13 @@
 #include <atomic>
 #include <algorithm>
 #include <chrono>
+#include <csignal>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -263,8 +267,452 @@ static bool try_register(const mm::NodeConfig& cfg,
     return false;
 }
 
+enum class NodeRunMode { Tui, Cli };
+enum class CliOutputMode { Text, Json };
+
+struct NodeMainArgs {
+    NodeRunMode mode = NodeRunMode::Tui;
+    CliOutputMode output = CliOutputMode::Text;
+    bool show_help = false;
+    std::string error;
+};
+
+static NodeMainArgs parse_node_main_args(int argc, char** argv) {
+    NodeMainArgs out;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i] ? argv[i] : "";
+        if (arg == "--help" || arg == "-h") {
+            out.show_help = true;
+            continue;
+        }
+        if (arg == "--mode") {
+            if (i + 1 >= argc) {
+                out.error = "--mode requires a value: tui or cli";
+                return out;
+            }
+            std::string value = mm::util::to_lower(argv[++i] ? argv[i] : "");
+            if (value == "tui") out.mode = NodeRunMode::Tui;
+            else if (value == "cli") out.mode = NodeRunMode::Cli;
+            else out.error = "invalid --mode value '" + value + "' (expected tui|cli)";
+            if (!out.error.empty()) return out;
+            continue;
+        }
+        if (arg == "--output") {
+            if (i + 1 >= argc) {
+                out.error = "--output requires a value: text or json";
+                return out;
+            }
+            std::string value = mm::util::to_lower(argv[++i] ? argv[i] : "");
+            if (value == "text") out.output = CliOutputMode::Text;
+            else if (value == "json") out.output = CliOutputMode::Json;
+            else out.error = "invalid --output value '" + value + "' (expected text|json)";
+            if (!out.error.empty()) return out;
+            continue;
+        }
+        if (mm::util::starts_with(arg, "--mode=")) {
+            std::string value = mm::util::to_lower(arg.substr(std::string("--mode=").size()));
+            if (value == "tui") out.mode = NodeRunMode::Tui;
+            else if (value == "cli") out.mode = NodeRunMode::Cli;
+            else out.error = "invalid --mode value '" + value + "' (expected tui|cli)";
+            if (!out.error.empty()) return out;
+            continue;
+        }
+        if (mm::util::starts_with(arg, "--output=")) {
+            std::string value = mm::util::to_lower(arg.substr(std::string("--output=").size()));
+            if (value == "text") out.output = CliOutputMode::Text;
+            else if (value == "json") out.output = CliOutputMode::Json;
+            else out.error = "invalid --output value '" + value + "' (expected text|json)";
+            if (!out.error.empty()) return out;
+            continue;
+        }
+        out.error = "unknown argument: " + arg;
+        return out;
+    }
+    return out;
+}
+
+static void print_node_usage() {
+    std::cout
+        << "Usage: mantic-mind [--mode tui|cli] [--output text|json] [--help]\n\n"
+        << "Modes:\n"
+        << "  tui  Default FTXUI terminal interface.\n"
+        << "  cli  Interactive REPL suitable for terminal assistants.\n\n"
+        << "Output:\n"
+        << "  text Default human-readable CLI output.\n"
+        << "  json Structured CLI output for automation.\n\n"
+        << "CLI commands:\n"
+        << "  status\n"
+        << "  metrics\n"
+        << "  slots\n"
+        << "  models list\n"
+        << "  models pull <model_filename>\n"
+        << "  models delete <model_filename>\n"
+        << "  llama check-update\n"
+        << "  llama update [build(true|false)] [force(true|false)]\n"
+        << "  api-key list\n"
+        << "  api-key add <key>\n"
+        << "  api-key remove <key>\n"
+        << "  pair status\n"
+        << "  logs tail [n]\n"
+        << "  help\n"
+        << "  quit\n";
+}
+
+class CliPrinter {
+public:
+    explicit CliPrinter(std::string prompt) : prompt_(std::move(prompt)) {}
+
+    void print_prompt() {
+        std::lock_guard<std::mutex> lk(mu_);
+        prompt_visible_ = true;
+        std::cout << prompt_ << std::flush;
+    }
+
+    void line(const std::string& text) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (prompt_visible_) std::cout << '\r';
+        prompt_visible_ = false;
+        std::cout << text << '\n';
+    }
+
+    void block(const std::string& text) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (prompt_visible_) std::cout << '\r';
+        prompt_visible_ = false;
+        std::cout << text;
+        if (text.empty() || text.back() != '\n') std::cout << '\n';
+    }
+
+private:
+    std::mutex mu_;
+    std::string prompt_;
+    bool prompt_visible_ = false;
+};
+
+static std::atomic<bool>* g_node_cli_stop = nullptr;
+
+static void node_cli_signal_handler(int /*signal*/) {
+    if (g_node_cli_stop) g_node_cli_stop->store(true);
+}
+
+static std::string summarize_http_error(const mm::HttpResponse& r) {
+    std::string msg = "HTTP " + std::to_string(r.status);
+    const std::string body = mm::util::trim(r.body);
+    if (!body.empty()) msg += ": " + body;
+    return msg;
+}
+
+static void run_node_cli(uint16_t listen_port,
+                         const std::string& initial_key,
+                         CliOutputMode output_mode,
+                         std::atomic<bool>& stop_flag) {
+    CliPrinter printer("mm-node> ");
+    printer.line("CLI mode active. Type 'help' for commands.");
+
+    mm::HttpClient self("http://127.0.0.1:" + std::to_string(listen_port));
+    self.set_bearer_token(initial_key);
+    const bool json_mode = output_mode == CliOutputMode::Json;
+
+    auto print_help = [&]() {
+        printer.line("Commands: status | metrics | slots | models list | models pull <file> | "
+                     "models delete <file> | llama check-update | llama update [build] [force] | "
+                     "api-key list|add|remove | pair status | logs tail [n] | help | quit");
+    };
+
+    auto parse_or_wrap = [&](const std::string& body) -> nlohmann::json {
+        try {
+            return nlohmann::json::parse(body);
+        } catch (...) {
+            return nlohmann::json{{"raw", body}};
+        }
+    };
+
+    auto emit_result = [&](bool ok, const std::string& command, const nlohmann::json& data, const std::string& error) {
+        if (json_mode) {
+            nlohmann::json out{{"ok", ok}, {"command", command}};
+            if (ok) out["data"] = data;
+            else out["error"] = error;
+            printer.block(out.dump());
+            return;
+        }
+        if (!ok) {
+            printer.line("error: " + error);
+            return;
+        }
+        if (data.is_null() || data.empty()) printer.line("ok");
+        else if (data.is_string()) printer.line(data.get<std::string>());
+        else printer.block(data.dump(2));
+    };
+
+    auto emit_http_result = [&](const std::string& command, const mm::HttpResponse& r) {
+        if (r.ok()) emit_result(true, command, parse_or_wrap(r.body), "");
+        else emit_result(false, command, nlohmann::json::object(), summarize_http_error(r));
+    };
+
+    while (!stop_flag.load()) {
+        printer.print_prompt();
+        std::string line;
+        if (!std::getline(std::cin, line)) {
+            printer.line("");
+            break;
+        }
+
+        std::vector<std::string> tokens;
+        std::string parse_error;
+        if (!mm::cli::tokenize_command_line(line, &tokens, &parse_error)) {
+            printer.line("error: " + parse_error);
+            continue;
+        }
+        if (tokens.empty()) continue;
+
+        const std::string cmd0 = mm::util::to_lower(tokens[0]);
+        if (cmd0 == "quit" || cmd0 == "exit") break;
+        if (cmd0 == "help") {
+            print_help();
+            continue;
+        }
+
+        if (cmd0 == "status") {
+            auto r = self.get("/api/node/status");
+            if (!r.ok()) {
+                emit_result(false, "status", nlohmann::json::object(), summarize_http_error(r));
+                continue;
+            }
+            auto j = parse_or_wrap(r.body);
+            if (json_mode) {
+                emit_result(true, "status", j, "");
+            } else {
+                std::string line_out =
+                    "node_id=" + j.value("node_id", std::string{}) +
+                    " slots=" + std::to_string(j.value("slot_in_use", 0)) + "/" + std::to_string(j.value("max_slots", 0)) +
+                    " stored_models=" + std::to_string(static_cast<int>(j.value("stored_models", nlohmann::json::array()).size())) +
+                    " llama_path=\"" + j.value("llama_server_path", std::string{}) + "\"" +
+                    " update_available=" + (j.value("llama_update_available", false) ? "yes" : "no");
+                printer.line(line_out);
+            }
+            continue;
+        }
+
+        if (cmd0 == "metrics") {
+            auto r = self.get("/api/node/health");
+            if (!r.ok()) {
+                emit_result(false, "metrics", nlohmann::json::object(), summarize_http_error(r));
+                continue;
+            }
+            auto j = parse_or_wrap(r.body);
+            if (json_mode) emit_result(true, "metrics", j, "");
+            else {
+                printer.line(
+                    "cpu=" + std::to_string(j.value("cpu_percent", 0.0f)) +
+                    "% ram=" + std::to_string(j.value("ram_percent", 0.0f)) +
+                    "% (" + std::to_string(j.value("ram_used_mb", 0LL)) + "/" + std::to_string(j.value("ram_total_mb", 0LL)) + " MB)" +
+                    " gpu=" + std::to_string(j.value("gpu_percent", 0.0f)) +
+                    "% vram=" + std::to_string(j.value("gpu_vram_used_mb", 0LL)) + "/" + std::to_string(j.value("gpu_vram_total_mb", 0LL)) + " MB" +
+                    " disk_free=" + std::to_string(j.value("disk_free_mb", 0LL)) + " MB" +
+                    " gpu_backend=" + (j.value("gpu_backend_available", false) ? "yes" : "no"));
+            }
+            continue;
+        }
+
+        if (cmd0 == "slots") {
+            auto r = self.get("/api/node/status");
+            if (!r.ok()) {
+                emit_result(false, "slots", nlohmann::json::object(), summarize_http_error(r));
+                continue;
+            }
+            auto j = parse_or_wrap(r.body);
+            if (json_mode) {
+                emit_result(true, "slots", j.value("slots", nlohmann::json::array()), "");
+                continue;
+            }
+            auto slots = j.value("slots", nlohmann::json::array());
+            if (!slots.is_array() || slots.empty()) {
+                printer.line("(no slots)");
+                continue;
+            }
+            for (const auto& s : slots) {
+                printer.line(
+                    s.value("id", std::string{}) +
+                    " state=" + s.value("state", std::string{}) +
+                    " port=" + std::to_string(s.value("port", 0)) +
+                    " model=" + (s.value("model_path", std::string{}).empty() ? "-" : s.value("model_path", std::string{})) +
+                    " agent=" + (s.value("assigned_agent", std::string{}).empty() ? "-" : s.value("assigned_agent", std::string{})) +
+                    " vram_mb=" + std::to_string(s.value("vram_usage_mb", 0LL)));
+            }
+            continue;
+        }
+
+        if (cmd0 == "models") {
+            if (tokens.size() < 2) {
+                printer.line("usage: models list | models pull <model_filename> | models delete <model_filename>");
+                continue;
+            }
+            const std::string sub = mm::util::to_lower(tokens[1]);
+            if (sub == "list") {
+                auto r = self.get("/api/node/models");
+                if (!r.ok()) {
+                    emit_result(false, "models list", nlohmann::json::object(), summarize_http_error(r));
+                    continue;
+                }
+                auto j = parse_or_wrap(r.body);
+                if (json_mode) {
+                    emit_result(true, "models list", j, "");
+                    continue;
+                }
+                auto models = j.value("models", nlohmann::json::array());
+                if (!models.is_array() || models.empty()) {
+                    printer.line("(no models)");
+                    continue;
+                }
+                for (const auto& m : models) {
+                    printer.line(m.value("model_path", std::string{}) +
+                                 " size_bytes=" + std::to_string(m.value("size_bytes", 0LL)) +
+                                 " shards=" + std::to_string(m.value("shard_count", 0)));
+                }
+                continue;
+            }
+            if (sub == "pull") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: models pull <model_filename>");
+                    continue;
+                }
+                const std::string filename = mm::canonical_model_filename(tokens[2]);
+                if (!mm::is_safe_model_filename(filename)) {
+                    printer.line("error: invalid model filename");
+                    continue;
+                }
+                auto r = self.post("/api/node/models/pull",
+                                   nlohmann::json{{"model_filename", filename}, {"force", false}});
+                emit_http_result("models pull", r);
+                continue;
+            }
+            if (sub == "delete") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: models delete <model_filename>");
+                    continue;
+                }
+                const std::string filename = mm::canonical_model_filename(tokens[2]);
+                if (!mm::is_safe_model_filename(filename)) {
+                    printer.line("error: invalid model filename");
+                    continue;
+                }
+                auto r = self.del("/api/node/models/" + filename);
+                emit_http_result("models delete", r);
+                continue;
+            }
+            printer.line("error: unknown models subcommand");
+            continue;
+        }
+
+        if (cmd0 == "llama") {
+            if (tokens.size() < 2) {
+                printer.line("usage: llama check-update | llama update [build] [force]");
+                continue;
+            }
+            const std::string sub = mm::util::to_lower(tokens[1]);
+            if (sub == "check-update") {
+                auto r = self.post("/api/node/llama/check-update", nlohmann::json::object());
+                emit_http_result("llama check-update", r);
+                continue;
+            }
+            if (sub == "update") {
+                bool build = true;
+                bool force = false;
+                if (tokens.size() >= 3 && !mm::cli::parse_bool_token(tokens[2], &build)) {
+                    printer.line("error: build must be true|false");
+                    continue;
+                }
+                if (tokens.size() >= 4 && !mm::cli::parse_bool_token(tokens[3], &force)) {
+                    printer.line("error: force must be true|false");
+                    continue;
+                }
+                auto r = self.post("/api/node/llama/update",
+                                   nlohmann::json{{"build", build}, {"force", force}});
+                emit_http_result("llama update", r);
+                continue;
+            }
+            printer.line("error: unknown llama subcommand");
+            continue;
+        }
+
+        if (cmd0 == "api-key") {
+            if (tokens.size() < 2) {
+                printer.line("usage: api-key list | api-key add <key> | api-key remove <key>");
+                continue;
+            }
+            const std::string sub = mm::util::to_lower(tokens[1]);
+            if (sub == "list") {
+                emit_http_result("api-key list", self.get("/api/node/api-keys"));
+                continue;
+            }
+            if (sub == "add") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: api-key add <key>");
+                    continue;
+                }
+                auto r = self.post("/api/node/api-keys", nlohmann::json{{"key", tokens[2]}});
+                emit_http_result("api-key add", r);
+                continue;
+            }
+            if (sub == "remove") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: api-key remove <key>");
+                    continue;
+                }
+                auto r = self.del("/api/node/api-keys/" + tokens[2]);
+                emit_http_result("api-key remove", r);
+                continue;
+            }
+            printer.line("error: unknown api-key subcommand");
+            continue;
+        }
+
+        if (cmd0 == "pair") {
+            if (tokens.size() >= 2 && mm::util::to_lower(tokens[1]) == "status") {
+                emit_http_result("pair status", self.get("/api/node/pair-status"));
+                continue;
+            }
+            printer.line("usage: pair status");
+            continue;
+        }
+
+        if (cmd0 == "logs") {
+            if (tokens.size() < 2 || mm::util::to_lower(tokens[1]) != "tail") {
+                printer.line("usage: logs tail [n]");
+                continue;
+            }
+            int n = 20;
+            if (tokens.size() >= 3) {
+                try {
+                    n = std::stoi(tokens[2]);
+                } catch (...) {
+                    printer.line("error: n must be an integer");
+                    continue;
+                }
+                if (n < 1) n = 1;
+            }
+
+            emit_http_result("logs tail", self.get("/api/node/logs?tail=" + std::to_string(n)));
+            continue;
+        }
+
+        printer.line("error: unknown command. Type 'help'.");
+    }
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
-int main() {
+int main(int argc, char** argv) {
+    const NodeMainArgs args = parse_node_main_args(argc, argv);
+    if (!args.error.empty()) {
+        std::cerr << "ERROR: " << args.error << "\n\n";
+        print_node_usage();
+        return 1;
+    }
+    if (args.show_help) {
+        print_node_usage();
+        return 0;
+    }
+
     // ── Singleton lock ────────────────────────────────────────────────────────
     auto instance_lock = mm::SingletonLock::try_acquire();
     if (!instance_lock) {
@@ -302,7 +750,11 @@ int main() {
         }
     }
 
-    mm::init_logger(cfg.log_file, "mm-node");
+    mm::init_logger(
+        cfg.log_file,
+        "mm-node",
+        args.mode == NodeRunMode::Cli ? spdlog::level::off : spdlog::level::info,
+        spdlog::level::trace);
     MM_INFO("mantic-mind node starting — listen port {}, slots {}, port range {}-{}",
             cfg.listen_port, cfg.max_slots,
             cfg.llama_port_range_start, cfg.llama_port_range_end);
@@ -385,24 +837,43 @@ int main() {
         MM_INFO("Applied updated llama-server path: {}", out_path);
     });
 
+    std::mutex runtime_log_mutex;
+    std::deque<std::string> runtime_logs;
+    constexpr std::size_t kMaxRuntimeLogLines = 4000;
+    auto append_runtime_log = [&](const std::string& entry) {
+        std::lock_guard<std::mutex> lk(runtime_log_mutex);
+        if (runtime_logs.size() >= kMaxRuntimeLogLines) runtime_logs.pop_front();
+        runtime_logs.push_back(entry);
+    };
+
     mm::NodeUI* ui_ptr = nullptr;
-    slot_mgr.set_log_callback([&ui_ptr](const std::string& line, bool is_stderr) {
-        if (!ui_ptr) return;
-        if (is_stderr) {
-            ui_ptr->append_log("[stderr] " + line);
-        } else {
-            ui_ptr->append_log(line);
-        }
+    slot_mgr.set_log_callback([&](const std::string& line, bool is_stderr) {
+        const std::string out = is_stderr ? "[stderr] " + line : line;
+        append_runtime_log(out);
+        if (ui_ptr) ui_ptr->append_log(out);
     });
-    llama_runtime.set_log_callback([&ui_ptr](const std::string& line) {
-        if (!ui_ptr) return;
-        ui_ptr->append_log("[llama-updater] " + line);
+    llama_runtime.set_log_callback([&](const std::string& line) {
+        const std::string out = "[llama-updater] " + line;
+        append_runtime_log(out);
+        if (ui_ptr) ui_ptr->append_log(out);
     });
 
     // ── API server ────────────────────────────────────────────────────────────
 
     mm::NodeApiServer api_server(state, slot_mgr, model_storage, llama_runtime,
                                  cfg.control_url, cfg.pairing_key);
+    api_server.set_runtime_logs_provider([&](int tail) {
+        if (tail < 1) tail = 1;
+        std::vector<std::string> out;
+        std::lock_guard<std::mutex> lk(runtime_log_mutex);
+        const int total = static_cast<int>(runtime_logs.size());
+        const int start = std::max(0, total - tail);
+        out.reserve(static_cast<std::size_t>(total - start));
+        for (int i = start; i < total; ++i) {
+            out.push_back(runtime_logs[static_cast<std::size_t>(i)]);
+        }
+        return out;
+    });
 
     std::thread api_thread([&]() {
         if (!api_server.listen(cfg.listen_port))
@@ -411,7 +882,7 @@ int main() {
 
     // Give the server a moment to bind before we register / broadcast.
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
-    {
+    if (args.mode == NodeRunMode::Tui) {
         std::string msg;
         llama_runtime.check_update(&msg, /*force_remote=*/false);
         MM_INFO("llama runtime check: {}", msg);
@@ -431,78 +902,66 @@ int main() {
 
     // ── UI ────────────────────────────────────────────────────────────────────
 
-    mm::NodeUI ui(
-        state,
-        cfg.listen_port,
-        [&]() {
-            mm::HttpClient self("http://127.0.0.1:" + std::to_string(cfg.listen_port));
-            self.set_bearer_token(initial_key);
-            auto r = self.post("/api/node/llama/update",
-                               nlohmann::json{{"build", true}, {"force", false}});
-            if (!r.ok()) {
-                MM_WARN("NodeUI update request failed (HTTP {}): {}", r.status, r.body);
-                return;
-            }
-            MM_INFO("NodeUI update request accepted: {}", r.body);
-        },
-        [&](const std::string& model_filename, std::string* out_message) -> bool {
-            const std::string filename = mm::canonical_model_filename(model_filename);
-            if (!mm::is_safe_model_filename(filename)) {
-                if (out_message) *out_message = "invalid model filename";
-                return false;
-            }
+    auto request_llama_update = [&]() {
+        mm::HttpClient self("http://127.0.0.1:" + std::to_string(cfg.listen_port));
+        self.set_bearer_token(initial_key);
+        auto r = self.post("/api/node/llama/update",
+                           nlohmann::json{{"build", true}, {"force", false}});
+        if (!r.ok()) {
+            MM_WARN("Node UI/CLI update request failed (HTTP {}): {}", r.status, r.body);
+            return;
+        }
+        MM_INFO("Node UI/CLI update request accepted: {}", r.body);
+    };
+    auto request_model_pull = [&](const std::string& model_filename, std::string* out_message) -> bool {
+        const std::string filename = mm::canonical_model_filename(model_filename);
+        if (!mm::is_safe_model_filename(filename)) {
+            if (out_message) *out_message = "invalid model filename";
+            return false;
+        }
 
-            mm::HttpClient self("http://127.0.0.1:" + std::to_string(cfg.listen_port));
-            self.set_bearer_token(initial_key);
-            auto r = self.post("/api/node/models/pull",
-                               nlohmann::json{{"model_filename", filename}, {"force", false}});
-            if (!r.ok()) {
-                std::string msg = "pull failed (HTTP " + std::to_string(r.status) + ")";
-                try {
-                    auto j = nlohmann::json::parse(r.body);
-                    std::string err = j.value("error", std::string{});
-                    if (!err.empty()) msg += ": " + err;
-                } catch (...) {}
-                if (out_message) *out_message = msg;
-                return false;
-            }
-
-            std::string msg = "pulled " + filename;
+        mm::HttpClient self("http://127.0.0.1:" + std::to_string(cfg.listen_port));
+        self.set_bearer_token(initial_key);
+        auto r = self.post("/api/node/models/pull",
+                           nlohmann::json{{"model_filename", filename}, {"force", false}});
+        if (!r.ok()) {
+            std::string msg = "pull failed (HTTP " + std::to_string(r.status) + ")";
             try {
                 auto j = nlohmann::json::parse(r.body);
-                int downloaded = j.value("downloaded", 0);
-                int skipped = j.value("skipped", 0);
-                msg = "pull ok: downloaded " + std::to_string(downloaded) +
-                      ", skipped " + std::to_string(skipped);
+                std::string err = j.value("error", std::string{});
+                if (!err.empty()) msg += ": " + err;
             } catch (...) {}
             if (out_message) *out_message = msg;
-            return true;
-        },
-        [&](const std::string& model_filename, std::string* out_message) -> bool {
-            const std::string filename = mm::canonical_model_filename(model_filename);
-            if (!mm::is_safe_model_filename(filename)) {
-                if (out_message) *out_message = "invalid model filename";
-                return false;
-            }
+            return false;
+        }
 
-            mm::HttpClient self("http://127.0.0.1:" + std::to_string(cfg.listen_port));
-            self.set_bearer_token(initial_key);
-            auto r = self.del("/api/node/models/" + filename);
-            if (!r.ok()) {
-                std::string msg = "delete failed (HTTP " + std::to_string(r.status) + ")";
-                try {
-                    auto j = nlohmann::json::parse(r.body);
-                    std::string err = j.value("error", std::string{});
-                    if (!err.empty()) msg += ": " + err;
-                } catch (...) {}
-                if (out_message) *out_message = msg;
-                return false;
-            }
+        if (out_message) *out_message = "pull requested: " + filename;
+        return true;
+    };
+    auto request_model_delete = [&](const std::string& model_filename, std::string* out_message) -> bool {
+        const std::string filename = mm::canonical_model_filename(model_filename);
+        if (!mm::is_safe_model_filename(filename)) {
+            if (out_message) *out_message = "invalid model filename";
+            return false;
+        }
 
-            if (out_message) *out_message = "deleted " + filename;
-            return true;
-        });
-    ui_ptr = &ui;
+        mm::HttpClient self("http://127.0.0.1:" + std::to_string(cfg.listen_port));
+        self.set_bearer_token(initial_key);
+        auto r = self.del("/api/node/models/" + filename);
+        if (!r.ok()) {
+            std::string msg = "delete failed (HTTP " + std::to_string(r.status) + ")";
+            try {
+                auto j = nlohmann::json::parse(r.body);
+                std::string err = j.value("error", std::string{});
+                if (!err.empty()) msg += ": " + err;
+            } catch (...) {}
+            if (out_message) *out_message = msg;
+            return false;
+        }
+
+        if (out_message) *out_message = "deleted " + filename;
+        return true;
+    };
 
     // ── Reconnection loop ─────────────────────────────────────────────────────
     // Retries registration with control every 30 s until success or shutdown.
@@ -564,8 +1023,32 @@ int main() {
 
     // ── Run UI (blocks until q / Esc) ─────────────────────────────────────────
 
-    ui.run();
-    MM_INFO("UI exited — shutting down");
+    if (args.mode == NodeRunMode::Tui) {
+        mm::NodeUI ui(
+            state,
+            cfg.listen_port,
+            request_llama_update,
+            request_model_pull,
+            request_model_delete);
+        ui_ptr = &ui;
+        ui.run();
+        ui_ptr = nullptr;
+        MM_INFO("UI exited - shutting down");
+    } else {
+        std::atomic<bool> stop_cli{false};
+        g_node_cli_stop = &stop_cli;
+        auto old_int = std::signal(SIGINT, node_cli_signal_handler);
+#ifdef SIGTERM
+        auto old_term = std::signal(SIGTERM, node_cli_signal_handler);
+#endif
+        run_node_cli(cfg.listen_port, initial_key, args.output, stop_cli);
+        g_node_cli_stop = nullptr;
+        std::signal(SIGINT, old_int);
+#ifdef SIGTERM
+        std::signal(SIGTERM, old_term);
+#endif
+        MM_INFO("CLI exited - shutting down");
+    }
 
     // ── Graceful shutdown ─────────────────────────────────────────────────────
 
