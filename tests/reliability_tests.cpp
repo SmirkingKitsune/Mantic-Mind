@@ -30,6 +30,16 @@ std::filesystem::path temp_test_dir(const std::string& name) {
         / ("mantic-mind-" + name + "-" + mm::util::generate_uuid());
 }
 
+bool remove_tree(const std::filesystem::path& dir) {
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    if (ec) {
+        std::cerr << "cleanup failed for " << dir << ": " << ec.message() << "\n";
+        return false;
+    }
+    return true;
+}
+
 bool test_non_stream_parser_preserves_text() {
     const std::string body =
         R"({"choices":[{"message":{"content":"abcdefghijklmnopqrstuvwxyz"}}],)"
@@ -129,9 +139,10 @@ bool test_agent_queue_survives_throwing_job() {
     return true;
 }
 
-bool test_agent_manager_rejects_duplicates_and_keeps_handles_alive() {
+bool test_agent_manager_rejects_duplicates_and_defers_cleanup_until_handles_release() {
     auto dir = temp_test_dir("agents");
     std::filesystem::create_directories(dir);
+    const auto agent_dir = dir / "agents" / "agent-a";
 
     mm::AgentManager manager(dir.string());
     mm::AgentConfig cfg;
@@ -153,9 +164,12 @@ bool test_agent_manager_rejects_duplicates_and_keeps_handles_alive() {
 
     CHECK(manager.delete_agent("agent-a"));
     CHECK(held->get_id() == "agent-a");
+    CHECK(std::filesystem::exists(agent_dir));
 
-    std::error_code ec;
-    std::filesystem::remove_all(dir, ec);
+    held.reset();
+    CHECK(!std::filesystem::exists(agent_dir));
+
+    CHECK(remove_tree(dir));
     return true;
 }
 
@@ -172,8 +186,7 @@ bool test_slot_manager_not_found_statuses() {
     auto unload_all = slots.unload_all(false);
     CHECK(unload_all.status == mm::SlotOperationStatus::Ok);
 
-    std::error_code ec;
-    std::filesystem::remove_all(dir, ec);
+    CHECK(remove_tree(dir));
     return true;
 }
 
@@ -196,8 +209,7 @@ bool test_slot_lease_blocks_unload_and_suspend_while_busy() {
     auto unload_after_release = slots.unload_slot(slot_id);
     CHECK(unload_after_release.status == mm::SlotOperationStatus::Ok);
 
-    std::error_code ec;
-    std::filesystem::remove_all(dir, ec);
+    CHECK(remove_tree(dir));
     return true;
 }
 
@@ -214,8 +226,8 @@ int main() {
         {"non_stream_parser_extracts_thinking", test_non_stream_parser_extracts_thinking},
         {"stream_tool_call_indices", test_stream_tool_call_indices},
         {"agent_queue_survives_throwing_job", test_agent_queue_survives_throwing_job},
-        {"agent_manager_rejects_duplicates_and_keeps_handles_alive",
-         test_agent_manager_rejects_duplicates_and_keeps_handles_alive},
+        {"agent_manager_rejects_duplicates_and_defers_cleanup_until_handles_release",
+         test_agent_manager_rejects_duplicates_and_defers_cleanup_until_handles_release},
         {"slot_manager_not_found_statuses", test_slot_manager_not_found_statuses},
         {"slot_lease_blocks_unload_and_suspend_while_busy",
          test_slot_lease_blocks_unload_and_suspend_while_busy},

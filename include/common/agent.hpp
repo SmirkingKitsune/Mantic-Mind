@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/models.hpp"
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -24,9 +25,13 @@ public:
     AgentDB&       db();
     const AgentDB& db() const;
 
+    void remove_data_dir_on_destroy();
+
 private:
     AgentConfig              config_;
+    std::filesystem::path    data_dir_;
     std::unique_ptr<AgentDB> db_;
+    bool                     remove_data_dir_on_destroy_ = false;
     mutable std::mutex       config_mutex_;
 };
 

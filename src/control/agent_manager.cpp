@@ -79,15 +79,20 @@ std::shared_ptr<const Agent> AgentManager::get_agent(const AgentId& id) const {
 }
 
 bool AgentManager::delete_agent(const AgentId& id) {
-    namespace fs = std::filesystem;
-    std::lock_guard g(mutex_);
-    if (!agents_.erase(id)) return false;
+    std::shared_ptr<Agent> agent;
+    {
+        std::lock_guard g(mutex_);
+        auto it = agents_.find(id);
+        if (it == agents_.end()) return false;
 
-    // Remove database directory.
-    fs::path dir = fs::path(data_dir_) / "agents" / id;
-    std::error_code ec;
-    fs::remove_all(dir, ec);
-    if (ec) MM_WARN("Could not remove agent data dir {}: {}", dir.string(), ec.message());
+        agent = std::move(it->second);
+        agents_.erase(it);
+    }
+
+    // Existing request handlers may still hold shared Agent handles. Defer
+    // physical deletion until the last handle is destroyed so SQLite is closed
+    // before Windows removes the database files.
+    agent->remove_data_dir_on_destroy();
     return true;
 }
 
