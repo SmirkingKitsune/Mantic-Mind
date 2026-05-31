@@ -8,18 +8,45 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <thread>
 #include <vector>
 
 namespace mm {
 
-NodeRegistry::NodeRegistry()  = default;
+NodeRegistry::NodeRegistry() = default;
+
+NodeRegistry::NodeRegistry(std::string data_dir) {
+    if (data_dir.empty()) return;
+
+    namespace fs = std::filesystem;
+    remembered_nodes_path_ = (fs::path(data_dir) / "nodes.json").string();
+    load_remembered_nodes();
+}
+
 NodeRegistry::~NodeRegistry() { stop_health_poll(); }
 
 // ── Node management ────────────────────────────────────────────────────────────
 NodeId NodeRegistry::add_node(const std::string& url,
                                const std::string& api_key,
-                               const std::string& platform) {
+                               const std::string& platform,
+                               bool remember) {
+    std::lock_guard<std::mutex> g(mutex_);
+
+    for (auto& [id, n] : nodes_) {
+        if (n.url != url && (api_key.empty() || n.api_key != api_key)) continue;
+
+        n.url = url;
+        n.api_key = api_key;
+        if (!platform.empty()) n.platform = platform;
+        if (remember) remembered_nodes_.insert(id);
+        n.remembered = remembered_nodes_.count(id) > 0;
+        if (n.remembered) save_remembered_nodes_unlocked();
+        MM_INFO("NodeRegistry: updated node {} @ {}", id, url);
+        return id;
+    }
+
     NodeInfo info;
     info.id       = mm::util::generate_uuid();
     info.url      = url;
@@ -27,8 +54,12 @@ NodeId NodeRegistry::add_node(const std::string& url,
     info.platform = platform;
     info.connected = false;
     info.health    = NodeHealthStatus::Unknown;
-    std::lock_guard<std::mutex> g(mutex_);
+    info.remembered = remember;
     nodes_[info.id] = info;
+    if (remember) {
+        remembered_nodes_.insert(info.id);
+        save_remembered_nodes_unlocked();
+    }
     MM_INFO("NodeRegistry: added node {} @ {}", info.id, url);
     return info.id;
 }
@@ -36,7 +67,21 @@ NodeId NodeRegistry::add_node(const std::string& url,
 void NodeRegistry::remove_node(const NodeId& id) {
     std::lock_guard<std::mutex> g(mutex_);
     nodes_.erase(id);
+    const bool was_remembered = remembered_nodes_.erase(id) > 0;
+    if (was_remembered) save_remembered_nodes_unlocked();
     MM_INFO("NodeRegistry: removed node {}", id);
+}
+
+bool NodeRegistry::forget_node(const NodeId& id) {
+    std::lock_guard<std::mutex> g(mutex_);
+    auto it = nodes_.find(id);
+    if (it == nodes_.end()) return false;
+
+    const bool was_remembered = remembered_nodes_.erase(id) > 0;
+    it->second.remembered = false;
+    if (was_remembered) save_remembered_nodes_unlocked();
+    MM_INFO("NodeRegistry: forgot node {}", id);
+    return was_remembered;
 }
 
 NodeInfo NodeRegistry::get_node(const NodeId& id) const {
@@ -279,12 +324,14 @@ std::string NodeRegistry::start_pair(const std::string& url) {
 
 std::string NodeRegistry::complete_pair(const std::string& url,
                                          const std::string& nonce,
-                                         const std::string& pin_or_psk) {
+                                         const std::string& pin_or_psk,
+                                         bool remember) {
     HttpClient cli(url);
     std::string response = mm::pairing::hmac_sha256_hex(pin_or_psk, nonce);
     auto cpl_res = cli.post("/api/node/pair-complete",
                             nlohmann::json{{"challenge", nonce},
-                                           {"response",  response}});
+                                           {"response",  response},
+                                           {"remember",  remember}});
     if (!cpl_res.ok()) {
         MM_WARN("NodeRegistry: pair-complete to {} failed (HTTP {})", url, cpl_res.status);
         return {};
@@ -298,8 +345,8 @@ std::string NodeRegistry::complete_pair(const std::string& url,
         }
         std::string api_key = j.value("api_key", std::string{});
         if (api_key.empty()) return {};
-        add_node(url, api_key);
-        MM_INFO("NodeRegistry: paired with {} — node added", url);
+        add_node(url, api_key, {}, remember);
+        MM_INFO("NodeRegistry: paired with {} — node added{}", url, remember ? " and remembered" : "");
         return api_key;
     } catch (const std::exception& e) {
         MM_WARN("NodeRegistry: pair-complete parse error from {}: {}", url, e.what());
@@ -308,10 +355,78 @@ std::string NodeRegistry::complete_pair(const std::string& url,
 }
 
 std::string NodeRegistry::pair_node(const std::string& url,
-                                     const std::string& pin_or_psk) {
+                                     const std::string& pin_or_psk,
+                                     bool remember) {
     std::string nonce = start_pair(url);
     if (nonce.empty()) return {};
-    return complete_pair(url, nonce, pin_or_psk);
+    return complete_pair(url, nonce, pin_or_psk, remember);
+}
+
+void NodeRegistry::load_remembered_nodes() {
+    if (remembered_nodes_path_.empty()) return;
+
+    std::ifstream in(remembered_nodes_path_);
+    if (!in.is_open()) return;
+
+    try {
+        auto root = nlohmann::json::parse(in);
+        const auto& nodes_json = root.is_array() ? root : root.at("nodes");
+        std::lock_guard<std::mutex> g(mutex_);
+        for (const auto& item : nodes_json) {
+            const std::string url = item.value("url", std::string{});
+            const std::string api_key = item.value("api_key", std::string{});
+            if (url.empty() || api_key.empty()) continue;
+
+            NodeInfo info;
+            info.id = item.value("id", mm::util::generate_uuid());
+            if (info.id.empty()) info.id = mm::util::generate_uuid();
+            info.url = url;
+            info.api_key = api_key;
+            info.platform = item.value("platform", std::string{});
+            info.connected = false;
+            info.health = NodeHealthStatus::Unknown;
+            info.remembered = true;
+
+            nodes_[info.id] = info;
+            remembered_nodes_.insert(info.id);
+        }
+        MM_INFO("NodeRegistry: loaded {} remembered node(s)", remembered_nodes_.size());
+    } catch (const std::exception& e) {
+        MM_WARN("NodeRegistry: failed to load remembered nodes from {}: {}",
+                remembered_nodes_path_, e.what());
+    }
+}
+
+void NodeRegistry::save_remembered_nodes_unlocked() const {
+    if (remembered_nodes_path_.empty()) return;
+
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path path(remembered_nodes_path_);
+    if (path.has_parent_path()) fs::create_directories(path.parent_path(), ec);
+
+    nlohmann::json nodes_json = nlohmann::json::array();
+    for (const auto& [id, n] : nodes_) {
+        if (remembered_nodes_.count(id) == 0) continue;
+        nodes_json.push_back(nlohmann::json{
+            {"id", n.id},
+            {"url", n.url},
+            {"api_key", n.api_key},
+            {"platform", n.platform}
+        });
+    }
+
+    const nlohmann::json root{
+        {"version", 1},
+        {"nodes", nodes_json}
+    };
+
+    std::ofstream out(remembered_nodes_path_, std::ios::trunc);
+    if (!out.is_open()) {
+        MM_WARN("NodeRegistry: could not write remembered nodes to {}", remembered_nodes_path_);
+        return;
+    }
+    out << root.dump(2) << '\n';
 }
 
 bool NodeRegistry::request_llama_update(const NodeId& id,

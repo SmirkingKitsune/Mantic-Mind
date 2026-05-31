@@ -34,7 +34,9 @@ public:
     void stop();
 
     using RuntimeLogsProvider = std::function<std::vector<std::string>(int tail)>;
+    using RememberApiKeyCallback = std::function<void(const std::string& key)>;
     void set_runtime_logs_provider(RuntimeLogsProvider provider);
+    void set_remember_api_key_callback(RememberApiKeyCallback callback);
 
 private:
     NodeState&     state_;
@@ -46,6 +48,7 @@ private:
     std::string    pairing_key_;
     std::unique_ptr<HttpServer> server_;
     RuntimeLogsProvider runtime_logs_provider_;
+    RememberApiKeyCallback remember_api_key_cb_;
 
     void register_routes();
     bool check_auth(const std::string& auth_header);

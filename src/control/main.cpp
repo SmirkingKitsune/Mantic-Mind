@@ -268,11 +268,12 @@ static void print_control_usage() {
         << "CLI commands:\n"
         << "  nodes list\n"
         << "  nodes discovered\n"
-        << "  nodes add <url> <api_key> [platform]\n"
+        << "  nodes add <url> <api_key> [platform] [remember]\n"
         << "  nodes remove <node_id>\n"
+        << "  nodes forget <node_id>\n"
         << "  nodes pair start <url>\n"
-        << "  nodes pair complete <url> <nonce> <pin_or_psk>\n"
-        << "  nodes pair psk <url> [psk]\n"
+        << "  nodes pair complete <url> <nonce> <pin_or_psk> [remember]\n"
+        << "  nodes pair psk <url> [psk] [remember]\n"
         << "  nodes llama check <node_id>\n"
         << "  nodes llama update <node_id> [build(true|false)] [force(true|false)]\n"
         << "  models list\n"
@@ -417,7 +418,7 @@ static void run_control_cli(uint16_t listen_port,
 
         if (cmd0 == "nodes") {
             if (tokens.size() < 2) {
-                printer.line("usage: nodes list|discovered|add|remove|pair|llama ...");
+                printer.line("usage: nodes list|discovered|add|remove|forget|pair|llama ...");
                 continue;
             }
             const std::string sub = mm::util::to_lower(tokens[1]);
@@ -431,14 +432,22 @@ static void run_control_cli(uint16_t listen_port,
             }
             if (sub == "add") {
                 if (tokens.size() < 4) {
-                    printer.line("usage: nodes add <url> <api_key> [platform]");
+                    printer.line("usage: nodes add <url> <api_key> [platform] [remember]");
                     continue;
                 }
                 const std::string platform = tokens.size() >= 5 ? tokens[4] : "";
+                bool remember = false;
+                if (tokens.size() >= 6 && !mm::cli::parse_bool_token(tokens[5], &remember)) {
+                    printer.line("error: remember must be true|false");
+                    continue;
+                }
                 emit_http_result(
                     "nodes add",
                     self.post("/v1/nodes",
-                              nlohmann::json{{"url", tokens[2]}, {"api_key", tokens[3]}, {"platform", platform}}));
+                              nlohmann::json{{"url", tokens[2]},
+                                             {"api_key", tokens[3]},
+                                             {"platform", platform},
+                                             {"remember", remember}}));
                 continue;
             }
             if (sub == "remove") {
@@ -447,6 +456,15 @@ static void run_control_cli(uint16_t listen_port,
                     continue;
                 }
                 emit_http_result("nodes remove", self.del("/v1/nodes/" + tokens[2]));
+                continue;
+            }
+            if (sub == "forget") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: nodes forget <node_id>");
+                    continue;
+                }
+                emit_http_result("nodes forget", self.post("/v1/nodes/" + tokens[2] + "/forget",
+                                                           nlohmann::json::object()));
                 continue;
             }
             if (sub == "pair") {
@@ -462,18 +480,32 @@ static void run_control_cli(uint16_t listen_port,
                 }
                 if (pair_sub == "complete") {
                     if (tokens.size() < 6) {
-                        printer.line("usage: nodes pair complete <url> <nonce> <pin_or_psk>");
+                        printer.line("usage: nodes pair complete <url> <nonce> <pin_or_psk> [remember]");
+                        continue;
+                    }
+                    bool remember = false;
+                    if (tokens.size() >= 7 && !mm::cli::parse_bool_token(tokens[6], &remember)) {
+                        printer.line("error: remember must be true|false");
                         continue;
                     }
                     emit_http_result(
                         "nodes pair complete",
                         self.post("/v1/nodes/pair/complete",
-                                  nlohmann::json{{"url", tokens[3]}, {"nonce", tokens[4]}, {"pin_or_psk", tokens[5]}}));
+                                  nlohmann::json{{"url", tokens[3]},
+                                                 {"nonce", tokens[4]},
+                                                 {"pin_or_psk", tokens[5]},
+                                                 {"remember", remember}}));
                     continue;
                 }
                 if (pair_sub == "psk") {
+                    bool remember = false;
+                    if (tokens.size() >= 6 && !mm::cli::parse_bool_token(tokens[5], &remember)) {
+                        printer.line("error: remember must be true|false");
+                        continue;
+                    }
                     nlohmann::json body{{"url", tokens[3]}};
                     if (tokens.size() >= 5) body["psk"] = tokens[4];
+                    body["remember"] = remember;
                     emit_http_result("nodes pair psk", self.post("/v1/nodes/pair/psk", body));
                     continue;
                 }
@@ -881,7 +913,7 @@ int main(int argc, char** argv) {
     mm::AgentManager agents(cfg.data_dir);
     agents.load_all();
 
-    mm::NodeRegistry      registry;
+    mm::NodeRegistry      registry(cfg.data_dir);
     mm::ModelDistributor  distributor(registry, cfg.models_dir);
     mm::AgentScheduler    scheduler(registry, distributor, cfg.models_dir);
     mm::ModelRouter       router(scheduler);

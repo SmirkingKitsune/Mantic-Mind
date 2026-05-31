@@ -188,7 +188,7 @@ After file loading, matching environment variables override config values.
 | `llama_port_range_end` | `MM_LLAMA_PORT_RANGE_END` | `8090` | Last port in the per-slot llama-server range |
 | `max_slots` | `MM_MAX_SLOTS` | `4` | Maximum concurrent model slots/processes |
 | `models_dir` | `MM_MODELS_DIR` | `models` | Scanned for `.gguf` files |
-| `data_dir` | `MM_DATA_DIR` | `data` | Node runtime data root |
+| `data_dir` | `MM_DATA_DIR` | `data` | Node runtime data root; remembered pairing API keys are stored in `api_keys.json` |
 | `kv_cache_dir` | `MM_KV_CACHE_DIR` | `data/kv_cache` | KV cache checkpoint directory |
 | `pairing_key` | `MM_PAIRING_KEY` | *(empty)* | PSK for automatic node/control pairing |
 | `discovery_port` | `MM_DISCOVERY_PORT` | `7072` | UDP discovery port |
@@ -199,7 +199,7 @@ After file loading, matching environment variables override config values.
 | Key | Env var | Default | Description |
 |---|---|---|---|
 | `listen_port` | `MM_CONTROL_PORT` | `9090` | API server port |
-| `data_dir` | `MM_DATA_DIR` | `data` | Agent database root |
+| `data_dir` | `MM_DATA_DIR` | `data` | Agent database root; remembered nodes are stored in `nodes.json` |
 | `models_dir` | `MM_MODELS_DIR` | `models` | Model distribution root |
 | `node_health_poll_interval_s` | `MM_POLL_INTERVAL_S` | `30` | Health poll interval |
 | `pairing_key` | `MM_PAIRING_KEY` | *(empty)* | PSK for automatic node/control pairing |
@@ -279,12 +279,13 @@ GET            /v1/agents/{id}/memories
 PUT/DELETE     /v1/agents/{id}/memories/{mid}
 POST           /v1/agents/{id}/memories/extract   { conversation_id, start_index, end_index, context_before? }
 GET            /v1/nodes
-POST           /v1/nodes                            { url, api_key, platform? }
+POST           /v1/nodes                            { url, api_key, platform?, remember? }
 DELETE         /v1/nodes/{id}
+POST           /v1/nodes/{id}/forget
 GET            /v1/nodes/discovered
 POST           /v1/nodes/pair/start                 { url }
-POST           /v1/nodes/pair/complete              { url, nonce, pin_or_psk }
-POST           /v1/nodes/pair/psk                   { url, psk? }   (falls back to MM_PAIRING_KEY)
+POST           /v1/nodes/pair/complete              { url, nonce, pin_or_psk, remember? }
+POST           /v1/nodes/pair/psk                   { url, psk?, remember? }   (falls back to MM_PAIRING_KEY)
 POST           /v1/nodes/{id}/llama/check-update
 POST           /v1/nodes/{id}/llama/update          { build?, force? }
 GET            /v1/models

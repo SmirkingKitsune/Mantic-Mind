@@ -10,6 +10,7 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <unordered_set>
 
 namespace mm {
 
@@ -17,14 +18,17 @@ namespace mm {
 class NodeRegistry {
 public:
     NodeRegistry();
+    explicit NodeRegistry(std::string data_dir);
     ~NodeRegistry();
 
     // Register a node; returns assigned NodeId.
     NodeId add_node(const std::string& url,
                     const std::string& api_key,
-                    const std::string& platform = {});
+                    const std::string& platform = {},
+                    bool remember = false);
 
     void remove_node(const NodeId& id);
+    bool forget_node(const NodeId& id);
 
     // Returns copy of NodeInfo (throws if not found).
     NodeInfo get_node(const NodeId& id) const;
@@ -79,10 +83,13 @@ public:
     // Returns the new api_key on success, empty string on failure.
     std::string complete_pair(const std::string& url,
                               const std::string& nonce,
-                              const std::string& pin_or_psk);
+                              const std::string& pin_or_psk,
+                              bool remember = false);
 
     // Convenience: does start_pair + complete_pair in one call (used for PSK auto-pairing).
-    std::string pair_node(const std::string& url, const std::string& pin_or_psk);
+    std::string pair_node(const std::string& url,
+                          const std::string& pin_or_psk,
+                          bool remember = false);
 
     // Trigger node-side llama.cpp updater script (manual action).
     // Returns true if the node accepted the update job.
@@ -96,6 +103,8 @@ public:
 private:
     mutable std::mutex                    mutex_;
     std::unordered_map<NodeId, NodeInfo>  nodes_;
+    std::unordered_set<NodeId>            remembered_nodes_;
+    std::string                           remembered_nodes_path_;
     UpdateCallback                        update_cb_;
 
     std::atomic<bool> polling_{false};
@@ -105,6 +114,8 @@ private:
 
     void poll_all_nodes();
     bool ping_node(NodeInfo& info);
+    void load_remembered_nodes();
+    void save_remembered_nodes_unlocked() const;
 };
 
 } // namespace mm

@@ -966,13 +966,15 @@ void ControlApiServer::register_routes() {
             const std::string url = util::trim(j.value("url", std::string{}));
             const std::string api_key = util::trim(j.value("api_key", std::string{}));
             const std::string platform = util::trim(j.value("platform", std::string{}));
+            const bool remember = j.value("remember", false);
             if (url.empty() || api_key.empty()) {
                 res.status = 400;
                 res.set_content(R"({"error":"url and api_key required"})", "application/json");
                 return;
             }
-            const NodeId node_id = registry_.add_node(url, api_key, platform);
-            publish_activity(0, "Node added via API: " + node_id + " @ " + url);
+            const NodeId node_id = registry_.add_node(url, api_key, platform, remember);
+            publish_activity(0, "Node added via API: " + node_id + " @ " + url +
+                                (remember ? " (remembered)" : ""));
             res.status = 201;
             res.set_content(nlohmann::json{{"node_id", node_id}}.dump(), "application/json");
         } catch (const std::exception& e) {
@@ -993,6 +995,21 @@ void ControlApiServer::register_routes() {
         registry_.remove_node(node_id);
         publish_activity(0, "Node removed via API: " + node_id);
         res.set_content(R"({"status":"removed"})", "application/json");
+    });
+
+    server_->Post("/v1/nodes/:id/forget", [this](const Request& req, Response& res) {
+        const std::string node_id = req.path_params.at("id");
+        try {
+            registry_.get_node(node_id);
+        } catch (...) {
+            res.status = 404;
+            res.set_content(R"({"error":"node not found"})", "application/json");
+            return;
+        }
+        const bool changed = registry_.forget_node(node_id);
+        publish_activity(0, "Node forget requested via API: " + node_id);
+        res.set_content(nlohmann::json{{"status", "forgotten"}, {"changed", changed}}.dump(),
+                        "application/json");
     });
 
     server_->Post("/v1/nodes/pair/start", [this](const Request& req, Response& res) {
@@ -1024,18 +1041,20 @@ void ControlApiServer::register_routes() {
             const std::string url = util::trim(j.value("url", std::string{}));
             const std::string nonce = util::trim(j.value("nonce", std::string{}));
             const std::string pin_or_psk = util::trim(j.value("pin_or_psk", std::string{}));
+            const bool remember = j.value("remember", false);
             if (url.empty() || nonce.empty() || pin_or_psk.empty()) {
                 res.status = 400;
                 res.set_content(R"({"error":"url, nonce, and pin_or_psk required"})", "application/json");
                 return;
             }
-            std::string key = registry_.complete_pair(url, nonce, pin_or_psk);
+            std::string key = registry_.complete_pair(url, nonce, pin_or_psk, remember);
             if (key.empty()) {
                 res.status = 502;
                 res.set_content(R"({"error":"pair complete failed"})", "application/json");
                 return;
             }
-            publish_activity(0, "Pair complete accepted for " + url);
+            publish_activity(0, "Pair complete accepted for " + url +
+                                (remember ? " (remembered)" : ""));
             res.set_content(nlohmann::json{{"api_key", key}}.dump(), "application/json");
         } catch (const std::exception& e) {
             res.status = 400;
@@ -1048,6 +1067,7 @@ void ControlApiServer::register_routes() {
             auto j = nlohmann::json::parse(req.body);
             const std::string url = util::trim(j.value("url", std::string{}));
             std::string psk = util::trim(j.value("psk", std::string{}));
+            const bool remember = j.value("remember", false);
             if (url.empty()) {
                 res.status = 400;
                 res.set_content(R"({"error":"url required"})", "application/json");
@@ -1063,13 +1083,14 @@ void ControlApiServer::register_routes() {
                                 "application/json");
                 return;
             }
-            std::string key = registry_.pair_node(url, psk);
+            std::string key = registry_.pair_node(url, psk, remember);
             if (key.empty()) {
                 res.status = 502;
                 res.set_content(R"({"error":"psk pair failed"})", "application/json");
                 return;
             }
-            publish_activity(0, "PSK pair accepted for " + url);
+            publish_activity(0, "PSK pair accepted for " + url +
+                                (remember ? " (remembered)" : ""));
             res.set_content(nlohmann::json{{"api_key", key}}.dump(), "application/json");
         } catch (const std::exception& e) {
             res.status = 400;

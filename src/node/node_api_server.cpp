@@ -128,6 +128,10 @@ void NodeApiServer::set_runtime_logs_provider(RuntimeLogsProvider provider) {
     runtime_logs_provider_ = std::move(provider);
 }
 
+void NodeApiServer::set_remember_api_key_callback(RememberApiKeyCallback callback) {
+    remember_api_key_cb_ = std::move(callback);
+}
+
 // ── Auth check ────────────────────────────────────────────────────────────────
 bool NodeApiServer::check_auth(const std::string& auth_header) {
     static const std::string kBearer = "Bearer ";
@@ -779,6 +783,7 @@ void NodeApiServer::register_routes() {
             auto j = nlohmann::json::parse(req.body);
             std::string challenge = j.value("challenge", std::string{});
             std::string response  = j.value("response",  std::string{});
+            const bool remember = j.value("remember", false);
 
             auto pp = state_.get_pending_pair();
             if (!pp || pp->challenge != challenge || pp->expected_response != response) {
@@ -792,6 +797,7 @@ void NodeApiServer::register_routes() {
 
             std::string new_key = mm::util::generate_api_key();
             state_.add_api_key(new_key);
+            if (remember && remember_api_key_cb_) remember_api_key_cb_(new_key);
             state_.clear_pending_pair();
             state_.mark_control_contact();
             // Pairing means control has authenticated this node; reflect that in the TUI.

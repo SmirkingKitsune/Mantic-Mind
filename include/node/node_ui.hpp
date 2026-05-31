@@ -27,11 +27,13 @@ public:
     using ModelDeleteCallback = std::function<bool(
         const std::string& model_filename,
         std::string* out_message)>;
+    using ForgetPairingCallback = std::function<bool(std::string* out_message)>;
 
     NodeUI(NodeState& state, uint16_t listen_port,
            UpdateRequestCallback update_request_cb = {},
            ModelPullCallback pull_cb = {},
-           ModelDeleteCallback delete_cb = {});
+           ModelDeleteCallback delete_cb = {},
+           ForgetPairingCallback forget_pairing_cb = {});
     ~NodeUI();
 
     // Append a log line from llama-server (thread-safe, posts to UI event loop).
@@ -49,6 +51,7 @@ private:
     UpdateRequestCallback update_request_cb_;
     ModelPullCallback pull_cb_;
     ModelDeleteCallback delete_cb_;
+    ForgetPairingCallback forget_pairing_cb_;
 
     static constexpr size_t kMaxLogLines = 4000;
     static constexpr int    kLogScrollPage = 8;

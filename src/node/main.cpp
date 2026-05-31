@@ -197,6 +197,48 @@ bool save_cached_llama_path(const std::filesystem::path& cache_file,
     return true;
 }
 
+std::filesystem::path remembered_api_keys_file(const mm::NodeConfig& cfg) {
+    return std::filesystem::path(cfg.data_dir) / "api_keys.json";
+}
+
+std::vector<std::string> load_remembered_api_keys(const std::filesystem::path& path) {
+    std::ifstream in(path);
+    if (!in) return {};
+
+    std::vector<std::string> out;
+    try {
+        auto root = nlohmann::json::parse(in);
+        const auto& keys_json = root.is_array() ? root : root.at("keys");
+        for (const auto& item : keys_json) {
+            std::string key = item.get<std::string>();
+            key = mm::util::trim(key);
+            if (key.empty()) continue;
+            if (std::find(out.begin(), out.end(), key) == out.end()) out.push_back(std::move(key));
+        }
+    } catch (const std::exception& e) {
+        MM_WARN("Failed to load remembered API keys from {}: {}", path.string(), e.what());
+    }
+    return out;
+}
+
+bool save_remembered_api_keys(const std::filesystem::path& path,
+                              const std::vector<std::string>& keys) {
+    std::vector<std::string> unique;
+    for (const auto& key : keys) {
+        const std::string trimmed = mm::util::trim(key);
+        if (trimmed.empty()) continue;
+        if (std::find(unique.begin(), unique.end(), trimmed) == unique.end()) unique.push_back(trimmed);
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    std::ofstream out(path, std::ios::out | std::ios::trunc);
+    if (!out) return false;
+
+    out << nlohmann::json{{"version", 1}, {"keys", unique}}.dump(2) << '\n';
+    return true;
+}
+
 #ifdef _WIN32
 void set_process_env_cache_file(const std::filesystem::path& p) {
     _putenv_s("MM_LLAMA_PATH_CACHE_FILE", p.string().c_str());
@@ -777,13 +819,24 @@ int main(int argc, char** argv) {
     state.set_llama_server_path(cfg.llama_server_path);
     MM_INFO("Local node identity: {}", local_node_id);
 
-    // Prefer configured API key; fall back to env var; fall back to generated.
+    const auto remembered_keys_path = remembered_api_keys_file(cfg);
+    std::vector<std::string> remembered_api_keys =
+        load_remembered_api_keys(remembered_keys_path);
+
+    // Prefer configured API key; otherwise reuse a remembered pairing key; fall back to generated.
     const char* key_env = std::getenv("MM_API_KEY");
     std::string initial_key = (key_env && *key_env)
         ? std::string(key_env)
-        : mm::util::generate_api_key();
+        : (!remembered_api_keys.empty() ? remembered_api_keys.front()
+                                        : mm::util::generate_api_key());
     state.add_api_key(initial_key);
+    for (const auto& key : remembered_api_keys) {
+        state.add_api_key(key);
+    }
     MM_INFO("Node API key: {}", initial_key);
+    if (!remembered_api_keys.empty()) {
+        MM_INFO("Loaded {} remembered node API key(s)", remembered_api_keys.size());
+    }
 
     state.start_metrics_poll(2000);
 
@@ -862,6 +915,14 @@ int main(int argc, char** argv) {
 
     mm::NodeApiServer api_server(state, slot_mgr, model_storage, llama_runtime,
                                  cfg.control_url, cfg.pairing_key);
+    api_server.set_remember_api_key_callback([&](const std::string& key) {
+        remembered_api_keys.push_back(key);
+        if (save_remembered_api_keys(remembered_keys_path, remembered_api_keys)) {
+            MM_INFO("Remembered paired API key at {}", remembered_keys_path.string());
+        } else {
+            MM_WARN("Failed to remember paired API key at {}", remembered_keys_path.string());
+        }
+    });
     api_server.set_runtime_logs_provider([&](int tail) {
         if (tail < 1) tail = 1;
         std::vector<std::string> out;
@@ -962,6 +1023,22 @@ int main(int argc, char** argv) {
         if (out_message) *out_message = "deleted " + filename;
         return true;
     };
+    auto forget_remembered_pairings = [&](std::string* out_message) -> bool {
+        const std::size_t count = remembered_api_keys.size();
+        remembered_api_keys.clear();
+        if (!save_remembered_api_keys(remembered_keys_path, remembered_api_keys)) {
+            if (out_message) *out_message = "failed to write " + remembered_keys_path.string();
+            return false;
+        }
+
+        if (out_message) {
+            *out_message = count == 0
+                ? "no remembered pairing keys"
+                : "forgot " + std::to_string(count) + " remembered pairing key(s)";
+        }
+        MM_INFO("Forgot remembered pairing keys at {}", remembered_keys_path.string());
+        return true;
+    };
 
     // ── Reconnection loop ─────────────────────────────────────────────────────
     // Retries registration with control every 30 s until success or shutdown.
@@ -1004,6 +1081,10 @@ int main(int argc, char** argv) {
             }
 
             if (cfg.control_url.empty()) {
+                if (state.has_recent_control_contact(kControlStaleMs)) {
+                    state.set_registered(true);
+                    continue;
+                }
                 for (int i = 0; i < (kActivePollMs / 100) && !stop_reconnect; ++i)
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 continue;
@@ -1029,7 +1110,8 @@ int main(int argc, char** argv) {
             cfg.listen_port,
             request_llama_update,
             request_model_pull,
-            request_model_delete);
+            request_model_delete,
+            forget_remembered_pairings);
         ui_ptr = &ui;
         ui.run();
         ui_ptr = nullptr;

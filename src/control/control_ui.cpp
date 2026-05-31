@@ -118,6 +118,7 @@ void ControlUI::run() {
     bool show_add_node  = false;
     bool show_pin_entry = false;
     bool show_agent_validation_modal = false;
+    bool remember_pair_node = true;
     std::string add_url;
     std::string pin_input, pair_url, pair_nonce;
 
@@ -492,11 +493,14 @@ void ControlUI::run() {
         auto dns = registry_.get_discovered_nodes();
         if (disc_sel < 0 || disc_sel >= static_cast<int>(dns.size())) return;
         pair_url = dns[disc_sel].url;
+        remember_pair_node = true;
         if (!pairing_key_.empty()) {
             //
-            auto key = registry_.pair_node(pair_url, pairing_key_);
+            auto key = registry_.pair_node(pair_url, pairing_key_, remember_pair_node);
             if (!key.empty())
-                log(LogLevel::Info, "Paired with " + pair_url + " (PSK)");
+                log(LogLevel::Info,
+                    "Paired with " + pair_url + " (PSK)" +
+                    (remember_pair_node ? " and remembered" : ""));
             else
                 log(LogLevel::Error, "PSK pairing failed for " + pair_url);
         } else {
@@ -513,6 +517,7 @@ void ControlUI::run() {
     }, ButtonOption::Simple());
     auto btn_add_manual = Button("[+] Add Manually", [&] {
         add_url.clear();
+        remember_pair_node = true;
         show_add_node = true;
     }, ButtonOption::Simple());
     auto disc_btns    = Container::Horizontal({btn_pair, btn_add_manual});
@@ -546,6 +551,16 @@ void ControlUI::run() {
         if (ok) log(LogLevel::Info, "Check update on node " + ns[node_sel].id + ": " + msg);
         else    log(LogLevel::Error, "Check update failed for node " + ns[node_sel].id + ": " + msg);
     }, ButtonOption::Simple());
+    auto forget_selected_node = [&]() {
+        auto ns = registry_.list_nodes();
+        if (node_sel < 0 || node_sel >= static_cast<int>(ns.size())) return;
+        const auto& n = ns[node_sel];
+        const bool changed = registry_.forget_node(n.id);
+        log(LogLevel::Info,
+            changed ? ("Forgot saved node " + n.id)
+                    : ("Node " + n.id + " was not remembered"));
+    };
+    auto btn_forget_n = Button("[F] Forget", forget_selected_node, ButtonOption::Simple());
     auto btn_rem_n   = Button("[-] Remove", [&] {
         auto ns = registry_.list_nodes();
         if (node_sel >= 0 && node_sel < static_cast<int>(ns.size())) {
@@ -555,7 +570,7 @@ void ControlUI::run() {
         }
     }, ButtonOption::Simple());
     auto node_menu_m  = Maybe(node_menu, [&]() { return !node_entries.empty(); });
-    auto node_btns    = Container::Horizontal({btn_upd_n, btn_chk_n, btn_rem_n});
+    auto node_btns    = Container::Horizontal({btn_upd_n, btn_chk_n, btn_forget_n, btn_rem_n});
     auto nodes_section = Container::Vertical({node_menu_m, node_btns});
 
     auto catalog_menu = Menu(&catalog_entries, &catalog_sel, MenuOption::Vertical());
@@ -644,12 +659,15 @@ void ControlUI::run() {
     InputOption url_iopt; url_iopt.multiline = false;
     url_iopt.placeholder = "http://hostname:7070";
     auto modal_url    = Input(&add_url, url_iopt);
+    auto modal_remember_cb = Checkbox("Remember this node", &remember_pair_node);
     auto modal_ok     = Button("  Connect  ", [&] {
         if (!add_url.empty()) {
             if (!pairing_key_.empty()) {
-                auto key = registry_.pair_node(add_url, pairing_key_);
+                auto key = registry_.pair_node(add_url, pairing_key_, remember_pair_node);
                 if (!key.empty()) {
-                    log(LogLevel::Info, "Paired with " + add_url + " (PSK)");
+                    log(LogLevel::Info,
+                        "Paired with " + add_url + " (PSK)" +
+                        (remember_pair_node ? " and remembered" : ""));
                 } else {
                     log(LogLevel::Error, "PSK pairing failed for " + add_url);
                 }
@@ -669,13 +687,14 @@ void ControlUI::run() {
     auto modal_cancel = Button("  Cancel  ", [&] { show_add_node = false; },
                                ButtonOption::Simple());
     auto modal_btns   = Container::Horizontal({modal_ok, modal_cancel});
-    auto modal_inputs = Container::Vertical({modal_url, modal_btns});
+    auto modal_inputs = Container::Vertical({modal_url, modal_remember_cb, modal_btns});
 
     auto modal_renderer = Renderer(modal_inputs, [&]() {
         return vbox({
             text(" Add Node Manually ") | bold | hcenter,
             separator(),
             hbox({text(" URL : "), modal_url->Render() | flex}),
+            modal_remember_cb->Render(),
             text(" Uses pairing (PIN or configured PSK)") | color(Color::GrayDark),
             separator(),
             modal_btns->Render() | hcenter,
@@ -688,11 +707,14 @@ void ControlUI::run() {
     pin_iopt.placeholder = "000000";
 
     auto pin_input_comp   = Input(&pin_input, pin_iopt);
+    auto pin_remember_cb  = Checkbox("Remember this node", &remember_pair_node);
     auto pin_ok           = Button("  Pair  ", [&] {
         if (!pin_input.empty()) {
-            auto key = registry_.complete_pair(pair_url, pair_nonce, pin_input);
+            auto key = registry_.complete_pair(pair_url, pair_nonce, pin_input, remember_pair_node);
             if (!key.empty())
-                log(LogLevel::Info, "Paired with " + pair_url);
+                log(LogLevel::Info,
+                    "Paired with " + pair_url +
+                    (remember_pair_node ? " and remembered" : ""));
             else
                 log(LogLevel::Error, "PIN pairing failed for " + pair_url);
         }
@@ -701,7 +723,7 @@ void ControlUI::run() {
     auto pin_cancel       = Button("  Cancel  ", [&] { show_pin_entry = false; },
                                    ButtonOption::Simple());
     auto pin_modal_btns   = Container::Horizontal({pin_ok, pin_cancel});
-    auto pin_modal_inputs = Container::Vertical({pin_input_comp, pin_modal_btns});
+    auto pin_modal_inputs = Container::Vertical({pin_input_comp, pin_remember_cb, pin_modal_btns});
 
     auto pin_modal_renderer = Renderer(pin_modal_inputs, [&]() {
         return vbox({
@@ -709,6 +731,7 @@ void ControlUI::run() {
             separator(),
             text(" PIN shown on node TUI") | color(Color::GrayDark),
             hbox({text(" PIN: "), pin_input_comp->Render() | flex}),
+            pin_remember_cb->Render(),
             separator(),
             pin_modal_btns->Render() | hcenter,
         }) | border | size(WIDTH, EQUAL, 36);
@@ -1418,12 +1441,13 @@ void ControlUI::run() {
         node_entries.resize(ns.size());
         for (size_t i = 0; i < ns.size(); ++i) {
             auto& n = ns[i];
-            char buf[128];
-            snprintf(buf, sizeof(buf), "%-35s  %-18s  [%s]",
+            char buf[160];
+            snprintf(buf, sizeof(buf), "%-35s  %-18s  [%s]%s",
                      n.url.c_str(),
                      n.loaded_model.empty() ? "(no model)"
                          : n.loaded_model.substr(0, 18).c_str(),
-                     to_string(n.health).c_str());
+                     to_string(n.health).c_str(),
+                     n.remembered ? " saved" : "");
             node_entries[i] = buf;
         }
         if (!ns.empty() && node_sel >= static_cast<int>(ns.size()))
@@ -1499,6 +1523,7 @@ void ControlUI::run() {
 
             Elements detail_rows = {
                 hbox({text("  URL     : "), text(n.url) | bold}),
+                hbox({text("  Saved   : "), text(n.remembered ? "yes" : "no")}),
                 hbox({text("  Platform: "), text(n.platform.empty() ? "-" : n.platform)}),
                 hbox({text("  Model   : "),
                       text(n.loaded_model.empty() ? "(none)" : n.loaded_model) | bold}),
@@ -1593,22 +1618,25 @@ void ControlUI::run() {
         }
 
         return vbox({
-            vbox({
-                text(" Discovered Nodes") | bold,
+            hbox({
+                vbox({
+                    text(" Discovered Nodes") | bold,
+                    separator(),
+                    dns.empty()
+                        ? text("  Listening for nodes...") | color(Color::GrayDark)
+                        : (disc_menu->Render() | yframe | flex),
+                    disc_btns->Render(),
+                }) | border | flex,
                 separator(),
-                dns.empty()
-                    ? text("  Listening for nodes...") | color(Color::GrayDark)
-                    : (disc_menu->Render() | yframe | flex),
-                disc_btns->Render(),
-            }) | size(HEIGHT, LESS_THAN, 10) | border,
-            vbox({
-                text(" Connected Nodes") | bold,
-                separator(),
-                ns.empty()
-                    ? text("  No connected nodes.") | color(Color::GrayDark)
-                    : (node_menu->Render() | yframe | flex),
-                node_btns->Render(),
-            }) | size(HEIGHT, LESS_THAN, 10) | border,
+                vbox({
+                    text(" Connected Nodes (" + std::to_string(ns.size()) + ")") | bold,
+                    separator(),
+                    ns.empty()
+                        ? text("  No connected nodes.") | color(Color::GrayDark)
+                        : (node_menu->Render() | yframe | flex),
+                    node_btns->Render(),
+                }) | border | flex,
+            }) | size(HEIGHT, EQUAL, 9),
             vbox({
                 text(" Model Management") | bold,
                 separator(),
@@ -1636,9 +1664,9 @@ void ControlUI::run() {
                         | color(Color::GrayDark)
                     : text("  " + node_model_action_status)
                         | color(Color::Yellow),
-            }) | border,
+            }) | border | size(HEIGHT, LESS_THAN, 16),
             separator(),
-            detail,
+            detail | yframe | flex,
         });
     });
 
@@ -2227,6 +2255,10 @@ void ControlUI::run() {
                     refresh_node_storage_cache(ns[node_sel].id, true);
                 }
                 node_model_action_status = "refreshed model views";
+                return true;
+            }
+            if (ev == Event::Character('f') && tab_index == 0) {
+                forget_selected_node();
                 return true;
             }
         }
