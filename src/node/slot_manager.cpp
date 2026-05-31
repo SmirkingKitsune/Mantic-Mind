@@ -463,6 +463,24 @@ std::string SlotManager::last_error() const {
     return last_error_;
 }
 
+#ifdef MM_TESTING
+SlotId SlotManager::add_ready_test_slot(std::string model_path, AgentId agent_id) {
+    std::lock_guard lock(mutex_);
+
+    auto slot = std::make_unique<Slot>();
+    slot->id = util::generate_uuid();
+    slot->model_path = std::move(model_path);
+    slot->assigned_agent = std::move(agent_id);
+    slot->client = std::make_unique<LlamaCppClient>("http://127.0.0.1:0");
+    slot->state = SlotState::Ready;
+    slot->last_active_ms = util::now_ms();
+
+    SlotId id = slot->id;
+    slots_.push_back(std::move(slot));
+    return id;
+}
+#endif
+
 void SlotManager::set_llama_server_path(const std::string& path) {
     std::lock_guard lock(mutex_);
     llama_server_path_ = path;

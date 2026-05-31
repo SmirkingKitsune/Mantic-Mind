@@ -120,6 +120,12 @@ public:
     /// Last load/restore failure reason for diagnostics.
     std::string last_error() const;
 
+#ifdef MM_TESTING
+    /// Test-only helper for exercising lease behavior without launching llama-server.
+    SlotId add_ready_test_slot(std::string model_path = "test-model.gguf",
+                               AgentId agent_id = {});
+#endif
+
     /// Runtime override for llama-server executable path.
     void        set_llama_server_path(const std::string& path);
     std::string llama_server_path() const;

@@ -177,6 +177,30 @@ bool test_slot_manager_not_found_statuses() {
     return true;
 }
 
+bool test_slot_lease_blocks_unload_and_suspend_while_busy() {
+    auto dir = temp_test_dir("lease-busy");
+    mm::SlotManager slots("missing-llama-server", 46110, 46111, 1, dir.string());
+    const auto slot_id = slots.add_ready_test_slot("test-model.gguf", "agent-a");
+
+    {
+        auto inference_lease = slots.acquire_slot(slot_id);
+        CHECK(static_cast<bool>(inference_lease));
+
+        auto unload = slots.unload_slot(slot_id);
+        CHECK(unload.status == mm::SlotOperationStatus::Busy);
+
+        auto suspend = slots.suspend_slot(slot_id);
+        CHECK(suspend.status == mm::SlotOperationStatus::Busy);
+    }
+
+    auto unload_after_release = slots.unload_slot(slot_id);
+    CHECK(unload_after_release.status == mm::SlotOperationStatus::Ok);
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -193,6 +217,8 @@ int main() {
         {"agent_manager_rejects_duplicates_and_keeps_handles_alive",
          test_agent_manager_rejects_duplicates_and_keeps_handles_alive},
         {"slot_manager_not_found_statuses", test_slot_manager_not_found_statuses},
+        {"slot_lease_blocks_unload_and_suspend_while_busy",
+         test_slot_lease_blocks_unload_and_suspend_while_busy},
     };
 
     for (const auto& test : tests) {

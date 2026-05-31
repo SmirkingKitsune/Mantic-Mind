@@ -10,6 +10,8 @@ target_include_directories(mm_reliability_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/include
 )
 
+target_compile_definitions(mm_reliability_tests PRIVATE MM_TESTING)
+
 target_link_libraries(mm_reliability_tests PRIVATE
     mm_common
     ${MM_PLATFORM_LIBS}
