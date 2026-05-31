@@ -1,8 +1,10 @@
 #pragma once
 
 #include "common/models.hpp"
+#include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <cstdint>
 
 namespace mm {
@@ -39,9 +41,10 @@ public:
     // Activity logging callback — 0=Info, 1=Warn, 2=Error.
     using LogCallback = std::function<void(int level, const std::string& message)>;
     void set_log_callback(LogCallback cb);
+    void publish_activity(int level, const std::string& message);
 
     // In-process chat path for local tooling when loopback HTTP is unavailable.
-    // max_tokens_override > 0 replaces the agent's configured max_tokens for this request.
+    // max_tokens_override != 0 replaces the agent's configured max_tokens for this request.
     LocalChatResult chat_local(const AgentId& agent_id,
                                const std::string& message,
                                const ConvId& conv_id_hint = {},
@@ -56,6 +59,9 @@ private:
     std::string     models_dir_;
     std::unique_ptr<HttpServer> server_;
     LogCallback     log_cb_;
+    mutable std::mutex activity_mutex_;
+    std::deque<nlohmann::json> activity_entries_;
+    static constexpr std::size_t kMaxActivityEntries = 4000;
 
     using ChunkCb = std::function<void(const InferenceChunk&)>;
     using DoneCb  = std::function<void(const ConvId&, bool, const std::string&)>;

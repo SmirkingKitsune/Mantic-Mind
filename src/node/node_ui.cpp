@@ -53,12 +53,14 @@ std::string shorten_middle(const std::string& s, size_t max_len) {
 NodeUI::NodeUI(NodeState& state, uint16_t listen_port,
                UpdateRequestCallback update_request_cb,
                ModelPullCallback pull_cb,
-               ModelDeleteCallback delete_cb)
+               ModelDeleteCallback delete_cb,
+               ForgetPairingCallback forget_pairing_cb)
     : state_(state)
     , listen_port_(listen_port)
     , update_request_cb_(std::move(update_request_cb))
     , pull_cb_(std::move(pull_cb))
-    , delete_cb_(std::move(delete_cb)) {
+    , delete_cb_(std::move(delete_cb))
+    , forget_pairing_cb_(std::move(forget_pairing_cb)) {
     log_file_path_ = make_temp_llama_log_path();
     if (!log_file_path_.empty()) {
         log_file_.open(log_file_path_, std::ios::out | std::ios::app);
@@ -117,9 +119,20 @@ void NodeUI::run() {
     ModelPromptMode prompt_mode = ModelPromptMode::None;
     std::string prompt_buffer;
     std::string model_action_status;
+    auto forget_pairing = [&]() {
+        std::string msg;
+        bool ok = false;
+        if (forget_pairing_cb_) ok = forget_pairing_cb_(&msg);
+        else msg = "forget callback not configured";
+        if (msg.empty()) msg = ok ? "forgot remembered pairing keys" : "forget pairing failed";
+        model_action_status = msg;
+        return true;
+    };
+    auto btn_forget_pairing = Button("[F] Forget Pairing", [&] { forget_pairing(); },
+                                     ButtonOption::Simple());
 
     // ── Renderer ──────────────────────────────────────────────────────────────
-    auto render = Renderer([&]() -> Element {
+    auto render = Renderer(btn_forget_pairing, [&]() -> Element {
         frame = (frame + 1) % static_cast<int>(kSpinner.size());
 
         // Snapshot mutable state
@@ -288,8 +301,13 @@ void NodeUI::run() {
             }
 
             waiting_elems.push_back(text(""));
+            if (!model_action_status.empty()) {
+                waiting_elems.push_back(text("  " + model_action_status) | color(Color::Yellow));
+            }
+            waiting_elems.push_back(btn_forget_pairing->Render() | hcenter);
+            waiting_elems.push_back(text(""));
             waiting_elems.push_back(
-                text("  Press u:update llama.cpp  p:pull model  d:delete model  q:quit")
+                text("  Press u:update llama.cpp  p:pull model  d:delete model  f:forget pairing  q:quit")
                 | color(Color::GrayDark));
 
             return vbox(waiting_elems) | border;
@@ -543,8 +561,11 @@ void NodeUI::run() {
             separator(),
             log_panel | flex,
             separator(),
-            text("  Press u:update llama.cpp  p:pull model  d:delete model  j/k or arrows:scroll logs  q:quit")
-                | color(Color::GrayDark),
+            hbox({
+                btn_forget_pairing->Render(),
+                text("  u:update llama.cpp  p:pull model  d:delete model  j/k or arrows:scroll logs  q:quit")
+                    | color(Color::GrayDark),
+            }),
         }) | border;
     });
 
@@ -659,6 +680,9 @@ void NodeUI::run() {
             prompt_buffer.clear();
             model_action_status = "enter model filename and press Enter";
             return true;
+        }
+        if (ev == Event::Character('f')) {
+            return forget_pairing();
         }
         if (ev == Event::Escape || ev == Event::Character('q')) {
             screen.ExitLoopClosure()();

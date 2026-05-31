@@ -1,9 +1,11 @@
 #pragma once
 
 #include "common/models.hpp"
+#include <functional>
 #include <memory>
 #include <string>
 #include <cstdint>
+#include <vector>
 
 namespace mm {
 
@@ -31,6 +33,11 @@ public:
     bool listen(uint16_t port);
     void stop();
 
+    using RuntimeLogsProvider = std::function<std::vector<std::string>(int tail)>;
+    using RememberApiKeyCallback = std::function<void(const std::string& key)>;
+    void set_runtime_logs_provider(RuntimeLogsProvider provider);
+    void set_remember_api_key_callback(RememberApiKeyCallback callback);
+
 private:
     NodeState&     state_;
     SlotManager&   slot_mgr_;
@@ -40,6 +47,8 @@ private:
     std::string    control_url_;
     std::string    pairing_key_;
     std::unique_ptr<HttpServer> server_;
+    RuntimeLogsProvider runtime_logs_provider_;
+    RememberApiKeyCallback remember_api_key_cb_;
 
     void register_routes();
     bool check_auth(const std::string& auth_header);

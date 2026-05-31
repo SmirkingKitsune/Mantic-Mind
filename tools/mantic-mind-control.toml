@@ -8,6 +8,7 @@ listen_port = 9090
 
 # ── Storage ────────────────────────────────────────────────────────────────────
 # Root data directory — agent databases live under {data_dir}/agents/{uuid}/agent.db
+# and remembered paired nodes live in {data_dir}/nodes.json.
 data_dir = "data"
 
 # Directory containing .gguf model files for distribution to nodes.

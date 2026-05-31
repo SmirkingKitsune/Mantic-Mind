@@ -204,6 +204,7 @@ struct NodeInfo {
     std::string      loaded_model;  // deprecated: kept for backwards compat
     NodeHealthStatus health    = NodeHealthStatus::Unknown;
     bool             connected = false;
+    bool             remembered = false;
     std::string      platform;
     NodeHealthMetrics metrics;
 
@@ -624,6 +625,7 @@ inline void to_json(nlohmann::json& j, const NodeInfo& n) {
           {"loaded_model",  n.loaded_model},
           {"health",        to_string(n.health)},
           {"connected",     n.connected},
+          {"remembered",    n.remembered},
           {"platform",      n.platform},
           {"metrics",       n.metrics},
           {"slots",         n.slots},
@@ -662,6 +664,7 @@ inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     if (j.contains("loaded_model"))  j.at("loaded_model").get_to(n.loaded_model);
     if (j.contains("health"))        n.health = node_health_from_string(j.at("health").get<std::string>());
     if (j.contains("connected"))     j.at("connected").get_to(n.connected);
+    if (j.contains("remembered"))    j.at("remembered").get_to(n.remembered);
     if (j.contains("platform"))      j.at("platform").get_to(n.platform);
     if (j.contains("metrics"))       j.at("metrics").get_to(n.metrics);
     if (j.contains("slots"))         j.at("slots").get_to(n.slots);

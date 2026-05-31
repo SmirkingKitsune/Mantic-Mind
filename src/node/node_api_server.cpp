@@ -124,6 +124,14 @@ bool NodeApiServer::listen(uint16_t port) {
 
 void NodeApiServer::stop() { server_->stop(); }
 
+void NodeApiServer::set_runtime_logs_provider(RuntimeLogsProvider provider) {
+    runtime_logs_provider_ = std::move(provider);
+}
+
+void NodeApiServer::set_remember_api_key_callback(RememberApiKeyCallback callback) {
+    remember_api_key_cb_ = std::move(callback);
+}
+
 // ── Auth check ────────────────────────────────────────────────────────────────
 bool NodeApiServer::check_auth(const std::string& auth_header) {
     static const std::string kBearer = "Bearer ";
@@ -350,6 +358,30 @@ void NodeApiServer::register_routes() {
         j["disk_free_mb"]  = disk_free;
         j["stored_models"] = stored;
         res.set_content(j.dump(), "application/json");
+    });
+
+    // ── GET /api/node/logs ───────────────────────────────────────────────────
+    server_->Get("/api/node/logs", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401; return;
+        }
+
+        int tail = 20;
+        if (req.has_param("tail")) {
+            try {
+                tail = std::stoi(req.get_param_value("tail"));
+            } catch (...) {
+                res.status = 400;
+                res.set_content(R"({"error":"tail must be an integer"})", "application/json");
+                return;
+            }
+        }
+        if (tail < 1) tail = 1;
+        if (tail > 5000) tail = 5000;
+
+        std::vector<std::string> lines;
+        if (runtime_logs_provider_) lines = runtime_logs_provider_(tail);
+        res.set_content(nlohmann::json{{"lines", lines}}.dump(), "application/json");
     });
 
     // ── POST /api/node/load-model ─────────────────────────────────────────────
@@ -652,6 +684,15 @@ void NodeApiServer::register_routes() {
     });
 
     // ── POST /api/node/api-keys ───────────────────────────────────────────────
+    server_->Get("/api/node/api-keys", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401; return;
+        }
+        auto keys = state_.get_api_keys();
+        res.set_content(nlohmann::json{{"keys", keys}}.dump(), "application/json");
+    });
+
+    // ── POST /api/node/api-keys ───────────────────────────────────────────────
     server_->Post("/api/node/api-keys", [this](const Request& req, Response& res) {
         if (!check_auth(req.get_header_value("Authorization"))) {
             res.status = 401; return;
@@ -680,6 +721,23 @@ void NodeApiServer::register_routes() {
         std::string key = req.path_params.at("key");
         state_.remove_api_key(key);
         res.set_content(R"({"status":"removed"})", "application/json");
+    });
+
+    // ── GET /api/node/pair-status ─────────────────────────────────────────────
+    server_->Get("/api/node/pair-status", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401; return;
+        }
+        auto p = state_.get_pending_pair();
+        nlohmann::json j;
+        j["pending"] = static_cast<bool>(p);
+        if (p) {
+            j["mode"] = p->pin.empty() ? "psk" : "pin";
+            j["expires_ms"] = p->expiry_ms;
+            j["challenge"] = p->challenge;
+            if (!p->pin.empty()) j["pin"] = p->pin;
+        }
+        res.set_content(j.dump(), "application/json");
     });
 
     // ── POST /api/node/pair-request  (unauthenticated) ───────────────────────
@@ -725,6 +783,7 @@ void NodeApiServer::register_routes() {
             auto j = nlohmann::json::parse(req.body);
             std::string challenge = j.value("challenge", std::string{});
             std::string response  = j.value("response",  std::string{});
+            const bool remember = j.value("remember", false);
 
             auto pp = state_.get_pending_pair();
             if (!pp || pp->challenge != challenge || pp->expected_response != response) {
@@ -738,6 +797,7 @@ void NodeApiServer::register_routes() {
 
             std::string new_key = mm::util::generate_api_key();
             state_.add_api_key(new_key);
+            if (remember && remember_api_key_cb_) remember_api_key_cb_(new_key);
             state_.clear_pending_pair();
             state_.mark_control_contact();
             // Pairing means control has authenticated this node; reflect that in the TUI.

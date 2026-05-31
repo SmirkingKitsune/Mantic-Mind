@@ -33,10 +33,11 @@ std::string quote_shell_arg(const std::string& s) {
 
 int run_command_capture_lines(const std::string& cmd,
                               const std::function<void(const std::string&)>& on_line) {
+    const std::string capture_cmd = cmd + " 2>&1";
 #ifdef _WIN32
-    FILE* pipe = _popen(cmd.c_str(), "r");
+    FILE* pipe = _popen(capture_cmd.c_str(), "r");
 #else
-    FILE* pipe = ::popen(cmd.c_str(), "r");
+    FILE* pipe = ::popen(capture_cmd.c_str(), "r");
 #endif
     if (!pipe) return -1;
 

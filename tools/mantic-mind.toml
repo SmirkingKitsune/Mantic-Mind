@@ -37,6 +37,7 @@ max_slots = 4
 # Directory scanned recursively for .gguf model files.
 models_dir = "models"
 
+# Node runtime data root. Remembered pairing API keys live in {data_dir}/api_keys.json.
 data_dir = "data"
 
 # Directory for KV cache checkpoint files (suspend/resume).
