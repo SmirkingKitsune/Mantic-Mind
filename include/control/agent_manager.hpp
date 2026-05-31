@@ -22,8 +22,8 @@ public:
     void load_all();
 
     AgentId     create_agent(const AgentConfig& config);
-    Agent*      get_agent(const AgentId& id);
-    const Agent* get_agent(const AgentId& id) const;
+    std::shared_ptr<Agent> get_agent(const AgentId& id);
+    std::shared_ptr<const Agent> get_agent(const AgentId& id) const;
     bool        delete_agent(const AgentId& id);
     std::vector<AgentConfig> list_agents() const;
 
@@ -36,7 +36,7 @@ public:
 private:
     std::string data_dir_;
     mutable std::mutex mutex_;
-    std::unordered_map<AgentId, std::unique_ptr<Agent>> agents_;
+    std::unordered_map<AgentId, std::shared_ptr<Agent>> agents_;
 };
 
 } // namespace mm

@@ -32,7 +32,7 @@ void AgentManager::load_all() {
             } // temp is destroyed here, releasing its SQLite connection
             if (cfg.id.empty() || cfg.name.empty()) continue;
 
-            auto agent = std::make_unique<Agent>(cfg, data_dir_);
+            auto agent = std::make_shared<Agent>(cfg, data_dir_);
             std::lock_guard g(mutex_);
             agents_[cfg.id] = std::move(agent);
             MM_INFO("Loaded agent: {} ({})", cfg.name, cfg.id);
@@ -52,26 +52,30 @@ AgentId AgentManager::create_agent(const AgentConfig& config) {
             "start with alphanumeric, and contain only [a-zA-Z0-9_-]");
     }
 
-    auto agent = std::make_unique<Agent>(cfg, data_dir_);
+    std::lock_guard g(mutex_);
+    if (agents_.count(cfg.id)) {
+        throw std::invalid_argument("Agent ID '" + cfg.id + "' is already in use");
+    }
+
+    auto agent = std::make_shared<Agent>(cfg, data_dir_);
     agent->db().save_config(cfg);
 
-    std::lock_guard g(mutex_);
     AgentId id = cfg.id;
     agents_[id] = std::move(agent);
     MM_INFO("Created agent: {} ({})", cfg.name, id);
     return id;
 }
 
-Agent* AgentManager::get_agent(const AgentId& id) {
+std::shared_ptr<Agent> AgentManager::get_agent(const AgentId& id) {
     std::lock_guard g(mutex_);
     auto it = agents_.find(id);
-    return it != agents_.end() ? it->second.get() : nullptr;
+    return it != agents_.end() ? it->second : nullptr;
 }
 
-const Agent* AgentManager::get_agent(const AgentId& id) const {
+std::shared_ptr<const Agent> AgentManager::get_agent(const AgentId& id) const {
     std::lock_guard g(mutex_);
     auto it = agents_.find(id);
-    return it != agents_.end() ? it->second.get() : nullptr;
+    return it != agents_.end() ? it->second : nullptr;
 }
 
 bool AgentManager::delete_agent(const AgentId& id) {
@@ -136,7 +140,7 @@ AgentId AgentManager::update_agent(const AgentId& id, const AgentConfig& config)
     if (ec)
         throw std::runtime_error("Failed to rename agent directory: " + ec.message());
 
-    auto agent = std::make_unique<Agent>(config, data_dir_);
+    auto agent = std::make_shared<Agent>(config, data_dir_);
     agent->db().save_config(config);
     agents_[new_id] = std::move(agent);
     MM_INFO("Renamed agent {} → {}", id, new_id);

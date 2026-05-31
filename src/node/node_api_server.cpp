@@ -22,6 +22,7 @@
 #include <fstream>
 #include <string>
 #include <thread>
+#include <utility>
 
 namespace mm {
 namespace fs = std::filesystem;
@@ -489,14 +490,28 @@ void NodeApiServer::register_routes() {
 
             if (slot_id.empty()) {
                 // Backwards compat: unload all if no slot_id given
-                slot_mgr_.unload_all();
+                auto unload = slot_mgr_.unload_all(false);
+                if (!unload.ok()) {
+                    res.status = unload.status == SlotOperationStatus::Busy ? 409 : 500;
+                    res.set_content(nlohmann::json{{"error", unload.message}}.dump(),
+                                    "application/json");
+                    return;
+                }
                 state_.set_loaded_model("");
                 state_.set_active_agent("");
                 state_.set_slots({});
                 state_.set_last_error("");
             } else {
-                slot_mgr_.unload_slot(slot_id);
+                auto unload = slot_mgr_.unload_slot(slot_id);
                 state_.set_slots(slot_mgr_.get_slot_info());
+                if (!unload.ok()) {
+                    res.status = unload.status == SlotOperationStatus::NotFound ? 404
+                               : unload.status == SlotOperationStatus::Busy ? 409
+                               : 500;
+                    res.set_content(nlohmann::json{{"error", unload.message}}.dump(),
+                                    "application/json");
+                    return;
+                }
             }
             res.set_content(R"({"status":"unloaded"})", "application/json");
         } catch (const std::exception& e) {
@@ -519,12 +534,20 @@ void NodeApiServer::register_routes() {
                 return;
             }
 
-            auto cache_path = slot_mgr_.suspend_slot(slot_id);
+            auto suspend = slot_mgr_.suspend_slot(slot_id);
             state_.set_slots(slot_mgr_.get_slot_info());
+            if (!suspend.ok()) {
+                res.status = suspend.status == SlotOperationStatus::NotFound ? 404
+                           : suspend.status == SlotOperationStatus::Busy ? 409
+                           : 500;
+                res.set_content(nlohmann::json{{"error", suspend.message}}.dump(),
+                                "application/json");
+                return;
+            }
 
             nlohmann::json resp;
             resp["status"] = "suspended";
-            resp["kv_cache_path"] = cache_path;
+            resp["kv_cache_path"] = suspend.kv_cache_path;
             res.set_content(resp.dump(), "application/json");
         } catch (const std::exception& e) {
             res.status = 400;
@@ -846,13 +869,11 @@ void NodeApiServer::register_routes() {
             }
         }
 
-        // Find the right LlamaCppClient.
-        LlamaCppClient* client = nullptr;
-        if (!selected_slot_id.empty()) {
-            client = slot_mgr_.get_client(selected_slot_id);
-        }
+        auto slot_lease = selected_slot_id.empty()
+            ? SlotManager::SlotLease{}
+            : slot_mgr_.acquire_slot(selected_slot_id);
 
-        if (!client) {
+        if (!slot_lease) {
             res.status = 503;
             res.set_content(R"({"error":"no ready slot available"})", "application/json");
             return;
@@ -878,7 +899,11 @@ void NodeApiServer::register_routes() {
         if (!agent_for_slot.empty()) state_.set_active_agent(agent_for_slot);
 
         // Fire the LLM call on a background thread
-        std::thread([this, client, infer_req, ctx]() {
+        std::thread([this,
+                     infer_req,
+                     ctx,
+                     slot_lease = std::move(slot_lease)]() mutable {
+            LlamaCppClient* client = slot_lease.get();
             auto emit_line = [ctx](const std::string& payload, bool done) {
                 std::lock_guard<std::mutex> lk(ctx->mx);
                 ctx->lines.push_back(payload);
@@ -899,7 +924,8 @@ void NodeApiServer::register_routes() {
                                 state_.append_streaming_text(c.delta_content, "");
                             } else if (c.tool_call_delta) {
                                 auto& tc = *c.tool_call_delta;
-                                j = {{"type","tool_call"},{"name", tc.function_name},
+                                j = {{"type","tool_call"},{"id", tc.id},
+                                     {"name", tc.function_name},
                                      {"arguments", tc.arguments_json}};
                             } else if (c.is_done) {
                                 j = {{"type","done"},
@@ -953,6 +979,7 @@ void NodeApiServer::register_routes() {
                     for (const auto& tc : full.tool_calls) {
                         emit_line("data: " + safe_json_dump(nlohmann::json{
                             {"type", "tool_call"},
+                            {"id", tc.id},
                             {"name", tc.function_name},
                             {"arguments", tc.arguments_json}
                         }) + "\n\n", false);

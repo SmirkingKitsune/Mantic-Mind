@@ -34,3 +34,8 @@ endif()
 add_subdirectory(src/common)
 add_subdirectory(src/node)
 add_subdirectory(src/control)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()

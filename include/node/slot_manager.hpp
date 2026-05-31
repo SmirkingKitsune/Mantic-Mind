@@ -15,11 +15,50 @@
 
 namespace mm {
 
+enum class SlotOperationStatus {
+    Ok,
+    NotFound,
+    Busy,
+    Failed
+};
+
+struct SlotOperationResult {
+    SlotOperationStatus status = SlotOperationStatus::Failed;
+    std::string message;
+    std::string kv_cache_path;
+
+    bool ok() const { return status == SlotOperationStatus::Ok; }
+};
+
 /// Manages a pool of concurrent llama-server processes (slots).
 /// Each slot is an independent llama-server subprocess with its own port.
 class SlotManager {
 public:
     using LogCallback = LlamaServerProcess::LogCallback;
+
+    class SlotLease {
+    public:
+        SlotLease() = default;
+        SlotLease(const SlotLease&) = delete;
+        SlotLease& operator=(const SlotLease&) = delete;
+        SlotLease(SlotLease&& other) noexcept;
+        SlotLease& operator=(SlotLease&& other) noexcept;
+        ~SlotLease();
+
+        explicit operator bool() const { return client_ != nullptr; }
+        LlamaCppClient* get() const { return client_; }
+        const SlotId& slot_id() const { return slot_id_; }
+
+    private:
+        friend class SlotManager;
+        SlotLease(SlotManager* manager, SlotId slot_id, LlamaCppClient* client);
+
+        void reset();
+
+        SlotManager* manager_ = nullptr;
+        SlotId slot_id_;
+        LlamaCppClient* client_ = nullptr;
+    };
 
     SlotManager(std::string llama_server_path,
                 uint16_t port_range_start,
@@ -40,11 +79,11 @@ public:
                       const AgentId& agent_id = {});
 
     /// Unload a slot — stops its llama-server process, frees the port.
-    bool unload_slot(const SlotId& slot_id);
+    SlotOperationResult unload_slot(const SlotId& slot_id);
 
     /// Suspend a slot: save KV cache, stop process.
     /// Returns the KV cache file path, or empty string on failure.
-    std::string suspend_slot(const SlotId& slot_id);
+    SlotOperationResult suspend_slot(const SlotId& slot_id);
 
     /// Restore a suspended slot: start a new process, load model, restore KV cache.
     /// Returns the new slot ID, or empty string on failure.
@@ -53,14 +92,14 @@ public:
                         const std::string& kv_cache_path,
                         const AgentId& agent_id = {});
 
-    /// Gracefully stop all slots.
-    void unload_all();
+    /// Gracefully stop all slots. force=true is intended for shutdown cleanup.
+    SlotOperationResult unload_all(bool force = true);
 
     /// Find the slot assigned to a given agent.
     std::optional<SlotId> find_slot_by_agent(const AgentId& agent_id) const;
 
-    /// Get the LlamaCppClient for a specific slot (for inference).
-    LlamaCppClient* get_client(const SlotId& slot_id);
+    /// Acquire a temporary inference lease for a ready slot.
+    SlotLease acquire_slot(const SlotId& slot_id);
 
     /// Update last-active timestamp for a slot when it is selected for work.
     bool touch_slot(const SlotId& slot_id);
@@ -93,6 +132,7 @@ private:
         AgentId                             assigned_agent;
         std::unique_ptr<LlamaServerProcess> process;
         std::unique_ptr<LlamaCppClient>     client;
+        int                                 active_requests = 0;
         int64_t                             vram_usage_mb  = 0;
         int64_t                             last_active_ms = 0;
         SlotState                           state          = SlotState::Empty;
@@ -111,6 +151,8 @@ private:
     std::vector<std::unique_ptr<Slot>> slots_;
     std::set<uint16_t>                 used_ports_;
     std::string                        last_error_;
+
+    void release_slot_request(const SlotId& slot_id);
 
     /// Try to find and claim an available port in the configured range.
     std::optional<uint16_t> allocate_port();

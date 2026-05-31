@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <utility>
 
 #ifdef _WIN32
 #  include <winsock2.h>
@@ -21,6 +22,46 @@
 namespace fs = std::filesystem;
 
 namespace mm {
+
+SlotManager::SlotLease::SlotLease(SlotManager* manager, SlotId slot_id, LlamaCppClient* client)
+    : manager_(manager)
+    , slot_id_(std::move(slot_id))
+    , client_(client)
+{}
+
+SlotManager::SlotLease::SlotLease(SlotLease&& other) noexcept
+    : manager_(other.manager_)
+    , slot_id_(std::move(other.slot_id_))
+    , client_(other.client_)
+{
+    other.manager_ = nullptr;
+    other.client_ = nullptr;
+}
+
+SlotManager::SlotLease& SlotManager::SlotLease::operator=(SlotLease&& other) noexcept {
+    if (this != &other) {
+        reset();
+        manager_ = other.manager_;
+        slot_id_ = std::move(other.slot_id_);
+        client_ = other.client_;
+        other.manager_ = nullptr;
+        other.client_ = nullptr;
+    }
+    return *this;
+}
+
+SlotManager::SlotLease::~SlotLease() {
+    reset();
+}
+
+void SlotManager::SlotLease::reset() {
+    if (manager_ && !slot_id_.empty()) {
+        manager_->release_slot_request(slot_id_);
+    }
+    manager_ = nullptr;
+    client_ = nullptr;
+    slot_id_.clear();
+}
 
 SlotManager::SlotManager(std::string llama_server_path,
                          uint16_t port_range_start,
@@ -38,7 +79,7 @@ SlotManager::SlotManager(std::string llama_server_path,
 }
 
 SlotManager::~SlotManager() {
-    unload_all();
+    static_cast<void>(unload_all(true));
 }
 
 void SlotManager::set_log_callback(LogCallback cb) {
@@ -151,17 +192,23 @@ SlotId SlotManager::load_model(const std::string& model_path,
     return id;
 }
 
-bool SlotManager::unload_slot(const SlotId& slot_id) {
+SlotOperationResult SlotManager::unload_slot(const SlotId& slot_id) {
     std::lock_guard lock(mutex_);
 
     auto it = std::find_if(slots_.begin(), slots_.end(),
                            [&](const auto& s) { return s->id == slot_id; });
-    if (it == slots_.end()) return false;
+    if (it == slots_.end()) {
+        return {SlotOperationStatus::NotFound, "slot not found", {}};
+    }
 
     auto& slot = *it;
+    if (slot->active_requests > 0) {
+        return {SlotOperationStatus::Busy, "slot has active inference requests", {}};
+    }
+
     MM_INFO("SlotManager: unloading slot {} (port {})", slot->id, slot->port);
 
-    slot->process->stop();
+    if (slot->process) slot->process->stop();
     release_port(slot->port);
 
     // Clean up any KV cache file for this slot.
@@ -171,18 +218,25 @@ bool SlotManager::unload_slot(const SlotId& slot_id) {
     }
 
     slots_.erase(it);
-    return true;
+    return {SlotOperationStatus::Ok, "unloaded", {}};
 }
 
-std::string SlotManager::suspend_slot(const SlotId& slot_id) {
+SlotOperationResult SlotManager::suspend_slot(const SlotId& slot_id) {
     std::lock_guard lock(mutex_);
 
     auto it = std::find_if(slots_.begin(), slots_.end(),
                            [&](const auto& s) { return s->id == slot_id; });
-    if (it == slots_.end()) return {};
+    if (it == slots_.end()) {
+        return {SlotOperationStatus::NotFound, "slot not found", {}};
+    }
 
     auto& slot = *it;
-    if (slot->state != SlotState::Ready) return {};
+    if (slot->active_requests > 0) {
+        return {SlotOperationStatus::Busy, "slot has active inference requests", {}};
+    }
+    if (slot->state != SlotState::Ready) {
+        return {SlotOperationStatus::Failed, "slot is not ready", {}};
+    }
 
     slot->state = SlotState::Suspending;
     MM_INFO("SlotManager: suspending slot {} (agent={})",
@@ -216,7 +270,7 @@ std::string SlotManager::suspend_slot(const SlotId& slot_id) {
     slot->client.reset();
 
     MM_INFO("SlotManager: slot {} suspended (cache={})", slot->id, cache_path);
-    return cache_path;
+    return {SlotOperationStatus::Ok, "suspended", cache_path};
 }
 
 SlotId SlotManager::restore_slot(const std::string& model_path,
@@ -313,8 +367,17 @@ SlotId SlotManager::restore_slot(const std::string& model_path,
     return id;
 }
 
-void SlotManager::unload_all() {
+SlotOperationResult SlotManager::unload_all(bool force) {
     std::lock_guard lock(mutex_);
+    if (!force) {
+        for (const auto& slot : slots_) {
+            if (slot->active_requests > 0) {
+                return {SlotOperationStatus::Busy,
+                        "one or more slots have active inference requests",
+                        {}};
+            }
+        }
+    }
     for (auto& slot : slots_) {
         if (slot->process)
             slot->process->stop();
@@ -324,6 +387,7 @@ void SlotManager::unload_all() {
     slots_.clear();
     used_ports_.clear();
     MM_INFO("SlotManager: all slots unloaded");
+    return {SlotOperationStatus::Ok, "unloaded", {}};
 }
 
 std::optional<SlotId> SlotManager::find_slot_by_agent(const AgentId& agent_id) const {
@@ -335,12 +399,16 @@ std::optional<SlotId> SlotManager::find_slot_by_agent(const AgentId& agent_id) c
     return std::nullopt;
 }
 
-LlamaCppClient* SlotManager::get_client(const SlotId& slot_id) {
+SlotManager::SlotLease SlotManager::acquire_slot(const SlotId& slot_id) {
     std::lock_guard lock(mutex_);
-    for (const auto& s : slots_) {
-        if (s->id == slot_id) return s->client.get();
+    for (auto& s : slots_) {
+        if (s->id == slot_id && s->state == SlotState::Ready && s->client) {
+            ++s->active_requests;
+            s->last_active_ms = util::now_ms();
+            return SlotLease(this, slot_id, s->client.get());
+        }
     }
-    return nullptr;
+    return {};
 }
 
 bool SlotManager::touch_slot(const SlotId& slot_id) {
@@ -403,6 +471,16 @@ void SlotManager::set_llama_server_path(const std::string& path) {
 std::string SlotManager::llama_server_path() const {
     std::lock_guard lock(mutex_);
     return llama_server_path_;
+}
+
+void SlotManager::release_slot_request(const SlotId& slot_id) {
+    std::lock_guard lock(mutex_);
+    for (auto& s : slots_) {
+        if (s->id == slot_id) {
+            if (s->active_requests > 0) --s->active_requests;
+            return;
+        }
+    }
 }
 
 // ── Private helpers ─────────────────────────────────────────────────────────

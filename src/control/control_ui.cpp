@@ -1235,7 +1235,7 @@ void ControlUI::run() {
     auto btn_cur_new_conv = Button(" New Conversation ", [&] {
         auto agents = agents_.list_agents();
         if (agents.empty() || cur_agent_sel < 0 || cur_agent_sel >= static_cast<int>(agents.size())) return;
-        Agent* a = agents_.get_agent(agents[cur_agent_sel].id);
+        auto a = agents_.get_agent(agents[cur_agent_sel].id);
         if (!a) return;
 
         auto convs = a->db().list_conversations();
@@ -1259,7 +1259,7 @@ void ControlUI::run() {
     auto btn_cur_activate = Button(" Set Active ", [&] {
         auto agents = agents_.list_agents();
         if (agents.empty() || cur_agent_sel < 0 || cur_agent_sel >= static_cast<int>(agents.size())) return;
-        Agent* a = agents_.get_agent(agents[cur_agent_sel].id);
+        auto a = agents_.get_agent(agents[cur_agent_sel].id);
         if (!a) return;
         auto convs = a->db().list_conversations();
         if (cur_conv_sel < 0 || cur_conv_sel >= static_cast<int>(convs.size())) return;
@@ -1272,7 +1272,7 @@ void ControlUI::run() {
         auto agents = agents_.list_agents();
         if (agents.empty() || cur_agent_sel < 0 || cur_agent_sel >= static_cast<int>(agents.size())) return;
         const auto& agent_id = agents[cur_agent_sel].id;
-        Agent* a = agents_.get_agent(agent_id);
+        auto a = agents_.get_agent(agent_id);
         if (!a) return;
         auto convs = a->db().list_conversations();
         if (cur_conv_sel < 0 || cur_conv_sel >= static_cast<int>(convs.size())) return;
@@ -1293,7 +1293,7 @@ void ControlUI::run() {
         auto agents = agents_.list_agents();
         if (agents.empty() || cur_agent_sel < 0 || cur_agent_sel >= static_cast<int>(agents.size())) return;
         const auto& agent_id = agents[cur_agent_sel].id;
-        Agent* a = agents_.get_agent(agent_id);
+        auto a = agents_.get_agent(agent_id);
         if (!a) return;
         auto convs = a->db().list_conversations();
         if (cur_conv_sel < 0 || cur_conv_sel >= static_cast<int>(convs.size())) return;
@@ -1314,7 +1314,7 @@ void ControlUI::run() {
         auto agents = agents_.list_agents();
         if (agents.empty() || cur_agent_sel < 0 || cur_agent_sel >= static_cast<int>(agents.size())) return;
         const auto& agent_id = agents[cur_agent_sel].id;
-        Agent* a = agents_.get_agent(agent_id);
+        auto a = agents_.get_agent(agent_id);
         if (!a) return;
         auto convs = a->db().list_conversations();
         if (cur_conv_sel < 0 || cur_conv_sel >= static_cast<int>(convs.size())) return;
@@ -1353,7 +1353,7 @@ void ControlUI::run() {
         auto agents = agents_.list_agents();
         if (agents.empty() || cur_agent_sel < 0 || cur_agent_sel >= static_cast<int>(agents.size())) return;
         const auto& agent_id = agents[cur_agent_sel].id;
-        Agent* a = agents_.get_agent(agent_id);
+        auto a = agents_.get_agent(agent_id);
         if (!a) return;
         auto mems = a->db().list_memories();
         if (cur_mem_sel < 0 || cur_mem_sel >= static_cast<int>(mems.size())) return;
@@ -1386,7 +1386,7 @@ void ControlUI::run() {
     });
 
     auto btn_cur_confirm_delete = Button(" Confirm Delete ", [&] {
-        Agent* a = agents_.get_agent(cur_delete_agent_id);
+        auto a = agents_.get_agent(cur_delete_agent_id);
         if (!a) {
             show_cur_delete_confirm = false;
             return;
@@ -1988,7 +1988,7 @@ void ControlUI::run() {
 
         if (!cs.empty() && cur_agent_sel >= 0 && cur_agent_sel < static_cast<int>(cs.size())) {
             selected_agent = cs[cur_agent_sel].name + " [" + cs[cur_agent_sel].id + "]";
-            Agent* a = agents_.get_agent(cs[cur_agent_sel].id);
+            auto a = agents_.get_agent(cs[cur_agent_sel].id);
             if (a) {
                 convs = a->db().list_conversations();
                 mems  = a->db().list_memories();
@@ -2010,7 +2010,7 @@ void ControlUI::run() {
             cur_conv_sel = 0;
 
         if (!convs.empty() && cur_conv_sel >= 0 && cur_conv_sel < static_cast<int>(convs.size())) {
-            Agent* a = agents_.get_agent(cs[cur_agent_sel].id);
+            auto a = agents_.get_agent(cs[cur_agent_sel].id);
             if (a) conv_detail = a->db().load_conversation(convs[cur_conv_sel].id);
         }
 

@@ -1,6 +1,8 @@
 #include "control/agent_queue.hpp"
 #include "common/logger.hpp"
 
+#include <exception>
+
 namespace mm {
 
 AgentQueue::AgentQueue()  = default;
@@ -67,10 +69,26 @@ void AgentQueue::shutdown() {
         }
 
         // process_fn encapsulates the full inference pipeline.
-        if (job.process_fn) {
-            job.process_fn();
-        } else if (job.done_cb) {
-            job.done_cb(job.conversation_id, false);
+        try {
+            if (job.process_fn) {
+                job.process_fn();
+            } else if (job.done_cb) {
+                job.done_cb(job.conversation_id, false);
+            }
+        } catch (const std::exception& e) {
+            MM_ERROR("AgentQueue worker job {} for agent {} failed: {}",
+                     job.job_id, job.agent_id, e.what());
+            if (job.done_cb) {
+                try { job.done_cb(job.conversation_id, false); }
+                catch (...) {}
+            }
+        } catch (...) {
+            MM_ERROR("AgentQueue worker job {} for agent {} failed with unknown exception",
+                     job.job_id, job.agent_id);
+            if (job.done_cb) {
+                try { job.done_cb(job.conversation_id, false); }
+                catch (...) {}
+            }
         }
     }
 }
