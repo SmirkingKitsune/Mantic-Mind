@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -145,6 +146,7 @@ public:
                         result.thinking_text += j.value("content", "");
                     } else if (type == "tool_call") {
                         ToolCall tc;
+                        tc.id             = j.value("id", std::string{});
                         tc.function_name  = j.value("name", "");
                         tc.arguments_json = j.value("arguments", "");
                         result.tool_calls.push_back(tc);
@@ -198,7 +200,7 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
                                     DoneCb done_cb,
                                     int max_tokens_override) {
     // 1. Look up agent
-    Agent* agent = agents_.get_agent(agent_id);
+    auto agent = agents_.get_agent(agent_id);
     if (!agent) {
         MM_WARN("handle_chat: agent '{}' not found", agent_id);
         done_cb({}, false, "agent not found");
@@ -220,6 +222,10 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
             conv_id = db.create_conversation();
             db.set_active_conversation(conv_id);
         }
+    } else if (!db.conversation_exists(conv_id)) {
+        MM_WARN("handle_chat: conversation '{}' not found for agent '{}'", conv_id, agent_id);
+        done_cb(conv_id, false, "conversation not found");
+        return;
     }
 
     // 3. Append user message
@@ -610,7 +616,7 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
 
 void ControlApiServer::queue_global_recall(const AgentId& agent_id,
                                            const ConvId& conv_id) {
-    Agent* agent = agents_.get_agent(agent_id);
+    auto agent = agents_.get_agent(agent_id);
     if (!agent) return;
 
     AgentConfig cfg = agent->get_config();
@@ -623,7 +629,7 @@ void ControlApiServer::queue_global_recall(const AgentId& agent_id,
     recall_job.job_id   = util::generate_uuid();
     recall_job.agent_id = agent_id;
     recall_job.process_fn = [this, agent_id, conv_id]() {
-        Agent* a = agents_.get_agent(agent_id);
+        auto a = agents_.get_agent(agent_id);
         if (!a) return;
         AgentConfig acfg = a->get_config();
         if (!acfg.memories_enabled) return;
@@ -1338,7 +1344,7 @@ void ControlApiServer::register_routes() {
                 return;
             }
             AgentId id = agents_.create_agent(cfg);
-            Agent* a = agents_.get_agent(id);
+            auto a = agents_.get_agent(id);
             nlohmann::json resp = a ? nlohmann::json(a->get_config())
                                     : nlohmann::json{{"id", id}};
             if (a) {
@@ -1356,7 +1362,7 @@ void ControlApiServer::register_routes() {
     // ── GET /v1/agents/:id ────────────────────────────────────────────────────
     server_->Get("/v1/agents/:id", [this, compute_node_compat](const Request& req, Response& res) {
         std::string id = req.path_params.at("id");
-        Agent* a = agents_.get_agent(id);
+        auto a = agents_.get_agent(id);
         if (!a) { res.status = 404; return; }
         auto cfg = a->get_config();
         nlohmann::json j = cfg;
@@ -1394,7 +1400,7 @@ void ControlApiServer::register_routes() {
             }
             AgentId final_id = agents_.update_agent(id, cfg);
             if (final_id.empty()) { res.status = 404; return; }
-            Agent* a = agents_.get_agent(final_id);
+            auto a = agents_.get_agent(final_id);
             if (!a) { res.status = 404; return; }
             res.set_content(nlohmann::json(a->get_config()).dump(), "application/json");
         } catch (const std::exception& e) {
@@ -1453,6 +1459,7 @@ void ControlApiServer::register_routes() {
                 auto& tc = *chunk.tool_call_delta;
                 payload = "data: " +
                     nlohmann::json{{"type",      "tool_call"},
+                                   {"id",        tc.id},
                                    {"name",      tc.function_name},
                                    {"arguments", tc.arguments_json}}.dump() + "\n\n";
             } else if (!chunk.delta_content.empty()) {
@@ -1468,7 +1475,11 @@ void ControlApiServer::register_routes() {
         };
 
         // Done callback: emit done event and signal provider to stop.
-        auto done_fn = [ctx](const ConvId& conv_id, bool success, const std::string& error) {
+        auto done_sent = std::make_shared<std::atomic_bool>(false);
+        auto done_fn = [ctx, done_sent](const ConvId& conv_id,
+                                        bool success,
+                                        const std::string& error) {
+            if (done_sent->exchange(true)) return;
             nlohmann::json done_payload = {
                 {"type", "done"},
                 {"conv_id", conv_id},
@@ -1488,11 +1499,29 @@ void ControlApiServer::register_routes() {
         InferenceJob job;
         job.job_id   = util::generate_uuid();
         job.agent_id = agent_id;
-        job.process_fn = [this, agent_id, message, conv_id_hint,
-                          max_tokens_override, chunk_fn, done_fn]() mutable {
-            handle_chat(agent_id, message, conv_id_hint,
-                        std::move(chunk_fn), std::move(done_fn),
-                        max_tokens_override);
+        job.conversation_id = conv_id_hint;
+        job.done_cb = [done_fn](const ConvId& conv_id, bool success) mutable {
+            done_fn(conv_id, success, success ? std::string{} : "queued chat job failed");
+        };
+        job.process_fn = [this,
+                          agent_id,
+                          message,
+                          conv_id_hint,
+                          max_tokens_override,
+                          chunk_fn,
+                          done_for_handle = done_fn,
+                          done_for_catch = done_fn]() mutable {
+            try {
+                handle_chat(agent_id, message, conv_id_hint,
+                            std::move(chunk_fn), std::move(done_for_handle),
+                            max_tokens_override);
+            } catch (const std::exception& e) {
+                MM_ERROR("queued chat job for agent '{}' failed: {}", agent_id, e.what());
+                done_for_catch(conv_id_hint, false, e.what());
+            } catch (...) {
+                MM_ERROR("queued chat job for agent '{}' failed with unknown exception", agent_id);
+                done_for_catch(conv_id_hint, false, "queued chat job failed");
+            }
         };
         queue_.enqueue(std::move(job));
 
@@ -1534,7 +1563,7 @@ void ControlApiServer::register_routes() {
     server_->Get("/v1/agents/:id/conversations",
                  [this](const Request& req, Response& res) {
         std::string id = req.path_params.at("id");
-        Agent* a = agents_.get_agent(id);
+        auto a = agents_.get_agent(id);
         if (!a) { res.status = 404; return; }
 
         auto convs = a->db().list_conversations();
@@ -1547,7 +1576,7 @@ void ControlApiServer::register_routes() {
     server_->Post("/v1/agents/:id/conversations",
                   [this](const Request& req, Response& res) {
         std::string id = req.path_params.at("id");
-        Agent* a = agents_.get_agent(id);
+        auto a = agents_.get_agent(id);
         if (!a) { res.status = 404; return; }
 
         try {
@@ -1610,7 +1639,7 @@ void ControlApiServer::register_routes() {
                  [this](const Request& req, Response& res) {
         std::string id  = req.path_params.at("id");
         std::string cid = req.path_params.at("cid");
-        Agent* a = agents_.get_agent(id);
+        auto a = agents_.get_agent(id);
         if (!a) { res.status = 404; return; }
 
         auto conv_opt = a->db().load_conversation(cid);
@@ -1624,7 +1653,7 @@ void ControlApiServer::register_routes() {
         (void)req.body;
         std::string id  = req.path_params.at("id");
         std::string cid = req.path_params.at("cid");
-        Agent* a = agents_.get_agent(id);
+        auto a = agents_.get_agent(id);
         if (!a) { res.status = 404; return; }
         if (!a->db().conversation_exists(cid)) { res.status = 404; return; }
 
@@ -1647,7 +1676,7 @@ void ControlApiServer::register_routes() {
         std::string id  = req.path_params.at("id");
         std::string cid = req.path_params.at("cid");
 
-        Agent* a = agents_.get_agent(id);
+        auto a = agents_.get_agent(id);
         if (!a) { res.status = 404; return; }
         if (!a->db().conversation_exists(cid)) { res.status = 404; return; }
 
@@ -1691,7 +1720,7 @@ void ControlApiServer::register_routes() {
                     [this](const Request& req, Response& res) {
         std::string id  = req.path_params.at("id");
         std::string cid = req.path_params.at("cid");
-        Agent* a = agents_.get_agent(id);
+        auto a = agents_.get_agent(id);
         if (!a) { res.status = 404; return; }
         if (!a->db().conversation_exists(cid)) { res.status = 404; return; }
         if (a->db().is_conversation_active(cid)) {
@@ -1712,7 +1741,7 @@ void ControlApiServer::register_routes() {
                  [this](const Request& req, Response& res) {
         std::string id  = req.path_params.at("id");
         std::string cid = req.path_params.at("cid");
-        Agent* a = agents_.get_agent(id);
+        auto a = agents_.get_agent(id);
         if (!a) { res.status = 404; return; }
         if (!a->db().conversation_exists(cid)) { res.status = 404; return; }
 
@@ -1726,7 +1755,7 @@ void ControlApiServer::register_routes() {
     server_->Post("/v1/agents/:id/memories/extract",
                   [this](const Request& req, Response& res) {
         std::string id = req.path_params.at("id");
-        Agent* a = agents_.get_agent(id);
+        auto a = agents_.get_agent(id);
         if (!a) { res.status = 404; return; }
 
         try {
@@ -1776,7 +1805,7 @@ void ControlApiServer::register_routes() {
             job.job_id   = util::generate_uuid();
             job.agent_id = id;
             job.process_fn = [this, id, conv_id, selected]() {
-                Agent* a_local = agents_.get_agent(id);
+                auto a_local = agents_.get_agent(id);
                 if (!a_local) return;
 
                 AgentConfig cfg = a_local->get_config();
@@ -1821,7 +1850,7 @@ void ControlApiServer::register_routes() {
     server_->Get("/v1/agents/:id/memories",
                  [this](const Request& req, Response& res) {
         std::string id = req.path_params.at("id");
-        Agent* a = agents_.get_agent(id);
+        auto a = agents_.get_agent(id);
         if (!a) { res.status = 404; return; }
 
         auto mems = a->db().list_memories();
@@ -1835,7 +1864,7 @@ void ControlApiServer::register_routes() {
                  [this](const Request& req, Response& res) {
         std::string id  = req.path_params.at("id");
         std::string mid = req.path_params.at("mid");
-        Agent* a = agents_.get_agent(id);
+        auto a = agents_.get_agent(id);
         if (!a) { res.status = 404; return; }
         try {
             auto j = nlohmann::json::parse(req.body);
@@ -1858,7 +1887,7 @@ void ControlApiServer::register_routes() {
                     [this](const Request& req, Response& res) {
         std::string id  = req.path_params.at("id");
         std::string mid = req.path_params.at("mid");
-        Agent* a = agents_.get_agent(id);
+        auto a = agents_.get_agent(id);
         if (!a) { res.status = 404; return; }
         a->db().delete_memory(mid);
         res.set_content(R"({"status":"deleted"})", "application/json");

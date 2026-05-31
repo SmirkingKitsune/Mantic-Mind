@@ -2,6 +2,7 @@
 
 #include "common/models.hpp"
 #include <memory>
+#include <mutex>
 #include <string>
 
 namespace mm {
@@ -15,8 +16,8 @@ public:
     explicit Agent(const AgentConfig& config, const std::string& data_dir = "data");
     ~Agent();
 
-    const AgentId&   get_id()   const;
-    const std::string& get_name() const;
+    AgentId          get_id()   const;
+    std::string      get_name() const;
     AgentConfig      get_config() const;
     void             update_config(const AgentConfig& cfg);
 
@@ -26,6 +27,7 @@ public:
 private:
     AgentConfig              config_;
     std::unique_ptr<AgentDB> db_;
+    mutable std::mutex       config_mutex_;
 };
 
 } // namespace mm

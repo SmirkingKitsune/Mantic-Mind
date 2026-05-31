@@ -1,4 +1,5 @@
 #include "common/llama_cpp_client.hpp"
+#include "common/inference_response_parser.hpp"
 #include "common/logger.hpp"
 #include "common/util.hpp"
 
@@ -170,20 +171,6 @@ nlohmann::json build_request(const InferenceRequest& req, bool stream) {
 }
 
 // ── Tool call delta accumulator ───────────────────────────────────────────────
-std::optional<ToolCall> parse_tool_call_delta(const nlohmann::json& delta) {
-    if (!delta.contains("tool_calls") || delta["tool_calls"].empty())
-        return std::nullopt;
-    auto& tc = delta["tool_calls"][0];
-    ToolCall out;
-    if (tc.contains("id"))       out.id = tc["id"].get<std::string>();
-    if (tc.contains("function")) {
-        auto& fn = tc["function"];
-        if (fn.contains("name"))      out.function_name  = fn["name"].get<std::string>();
-        if (fn.contains("arguments")) out.arguments_json = fn["arguments"].get<std::string>();
-    }
-    return out;
-}
-
 httplib::Client make_client(const std::string& host, int port) {
     httplib::Client cli(host, port);
     cli.set_connection_timeout(10);
@@ -206,88 +193,7 @@ LlamaCppClient::LlamaCppClient(std::string base_url)
 // ── <think>…</think> extraction ───────────────────────────────────────────────
 // Buffer-search approach: find complete tags in the accumulated buffer.
 // Keeps the last (tag.size()-1) bytes in buf to handle tags split across chunks.
-std::string LlamaCppClient::extract_thinking(const std::string& raw,
-                                              std::string& buf,
-                                              bool& in_think,
-                                              std::string& out_thinking) {
-    buf += raw;
-    std::string normal_out;
-    out_thinking.clear();
-
-    static const std::string OPEN  = "<think>";
-    static const std::string CLOSE = "</think>";
-
-    bool progress = true;
-    while (progress) {
-        progress = false;
-        if (!in_think) {
-            auto pos = buf.find(OPEN);
-            if (pos != std::string::npos) {
-                normal_out += buf.substr(0, pos);
-                buf = buf.substr(pos + OPEN.size());
-                in_think = true;
-                progress = true;
-            }
-        } else {
-            auto pos = buf.find(CLOSE);
-            if (pos != std::string::npos) {
-                out_thinking += buf.substr(0, pos);
-                buf = buf.substr(pos + CLOSE.size());
-                in_think = false;
-                progress = true;
-            }
-        }
-    }
-
-    // Safe to emit buf minus the last (max_tag_size-1) chars
-    // to avoid emitting a partial tag boundary.
-    const size_t guard = std::max(OPEN.size(), CLOSE.size()) - 1;
-    if (!in_think) {
-        if (buf.size() > guard) {
-            normal_out += buf.substr(0, buf.size() - guard);
-            buf = buf.substr(buf.size() - guard);
-        }
-    } else {
-        if (buf.size() > guard) {
-            out_thinking += buf.substr(0, buf.size() - guard);
-            buf = buf.substr(buf.size() - guard);
-        }
-    }
-
-    return normal_out;
-}
-
 // ── parse_sse_line ────────────────────────────────────────────────────────────
-InferenceChunk LlamaCppClient::parse_sse_line(const std::string& data_json) {
-    InferenceChunk chunk;
-    try {
-        auto j = nlohmann::json::parse(data_json);
-        if (!j.contains("choices") || j["choices"].empty()) {
-            // Usage-only frame
-            if (j.contains("usage") && !j["usage"].is_null())
-                chunk.tokens_used = j["usage"].value("completion_tokens", 0);
-            return chunk;
-        }
-        auto& choice = j["choices"][0];
-        const auto delta = choice.value("delta", nlohmann::json::object());
-
-        if (delta.contains("content") && !delta["content"].is_null())
-            chunk.delta_content = delta["content"].get<std::string>();
-
-        chunk.tool_call_delta = parse_tool_call_delta(delta);
-
-        if (choice.contains("finish_reason") && !choice["finish_reason"].is_null())
-            chunk.finish_reason = choice["finish_reason"].get<std::string>();
-
-        if (j.contains("usage") && !j["usage"].is_null())
-            chunk.tokens_used = j["usage"].value("completion_tokens", 0);
-
-    } catch (const std::exception& e) {
-        MM_DEBUG("SSE parse error: {}", e.what());
-    }
-    return chunk;
-}
-
 // ── complete (non-streaming) ──────────────────────────────────────────────────
 Message LlamaCppClient::complete(const InferenceRequest& req) {
     auto body = build_request(req, false);
@@ -310,42 +216,13 @@ Message LlamaCppClient::complete(const InferenceRequest& req) {
         MM_ERROR("LlamaCppClient::complete HTTP {}: {}", res->status, res->body);
         return {};
     }
-    try {
-        auto j = nlohmann::json::parse(res->body);
-        auto& msg = j["choices"][0]["message"];
-        Message m;
-        m.role         = MessageRole::Assistant;
-        m.content      = msg.value("content", std::string{});
-        m.token_count  = j.value("usage", nlohmann::json{}).value("completion_tokens", 0);
-        m.timestamp_ms = util::now_ms();
-
-        if (msg.contains("tool_calls") && msg["tool_calls"].is_array()) {
-            for (const auto& tc : msg["tool_calls"]) {
-                ToolCall parsed;
-                parsed.id = tc.value("id", std::string{});
-                if (tc.contains("function") && tc["function"].is_object()) {
-                    const auto& fn = tc["function"];
-                    parsed.function_name = fn.value("name", std::string{});
-                    parsed.arguments_json = fn.value("arguments", std::string{});
-                }
-                if (!parsed.function_name.empty()) {
-                    m.tool_calls.push_back(std::move(parsed));
-                }
-            }
-        }
-
-        // Strip thinking if present in non-streaming response
-        std::string think_buf;
-        bool in_think = false;
-        std::string thinking_out;
-        m.content = extract_thinking(m.content, think_buf, in_think, thinking_out);
-        m.thinking_text = thinking_out;
-
-        return m;
-    } catch (const std::exception& e) {
-        MM_ERROR("LlamaCppClient::complete parse error: {}", e.what());
+    std::string parse_error;
+    auto parsed = inference::parse_openai_chat_completion(res->body, util::now_ms(), &parse_error);
+    if (!parsed) {
+        MM_ERROR("LlamaCppClient::complete parse error: {}", parse_error);
         return {};
     }
+    return *parsed;
 }
 
 // ── stream_complete ───────────────────────────────────────────────────────────
@@ -357,8 +234,7 @@ void LlamaCppClient::stream_complete(const InferenceRequest& req,
 
     std::string  sse_buf;
     std::string  raw_body;
-    std::string  think_buf;
-    bool         in_think    = false;
+    inference::ThinkingExtractor thinking;
     int          total_tokens = 0;
     std::string  finish_reason;
     bool         done_sent   = false;
@@ -397,17 +273,14 @@ void LlamaCppClient::stream_complete(const InferenceRequest& req,
         if (done_sent) return;
         done_sent = true;
 
-        // Flush residual characters held back by extract_thinking()'s
-        // guard buffer (up to 7 chars kept to avoid splitting tags).
-        if (!think_buf.empty()) {
-            if (in_think) {
-                InferenceChunk c; c.thinking_delta = think_buf;
-                if (!safe_chunk(c)) return;
-            } else {
-                InferenceChunk c; c.delta_content = think_buf;
-                if (!safe_chunk(c)) return;
-            }
-            think_buf.clear();
+        auto tail = thinking.flush();
+        if (!tail.thinking.empty()) {
+            InferenceChunk c; c.thinking_delta = tail.thinking;
+            if (!safe_chunk(c)) return;
+        }
+        if (!tail.content.empty()) {
+            InferenceChunk c; c.delta_content = tail.content;
+            if (!safe_chunk(c)) return;
         }
 
         for (auto& [_, tc] : tc_acc) {
@@ -431,30 +304,31 @@ void LlamaCppClient::stream_complete(const InferenceRequest& req,
         for (auto& payload : util::drain_sse_lines(sse_buf)) {
             if (payload == "[DONE]") { flush_done(); return true; }
 
-            auto raw = parse_sse_line(payload);
-            if (!raw.finish_reason.empty()) finish_reason = raw.finish_reason;
-            if (raw.tokens_used > 0) total_tokens = raw.tokens_used;
+            std::string parse_error;
+            auto raw = inference::parse_openai_sse_delta(payload, &parse_error);
+            if (!raw) {
+                MM_DEBUG("SSE parse error: {}", parse_error);
+                continue;
+            }
+            if (!raw->finish_reason.empty()) finish_reason = raw->finish_reason;
+            if (raw->tokens_used > 0) total_tokens = raw->tokens_used;
 
-            if (raw.tool_call_delta) {
-                auto& acc = tc_acc[0];
-                auto& tc  = *raw.tool_call_delta;
+            for (const auto& tc_delta : raw->tool_calls) {
+                auto& acc = tc_acc[tc_delta.index];
+                const auto& tc = tc_delta.call;
                 if (!tc.id.empty())            acc.id            = tc.id;
                 if (!tc.function_name.empty()) acc.function_name = tc.function_name;
                 acc.arguments_json += tc.arguments_json;
-                continue;
             }
 
-            if (!raw.delta_content.empty()) {
-                std::string thinking_out;
-                std::string normal = extract_thinking(raw.delta_content,
-                                                      think_buf, in_think,
-                                                      thinking_out);
-                if (!thinking_out.empty()) {
-                    InferenceChunk c; c.thinking_delta = thinking_out;
+            if (!raw->content.empty()) {
+                auto parts = thinking.append(raw->content);
+                if (!parts.thinking.empty()) {
+                    InferenceChunk c; c.thinking_delta = parts.thinking;
                     if (!safe_chunk(c)) return false;
                 }
-                if (!normal.empty()) {
-                    InferenceChunk c; c.delta_content = normal;
+                if (!parts.content.empty()) {
+                    InferenceChunk c; c.delta_content = parts.content;
                     if (!safe_chunk(c)) return false;
                 }
             }

@@ -198,27 +198,31 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
 }
 
 void AgentScheduler::release_agent(const AgentId& agent_id) {
-    std::lock_guard lock(mutex_);
+    std::optional<AgentPlacement> placement;
 
-    auto it = placements_.find(agent_id);
-    if (it == placements_.end()) return;
+    {
+        std::lock_guard lock(mutex_);
+        auto it = placements_.find(agent_id);
+        if (it == placements_.end()) return;
 
-    auto& p = it->second;
-    if (!p.suspended) {
+        placement = it->second;
+        placements_.erase(it);
+    }
+
+    if (placement && !placement->suspended) {
         // Unload the slot on the node.
         try {
-            auto node = registry_.get_node(p.node_id);
+            auto node = registry_.get_node(placement->node_id);
             HttpClient cli(node.url);
             cli.set_bearer_token(node.api_key);
             cli.post("/api/node/unload-model",
-                     nlohmann::json{{"slot_id", p.slot_id}});
+                     nlohmann::json{{"slot_id", placement->slot_id}});
         } catch (const std::exception& e) {
             MM_WARN("AgentScheduler: failed to unload slot for agent {}: {}",
                     agent_id, e.what());
         }
     }
 
-    placements_.erase(it);
     MM_INFO("AgentScheduler: released agent {}", agent_id);
 }
 
@@ -264,35 +268,50 @@ std::string AgentScheduler::last_error() const {
 }
 
 void AgentScheduler::housekeeping(const std::vector<AgentConfig>& active_agents) {
-    std::lock_guard lock(mutex_);
+    struct PendingUnload {
+        AgentId agent_id;
+        NodeId node_id;
+        SlotId slot_id;
+    };
+    std::vector<PendingUnload> unloads;
 
-    // Build set of active agent IDs.
-    std::unordered_map<std::string, bool> active_ids;
-    for (const auto& a : active_agents)
-        active_ids[a.id] = true;
+    {
+        std::lock_guard lock(mutex_);
 
-    // Remove placements for deleted agents.
-    std::vector<AgentId> to_remove;
-    for (const auto& [id, p] : placements_) {
-        if (!active_ids.count(id)) {
-            to_remove.push_back(id);
+        // Build set of active agent IDs.
+        std::unordered_map<std::string, bool> active_ids;
+        for (const auto& a : active_agents)
+            active_ids[a.id] = true;
+
+        // Remove placements for deleted agents.
+        for (auto it = placements_.begin(); it != placements_.end();) {
+            if (active_ids.count(it->first)) {
+                ++it;
+                continue;
+            }
+
+            const auto& id = it->first;
+            const auto& p = it->second;
+            if (!p.suspended) {
+                unloads.push_back(PendingUnload{id, p.node_id, p.slot_id});
+            }
+            MM_INFO("AgentScheduler: housekeeping removed placement for deleted agent {}",
+                    id);
+            it = placements_.erase(it);
         }
     }
 
-    for (const auto& id : to_remove) {
-        auto& p = placements_[id];
-        if (!p.suspended) {
-            try {
-                auto node = registry_.get_node(p.node_id);
-                HttpClient cli(node.url);
-                cli.set_bearer_token(node.api_key);
-                cli.post("/api/node/unload-model",
-                         nlohmann::json{{"slot_id", p.slot_id}});
-            } catch (...) {}
+    for (const auto& unload : unloads) {
+        try {
+            auto node = registry_.get_node(unload.node_id);
+            HttpClient cli(node.url);
+            cli.set_bearer_token(node.api_key);
+            cli.post("/api/node/unload-model",
+                     nlohmann::json{{"slot_id", unload.slot_id}});
+        } catch (const std::exception& e) {
+            MM_WARN("AgentScheduler: housekeeping failed to unload slot for deleted agent {}: {}",
+                    unload.agent_id, e.what());
         }
-        placements_.erase(id);
-        MM_INFO("AgentScheduler: housekeeping removed placement for deleted agent {}",
-                id);
     }
 }
 
@@ -362,9 +381,16 @@ bool AgentScheduler::suspend_agent(const AgentId& agent_id) {
         if (resp.ok()) {
             auto j = nlohmann::json::parse(resp.body);
             p.kv_cache_node_path = j.value("kv_cache_path", std::string{});
+        } else {
+            std::string preview = resp.body;
+            if (preview.size() > 300) preview = preview.substr(0, 300) + "...";
+            MM_WARN("AgentScheduler: suspend failed for agent {} on node {} (HTTP {}): {}",
+                    agent_id, p.node_id, resp.status, preview);
+            return false;
         }
     } catch (const std::exception& e) {
         MM_WARN("AgentScheduler: suspend failed for agent {}: {}", agent_id, e.what());
+        return false;
     }
 
     p.suspended = true;

@@ -16,6 +16,7 @@ set(MM_COMMON_SOURCES
     gguf_metadata.cpp
     model_catalog.cpp
     cli_repl.cpp
+    inference_response_parser.cpp
 )
 
 add_library(mm_common STATIC ${MM_COMMON_SOURCES})
