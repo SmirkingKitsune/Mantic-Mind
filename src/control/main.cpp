@@ -95,6 +95,7 @@ static mm::ControlConfig load_config(
             file.get_int("node_health_poll_interval_s",
                          static_cast<int>(cfg.node_health_poll_interval_s)));
         cfg.models_dir     = file.get("models_dir",     cfg.models_dir);
+        cfg.external_api_token = file.get("external_api_token", cfg.external_api_token);
         cfg.pairing_key    = file.get("pairing_key",    "");
         cfg.discovery_port = static_cast<uint16_t>(
             file.get_int("discovery_port", static_cast<int>(cfg.discovery_port)));
@@ -118,6 +119,8 @@ static mm::ControlConfig load_config(
     cfg.data_dir    = env("MM_DATA_DIR",    cfg.data_dir);
     cfg.log_file    = env("MM_LOG_FILE",    cfg.log_file);
     cfg.models_dir  = env("MM_MODELS_DIR",  cfg.models_dir);
+    cfg.external_api_token =
+        env("MM_CONTROL_EXTERNAL_API_TOKEN", cfg.external_api_token);
     cfg.pairing_key = env("MM_PAIRING_KEY", cfg.pairing_key);
     cfg.node_health_poll_interval_s = static_cast<uint32_t>(
         env_int("MM_POLL_INTERVAL_S",
@@ -918,7 +921,9 @@ int main(int argc, char** argv) {
     mm::AgentScheduler    scheduler(registry, distributor, cfg.models_dir);
     mm::ModelRouter       router(scheduler);
     mm::AgentQueue        queue;
-    mm::ControlApiServer  api_server(agents, queue, registry, router, scheduler, cfg.models_dir);
+    mm::ControlApiServer  api_server(
+        agents, queue, registry, router, scheduler,
+        cfg.models_dir, cfg.external_api_token);
     mm::ControlUI         ui(
         registry,
         agents,

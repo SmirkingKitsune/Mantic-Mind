@@ -96,15 +96,10 @@ bool HttpClient::stream_post(const std::string& path,
     std::string raw_body;
     constexpr size_t kRawBodyCaptureLimit = 32 * 1024;
 
-    // cpp-httplib: ContentProviderWithoutLength + ContentReceiver overload
     auto res = cli.Post(
         path,
         make_headers(bearer_token_),
-        [&](size_t /*offset*/, httplib::DataSink& sink) -> bool {
-            sink.write(body_str.data(), body_str.size());
-            sink.done();
-            return true;
-        },
+        body_str,
         "application/json",
         [&](const char* data, size_t len) -> bool {
             if (raw_body.size() < kRawBodyCaptureLimit) {

@@ -24,6 +24,14 @@ std::vector<ToolCall> deserialize_tool_calls(const std::string& s) {
     catch (const std::exception& e) { MM_DEBUG("deserialize_tool_calls: {}", e.what()); return {}; }
 }
 
+std::string serialize(const std::vector<TraceEvent>& events) {
+    return nlohmann::json(events).dump();
+}
+std::vector<TraceEvent> deserialize_trace_events(const std::string& s) {
+    try { return nlohmann::json::parse(s).get<std::vector<TraceEvent>>(); }
+    catch (const std::exception& e) { MM_DEBUG("deserialize_trace_events: {}", e.what()); return {}; }
+}
+
 std::string serialize(const std::vector<std::string>& v) {
     return nlohmann::json(v).dump();
 }
@@ -67,6 +75,7 @@ Message row_to_message(SQLite::Statement& q) {
     m.thinking_text = q.getColumn("thinking_text").getText();
     m.token_count   = q.getColumn("token_count").getInt();
     m.timestamp_ms  = q.getColumn("timestamp_ms").getInt64();
+    m.trace_events  = deserialize_trace_events(q.getColumn("trace_events_json").getText());
     return m;
 }
 
@@ -115,6 +124,13 @@ void AgentDB::run_migrations() {
         q.bind(1, version);
         return q.executeStep();
     };
+    auto has_column = [this](const std::string& table, const std::string& column) {
+        SQLite::Statement q(*db_, "PRAGMA table_info(" + table + ")");
+        while (q.executeStep()) {
+            if (std::string(q.getColumn("name").getText()) == column) return true;
+        }
+        return false;
+    };
 
     //
     if (!has_version(1)) {
@@ -129,6 +145,10 @@ void AgentDB::run_migrations() {
                 ctx_size          INTEGER NOT NULL DEFAULT 4096,
                 n_gpu_layers      INTEGER NOT NULL DEFAULT -1,
                 n_threads         INTEGER NOT NULL DEFAULT -1,
+                n_threads_http    INTEGER NOT NULL DEFAULT -1,
+                parallel          INTEGER NOT NULL DEFAULT 1,
+                batch_size        INTEGER NOT NULL DEFAULT -1,
+                ubatch_size       INTEGER NOT NULL DEFAULT -1,
                 temperature       REAL    NOT NULL DEFAULT 0.7,
                 top_p             REAL    NOT NULL DEFAULT 0.9,
                 max_tokens        INTEGER NOT NULL DEFAULT 1024,
@@ -173,6 +193,7 @@ void AgentDB::run_migrations() {
                 thinking_text   TEXT    NOT NULL DEFAULT '',
                 token_count     INTEGER NOT NULL DEFAULT 0,
                 sequence_num    INTEGER NOT NULL DEFAULT 0,
+                trace_events_json TEXT   NOT NULL DEFAULT '[]',
                 timestamp_ms    INTEGER NOT NULL
                     DEFAULT (CAST(strftime('%s','now') AS INTEGER)*1000)
             )
@@ -252,6 +273,41 @@ void AgentDB::run_migrations() {
         db_->exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (2)");
         tx.commit();
     }
+
+    if (!has_version(3)) {
+        SQLite::Transaction tx(*db_);
+        bool has_trace_events_json = false;
+        SQLite::Statement columns(*db_, "PRAGMA table_info(messages)");
+        while (columns.executeStep()) {
+            if (std::string(columns.getColumn("name").getText()) == "trace_events_json") {
+                has_trace_events_json = true;
+                break;
+            }
+        }
+        if (!has_trace_events_json) {
+            db_->exec("ALTER TABLE messages ADD COLUMN trace_events_json TEXT NOT NULL DEFAULT '[]'");
+        }
+        db_->exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (3)");
+        tx.commit();
+    }
+
+    if (!has_version(4)) {
+        SQLite::Transaction tx(*db_);
+        if (!has_column("agent_config", "n_threads_http")) {
+            db_->exec("ALTER TABLE agent_config ADD COLUMN n_threads_http INTEGER NOT NULL DEFAULT -1");
+        }
+        if (!has_column("agent_config", "parallel")) {
+            db_->exec("ALTER TABLE agent_config ADD COLUMN parallel INTEGER NOT NULL DEFAULT 1");
+        }
+        if (!has_column("agent_config", "batch_size")) {
+            db_->exec("ALTER TABLE agent_config ADD COLUMN batch_size INTEGER NOT NULL DEFAULT -1");
+        }
+        if (!has_column("agent_config", "ubatch_size")) {
+            db_->exec("ALTER TABLE agent_config ADD COLUMN ubatch_size INTEGER NOT NULL DEFAULT -1");
+        }
+        db_->exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (4)");
+        tx.commit();
+    }
 }
 
 //
@@ -264,13 +320,15 @@ void AgentDB::save_config(const AgentConfig& cfg) {
         SQLite::Statement q(*db_, R"(
             INSERT INTO agent_config
                 (id, name, model_path, system_prompt,
-                 ctx_size, n_gpu_layers, n_threads, temperature, top_p,
+                 ctx_size, n_gpu_layers, n_threads, n_threads_http,
+                 parallel, batch_size, ubatch_size, temperature, top_p,
                  max_tokens, flash_attn, extra_args_json,
                  reasoning_enabled, memories_enabled, tools_enabled,
                  preferred_node_id, updated_at_ms)
             VALUES
                 (:id,:name,:model_path,:system_prompt,
-                 :ctx_size,:n_gpu_layers,:n_threads,:temperature,:top_p,
+                 :ctx_size,:n_gpu_layers,:n_threads,:n_threads_http,
+                 :parallel,:batch_size,:ubatch_size,:temperature,:top_p,
                  :max_tokens,:flash_attn,:extra_args_json,
                  :reasoning,:memories,:tools,
                  :preferred_node_id,:now)
@@ -281,6 +339,10 @@ void AgentDB::save_config(const AgentConfig& cfg) {
                 ctx_size          = excluded.ctx_size,
                 n_gpu_layers      = excluded.n_gpu_layers,
                 n_threads         = excluded.n_threads,
+                n_threads_http    = excluded.n_threads_http,
+                parallel          = excluded.parallel,
+                batch_size        = excluded.batch_size,
+                ubatch_size       = excluded.ubatch_size,
                 temperature       = excluded.temperature,
                 top_p             = excluded.top_p,
                 max_tokens        = excluded.max_tokens,
@@ -300,6 +362,10 @@ void AgentDB::save_config(const AgentConfig& cfg) {
         q.bind(":ctx_size",          s.ctx_size);
         q.bind(":n_gpu_layers",      s.n_gpu_layers);
         q.bind(":n_threads",         s.n_threads);
+        q.bind(":n_threads_http",    s.n_threads_http);
+        q.bind(":parallel",          s.parallel);
+        q.bind(":batch_size",        s.batch_size);
+        q.bind(":ubatch_size",       s.ubatch_size);
         q.bind(":temperature",       static_cast<double>(s.temperature));
         q.bind(":top_p",             static_cast<double>(s.top_p));
         q.bind(":max_tokens",        s.max_tokens);
@@ -331,6 +397,10 @@ AgentConfig AgentDB::load_config() const {
     s.ctx_size      = q.getColumn("ctx_size").getInt();
     s.n_gpu_layers  = q.getColumn("n_gpu_layers").getInt();
     s.n_threads     = q.getColumn("n_threads").getInt();
+    s.n_threads_http = q.getColumn("n_threads_http").getInt();
+    s.parallel      = q.getColumn("parallel").getInt();
+    s.batch_size    = q.getColumn("batch_size").getInt();
+    s.ubatch_size   = q.getColumn("ubatch_size").getInt();
     s.temperature   = static_cast<float>(q.getColumn("temperature").getDouble());
     s.top_p         = static_cast<float>(q.getColumn("top_p").getDouble());
     s.max_tokens    = q.getColumn("max_tokens").getInt();
@@ -471,6 +541,16 @@ bool AgentDB::is_conversation_active(const ConvId& id) const {
     return q.getColumn(0).getInt() != 0;
 }
 
+void AgentDB::rename_conversation(const ConvId& id, const std::string& title) {
+    std::lock_guard g(mutex_);
+    SQLite::Statement q(*db_,
+        "UPDATE conversations SET title=?, updated_at_ms=? WHERE id=?");
+    q.bind(1, title.empty() ? "Untitled conversation" : title);
+    q.bind(2, util::now_ms());
+    q.bind(3, id);
+    q.exec();
+}
+
 void AgentDB::delete_conversation(const ConvId& id) {
     std::lock_guard g(mutex_);
     // FK CASCADE removes messages automatically.
@@ -511,8 +591,9 @@ void AgentDB::append_message(const ConvId& conv_id,
     SQLite::Statement q(*db_, R"(
         INSERT INTO messages
             (conversation_id, role, content, tool_calls_json,
-             tool_call_id, thinking_text, token_count, sequence_num, timestamp_ms)
-        VALUES (?,?,?,?,?,?,?,?,?)
+             tool_call_id, thinking_text, token_count, sequence_num,
+             trace_events_json, timestamp_ms)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
     )");
     q.bind(1, conv_id);
     q.bind(2, to_string(msg.role));
@@ -522,7 +603,8 @@ void AgentDB::append_message(const ConvId& conv_id,
     q.bind(6, msg.thinking_text);
     q.bind(7, msg.token_count);
     q.bind(8, sequence_num);
-    q.bind(9, ts);
+    q.bind(9, serialize(msg.trace_events));
+    q.bind(10, ts);
     q.exec();
 
     // Update running token total on the conversation.

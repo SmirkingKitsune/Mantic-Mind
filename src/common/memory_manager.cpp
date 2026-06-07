@@ -169,12 +169,13 @@ void MemoryManager::extract_and_store_memories_from_messages(
     if (transcript.empty()) return;
 
     const std::string extraction_prompt =
-        "Analyze the conversation below and extract important reusable information "
-        "worth remembering for future conversations. The memories may be about a "
-        "person, agent, project, world state, task, preference, decision, or other "
-        "durable context.\n\n"
+        "Analyze the conversation below and create concise global conversation-chain "
+        "summaries for future conversations. Each memory should summarize what this "
+        "conversation chain contains and why it may matter later. Do not copy short-lived "
+        "scratch notes; preserve durable context that helps another conversation decide "
+        "whether to inspect this source conversation.\n\n"
         "Return ONLY a valid JSON array. Each element must be an object with:\n"
-        "  \"content\"    (string)  the memory, written as a concise durable fact\n"
+        "  \"content\"    (string)  a concise source-grounded summary\n"
         "  \"importance\" (number)  0.0 (trivial) to 1.0 (critical)\n\n"
         "If there is nothing worth remembering, return an empty array [].\n\n"
         "Conversation:\n" + transcript + "\n\nJSON:";
@@ -274,9 +275,18 @@ std::string MemoryManager::format_memories_for_context(const std::vector<Memory>
     if (memories.empty()) return {};
 
     std::ostringstream oss;
-    oss << "## Remembered from other conversations\n";
+    oss << "## Global conversation-chain summaries\n";
+    oss << "These are summaries from prior conversation chains. Each item includes a "
+           "global memory id and, when available, its source conversation id. If a "
+           "summary is relevant but incomplete, call get_global_memory_origin with "
+           "the memory id to inspect its source conversation before relying on it.\n";
     for (const auto& memory : memories) {
-        oss << "- " << memory.content << "\n";
+        oss << "- [" << memory.id << "]";
+        if (!memory.source_conv_id.empty()) {
+            oss << " source_conversation=" << memory.source_conv_id;
+        }
+        oss << " importance=" << memory.importance << ": "
+            << memory.content << "\n";
     }
     return oss.str();
 }

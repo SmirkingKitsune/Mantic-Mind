@@ -267,6 +267,12 @@ Bearer auth rule: token must match a registered node `api_key` in `NodeRegistry`
 
 ### External Client API
 
+If `external_api_token` is configured on control, every external `/v1` and
+`/v1/*` route requires `Authorization: Bearer <external_api_token>`, including
+SSE chat and mutating agent routes. Registered node API keys authenticate only
+the internal `/api/control/*` routes; they are not accepted for external
+`/v1/*` clients.
+
 ```
 GET/POST       /v1/agents
 GET/PUT/DELETE /v1/agents/{id}

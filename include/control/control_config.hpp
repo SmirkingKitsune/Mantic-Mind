@@ -14,6 +14,9 @@ struct ControlConfig {
     // Model distribution
     std::string models_dir  = "models";
 
+    // Optional bearer token required by external /v1/* client routes.
+    std::string external_api_token;
+
     // Pairing / discovery
     std::string pairing_key;           // must match node's pairing_key for PSK mode
     uint16_t    discovery_port = 7072;

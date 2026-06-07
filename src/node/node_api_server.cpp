@@ -1037,7 +1037,8 @@ void NodeApiServer::register_routes() {
                     lk.unlock();
                     const std::string fin = "data: [DONE]\n\n";
                     sink.write(fin.data(), fin.size());
-                    return false;
+                    sink.done();
+                    return true;
                 }
                 return true;
             }

@@ -7,6 +7,8 @@
 #include <mutex>
 #include <cstdint>
 
+namespace httplib { struct Request; struct Response; }
+
 namespace mm {
 
 class AgentManager;
@@ -32,7 +34,8 @@ public:
                      NodeRegistry& registry,
                      ModelRouter& router,
                      AgentScheduler& scheduler,
-                     std::string models_dir);
+                     std::string models_dir,
+                     std::string external_api_token = {});
     ~ControlApiServer();
 
     bool listen(uint16_t port);
@@ -57,6 +60,7 @@ private:
     ModelRouter&    router_;
     AgentScheduler& scheduler_;
     std::string     models_dir_;
+    std::string     external_api_token_;
     std::unique_ptr<HttpServer> server_;
     LogCallback     log_cb_;
     mutable std::mutex activity_mutex_;
@@ -67,6 +71,8 @@ private:
     using DoneCb  = std::function<void(const ConvId&, bool, const std::string&)>;
 
     void register_routes();
+    bool authorize_external_request(const httplib::Request& req,
+                                    httplib::Response& res) const;
 
     // Runs on the AgentQueue worker thread: builds context, routes to node,
     // proxies SSE, persists messages, fires callbacks.

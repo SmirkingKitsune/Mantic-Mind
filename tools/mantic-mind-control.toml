@@ -6,6 +6,12 @@
 # Port the REST + SSE API listens on.
 listen_port = 9090
 
+# Optional bearer token for external /v1 and /v1/* API clients such as Yappy-Agent.
+# Applies to streaming chat and mutating agent routes. Internal /api/control/*
+# node routes keep using registered node api keys.
+# If set, external clients must send: Authorization: Bearer <token>
+# external_api_token = ""
+
 # ── Storage ────────────────────────────────────────────────────────────────────
 # Root data directory — agent databases live under {data_dir}/agents/{uuid}/agent.db
 # and remembered paired nodes live in {data_dir}/nodes.json.

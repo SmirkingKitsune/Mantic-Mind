@@ -33,6 +33,7 @@ public:
     std::vector<Conversation> list_conversations() const;
     bool                      conversation_exists(const ConvId& id) const;
     bool                      is_conversation_active(const ConvId& id) const;
+    void                      rename_conversation(const ConvId& id, const std::string& title);
     void                      delete_conversation(const ConvId& id);
     void                      set_active_conversation(const ConvId& id);
     std::optional<ConvId>     get_active_conversation_id() const;

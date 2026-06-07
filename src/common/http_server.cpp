@@ -11,6 +11,15 @@ struct HttpServer::Impl {
 HttpServer::HttpServer() : impl_(std::make_unique<Impl>()) {}
 HttpServer::~HttpServer() { stop(); }
 
+void HttpServer::SetPreRoutingHandler(PreRoutingHandler h) {
+    impl_->srv.set_pre_routing_handler(
+        [handler = std::move(h)](const httplib::Request& req, httplib::Response& res) {
+            return handler(req, res)
+                ? httplib::Server::HandlerResponse::Unhandled
+                : httplib::Server::HandlerResponse::Handled;
+        });
+}
+
 void HttpServer::Get(const std::string& pattern, Handler h) {
     impl_->srv.Get(pattern, std::move(h));
 }

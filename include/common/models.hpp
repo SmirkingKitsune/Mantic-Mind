@@ -30,6 +30,22 @@ struct ToolCall {
     std::string arguments_json;  // raw JSON string of function arguments
 };
 
+struct TraceEvent {
+    std::string    id;
+    std::string    type;
+    std::string    category;
+    std::string    title;
+    std::string    summary;
+    std::string    detail;
+    std::string    content;
+    std::string    message;
+    int64_t        timestamp_ms = 0;
+    int            sequence = 0;
+    int            message_index = -1;
+    std::string    source_id;
+    nlohmann::json metadata = nlohmann::json::object();
+};
+
 // ── Message ───────────────────────────────────────────────────────────────────
 struct Message {
     MessageRole          role         = MessageRole::User;
@@ -39,6 +55,7 @@ struct Message {
     std::string          thinking_text;  // content stripped from <think>…</think>
     int                  token_count  = 0;
     int64_t              timestamp_ms = 0;
+    std::vector<TraceEvent> trace_events;
 };
 
 // ── LlamaSettings ─────────────────────────────────────────────────────────────
@@ -46,6 +63,10 @@ struct LlamaSettings {
     int   ctx_size     = 4096;
     int   n_gpu_layers = -1;   // -1 = all layers on GPU
     int   n_threads    = -1;   // -1 = auto-detect
+    int   n_threads_http = -1; // -1 = llama-server default
+    int   parallel     = 1;    // llama-server request slots; ctx_size is per slot
+    int   batch_size   = -1;   // -1 = llama-server default
+    int   ubatch_size  = -1;   // -1 = llama-server default
     float temperature  = 0.7f;
     float top_p        = 0.9f;
     int   max_tokens   = 1024;
@@ -335,6 +356,39 @@ inline void from_json(const nlohmann::json& j, ToolCall& t) {
     j.at("arguments_json").get_to(t.arguments_json);
 }
 
+inline void to_json(nlohmann::json& j, const TraceEvent& t) {
+    j = {
+        {"id", t.id},
+        {"type", t.type},
+        {"category", t.category},
+        {"title", t.title},
+        {"summary", t.summary},
+        {"detail", t.detail},
+        {"content", t.content},
+        {"message", t.message},
+        {"timestamp_ms", t.timestamp_ms},
+        {"sequence", t.sequence},
+        {"message_index", t.message_index},
+        {"source_id", t.source_id},
+        {"metadata", t.metadata}
+    };
+}
+inline void from_json(const nlohmann::json& j, TraceEvent& t) {
+    if (j.contains("id"))            j.at("id").get_to(t.id);
+    if (j.contains("type"))          j.at("type").get_to(t.type);
+    if (j.contains("category"))      j.at("category").get_to(t.category);
+    if (j.contains("title"))         j.at("title").get_to(t.title);
+    if (j.contains("summary"))       j.at("summary").get_to(t.summary);
+    if (j.contains("detail"))        j.at("detail").get_to(t.detail);
+    if (j.contains("content"))       j.at("content").get_to(t.content);
+    if (j.contains("message"))       j.at("message").get_to(t.message);
+    if (j.contains("timestamp_ms"))  j.at("timestamp_ms").get_to(t.timestamp_ms);
+    if (j.contains("sequence"))      j.at("sequence").get_to(t.sequence);
+    if (j.contains("message_index")) j.at("message_index").get_to(t.message_index);
+    if (j.contains("source_id"))     j.at("source_id").get_to(t.source_id);
+    if (j.contains("metadata"))      t.metadata = j.at("metadata");
+}
+
 // ─── Message ─────────────────────────────────────────────────────────────────
 inline void to_json(nlohmann::json& j, const Message& m) {
     j = { {"role",         to_string(m.role)},
@@ -343,7 +397,8 @@ inline void to_json(nlohmann::json& j, const Message& m) {
           {"tool_call_id", m.tool_call_id},
           {"thinking_text",m.thinking_text},
           {"token_count",  m.token_count},
-          {"timestamp_ms", m.timestamp_ms} };
+          {"timestamp_ms", m.timestamp_ms},
+          {"trace_events", m.trace_events} };
 }
 inline void from_json(const nlohmann::json& j, Message& m) {
     m.role = message_role_from_string(j.at("role").get<std::string>());
@@ -353,6 +408,7 @@ inline void from_json(const nlohmann::json& j, Message& m) {
     if (j.contains("thinking_text"))j.at("thinking_text").get_to(m.thinking_text);
     if (j.contains("token_count"))  j.at("token_count").get_to(m.token_count);
     if (j.contains("timestamp_ms")) j.at("timestamp_ms").get_to(m.timestamp_ms);
+    if (j.contains("trace_events")) j.at("trace_events").get_to(m.trace_events);
 }
 
 // ─── LlamaSettings ───────────────────────────────────────────────────────────
@@ -360,6 +416,10 @@ inline void to_json(nlohmann::json& j, const LlamaSettings& s) {
     j = { {"ctx_size",     s.ctx_size},
           {"n_gpu_layers", s.n_gpu_layers},
           {"n_threads",    s.n_threads},
+          {"n_threads_http", s.n_threads_http},
+          {"parallel",     s.parallel},
+          {"batch_size",   s.batch_size},
+          {"ubatch_size",  s.ubatch_size},
           {"temperature",  s.temperature},
           {"top_p",        s.top_p},
           {"max_tokens",   s.max_tokens},
@@ -370,6 +430,10 @@ inline void from_json(const nlohmann::json& j, LlamaSettings& s) {
     if (j.contains("ctx_size"))     j.at("ctx_size").get_to(s.ctx_size);
     if (j.contains("n_gpu_layers")) j.at("n_gpu_layers").get_to(s.n_gpu_layers);
     if (j.contains("n_threads"))    j.at("n_threads").get_to(s.n_threads);
+    if (j.contains("n_threads_http")) j.at("n_threads_http").get_to(s.n_threads_http);
+    if (j.contains("parallel"))     j.at("parallel").get_to(s.parallel);
+    if (j.contains("batch_size"))   j.at("batch_size").get_to(s.batch_size);
+    if (j.contains("ubatch_size"))  j.at("ubatch_size").get_to(s.ubatch_size);
     if (j.contains("temperature"))  j.at("temperature").get_to(s.temperature);
     if (j.contains("top_p"))        j.at("top_p").get_to(s.top_p);
     if (j.contains("max_tokens"))   j.at("max_tokens").get_to(s.max_tokens);

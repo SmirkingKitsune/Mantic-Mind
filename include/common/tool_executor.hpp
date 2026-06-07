@@ -44,6 +44,7 @@ private:
     std::string handle_save_global_memory(const nlohmann::json& args, const ConvId& conv_id);
     std::string handle_update_global_memory(const nlohmann::json& args);
     std::string handle_delete_global_memory(const nlohmann::json& args);
+    std::string handle_get_global_memory_origin(const nlohmann::json& args);
     std::string handle_list_conversations(const nlohmann::json& args);
     std::string handle_get_conversation_summary(const nlohmann::json& args);
 };

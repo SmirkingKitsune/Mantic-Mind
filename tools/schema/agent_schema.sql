@@ -24,6 +24,10 @@ CREATE TABLE IF NOT EXISTS agent_config (
     ctx_size          INTEGER NOT NULL DEFAULT 4096,
     n_gpu_layers      INTEGER NOT NULL DEFAULT -1,
     n_threads         INTEGER NOT NULL DEFAULT -1,
+    n_threads_http    INTEGER NOT NULL DEFAULT -1,
+    parallel          INTEGER NOT NULL DEFAULT 1,
+    batch_size        INTEGER NOT NULL DEFAULT -1,
+    ubatch_size       INTEGER NOT NULL DEFAULT -1,
     temperature       REAL    NOT NULL DEFAULT 0.7,
     top_p             REAL    NOT NULL DEFAULT 0.9,
     max_tokens        INTEGER NOT NULL DEFAULT 1024,
@@ -73,6 +77,7 @@ CREATE TABLE IF NOT EXISTS messages (
     thinking_text   TEXT    NOT NULL DEFAULT '',   -- from <think>…</think>
     token_count     INTEGER NOT NULL DEFAULT 0,
     sequence_num    INTEGER NOT NULL DEFAULT 0,
+    trace_events_json TEXT   NOT NULL DEFAULT '[]',
     timestamp_ms    INTEGER NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS INTEGER) * 1000)
 );
 

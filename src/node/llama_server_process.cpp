@@ -9,7 +9,9 @@
 #include <array>
 #include <cctype>
 #include <filesystem>
+#include <initializer_list>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -204,19 +206,106 @@ std::string resolve_windows_executable(const std::string& exe_name) {
 std::vector<std::string> build_args(const std::string& model_path,
                                     const LlamaSettings& s, uint16_t port) {
     std::vector<std::string> args;
+    const auto& extra = s.extra_args;
+
+    auto arg_matches_flag = [](const std::string& raw, const std::string& flag) {
+        const std::string arg = mm::util::trim(raw);
+        return arg == flag
+            || arg.rfind(flag + "=", 0) == 0
+            || arg.rfind(flag + " ", 0) == 0;
+    };
+
+    auto has_any_flag = [&](std::initializer_list<const char*> flags) {
+        for (const auto& arg : extra) {
+            for (const char* flag : flags) {
+                if (arg_matches_flag(arg, flag)) return true;
+            }
+        }
+        return false;
+    };
+
+    auto find_flag_value = [&](std::initializer_list<const char*> flags) -> std::optional<std::string> {
+        for (size_t i = 0; i < extra.size(); ++i) {
+            const std::string arg = mm::util::trim(extra[i]);
+            for (const char* flag_raw : flags) {
+                const std::string flag(flag_raw);
+                if (arg == flag) {
+                    if (i + 1 < extra.size()) return mm::util::trim(extra[i + 1]);
+                    return std::nullopt;
+                }
+                if (arg.rfind(flag + "=", 0) == 0) {
+                    return mm::util::trim(arg.substr(flag.size() + 1));
+                }
+                if (arg.rfind(flag + " ", 0) == 0) {
+                    return mm::util::trim(arg.substr(flag.size() + 1));
+                }
+            }
+        }
+        return std::nullopt;
+    };
+
+    auto append_value_unless_extra = [&](std::initializer_list<const char*> flags,
+                                         const std::string& flag,
+                                         const std::string& value) {
+        if (has_any_flag(flags)) return;
+        args.push_back(flag);
+        args.push_back(value);
+    };
+
+    int parallel_for_ctx = s.parallel > 0 ? s.parallel : 1;
+    if (auto override = find_flag_value({"--parallel"})) {
+        try {
+            int parsed = std::stoi(*override);
+            if (parsed > 0) parallel_for_ctx = parsed;
+        } catch (...) {
+        }
+    }
+    const long long server_ctx_size =
+        static_cast<long long>(s.ctx_size) * static_cast<long long>(parallel_for_ctx);
+
     args.push_back("--model");       args.push_back(strip_wrapping_quotes(model_path));
     args.push_back("--port");        args.push_back(std::to_string(port));
-    args.push_back("--ctx-size");    args.push_back(std::to_string(s.ctx_size));
-    args.push_back("--gpu-layers"); args.push_back(std::to_string(s.n_gpu_layers));
+    append_value_unless_extra({"--ctx-size", "-c"},
+                              "--ctx-size", std::to_string(server_ctx_size));
+    append_value_unless_extra({"--gpu-layers", "-ngl"},
+                              "--gpu-layers", std::to_string(s.n_gpu_layers));
     if (s.n_threads > 0) {
-        args.push_back("--threads"); args.push_back(std::to_string(s.n_threads));
+        append_value_unless_extra({"--threads", "-t"},
+                                  "--threads", std::to_string(s.n_threads));
     }
-    if (s.flash_attn) args.push_back("--flash-attn");
-    for (auto& a : s.extra_args) args.push_back(a);
+    if (s.n_threads_http > 0) {
+        append_value_unless_extra({"--threads-http"},
+                                  "--threads-http", std::to_string(s.n_threads_http));
+    }
+    if (s.parallel > 1) {
+        append_value_unless_extra({"--parallel"},
+                                  "--parallel", std::to_string(s.parallel));
+    }
+    if (s.batch_size > 0) {
+        append_value_unless_extra({"--batch-size", "-b"},
+                                  "--batch-size", std::to_string(s.batch_size));
+    }
+    if (s.ubatch_size > 0) {
+        append_value_unless_extra({"--ubatch"},
+                                  "--ubatch", std::to_string(s.ubatch_size));
+    }
+    if (s.flash_attn && !has_any_flag({"--flash-attn", "-fa"})) {
+        args.push_back("--flash-attn");
+    }
+    for (auto& a : extra) args.push_back(a);
     return args;
 }
 
 } // namespace
+
+#ifdef MM_TESTING
+std::vector<std::string> build_llama_server_args_for_test(
+    const std::string& model_path,
+    const LlamaSettings& settings,
+    uint16_t port) {
+    return build_args(model_path, settings, port);
+}
+#endif
 
 // ── Construction ──────────────────────────────────────────────────────────────
 LlamaServerProcess::LlamaServerProcess(std::string path)

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 
 namespace mm {
 
@@ -67,6 +68,18 @@ AgentValidationResult validate_agent_config(const AgentConfig& cfg,
     }
     if (cfg.llama_settings.n_threads < -1) {
         add_issue(result, ValidationSeverity::Error, "llama_settings.n_threads", "n_threads must be -1 or greater.");
+    }
+    if (cfg.llama_settings.n_threads_http < -1) {
+        add_issue(result, ValidationSeverity::Error, "llama_settings.n_threads_http", "n_threads_http must be -1 or greater.");
+    }
+    if (cfg.llama_settings.parallel <= 0) {
+        add_issue(result, ValidationSeverity::Error, "llama_settings.parallel", "parallel must be greater than 0.");
+    }
+    if (cfg.llama_settings.batch_size != -1 && cfg.llama_settings.batch_size <= 0) {
+        add_issue(result, ValidationSeverity::Error, "llama_settings.batch_size", "batch_size must be greater than 0, or -1 for the llama-server default.");
+    }
+    if (cfg.llama_settings.ubatch_size != -1 && cfg.llama_settings.ubatch_size <= 0) {
+        add_issue(result, ValidationSeverity::Error, "llama_settings.ubatch_size", "ubatch_size must be greater than 0, or -1 for the llama-server default.");
     }
 
     ModelCapabilityInfo model_info;
@@ -151,6 +164,23 @@ AgentValidationResult validate_agent_config(const AgentConfig& cfg,
                   ValidationSeverity::Warning,
                   "llama_settings.ctx_size",
                   "ctx_size is very large and may be slow or require substantial memory.");
+    }
+
+    if (cfg.llama_settings.ctx_size > 0 && cfg.llama_settings.parallel > 1) {
+        const int64_t server_ctx_size =
+            static_cast<int64_t>(cfg.llama_settings.ctx_size) *
+            static_cast<int64_t>(cfg.llama_settings.parallel);
+        if (server_ctx_size > 131072) {
+            add_issue(result,
+                      ValidationSeverity::Warning,
+                      "llama_settings.parallel",
+                      "ctx_size * parallel is extremely large and may fail to load or perform poorly.");
+        } else if (server_ctx_size > 65536) {
+            add_issue(result,
+                      ValidationSeverity::Warning,
+                      "llama_settings.parallel",
+                      "ctx_size * parallel is very large and may be slow or require substantial memory.");
+        }
     }
 
     return result;

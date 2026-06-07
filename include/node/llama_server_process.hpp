@@ -6,6 +6,7 @@
 #include <thread>
 #include <atomic>
 #include <memory>
+#include <vector>
 
 namespace mm {
 
@@ -48,5 +49,12 @@ private:
 
     bool poll_health(int timeout_seconds = 60);
 };
+
+#ifdef MM_TESTING
+std::vector<std::string> build_llama_server_args_for_test(
+    const std::string& model_path,
+    const LlamaSettings& settings,
+    uint16_t port);
+#endif
 
 } // namespace mm

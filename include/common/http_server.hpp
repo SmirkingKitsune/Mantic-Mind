@@ -16,7 +16,11 @@ public:
     ~HttpServer();
 
     using Handler = std::function<void(const httplib::Request&, httplib::Response&)>;
+    // Return true to continue normal route handling, false when the hook has
+    // fully handled the request.
+    using PreRoutingHandler = std::function<bool(const httplib::Request&, httplib::Response&)>;
 
+    void SetPreRoutingHandler(PreRoutingHandler h);
     void Get(const std::string& pattern, Handler h);
     void Post(const std::string& pattern, Handler h);
     void Put(const std::string& pattern, Handler h);

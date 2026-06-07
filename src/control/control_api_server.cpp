@@ -12,6 +12,7 @@
 #include "common/memory_manager.hpp"
 #include "common/conversation_manager.hpp"
 #include "common/tool_executor.hpp"
+#include "common/trace_provenance.hpp"
 #include "common/llama_cpp_client.hpp"
 #include "common/logger.hpp"
 #include "common/util.hpp"
@@ -32,9 +33,348 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <unordered_map>
+#include <vector>
 
 namespace mm {
+
+namespace {
+
+std::string preview_text(const std::string& text, std::size_t max_len) {
+    std::string out = util::trim(text);
+    if (out.size() <= max_len) return out;
+    return out.substr(0, max_len);
+}
+
+std::string first_user_preview(const Conversation& conv, std::size_t max_len) {
+    for (const auto& msg : conv.messages) {
+        if (msg.role == MessageRole::User && !util::trim(msg.content).empty()) {
+            return preview_text(msg.content, max_len);
+        }
+    }
+    for (const auto& msg : conv.messages) {
+        if (!util::trim(msg.content).empty()) return preview_text(msg.content, max_len);
+    }
+    return {};
+}
+
+nlohmann::json curation_proposal(const std::string& action,
+                                 const std::string& target_type,
+                                 const std::string& target_id,
+                                 const ConvId& conversation_id,
+                                 nlohmann::json current,
+                                 nlohmann::json proposed,
+                                 const std::string& rationale) {
+    const std::string seed = action + ":" + target_type + ":" + target_id + ":" + conversation_id;
+    return nlohmann::json{
+        {"id", util::generate_uuid()},
+        {"action", action},
+        {"target_type", target_type},
+        {"target_id", target_id},
+        {"conversation_id", conversation_id},
+        {"current", std::move(current)},
+        {"proposed", std::move(proposed)},
+        {"rationale", rationale},
+        {"dedupe_key", seed}
+    };
+}
+
+struct CurationApplyPlan {
+    std::string proposal_id;
+    std::string action;
+    std::string target_type;
+    std::string target_id;
+    ConvId      conversation_id;
+    ConvId      source_conv_id;
+    std::string title;
+    std::string content;
+    float       importance = 0.5f;
+};
+
+std::string json_string_field(const nlohmann::json& j, const char* key) {
+    auto it = j.find(key);
+    if (it == j.end() || it->is_null()) return {};
+    if (!it->is_string()) {
+        throw std::invalid_argument(std::string(key) + " must be a string");
+    }
+    return it->get<std::string>();
+}
+
+std::string required_json_string_field(const nlohmann::json& j, const char* key) {
+    const std::string value = json_string_field(j, key);
+    if (value.empty()) {
+        throw std::invalid_argument(std::string(key) + " is required");
+    }
+    return value;
+}
+
+float json_float_field(const nlohmann::json& j, const char* key, float fallback) {
+    auto it = j.find(key);
+    if (it == j.end() || it->is_null()) return fallback;
+    if (!it->is_number()) {
+        throw std::invalid_argument(std::string(key) + " must be a number");
+    }
+    return it->get<float>();
+}
+
+const nlohmann::json& proposal_payload(const nlohmann::json& proposal,
+                                       const char* key) {
+    auto it = proposal.find(key);
+    if (it == proposal.end() || !it->is_object()) {
+        throw std::invalid_argument(std::string(key) + " must be an object");
+    }
+    return *it;
+}
+
+void require_target_type(const CurationApplyPlan& plan,
+                         const std::string& expected) {
+    if (plan.target_type != expected) {
+        throw std::invalid_argument(
+            plan.action + " requires target_type '" + expected + "'");
+    }
+}
+
+CurationApplyPlan validate_curation_apply_proposal(AgentDB& db,
+                                                   const nlohmann::json& proposal) {
+    if (!proposal.is_object()) {
+        throw std::invalid_argument("proposal must be an object");
+    }
+
+    CurationApplyPlan plan;
+    plan.proposal_id     = required_json_string_field(proposal, "id");
+    plan.action          = required_json_string_field(proposal, "action");
+    plan.target_type     = required_json_string_field(proposal, "target_type");
+    plan.target_id       = json_string_field(proposal, "target_id");
+    plan.conversation_id = json_string_field(proposal, "conversation_id");
+
+    const nlohmann::json& proposed = proposal_payload(proposal, "proposed");
+
+    if (plan.action == "rename_conversation") {
+        require_target_type(plan, "conversation");
+        ConvId conv_id = plan.conversation_id.empty() ? plan.target_id : plan.conversation_id;
+        if (conv_id.empty()) {
+            throw std::invalid_argument("conversation target is required");
+        }
+        if (!plan.target_id.empty() && plan.target_id != conv_id) {
+            throw std::invalid_argument(
+                "target_id must match conversation_id for rename_conversation");
+        }
+        if (!db.conversation_exists(conv_id)) {
+            throw std::invalid_argument("conversation target not found");
+        }
+        plan.target_id = conv_id;
+        plan.conversation_id = conv_id;
+        plan.title = util::trim(required_json_string_field(proposed, "title"));
+        if (plan.title.empty()) {
+            throw std::invalid_argument("proposed.title is required");
+        }
+        return plan;
+    }
+
+    if (plan.action == "delete_conversation") {
+        require_target_type(plan, "conversation");
+        if (plan.target_id.empty()) {
+            throw std::invalid_argument("target_id is required");
+        }
+        if (!plan.conversation_id.empty() && plan.conversation_id != plan.target_id) {
+            throw std::invalid_argument(
+                "conversation_id must match target_id for delete_conversation");
+        }
+        if (!db.conversation_exists(plan.target_id)) {
+            throw std::invalid_argument("conversation target not found");
+        }
+        if (db.is_conversation_active(plan.target_id)) {
+            throw std::invalid_argument(
+                "cannot delete active conversation; activate another conversation first");
+        }
+        plan.conversation_id = plan.target_id;
+        return plan;
+    }
+
+    if (plan.action == "create_local_memory") {
+        require_target_type(plan, "local_memory");
+        if (!plan.target_id.empty()) {
+            throw std::invalid_argument("create_local_memory target_id must be empty");
+        }
+        if (plan.conversation_id.empty()) {
+            throw std::invalid_argument("conversation_id is required");
+        }
+        if (!db.conversation_exists(plan.conversation_id)) {
+            throw std::invalid_argument("conversation target not found");
+        }
+        plan.content = util::trim(required_json_string_field(proposed, "content"));
+        if (plan.content.empty()) {
+            throw std::invalid_argument("proposed.content is required");
+        }
+        return plan;
+    }
+
+    if (plan.action == "update_local_memory" || plan.action == "delete_local_memory") {
+        require_target_type(plan, "local_memory");
+        if (plan.target_id.empty()) {
+            throw std::invalid_argument("target_id is required");
+        }
+        if (plan.conversation_id.empty()) {
+            throw std::invalid_argument("conversation_id is required");
+        }
+        if (!db.conversation_exists(plan.conversation_id)) {
+            throw std::invalid_argument("conversation target not found");
+        }
+        auto existing = db.get_local_memory(plan.target_id);
+        if (!existing) {
+            throw std::invalid_argument("local memory target not found");
+        }
+        if (existing->conversation_id != plan.conversation_id) {
+            throw std::invalid_argument(
+                "local memory target does not belong to proposal conversation");
+        }
+        if (plan.action == "update_local_memory") {
+            plan.content = util::trim(required_json_string_field(proposed, "content"));
+            if (plan.content.empty()) {
+                throw std::invalid_argument("proposed.content is required");
+            }
+        }
+        return plan;
+    }
+
+    if (plan.action == "create_global_memory") {
+        require_target_type(plan, "global_memory");
+        if (!plan.target_id.empty()) {
+            throw std::invalid_argument("create_global_memory target_id must be empty");
+        }
+        plan.source_conv_id = json_string_field(proposed, "source_conv_id");
+        if (plan.source_conv_id.empty()) plan.source_conv_id = plan.conversation_id;
+        if (!plan.source_conv_id.empty() && !db.conversation_exists(plan.source_conv_id)) {
+            throw std::invalid_argument("source conversation target not found");
+        }
+        plan.content = util::trim(required_json_string_field(proposed, "content"));
+        if (plan.content.empty()) {
+            throw std::invalid_argument("proposed.content is required");
+        }
+        plan.importance = json_float_field(proposed, "importance", 0.5f);
+        return plan;
+    }
+
+    if (plan.action == "update_global_memory" || plan.action == "delete_global_memory") {
+        require_target_type(plan, "global_memory");
+        if (plan.target_id.empty()) {
+            throw std::invalid_argument("target_id is required");
+        }
+        auto existing = db.get_memory(plan.target_id);
+        if (!existing) {
+            throw std::invalid_argument("global memory target not found");
+        }
+        if (!plan.conversation_id.empty() && existing->source_conv_id != plan.conversation_id) {
+            throw std::invalid_argument(
+                "global memory target source conversation does not match proposal");
+        }
+        plan.source_conv_id = existing->source_conv_id;
+        if (plan.action == "update_global_memory") {
+            plan.content = proposed.contains("content")
+                ? util::trim(json_string_field(proposed, "content"))
+                : existing->content;
+            if (plan.content.empty()) {
+                throw std::invalid_argument("proposed.content is required");
+            }
+            plan.importance = json_float_field(proposed, "importance", existing->importance);
+        }
+        return plan;
+    }
+
+    throw std::invalid_argument("unsupported curation proposal action: " + plan.action);
+}
+
+nlohmann::json apply_curation_plan(AgentDB& db, const CurationApplyPlan& plan) {
+    nlohmann::json result = {
+        {"proposal_id", plan.proposal_id},
+        {"action", plan.action},
+        {"target_type", plan.target_type},
+        {"target_id", plan.target_id},
+        {"status", "applied"}
+    };
+
+    if (plan.action == "rename_conversation") {
+        db.rename_conversation(plan.conversation_id, plan.title);
+        auto saved = db.load_conversation(plan.conversation_id);
+        result["target_id"] = plan.conversation_id;
+        result["conversation"] = saved ? nlohmann::json(*saved) : nlohmann::json::object();
+        return result;
+    }
+
+    if (plan.action == "delete_conversation") {
+        db.delete_conversation(plan.target_id);
+        result["deleted"] = true;
+        return result;
+    }
+
+    if (plan.action == "create_local_memory") {
+        LocalMemory mem;
+        mem.id = util::generate_uuid();
+        mem.conversation_id = plan.conversation_id;
+        mem.content = plan.content;
+        db.add_local_memory(mem);
+        auto saved = db.get_local_memory(mem.id);
+        result["target_id"] = mem.id;
+        result["local_memory"] = saved ? nlohmann::json(*saved) : nlohmann::json(mem);
+        return result;
+    }
+
+    if (plan.action == "update_local_memory") {
+        auto existing = db.get_local_memory(plan.target_id);
+        LocalMemory mem = existing ? *existing : LocalMemory{};
+        mem.id = plan.target_id;
+        mem.conversation_id = plan.conversation_id;
+        mem.content = plan.content;
+        db.update_local_memory(mem);
+        auto saved = db.get_local_memory(plan.target_id);
+        result["local_memory"] = saved ? nlohmann::json(*saved) : nlohmann::json(mem);
+        return result;
+    }
+
+    if (plan.action == "delete_local_memory") {
+        db.delete_local_memory(plan.target_id);
+        result["deleted"] = true;
+        return result;
+    }
+
+    if (plan.action == "create_global_memory") {
+        Memory mem;
+        mem.id = util::generate_uuid();
+        mem.content = plan.content;
+        mem.source_conv_id = plan.source_conv_id;
+        mem.importance = plan.importance;
+        db.add_memory(mem);
+        auto saved = db.get_memory(mem.id);
+        result["target_id"] = mem.id;
+        result["global_memory"] = saved ? nlohmann::json(*saved) : nlohmann::json(mem);
+        return result;
+    }
+
+    if (plan.action == "update_global_memory") {
+        auto existing = db.get_memory(plan.target_id);
+        Memory mem = existing ? *existing : Memory{};
+        mem.id = plan.target_id;
+        mem.content = plan.content;
+        mem.source_conv_id = plan.source_conv_id;
+        mem.importance = plan.importance;
+        db.update_memory(mem);
+        auto saved = db.get_memory(plan.target_id);
+        result["global_memory"] = saved ? nlohmann::json(*saved) : nlohmann::json(mem);
+        return result;
+    }
+
+    if (plan.action == "delete_global_memory") {
+        db.delete_memory(plan.target_id);
+        result["deleted"] = true;
+        return result;
+    }
+
+    throw std::logic_error("validated curation proposal action is not implemented");
+}
+
+} // namespace
 
 // ── Constructor / destructor ───────────────────────────────────────────────────
 
@@ -43,19 +383,25 @@ ControlApiServer::ControlApiServer(AgentManager& agents,
                                    NodeRegistry& registry,
                                    ModelRouter& router,
                                    AgentScheduler& scheduler,
-                                   std::string models_dir)
+                                   std::string models_dir,
+                                   std::string external_api_token)
     : agents_(agents)
     , queue_(queue)
     , registry_(registry)
     , router_(router)
     , scheduler_(scheduler)
     , models_dir_(std::move(models_dir))
+    , external_api_token_(std::move(external_api_token))
     , server_(std::make_unique<HttpServer>())
 {}
 
 ControlApiServer::~ControlApiServer() { stop(); }
 
 bool ControlApiServer::listen(uint16_t port) {
+    server_->SetPreRoutingHandler([this](const httplib::Request& req,
+                                         httplib::Response& res) {
+        return authorize_external_request(req, res);
+    });
     register_routes();
     MM_INFO("ControlApiServer listening on port {}", port);
     return server_->listen("0.0.0.0", port);
@@ -80,6 +426,28 @@ void ControlApiServer::publish_activity(int level, const std::string& message) {
 
 void ControlApiServer::activity_log(int level, const std::string& message) {
     publish_activity(level, message);
+}
+
+bool ControlApiServer::authorize_external_request(const httplib::Request& req,
+                                                  httplib::Response& res) const {
+    if (external_api_token_.empty()) return true;
+    // external_api_token_ is only for public control clients. Internal node
+    // routes under /api/control/* keep their separate registered-node auth.
+    if (req.path.rfind("/v1/", 0) != 0 && req.path != "/v1") return true;
+
+    static const std::string kBearer = "Bearer ";
+    const std::string auth = req.get_header_value("Authorization");
+    if (auth.rfind(kBearer, 0) != 0) {
+        res.status = 401;
+        res.set_content(R"({"error":"missing bearer token"})", "application/json");
+        return false;
+    }
+    if (auth.substr(kBearer.size()) != external_api_token_) {
+        res.status = 403;
+        res.set_content(R"({"error":"invalid bearer token"})", "application/json");
+        return false;
+    }
+    return true;
 }
 
 ControlApiServer::LocalChatResult ControlApiServer::chat_local(
@@ -350,6 +718,8 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
 
     for (int tool_round = 0; tool_round < kMaxToolRounds; ++tool_round) {
         // Build context fresh each round (local memories may have changed)
+        std::vector<TraceEvent> context_trace_events =
+            build_context_trace_events(db, conv_id, memories);
         std::vector<Message> context_msgs = conv_mgr.build_context(conv_id, cfg, memories);
 
         // Build inference request
@@ -524,6 +894,7 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
         asst_msg.tool_calls    = accumulated_tool_calls;
         asst_msg.token_count   = total_tokens;
         asst_msg.timestamp_ms  = util::now_ms();
+        asst_msg.trace_events  = std::move(context_trace_events);
         db.append_message(conv_id, asst_msg, seq + 1);
         ++seq;
 
@@ -554,6 +925,9 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
                 tool_result.tool_call_id = tc.id;
                 tool_result.content      = nlohmann::json{{"error", "tool not available"}}.dump();
                 tool_result.timestamp_ms = util::now_ms();
+            }
+            if (auto trace = build_tool_access_trace(tc, tool_result, conv_id)) {
+                tool_result.trace_events.push_back(*trace);
             }
 
             db.append_message(conv_id, tool_result, seq + 1);
@@ -672,12 +1046,27 @@ void ControlApiServer::queue_global_recall(const AgentId& agent_id,
             "important and not already captured in existing global memories.\n\n"
             "You can also update or delete existing global memories if the conversation "
             "revealed new information that changes them.";
+        system_text =
+            "You are reviewing a completed conversation chain to maintain global summaries "
+            "for future conversations.\n\n"
+            "Review the conversation below and use the available tools to create global memories "
+            "as concise conversation-chain summaries. Each summary should explain what this "
+            "source conversation contains and why it may matter later, so future agents can "
+            "decide whether to inspect the origin conversation. Be selective; only save "
+            "durable context that is genuinely useful and not already captured in existing "
+            "global summaries.\n\n"
+            "You can also update or delete existing global memories if this conversation "
+            "revealed new information that changes them.";
 
         if (!global_mems.empty()) {
-            system_text += "\n\n## Existing global memories\n";
+            system_text += "\n\n## Existing global summaries\n";
             for (const auto& gm : global_mems) {
-                system_text += "- [" + gm.id + "] (importance=" +
-                               std::to_string(gm.importance) + ") " + gm.content + "\n";
+                system_text += "- [" + gm.id + "]";
+                if (!gm.source_conv_id.empty()) {
+                    system_text += " source_conversation=" + gm.source_conv_id;
+                }
+                system_text += " (importance=" + std::to_string(gm.importance) +
+                               ") " + gm.content + "\n";
             }
         }
 
@@ -711,7 +1100,7 @@ void ControlApiServer::queue_global_recall(const AgentId& agent_id,
         Message recall_prompt;
         recall_prompt.role    = MessageRole::User;
         recall_prompt.content = "Please review this conversation and save any important "
-                                "information as global memories.";
+                                "conversation-chain summaries as global memories.";
         recall_ctx.push_back(recall_prompt);
 
         // Run tool call loop (internal, not streamed to client)
@@ -1545,7 +1934,8 @@ void ControlApiServer::register_routes() {
                     lk.unlock();
                     const std::string fin = "data: [DONE]\n\n";
                     sink.write(fin.data(), fin.size());
-                    return false;
+                    sink.done();
+                    return true;
                 }
                 return true;
             });
@@ -1559,7 +1949,236 @@ void ControlApiServer::register_routes() {
         res.set_content(arr.dump(), "application/json");
     });
 
-    // ── GET /v1/agents/:id/conversations ──────────────────────────────────────
+    // ── POST /v1/agents/:id/curation/proposals ───────────────────────────────
+    server_->Post("/v1/agents/:id/curation/proposals",
+                  [this](const Request& req, Response& res) {
+        const std::string id = req.path_params.at("id");
+        auto a = agents_.get_agent(id);
+        if (!a) { res.status = 404; return; }
+
+        try {
+            nlohmann::json body = nlohmann::json::object();
+            if (!util::trim(req.body).empty()) body = nlohmann::json::parse(req.body);
+            const std::string requested_conv_id = body.value("conversation_id", std::string{});
+            int max_items = body.value("max_items", 12);
+            max_items = std::clamp(max_items, 1, 50);
+
+            auto& db = a->db();
+            nlohmann::json proposals = nlohmann::json::array();
+            auto add = [&](nlohmann::json proposal) {
+                if (static_cast<int>(proposals.size()) < max_items) {
+                    proposals.push_back(std::move(proposal));
+                }
+            };
+
+            std::vector<Conversation> convs = db.list_conversations();
+            std::optional<Conversation> focus;
+            if (!requested_conv_id.empty()) {
+                focus = db.load_conversation(requested_conv_id);
+                if (!focus) { res.status = 404; return; }
+            } else {
+                for (const auto& item : convs) {
+                    if (item.is_active) {
+                        focus = db.load_conversation(item.id);
+                        break;
+                    }
+                }
+                if (!focus && !convs.empty()) focus = db.load_conversation(convs.front().id);
+            }
+
+            if (focus) {
+                const std::string title = util::trim(focus->title);
+                const std::string prompt_preview = first_user_preview(*focus, 56);
+                if (!prompt_preview.empty() &&
+                    (title.empty() || title == "New Conversation" || title == "Untitled conversation")) {
+                    add(curation_proposal(
+                        "rename_conversation",
+                        "conversation",
+                        focus->id,
+                        focus->id,
+                        nlohmann::json{{"title", focus->title}},
+                        nlohmann::json{{"title", prompt_preview}},
+                        "The conversation has a generic title; the first user prompt gives it a clearer label."));
+                }
+
+                auto local_mems = db.list_local_memories(focus->id);
+                if (local_mems.empty() && !prompt_preview.empty()) {
+                    add(curation_proposal(
+                        "create_local_memory",
+                        "local_memory",
+                        "",
+                        focus->id,
+                        nlohmann::json::object(),
+                        nlohmann::json{{"content", prompt_preview}},
+                        "No local memory exists for the selected conversation; this captures the main prompt."));
+                }
+                for (const auto& mem : local_mems) {
+                    const std::string trimmed = util::trim(mem.content);
+                    if (trimmed.empty()) {
+                        add(curation_proposal(
+                            "delete_local_memory",
+                            "local_memory",
+                            mem.id,
+                            focus->id,
+                            nlohmann::json(mem),
+                            nlohmann::json::object(),
+                            "This local memory is empty."));
+                    } else if (trimmed != mem.content) {
+                        add(curation_proposal(
+                            "update_local_memory",
+                            "local_memory",
+                            mem.id,
+                            focus->id,
+                            nlohmann::json(mem),
+                            nlohmann::json{{"content", trimmed}},
+                            "This local memory has leading or trailing whitespace."));
+                    }
+                }
+            }
+
+            for (const auto& conv_meta : convs) {
+                if (static_cast<int>(proposals.size()) >= max_items) break;
+                if (conv_meta.is_active) continue;
+                auto conv = db.load_conversation(conv_meta.id);
+                if (conv && conv->messages.empty()) {
+                    add(curation_proposal(
+                        "delete_conversation",
+                        "conversation",
+                        conv->id,
+                        conv->id,
+                        nlohmann::json(*conv),
+                        nlohmann::json::object(),
+                        "This inactive conversation has no messages."));
+                }
+            }
+
+            auto memories = db.list_memories();
+            if (memories.empty() && focus) {
+                const std::string prompt_preview = first_user_preview(*focus, 96);
+                if (!prompt_preview.empty()) {
+                    add(curation_proposal(
+                        "create_global_memory",
+                        "global_memory",
+                        "",
+                        focus->id,
+                        nlohmann::json::object(),
+                        nlohmann::json{
+                            {"content", "Conversation '" + focus->title + "' covers: " + prompt_preview},
+                            {"importance", 0.5}
+                        },
+                        "No global summary exists yet; this creates a traceable summary for future conversations."));
+                }
+            }
+            for (const auto& mem : memories) {
+                if (static_cast<int>(proposals.size()) >= max_items) break;
+                const std::string trimmed = util::trim(mem.content);
+                if (trimmed.empty()) {
+                    add(curation_proposal(
+                        "delete_global_memory",
+                        "global_memory",
+                        mem.id,
+                        mem.source_conv_id,
+                        nlohmann::json(mem),
+                        nlohmann::json::object(),
+                        "This global memory is empty."));
+                } else if (trimmed != mem.content) {
+                    add(curation_proposal(
+                        "update_global_memory",
+                        "global_memory",
+                        mem.id,
+                        mem.source_conv_id,
+                        nlohmann::json(mem),
+                        nlohmann::json{{"content", trimmed}, {"importance", mem.importance}},
+                        "This global memory has leading or trailing whitespace."));
+                }
+            }
+
+            res.set_content(nlohmann::json{{"proposals", proposals}}.dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+        }
+    });
+
+    // POST /v1/agents/:id/curation/apply
+    auto apply_curation_proposals =
+        [this](const Request& req, Response& res) {
+        const std::string id = req.path_params.at("id");
+        auto a = agents_.get_agent(id);
+        if (!a) { res.status = 404; return; }
+
+        try {
+            nlohmann::json body = nlohmann::json::object();
+            if (!util::trim(req.body).empty()) body = nlohmann::json::parse(req.body);
+
+            const nlohmann::json* proposals = nullptr;
+            if (body.is_array()) {
+                proposals = &body;
+            } else if (body.contains("proposals")) {
+                proposals = &body.at("proposals");
+            } else if (body.contains("approved_proposals")) {
+                proposals = &body.at("approved_proposals");
+            }
+
+            if (!proposals || !proposals->is_array()) {
+                res.status = 400;
+                res.set_content(
+                    nlohmann::json{{"error", "proposals must be an array"}}.dump(),
+                    "application/json");
+                return;
+            }
+            if (proposals->empty()) {
+                res.status = 400;
+                res.set_content(
+                    nlohmann::json{{"error", "at least one proposal is required"}}.dump(),
+                    "application/json");
+                return;
+            }
+
+            auto& db = a->db();
+            std::vector<CurationApplyPlan> plans;
+            plans.reserve(proposals->size());
+            for (std::size_t i = 0; i < proposals->size(); ++i) {
+                const auto& proposal = proposals->at(i);
+                try {
+                    plans.push_back(validate_curation_apply_proposal(db, proposal));
+                } catch (const std::exception& e) {
+                    nlohmann::json rejection = {
+                        {"error", "invalid curation proposal"},
+                        {"index", i},
+                        {"reason", e.what()}
+                    };
+                    if (proposal.is_object() && proposal.contains("id") &&
+                        proposal.at("id").is_string()) {
+                        rejection["proposal_id"] = proposal.at("id").get<std::string>();
+                    }
+                    res.status = 400;
+                    res.set_content(rejection.dump(), "application/json");
+                    return;
+                }
+            }
+
+            nlohmann::json results = nlohmann::json::array();
+            for (const auto& plan : plans) {
+                results.push_back(apply_curation_plan(db, plan));
+            }
+
+            res.set_content(
+                nlohmann::json{
+                    {"status", "applied"},
+                    {"applied_count", results.size()},
+                    {"results", results}
+                }.dump(),
+                "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+        }
+    };
+    server_->Post("/v1/agents/:id/curation/apply", apply_curation_proposals);
+    server_->Post("/v1/agents/:id/curation/proposals/apply", apply_curation_proposals);
+
+    // GET /v1/agents/:id/conversations
     server_->Get("/v1/agents/:id/conversations",
                  [this](const Request& req, Response& res) {
         std::string id = req.path_params.at("id");
@@ -1587,7 +2206,7 @@ void ControlApiServer::register_routes() {
 
             const std::string title = j.value("title", std::string{});
             const std::string parent_conv_id = j.value("parent_conv_id", std::string{});
-            const bool set_active = j.value("set_active", false);
+            const bool set_active = j.value("set_active", j.value("activate", false));
 
             if (!parent_conv_id.empty() && !a->db().conversation_exists(parent_conv_id)) {
                 res.status = 400;
@@ -1645,6 +2264,35 @@ void ControlApiServer::register_routes() {
         auto conv_opt = a->db().load_conversation(cid);
         if (!conv_opt) { res.status = 404; return; }
         res.set_content(nlohmann::json(*conv_opt).dump(), "application/json");
+    });
+
+    // ── PUT /v1/agents/:id/conversations/:cid ────────────────────────────────
+    server_->Put("/v1/agents/:id/conversations/:cid",
+                 [this](const Request& req, Response& res) {
+        std::string id  = req.path_params.at("id");
+        std::string cid = req.path_params.at("cid");
+        auto a = agents_.get_agent(id);
+        if (!a) { res.status = 404; return; }
+        if (!a->db().conversation_exists(cid)) { res.status = 404; return; }
+
+        try {
+            auto j = nlohmann::json::parse(req.body);
+            const std::string title = util::trim(j.value("title", std::string{}));
+            if (title.empty()) {
+                res.status = 400;
+                res.set_content(nlohmann::json{{"error", "title is required"}}.dump(),
+                                "application/json");
+                return;
+            }
+            a->db().rename_conversation(cid, title);
+            auto conv_opt = a->db().load_conversation(cid);
+            if (!conv_opt) { res.status = 404; return; }
+            res.set_content(nlohmann::json(*conv_opt).dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(),
+                            "application/json");
+        }
     });
 
     // ── POST /v1/agents/:id/conversations/:cid/activate ──────────────────────
@@ -1749,6 +2397,88 @@ void ControlApiServer::register_routes() {
         nlohmann::json arr = nlohmann::json::array();
         for (auto& m : mems) arr.push_back(nlohmann::json(m));
         res.set_content(arr.dump(), "application/json");
+    });
+
+    // ── POST /v1/agents/:id/conversations/:cid/local-memories ────────────────
+    server_->Post("/v1/agents/:id/conversations/:cid/local-memories",
+                  [this](const Request& req, Response& res) {
+        std::string id  = req.path_params.at("id");
+        std::string cid = req.path_params.at("cid");
+        auto a = agents_.get_agent(id);
+        if (!a) { res.status = 404; return; }
+        if (!a->db().conversation_exists(cid)) { res.status = 404; return; }
+
+        try {
+            auto j = nlohmann::json::parse(req.body);
+            const std::string content = util::trim(j.value("content", std::string{}));
+            if (content.empty()) {
+                res.status = 400;
+                res.set_content(nlohmann::json{{"error", "content is required"}}.dump(),
+                                "application/json");
+                return;
+            }
+            LocalMemory mem;
+            mem.id = util::generate_uuid();
+            mem.conversation_id = cid;
+            mem.content = content;
+            a->db().add_local_memory(mem);
+            auto saved = a->db().get_local_memory(mem.id);
+            res.status = 201;
+            res.set_content(nlohmann::json(saved ? *saved : mem).dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(),
+                            "application/json");
+        }
+    });
+
+    // ── PUT /v1/agents/:id/conversations/:cid/local-memories/:mid ────────────
+    server_->Put("/v1/agents/:id/conversations/:cid/local-memories/:mid",
+                 [this](const Request& req, Response& res) {
+        std::string id  = req.path_params.at("id");
+        std::string cid = req.path_params.at("cid");
+        std::string mid = req.path_params.at("mid");
+        auto a = agents_.get_agent(id);
+        if (!a) { res.status = 404; return; }
+        if (!a->db().conversation_exists(cid)) { res.status = 404; return; }
+
+        auto existing = a->db().get_local_memory(mid);
+        if (!existing || existing->conversation_id != cid) { res.status = 404; return; }
+
+        try {
+            auto j = nlohmann::json::parse(req.body);
+            const std::string content = util::trim(j.value("content", std::string{}));
+            if (content.empty()) {
+                res.status = 400;
+                res.set_content(nlohmann::json{{"error", "content is required"}}.dump(),
+                                "application/json");
+                return;
+            }
+            LocalMemory mem = *existing;
+            mem.content = content;
+            a->db().update_local_memory(mem);
+            auto saved = a->db().get_local_memory(mid);
+            res.set_content(nlohmann::json(saved ? *saved : mem).dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(),
+                            "application/json");
+        }
+    });
+
+    // ── DELETE /v1/agents/:id/conversations/:cid/local-memories/:mid ─────────
+    server_->Delete("/v1/agents/:id/conversations/:cid/local-memories/:mid",
+                    [this](const Request& req, Response& res) {
+        std::string id  = req.path_params.at("id");
+        std::string cid = req.path_params.at("cid");
+        std::string mid = req.path_params.at("mid");
+        auto a = agents_.get_agent(id);
+        if (!a) { res.status = 404; return; }
+        if (!a->db().conversation_exists(cid)) { res.status = 404; return; }
+        auto existing = a->db().get_local_memory(mid);
+        if (!existing || existing->conversation_id != cid) { res.status = 404; return; }
+        a->db().delete_local_memory(mid);
+        res.set_content(R"({"status":"deleted"})", "application/json");
     });
 
     // ── POST /v1/agents/:id/memories/extract ──────────────────────────────────
@@ -1859,6 +2589,47 @@ void ControlApiServer::register_routes() {
         res.set_content(arr.dump(), "application/json");
     });
 
+    // ── POST /v1/agents/:id/memories ──────────────────────────────────────────
+    server_->Post("/v1/agents/:id/memories",
+                  [this](const Request& req, Response& res) {
+        std::string id = req.path_params.at("id");
+        auto a = agents_.get_agent(id);
+        if (!a) { res.status = 404; return; }
+
+        try {
+            auto j = nlohmann::json::parse(req.body);
+            const std::string content = util::trim(j.value("content", std::string{}));
+            if (content.empty()) {
+                res.status = 400;
+                res.set_content(nlohmann::json{{"error", "content is required"}}.dump(),
+                                "application/json");
+                return;
+            }
+            const std::string source_conv_id = j.value("source_conv_id", std::string{});
+            if (!source_conv_id.empty() && !a->db().conversation_exists(source_conv_id)) {
+                res.status = 400;
+                res.set_content(nlohmann::json{{"error", "source conversation not found"}}.dump(),
+                                "application/json");
+                return;
+            }
+
+            Memory mem;
+            mem.id = util::generate_uuid();
+            mem.agent_id = id;
+            mem.content = content;
+            mem.source_conv_id = source_conv_id;
+            mem.importance = j.value("importance", 0.5f);
+            a->db().add_memory(mem);
+            auto saved = a->db().get_memory(mem.id);
+            res.status = 201;
+            res.set_content(nlohmann::json(saved ? *saved : mem).dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(),
+                            "application/json");
+        }
+    });
+
     // ── PUT /v1/agents/:id/memories/:mid ──────────────────────────────────────
     server_->Put("/v1/agents/:id/memories/:mid",
                  [this](const Request& req, Response& res) {
@@ -1868,13 +2639,20 @@ void ControlApiServer::register_routes() {
         if (!a) { res.status = 404; return; }
         try {
             auto j = nlohmann::json::parse(req.body);
-            Memory mem;
-            mem.id         = mid;
-            mem.agent_id   = id;
-            mem.content    = j.value("content", "");
-            mem.importance = j.value("importance", 0.5f);
+            auto existing = a->db().get_memory(mid);
+            if (!existing) { res.status = 404; return; }
+            Memory mem = *existing;
+            mem.content    = util::trim(j.value("content", mem.content));
+            mem.importance = j.value("importance", mem.importance);
+            if (mem.content.empty()) {
+                res.status = 400;
+                res.set_content(nlohmann::json{{"error", "content is required"}}.dump(),
+                                "application/json");
+                return;
+            }
             a->db().update_memory(mem);
-            res.set_content(nlohmann::json(mem).dump(), "application/json");
+            auto saved = a->db().get_memory(mid);
+            res.set_content(nlohmann::json(saved ? *saved : mem).dump(), "application/json");
         } catch (const std::exception& e) {
             res.status = 400;
             res.set_content(nlohmann::json{{"error", e.what()}}.dump(),

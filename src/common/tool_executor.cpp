@@ -7,6 +7,51 @@
 
 namespace mm {
 
+namespace {
+
+nlohmann::json build_conversation_summary_json(AgentDB& db, const ConvId& conv_id) {
+    auto conv = db.load_conversation(conv_id);
+    if (!conv) {
+        return nlohmann::json{{"error", "conversation not found: " + conv_id}};
+    }
+
+    auto local_mems = db.list_local_memories(conv_id);
+    nlohmann::json mems_arr = nlohmann::json::array();
+    for (const auto& m : local_mems) {
+        mems_arr.push_back({
+            {"id", m.id},
+            {"content", m.content},
+            {"created_at_ms", m.created_at_ms},
+            {"updated_at_ms", m.updated_at_ms}
+        });
+    }
+
+    nlohmann::json msg_summary = nlohmann::json::array();
+    for (const auto& m : conv->messages) {
+        nlohmann::json entry = {
+            {"role", to_string(m.role)},
+            {"content_preview", m.content.substr(0, 500)}
+        };
+        if (m.content.size() > 500) entry["truncated"] = true;
+        if (m.timestamp_ms != 0) entry["timestamp_ms"] = m.timestamp_ms;
+        msg_summary.push_back(entry);
+    }
+
+    return nlohmann::json{
+        {"conversation_id", conv_id},
+        {"title", conv->title},
+        {"is_active", conv->is_active},
+        {"parent_conv_id", conv->parent_conv_id},
+        {"total_tokens", conv->total_tokens},
+        {"message_count", conv->messages.size()},
+        {"messages", msg_summary},
+        {"compaction_summary", conv->compaction_summary},
+        {"local_memories", mems_arr}
+    };
+}
+
+} // namespace
+
 ToolExecutor::ToolExecutor(AgentDB& db) : db_(db) {}
 
 // ── Tool definitions ──────────────────────────────────────────────────────────
@@ -46,6 +91,17 @@ std::vector<ToolDefinition> ToolExecutor::local_tool_catalog() {
             "list_local_memories",
             "List all local memories for this conversation.",
             {{"type", "object"}, {"properties", nlohmann::json::object()}}
+        },
+        {
+            "get_global_memory_origin",
+            "Inspect the source conversation behind a remembered global summary. "
+            "Use this when a global memory seems relevant but you need its origin "
+            "conversation context before relying on it.",
+            {{"type", "object"},
+             {"properties", {
+                 {"memory_id", {{"type", "string"}, {"description", "The global memory ID to inspect"}}}
+             }},
+             {"required", {"memory_id"}}}
         }
     };
 }
@@ -56,8 +112,8 @@ std::vector<ToolDefinition> ToolExecutor::all_tool_catalog() {
     // Global memory tools
     tools.push_back({
         "save_global_memory",
-        "Save a cross-conversation memory. Use this to persist important information "
-        "that should be available in all future conversations.",
+        "Save a cross-conversation summary. Use this to persist durable conversation-chain "
+        "context that should be available in future conversations and traceable to this origin.",
         {{"type", "object"},
          {"properties", {
              {"content", {{"type", "string"}, {"description", "The content to remember globally"}}},
@@ -131,6 +187,7 @@ bool ToolExecutor::is_memory_tool(const std::string& function_name) const {
         || function_name == "save_global_memory"
         || function_name == "update_global_memory"
         || function_name == "delete_global_memory"
+        || function_name == "get_global_memory_origin"
         || function_name == "list_conversations"
         || function_name == "get_conversation_summary";
 }
@@ -162,6 +219,8 @@ Message ToolExecutor::execute_tool(const ToolCall& call, const ConvId& conv_id) 
             output = handle_update_global_memory(args);
         } else if (call.function_name == "delete_global_memory") {
             output = handle_delete_global_memory(args);
+        } else if (call.function_name == "get_global_memory_origin") {
+            output = handle_get_global_memory_origin(args);
         } else if (call.function_name == "list_conversations") {
             output = handle_list_conversations(args);
         } else if (call.function_name == "get_conversation_summary") {
@@ -263,6 +322,34 @@ std::string ToolExecutor::handle_delete_global_memory(const nlohmann::json& args
     return nlohmann::json{{"status", "deleted"}, {"id", id}}.dump();
 }
 
+std::string ToolExecutor::handle_get_global_memory_origin(const nlohmann::json& args) {
+    std::string memory_id = args.at("memory_id").get<std::string>();
+
+    auto memory = db_.get_memory(memory_id);
+    if (!memory) {
+        return nlohmann::json{{"error", "global memory not found: " + memory_id}}.dump();
+    }
+
+    nlohmann::json result = {
+        {"memory", {
+            {"id", memory->id},
+            {"content", memory->content},
+            {"source_conv_id", memory->source_conv_id},
+            {"importance", memory->importance},
+            {"created_at_ms", memory->created_at_ms},
+            {"updated_at_ms", memory->updated_at_ms}
+        }}
+    };
+
+    if (memory->source_conv_id.empty()) {
+        result["status"] = "no_source_conversation";
+        return result.dump();
+    }
+
+    result["origin"] = build_conversation_summary_json(db_, memory->source_conv_id);
+    return result.dump();
+}
+
 std::string ToolExecutor::handle_list_conversations(const nlohmann::json& args) {
     int limit = args.value("limit", 10);
     auto convs = db_.list_conversations();
@@ -287,38 +374,7 @@ std::string ToolExecutor::handle_list_conversations(const nlohmann::json& args) 
 std::string ToolExecutor::handle_get_conversation_summary(const nlohmann::json& args) {
     std::string conv_id = args.at("conversation_id").get<std::string>();
 
-    auto conv = db_.load_conversation(conv_id);
-    if (!conv) {
-        return nlohmann::json{{"error", "conversation not found: " + conv_id}}.dump();
-    }
-
-    // Include local memories for this conversation
-    auto local_mems = db_.list_local_memories(conv_id);
-    nlohmann::json mems_arr = nlohmann::json::array();
-    for (const auto& m : local_mems) {
-        mems_arr.push_back({{"id", m.id}, {"content", m.content}});
-    }
-
-    // Build a brief summary of messages
-    nlohmann::json msg_summary = nlohmann::json::array();
-    for (const auto& m : conv->messages) {
-        nlohmann::json entry = {
-            {"role", to_string(m.role)},
-            {"content_preview", m.content.substr(0, 200)}
-        };
-        if (m.content.size() > 200) entry["truncated"] = true;
-        msg_summary.push_back(entry);
-    }
-
-    return nlohmann::json{
-        {"conversation_id", conv_id},
-        {"title", conv->title},
-        {"total_tokens", conv->total_tokens},
-        {"message_count", conv->messages.size()},
-        {"messages", msg_summary},
-        {"compaction_summary", conv->compaction_summary},
-        {"local_memories", mems_arr}
-    }.dump();
+    return build_conversation_summary_json(db_, conv_id).dump();
 }
 
 } // namespace mm

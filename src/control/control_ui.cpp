@@ -126,7 +126,8 @@ void ControlUI::run() {
     int  agent_sel    = 0;
     bool show_editor  = false;
     std::string ed_id, ed_id_orig, ed_name, ed_model, ed_sysprompt, ed_pref_node;
-    std::string ed_ctx_s{"4096"}, ed_gpu_s{"-1"}, ed_thr_s{"-1"};
+    std::string ed_ctx_s{"4096"}, ed_gpu_s{"-1"}, ed_thr_s{"-1"}, ed_http_thr_s{"-1"};
+    std::string ed_parallel_s{"1"}, ed_batch_s{"-1"}, ed_ubatch_s{"-1"};
     std::string ed_temp_s{"0.70"}, ed_topp_s{"0.90"}, ed_max_s{"1024"};
     std::string ed_extra_args_text;
     bool ed_flash{true}, ed_reasoning{false}, ed_memories{true}, ed_tools{false};
@@ -433,6 +434,10 @@ void ControlUI::run() {
         try { cfg.llama_settings.ctx_size = std::stoi(ed_ctx_s); } catch (...) {}
         try { cfg.llama_settings.n_gpu_layers = std::stoi(ed_gpu_s); } catch (...) {}
         try { cfg.llama_settings.n_threads = std::stoi(ed_thr_s); } catch (...) {}
+        try { cfg.llama_settings.n_threads_http = std::stoi(ed_http_thr_s); } catch (...) {}
+        try { cfg.llama_settings.parallel = std::stoi(ed_parallel_s); } catch (...) {}
+        try { cfg.llama_settings.batch_size = std::stoi(ed_batch_s); } catch (...) {}
+        try { cfg.llama_settings.ubatch_size = std::stoi(ed_ubatch_s); } catch (...) {}
         try { cfg.llama_settings.temperature = std::stof(ed_temp_s); } catch (...) {}
         try { cfg.llama_settings.top_p = std::stof(ed_topp_s); } catch (...) {}
         try { cfg.llama_settings.max_tokens = std::stoi(ed_max_s); } catch (...) {}
@@ -476,6 +481,7 @@ void ControlUI::run() {
         const std::string signature =
             ed_id + '\n' + ed_name + '\n' + ed_model + '\n' + ed_sysprompt + '\n' + ed_pref_node +
             '\n' + ed_ctx_s + '\n' + ed_gpu_s + '\n' + ed_thr_s + '\n' + ed_temp_s + '\n' +
+            ed_http_thr_s + '\n' + ed_parallel_s + '\n' + ed_batch_s + '\n' + ed_ubatch_s + '\n' +
             ed_topp_s + '\n' + ed_max_s + '\n' + ed_extra_args_text + '\n' +
             (ed_flash ? "1" : "0") + (ed_reasoning ? "1" : "0") +
             (ed_memories ? "1" : "0") + (ed_tools ? "1" : "0");
@@ -763,7 +769,8 @@ void ControlUI::run() {
     auto btn_new_a    = Button("[+] New", [&] {
         ed_id.clear(); ed_id_orig.clear(); ed_name = "New Agent"; ed_model.clear();
         ed_sysprompt.clear(); ed_pref_node.clear();
-        ed_ctx_s = "4096"; ed_gpu_s = "-1"; ed_thr_s = "-1";
+        ed_ctx_s = "4096"; ed_gpu_s = "-1"; ed_thr_s = "-1"; ed_http_thr_s = "-1";
+        ed_parallel_s = "1"; ed_batch_s = "-1"; ed_ubatch_s = "-1";
         ed_temp_s = "0.70"; ed_topp_s = "0.90"; ed_max_s = "1024";
         ed_extra_args_text.clear();
         ed_flash = true; ed_reasoning = false; ed_memories = true; ed_tools = false;
@@ -782,6 +789,10 @@ void ControlUI::run() {
             ed_ctx_s = std::to_string(c.llama_settings.ctx_size);
             ed_gpu_s = std::to_string(c.llama_settings.n_gpu_layers);
             ed_thr_s = std::to_string(c.llama_settings.n_threads);
+            ed_http_thr_s = std::to_string(c.llama_settings.n_threads_http);
+            ed_parallel_s = std::to_string(c.llama_settings.parallel);
+            ed_batch_s = std::to_string(c.llama_settings.batch_size);
+            ed_ubatch_s = std::to_string(c.llama_settings.ubatch_size);
             char tmp[32];
             snprintf(tmp, sizeof(tmp), "%.2f", static_cast<double>(c.llama_settings.temperature));
             ed_temp_s = tmp;
@@ -829,6 +840,10 @@ void ControlUI::run() {
     auto ed_inp_ctx   = Input(&ed_ctx_s,     sl);
     auto ed_inp_gpu   = Input(&ed_gpu_s,     sl);
     auto ed_inp_thr   = Input(&ed_thr_s,     sl);
+    auto ed_inp_http_thr = Input(&ed_http_thr_s, sl);
+    auto ed_inp_parallel = Input(&ed_parallel_s, sl);
+    auto ed_inp_batch = Input(&ed_batch_s, sl);
+    auto ed_inp_ubatch = Input(&ed_ubatch_s, sl);
     auto ed_inp_temp  = Input(&ed_temp_s,    sl);
     auto ed_inp_topp  = Input(&ed_topp_s,    sl);
     auto ed_inp_max   = Input(&ed_max_s,     sl);
@@ -895,6 +910,7 @@ void ControlUI::run() {
     auto editor_comp  = Container::Vertical({
         ed_inp_id, ed_inp_name, model_row, ed_inp_sys, ed_inp_pnode,
         ed_inp_ctx, ed_inp_gpu, ed_inp_thr,
+        ed_inp_http_thr, ed_inp_parallel, ed_inp_batch, ed_inp_ubatch,
         ed_inp_temp, ed_inp_topp, ed_inp_max,
         ed_inp_extra,
         ed_cb_flash, ed_cb_reasoning, ed_cb_memories, ed_cb_tools,
@@ -1732,6 +1748,10 @@ void ControlUI::run() {
                               text("  max_tokens  : "), ed_inp_max->Render()  | flex}),
                         hbox({text("  gpu_layers  : "), ed_inp_gpu->Render()  | flex,
                               text("  threads     : "), ed_inp_thr->Render()  | flex}),
+                        hbox({text("  http_threads: "), ed_inp_http_thr->Render() | flex,
+                              text("  parallel    : "), ed_inp_parallel->Render() | flex}),
+                        hbox({text("  batch_size  : "), ed_inp_batch->Render() | flex,
+                              text("  ubatch_size : "), ed_inp_ubatch->Render() | flex}),
                         hbox({text("  temperature : "), ed_inp_temp->Render() | flex,
                               text("  top_p       : "), ed_inp_topp->Render() | flex}),
                         separator(),

@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include <regex>
 #include <unordered_set>
@@ -479,13 +480,29 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
             if (!local_path.empty()) model_ref = local_path;
         }
 
-        // Warn about large ctx_size before sending the request.
+        // Warn about large per-session and total server context before sending the request.
         if (cfg.llama_settings.ctx_size > 131072) {
             MM_WARN("AgentScheduler: agent {} has extremely large ctx_size={}; "
                     "consider reducing", cfg.id, cfg.llama_settings.ctx_size);
         } else if (cfg.llama_settings.ctx_size > 65536) {
             MM_WARN("AgentScheduler: agent {} has very large ctx_size={}; "
                     "load may fail or be slow", cfg.id, cfg.llama_settings.ctx_size);
+        }
+        if (cfg.llama_settings.ctx_size > 0 && cfg.llama_settings.parallel > 1) {
+            const int64_t server_ctx_size =
+                static_cast<int64_t>(cfg.llama_settings.ctx_size) *
+                static_cast<int64_t>(cfg.llama_settings.parallel);
+            if (server_ctx_size > 131072) {
+                MM_WARN("AgentScheduler: agent {} has extremely large total server ctx_size={} "
+                        "(ctx_size={} * parallel={}); consider reducing",
+                        cfg.id, server_ctx_size, cfg.llama_settings.ctx_size,
+                        cfg.llama_settings.parallel);
+            } else if (server_ctx_size > 65536) {
+                MM_WARN("AgentScheduler: agent {} has very large total server ctx_size={} "
+                        "(ctx_size={} * parallel={}); load may fail or be slow",
+                        cfg.id, server_ctx_size, cfg.llama_settings.ctx_size,
+                        cfg.llama_settings.parallel);
+            }
         }
 
         bool attempted_pull = false;

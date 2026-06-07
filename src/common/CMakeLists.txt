@@ -7,6 +7,7 @@ set(MM_COMMON_SOURCES
     conversation_manager.cpp
     memory_manager.cpp
     tool_executor.cpp
+    trace_provenance.cpp
     http_server.cpp
     http_client.cpp
     sse_emitter.cpp
