@@ -2,6 +2,7 @@
 #include "control/node_registry.hpp"
 #include "control/model_distributor.hpp"
 #include "common/http_client.hpp"
+#include "common/inference_sizing.hpp"
 #include "common/logger.hpp"
 #include "common/model_catalog.hpp"
 #include "common/gguf_metadata.hpp"
@@ -11,11 +12,8 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <filesystem>
 #include <regex>
 #include <unordered_set>
-
-namespace fs = std::filesystem;
 
 namespace mm {
 
@@ -42,7 +40,7 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         return ScheduleResult{pit->second.node_id, pit->second.slot_id};
     }
 
-    int64_t vram_needed = estimate_vram_mb(cfg.model_path);
+    int64_t vram_needed = estimate_vram_mb(cfg.model_path, cfg.llama_settings);
     const std::string model_filename = canonical_model_filename(cfg.model_path);
     if (model_filename != cfg.model_path) {
         MM_WARN("AgentScheduler: agent {} model_path '{}' treated as catalog filename '{}'",
@@ -325,12 +323,9 @@ bool AgentScheduler::is_local_node(const std::string& node_url) {
     return std::regex_match(node_url, local_re);
 }
 
-int64_t AgentScheduler::estimate_vram_mb(const std::string& model_path) const {
-    std::error_code ec;
-    const std::string resolved = resolve_model_path_for_metadata(model_path, models_dir_);
-    auto sz = fs::file_size(resolved.empty() ? model_path : resolved, ec);
-    if (ec) return 2048; // Conservative default: 2 GB
-    return static_cast<int64_t>(static_cast<double>(sz) * 1.2 / (1024.0 * 1024.0));
+int64_t AgentScheduler::estimate_vram_mb(const std::string& model_path,
+                                         const LlamaSettings& settings) const {
+    return estimate_inference_vram_mb(model_path, settings, models_dir_);
 }
 
 std::optional<NodeInfo> AgentScheduler::find_node_with_vram(

@@ -65,8 +65,9 @@ private:
     /// Check if a node URL is local (loopback).
     static bool is_local_node(const std::string& node_url);
 
-    /// Estimate VRAM needed for a model (from file size).
-    int64_t estimate_vram_mb(const std::string& model_path) const;
+    /// Estimate capacity needed for a model and its effective server context.
+    int64_t estimate_vram_mb(const std::string& model_path,
+                             const LlamaSettings& settings) const;
 
     /// Try to find a node that can accommodate a model of the given VRAM.
     /// Returns node info or nullopt.

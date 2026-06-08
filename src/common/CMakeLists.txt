@@ -15,6 +15,7 @@ set(MM_COMMON_SOURCES
     pairing.cpp
     node_discovery.cpp
     gguf_metadata.cpp
+    inference_sizing.cpp
     model_catalog.cpp
     cli_repl.cpp
     inference_response_parser.cpp

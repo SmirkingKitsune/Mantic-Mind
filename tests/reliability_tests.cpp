@@ -3,6 +3,7 @@
 #include "common/agent_db.hpp"
 #include "common/conversation_manager.hpp"
 #include "common/http_client.hpp"
+#include "common/inference_sizing.hpp"
 #include "common/llama_cpp_client.hpp"
 #include "common/memory_manager.hpp"
 #include "common/trace_provenance.hpp"
@@ -22,6 +23,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -374,6 +376,42 @@ bool test_llama_server_args_throughput_tunables() {
     auto explicit_ctx_args = mm::build_llama_server_args_for_test("model.gguf", explicit_ctx, 48126);
     CHECK(!has_arg_pair(explicit_ctx_args, "--ctx-size", "32768"));
     CHECK(has_arg(explicit_ctx_args, "--ctx-size=32768"));
+
+    return true;
+}
+
+bool test_inference_sizing_tracks_effective_context() {
+    auto dir = temp_test_dir("inference-sizing");
+    std::filesystem::create_directories(dir);
+    const auto model = dir / "tiny.gguf";
+    {
+        std::ofstream out(model, std::ios::binary);
+        std::string chunk(1024 * 1024, '\0');
+        for (int i = 0; i < 64; ++i) out.write(chunk.data(), chunk.size());
+    }
+
+    mm::LlamaSettings defaults;
+    auto base = mm::estimate_inference_memory(model.string(), defaults);
+    CHECK(base.model_weight_mb == 64);
+    CHECK(base.effective_ctx_tokens == 4096);
+    CHECK(base.parallel == 1);
+
+    mm::LlamaSettings tuned;
+    tuned.ctx_size = 2048;
+    tuned.parallel = 4;
+    auto parallel = mm::estimate_inference_memory(model.string(), tuned);
+    CHECK(parallel.effective_ctx_tokens == 8192);
+    CHECK(parallel.parallel == 4);
+    CHECK(parallel.total_vram_mb > base.total_vram_mb);
+
+    mm::LlamaSettings overridden;
+    overridden.ctx_size = 1024;
+    overridden.parallel = 1;
+    overridden.extra_args = {"--parallel=8", "--ctx-size=32768"};
+    auto explicit_ctx = mm::estimate_inference_memory(model.string(), overridden);
+    CHECK(explicit_ctx.parallel == 8);
+    CHECK(explicit_ctx.effective_ctx_tokens == 32768);
+    CHECK(explicit_ctx.total_vram_mb > parallel.total_vram_mb);
 
     return true;
 }
@@ -1214,6 +1252,8 @@ int main() {
          test_llama_settings_throughput_fields_round_trip},
         {"llama_server_args_throughput_tunables",
          test_llama_server_args_throughput_tunables},
+        {"inference_sizing_tracks_effective_context",
+         test_inference_sizing_tracks_effective_context},
         {"control_api_external_token_gate", test_control_api_external_token_gate},
         {"control_api_curation_routes", test_control_api_curation_routes},
         {"global_memory_origin_tool_and_context_metadata",

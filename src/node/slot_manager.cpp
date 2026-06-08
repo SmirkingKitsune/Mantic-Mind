@@ -1,5 +1,6 @@
 #include "node/slot_manager.hpp"
 #include "common/http_client.hpp"
+#include "common/inference_sizing.hpp"
 #include "common/logger.hpp"
 #include "common/util.hpp"
 
@@ -120,7 +121,7 @@ SlotId SlotManager::load_model(const std::string& model_path,
     slot->model_path     = model_path;
     slot->assigned_agent = agent_id;
     slot->state          = SlotState::Loading;
-    slot->vram_usage_mb  = estimate_vram_mb(model_path);
+    slot->vram_usage_mb  = estimate_vram_mb(model_path, settings);
     slot->last_active_ms = util::now_ms();
 
     slot->process = std::make_unique<LlamaServerProcess>(llama_server_path_);
@@ -314,7 +315,7 @@ SlotId SlotManager::restore_slot(const std::string& model_path,
     slot->model_path     = model_path;
     slot->assigned_agent = agent_id;
     slot->state          = SlotState::Loading;
-    slot->vram_usage_mb  = estimate_vram_mb(model_path);
+    slot->vram_usage_mb  = estimate_vram_mb(model_path, settings);
     slot->last_active_ms = util::now_ms();
     slot->kv_cache_path  = kv_cache_path;
 
@@ -517,12 +518,9 @@ void SlotManager::release_port(uint16_t port) {
     used_ports_.erase(port);
 }
 
-int64_t SlotManager::estimate_vram_mb(const std::string& model_path) {
-    std::error_code ec;
-    auto sz = fs::file_size(model_path, ec);
-    if (ec) return 0;
-    // Rough heuristic: file_size * 1.2 for runtime overhead.
-    return static_cast<int64_t>(static_cast<double>(sz) * 1.2 / (1024.0 * 1024.0));
+int64_t SlotManager::estimate_vram_mb(const std::string& model_path,
+                                      const LlamaSettings& settings) {
+    return estimate_inference_vram_mb(model_path, settings);
 }
 
 bool SlotManager::test_port_available(uint16_t port) {

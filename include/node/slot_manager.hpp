@@ -164,8 +164,9 @@ private:
     std::optional<uint16_t> allocate_port();
     void release_port(uint16_t port);
 
-    /// Rough VRAM estimate from file size.
-    static int64_t estimate_vram_mb(const std::string& model_path);
+    /// Rough memory estimate from file size and effective llama-server context.
+    static int64_t estimate_vram_mb(const std::string& model_path,
+                                    const LlamaSettings& settings);
 
     /// Test-bind a TCP socket to check if a port is free.
     static bool test_port_available(uint16_t port);
