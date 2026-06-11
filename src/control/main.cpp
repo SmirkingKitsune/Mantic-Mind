@@ -96,6 +96,19 @@ static mm::ControlConfig load_config(
                          static_cast<int>(cfg.node_health_poll_interval_s)));
         cfg.models_dir     = file.get("models_dir",     cfg.models_dir);
         cfg.external_api_token = file.get("external_api_token", cfg.external_api_token);
+        cfg.tts.enabled = file.get_bool("tts_enabled", cfg.tts.enabled);
+        cfg.tts.service_url = file.get("tts_service_url", cfg.tts.service_url);
+        cfg.tts.service_command = file.get("tts_service_command", cfg.tts.service_command);
+        cfg.tts.cache_dir = file.get("tts_cache_dir", cfg.tts.cache_dir);
+        cfg.tts.voice_design_model_id =
+            file.get("tts_voice_design_model_id", cfg.tts.voice_design_model_id);
+        cfg.tts.clone_model_id = file.get("tts_clone_model_id", cfg.tts.clone_model_id);
+        cfg.tts.custom_voice_model_id =
+            file.get("tts_custom_voice_model_id", cfg.tts.custom_voice_model_id);
+        cfg.tts.cache_ttl_ms = file.get_int(
+            "tts_cache_ttl_ms",
+            static_cast<int>(cfg.tts.cache_ttl_ms));
+        cfg.tts.timeout_s = file.get_int("tts_timeout_s", cfg.tts.timeout_s);
         cfg.pairing_key    = file.get("pairing_key",    "");
         cfg.discovery_port = static_cast<uint16_t>(
             file.get_int("discovery_port", static_cast<int>(cfg.discovery_port)));
@@ -113,6 +126,14 @@ static mm::ControlConfig load_config(
         if (!v) return cur;
         try { return std::stoi(v); } catch (...) { return cur; }
     };
+    auto env_bool = [](const char* name, bool cur) -> bool {
+        const char* v = std::getenv(name);
+        if (!v) return cur;
+        std::string s = mm::util::to_lower(mm::util::trim(v));
+        if (s == "true" || s == "yes" || s == "1" || s == "on") return true;
+        if (s == "false" || s == "no" || s == "0" || s == "off") return false;
+        return cur;
+    };
 
     cfg.listen_port = static_cast<uint16_t>(
         env_int("MM_CONTROL_PORT", static_cast<int>(cfg.listen_port)));
@@ -121,6 +142,19 @@ static mm::ControlConfig load_config(
     cfg.models_dir  = env("MM_MODELS_DIR",  cfg.models_dir);
     cfg.external_api_token =
         env("MM_CONTROL_EXTERNAL_API_TOKEN", cfg.external_api_token);
+    cfg.tts.enabled = env_bool("MM_TTS_ENABLED", cfg.tts.enabled);
+    cfg.tts.service_url = env("MM_TTS_SERVICE_URL", cfg.tts.service_url);
+    cfg.tts.service_command = env("MM_TTS_SERVICE_COMMAND", cfg.tts.service_command);
+    cfg.tts.cache_dir = env("MM_TTS_CACHE_DIR", cfg.tts.cache_dir);
+    cfg.tts.voice_design_model_id =
+        env("MM_TTS_VOICE_DESIGN_MODEL_ID", cfg.tts.voice_design_model_id);
+    cfg.tts.clone_model_id = env("MM_TTS_CLONE_MODEL_ID", cfg.tts.clone_model_id);
+    cfg.tts.custom_voice_model_id =
+        env("MM_TTS_CUSTOM_VOICE_MODEL_ID", cfg.tts.custom_voice_model_id);
+    cfg.tts.cache_ttl_ms = env_int(
+        "MM_TTS_CACHE_TTL_MS",
+        static_cast<int>(cfg.tts.cache_ttl_ms));
+    cfg.tts.timeout_s = env_int("MM_TTS_TIMEOUT_S", cfg.tts.timeout_s);
     cfg.pairing_key = env("MM_PAIRING_KEY", cfg.pairing_key);
     cfg.node_health_poll_interval_s = static_cast<uint32_t>(
         env_int("MM_POLL_INTERVAL_S",
@@ -923,7 +957,8 @@ int main(int argc, char** argv) {
     mm::AgentQueue        queue;
     mm::ControlApiServer  api_server(
         agents, queue, registry, router, scheduler,
-        cfg.models_dir, cfg.external_api_token);
+        cfg.data_dir, cfg.models_dir, cfg.external_api_token, cfg.tts);
+    api_server.cleanup_expired_tts_cache();
     mm::ControlUI         ui(
         registry,
         agents,
@@ -985,6 +1020,7 @@ int main(int argc, char** argv) {
             if (!stop_housekeeping) {
                 MM_INFO("Running scheduler housekeeping");
                 scheduler.housekeeping(agents.list_agents());
+                api_server.cleanup_expired_tts_cache();
             }
         }
     });

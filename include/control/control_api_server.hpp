@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/models.hpp"
+#include "control/tts_service_client.hpp"
 #include <deque>
 #include <functional>
 #include <memory>
@@ -34,12 +35,15 @@ public:
                      NodeRegistry& registry,
                      ModelRouter& router,
                      AgentScheduler& scheduler,
+                     std::string data_dir,
                      std::string models_dir,
-                     std::string external_api_token = {});
+                     std::string external_api_token = {},
+                     TtsServiceConfig tts_config = {});
     ~ControlApiServer();
 
     bool listen(uint16_t port);
     void stop();
+    void cleanup_expired_tts_cache();
 
     // Activity logging callback — 0=Info, 1=Warn, 2=Error.
     using LogCallback = std::function<void(int level, const std::string& message)>;
@@ -59,8 +63,10 @@ private:
     NodeRegistry&   registry_;
     ModelRouter&    router_;
     AgentScheduler& scheduler_;
+    std::string     data_dir_;
     std::string     models_dir_;
     std::string     external_api_token_;
+    TtsServiceClient tts_;
     std::unique_ptr<HttpServer> server_;
     LogCallback     log_cb_;
     mutable std::mutex activity_mutex_;

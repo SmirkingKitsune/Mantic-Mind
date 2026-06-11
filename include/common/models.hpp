@@ -15,6 +15,9 @@ using MemoryId = std::string;
 using NodeId   = std::string;
 using SlotId   = std::string;
 using JobId    = std::string;
+using VoiceProfileId = std::string;
+using VoiceProposalId = std::string;
+using TtsCacheId = std::string;
 
 // ── Enumerations ──────────────────────────────────────────────────────────────
 enum class MessageRole { System, User, Assistant, Tool };
@@ -85,6 +88,72 @@ struct AgentConfig {
     bool          memories_enabled  = true;
     bool          tools_enabled     = false;
     NodeId        preferred_node_id;
+};
+
+struct AgentVoiceProfile {
+    VoiceProfileId id;
+    AgentId        agent_id;
+    std::string    display_name;
+    std::string    language = "Auto";
+    std::string    voice_description;
+    std::string    sample_text;
+    std::string    rationale;
+    std::string    provider = "qwen3-tts";
+    std::string    voice_design_model_id;
+    std::string    clone_model_id;
+    std::string    reference_audio_path;
+    std::string    voice_clone_prompt_path;
+    VoiceProposalId approved_from_proposal_id;
+    bool           active = false;
+    int64_t        created_at_ms = 0;
+    int64_t        updated_at_ms = 0;
+};
+
+struct VoiceDesignProposal {
+    VoiceProposalId id;
+    AgentId         agent_id;
+    std::string     display_name;
+    std::string     language = "Auto";
+    std::string     voice_description;
+    std::string     sample_text;
+    std::string     rationale;
+    std::string     status = "pending"; // pending|sampled|approved|rejected|error
+    std::string     provider = "qwen3-tts";
+    std::string     voice_design_model_id;
+    std::string     clone_model_id;
+    std::string     preview_audio_path;
+    std::string     voice_clone_prompt_path;
+    std::string     error;
+    int64_t         created_at_ms = 0;
+    int64_t         updated_at_ms = 0;
+};
+
+struct TtsSynthesisRequest {
+    AgentId        agent_id;
+    std::string    text;
+    VoiceProfileId voice_profile_id;
+    ConvId         conversation_id;
+    int            message_index = -1;
+    std::string    language = "Auto";
+    std::string    format = "wav";
+    bool           use_cache = true;
+};
+
+struct TtsSynthesisResult {
+    TtsCacheId     cache_id;
+    AgentId        agent_id;
+    VoiceProfileId voice_profile_id;
+    ConvId         conversation_id;
+    int            message_index = -1;
+    std::string    text_hash;
+    std::string    audio_path;
+    std::string    mime_type = "audio/wav";
+    std::string    format = "wav";
+    int            sample_rate = 0;
+    int            duration_ms = 0;
+    bool           cached = false;
+    int64_t        created_at_ms = 0;
+    int64_t        expires_at_ms = 0;
 };
 
 enum class ValidationSeverity {
@@ -463,6 +532,140 @@ inline void from_json(const nlohmann::json& j, AgentConfig& a) {
     if (j.contains("memories_enabled"))  j.at("memories_enabled").get_to(a.memories_enabled);
     if (j.contains("tools_enabled"))     j.at("tools_enabled").get_to(a.tools_enabled);
     if (j.contains("preferred_node_id")) j.at("preferred_node_id").get_to(a.preferred_node_id);
+}
+
+inline void to_json(nlohmann::json& j, const AgentVoiceProfile& p) {
+    j = { {"id", p.id},
+          {"agent_id", p.agent_id},
+          {"display_name", p.display_name},
+          {"language", p.language},
+          {"voice_description", p.voice_description},
+          {"sample_text", p.sample_text},
+          {"rationale", p.rationale},
+          {"provider", p.provider},
+          {"voice_design_model_id", p.voice_design_model_id},
+          {"clone_model_id", p.clone_model_id},
+          {"reference_audio_path", p.reference_audio_path},
+          {"voice_clone_prompt_path", p.voice_clone_prompt_path},
+          {"approved_from_proposal_id", p.approved_from_proposal_id},
+          {"active", p.active},
+          {"created_at_ms", p.created_at_ms},
+          {"updated_at_ms", p.updated_at_ms} };
+}
+
+inline void from_json(const nlohmann::json& j, AgentVoiceProfile& p) {
+    if (j.contains("id")) j.at("id").get_to(p.id);
+    if (j.contains("agent_id")) j.at("agent_id").get_to(p.agent_id);
+    if (j.contains("display_name")) j.at("display_name").get_to(p.display_name);
+    if (j.contains("language")) j.at("language").get_to(p.language);
+    if (j.contains("voice_description")) j.at("voice_description").get_to(p.voice_description);
+    if (j.contains("sample_text")) j.at("sample_text").get_to(p.sample_text);
+    if (j.contains("rationale")) j.at("rationale").get_to(p.rationale);
+    if (j.contains("provider")) j.at("provider").get_to(p.provider);
+    if (j.contains("voice_design_model_id")) j.at("voice_design_model_id").get_to(p.voice_design_model_id);
+    if (j.contains("clone_model_id")) j.at("clone_model_id").get_to(p.clone_model_id);
+    if (j.contains("reference_audio_path")) j.at("reference_audio_path").get_to(p.reference_audio_path);
+    if (j.contains("voice_clone_prompt_path")) j.at("voice_clone_prompt_path").get_to(p.voice_clone_prompt_path);
+    if (j.contains("approved_from_proposal_id")) j.at("approved_from_proposal_id").get_to(p.approved_from_proposal_id);
+    if (j.contains("active")) j.at("active").get_to(p.active);
+    if (j.contains("created_at_ms")) j.at("created_at_ms").get_to(p.created_at_ms);
+    if (j.contains("updated_at_ms")) j.at("updated_at_ms").get_to(p.updated_at_ms);
+}
+
+inline void to_json(nlohmann::json& j, const VoiceDesignProposal& p) {
+    j = { {"id", p.id},
+          {"agent_id", p.agent_id},
+          {"display_name", p.display_name},
+          {"language", p.language},
+          {"voice_description", p.voice_description},
+          {"sample_text", p.sample_text},
+          {"rationale", p.rationale},
+          {"status", p.status},
+          {"provider", p.provider},
+          {"voice_design_model_id", p.voice_design_model_id},
+          {"clone_model_id", p.clone_model_id},
+          {"preview_audio_path", p.preview_audio_path},
+          {"voice_clone_prompt_path", p.voice_clone_prompt_path},
+          {"error", p.error},
+          {"created_at_ms", p.created_at_ms},
+          {"updated_at_ms", p.updated_at_ms} };
+}
+
+inline void from_json(const nlohmann::json& j, VoiceDesignProposal& p) {
+    if (j.contains("id")) j.at("id").get_to(p.id);
+    if (j.contains("agent_id")) j.at("agent_id").get_to(p.agent_id);
+    if (j.contains("display_name")) j.at("display_name").get_to(p.display_name);
+    if (j.contains("language")) j.at("language").get_to(p.language);
+    if (j.contains("voice_description")) j.at("voice_description").get_to(p.voice_description);
+    if (j.contains("sample_text")) j.at("sample_text").get_to(p.sample_text);
+    if (j.contains("rationale")) j.at("rationale").get_to(p.rationale);
+    if (j.contains("status")) j.at("status").get_to(p.status);
+    if (j.contains("provider")) j.at("provider").get_to(p.provider);
+    if (j.contains("voice_design_model_id")) j.at("voice_design_model_id").get_to(p.voice_design_model_id);
+    if (j.contains("clone_model_id")) j.at("clone_model_id").get_to(p.clone_model_id);
+    if (j.contains("preview_audio_path")) j.at("preview_audio_path").get_to(p.preview_audio_path);
+    if (j.contains("voice_clone_prompt_path")) j.at("voice_clone_prompt_path").get_to(p.voice_clone_prompt_path);
+    if (j.contains("error")) j.at("error").get_to(p.error);
+    if (j.contains("created_at_ms")) j.at("created_at_ms").get_to(p.created_at_ms);
+    if (j.contains("updated_at_ms")) j.at("updated_at_ms").get_to(p.updated_at_ms);
+}
+
+inline void to_json(nlohmann::json& j, const TtsSynthesisRequest& r) {
+    j = { {"agent_id", r.agent_id},
+          {"text", r.text},
+          {"voice_profile_id", r.voice_profile_id},
+          {"conversation_id", r.conversation_id},
+          {"message_index", r.message_index},
+          {"language", r.language},
+          {"format", r.format},
+          {"use_cache", r.use_cache} };
+}
+
+inline void from_json(const nlohmann::json& j, TtsSynthesisRequest& r) {
+    if (j.contains("agent_id")) j.at("agent_id").get_to(r.agent_id);
+    if (j.contains("text")) j.at("text").get_to(r.text);
+    if (j.contains("input")) j.at("input").get_to(r.text);
+    if (j.contains("voice_profile_id")) j.at("voice_profile_id").get_to(r.voice_profile_id);
+    if (j.contains("conversation_id")) j.at("conversation_id").get_to(r.conversation_id);
+    if (j.contains("message_index")) j.at("message_index").get_to(r.message_index);
+    if (j.contains("language")) j.at("language").get_to(r.language);
+    if (j.contains("format")) j.at("format").get_to(r.format);
+    if (j.contains("response_format")) j.at("response_format").get_to(r.format);
+    if (j.contains("use_cache")) j.at("use_cache").get_to(r.use_cache);
+}
+
+inline void to_json(nlohmann::json& j, const TtsSynthesisResult& r) {
+    j = { {"cache_id", r.cache_id},
+          {"agent_id", r.agent_id},
+          {"voice_profile_id", r.voice_profile_id},
+          {"conversation_id", r.conversation_id},
+          {"message_index", r.message_index},
+          {"text_hash", r.text_hash},
+          {"audio_path", r.audio_path},
+          {"mime_type", r.mime_type},
+          {"format", r.format},
+          {"sample_rate", r.sample_rate},
+          {"duration_ms", r.duration_ms},
+          {"cached", r.cached},
+          {"created_at_ms", r.created_at_ms},
+          {"expires_at_ms", r.expires_at_ms} };
+}
+
+inline void from_json(const nlohmann::json& j, TtsSynthesisResult& r) {
+    if (j.contains("cache_id")) j.at("cache_id").get_to(r.cache_id);
+    if (j.contains("agent_id")) j.at("agent_id").get_to(r.agent_id);
+    if (j.contains("voice_profile_id")) j.at("voice_profile_id").get_to(r.voice_profile_id);
+    if (j.contains("conversation_id")) j.at("conversation_id").get_to(r.conversation_id);
+    if (j.contains("message_index")) j.at("message_index").get_to(r.message_index);
+    if (j.contains("text_hash")) j.at("text_hash").get_to(r.text_hash);
+    if (j.contains("audio_path")) j.at("audio_path").get_to(r.audio_path);
+    if (j.contains("mime_type")) j.at("mime_type").get_to(r.mime_type);
+    if (j.contains("format")) j.at("format").get_to(r.format);
+    if (j.contains("sample_rate")) j.at("sample_rate").get_to(r.sample_rate);
+    if (j.contains("duration_ms")) j.at("duration_ms").get_to(r.duration_ms);
+    if (j.contains("cached")) j.at("cached").get_to(r.cached);
+    if (j.contains("created_at_ms")) j.at("created_at_ms").get_to(r.created_at_ms);
+    if (j.contains("expires_at_ms")) j.at("expires_at_ms").get_to(r.expires_at_ms);
 }
 
 // ─── ValidationSeverity ─────────────────────────────────────────────────────

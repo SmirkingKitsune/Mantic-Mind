@@ -62,6 +62,29 @@ public:
     std::vector<LocalMemory>       list_local_memories(const ConvId& conv_id) const;
     void                           transfer_local_memories(const ConvId& from, const ConvId& to);
 
+    // Voice design / TTS metadata. Audio and prompt artifacts are stored as
+    // files; the database stores only metadata and paths.
+    void                                 save_voice_proposal(const VoiceDesignProposal& proposal);
+    std::optional<VoiceDesignProposal>  get_voice_proposal(const VoiceProposalId& id) const;
+    std::vector<VoiceDesignProposal>    list_voice_proposals() const;
+    void                                 update_voice_proposal_status(const VoiceProposalId& id,
+                                                                     const std::string& status,
+                                                                     const std::string& error = {});
+
+    void                                save_voice_profile(const AgentVoiceProfile& profile);
+    std::optional<AgentVoiceProfile>   get_voice_profile(const VoiceProfileId& id) const;
+    std::optional<AgentVoiceProfile>   get_active_voice_profile() const;
+    std::vector<AgentVoiceProfile>     list_voice_profiles() const;
+    void                               set_active_voice_profile(const VoiceProfileId& id);
+
+    void                              save_tts_cache_entry(const TtsSynthesisResult& entry);
+    std::optional<TtsSynthesisResult> find_tts_cache_entry(const VoiceProfileId& profile_id,
+                                                           const std::string& text_hash,
+                                                           const ConvId& conversation_id = {},
+                                                           int message_index = -1) const;
+    std::optional<TtsSynthesisResult> get_tts_cache_entry(const TtsCacheId& id) const;
+    std::vector<TtsSynthesisResult>   delete_expired_tts_cache_entries(int64_t now_ms);
+
 private:
     AgentId                       agent_id_;
     std::unique_ptr<SQLite::Database> db_;

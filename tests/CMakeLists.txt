@@ -5,6 +5,7 @@ add_executable(mm_reliability_tests
     ${CMAKE_SOURCE_DIR}/src/control/agent_config_validator.cpp
     ${CMAKE_SOURCE_DIR}/src/control/agent_scheduler.cpp
     ${CMAKE_SOURCE_DIR}/src/control/control_api_server.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/tts_service_client.cpp
     ${CMAKE_SOURCE_DIR}/src/control/model_distributor.cpp
     ${CMAKE_SOURCE_DIR}/src/control/model_router.cpp
     ${CMAKE_SOURCE_DIR}/src/control/node_registry.cpp

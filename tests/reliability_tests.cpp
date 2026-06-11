@@ -16,6 +16,7 @@
 #include "control/model_distributor.hpp"
 #include "control/model_router.hpp"
 #include "control/node_registry.hpp"
+#include "control/tts_service_client.hpp"
 #include "node/llama_server_process.hpp"
 #include "node/slot_manager.hpp"
 
@@ -33,6 +34,7 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
+#include <httplib.h>
 
 namespace {
 
@@ -442,7 +444,7 @@ bool test_control_api_external_token_gate() {
         mm::ModelRouter router(scheduler);
         mm::ControlApiServer api(
             agents, queue, registry, router, scheduler,
-            (dir / "models").string(), "control-secret");
+            dir.string(), (dir / "models").string(), "control-secret");
 
         const uint16_t port = 49287;
         const std::string base_url = "http://127.0.0.1:" + std::to_string(port);
@@ -488,6 +490,12 @@ bool test_control_api_external_token_gate() {
         client.set_bearer_token("control-secret");
         auto valid = client.get("/v1/nodes");
         RECORD(valid.status == 200);
+        auto valid_voice = client.get("/v1/agents/agent-a/voice");
+        RECORD(valid_voice.status == 200);
+
+        mm::HttpClient missing_voice_client(base_url);
+        auto missing_voice = missing_voice_client.get("/v1/agents/agent-a/voice");
+        expect_error(missing_voice, 401, "missing bearer token");
 
         mm::HttpClient external_on_internal(base_url);
         external_on_internal.set_bearer_token("control-secret");
@@ -612,6 +620,284 @@ bool test_control_api_external_token_gate() {
     return ok;
 }
 
+bool test_agent_voice_db_and_cache_lifecycle() {
+    auto dir = temp_test_dir("agent-voice-db");
+    std::filesystem::create_directories(dir);
+    {
+        mm::AgentDB db("agent-a", dir.string());
+
+        mm::VoiceDesignProposal proposal;
+        proposal.id = "proposal-a";
+        proposal.agent_id = "agent-a";
+        proposal.display_name = "Analyst Voice";
+        proposal.language = "English";
+        proposal.voice_description = "Clear, calm, original synthetic narrator voice.";
+        proposal.sample_text = "Here is a concise operational update.";
+        proposal.rationale = "Fits the agent role.";
+        proposal.status = "pending";
+        db.save_voice_proposal(proposal);
+
+        auto loaded = db.get_voice_proposal("proposal-a");
+        CHECK(loaded.has_value());
+        CHECK(loaded->display_name == "Analyst Voice");
+        CHECK(db.list_voice_proposals().size() == 1);
+        db.update_voice_proposal_status("proposal-a", "sampled");
+        loaded = db.get_voice_proposal("proposal-a");
+        CHECK(loaded.has_value());
+        CHECK(loaded->status == "sampled");
+
+        mm::AgentVoiceProfile profile_a;
+        profile_a.id = "profile-a";
+        profile_a.agent_id = "agent-a";
+        profile_a.display_name = "Voice A";
+        profile_a.voice_description = "First voice.";
+        profile_a.sample_text = "Sample A";
+        profile_a.voice_clone_prompt_path = "prompt-a.pkl";
+        profile_a.active = true;
+        db.save_voice_profile(profile_a);
+        auto active = db.get_active_voice_profile();
+        CHECK(active.has_value());
+        CHECK(active->id == "profile-a");
+
+        mm::AgentVoiceProfile profile_b = profile_a;
+        profile_b.id = "profile-b";
+        profile_b.display_name = "Voice B";
+        db.save_voice_profile(profile_b);
+        active = db.get_active_voice_profile();
+        CHECK(active.has_value());
+        CHECK(active->id == "profile-b");
+        auto old_profile = db.get_voice_profile("profile-a");
+        CHECK(old_profile.has_value());
+        CHECK(!old_profile->active);
+
+        mm::TtsSynthesisResult cache;
+        cache.cache_id = "cache-a";
+        cache.agent_id = "agent-a";
+        cache.voice_profile_id = "profile-b";
+        cache.conversation_id = "conv-a";
+        cache.message_index = 3;
+        cache.text_hash = "hash-a";
+        cache.audio_path = "speech-a.wav";
+        cache.expires_at_ms = mm::util::now_ms() + 60000;
+        db.save_tts_cache_entry(cache);
+        auto found = db.find_tts_cache_entry("profile-b", "hash-a", "conv-a", 3);
+        CHECK(found.has_value());
+        CHECK(found->cached);
+        CHECK(found->cache_id == "cache-a");
+
+        mm::TtsSynthesisResult expired = cache;
+        expired.cache_id = "cache-expired";
+        expired.text_hash = "hash-expired";
+        expired.expires_at_ms = mm::util::now_ms() - 1;
+        db.save_tts_cache_entry(expired);
+        auto removed = db.delete_expired_tts_cache_entries(mm::util::now_ms());
+        CHECK(removed.size() == 1);
+        CHECK(removed[0].cache_id == "cache-expired");
+        CHECK(!db.get_tts_cache_entry("cache-expired").has_value());
+    }
+
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_tts_service_client_fake_sidecar_paths() {
+    const uint16_t port = 49290;
+    httplib::Server server;
+
+    server.Get("/health", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(nlohmann::json{{"ok", true}}.dump(), "application/json");
+    });
+
+    server.Post("/voice-design", [](const httplib::Request& req, httplib::Response& res) {
+        auto body = nlohmann::json::parse(req.body);
+        res.set_content(nlohmann::json{
+            {"ok", true},
+            {"audio_path", body.value("output_audio_path", std::string{})},
+            {"voice_clone_prompt_path", body.value("output_prompt_path", std::string{})},
+            {"sample_rate", 24000},
+            {"duration_ms", 500}
+        }.dump(), "application/json");
+    });
+
+    server.Post("/synthesize", [](const httplib::Request& req, httplib::Response& res) {
+        auto body = nlohmann::json::parse(req.body);
+        if (body.value("text", std::string{}) == "fail") {
+            res.status = 500;
+            res.set_content(nlohmann::json{{"ok", false}, {"error", "synthetic failure"}}.dump(),
+                            "application/json");
+            return;
+        }
+        res.set_content(nlohmann::json{
+            {"ok", true},
+            {"audio_path", body.value("output_audio_path", std::string{})},
+            {"sample_rate", 24000},
+            {"duration_ms", 650}
+        }.dump(), "application/json");
+    });
+
+    std::atomic<bool> listen_returned{false};
+    std::atomic<bool> listen_ok{false};
+    std::thread server_thread([&] {
+        listen_ok = server.listen("127.0.0.1", port);
+        listen_returned = true;
+    });
+
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    mm::TtsServiceConfig config;
+    config.enabled = true;
+    config.service_url = "http://127.0.0.1:" + std::to_string(port);
+    mm::TtsServiceClient client(config);
+
+    bool ready = false;
+    std::string health_error;
+    for (int i = 0; i < 50; ++i) {
+        if (client.health(&health_error)) {
+            ready = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    RECORD(ready);
+
+    mm::VoiceDesignProposal proposal;
+    proposal.sample_text = "Preview text.";
+    proposal.language = "English";
+    proposal.voice_description = "Original clear voice.";
+    auto sample = client.generate_voice_sample(proposal, "preview.wav", "prompt.pkl");
+    RECORD(sample.ok);
+    RECORD(sample.status == 200);
+    RECORD(sample.audio_path == "preview.wav");
+    RECORD(sample.voice_clone_prompt_path == "prompt.pkl");
+    RECORD(sample.sample_rate == 24000);
+
+    mm::AgentVoiceProfile profile;
+    profile.id = "profile-a";
+    profile.language = "English";
+    profile.voice_clone_prompt_path = "prompt.pkl";
+
+    mm::TtsSynthesisRequest request;
+    request.text = "Speak.";
+    request.format = "wav";
+    auto speech = client.synthesize(request, profile, "speech.wav");
+    RECORD(speech.ok);
+    RECORD(speech.audio_path == "speech.wav");
+    RECORD(speech.duration_ms == 650);
+
+    request.text = "fail";
+    auto failed = client.synthesize(request, profile, "failed.wav");
+    RECORD(!failed.ok);
+    RECORD(failed.status == 500);
+    RECORD(failed.error.find("synthetic failure") != std::string::npos);
+
+    server.stop();
+    if (server_thread.joinable()) server_thread.join();
+    RECORD(listen_ok);
+    RECORD(listen_returned);
+#undef RECORD
+    return ok;
+}
+
+bool test_control_api_tts_routes_disabled() {
+    auto dir = temp_test_dir("control-tts-disabled");
+    std::filesystem::create_directories(dir);
+    std::filesystem::create_directories(dir / "models");
+
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    {
+        mm::AgentManager agents(dir.string());
+        mm::AgentConfig cfg;
+        cfg.id = "agent-a";
+        cfg.name = "Agent A";
+        cfg.model_path = "model.gguf";
+        agents.create_agent(cfg);
+
+        mm::AgentQueue queue;
+        mm::NodeRegistry registry(dir.string());
+        mm::ModelDistributor distributor(registry, (dir / "models").string());
+        mm::AgentScheduler scheduler(registry, distributor, (dir / "models").string());
+        mm::ModelRouter router(scheduler);
+        mm::ControlApiServer api(
+            agents, queue, registry, router, scheduler,
+            dir.string(), (dir / "models").string());
+
+        const uint16_t port = 49289;
+        std::atomic<bool> listen_returned{false};
+        std::atomic<bool> listen_ok{false};
+        std::thread server_thread([&] {
+            listen_ok = api.listen(port);
+            listen_returned = true;
+        });
+
+        mm::HttpClient client("http://127.0.0.1:" + std::to_string(port));
+        bool server_ready = false;
+        for (int i = 0; i < 50; ++i) {
+            auto resp = client.get("/v1/nodes");
+            if (resp.status != 0) {
+                server_ready = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        RECORD(server_ready);
+
+    auto create = client.post(
+        "/v1/agents/agent-a/voice/proposals",
+        nlohmann::json{
+            {"display_name", "Agent A Voice"},
+            {"language", "English"},
+            {"voice_description", "A clear original synthetic assistant voice."},
+            {"sample_text", "This is a local voice preview."},
+            {"rationale", "It matches the assistant role."}
+        });
+    RECORD(create.status == 201);
+    auto create_body = nlohmann::json::parse(create.body);
+    const std::string proposal_id = create_body["proposal"]["id"].get<std::string>();
+
+    auto state = client.get("/v1/agents/agent-a/voice");
+    RECORD(state.status == 200);
+    auto state_body = nlohmann::json::parse(state.body);
+    RECORD(state_body["tts_enabled"] == false);
+    RECORD(state_body["proposals"].size() == 1);
+
+    auto sample = client.post(
+        "/v1/agents/agent-a/voice/proposals/" + proposal_id + "/sample",
+        nlohmann::json::object());
+    RECORD(sample.status == 503);
+    RECORD(sample.body.find("disabled") != std::string::npos);
+
+    auto speech = client.post(
+        "/v1/agents/agent-a/speech",
+        nlohmann::json{{"text", "Speak this message."}});
+    RECORD(speech.status == 503);
+    RECORD(speech.body.find("disabled") != std::string::npos);
+
+    auto compat = client.post(
+        "/v1/audio/speech",
+        nlohmann::json{{"voice", "agent:agent-a"}, {"input", "Speak this message."}});
+    RECORD(compat.status == 503);
+    RECORD(compat.body.find("disabled") != std::string::npos);
+
+        api.stop();
+        if (server_thread.joinable()) server_thread.join();
+        RECORD(listen_ok);
+        RECORD(listen_returned);
+        queue.shutdown();
+    }
+    RECORD(remove_tree(dir));
+#undef RECORD
+    return ok;
+}
+
 bool test_control_api_curation_routes() {
     auto dir = temp_test_dir("control-curation-routes");
     std::filesystem::create_directories(dir);
@@ -631,7 +917,7 @@ bool test_control_api_curation_routes() {
     mm::ModelRouter router(scheduler);
     mm::ControlApiServer api(
         agents, queue, registry, router, scheduler,
-        (dir / "models").string());
+        dir.string(), (dir / "models").string());
 
     const uint16_t port = 49288;
     std::atomic<bool> listen_returned{false};
@@ -1255,6 +1541,11 @@ int main() {
         {"inference_sizing_tracks_effective_context",
          test_inference_sizing_tracks_effective_context},
         {"control_api_external_token_gate", test_control_api_external_token_gate},
+        {"agent_voice_db_and_cache_lifecycle",
+         test_agent_voice_db_and_cache_lifecycle},
+        {"tts_service_client_fake_sidecar_paths",
+         test_tts_service_client_fake_sidecar_paths},
+        {"control_api_tts_routes_disabled", test_control_api_tts_routes_disabled},
         {"control_api_curation_routes", test_control_api_curation_routes},
         {"global_memory_origin_tool_and_context_metadata",
          test_global_memory_origin_tool_and_context_metadata},

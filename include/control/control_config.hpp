@@ -1,5 +1,7 @@
 #pragma once
 
+#include "control/tts_service_client.hpp"
+
 #include <string>
 #include <cstdint>
 
@@ -16,6 +18,10 @@ struct ControlConfig {
 
     // Optional bearer token required by external /v1/* client routes.
     std::string external_api_token;
+
+    // Local Qwen3-TTS sidecar. Disabled by default; when enabled but
+    // unreachable, public TTS routes return 503 JSON errors.
+    TtsServiceConfig tts;
 
     // Pairing / discovery
     std::string pairing_key;           // must match node's pairing_key for PSK mode
