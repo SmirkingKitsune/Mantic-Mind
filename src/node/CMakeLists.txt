@@ -1,9 +1,8 @@
 add_executable(mantic-mind
     main.cpp
-    llama_runtime_manager.cpp
     llama_server_process.cpp
-    model_storage.cpp
-    model_puller.cpp
+    vllm_runtime.cpp
+    ray_orchestration.cpp
     node_api_server.cpp
     node_state.cpp
     node_ui.cpp
@@ -21,4 +20,8 @@ target_link_libraries(mantic-mind PRIVATE
 
 target_include_directories(mantic-mind PRIVATE
     ${CMAKE_SOURCE_DIR}/include
+)
+
+install(TARGETS mantic-mind
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )

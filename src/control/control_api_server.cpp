@@ -2,7 +2,6 @@
 #include "control/agent_manager.hpp"
 #include "control/agent_queue.hpp"
 #include "control/node_registry.hpp"
-#include "control/model_router.hpp"
 #include "control/agent_scheduler.hpp"
 #include "control/agent_config_validator.hpp"
 #include "control/tts_service_client.hpp"
@@ -18,8 +17,6 @@
 #include "common/logger.hpp"
 #include "common/util.hpp"
 #include "common/sse_infer_ctx.hpp"
-#include "common/gguf_metadata.hpp"
-#include "common/model_catalog.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -501,7 +498,6 @@ bool set_file_response(httplib::Response& res,
 ControlApiServer::ControlApiServer(AgentManager& agents,
                                    AgentQueue& queue,
                                    NodeRegistry& registry,
-                                   ModelRouter& router,
                                    AgentScheduler& scheduler,
                                    std::string data_dir,
                                    std::string models_dir,
@@ -510,7 +506,6 @@ ControlApiServer::ControlApiServer(AgentManager& agents,
     : agents_(agents)
     , queue_(queue)
     , registry_(registry)
-    , router_(router)
     , scheduler_(scheduler)
     , data_dir_(std::move(data_dir))
     , models_dir_(std::move(models_dir))
@@ -835,7 +830,16 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     // 6. Compact the conversation if it is approaching context limits.
     //    may_compact() creates a new conversation with a summary if >80% full.
     ConversationManager conv_mgr(db, real_llama);
+    const ConvId conv_id_before_compact = conv_id;
     conv_id = conv_mgr.maybe_compact(conv_id, cfg);
+    if (conv_id != conv_id_before_compact) {
+        // Compaction started a fresh conversation with only the kept-recent
+        // messages re-appended. `seq` tracks the last message's sequence number
+        // (the next append uses seq + 1), so point it at the last re-appended
+        // message in the new conversation rather than the pre-compaction count.
+        const int new_len = static_cast<int>(db.load_messages(conv_id).size());
+        seq = new_len > 0 ? new_len - 1 : 0;
+    }
 
     // 7. Retrieve memories and build the full context to send to the LLM.
     std::vector<Memory> memories;
@@ -1179,15 +1183,6 @@ void ControlApiServer::queue_global_recall(const AgentId& agent_id,
         auto conv = db.load_conversation(conv_id);
 
         std::string system_text =
-            "You are reviewing a completed conversation to extract important information "
-            "worth remembering across future conversations.\n\n"
-            "Review the conversation below and use the available tools to create global memories "
-            "for any important facts, preferences, decisions, or context that would be useful "
-            "in future conversations. Be selective — only save information that is genuinely "
-            "important and not already captured in existing global memories.\n\n"
-            "You can also update or delete existing global memories if the conversation "
-            "revealed new information that changes them.";
-        system_text =
             "You are reviewing a completed conversation chain to maintain global summaries "
             "for future conversations.\n\n"
             "Review the conversation below and use the available tools to create global memories "
@@ -1299,15 +1294,8 @@ void ControlApiServer::register_routes() {
     using namespace httplib;
 
     // Helper: compute node_compatibility info for an agent config.
-    auto compute_node_compat = [this](const AgentConfig& cfg) -> nlohmann::json {
-        int64_t estimated_vram = 2048; // conservative default
-        const std::string resolved = resolve_model_path_for_metadata(cfg.model_path, models_dir_);
-        std::error_code ec;
-        auto sz = std::filesystem::file_size(resolved.empty() ? cfg.model_path : resolved, ec);
-        if (!ec) {
-            estimated_vram = static_cast<int64_t>(
-                static_cast<double>(sz) * 1.2 / (1024.0 * 1024.0));
-        }
+    auto compute_node_compat = [this](const AgentConfig& /*cfg*/) -> nlohmann::json {
+        const int64_t estimated_vram = 2048; // conservative default
 
         auto compatible = registry_.nodes_with_available_vram(estimated_vram);
         auto all_nodes  = registry_.list_nodes();
@@ -1329,77 +1317,8 @@ void ControlApiServer::register_routes() {
         return auth_header.substr(kBearer.size());
     };
 
-    auto require_node_auth = [this, extract_bearer](const Request& req, Response& res) -> bool {
-        const std::string token = extract_bearer(req.get_header_value("Authorization"));
-        if (token.empty()) {
-            res.status = 401;
-            res.set_content(R"({"error":"missing bearer token"})", "application/json");
-            return false;
-        }
-        if (!registry_.find_node_by_api_key(token).has_value()) {
-            res.status = 401;
-            res.set_content(R"({"error":"invalid node api key"})", "application/json");
-            return false;
-        }
-        return true;
-    };
-
-    struct ControlCatalogSnapshot {
-        std::vector<StoredModel> models;
-        std::unordered_map<std::string, StoredModel> by_filename;
-        std::unordered_map<std::string, std::string> path_by_filename;
-    };
-
-    auto build_control_catalog = [this](bool include_hash) -> ControlCatalogSnapshot {
-        ControlCatalogSnapshot out;
-
-        auto add_file = [&](const std::string& file_path,
-                            const std::string& source_tag) {
-            auto meta = inspect_model_file(file_path, include_hash);
-            if (!meta) return;
-            const std::string filename = canonical_model_filename(meta->model_path);
-            if (!is_safe_model_filename(filename)) return;
-
-            auto pit = out.path_by_filename.find(filename);
-            if (pit != out.path_by_filename.end()) {
-                if (pit->second != file_path) {
-                    MM_WARN("Control catalog: duplicate filename '{}' from {}; keeping {}",
-                            filename, source_tag, pit->second);
-                }
-                return;
-            }
-
-            meta->model_path = filename;
-            out.path_by_filename[filename] = file_path;
-            out.by_filename[filename] = *meta;
-        };
-
-        std::error_code ec;
-        if (!models_dir_.empty() && std::filesystem::exists(models_dir_, ec)) {
-            for (const auto& entry : std::filesystem::recursive_directory_iterator(models_dir_, ec)) {
-                if (!entry.is_regular_file()) continue;
-                add_file(entry.path().string(), "models_dir");
-            }
-        }
-
-        const auto agent_cfgs = agents_.list_agents();
-        for (const auto& cfg : agent_cfgs) {
-            const std::string resolved = resolve_model_path_for_metadata(cfg.model_path, models_dir_);
-            if (resolved.empty()) continue;
-            add_file(resolved, "agent:" + cfg.id);
-        }
-
-        out.models.reserve(out.by_filename.size());
-        for (const auto& [_, m] : out.by_filename) out.models.push_back(m);
-        std::sort(out.models.begin(), out.models.end(),
-                  [](const StoredModel& a, const StoredModel& b) {
-                      return a.model_path < b.model_path;
-                  });
-        return out;
-    };
-
     // ── POST /api/control/register-node ───────────────────────────────────────
-    server_->Post("/api/control/register-node", [this](const Request& req, Response& res) {
+    server_->Post("/api/control/register-node", [this, extract_bearer](const Request& req, Response& res) {
         try {
             auto j = nlohmann::json::parse(req.body);
             std::string node_url = j.value("node_url", "");
@@ -1410,6 +1329,23 @@ void ControlApiServer::register_routes() {
                 res.status = 400;
                 res.set_content(R"({"error":"node_url and api_key required"})",
                                 "application/json");
+                return;
+            }
+
+            // A node may only self-register if it is already known (re-announce
+            // after restart / address change, matched by its api_key) or if the
+            // request carries the control's external bearer token. New nodes
+            // must be added through pairing or POST /v1/nodes.
+            const bool known_node = registry_.find_node_by_api_key(api_key).has_value();
+            const bool bearer_ok = !external_api_token_.empty() &&
+                extract_bearer(req.get_header_value("Authorization")) == external_api_token_;
+            if (!known_node && !bearer_ok) {
+                MM_WARN("register-node rejected for {}: unknown api_key and no valid bearer token",
+                        node_url);
+                res.status = 401;
+                res.set_content(
+                    R"({"error":"unauthorized: pair this node first or send the control bearer token"})",
+                    "application/json");
                 return;
             }
 
@@ -1427,62 +1363,6 @@ void ControlApiServer::register_routes() {
     });
 
     // ── GET /v1/nodes ─────────────────────────────────────────────────────────
-    // ── GET /api/control/models  (node-authenticated) ─────────────────────────
-    server_->Get("/api/control/models", [this, require_node_auth, build_control_catalog](const Request& req, Response& res) {
-        if (!require_node_auth(req, res)) return;
-        auto catalog = build_control_catalog(/*include_hash=*/true);
-        res.set_content(nlohmann::json{{"models", catalog.models}}.dump(), "application/json");
-    });
-
-    // ── GET /api/control/models/:filename/content  (node-authenticated) ───────
-    server_->Get("/api/control/models/:filename/content",
-                 [this, require_node_auth, build_control_catalog](const Request& req, Response& res) {
-        if (!require_node_auth(req, res)) return;
-
-        std::string filename = canonical_model_filename(req.path_params.at("filename"));
-        if (!is_safe_model_filename(filename)) {
-            res.status = 400;
-            res.set_content(R"({"error":"invalid filename"})", "application/json");
-            return;
-        }
-
-        auto catalog = build_control_catalog(/*include_hash=*/true);
-        auto mit = catalog.by_filename.find(filename);
-        if (mit == catalog.by_filename.end()) {
-            res.status = 404;
-            res.set_content(R"({"error":"model not found"})", "application/json");
-            return;
-        }
-        auto pit = catalog.path_by_filename.find(filename);
-        if (pit == catalog.path_by_filename.end()) {
-            res.status = 404;
-            res.set_content(R"({"error":"model file path could not be resolved"})", "application/json");
-            return;
-        }
-
-        auto file = std::make_shared<std::ifstream>(pit->second, std::ios::binary);
-        if (!file->is_open()) {
-            res.status = 404;
-            res.set_content(R"({"error":"model file could not be opened"})", "application/json");
-            return;
-        }
-
-        res.set_header("X-Model-Filename", filename);
-        res.set_header("X-Model-SHA256", mit->second.sha256);
-        res.set_header("X-Model-Size-Bytes", std::to_string(mit->second.size_bytes));
-        res.set_chunked_content_provider(
-            "application/octet-stream",
-            [file](size_t /*offset*/, DataSink& sink) -> bool {
-                char buf[64 * 1024];
-                file->read(buf, static_cast<std::streamsize>(sizeof(buf)));
-                std::streamsize n = file->gcount();
-                if (n > 0) {
-                    return sink.write(buf, static_cast<size_t>(n));
-                }
-                return false;
-            });
-    });
-
     server_->Get("/v1/nodes/discovered", [this](const Request& /*req*/, Response& res) {
         auto discovered = registry_.get_discovered_nodes();
         nlohmann::json arr = nlohmann::json::array();
@@ -1688,157 +1568,6 @@ void ControlApiServer::register_routes() {
     });
 
     // ── GET /v1/agents ────────────────────────────────────────────────────────
-    // ── GET /v1/models ────────────────────────────────────────────────────────
-    server_->Get("/v1/models", [this, build_control_catalog](const Request& /*req*/, Response& res) {
-        auto catalog = build_control_catalog(/*include_hash=*/false);
-        res.set_content(nlohmann::json{{"models", catalog.models}}.dump(), "application/json");
-    });
-
-    // ── GET /v1/nodes/:id/models ──────────────────────────────────────────────
-    server_->Post("/v1/nodes/:id/llama/check-update", [this](const Request& req, Response& res) {
-        const std::string node_id = req.path_params.at("id");
-        std::string message;
-        const bool ok = registry_.request_llama_check_update(node_id, &message);
-        if (!ok) {
-            const std::string lowered = util::to_lower(message);
-            res.status = lowered.find("node not found") != std::string::npos ? 404 : 502;
-            res.set_content(nlohmann::json{{"error", message.empty() ? "check-update failed" : message}}.dump(),
-                            "application/json");
-            return;
-        }
-        publish_activity(0, "Node llama check-update requested: " + node_id);
-        res.set_content(nlohmann::json{{"ok", true}, {"message", message}}.dump(), "application/json");
-    });
-
-    server_->Post("/v1/nodes/:id/llama/update", [this](const Request& req, Response& res) {
-        const std::string node_id = req.path_params.at("id");
-        bool build = true;
-        bool force = false;
-        if (!req.body.empty()) {
-            try {
-                auto j = nlohmann::json::parse(req.body);
-                build = j.value("build", true);
-                force = j.value("force", false);
-            } catch (const std::exception& e) {
-                res.status = 400;
-                res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
-                return;
-            }
-        }
-
-        std::string message;
-        const bool ok = registry_.request_llama_update(node_id, build, force, &message);
-        if (!ok) {
-            const std::string lowered = util::to_lower(message);
-            res.status = lowered.find("node not found") != std::string::npos ? 404 : 502;
-            res.set_content(nlohmann::json{{"error", message.empty() ? "update failed" : message}}.dump(),
-                            "application/json");
-            return;
-        }
-        publish_activity(0, "Node llama update requested: " + node_id);
-        res.set_content(nlohmann::json{{"ok", true}, {"message", message}}.dump(), "application/json");
-    });
-
-    server_->Get("/v1/nodes/:id/models", [this](const Request& req, Response& res) {
-        const std::string node_id = req.path_params.at("id");
-        NodeInfo node;
-        try {
-            node = registry_.get_node(node_id);
-        } catch (...) {
-            res.status = 404;
-            res.set_content(R"({"error":"node not found"})", "application/json");
-            return;
-        }
-
-        auto [host, port] = util::parse_url(node.url);
-        httplib::Client quick_cli(host, port);
-        quick_cli.set_connection_timeout(1);
-        quick_cli.set_read_timeout(2);
-        quick_cli.set_write_timeout(2);
-        httplib::Headers headers = {{"Authorization", "Bearer " + node.api_key}};
-        auto storage = quick_cli.Get("/api/node/storage", headers);
-        if (storage && storage->status >= 200 && storage->status < 300) {
-            res.set_content(storage->body, "application/json");
-            return;
-        }
-
-        nlohmann::json body = {
-            {"stored_models", node.stored_models},
-            {"disk_free_mb", node.disk_free_mb},
-            {"warning", "node storage endpoint unavailable; returning last known snapshot"}
-        };
-        res.status = 200;
-        res.set_content(body.dump(), "application/json");
-    });
-
-    // ── POST /v1/nodes/:id/models/pull ────────────────────────────────────────
-    server_->Post("/v1/nodes/:id/models/pull", [this](const Request& req, Response& res) {
-        const std::string node_id = req.path_params.at("id");
-        NodeInfo node;
-        try {
-            node = registry_.get_node(node_id);
-        } catch (...) {
-            res.status = 404;
-            res.set_content(R"({"error":"node not found"})", "application/json");
-            return;
-        }
-
-        try {
-            auto j = nlohmann::json::parse(req.body);
-            std::string model_filename = canonical_model_filename(
-                j.value("model_filename", std::string{}));
-            bool force = j.value("force", false);
-            if (!is_safe_model_filename(model_filename)) {
-                res.status = 400;
-                res.set_content(R"({"error":"valid model_filename required"})", "application/json");
-                return;
-            }
-
-            HttpClient cli(node.url);
-            cli.set_bearer_token(node.api_key);
-            auto pull = cli.post("/api/node/models/pull",
-                                 nlohmann::json{{"model_filename", model_filename},
-                                                {"force", force}});
-            res.status = pull.status == 0 ? 502 : pull.status;
-            res.set_content(pull.body.empty()
-                                ? nlohmann::json{{"error", "node pull request failed"}}.dump()
-                                : pull.body,
-                            "application/json");
-        } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
-        }
-    });
-
-    // ── DELETE /v1/nodes/:id/models/:filename ─────────────────────────────────
-    server_->Delete("/v1/nodes/:id/models/:filename", [this](const Request& req, Response& res) {
-        const std::string node_id = req.path_params.at("id");
-        std::string filename = canonical_model_filename(req.path_params.at("filename"));
-        if (!is_safe_model_filename(filename)) {
-            res.status = 400;
-            res.set_content(R"({"error":"invalid filename"})", "application/json");
-            return;
-        }
-
-        NodeInfo node;
-        try {
-            node = registry_.get_node(node_id);
-        } catch (...) {
-            res.status = 404;
-            res.set_content(R"({"error":"node not found"})", "application/json");
-            return;
-        }
-
-        HttpClient cli(node.url);
-        cli.set_bearer_token(node.api_key);
-        auto del = cli.del("/api/node/models/" + filename);
-        res.status = del.status == 0 ? 502 : del.status;
-        res.set_content(del.body.empty()
-                            ? nlohmann::json{{"error", "node delete request failed"}}.dump()
-                            : del.body,
-                        "application/json");
-    });
-
     server_->Get("/v1/agents", [this](const Request& /*req*/, Response& res) {
         auto configs = agents_.list_agents();
         nlohmann::json arr = nlohmann::json::array();
@@ -2035,7 +1764,8 @@ void ControlApiServer::register_routes() {
         body["profiles"] = db.list_voice_profiles();
         body["proposals"] = db.list_voice_proposals();
         body["tts_enabled"] = tts_.enabled();
-        body["provider"] = "qwen3-tts";
+        body["provider"] = tts_.provider_name();
+        body["backend"] = tts_.backend();
         return body;
     };
 
@@ -2204,10 +1934,11 @@ void ControlApiServer::register_routes() {
             proposal.sample_text = util::trim(j.value("sample_text", proposal.sample_text));
             proposal.rationale = util::trim(j.value("rationale", proposal.rationale));
             proposal.status = "pending";
-            proposal.provider = "qwen3-tts";
+            proposal.provider = tts_.provider_name();
             proposal.voice_design_model_id =
                 j.value("voice_design_model_id", tts_.config().voice_design_model_id);
-            proposal.clone_model_id = j.value("clone_model_id", tts_.config().clone_model_id);
+            proposal.clone_model_id =
+                j.value("clone_model_id", tts_.default_synthesis_model_id());
             proposal.created_at_ms = util::now_ms();
             proposal.updated_at_ms = proposal.created_at_ms;
 
@@ -2256,7 +1987,9 @@ void ControlApiServer::register_routes() {
         }
 
         const auto preview_path = (proposal_dir / (proposal_id + ".wav")).string();
-        const auto prompt_path = (proposal_dir / (proposal_id + ".prompt.pkl")).string();
+        const auto prompt_ext =
+            tts_.backend() == "vllm" ? ".voice.json" : ".prompt.pkl";
+        const auto prompt_path = (proposal_dir / (proposal_id + prompt_ext)).string();
         auto svc = tts_.generate_voice_sample(*proposal, preview_path, prompt_path);
         if (!svc.ok) {
             agent->db().update_voice_proposal_status(
@@ -3206,7 +2939,9 @@ void ControlApiServer::register_routes() {
                 nlohmann::json{
                     {"status", "queued"},
                     {"conversation_id", conv_id},
-                    {"selected_count", end_index - start_index + 1}
+                    // Count the messages actually sent (the requested range plus
+                    // the context_before lead-in), matching `selected`.
+                    {"selected_count", static_cast<int>(selected.size())}
                 }.dump(),
                 "application/json");
         } catch (const std::exception& e) {

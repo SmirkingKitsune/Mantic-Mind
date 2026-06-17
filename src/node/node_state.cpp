@@ -69,22 +69,6 @@ void NodeState::set_slots(const std::vector<SlotInfo>& slots) {
     }
 }
 
-std::vector<StoredModel> NodeState::get_stored_models() const {
-    std::lock_guard<std::mutex> g(mutex_);
-    return stored_models_;
-}
-
-int64_t NodeState::get_models_disk_free_mb() const {
-    std::lock_guard<std::mutex> g(mutex_);
-    return models_disk_free_mb_;
-}
-
-void NodeState::set_storage(const std::vector<StoredModel>& models, int64_t disk_free_mb) {
-    std::lock_guard<std::mutex> g(mutex_);
-    stored_models_ = models;
-    models_disk_free_mb_ = disk_free_mb;
-}
-
 // ── Metrics ────────────────────────────────────────────────────────────────────
 NodeHealthMetrics NodeState::get_metrics() const { std::lock_guard<std::mutex> g(mutex_); return metrics_; }
 void NodeState::update_metrics(const NodeHealthMetrics& m) {
@@ -111,45 +95,6 @@ std::string NodeState::get_llama_server_path() const {
 void NodeState::set_llama_server_path(const std::string& path) {
     std::lock_guard<std::mutex> g(mutex_);
     llama_server_path_ = path;
-}
-
-LlamaUpdateState NodeState::get_llama_update_state() const {
-    std::lock_guard<std::mutex> g(mutex_);
-    return llama_update_;
-}
-
-bool NodeState::start_llama_update(const std::string& message) {
-    std::lock_guard<std::mutex> g(mutex_);
-    if (llama_update_.running) return false;
-    llama_update_.running = true;
-    llama_update_.status = "running";
-    llama_update_.message = message;
-    llama_update_.started_ms = mm::util::now_ms();
-    llama_update_.finished_ms = 0;
-    return true;
-}
-
-void NodeState::finish_llama_update(bool success, const std::string& message) {
-    std::lock_guard<std::mutex> g(mutex_);
-    llama_update_.running = false;
-    llama_update_.status = success ? "succeeded" : "failed";
-    llama_update_.message = message;
-    llama_update_.finished_ms = mm::util::now_ms();
-}
-
-void NodeState::set_llama_update_message(const std::string& message) {
-    std::lock_guard<std::mutex> g(mutex_);
-    llama_update_.message = message;
-}
-
-LlamaRuntimeSummary NodeState::get_llama_runtime_summary() const {
-    std::lock_guard<std::mutex> g(mutex_);
-    return llama_runtime_;
-}
-
-void NodeState::set_llama_runtime_summary(const LlamaRuntimeSummary& summary) {
-    std::lock_guard<std::mutex> g(mutex_);
-    llama_runtime_ = summary;
 }
 
 // ── Streaming text ─────────────────────────────────────────────────────────────
@@ -235,14 +180,32 @@ void NodeState::start_metrics_poll(int interval_ms) {
                 path = llama_server_path_;
             }
             update_metrics(sample_metrics(path));
-            std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+            // Interruptible wait: stop_metrics_poll() wakes us immediately so
+            // node shutdown is not delayed by up to interval_ms.
+            std::unique_lock<std::mutex> lk(poll_mutex_);
+            poll_cv_.wait_for(lk, std::chrono::milliseconds(interval_ms),
+                              [this] { return !polling_; });
         }
     });
 }
 
 void NodeState::stop_metrics_poll() {
-    polling_ = false;
+    {
+        std::lock_guard<std::mutex> lk(poll_mutex_);
+        polling_ = false;
+    }
+    poll_cv_.notify_all();
     if (poll_thread_.joinable()) poll_thread_.join();
+}
+
+NodeCapabilities NodeState::get_capabilities() const {
+    std::lock_guard<std::mutex> g(mutex_);
+    return capabilities_;
+}
+
+void NodeState::set_capabilities(const NodeCapabilities& caps) {
+    std::lock_guard<std::mutex> g(mutex_);
+    capabilities_ = caps;
 }
 
 // ── Platform metrics sampling ──────────────────────────────────────────────────

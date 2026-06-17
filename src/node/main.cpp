@@ -2,15 +2,12 @@
 #include "common/cli_repl.hpp"
 #include "common/http_client.hpp"
 #include "common/logger.hpp"
-#include "common/model_catalog.hpp"
 #include "common/node_discovery.hpp"
 #include "common/util.hpp"
-#include "node/model_storage.hpp"
 #include "node/node_api_server.hpp"
 #include "node/node_config.hpp"
 #include "node/node_state.hpp"
 #include "node/node_ui.hpp"
-#include "node/llama_runtime_manager.hpp"
 #include "node/singleton_lock.hpp"
 #include "node/slot_manager.hpp"
 
@@ -18,8 +15,10 @@
 
 #include <atomic>
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
@@ -80,6 +79,7 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
         cfg.control_url       = file.get("control_url",       "");
         cfg.control_api_key   = file.get("control_api_key",   "");
         cfg.llama_server_path = file.get("llama_server_path", "llama-server");
+        cfg.vllm_server_path  = file.get("vllm_server_path",  "vllm");
         cfg.models_dir        = file.get("models_dir",        "models");
         cfg.data_dir          = file.get("data_dir",          "data");
         cfg.log_file          = file.get("log_file", "logs/mantic-mind.log");
@@ -92,6 +92,18 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
         cfg.llama_port_range_end = static_cast<uint16_t>(
             file.get_int("llama_port_range_end", cfg.llama_port_range_start + 10));
         cfg.max_slots    = file.get_int("max_slots", 4);
+        cfg.vllm_gpu_budget = static_cast<double>(
+            file.get_float("vllm_gpu_budget", 0.90f));
+        cfg.comm_backends   = file.get("comm_backends", "");
+        if (file.has("supports_ray")) {
+            cfg.supports_ray     = file.get_bool("supports_ray", false);
+            cfg.supports_ray_set = true;
+        }
+        cfg.node_gpu_count    = file.get_int("node_gpu_count", 0);
+        cfg.interconnect_gbps = static_cast<double>(
+            file.get_float("interconnect_gbps", 0.0f));
+        cfg.ray_path = file.get("ray_path", "ray");
+        cfg.ray_port = static_cast<uint16_t>(file.get_int("ray_port", 6379));
         cfg.kv_cache_dir = file.get("kv_cache_dir", "data/kv_cache");
         cfg.pairing_key    = file.get("pairing_key",    "");
         cfg.discovery_port = static_cast<uint16_t>(
@@ -114,6 +126,7 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
     cfg.control_url       = env("MM_CONTROL_URL",     cfg.control_url);
     cfg.control_api_key   = env("MM_CONTROL_API_KEY", cfg.control_api_key);
     cfg.llama_server_path = env("MM_LLAMA_PATH",      cfg.llama_server_path);
+    cfg.vllm_server_path  = env("MM_VLLM_PATH",       cfg.vllm_server_path);
     cfg.models_dir        = env("MM_MODELS_DIR",      cfg.models_dir);
     cfg.data_dir          = env("MM_DATA_DIR",        cfg.data_dir);
     cfg.log_file          = env("MM_LOG_FILE",        cfg.log_file);
@@ -132,69 +145,148 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
     cfg.llama_port_range_end   = env_port("MM_LLAMA_PORT_RANGE_END",   cfg.llama_port_range_end);
     cfg.max_slots              = env_int("MM_MAX_SLOTS", cfg.max_slots);
 
+    auto env_double = [](const char* name, double cur) -> double {
+        const char* v = std::getenv(name);
+        if (!v) return cur;
+        try { return std::stod(v); } catch (...) { return cur; }
+    };
+    cfg.vllm_gpu_budget = env_double("MM_VLLM_GPU_BUDGET", cfg.vllm_gpu_budget);
+    cfg.comm_backends   = env("MM_COMM_BACKENDS", cfg.comm_backends);
+    cfg.node_gpu_count  = env_int("MM_NODE_GPU_COUNT", cfg.node_gpu_count);
+    cfg.interconnect_gbps = env_double("MM_INTERCONNECT_GBPS", cfg.interconnect_gbps);
+    cfg.ray_path = env("MM_RAY_PATH", cfg.ray_path);
+    cfg.ray_port = env_port("MM_RAY_PORT", cfg.ray_port);
+    if (const char* sr = std::getenv("MM_SUPPORTS_RAY")) {
+        const std::string v = mm::util::to_lower(sr);
+        cfg.supports_ray     = (v == "1" || v == "true" || v == "yes");
+        cfg.supports_ray_set = true;
+    }
+
     // Keep node startup resilient if env/config accidentally provide empty strings.
     if (cfg.llama_server_path.empty()) cfg.llama_server_path = "llama-server";
+    if (cfg.vllm_server_path.empty()) cfg.vllm_server_path = "vllm";
     if (cfg.models_dir.empty()) cfg.models_dir = "models";
     if (cfg.data_dir.empty()) cfg.data_dir = "data";
     if (cfg.kv_cache_dir.empty()) cfg.kv_cache_dir = "data/kv_cache";
     if (cfg.log_file.empty()) cfg.log_file = "logs/mantic-mind.log";
+    if (cfg.ray_path.empty()) cfg.ray_path = "ray";
+    if (cfg.vllm_gpu_budget <= 0.0 || cfg.vllm_gpu_budget > 1.0) cfg.vllm_gpu_budget = 0.90;
 
     return cfg;
 }
 
 namespace {
 
-std::filesystem::path resolve_llama_cache_file(const mm::NodeConfig& cfg) {
-    const char* env_cache = std::getenv("MM_LLAMA_PATH_CACHE_FILE");
-    if (env_cache && *env_cache) return std::filesystem::path(env_cache);
-    return std::filesystem::path(cfg.data_dir) / "llama_server_path.txt";
-}
-
-bool is_default_llama_path(const std::string& path_in) {
-    std::string s = mm::util::to_lower(mm::util::trim(path_in));
-    if (s.size() >= 2 &&
-        ((s.front() == '"' && s.back() == '"') ||
-         (s.front() == '\'' && s.back() == '\''))) {
-        s = mm::util::to_lower(mm::util::trim(s.substr(1, s.size() - 2)));
+// Run a command, capturing trimmed stdout (first line). Empty on failure.
+std::string capture_command_line(const std::string& cmd) {
+#ifdef _WIN32
+    FILE* f = _popen((cmd + " 2>nul").c_str(), "r");
+#else
+    FILE* f = ::popen((cmd + " 2>/dev/null").c_str(), "r");
+#endif
+    if (!f) return {};
+    std::string out;
+    char buf[512];
+    while (fgets(buf, static_cast<int>(sizeof(buf)), f)) out += buf;
+#ifdef _WIN32
+    _pclose(f);
+#else
+    ::pclose(f);
+#endif
+    // Return the first non-empty line.
+    for (auto& line : mm::util::split(out, '\n')) {
+        const std::string t = mm::util::trim(line);
+        if (!t.empty()) return t;
     }
-    return s.empty() || s == "llama-server" || s == "llama-server.exe";
+    return {};
 }
 
-bool looks_path_like(const std::string& s) {
-    return s.find('\\') != std::string::npos ||
-           s.find('/')  != std::string::npos ||
-           s.find(':')  != std::string::npos;
-}
-
-bool file_exists_regular(const std::string& p) {
-    if (p.empty()) return false;
-    std::error_code ec;
-    return std::filesystem::exists(p, ec) && std::filesystem::is_regular_file(p, ec);
-}
-
-std::string load_cached_llama_path(const std::filesystem::path& cache_file) {
-    std::ifstream in(cache_file);
-    if (!in) return {};
-    std::string line;
-    std::getline(in, line);
-    line = mm::util::trim(line);
-    if (line.size() >= 2 &&
-        ((line.front() == '"' && line.back() == '"') ||
-         (line.front() == '\'' && line.back() == '\''))) {
-        line = mm::util::trim(line.substr(1, line.size() - 2));
+// Count GPUs visible via nvidia-smi (one CSV line per GPU).
+int detect_gpu_count() {
+    const std::string cmd =
+        "nvidia-smi --query-gpu=index --format=csv,noheader,nounits";
+#ifdef _WIN32
+    FILE* f = _popen((cmd + " 2>nul").c_str(), "r");
+#else
+    FILE* f = ::popen((cmd + " 2>/dev/null").c_str(), "r");
+#endif
+    if (!f) return 0;
+    int count = 0;
+    char buf[256];
+    while (fgets(buf, static_cast<int>(sizeof(buf)), f)) {
+        if (!mm::util::trim(buf).empty()) ++count;
     }
-    return line;
+#ifdef _WIN32
+    _pclose(f);
+#else
+    ::pclose(f);
+#endif
+    return count;
 }
 
-bool save_cached_llama_path(const std::filesystem::path& cache_file,
-                            const std::string& path) {
-    if (path.empty()) return false;
-    std::error_code ec;
-    std::filesystem::create_directories(cache_file.parent_path(), ec);
-    std::ofstream out(cache_file, std::ios::out | std::ios::trunc);
-    if (!out) return false;
-    out << path << '\n';
-    return true;
+// Build the capability block this node advertises. Detection fills the gaps
+// the config left blank.
+mm::NodeCapabilities detect_node_capabilities(const mm::NodeConfig& cfg,
+                                              bool gpu_backend_available) {
+    mm::NodeCapabilities caps;
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+    caps.arch = "aarch64";
+#elif defined(__x86_64__) || defined(_M_X64) || defined(__amd64__)
+    caps.arch = "x86_64";
+#else
+    caps.arch = "";
+#endif
+
+#ifdef _WIN32
+    const bool is_linux = false;
+#else
+    const bool is_linux = true;
+#endif
+
+    caps.gpu_count = cfg.node_gpu_count > 0 ? cfg.node_gpu_count : detect_gpu_count();
+    caps.interconnect_gbps = cfg.interconnect_gbps;
+
+    // Ray multi-node membership: Linux/WSL only in practice. Config wins.
+    caps.supports_ray = cfg.supports_ray_set ? cfg.supports_ray : is_linux;
+
+    // Comm backends: explicit CSV, else inferred. NCCL has no Windows build
+    // yet (NVIDIA/nccl#1922 pending), so native Windows gets Gloo only; Linux
+    // with a CUDA GPU gets NCCL + Gloo; CPU-only gets Gloo.
+    if (!cfg.comm_backends.empty()) {
+        for (auto& b : mm::util::split(cfg.comm_backends, ',')) {
+            const std::string t = mm::util::to_lower(mm::util::trim(b));
+            if (!t.empty()) caps.comm_backends.push_back(t);
+        }
+    } else {
+        if (is_linux && gpu_backend_available && caps.gpu_count > 0)
+            caps.comm_backends = {"nccl", "gloo"};
+        else
+            caps.comm_backends = {"gloo"};
+    }
+
+    // vLLM build fingerprint: `vllm --version` (e.g. "0.6.3").
+    const std::string version_cmd =
+        mm::util::trim(cfg.vllm_server_path).empty()
+            ? std::string{}
+            : "\"" + mm::util::trim(cfg.vllm_server_path) + "\" --version";
+    if (!version_cmd.empty()) {
+        const std::string v = capture_command_line(version_cmd);
+        // Keep only a version-looking token if the line has extra words.
+        if (!v.empty()) {
+            for (auto& tok : mm::util::split(v, ' ')) {
+                const std::string t = mm::util::trim(tok);
+                if (!t.empty() && (std::isdigit(static_cast<unsigned char>(t[0])) ||
+                                   t.find('.') != std::string::npos)) {
+                    caps.vllm_version = t;
+                    break;
+                }
+            }
+            if (caps.vllm_version.empty()) caps.vllm_version = v;
+        }
+    }
+
+    return caps;
 }
 
 std::filesystem::path remembered_api_keys_file(const mm::NodeConfig& cfg) {
@@ -238,24 +330,6 @@ bool save_remembered_api_keys(const std::filesystem::path& path,
     out << nlohmann::json{{"version", 1}, {"keys", unique}}.dump(2) << '\n';
     return true;
 }
-
-#ifdef _WIN32
-void set_process_env_cache_file(const std::filesystem::path& p) {
-    _putenv_s("MM_LLAMA_PATH_CACHE_FILE", p.string().c_str());
-}
-void set_process_env_llama_path(const std::string& p) {
-    if (p.empty()) return;
-    _putenv_s("MM_LLAMA_PATH", p.c_str());
-}
-#else
-void set_process_env_cache_file(const std::filesystem::path& p) {
-    setenv("MM_LLAMA_PATH_CACHE_FILE", p.string().c_str(), 1);
-}
-void set_process_env_llama_path(const std::string& p) {
-    if (p.empty()) return;
-    setenv("MM_LLAMA_PATH", p.c_str(), 1);
-}
-#endif
 
 } // namespace
 
@@ -387,10 +461,6 @@ static void print_node_usage() {
         << "  metrics\n"
         << "  slots\n"
         << "  models list\n"
-        << "  models pull <model_filename>\n"
-        << "  models delete <model_filename>\n"
-        << "  llama check-update\n"
-        << "  llama update [build(true|false)] [force(true|false)]\n"
         << "  api-key list\n"
         << "  api-key add <key>\n"
         << "  api-key remove <key>\n"
@@ -456,8 +526,7 @@ static void run_node_cli(uint16_t listen_port,
     const bool json_mode = output_mode == CliOutputMode::Json;
 
     auto print_help = [&]() {
-        printer.line("Commands: status | metrics | slots | models list | models pull <file> | "
-                     "models delete <file> | llama check-update | llama update [build] [force] | "
+        printer.line("Commands: status | metrics | slots | models list | "
                      "api-key list|add|remove | pair status | logs tail [n] | help | quit");
     };
 
@@ -526,10 +595,7 @@ static void run_node_cli(uint16_t listen_port,
             } else {
                 std::string line_out =
                     "node_id=" + j.value("node_id", std::string{}) +
-                    " slots=" + std::to_string(j.value("slot_in_use", 0)) + "/" + std::to_string(j.value("max_slots", 0)) +
-                    " stored_models=" + std::to_string(static_cast<int>(j.value("stored_models", nlohmann::json::array()).size())) +
-                    " llama_path=\"" + j.value("llama_server_path", std::string{}) + "\"" +
-                    " update_available=" + (j.value("llama_update_available", false) ? "yes" : "no");
+                    " slots=" + std::to_string(j.value("slot_in_use", 0)) + "/" + std::to_string(j.value("max_slots", 0));
                 printer.line(line_out);
             }
             continue;
@@ -585,95 +651,30 @@ static void run_node_cli(uint16_t listen_port,
         }
 
         if (cmd0 == "models") {
-            if (tokens.size() < 2) {
-                printer.line("usage: models list | models pull <model_filename> | models delete <model_filename>");
+            if (tokens.size() < 2 || mm::util::to_lower(tokens[1]) != "list") {
+                printer.line("usage: models list");
                 continue;
             }
-            const std::string sub = mm::util::to_lower(tokens[1]);
-            if (sub == "list") {
-                auto r = self.get("/api/node/models");
-                if (!r.ok()) {
-                    emit_result(false, "models list", nlohmann::json::object(), summarize_http_error(r));
-                    continue;
-                }
-                auto j = parse_or_wrap(r.body);
-                if (json_mode) {
-                    emit_result(true, "models list", j, "");
-                    continue;
-                }
-                auto models = j.value("models", nlohmann::json::array());
-                if (!models.is_array() || models.empty()) {
-                    printer.line("(no models)");
-                    continue;
-                }
-                for (const auto& m : models) {
-                    printer.line(m.value("model_path", std::string{}) +
-                                 " size_bytes=" + std::to_string(m.value("size_bytes", 0LL)) +
-                                 " shards=" + std::to_string(m.value("shard_count", 0)));
-                }
+            auto r = self.get("/api/node/models");
+            if (!r.ok()) {
+                emit_result(false, "models list", nlohmann::json::object(), summarize_http_error(r));
                 continue;
             }
-            if (sub == "pull") {
-                if (tokens.size() < 3) {
-                    printer.line("usage: models pull <model_filename>");
-                    continue;
-                }
-                const std::string filename = mm::canonical_model_filename(tokens[2]);
-                if (!mm::is_safe_model_filename(filename)) {
-                    printer.line("error: invalid model filename");
-                    continue;
-                }
-                auto r = self.post("/api/node/models/pull",
-                                   nlohmann::json{{"model_filename", filename}, {"force", false}});
-                emit_http_result("models pull", r);
+            auto j = parse_or_wrap(r.body);
+            if (json_mode) {
+                emit_result(true, "models list", j, "");
                 continue;
             }
-            if (sub == "delete") {
-                if (tokens.size() < 3) {
-                    printer.line("usage: models delete <model_filename>");
-                    continue;
-                }
-                const std::string filename = mm::canonical_model_filename(tokens[2]);
-                if (!mm::is_safe_model_filename(filename)) {
-                    printer.line("error: invalid model filename");
-                    continue;
-                }
-                auto r = self.del("/api/node/models/" + filename);
-                emit_http_result("models delete", r);
+            auto models = j.value("models", nlohmann::json::array());
+            if (!models.is_array() || models.empty()) {
+                printer.line("(no models)");
                 continue;
             }
-            printer.line("error: unknown models subcommand");
-            continue;
-        }
-
-        if (cmd0 == "llama") {
-            if (tokens.size() < 2) {
-                printer.line("usage: llama check-update | llama update [build] [force]");
-                continue;
+            for (const auto& m : models) {
+                printer.line(m.value("model_path", std::string{}) +
+                             " size_bytes=" + std::to_string(m.value("size_bytes", 0LL)) +
+                             " shards=" + std::to_string(m.value("shard_count", 0)));
             }
-            const std::string sub = mm::util::to_lower(tokens[1]);
-            if (sub == "check-update") {
-                auto r = self.post("/api/node/llama/check-update", nlohmann::json::object());
-                emit_http_result("llama check-update", r);
-                continue;
-            }
-            if (sub == "update") {
-                bool build = true;
-                bool force = false;
-                if (tokens.size() >= 3 && !mm::cli::parse_bool_token(tokens[2], &build)) {
-                    printer.line("error: build must be true|false");
-                    continue;
-                }
-                if (tokens.size() >= 4 && !mm::cli::parse_bool_token(tokens[3], &force)) {
-                    printer.line("error: force must be true|false");
-                    continue;
-                }
-                auto r = self.post("/api/node/llama/update",
-                                   nlohmann::json{{"build", build}, {"force", force}});
-                emit_http_result("llama update", r);
-                continue;
-            }
-            printer.line("error: unknown llama subcommand");
             continue;
         }
 
@@ -767,29 +768,10 @@ int main(int argc, char** argv) {
     auto cfg = load_config(&cfg_path);
 
     namespace fs = std::filesystem;
-    auto llama_cache_file = resolve_llama_cache_file(cfg);
     {
         std::error_code ec;
         fs::create_directories(fs::path(cfg.log_file).parent_path(), ec);
         fs::create_directories(cfg.kv_cache_dir, ec);
-        fs::create_directories(llama_cache_file.parent_path(), ec);
-    }
-    if (!(std::getenv("MM_LLAMA_PATH_CACHE_FILE") && *std::getenv("MM_LLAMA_PATH_CACHE_FILE"))) {
-        set_process_env_cache_file(llama_cache_file);
-    }
-
-    // If no explicit MM_LLAMA_PATH is set, restore cached executable path when config
-    // still points at default launcher name or an invalid explicit path.
-    if (!(std::getenv("MM_LLAMA_PATH") && *std::getenv("MM_LLAMA_PATH"))) {
-        std::string cached = load_cached_llama_path(llama_cache_file);
-        bool should_apply = is_default_llama_path(cfg.llama_server_path);
-        if (!should_apply && looks_path_like(cfg.llama_server_path)
-            && !file_exists_regular(cfg.llama_server_path)) {
-            should_apply = true;
-        }
-        if (should_apply && !cached.empty() && file_exists_regular(cached)) {
-            cfg.llama_server_path = cached;
-        }
     }
 
     mm::init_logger(
@@ -804,12 +786,7 @@ int main(int argc, char** argv) {
             cfg_path.empty() ? "(defaults/env only; no config file found)" : cfg_path);
     MM_INFO("Node config — control_url='{}', llama_server_path='{}', models_dir='{}'",
             cfg.control_url, cfg.llama_server_path, cfg.models_dir);
-    MM_INFO("Node llama path cache file: {}", llama_cache_file.string());
-    if (looks_path_like(cfg.llama_server_path) && file_exists_regular(cfg.llama_server_path)) {
-        if (!save_cached_llama_path(llama_cache_file, cfg.llama_server_path)) {
-            MM_WARN("Failed to persist llama path cache: {}", llama_cache_file.string());
-        }
-    }
+    MM_INFO("Node vLLM path: {}", cfg.vllm_server_path);
 
     // ── NodeState ─────────────────────────────────────────────────────────────
 
@@ -851,43 +828,36 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ── SlotManager + ModelStorage ────────────────────────────────────────────
+    // ── SlotManager ───────────────────────────────────────────────────────────
 
-    mm::SlotManager slot_mgr(cfg.llama_server_path,
-                             cfg.llama_port_range_start,
+    mm::SlotManager slot_mgr(cfg.llama_port_range_start,
                              cfg.llama_port_range_end,
                              cfg.max_slots,
-                             cfg.kv_cache_dir);
+                             cfg.vllm_server_path,
+                             cfg.vllm_gpu_budget);
+    slot_mgr.set_gpu_vram_total_mb(state.get_metrics().gpu_vram_total_mb);
 
-    mm::ModelStorage model_storage(cfg.models_dir);
-    state.set_storage(model_storage.list_models(), model_storage.free_space_mb());
+    // Advertise cluster capabilities (arch, GPUs, comm backends, vLLM build)
+    // for multi-node engine-group planning on control.
+    {
+        auto caps = detect_node_capabilities(
+            cfg, state.get_metrics().gpu_backend_available);
+        state.set_capabilities(caps);
+        MM_INFO("Node capabilities: arch={} gpus={} ray={} backends=[{}] vllm={}",
+                caps.arch.empty() ? "?" : caps.arch, caps.gpu_count,
+                caps.supports_ray, mm::util::join(caps.comm_backends, ","),
+                caps.vllm_version.empty() ? "?" : caps.vllm_version);
+    }
 
-    const char* repo_url_env = std::getenv("MM_LLAMA_REPO_URL");
-    const char* install_root_env = std::getenv("MM_LLAMA_INSTALL_ROOT");
-    const char* updater_log_dir_env = std::getenv("MM_LLAMA_UPDATER_LOG_DIR");
-
-    mm::LlamaRuntimeManager::Options runtime_opts;
-    runtime_opts.repo_url = (repo_url_env && *repo_url_env)
-        ? std::string(repo_url_env)
-        : "https://github.com/ggml-org/llama.cpp.git";
-    runtime_opts.install_root = (install_root_env && *install_root_env)
-        ? fs::path(install_root_env)
-        : (fs::path(cfg.data_dir) / "llama.cpp");
-    runtime_opts.metadata_file = fs::path(cfg.data_dir) / "llama_runtime.json";
-    runtime_opts.log_dir = (updater_log_dir_env && *updater_log_dir_env)
-        ? fs::path(updater_log_dir_env)
-        : (fs::path(cfg.log_file).parent_path() / "llama-updater");
-    mm::LlamaRuntimeManager llama_runtime(state, runtime_opts);
-
-    llama_runtime.set_binary_ready_callback([&](const std::string& out_path) {
-        if (out_path.empty()) return;
-        slot_mgr.set_llama_server_path(out_path);
-        state.set_llama_server_path(out_path);
-        set_process_env_llama_path(out_path);
-        if (!save_cached_llama_path(llama_cache_file, out_path)) {
-            MM_WARN("Failed to persist llama path cache: {}", llama_cache_file.string());
+    // Periodically scrape running vLLM engines' /metrics so node status
+    // reports per-engine load (running/waiting requests, KV cache usage).
+    std::atomic<bool> stop_engine_metrics{false};
+    std::thread engine_metrics_thread([&slot_mgr, &stop_engine_metrics]() {
+        while (!stop_engine_metrics) {
+            slot_mgr.refresh_vllm_metrics();
+            for (int i = 0; i < 25 && !stop_engine_metrics; ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        MM_INFO("Applied updated llama-server path: {}", out_path);
     });
 
     std::mutex runtime_log_mutex;
@@ -905,16 +875,12 @@ int main(int argc, char** argv) {
         append_runtime_log(out);
         if (ui_ptr) ui_ptr->append_log(out);
     });
-    llama_runtime.set_log_callback([&](const std::string& line) {
-        const std::string out = "[llama-updater] " + line;
-        append_runtime_log(out);
-        if (ui_ptr) ui_ptr->append_log(out);
-    });
 
     // ── API server ────────────────────────────────────────────────────────────
 
-    mm::NodeApiServer api_server(state, slot_mgr, model_storage, llama_runtime,
+    mm::NodeApiServer api_server(state, slot_mgr,
                                  cfg.control_url, cfg.pairing_key);
+    api_server.set_ray_config(cfg.ray_path, cfg.ray_port);
     api_server.set_remember_api_key_callback([&](const std::string& key) {
         remembered_api_keys.push_back(key);
         if (save_remembered_api_keys(remembered_keys_path, remembered_api_keys)) {
@@ -943,11 +909,6 @@ int main(int argc, char** argv) {
 
     // Give the server a moment to bind before we register / broadcast.
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
-    if (args.mode == NodeRunMode::Tui) {
-        std::string msg;
-        llama_runtime.check_update(&msg, /*force_remote=*/false);
-        MM_INFO("llama runtime check: {}", msg);
-    }
 
     // ── UDP discovery broadcaster ─────────────────────────────────────────────
     const char* self_env = std::getenv("MM_SELF_URL");
@@ -963,66 +924,6 @@ int main(int argc, char** argv) {
 
     // ── UI ────────────────────────────────────────────────────────────────────
 
-    auto request_llama_update = [&]() {
-        mm::HttpClient self("http://127.0.0.1:" + std::to_string(cfg.listen_port));
-        self.set_bearer_token(initial_key);
-        auto r = self.post("/api/node/llama/update",
-                           nlohmann::json{{"build", true}, {"force", false}});
-        if (!r.ok()) {
-            MM_WARN("Node UI/CLI update request failed (HTTP {}): {}", r.status, r.body);
-            return;
-        }
-        MM_INFO("Node UI/CLI update request accepted: {}", r.body);
-    };
-    auto request_model_pull = [&](const std::string& model_filename, std::string* out_message) -> bool {
-        const std::string filename = mm::canonical_model_filename(model_filename);
-        if (!mm::is_safe_model_filename(filename)) {
-            if (out_message) *out_message = "invalid model filename";
-            return false;
-        }
-
-        mm::HttpClient self("http://127.0.0.1:" + std::to_string(cfg.listen_port));
-        self.set_bearer_token(initial_key);
-        auto r = self.post("/api/node/models/pull",
-                           nlohmann::json{{"model_filename", filename}, {"force", false}});
-        if (!r.ok()) {
-            std::string msg = "pull failed (HTTP " + std::to_string(r.status) + ")";
-            try {
-                auto j = nlohmann::json::parse(r.body);
-                std::string err = j.value("error", std::string{});
-                if (!err.empty()) msg += ": " + err;
-            } catch (...) {}
-            if (out_message) *out_message = msg;
-            return false;
-        }
-
-        if (out_message) *out_message = "pull requested: " + filename;
-        return true;
-    };
-    auto request_model_delete = [&](const std::string& model_filename, std::string* out_message) -> bool {
-        const std::string filename = mm::canonical_model_filename(model_filename);
-        if (!mm::is_safe_model_filename(filename)) {
-            if (out_message) *out_message = "invalid model filename";
-            return false;
-        }
-
-        mm::HttpClient self("http://127.0.0.1:" + std::to_string(cfg.listen_port));
-        self.set_bearer_token(initial_key);
-        auto r = self.del("/api/node/models/" + filename);
-        if (!r.ok()) {
-            std::string msg = "delete failed (HTTP " + std::to_string(r.status) + ")";
-            try {
-                auto j = nlohmann::json::parse(r.body);
-                std::string err = j.value("error", std::string{});
-                if (!err.empty()) msg += ": " + err;
-            } catch (...) {}
-            if (out_message) *out_message = msg;
-            return false;
-        }
-
-        if (out_message) *out_message = "deleted " + filename;
-        return true;
-    };
     auto forget_remembered_pairings = [&](std::string* out_message) -> bool {
         const std::size_t count = remembered_api_keys.size();
         remembered_api_keys.clear();
@@ -1108,9 +1009,6 @@ int main(int argc, char** argv) {
         mm::NodeUI ui(
             state,
             cfg.listen_port,
-            request_llama_update,
-            request_model_pull,
-            request_model_delete,
             forget_remembered_pairings);
         ui_ptr = &ui;
         ui.run();
@@ -1141,6 +1039,9 @@ int main(int argc, char** argv) {
 
     api_server.stop();
     if (api_thread.joinable()) api_thread.join();
+
+    stop_engine_metrics = true;
+    if (engine_metrics_thread.joinable()) engine_metrics_thread.join();
 
     state.stop_metrics_poll();
     slot_mgr.unload_all();

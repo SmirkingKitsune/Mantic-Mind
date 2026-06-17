@@ -1,0 +1,20 @@
+# Node config for live confirmation run (WSL).
+# control_url left empty: control registers this node via POST /v1/nodes.
+listen_port = 7070
+control_url = ""
+
+# vLLM CLI from the venv.
+vllm_server_path = "/home/ryanm/vllm-venv/bin/vllm"
+
+# Low GPU budget so the step-1 rejection path is easy to trigger on one GPU.
+vllm_gpu_budget = 0.50
+
+# Allow several concurrent engines.
+max_slots = 6
+llama_port_range_start = 8100
+llama_port_range_end   = 8120
+
+models_dir = "models"
+data_dir   = "data"
+kv_cache_dir = "data/kv_cache"
+log_file = "logs/node.log"

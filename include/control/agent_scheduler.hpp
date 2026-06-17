@@ -10,7 +10,6 @@
 namespace mm {
 
 class NodeRegistry;
-class ModelDistributor;
 
 /// Result of a successful scheduling decision.
 struct ScheduleResult {
@@ -24,7 +23,6 @@ struct ScheduleResult {
 class AgentScheduler {
 public:
     AgentScheduler(NodeRegistry& registry,
-                   ModelDistributor& distributor,
                    std::string models_dir);
 
     /// Ensure an agent has a running slot on some node.
@@ -55,19 +53,41 @@ public:
 
 private:
     NodeRegistry&       registry_;
-    ModelDistributor&   distributor_;
     std::string         models_dir_;
 
-    mutable std::mutex                              mutex_;
+    // schedule_mutex_ serializes scheduling decisions end-to-end — these can
+    // include slow node HTTP calls and multi-GB model uploads. state_mutex_
+    // guards the placement map and last_error_ only, so read APIs
+    // (get_placement, list_placements) and idle/active marks never block
+    // behind a scheduling operation in progress.
+    std::mutex                                      schedule_mutex_;
+    mutable std::mutex                              state_mutex_;
     std::unordered_map<AgentId, AgentPlacement>     placements_;
     std::string                                      last_error_;
 
+    /// Copy a placement out of the map (state_mutex_).
+    std::optional<AgentPlacement> find_placement_copy(const AgentId& id) const;
+
+    /// Insert or overwrite a placement (state_mutex_).
+    void store_placement(const AgentPlacement& p);
+
+    /// Remove a placement; returns false if absent (state_mutex_).
+    bool erase_placement_entry(const AgentId& id);
+
+    /// Apply fn to an existing placement; returns false if absent (state_mutex_).
+    template <typename Fn>
+    bool mutate_placement(const AgentId& id, Fn&& fn) {
+        std::lock_guard<std::mutex> g(state_mutex_);
+        auto it = placements_.find(id);
+        if (it == placements_.end()) return false;
+        fn(it->second);
+        return true;
+    }
+
+    void set_last_error(const std::string& err);
+
     /// Check if a node URL is local (loopback).
     static bool is_local_node(const std::string& node_url);
-
-    /// Estimate capacity needed for a model and its effective server context.
-    int64_t estimate_vram_mb(const std::string& model_path,
-                             const LlamaSettings& settings) const;
 
     /// Try to find a node that can accommodate a model of the given VRAM.
     /// Returns node info or nullopt.

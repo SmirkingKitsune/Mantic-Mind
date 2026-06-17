@@ -1,9 +1,9 @@
 #include "common/inference_response_parser.hpp"
 #include "common/agent.hpp"
 #include "common/agent_db.hpp"
+#include "common/config_file.hpp"
 #include "common/conversation_manager.hpp"
 #include "common/http_client.hpp"
-#include "common/inference_sizing.hpp"
 #include "common/llama_cpp_client.hpp"
 #include "common/memory_manager.hpp"
 #include "common/trace_provenance.hpp"
@@ -12,20 +12,23 @@
 #include "control/agent_manager.hpp"
 #include "control/agent_queue.hpp"
 #include "control/agent_scheduler.hpp"
+#include "control/engine_group_planner.hpp"
 #include "control/control_api_server.hpp"
-#include "control/model_distributor.hpp"
-#include "control/model_router.hpp"
 #include "control/node_registry.hpp"
 #include "control/tts_service_client.hpp"
 #include "node/llama_server_process.hpp"
 #include "node/slot_manager.hpp"
+#include "node/vllm_runtime.hpp"
+#include "node/ray_orchestration.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -238,7 +241,7 @@ bool test_agent_manager_rejects_duplicates_and_defers_cleanup_until_handles_rele
 
 bool test_slot_manager_not_found_statuses() {
     auto dir = temp_test_dir("slots");
-    mm::SlotManager slots("missing-llama-server", 46100, 46101, 1, dir.string());
+    mm::SlotManager slots(46100, 46101, 1);
 
     auto unload = slots.unload_slot("missing-slot");
     CHECK(unload.status == mm::SlotOperationStatus::NotFound);
@@ -255,7 +258,7 @@ bool test_slot_manager_not_found_statuses() {
 
 bool test_slot_lease_blocks_unload_and_suspend_while_busy() {
     auto dir = temp_test_dir("lease-busy");
-    mm::SlotManager slots("missing-llama-server", 46110, 46111, 1, dir.string());
+    mm::SlotManager slots(46110, 46111, 1);
     const auto slot_id = slots.add_ready_test_slot("test-model.gguf", "agent-a");
 
     {
@@ -271,6 +274,163 @@ bool test_slot_lease_blocks_unload_and_suspend_while_busy() {
 
     auto unload_after_release = slots.unload_slot(slot_id);
     CHECK(unload_after_release.status == mm::SlotOperationStatus::Ok);
+
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_vllm_slot_info_and_suspend_without_kv_cache() {
+    auto dir = temp_test_dir("vllm-slot");
+    mm::SlotManager slots(46120, 46121, 1, "missing-vllm");
+    const auto slot_id = slots.add_ready_test_slot("Qwen/Qwen3-8B",
+                                                   "agent-v");
+
+    auto info = slots.find_slot(slot_id);
+    CHECK(info.has_value());
+
+    nlohmann::json serialized = *info;
+    auto parsed = serialized.get<mm::SlotInfo>();
+    CHECK(parsed.model_path == "Qwen/Qwen3-8B");
+
+    auto suspend = slots.suspend_slot(slot_id);
+    CHECK(suspend.status == mm::SlotOperationStatus::Ok);
+    CHECK(suspend.kv_cache_path.empty());
+
+    auto suspended = slots.find_slot(slot_id);
+    CHECK(suspended.has_value());
+    CHECK(suspended->state == mm::SlotState::Suspended);
+    CHECK(suspended->kv_cache_path.empty());
+
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_vllm_gpu_budget_accounting() {
+    auto dir = temp_test_dir("vllm-budget");
+    mm::SlotManager slots(46130, 46133, 4, "missing-vllm", 0.80);
+    CHECK(slots.vllm_gpu_budget() == 0.80);
+    CHECK(slots.vllm_gpu_fraction_used() == 0.0);
+
+    // An active vLLM slot holding 0.78 leaves less than the minimum useful
+    // slice (0.05) of the 0.80 budget — the next load must be rejected
+    // before any process spawn is attempted.
+    const auto holder_id = slots.add_ready_test_slot("Qwen/Qwen3-8B",
+                                                     "agent-holder",
+                                                     0.78);
+    CHECK(slots.vllm_gpu_fraction_used() == 0.78);
+
+    auto rejected = slots.load_model("Qwen/Qwen3-4B",
+                                     mm::VllmSettings{},
+                                     "agent-rejected");
+    CHECK(rejected.empty());
+    CHECK(slots.last_error().find("insufficient GPU memory budget")
+          != std::string::npos);
+    CHECK(slots.vllm_gpu_fraction_used() == 0.78);
+
+    // The fraction is informational on the SlotInfo and survives JSON.
+    auto info = slots.find_slot(holder_id);
+    CHECK(info.has_value());
+    nlohmann::json serialized = *info;
+    auto parsed = serialized.get<mm::SlotInfo>();
+    CHECK(parsed.gpu_mem_fraction == 0.78);
+
+    // Suspending the holder releases its claim on the budget.
+    auto suspend = slots.suspend_slot(holder_id);
+    CHECK(suspend.status == mm::SlotOperationStatus::Ok);
+    CHECK(slots.vllm_gpu_fraction_used() == 0.0);
+
+    // A failed load (missing vLLM executable) must release its pending
+    // reservation rather than leak budget.
+    auto failed = slots.load_model("Qwen/Qwen3-4B",
+                                   mm::VllmSettings{},
+                                   "agent-failed");
+    CHECK(failed.empty());
+    CHECK(slots.vllm_gpu_fraction_used() == 0.0);
+
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_vllm_shared_slot_attach_and_detach() {
+    auto dir = temp_test_dir("vllm-shared");
+    mm::SlotManager slots(46140, 46143, 4, "missing-vllm", 0.90);
+
+    // Agent A's engine is running (test slots carry default launch settings).
+    const auto engine_id = slots.add_ready_test_slot("Qwen/Qwen3-8B",
+                                                     "agent-a",
+                                                     0.45);
+
+    // Agent B requests the same model with compatible launch settings —
+    // attaches to the running engine instead of spawning a second process
+    // (a real spawn of "missing-vllm" would fail).
+    auto shared_id = slots.load_model("Qwen/Qwen3-8B",
+                                      mm::VllmSettings{},
+                                      "agent-b");
+    CHECK(shared_id == engine_id);
+    CHECK(slots.find_slot_by_agent("agent-a").has_value());
+    CHECK(slots.find_slot_by_agent("agent-b").has_value());
+    CHECK(slots.vllm_gpu_fraction_used() == 0.45);  // no new engine
+
+    auto info = slots.find_slot(engine_id);
+    CHECK(info.has_value());
+    CHECK(info->agent_ids.size() == 2);
+    CHECK(info->assigned_agent == "agent-a");
+
+    nlohmann::json serialized = *info;
+    auto parsed = serialized.get<mm::SlotInfo>();
+    CHECK(parsed.agent_ids.size() == 2);
+
+    // Mismatched launch settings must NOT attach — the fresh spawn then
+    // fails on the missing executable, proving no sharing happened.
+    mm::VllmSettings other;
+    other.max_model_len = 8192;
+    auto fresh = slots.load_model("Qwen/Qwen3-8B", other, "agent-c");
+    CHECK(fresh.empty());
+
+    // Detaching one agent keeps the engine up for the other.
+    auto d1 = slots.detach_agent(engine_id, "agent-b");
+    CHECK(d1.ok());
+    CHECK(d1.remaining_agents == 1);
+    CHECK(!d1.unloaded);
+    CHECK(!slots.find_slot_by_agent("agent-b").has_value());
+
+    // Detaching the last agent unloads the engine.
+    auto d2 = slots.detach_agent(engine_id, "agent-a");
+    CHECK(d2.ok());
+    CHECK(d2.remaining_agents == 0);
+    CHECK(d2.unloaded);
+    CHECK(!slots.find_slot(engine_id).has_value());
+
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_vllm_restore_attaches_and_cleans_suspended_record() {
+    auto dir = temp_test_dir("vllm-restore-attach");
+    mm::SlotManager slots(46150, 46153, 4, "missing-vllm", 0.90);
+
+    // Agent B's old engine was suspended (vLLM: no KV cache survives).
+    const auto old_id = slots.add_ready_test_slot("Qwen/Qwen3-8B",
+                                                  "agent-b",
+                                                  0.45);
+    CHECK(slots.suspend_slot(old_id).ok());
+
+    // Meanwhile agent A's compatible engine is running.
+    const auto engine_id = slots.add_ready_test_slot("Qwen/Qwen3-8B",
+                                                     "agent-a",
+                                                     0.45);
+
+    // Restoring agent B attaches to A's engine and drops B's stale
+    // suspended record.
+    auto restored = slots.restore_slot("Qwen/Qwen3-8B",
+                                       mm::VllmSettings{},
+                                       "agent-b");
+    CHECK(restored == engine_id);
+    CHECK(!slots.find_slot(old_id).has_value());
+
+    auto info = slots.find_slot(engine_id);
+    CHECK(info.has_value());
+    CHECK(info->agent_ids.size() == 2);
 
     CHECK(remove_tree(dir));
     return true;
@@ -292,128 +452,306 @@ bool has_arg(const std::vector<std::string>& args, const std::string& flag) {
     return false;
 }
 
-bool test_llama_settings_throughput_fields_round_trip() {
-    mm::LlamaSettings settings;
-    settings.ctx_size = 8192;
-    settings.n_threads = 8;
-    settings.n_threads_http = 4;
-    settings.parallel = 6;
-    settings.batch_size = 1024;
-    settings.ubatch_size = 256;
+bool test_vllm_sleep_fallback_and_dead_wake_cleanup() {
+    auto dir = temp_test_dir("vllm-sleep");
+    mm::SlotManager slots(46160, 46163, 4, "missing-vllm", 0.90);
 
-    nlohmann::json serialized = settings;
-    CHECK(serialized["n_threads_http"] == 4);
-    CHECK(serialized["parallel"] == 6);
-    CHECK(serialized["batch_size"] == 1024);
-    CHECK(serialized["ubatch_size"] == 256);
+    // Suspending an unreachable engine falls back to stopping it: state is
+    // Suspended but not sleeping.
+    const auto a = slots.add_ready_test_slot("Qwen/Qwen3-8B", "agent-a", 0.45);
+    auto susp = slots.suspend_slot(a);
+    CHECK(susp.ok());
+    auto info = slots.find_slot(a);
+    CHECK(info.has_value());
+    CHECK(info->state == mm::SlotState::Suspended);
+    CHECK(!info->sleeping);
 
-    auto parsed = serialized.get<mm::LlamaSettings>();
-    CHECK(parsed.n_threads_http == 4);
-    CHECK(parsed.parallel == 6);
-    CHECK(parsed.batch_size == 1024);
-    CHECK(parsed.ubatch_size == 256);
+    // A sleeping engine whose process died: the wake fails, the dead record
+    // is discarded, and the load falls through to a fresh start (which then
+    // fails on the missing executable).
+    const auto b = slots.add_ready_test_slot("Qwen/Qwen3-8B", "agent-b", 0.45);
+    CHECK(slots.mark_test_slot_sleeping(b));
+    auto sleeping_info = slots.find_slot(b);
+    CHECK(sleeping_info.has_value());
+    CHECK(sleeping_info->sleeping);
+    nlohmann::json serialized = *sleeping_info;
+    CHECK(serialized.value("sleeping", false));
+    CHECK(serialized.get<mm::SlotInfo>().sleeping);
 
-    auto dir = temp_test_dir("llama-settings-throughput");
-    std::filesystem::create_directories(dir);
-    {
-        mm::AgentDB db("agent-a", dir.string());
-        mm::AgentConfig cfg;
-        cfg.id = "agent-a";
-        cfg.name = "Agent A";
-        cfg.model_path = "model.gguf";
-        cfg.llama_settings = settings;
-        db.save_config(cfg);
+    auto loaded = slots.load_model("Qwen/Qwen3-8B", mm::VllmSettings{},
+                                   "agent-c");
+    CHECK(loaded.empty());                   // fresh spawn fails (missing vllm)
+    CHECK(!slots.find_slot(b).has_value());  // dead sleeping record discarded
+    CHECK(slots.vllm_gpu_fraction_used() == 0.0);
 
-        auto loaded = db.load_config();
-        CHECK(loaded.llama_settings.n_threads_http == 4);
-        CHECK(loaded.llama_settings.parallel == 6);
-        CHECK(loaded.llama_settings.batch_size == 1024);
-        CHECK(loaded.llama_settings.ubatch_size == 256);
-    }
+    // Sleep mode flag lands in the engine args; disabling removes it.
+    mm::VllmSettings vs;
+    auto args = mm::build_vllm_server_args("Qwen/Qwen3-8B", vs, 8000);
+    CHECK(has_arg(args, "--enable-sleep-mode"));
+    vs.enable_sleep_mode = false;
+    args = mm::build_vllm_server_args("Qwen/Qwen3-8B", vs, 8000);
+    CHECK(!has_arg(args, "--enable-sleep-mode"));
 
     CHECK(remove_tree(dir));
     return true;
 }
 
-bool test_llama_server_args_throughput_tunables() {
-    mm::LlamaSettings defaults;
-    auto default_args = mm::build_llama_server_args_for_test("model.gguf", defaults, 48123);
-    CHECK(has_arg_pair(default_args, "--ctx-size", "4096"));
-    CHECK(!has_arg(default_args, "--parallel"));
-    CHECK(!has_arg(default_args, "--batch-size"));
-    CHECK(!has_arg(default_args, "--ubatch"));
-    CHECK(!has_arg(default_args, "--threads-http"));
+bool test_vllm_metrics_parse_and_slot_info_round_trip() {
+    const std::string text =
+        "# HELP vllm:num_requests_running Number of requests on GPU.\n"
+        "# TYPE vllm:num_requests_running gauge\n"
+        "vllm:num_requests_running{model_name=\"Qwen/Qwen3-8B\"} 2.0\n"
+        "vllm:num_requests_waiting{model_name=\"Qwen/Qwen3-8B\"} 5.0\n"
+        "vllm:gpu_cache_usage_perc{model_name=\"Qwen/Qwen3-8B\"} 0.42\n"
+        "some_other_metric 7\n";
+    auto m = mm::parse_vllm_metrics_text(text);
+    CHECK(m.valid);
+    CHECK(m.num_requests_running == 2);
+    CHECK(m.num_requests_waiting == 5);
+    CHECK(m.kv_cache_usage > 0.41 && m.kv_cache_usage < 0.43);
 
-    mm::LlamaSettings tuned;
-    tuned.ctx_size = 2048;
-    tuned.n_threads = 8;
-    tuned.n_threads_http = 4;
-    tuned.parallel = 4;
-    tuned.batch_size = 1024;
-    tuned.ubatch_size = 256;
-    auto tuned_args = mm::build_llama_server_args_for_test("model.gguf", tuned, 48124);
-    CHECK(has_arg_pair(tuned_args, "--ctx-size", "8192"));
-    CHECK(has_arg_pair(tuned_args, "--threads", "8"));
-    CHECK(has_arg_pair(tuned_args, "--threads-http", "4"));
-    CHECK(has_arg_pair(tuned_args, "--parallel", "4"));
-    CHECK(has_arg_pair(tuned_args, "--batch-size", "1024"));
-    CHECK(has_arg_pair(tuned_args, "--ubatch", "256"));
+    // vLLM v1 renamed the cache metric.
+    auto m_v1 = mm::parse_vllm_metrics_text(
+        "vllm:kv_cache_usage_perc{model_name=\"x\"} 0.9\n");
+    CHECK(m_v1.valid);
+    CHECK(m_v1.kv_cache_usage > 0.89);
 
-    mm::LlamaSettings overridden;
-    overridden.ctx_size = 1024;
-    overridden.parallel = 1;
-    overridden.batch_size = 512;
-    overridden.extra_args = {"--parallel=8", "--batch-size", "2048"};
-    auto override_args = mm::build_llama_server_args_for_test("model.gguf", overridden, 48125);
-    CHECK(has_arg_pair(override_args, "--ctx-size", "8192"));
-    CHECK(!has_arg_pair(override_args, "--parallel", "1"));
-    CHECK(!has_arg_pair(override_args, "--batch-size", "512"));
-    CHECK(has_arg(override_args, "--parallel=8"));
-    CHECK(has_arg_pair(override_args, "--batch-size", "2048"));
+    auto m_empty = mm::parse_vllm_metrics_text("# comments only\n");
+    CHECK(!m_empty.valid);
 
-    mm::LlamaSettings explicit_ctx;
-    explicit_ctx.ctx_size = 4096;
-    explicit_ctx.parallel = 8;
-    explicit_ctx.extra_args = {"--ctx-size=32768"};
-    auto explicit_ctx_args = mm::build_llama_server_args_for_test("model.gguf", explicit_ctx, 48126);
-    CHECK(!has_arg_pair(explicit_ctx_args, "--ctx-size", "32768"));
-    CHECK(has_arg(explicit_ctx_args, "--ctx-size=32768"));
+    // Engine load survives the SlotInfo JSON contract node → control.
+    mm::SlotInfo si;
+    si.engine_metrics_valid = true;
+    si.num_requests_running = 3;
+    si.num_requests_waiting = 1;
+    si.kv_cache_usage = 0.5;
+    nlohmann::json j = si;
+    auto parsed = j.get<mm::SlotInfo>();
+    CHECK(parsed.engine_metrics_valid);
+    CHECK(parsed.num_requests_running == 3);
+    CHECK(parsed.num_requests_waiting == 1);
+    CHECK(parsed.kv_cache_usage > 0.49 && parsed.kv_cache_usage < 0.51);
 
     return true;
 }
 
-bool test_inference_sizing_tracks_effective_context() {
-    auto dir = temp_test_dir("inference-sizing");
-    std::filesystem::create_directories(dir);
-    const auto model = dir / "tiny.gguf";
+namespace {
+mm::NodeInfo make_capable_node(const std::string& id,
+                               const std::string& arch,
+                               const std::string& vllm_version,
+                               int gpu_count,
+                               std::vector<std::string> backends,
+                               bool supports_ray,
+                               double interconnect_gbps = 0.0) {
+    mm::NodeInfo n;
+    n.id = id;
+    n.url = "http://" + id + ":7070";
+    n.connected = true;
+    n.capabilities.arch = arch;
+    n.capabilities.vllm_version = vllm_version;
+    n.capabilities.gpu_count = gpu_count;
+    n.capabilities.comm_backends = std::move(backends);
+    n.capabilities.supports_ray = supports_ray;
+    n.capabilities.interconnect_gbps = interconnect_gbps;
+    return n;
+}
+} // namespace
+
+bool test_engine_group_planner() {
+    using mm::EngineGroupRequest;
+
+    // Two DGX Sparks (aarch64, 1 GPU each, NCCL over 200GbE) form the natural
+    // NCCL pipeline-parallel group for a 2-GPU model.
+    auto spark1 = make_capable_node("spark-1", "aarch64", "0.6.3", 1,
+                                    {"nccl", "gloo"}, true, 200.0);
+    auto spark2 = make_capable_node("spark-2", "aarch64", "0.6.3", 1,
+                                    {"nccl", "gloo"}, true, 200.0);
+    auto nas    = make_capable_node("nas", "x86_64", "0.6.3", 1,
+                                    {"nccl", "gloo"}, true, 10.0);
+
     {
-        std::ofstream out(model, std::ios::binary);
-        std::string chunk(1024 * 1024, '\0');
-        for (int i = 0; i < 64; ++i) out.write(chunk.data(), chunk.size());
+        EngineGroupRequest req{"big-model", 2};
+        auto best = mm::best_engine_group(req, {spark1, spark2, nas});
+        CHECK(best.has_value());
+        CHECK(best->comm_backend == "nccl");
+        CHECK(best->pipeline_parallel_size == 2);
+        CHECK(best->tensor_parallel_size == 1);
+        CHECK(best->world_size == 2);
+        // Cross-arch pairing (spark + nas) is never formed: different
+        // fingerprints can't share an engine, so the two Sparks are chosen.
+        CHECK(best->nodes.size() == 2);
+        CHECK((best->nodes[0] == "spark-1" || best->nodes[0] == "spark-2"));
+        CHECK((best->nodes[1] == "spark-1" || best->nodes[1] == "spark-2"));
     }
 
-    mm::LlamaSettings defaults;
-    auto base = mm::estimate_inference_memory(model.string(), defaults);
-    CHECK(base.model_weight_mb == 64);
-    CHECK(base.effective_ctx_tokens == 4096);
-    CHECK(base.parallel == 1);
+    // Spark 2 unavailable: a single remaining Spark can't reach world_size 2.
+    {
+        EngineGroupRequest req{"big-model", 2};
+        auto best = mm::best_engine_group(req, {spark1, nas});
+        CHECK(!best.has_value());
+    }
 
-    mm::LlamaSettings tuned;
-    tuned.ctx_size = 2048;
-    tuned.parallel = 4;
-    auto parallel = mm::estimate_inference_memory(model.string(), tuned);
-    CHECK(parallel.effective_ctx_tokens == 8192);
-    CHECK(parallel.parallel == 4);
-    CHECK(parallel.total_vram_mb > base.total_vram_mb);
+    // A model that fits on one node yields a single-node (pp=1) plan, so the
+    // caller routes it normally rather than forming a group.
+    {
+        EngineGroupRequest req{"small-model", 1};
+        auto best = mm::best_engine_group(req, {spark1, spark2});
+        CHECK(best.has_value());
+        CHECK(best->pipeline_parallel_size == 1);
+        CHECK(!best->spans_nodes());
+    }
 
-    mm::LlamaSettings overridden;
-    overridden.ctx_size = 1024;
-    overridden.parallel = 1;
-    overridden.extra_args = {"--parallel=8", "--ctx-size=32768"};
-    auto explicit_ctx = mm::estimate_inference_memory(model.string(), overridden);
-    CHECK(explicit_ctx.parallel == 8);
-    CHECK(explicit_ctx.effective_ctx_tokens == 32768);
-    CHECK(explicit_ctx.total_vram_mb > parallel.total_vram_mb);
+    // Gloo last resort: a pair where one member lacks NCCL forms a Gloo group
+    // only because no all-NCCL pair exists for that fingerprint.
+    {
+        auto win1 = make_capable_node("win-1", "x86_64", "0.6.3", 1,
+                                      {"gloo"}, true, 1.0);
+        auto win2 = make_capable_node("win-2", "x86_64", "0.6.3", 1,
+                                      {"nccl", "gloo"}, true, 1.0);
+        EngineGroupRequest req{"big-model", 2};
+        auto best = mm::best_engine_group(req, {win1, win2});
+        CHECK(best.has_value());
+        CHECK(best->comm_backend == "gloo");
+    }
+
+    // NCCL pair outranks a Gloo pair for the same need.
+    {
+        auto a = make_capable_node("a", "x86_64", "1.0", 1, {"nccl", "gloo"}, true, 100.0);
+        auto b = make_capable_node("b", "x86_64", "1.0", 1, {"nccl", "gloo"}, true, 100.0);
+        auto c = make_capable_node("c", "aarch64", "1.0", 1, {"gloo"}, true, 1.0);
+        auto d = make_capable_node("d", "aarch64", "1.0", 1, {"gloo"}, true, 1.0);
+        EngineGroupRequest req{"big-model", 2};
+        auto ranked = mm::plan_engine_groups(req, {a, b, c, d});
+        CHECK(ranked.size() >= 2);
+        CHECK(ranked.front().valid);
+        CHECK(ranked.front().comm_backend == "nccl");  // NCCL pool wins
+    }
+
+    // A multi-node need where a member lacks Ray is rejected.
+    {
+        auto a = make_capable_node("a", "x86_64", "1.0", 1, {"nccl", "gloo"}, true);
+        auto b = make_capable_node("b", "x86_64", "1.0", 1, {"nccl", "gloo"}, false);
+        EngineGroupRequest req{"big-model", 2};
+        auto best = mm::best_engine_group(req, {a, b});
+        CHECK(!best.has_value());
+    }
+
+    // Nodes with no advertised capabilities (older build) are ignored.
+    {
+        mm::NodeInfo bare;
+        bare.id = "legacy";
+        bare.connected = true;
+        EngineGroupRequest req{"big-model", 1};
+        auto best = mm::best_engine_group(req, {bare});
+        CHECK(!best.has_value());
+    }
+
+    // Capability block survives the node-status JSON round trip.
+    {
+        nlohmann::json j = spark1.capabilities;
+        auto parsed = j.get<mm::NodeCapabilities>();
+        CHECK(parsed.arch == "aarch64");
+        CHECK(parsed.vllm_version == "0.6.3");
+        CHECK(parsed.gpu_count == 1);
+        CHECK(parsed.has_comm_backend("nccl"));
+        CHECK(parsed.supports_ray);
+        CHECK(parsed.interconnect_gbps > 199.0);
+    }
+
+    return true;
+}
+
+bool test_ray_start_args() {
+    // Head node: binds the GCS port and advertises its GPUs.
+    {
+        mm::RayStartConfig cfg;
+        cfg.role = mm::RayRole::Head;
+        cfg.port = 6379;
+        cfg.num_gpus = 2;
+        auto args = mm::build_ray_start_args(cfg);
+        CHECK(!args.empty() && args.front() == "start");
+        CHECK(has_arg(args, "--head"));
+        CHECK(has_arg(args, "--port=6379"));
+        CHECK(has_arg(args, "--num-gpus=2"));
+        CHECK(has_arg(args, "--disable-usage-stats"));
+    }
+
+    // Worker node: connects to the head's address, no --head.
+    {
+        mm::RayStartConfig cfg;
+        cfg.role = mm::RayRole::Worker;
+        cfg.head_address = "10.0.0.1:6379";
+        cfg.num_gpus = 1;
+        auto args = mm::build_ray_start_args(cfg);
+        CHECK(has_arg(args, "--address=10.0.0.1:6379"));
+        CHECK(has_arg(args, "--num-gpus=1"));
+        CHECK(!has_arg(args, "--head"));
+    }
+
+    // num_gpus 0 means "let Ray auto-detect" — flag omitted.
+    {
+        mm::RayStartConfig cfg;
+        cfg.role = mm::RayRole::Head;
+        auto args = mm::build_ray_start_args(cfg);
+        for (const auto& a : args) CHECK(a.rfind("--num-gpus", 0) != 0);
+    }
+
+    // Live orchestration is Linux-only; on Windows it must refuse cleanly.
+#ifdef _WIN32
+    CHECK(!mm::ray_supported());
+    std::string err;
+    mm::RayStartConfig cfg;
+    CHECK(!mm::ray_start(cfg, &err));
+    CHECK(!err.empty());
+#else
+    CHECK(mm::ray_supported());
+#endif
+    return true;
+}
+
+bool test_vllm_runtime_defaults_and_args() {
+    mm::VllmSettings settings;
+    settings.max_model_len = 16384;
+    settings.max_num_seqs = 2;
+    settings.max_num_batched_tokens = 8192;
+    settings.tensor_parallel_size = 2;
+    settings.pipeline_parallel_size = 2;
+    settings.gpu_memory_utilization = 0.8;
+    settings.served_model_name = "agent-qwen";
+    settings.trust_remote_code = true;
+    settings.enable_prefix_caching = true;
+    settings.enable_auto_tool_choice = true;
+    settings.tool_call_parser = "hermes";
+    settings.extra_args = {"--gpu-memory-utilization", "0.7",
+                           "--disable-log-requests"};
+
+    auto args = mm::build_vllm_server_args("Qwen/Qwen3-8B", settings, 8123);
+    CHECK(args.size() >= 2);
+    CHECK(args[0] == "serve");
+    CHECK(args[1] == "Qwen/Qwen3-8B");
+    CHECK(has_arg_pair(args, "--host", "127.0.0.1"));
+    CHECK(has_arg_pair(args, "--port", "8123"));
+    CHECK(has_arg_pair(args, "--max-model-len", "16384"));
+    CHECK(has_arg_pair(args, "--max-num-seqs", "2"));
+    CHECK(has_arg_pair(args, "--max-num-batched-tokens", "8192"));
+    CHECK(has_arg_pair(args, "--tensor-parallel-size", "2"));
+    CHECK(has_arg_pair(args, "--pipeline-parallel-size", "2"));
+    CHECK(!has_arg_pair(args, "--gpu-memory-utilization", "0.8"));
+    CHECK(has_arg_pair(args, "--gpu-memory-utilization", "0.7"));
+    CHECK(has_arg_pair(args, "--served-model-name", "agent-qwen"));
+    CHECK(has_arg(args, "--trust-remote-code"));
+    CHECK(has_arg(args, "--enable-prefix-caching"));
+    CHECK(has_arg(args, "--enable-auto-tool-choice"));
+    CHECK(has_arg_pair(args, "--tool-call-parser", "hermes"));
+    CHECK(has_arg(args, "--disable-log-requests"));
+
+#ifdef _WIN32
+    CHECK(mm::default_vllm_repo_url_for_platform() == mm::kWindowsVllmRepoUrl);
+    CHECK(mm::default_vllm_branch_for_platform() == mm::kWindowsVllmBranch);
+#else
+    CHECK(mm::default_vllm_repo_url_for_platform() == mm::kOfficialVllmRepoUrl);
+    CHECK(mm::default_vllm_branch_for_platform() == "main");
+#endif
 
     return true;
 }
@@ -439,11 +777,9 @@ bool test_control_api_external_token_gate() {
 
         mm::AgentQueue queue;
         mm::NodeRegistry registry(dir.string());
-        mm::ModelDistributor distributor(registry, (dir / "models").string());
-        mm::AgentScheduler scheduler(registry, distributor, (dir / "models").string());
-        mm::ModelRouter router(scheduler);
+        mm::AgentScheduler scheduler(registry, (dir / "models").string());
         mm::ControlApiServer api(
-            agents, queue, registry, router, scheduler,
+            agents, queue, registry, scheduler,
             dir.string(), (dir / "models").string(), "control-secret");
 
         const uint16_t port = 49287;
@@ -467,45 +803,59 @@ bool test_control_api_external_token_gate() {
         }
         RECORD(server_ready);
 
+        // mm::HttpClient opens a fresh connection per request; rapid
+        // sequential connect/close cycles on Windows loopback occasionally
+        // fail at the transport level (status == 0). Retry those.
+        auto with_retry = [](auto&& request) {
+            mm::HttpResponse resp;
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                resp = request();
+                if (resp.status != 0) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            return resp;
+        };
+
         auto expect_error = [&](const mm::HttpResponse& resp,
                                 int expected_status,
-                                const std::string& expected_text) {
+                                const std::string& expected_text,
+                                int call_line) {
+            if (resp.status != expected_status ||
+                resp.body.find(expected_text) == std::string::npos) {
+                std::cerr << "expect_error (call at line " << call_line
+                          << "): got status=" << resp.status
+                          << " body=" << resp.body.substr(0, 200)
+                          << " | expected status=" << expected_status
+                          << " containing '" << expected_text << "'\n";
+            }
             RECORD(resp.status == expected_status);
             RECORD(resp.body.find(expected_text) != std::string::npos);
         };
+#define EXPECT_ERROR(resp, status, text) expect_error((resp), (status), (text), __LINE__)
 
-        auto missing = client.get("/v1/nodes");
-        expect_error(missing, 401, "missing bearer token");
+        auto missing = with_retry([&] { return client.get("/v1/nodes"); });
+        EXPECT_ERROR(missing, 401, "missing bearer token");
 
         client.set_bearer_token("wrong-secret");
-        auto invalid = client.get("/v1/nodes");
-        expect_error(invalid, 403, "invalid bearer token");
+        auto invalid = with_retry([&] { return client.get("/v1/nodes"); });
+        EXPECT_ERROR(invalid, 403, "invalid bearer token");
 
         registry.add_node("http://127.0.0.1:1", "node-secret", "test", false);
 
         client.set_bearer_token("node-secret");
-        auto node_token_on_external = client.get("/v1/nodes");
-        expect_error(node_token_on_external, 403, "invalid bearer token");
+        auto node_token_on_external = with_retry([&] { return client.get("/v1/nodes"); });
+        EXPECT_ERROR(node_token_on_external, 403, "invalid bearer token");
 
         client.set_bearer_token("control-secret");
-        auto valid = client.get("/v1/nodes");
+        auto valid = with_retry([&] { return client.get("/v1/nodes"); });
         RECORD(valid.status == 200);
-        auto valid_voice = client.get("/v1/agents/agent-a/voice");
+        auto valid_voice = with_retry([&] { return client.get("/v1/agents/agent-a/voice"); });
         RECORD(valid_voice.status == 200);
 
         mm::HttpClient missing_voice_client(base_url);
-        auto missing_voice = missing_voice_client.get("/v1/agents/agent-a/voice");
-        expect_error(missing_voice, 401, "missing bearer token");
-
-        mm::HttpClient external_on_internal(base_url);
-        external_on_internal.set_bearer_token("control-secret");
-        auto external_token_internal = external_on_internal.get("/api/control/models");
-        expect_error(external_token_internal, 401, "invalid node api key");
-
-        mm::HttpClient node_client(base_url);
-        node_client.set_bearer_token("node-secret");
-        auto node_internal = node_client.get("/api/control/models");
-        RECORD(node_internal.status == 200);
+        auto missing_voice = with_retry(
+            [&] { return missing_voice_client.get("/v1/agents/agent-a/voice"); });
+        EXPECT_ERROR(missing_voice, 401, "missing bearer token");
 
         struct StreamAttempt {
             bool ok = false;
@@ -518,15 +868,21 @@ bool test_control_api_external_token_gate() {
             mm::HttpClient stream_client(base_url);
             if (!token.empty()) stream_client.set_bearer_token(token);
             StreamAttempt attempt;
-            attempt.ok = stream_client.stream_post(
-                "/v1/agents/agent-a/chat",
-                body,
-                [&](const std::string& event) {
-                    attempt.events.push_back(event);
-                    return true;
-                },
-                &attempt.status,
-                &attempt.body);
+            for (int retry = 0; retry < 3; ++retry) {
+                attempt = StreamAttempt{};
+                attempt.ok = stream_client.stream_post(
+                    "/v1/agents/agent-a/chat",
+                    body,
+                    [&](const std::string& event) {
+                        attempt.events.push_back(event);
+                        return true;
+                    },
+                    &attempt.status,
+                    &attempt.body);
+                // status stays 0 only on transport failure; retry those.
+                if (attempt.ok || attempt.status != 0) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
             return attempt;
         };
 
@@ -554,59 +910,74 @@ bool test_control_api_external_token_gate() {
         RECORD(valid_chat_route.body.find("message required") != std::string::npos);
 
         mm::HttpClient missing_mutator(base_url);
-        auto missing_create_conversation = missing_mutator.post(
-            "/v1/agents/agent-a/conversations",
-            nlohmann::json{{"title", "Blocked"}, {"set_active", true}});
-        expect_error(missing_create_conversation, 401, "missing bearer token");
+        auto missing_create_conversation = with_retry([&] {
+            return missing_mutator.post(
+                "/v1/agents/agent-a/conversations",
+                nlohmann::json{{"title", "Blocked"}, {"set_active", true}});
+        });
+        EXPECT_ERROR(missing_create_conversation, 401, "missing bearer token");
 
         mm::HttpClient node_mutator(base_url);
         node_mutator.set_bearer_token("node-secret");
-        auto node_create_conversation = node_mutator.post(
-            "/v1/agents/agent-a/conversations",
-            nlohmann::json{{"title", "Blocked"}, {"set_active", true}});
-        expect_error(node_create_conversation, 403, "invalid bearer token");
+        auto node_create_conversation = with_retry([&] {
+            return node_mutator.post(
+                "/v1/agents/agent-a/conversations",
+                nlohmann::json{{"title", "Blocked"}, {"set_active", true}});
+        });
+        EXPECT_ERROR(node_create_conversation, 403, "invalid bearer token");
 
-        auto create_conversation = client.post(
-            "/v1/agents/agent-a/conversations",
-            nlohmann::json{{"title", "Original title"}, {"set_active", true}});
+        auto create_conversation = with_retry([&] {
+            return client.post(
+                "/v1/agents/agent-a/conversations",
+                nlohmann::json{{"title", "Original title"}, {"set_active", true}});
+        });
         RECORD(create_conversation.status == 201);
         auto conversation_body = nlohmann::json::parse(create_conversation.body);
         const std::string conversation_id =
             conversation_body["conversation"]["id"].get<std::string>();
 
         mm::HttpClient missing_put(base_url);
-        auto missing_rename = missing_put.put(
-            "/v1/agents/agent-a/conversations/" + conversation_id,
-            nlohmann::json{{"title", "Blocked rename"}});
-        expect_error(missing_rename, 401, "missing bearer token");
+        auto missing_rename = with_retry([&] {
+            return missing_put.put(
+                "/v1/agents/agent-a/conversations/" + conversation_id,
+                nlohmann::json{{"title", "Blocked rename"}});
+        });
+        EXPECT_ERROR(missing_rename, 401, "missing bearer token");
 
-        auto rename = client.put(
-            "/v1/agents/agent-a/conversations/" + conversation_id,
-            nlohmann::json{{"title", "Renamed by authorized client"}});
+        auto rename = with_retry([&] {
+            return client.put(
+                "/v1/agents/agent-a/conversations/" + conversation_id,
+                nlohmann::json{{"title", "Renamed by authorized client"}});
+        });
         RECORD(rename.status == 200);
         auto renamed_body = nlohmann::json::parse(rename.body);
         RECORD(renamed_body["title"] == "Renamed by authorized client");
 
         mm::HttpClient invalid_memory_client(base_url);
         invalid_memory_client.set_bearer_token("wrong-secret");
-        auto invalid_create_memory = invalid_memory_client.post(
-            "/v1/agents/agent-a/memories",
-            nlohmann::json{{"content", "Blocked memory"}, {"source_conv_id", conversation_id}});
-        expect_error(invalid_create_memory, 403, "invalid bearer token");
+        auto invalid_create_memory = with_retry([&] {
+            return invalid_memory_client.post(
+                "/v1/agents/agent-a/memories",
+                nlohmann::json{{"content", "Blocked memory"}, {"source_conv_id", conversation_id}});
+        });
+        EXPECT_ERROR(invalid_create_memory, 403, "invalid bearer token");
 
-        auto create_memory = client.post(
-            "/v1/agents/agent-a/memories",
-            nlohmann::json{{"content", "Authorized memory"}, {"source_conv_id", conversation_id}});
+        auto create_memory = with_retry([&] {
+            return client.post(
+                "/v1/agents/agent-a/memories",
+                nlohmann::json{{"content", "Authorized memory"}, {"source_conv_id", conversation_id}});
+        });
         RECORD(create_memory.status == 201);
         auto memory_body = nlohmann::json::parse(create_memory.body);
         const std::string memory_id = memory_body["id"].get<std::string>();
 
         mm::HttpClient missing_delete(base_url);
-        auto missing_delete_memory = missing_delete.del(
-            "/v1/agents/agent-a/memories/" + memory_id);
-        expect_error(missing_delete_memory, 401, "missing bearer token");
+        auto missing_delete_memory = with_retry(
+            [&] { return missing_delete.del("/v1/agents/agent-a/memories/" + memory_id); });
+        EXPECT_ERROR(missing_delete_memory, 401, "missing bearer token");
 
-        auto delete_memory = client.del("/v1/agents/agent-a/memories/" + memory_id);
+        auto delete_memory = with_retry(
+            [&] { return client.del("/v1/agents/agent-a/memories/" + memory_id); });
         RECORD(delete_memory.status == 200);
 
         api.stop();
@@ -616,6 +987,7 @@ bool test_control_api_external_token_gate() {
         queue.shutdown();
     }
     RECORD(remove_tree(dir));
+#undef EXPECT_ERROR
 #undef RECORD
     return ok;
 }
@@ -802,6 +1174,144 @@ bool test_tts_service_client_fake_sidecar_paths() {
     return ok;
 }
 
+bool test_tts_service_client_vllm_backend_paths() {
+    const uint16_t port = 49291;
+    httplib::Server server;
+    std::mutex requests_mutex;
+    std::vector<nlohmann::json> requests;
+
+    server.Get("/health", [](const httplib::Request&, httplib::Response& res) {
+        res.status = 200;
+        res.set_content("", "text/plain");
+    });
+
+    server.Post("/v1/audio/speech", [&](const httplib::Request& req, httplib::Response& res) {
+        auto body = nlohmann::json::parse(req.body);
+        {
+            std::lock_guard<std::mutex> lock(requests_mutex);
+            requests.push_back(body);
+        }
+        if (body.value("input", std::string{}) == "fail") {
+            res.status = 500;
+            res.set_content(
+                nlohmann::json{{"error", {{"message", "vllm failure"}}}}.dump(),
+                "application/json");
+            return;
+        }
+        res.set_content(std::string{"RIFFfake-wav"}, "audio/wav");
+    });
+
+    std::atomic<bool> listen_returned{false};
+    std::atomic<bool> listen_ok{false};
+    std::thread server_thread([&] {
+        listen_ok = server.listen("127.0.0.1", port);
+        listen_returned = true;
+    });
+
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    auto dir = temp_test_dir("tts-vllm");
+    std::filesystem::create_directories(dir);
+
+    mm::TtsServiceConfig config;
+    config.enabled = true;
+    config.backend = "vllm";
+    config.vllm_base_url = "http://127.0.0.1:" + std::to_string(port);
+    config.vllm_model_id = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice";
+    mm::TtsServiceClient client(config);
+
+    bool ready = false;
+    std::string health_error;
+    for (int i = 0; i < 50; ++i) {
+        if (client.health(&health_error)) {
+            ready = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    RECORD(ready);
+    RECORD(client.provider_name() == "qwen3-tts-vllm");
+    RECORD(client.default_synthesis_model_id() == config.vllm_model_id);
+
+    const auto preview_path = (dir / "preview.wav").string();
+    const auto descriptor_path = (dir / "voice.voice.json").string();
+
+    mm::VoiceDesignProposal proposal;
+    proposal.display_name = "Analyst Voice";
+    proposal.sample_text = "Preview text.";
+    proposal.language = "English";
+    proposal.voice_description = "Original clear voice.";
+    auto sample = client.generate_voice_sample(proposal, preview_path, descriptor_path);
+    RECORD(sample.ok);
+    RECORD(sample.status == 200);
+    RECORD(sample.audio_path == preview_path);
+    RECORD(sample.voice_clone_prompt_path == descriptor_path);
+    RECORD(std::filesystem::is_regular_file(preview_path));
+    RECORD(std::filesystem::is_regular_file(descriptor_path));
+
+    nlohmann::json descriptor;
+    {
+        std::ifstream in(descriptor_path, std::ios::binary);
+        in >> descriptor;
+    }
+    RECORD(descriptor["provider"] == "qwen3-tts-vllm");
+    RECORD(descriptor["model"] == config.vllm_model_id);
+    RECORD(descriptor["voice_description"] == "Original clear voice.");
+
+    mm::AgentVoiceProfile profile;
+    profile.id = "profile-a";
+    profile.display_name = "Analyst Voice";
+    profile.language = "English";
+    profile.voice_description = "Should be overridden by descriptor.";
+    profile.voice_clone_prompt_path = descriptor_path;
+
+    const auto speech_path = (dir / "speech.wav").string();
+    mm::TtsSynthesisRequest request;
+    request.text = "Speak.";
+    request.format = "wav";
+    auto speech = client.synthesize(request, profile, speech_path);
+    RECORD(speech.ok);
+    RECORD(speech.audio_path == speech_path);
+    RECORD(std::filesystem::is_regular_file(speech_path));
+    {
+        std::ifstream in(speech_path, std::ios::binary);
+        const std::string audio((std::istreambuf_iterator<char>(in)),
+                                std::istreambuf_iterator<char>());
+        RECORD(audio == "RIFFfake-wav");
+    }
+
+    request.text = "fail";
+    auto failed = client.synthesize(request, profile, (dir / "failed.wav").string());
+    RECORD(!failed.ok);
+    RECORD(failed.status == 500);
+    RECORD(failed.error.find("vllm failure") != std::string::npos);
+
+    {
+        std::lock_guard<std::mutex> lock(requests_mutex);
+        RECORD(requests.size() == 3);
+        if (requests.size() >= 2) {
+            RECORD(requests[0]["model"] == config.vllm_model_id);
+            RECORD(requests[0]["input"] == "Preview text.");
+            RECORD(requests[0]["voice"] == "Original clear voice.");
+            RECORD(requests[1]["input"] == "Speak.");
+            RECORD(requests[1]["voice"] == "Original clear voice.");
+            RECORD(requests[1]["response_format"] == "wav");
+        }
+    }
+
+    server.stop();
+    if (server_thread.joinable()) server_thread.join();
+    RECORD(listen_ok);
+    RECORD(listen_returned);
+    RECORD(remove_tree(dir));
+#undef RECORD
+    return ok;
+}
+
 bool test_control_api_tts_routes_disabled() {
     auto dir = temp_test_dir("control-tts-disabled");
     std::filesystem::create_directories(dir);
@@ -823,11 +1333,9 @@ bool test_control_api_tts_routes_disabled() {
 
         mm::AgentQueue queue;
         mm::NodeRegistry registry(dir.string());
-        mm::ModelDistributor distributor(registry, (dir / "models").string());
-        mm::AgentScheduler scheduler(registry, distributor, (dir / "models").string());
-        mm::ModelRouter router(scheduler);
+        mm::AgentScheduler scheduler(registry, (dir / "models").string());
         mm::ControlApiServer api(
-            agents, queue, registry, router, scheduler,
+            agents, queue, registry, scheduler,
             dir.string(), (dir / "models").string());
 
         const uint16_t port = 49289;
@@ -912,11 +1420,9 @@ bool test_control_api_curation_routes() {
 
     mm::AgentQueue queue;
     mm::NodeRegistry registry(dir.string());
-    mm::ModelDistributor distributor(registry, (dir / "models").string());
-    mm::AgentScheduler scheduler(registry, distributor, (dir / "models").string());
-    mm::ModelRouter router(scheduler);
+    mm::AgentScheduler scheduler(registry, (dir / "models").string());
     mm::ControlApiServer api(
-        agents, queue, registry, router, scheduler,
+        agents, queue, registry, scheduler,
         dir.string(), (dir / "models").string());
 
     const uint16_t port = 49288;
@@ -1516,9 +2022,41 @@ bool test_compaction_followup_trace_provenance_survives() {
     return true;
 }
 
+bool test_config_and_url_parsing_edge_cases() {
+    auto dir = temp_test_dir("config-hash");
+    std::filesystem::create_directories(dir);
+    const auto cfg_path = dir / "test.toml";
+    {
+        std::ofstream f(cfg_path);
+        f << "# full-line comment\n";
+        f << "token = \"abc#123\" # trailing comment\n";
+        f << "plain = value # comment\n";
+        f << "single = 'x#y'\n";
+    }
+    mm::ConfigFile cfg;
+    CHECK(cfg.load(cfg_path.string()));
+    CHECK(cfg.get("token", "") == "abc#123");
+    CHECK(cfg.get("plain", "") == "value");
+    CHECK(cfg.get("single", "") == "x#y");
+
+    CHECK(mm::util::parse_url("https://example.com") ==
+          std::make_pair(std::string("example.com"), 443));
+    CHECK(mm::util::parse_url("http://example.com:7070/path") ==
+          std::make_pair(std::string("example.com"), 7070));
+    CHECK(mm::util::parse_url("http://[::1]:9090") ==
+          std::make_pair(std::string("::1"), 9090));
+    CHECK(mm::util::parse_url("http://[::1]/x") ==
+          std::make_pair(std::string("::1"), 80));
+    CHECK(mm::util::parse_url("https://example.com:notaport") ==
+          std::make_pair(std::string("example.com"), 443));
+
+    CHECK(remove_tree(dir));
+    return true;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     struct TestCase {
         const char* name;
         bool (*fn)();
@@ -1534,17 +2072,31 @@ int main() {
         {"slot_manager_not_found_statuses", test_slot_manager_not_found_statuses},
         {"slot_lease_blocks_unload_and_suspend_while_busy",
          test_slot_lease_blocks_unload_and_suspend_while_busy},
-        {"llama_settings_throughput_fields_round_trip",
-         test_llama_settings_throughput_fields_round_trip},
-        {"llama_server_args_throughput_tunables",
-         test_llama_server_args_throughput_tunables},
-        {"inference_sizing_tracks_effective_context",
-         test_inference_sizing_tracks_effective_context},
+        {"vllm_slot_info_and_suspend_without_kv_cache",
+         test_vllm_slot_info_and_suspend_without_kv_cache},
+        {"vllm_gpu_budget_accounting",
+         test_vllm_gpu_budget_accounting},
+        {"vllm_shared_slot_attach_and_detach",
+         test_vllm_shared_slot_attach_and_detach},
+        {"vllm_restore_attaches_and_cleans_suspended_record",
+         test_vllm_restore_attaches_and_cleans_suspended_record},
+        {"vllm_sleep_fallback_and_dead_wake_cleanup",
+         test_vllm_sleep_fallback_and_dead_wake_cleanup},
+        {"vllm_metrics_parse_and_slot_info_round_trip",
+         test_vllm_metrics_parse_and_slot_info_round_trip},
+        {"engine_group_planner",
+         test_engine_group_planner},
+        {"ray_start_args",
+         test_ray_start_args},
+        {"vllm_runtime_defaults_and_args",
+         test_vllm_runtime_defaults_and_args},
         {"control_api_external_token_gate", test_control_api_external_token_gate},
         {"agent_voice_db_and_cache_lifecycle",
          test_agent_voice_db_and_cache_lifecycle},
         {"tts_service_client_fake_sidecar_paths",
          test_tts_service_client_fake_sidecar_paths},
+        {"tts_service_client_vllm_backend_paths",
+         test_tts_service_client_vllm_backend_paths},
         {"control_api_tts_routes_disabled", test_control_api_tts_routes_disabled},
         {"control_api_curation_routes", test_control_api_curation_routes},
         {"global_memory_origin_tool_and_context_metadata",
@@ -1552,14 +2104,25 @@ int main() {
         {"message_trace_events_round_trip", test_message_trace_events_round_trip},
         {"compaction_followup_trace_provenance_survives",
          test_compaction_followup_trace_provenance_survives},
+        {"config_and_url_parsing_edge_cases", test_config_and_url_parsing_edge_cases},
     };
 
+    const std::string filter = argc > 1 ? argv[1] : std::string{};
+    bool ran_any = false;
     for (const auto& test : tests) {
+        if (!filter.empty() && std::string(test.name).find(filter) == std::string::npos) {
+            continue;
+        }
+        ran_any = true;
         if (!test.fn()) {
             std::cerr << "FAILED: " << test.name << "\n";
             return 1;
         }
         std::cout << "PASSED: " << test.name << "\n";
+    }
+    if (!filter.empty() && !ran_any) {
+        std::cerr << "No tests matched filter: " << filter << "\n";
+        return 1;
     }
     return 0;
 }

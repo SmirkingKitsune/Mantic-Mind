@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <unordered_set>
+#include <condition_variable>
 #include <mutex>
 #include <atomic>
 #include <functional>
@@ -32,30 +33,6 @@ struct StreamingTextState {
     int64_t     updated_ms    = 0;
 };
 
-struct LlamaUpdateState {
-    bool        running = false;
-    std::string status  = "idle"; // idle|running|succeeded|failed
-    std::string message;
-    int64_t     started_ms  = 0;
-    int64_t     finished_ms = 0;
-};
-
-struct LlamaRuntimeSummary {
-    std::string install_root;
-    std::string repo_dir;
-    std::string build_dir;
-    std::string binary_path;
-
-    std::string installed_commit;
-    std::string remote_commit;
-    std::string remote_error;
-    int64_t     remote_checked_ms = 0;
-    bool        update_available  = false;
-    std::string update_reason     = "unknown";
-
-    std::string last_log_path;
-};
-
 // Thread-safe shared state for the node process.
 // Metrics are updated by a background polling thread.
 class NodeState {
@@ -80,27 +57,20 @@ public:
     // ── Multi-slot tracking ─────────────────────────────────────────────────
     std::vector<SlotInfo> get_slots() const;
     void                  set_slots(const std::vector<SlotInfo>& slots);
-    std::vector<StoredModel> get_stored_models() const;
-    int64_t                 get_models_disk_free_mb() const;
-    void                    set_storage(const std::vector<StoredModel>& models,
-                                        int64_t disk_free_mb);
 
     // ── Health metrics ────────────────────────────────────────────────────────
     NodeHealthMetrics get_metrics() const;
     void              update_metrics(const NodeHealthMetrics& m);
+
+    // ── Cluster capabilities (advertised to control) ──────────────────────────
+    NodeCapabilities get_capabilities() const;
+    void             set_capabilities(const NodeCapabilities& caps);
 
     // ── Diagnostics ───────────────────────────────────────────────────────────
     std::string get_last_error() const;
     void        set_last_error(const std::string& err);
     std::string get_llama_server_path() const;
     void        set_llama_server_path(const std::string& path);
-
-    LlamaUpdateState get_llama_update_state() const;
-    bool             start_llama_update(const std::string& message);
-    void             finish_llama_update(bool success, const std::string& message);
-    void             set_llama_update_message(const std::string& message);
-    LlamaRuntimeSummary get_llama_runtime_summary() const;
-    void                set_llama_runtime_summary(const LlamaRuntimeSummary& summary);
 
     // ── Streaming text (for TUI display of generated output) ─────────────────
     StreamingTextState get_streaming_text() const;
@@ -138,21 +108,20 @@ private:
     std::string                  loaded_model_;
     std::string                  active_agent_;
     std::vector<SlotInfo>        slots_;
-    std::vector<StoredModel>     stored_models_;
-    int64_t                      models_disk_free_mb_ = 0;
     NodeHealthMetrics            metrics_;
+    NodeCapabilities             capabilities_;
     std::string                  last_error_;
     std::string                  llama_server_path_;
     std::unordered_set<std::string> api_keys_;
 
     std::optional<PendingPair>   pending_pair_;
     int64_t                      last_control_contact_ms_ = 0;
-    LlamaUpdateState             llama_update_;
-    LlamaRuntimeSummary          llama_runtime_;
     StreamingTextState           streaming_text_;
 
     std::atomic<bool>            polling_{false};
     std::thread                  poll_thread_;
+    std::mutex                   poll_mutex_;   // guards poll_cv_ wait predicate
+    std::condition_variable      poll_cv_;      // wakes the poll loop on stop
     MetricsCallback              metrics_cb_;
 
     static NodeHealthMetrics sample_metrics(const std::string& llama_server_path = "");

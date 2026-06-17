@@ -1,11 +1,14 @@
 #include "common/util.hpp"
 
+#include <openssl/rand.h>
+
 #include <random>
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <stdexcept>
 
 namespace mm::util {
 
@@ -124,32 +127,68 @@ bool is_valid_agent_id(const std::string& id) {
 }
 
 // ── API key generation ────────────────────────────────────────────────────────
+// API keys are bearer credentials, so they must come from a CSPRNG. Rejection
+// sampling keeps the charset distribution unbiased (62 does not divide 256).
 std::string generate_api_key(size_t length) {
     static constexpr char kCharset[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     static constexpr size_t kCharsetSize = sizeof(kCharset) - 1;
-
-    static thread_local std::mt19937 rng{std::random_device{}()};
-    std::uniform_int_distribution<size_t> dist(0, kCharsetSize - 1);
+    static constexpr unsigned char kRejectAbove =
+        static_cast<unsigned char>(256 / kCharsetSize * kCharsetSize); // 248
 
     std::string key;
     key.reserve(length);
-    for (size_t i = 0; i < length; ++i)
-        key += kCharset[dist(rng)];
+    unsigned char buf[64];
+    while (key.size() < length) {
+        if (RAND_bytes(buf, static_cast<int>(sizeof(buf))) != 1)
+            throw std::runtime_error("generate_api_key: RAND_bytes failed");
+        for (unsigned char b : buf) {
+            if (b >= kRejectAbove) continue;
+            key += kCharset[b % kCharsetSize];
+            if (key.size() == length) break;
+        }
+    }
     return key;
 }
 
 // ── URL parsing ──────────────────────────────────────────────────────────────
 std::pair<std::string, int> parse_url(const std::string& url) {
     std::string s = url;
-    if (s.rfind("https://", 0) == 0)      s = s.substr(8);
-    else if (s.rfind("http://", 0) == 0)  s = s.substr(7);
+    int default_port = 80;
+    if (s.rfind("https://", 0) == 0) {
+        s = s.substr(8);
+        default_port = 443;
+    } else if (s.rfind("http://", 0) == 0) {
+        s = s.substr(7);
+    }
     auto slash = s.find('/');
     if (slash != std::string::npos) s = s.substr(0, slash);
+
+    auto parse_port = [&](const std::string& text) -> int {
+        try {
+            int p = std::stoi(text);
+            if (p > 0 && p <= 65535) return p;
+        } catch (const std::exception&) {}
+        return default_port;
+    };
+
+    // Bracketed IPv6 literal: [::1] or [::1]:8080
+    if (!s.empty() && s.front() == '[') {
+        auto close = s.find(']');
+        if (close != std::string::npos) {
+            std::string host = s.substr(1, close - 1);
+            if (close + 1 < s.size() && s[close + 1] == ':')
+                return { host, parse_port(s.substr(close + 2)) };
+            return { host, default_port };
+        }
+    }
+
     auto colon = s.rfind(':');
-    if (colon != std::string::npos)
-        return { s.substr(0, colon), std::stoi(s.substr(colon + 1)) };
-    return { s, 80 };
+    // A single colon separates host:port. Multiple colons mean an unbracketed
+    // IPv6 address with no port.
+    if (colon != std::string::npos && s.find(':') == colon)
+        return { s.substr(0, colon), parse_port(s.substr(colon + 1)) };
+    return { s, default_port };
 }
 
 // ── SSE line draining ────────────────────────────────────────────────────────

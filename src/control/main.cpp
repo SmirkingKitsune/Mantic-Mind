@@ -6,9 +6,7 @@
 #include "control/control_config.hpp"
 #include "control/agent_manager.hpp"
 #include "control/node_registry.hpp"
-#include "control/model_distributor.hpp"
 #include "control/agent_scheduler.hpp"
-#include "control/model_router.hpp"
 #include "control/agent_queue.hpp"
 #include "control/control_api_server.hpp"
 #include "control/control_ui.hpp"
@@ -97,6 +95,7 @@ static mm::ControlConfig load_config(
         cfg.models_dir     = file.get("models_dir",     cfg.models_dir);
         cfg.external_api_token = file.get("external_api_token", cfg.external_api_token);
         cfg.tts.enabled = file.get_bool("tts_enabled", cfg.tts.enabled);
+        cfg.tts.backend = file.get("tts_backend", cfg.tts.backend);
         cfg.tts.service_url = file.get("tts_service_url", cfg.tts.service_url);
         cfg.tts.service_command = file.get("tts_service_command", cfg.tts.service_command);
         cfg.tts.cache_dir = file.get("tts_cache_dir", cfg.tts.cache_dir);
@@ -105,6 +104,13 @@ static mm::ControlConfig load_config(
         cfg.tts.clone_model_id = file.get("tts_clone_model_id", cfg.tts.clone_model_id);
         cfg.tts.custom_voice_model_id =
             file.get("tts_custom_voice_model_id", cfg.tts.custom_voice_model_id);
+        cfg.tts.vllm_base_url = file.get("tts_vllm_base_url", cfg.tts.vllm_base_url);
+        cfg.tts.vllm_speech_path =
+            file.get("tts_vllm_speech_path", cfg.tts.vllm_speech_path);
+        cfg.tts.vllm_model_id = file.get("tts_vllm_model_id", cfg.tts.vllm_model_id);
+        cfg.tts.vllm_api_key = file.get("tts_vllm_api_key", cfg.tts.vllm_api_key);
+        cfg.tts.vllm_api_key_env =
+            file.get("tts_vllm_api_key_env", cfg.tts.vllm_api_key_env);
         cfg.tts.cache_ttl_ms = file.get_int(
             "tts_cache_ttl_ms",
             static_cast<int>(cfg.tts.cache_ttl_ms));
@@ -143,6 +149,7 @@ static mm::ControlConfig load_config(
     cfg.external_api_token =
         env("MM_CONTROL_EXTERNAL_API_TOKEN", cfg.external_api_token);
     cfg.tts.enabled = env_bool("MM_TTS_ENABLED", cfg.tts.enabled);
+    cfg.tts.backend = env("MM_TTS_BACKEND", cfg.tts.backend);
     cfg.tts.service_url = env("MM_TTS_SERVICE_URL", cfg.tts.service_url);
     cfg.tts.service_command = env("MM_TTS_SERVICE_COMMAND", cfg.tts.service_command);
     cfg.tts.cache_dir = env("MM_TTS_CACHE_DIR", cfg.tts.cache_dir);
@@ -151,6 +158,11 @@ static mm::ControlConfig load_config(
     cfg.tts.clone_model_id = env("MM_TTS_CLONE_MODEL_ID", cfg.tts.clone_model_id);
     cfg.tts.custom_voice_model_id =
         env("MM_TTS_CUSTOM_VOICE_MODEL_ID", cfg.tts.custom_voice_model_id);
+    cfg.tts.vllm_base_url = env("MM_TTS_VLLM_BASE_URL", cfg.tts.vllm_base_url);
+    cfg.tts.vllm_speech_path = env("MM_TTS_VLLM_SPEECH_PATH", cfg.tts.vllm_speech_path);
+    cfg.tts.vllm_model_id = env("MM_TTS_VLLM_MODEL_ID", cfg.tts.vllm_model_id);
+    cfg.tts.vllm_api_key = env("MM_TTS_VLLM_API_KEY", cfg.tts.vllm_api_key);
+    cfg.tts.vllm_api_key_env = env("MM_TTS_VLLM_API_KEY_ENV", cfg.tts.vllm_api_key_env);
     cfg.tts.cache_ttl_ms = env_int(
         "MM_TTS_CACHE_TTL_MS",
         static_cast<int>(cfg.tts.cache_ttl_ms));
@@ -951,12 +963,10 @@ int main(int argc, char** argv) {
     agents.load_all();
 
     mm::NodeRegistry      registry(cfg.data_dir);
-    mm::ModelDistributor  distributor(registry, cfg.models_dir);
-    mm::AgentScheduler    scheduler(registry, distributor, cfg.models_dir);
-    mm::ModelRouter       router(scheduler);
+    mm::AgentScheduler    scheduler(registry, cfg.models_dir);
     mm::AgentQueue        queue;
     mm::ControlApiServer  api_server(
-        agents, queue, registry, router, scheduler,
+        agents, queue, registry, scheduler,
         cfg.data_dir, cfg.models_dir, cfg.external_api_token, cfg.tts);
     api_server.cleanup_expired_tts_cache();
     mm::ControlUI         ui(

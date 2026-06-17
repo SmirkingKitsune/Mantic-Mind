@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <vector>
 #include <functional>
+#include <condition_variable>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -46,15 +47,9 @@ public:
     // ── Multi-slot queries ─────────────────────────────────────────────────────
     /// Update node's slot list (from status poll).
     void update_node_slots(const NodeId& id, const std::vector<SlotInfo>& slots);
-    /// Update node's stored models and disk info (from status poll).
-    void update_node_storage(const NodeId& id,
-                             const std::vector<StoredModel>& models,
-                             int64_t disk_free_mb);
 
     /// Nodes that have a model loaded in a ready slot.
     std::vector<NodeInfo> nodes_with_model_loaded(const std::string& model_path) const;
-    /// Nodes that have a model file stored on disk.
-    std::vector<NodeInfo> nodes_with_model_stored(const std::string& model_path) const;
     /// Nodes that can likely host a model requiring `min_vram_mb`:
     /// - preferred: enough free VRAM
     /// - fallback: VRAM + weighted RAM budget (CPU offload)
@@ -91,15 +86,6 @@ public:
                           const std::string& pin_or_psk,
                           bool remember = false);
 
-    // Trigger node-side llama.cpp updater script (manual action).
-    // Returns true if the node accepted the update job.
-    bool request_llama_update(const NodeId& id,
-                              bool build = true,
-                              bool force = false,
-                              std::string* out_message = nullptr);
-    bool request_llama_check_update(const NodeId& id,
-                                    std::string* out_message = nullptr);
-
 private:
     mutable std::mutex                    mutex_;
     std::unordered_map<NodeId, NodeInfo>  nodes_;
@@ -107,8 +93,10 @@ private:
     std::string                           remembered_nodes_path_;
     UpdateCallback                        update_cb_;
 
-    std::atomic<bool> polling_{false};
-    std::thread       poll_thread_;
+    std::atomic<bool>       polling_{false};
+    std::thread             poll_thread_;
+    std::mutex              poll_mutex_;       // guards poll_cv_ wait predicate
+    std::condition_variable poll_cv_;          // wakes the poll loop on stop
 
     NodeDiscoveryListener discovery_listener_;
 

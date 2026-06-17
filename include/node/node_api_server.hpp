@@ -11,10 +11,7 @@ namespace mm {
 
 class NodeState;
 class SlotManager;
-class ModelStorage;
-class ModelPuller;
 class HttpServer;
-class LlamaRuntimeManager;
 
 // Hosts the node REST API.
 // Most endpoints require "Authorization: Bearer <node-api-key>".
@@ -23,8 +20,6 @@ class NodeApiServer {
 public:
     NodeApiServer(NodeState& state,
                   SlotManager& slot_mgr,
-                  ModelStorage& model_storage,
-                  LlamaRuntimeManager& runtime_mgr,
                   std::string control_url = {},
                   std::string pairing_key = {});
     ~NodeApiServer();
@@ -37,15 +32,16 @@ public:
     using RememberApiKeyCallback = std::function<void(const std::string& key)>;
     void set_runtime_logs_provider(RuntimeLogsProvider provider);
     void set_remember_api_key_callback(RememberApiKeyCallback callback);
+    // Ray CLI config for the multi-node engine-group endpoints.
+    void set_ray_config(std::string ray_path, uint16_t ray_port);
 
 private:
     NodeState&     state_;
     SlotManager&   slot_mgr_;
-    ModelStorage&  model_storage_;
-    std::unique_ptr<ModelPuller> model_puller_;
-    LlamaRuntimeManager& runtime_mgr_;
     std::string    control_url_;
     std::string    pairing_key_;
+    std::string    ray_path_ = "ray";
+    uint16_t       ray_port_ = 6379;
     std::unique_ptr<HttpServer> server_;
     RuntimeLogsProvider runtime_logs_provider_;
     RememberApiKeyCallback remember_api_key_cb_;

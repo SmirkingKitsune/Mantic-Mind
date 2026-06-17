@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <optional>
@@ -77,6 +78,50 @@ struct LlamaSettings {
     std::vector<std::string> extra_args;  // additional llama-server CLI flags
 };
 
+// vLLM server launch settings. Generation settings that are common to both
+// backends still flow through LlamaSettings in the current request contract.
+struct VllmSettings {
+    int         max_model_len = 4096;
+    int         max_num_seqs = 16;
+    int         max_num_batched_tokens = -1; // -1 = vLLM default
+    int         tensor_parallel_size = 1;
+    int         pipeline_parallel_size = 1;
+    double      gpu_memory_utilization = 0.90;
+    std::string dtype = "auto";
+    std::string quantization;
+    std::string served_model_name;
+    bool        trust_remote_code = false;
+    bool        enable_prefix_caching = true;
+    bool        enable_auto_tool_choice = false;
+    // Launch with vLLM sleep mode (--enable-sleep-mode + VLLM_SERVER_DEV_MODE).
+    // Suspension then offloads weights to host RAM (/sleep level=1) and wakes
+    // in seconds instead of restarting the engine. Requires CUDA.
+    bool        enable_sleep_mode = true;
+    std::string tool_call_parser;
+    std::vector<std::string> extra_args; // additional vllm serve CLI flags
+};
+
+/// True when two vLLM configurations describe the same engine launch, i.e.
+/// agents using either can share one vllm-serve process. gpu_memory_utilization
+/// is excluded: it sizes the engine on its node, it does not change what the
+/// engine serves.
+inline bool vllm_launch_compatible(const VllmSettings& a, const VllmSettings& b) {
+    return a.max_model_len          == b.max_model_len
+        && a.max_num_seqs           == b.max_num_seqs
+        && a.max_num_batched_tokens == b.max_num_batched_tokens
+        && a.tensor_parallel_size   == b.tensor_parallel_size
+        && a.pipeline_parallel_size == b.pipeline_parallel_size
+        && a.dtype                  == b.dtype
+        && a.quantization           == b.quantization
+        && a.served_model_name      == b.served_model_name
+        && a.trust_remote_code      == b.trust_remote_code
+        && a.enable_prefix_caching  == b.enable_prefix_caching
+        && a.enable_auto_tool_choice == b.enable_auto_tool_choice
+        && a.enable_sleep_mode      == b.enable_sleep_mode
+        && a.tool_call_parser       == b.tool_call_parser
+        && a.extra_args             == b.extra_args;
+}
+
 // ── AgentConfig ───────────────────────────────────────────────────────────────
 struct AgentConfig {
     AgentId       id;
@@ -84,6 +129,7 @@ struct AgentConfig {
     std::string   model_path;
     std::string   system_prompt;
     LlamaSettings llama_settings;
+    VllmSettings  vllm_settings;
     bool          reasoning_enabled = false;
     bool          memories_enabled  = true;
     bool          tools_enabled     = false;
@@ -249,29 +295,20 @@ struct SlotInfo {
     SlotId      id;
     uint16_t    port            = 0;
     std::string model_path;
-    AgentId     assigned_agent;
+    AgentId     assigned_agent;          // first attached agent (legacy display)
+    std::vector<AgentId> agent_ids;      // all agents attached to this slot
     SlotState   state           = SlotState::Empty;
+    bool        sleeping        = false; // vLLM: suspended via sleep mode, engine process alive
+    // vLLM engine load, scraped from the engine's Prometheus /metrics.
+    bool        engine_metrics_valid = false;
+    int         num_requests_running = 0;
+    int         num_requests_waiting = 0;
+    double      kv_cache_usage       = 0.0;  // 0.0–1.0
     int64_t     vram_usage_mb   = 0;
+    double      gpu_mem_fraction = 0.0;  // vLLM only: --gpu-memory-utilization slice held
     int64_t     last_active_ms  = 0;
     std::string kv_cache_path;
     int         effective_ctx_size = 0;
-};
-
-// ── StoredModel ──────────────────────────────────────────────────────────────
-struct StoredModel {
-    std::string model_path;
-    std::string sha256;
-    int64_t     size_bytes   = 0;
-    int         shard_count  = 1;
-};
-
-// ── ModelTransferRequest ─────────────────────────────────────────────────────
-struct ModelTransferRequest {
-    std::string model_filename;
-    std::string sha256;
-    int64_t     total_bytes  = 0;
-    int         shard_index  = 0;
-    int         shard_count  = 1;
 };
 
 // ── AgentPlacement ───────────────────────────────────────────────────────────
@@ -286,6 +323,32 @@ struct AgentPlacement {
     int64_t     last_active_ms  = 0;
 };
 
+// ── NodeCapabilities ──────────────────────────────────────────────────────────
+// Cluster-formation capabilities a node advertises. Multi-node vLLM engine
+// groups require members to share an arch + vLLM build (fingerprint) and a
+// common collective-comms backend. Empty/false defaults mean "unknown / not
+// cluster-capable", which is exactly how an older node (that doesn't report
+// this block) is treated.
+struct NodeCapabilities {
+    std::string              arch;            // "x86_64", "aarch64", "" = unknown
+    std::vector<std::string> comm_backends;   // e.g. {"nccl","gloo"} or {"gloo"}
+    std::string              vllm_version;     // engine build fingerprint, "" = unknown
+    bool                     supports_ray = false;
+    int                      gpu_count = 0;    // GPUs visible to this node
+    double                   interconnect_gbps = 0.0; // node-to-node link hint, 0 = unknown
+
+    bool has_comm_backend(const std::string& b) const {
+        return std::find(comm_backends.begin(), comm_backends.end(), b)
+            != comm_backends.end();
+    }
+    // The (arch, vllm_version) pair members must match to span one engine.
+    std::string fingerprint() const { return arch + "|" + vllm_version; }
+    bool cluster_capable() const {
+        return supports_ray && !arch.empty() && gpu_count > 0
+            && !comm_backends.empty();
+    }
+};
+
 // ── NodeInfo ──────────────────────────────────────────────────────────────────
 struct NodeInfo {
     NodeId           id;
@@ -296,11 +359,11 @@ struct NodeInfo {
     bool             connected = false;
     bool             remembered = false;
     std::string      platform;
+    NodeCapabilities capabilities;
     NodeHealthMetrics metrics;
 
     // Multi-slot fields
     std::vector<SlotInfo>    slots;
-    std::vector<StoredModel> stored_models;
     int64_t                  disk_free_mb = 0;
     int                      max_slots    = 1;
     int                      slot_in_use = 0;
@@ -310,27 +373,9 @@ struct NodeInfo {
     int                      slot_suspending = 0;
     int                      slot_suspended = 0;
     int                      slot_error = 0;
-    std::string              llama_server_path;
-
-    // Node-managed llama.cpp updater status
-    bool                     llama_update_running = false;
-    std::string              llama_update_status  = "idle"; // idle|running|succeeded|failed
-    std::string              llama_update_message;
-    int64_t                  llama_update_started_ms  = 0;
-    int64_t                  llama_update_finished_ms = 0;
-
-    // Runtime/version summary
-    std::string              llama_install_root;
-    std::string              llama_repo_dir;
-    std::string              llama_build_dir;
-    std::string              llama_binary_path;
-    std::string              llama_installed_commit;
-    std::string              llama_remote_commit;
-    std::string              llama_remote_error;
-    int64_t                  llama_remote_checked_ms = 0;
-    bool                     llama_update_available = false;
-    std::string              llama_update_reason = "unknown";
-    std::string              llama_update_log_path;
+    std::string              vllm_server_path;
+    double                   vllm_gpu_budget = 0.0;         // total GPU fraction vLLM slots may claim
+    double                   vllm_gpu_fraction_used = 0.0;  // fraction currently claimed (incl. loads in flight)
 };
 
 // ── ToolDefinition ────────────────────────────────────────────────────────────
@@ -510,6 +555,41 @@ inline void from_json(const nlohmann::json& j, LlamaSettings& s) {
     if (j.contains("extra_args"))   j.at("extra_args").get_to(s.extra_args);
 }
 
+inline void to_json(nlohmann::json& j, const VllmSettings& s) {
+    j = { {"max_model_len",           s.max_model_len},
+          {"max_num_seqs",            s.max_num_seqs},
+          {"max_num_batched_tokens",  s.max_num_batched_tokens},
+          {"tensor_parallel_size",    s.tensor_parallel_size},
+          {"pipeline_parallel_size",  s.pipeline_parallel_size},
+          {"gpu_memory_utilization",  s.gpu_memory_utilization},
+          {"dtype",                   s.dtype},
+          {"quantization",            s.quantization},
+          {"served_model_name",       s.served_model_name},
+          {"trust_remote_code",       s.trust_remote_code},
+          {"enable_prefix_caching",   s.enable_prefix_caching},
+          {"enable_auto_tool_choice", s.enable_auto_tool_choice},
+          {"enable_sleep_mode",       s.enable_sleep_mode},
+          {"tool_call_parser",        s.tool_call_parser},
+          {"extra_args",              s.extra_args} };
+}
+inline void from_json(const nlohmann::json& j, VllmSettings& s) {
+    if (j.contains("max_model_len"))           j.at("max_model_len").get_to(s.max_model_len);
+    if (j.contains("max_num_seqs"))            j.at("max_num_seqs").get_to(s.max_num_seqs);
+    if (j.contains("max_num_batched_tokens"))  j.at("max_num_batched_tokens").get_to(s.max_num_batched_tokens);
+    if (j.contains("tensor_parallel_size"))    j.at("tensor_parallel_size").get_to(s.tensor_parallel_size);
+    if (j.contains("pipeline_parallel_size"))  j.at("pipeline_parallel_size").get_to(s.pipeline_parallel_size);
+    if (j.contains("gpu_memory_utilization"))  j.at("gpu_memory_utilization").get_to(s.gpu_memory_utilization);
+    if (j.contains("dtype"))                   j.at("dtype").get_to(s.dtype);
+    if (j.contains("quantization"))            j.at("quantization").get_to(s.quantization);
+    if (j.contains("served_model_name"))       j.at("served_model_name").get_to(s.served_model_name);
+    if (j.contains("trust_remote_code"))       j.at("trust_remote_code").get_to(s.trust_remote_code);
+    if (j.contains("enable_prefix_caching"))   j.at("enable_prefix_caching").get_to(s.enable_prefix_caching);
+    if (j.contains("enable_auto_tool_choice")) j.at("enable_auto_tool_choice").get_to(s.enable_auto_tool_choice);
+    if (j.contains("enable_sleep_mode"))       j.at("enable_sleep_mode").get_to(s.enable_sleep_mode);
+    if (j.contains("tool_call_parser"))        j.at("tool_call_parser").get_to(s.tool_call_parser);
+    if (j.contains("extra_args"))              j.at("extra_args").get_to(s.extra_args);
+}
+
 // ─── AgentConfig ─────────────────────────────────────────────────────────────
 inline void to_json(nlohmann::json& j, const AgentConfig& a) {
     j = { {"id",                a.id},
@@ -517,6 +597,7 @@ inline void to_json(nlohmann::json& j, const AgentConfig& a) {
           {"model_path",        a.model_path},
           {"system_prompt",     a.system_prompt},
           {"llama_settings",    a.llama_settings},
+          {"vllm_settings",     a.vllm_settings},
           {"reasoning_enabled", a.reasoning_enabled},
           {"memories_enabled",  a.memories_enabled},
           {"tools_enabled",     a.tools_enabled},
@@ -528,6 +609,7 @@ inline void from_json(const nlohmann::json& j, AgentConfig& a) {
     if (j.contains("model_path"))        j.at("model_path").get_to(a.model_path);
     if (j.contains("system_prompt"))     j.at("system_prompt").get_to(a.system_prompt);
     if (j.contains("llama_settings"))    j.at("llama_settings").get_to(a.llama_settings);
+    if (j.contains("vllm_settings"))     j.at("vllm_settings").get_to(a.vllm_settings);
     if (j.contains("reasoning_enabled")) j.at("reasoning_enabled").get_to(a.reasoning_enabled);
     if (j.contains("memories_enabled"))  j.at("memories_enabled").get_to(a.memories_enabled);
     if (j.contains("tools_enabled"))     j.at("tools_enabled").get_to(a.tools_enabled);
@@ -814,8 +896,15 @@ inline void to_json(nlohmann::json& j, const SlotInfo& s) {
           {"port",            s.port},
           {"model_path",      s.model_path},
           {"assigned_agent",  s.assigned_agent},
+          {"agent_ids",       s.agent_ids},
           {"state",           to_string(s.state)},
+          {"sleeping",        s.sleeping},
+          {"engine_metrics_valid", s.engine_metrics_valid},
+          {"num_requests_running", s.num_requests_running},
+          {"num_requests_waiting", s.num_requests_waiting},
+          {"kv_cache_usage",  s.kv_cache_usage},
           {"vram_usage_mb",   s.vram_usage_mb},
+          {"gpu_mem_fraction", s.gpu_mem_fraction},
           {"last_active_ms",  s.last_active_ms},
           {"kv_cache_path",   s.kv_cache_path},
           {"effective_ctx_size", s.effective_ctx_size} };
@@ -825,41 +914,21 @@ inline void from_json(const nlohmann::json& j, SlotInfo& s) {
     if (j.contains("port"))           j.at("port").get_to(s.port);
     if (j.contains("model_path"))     j.at("model_path").get_to(s.model_path);
     if (j.contains("assigned_agent")) j.at("assigned_agent").get_to(s.assigned_agent);
+    if (j.contains("agent_ids"))      j.at("agent_ids").get_to(s.agent_ids);
+    // Older nodes only report assigned_agent.
+    if (s.agent_ids.empty() && !s.assigned_agent.empty())
+        s.agent_ids.push_back(s.assigned_agent);
     if (j.contains("state"))          s.state = slot_state_from_string(j.at("state").get<std::string>());
+    if (j.contains("sleeping"))       j.at("sleeping").get_to(s.sleeping);
+    if (j.contains("engine_metrics_valid")) j.at("engine_metrics_valid").get_to(s.engine_metrics_valid);
+    if (j.contains("num_requests_running")) j.at("num_requests_running").get_to(s.num_requests_running);
+    if (j.contains("num_requests_waiting")) j.at("num_requests_waiting").get_to(s.num_requests_waiting);
+    if (j.contains("kv_cache_usage")) j.at("kv_cache_usage").get_to(s.kv_cache_usage);
     if (j.contains("vram_usage_mb"))  j.at("vram_usage_mb").get_to(s.vram_usage_mb);
+    if (j.contains("gpu_mem_fraction")) j.at("gpu_mem_fraction").get_to(s.gpu_mem_fraction);
     if (j.contains("last_active_ms")) j.at("last_active_ms").get_to(s.last_active_ms);
     if (j.contains("kv_cache_path"))  j.at("kv_cache_path").get_to(s.kv_cache_path);
     if (j.contains("effective_ctx_size")) j.at("effective_ctx_size").get_to(s.effective_ctx_size);
-}
-
-// ─── StoredModel ─────────────────────────────────────────────────────────────
-inline void to_json(nlohmann::json& j, const StoredModel& m) {
-    j = { {"model_path",   m.model_path},
-          {"sha256",       m.sha256},
-          {"size_bytes",   m.size_bytes},
-          {"shard_count",  m.shard_count} };
-}
-inline void from_json(const nlohmann::json& j, StoredModel& m) {
-    j.at("model_path").get_to(m.model_path);
-    if (j.contains("sha256"))      j.at("sha256").get_to(m.sha256);
-    if (j.contains("size_bytes"))  j.at("size_bytes").get_to(m.size_bytes);
-    if (j.contains("shard_count")) j.at("shard_count").get_to(m.shard_count);
-}
-
-// ─── ModelTransferRequest ────────────────────────────────────────────────────
-inline void to_json(nlohmann::json& j, const ModelTransferRequest& r) {
-    j = { {"model_filename", r.model_filename},
-          {"sha256",         r.sha256},
-          {"total_bytes",    r.total_bytes},
-          {"shard_index",    r.shard_index},
-          {"shard_count",    r.shard_count} };
-}
-inline void from_json(const nlohmann::json& j, ModelTransferRequest& r) {
-    j.at("model_filename").get_to(r.model_filename);
-    if (j.contains("sha256"))      j.at("sha256").get_to(r.sha256);
-    if (j.contains("total_bytes")) j.at("total_bytes").get_to(r.total_bytes);
-    if (j.contains("shard_index")) j.at("shard_index").get_to(r.shard_index);
-    if (j.contains("shard_count")) j.at("shard_count").get_to(r.shard_count);
 }
 
 // ─── AgentPlacement ──────────────────────────────────────────────────────────
@@ -884,19 +953,40 @@ inline void from_json(const nlohmann::json& j, AgentPlacement& p) {
     if (j.contains("last_active_ms"))     j.at("last_active_ms").get_to(p.last_active_ms);
 }
 
+// ─── NodeCapabilities ────────────────────────────────────────────────────────
+inline void to_json(nlohmann::json& j, const NodeCapabilities& c) {
+    j = { {"arch",          c.arch},
+          {"comm_backends", c.comm_backends},
+          {"vllm_version",  c.vllm_version},
+          {"supports_ray",  c.supports_ray},
+          {"gpu_count",     c.gpu_count},
+          {"interconnect_gbps", c.interconnect_gbps} };
+}
+inline void from_json(const nlohmann::json& j, NodeCapabilities& c) {
+    if (j.contains("arch"))          j.at("arch").get_to(c.arch);
+    if (j.contains("comm_backends")) j.at("comm_backends").get_to(c.comm_backends);
+    if (j.contains("vllm_version"))  j.at("vllm_version").get_to(c.vllm_version);
+    if (j.contains("supports_ray"))  j.at("supports_ray").get_to(c.supports_ray);
+    if (j.contains("gpu_count"))     j.at("gpu_count").get_to(c.gpu_count);
+    if (j.contains("interconnect_gbps")) j.at("interconnect_gbps").get_to(c.interconnect_gbps);
+}
+
 // ─── NodeInfo ─────────────────────────────────────────────────────────────────
+// Note: api_key is intentionally NOT serialized — NodeInfo JSON is returned to
+// external clients (/v1/nodes) and must never leak node credentials. The
+// persistence path (NodeRegistry::save_remembered_nodes) writes api_key
+// explicitly.
 inline void to_json(nlohmann::json& j, const NodeInfo& n) {
     j = { {"id",            n.id},
           {"url",           n.url},
-          {"api_key",       n.api_key},
           {"loaded_model",  n.loaded_model},
           {"health",        to_string(n.health)},
           {"connected",     n.connected},
           {"remembered",    n.remembered},
           {"platform",      n.platform},
+          {"capabilities",  n.capabilities},
           {"metrics",       n.metrics},
           {"slots",         n.slots},
-          {"stored_models", n.stored_models},
           {"disk_free_mb",  n.disk_free_mb},
           {"max_slots",     n.max_slots},
           {"slot_in_use",   n.slot_in_use},
@@ -906,23 +996,9 @@ inline void to_json(nlohmann::json& j, const NodeInfo& n) {
           {"slot_suspending", n.slot_suspending},
           {"slot_suspended", n.slot_suspended},
           {"slot_error",    n.slot_error},
-          {"llama_server_path",        n.llama_server_path},
-          {"llama_update_running",     n.llama_update_running},
-          {"llama_update_status",      n.llama_update_status},
-          {"llama_update_message",     n.llama_update_message},
-          {"llama_update_started_ms",  n.llama_update_started_ms},
-          {"llama_update_finished_ms", n.llama_update_finished_ms},
-          {"llama_install_root",       n.llama_install_root},
-          {"llama_repo_dir",           n.llama_repo_dir},
-          {"llama_build_dir",          n.llama_build_dir},
-          {"llama_binary_path",        n.llama_binary_path},
-          {"llama_installed_commit",   n.llama_installed_commit},
-          {"llama_remote_commit",      n.llama_remote_commit},
-          {"llama_remote_error",       n.llama_remote_error},
-          {"llama_remote_checked_ms",  n.llama_remote_checked_ms},
-          {"llama_update_available",   n.llama_update_available},
-          {"llama_update_reason",      n.llama_update_reason},
-          {"llama_update_log_path",    n.llama_update_log_path} };
+          {"vllm_server_path",         n.vllm_server_path},
+          {"vllm_gpu_budget",          n.vllm_gpu_budget},
+          {"vllm_gpu_fraction_used",   n.vllm_gpu_fraction_used} };
 }
 inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     j.at("id").get_to(n.id);
@@ -933,9 +1009,9 @@ inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     if (j.contains("connected"))     j.at("connected").get_to(n.connected);
     if (j.contains("remembered"))    j.at("remembered").get_to(n.remembered);
     if (j.contains("platform"))      j.at("platform").get_to(n.platform);
+    if (j.contains("capabilities"))  j.at("capabilities").get_to(n.capabilities);
     if (j.contains("metrics"))       j.at("metrics").get_to(n.metrics);
     if (j.contains("slots"))         j.at("slots").get_to(n.slots);
-    if (j.contains("stored_models")) j.at("stored_models").get_to(n.stored_models);
     if (j.contains("disk_free_mb"))  j.at("disk_free_mb").get_to(n.disk_free_mb);
     if (j.contains("max_slots"))     j.at("max_slots").get_to(n.max_slots);
     if (j.contains("slot_in_use"))   j.at("slot_in_use").get_to(n.slot_in_use);
@@ -945,23 +1021,9 @@ inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     if (j.contains("slot_suspending")) j.at("slot_suspending").get_to(n.slot_suspending);
     if (j.contains("slot_suspended")) j.at("slot_suspended").get_to(n.slot_suspended);
     if (j.contains("slot_error"))    j.at("slot_error").get_to(n.slot_error);
-    if (j.contains("llama_server_path")) j.at("llama_server_path").get_to(n.llama_server_path);
-    if (j.contains("llama_update_running"))     j.at("llama_update_running").get_to(n.llama_update_running);
-    if (j.contains("llama_update_status"))      j.at("llama_update_status").get_to(n.llama_update_status);
-    if (j.contains("llama_update_message"))     j.at("llama_update_message").get_to(n.llama_update_message);
-    if (j.contains("llama_update_started_ms"))  j.at("llama_update_started_ms").get_to(n.llama_update_started_ms);
-    if (j.contains("llama_update_finished_ms")) j.at("llama_update_finished_ms").get_to(n.llama_update_finished_ms);
-    if (j.contains("llama_install_root"))      j.at("llama_install_root").get_to(n.llama_install_root);
-    if (j.contains("llama_repo_dir"))          j.at("llama_repo_dir").get_to(n.llama_repo_dir);
-    if (j.contains("llama_build_dir"))         j.at("llama_build_dir").get_to(n.llama_build_dir);
-    if (j.contains("llama_binary_path"))       j.at("llama_binary_path").get_to(n.llama_binary_path);
-    if (j.contains("llama_installed_commit"))  j.at("llama_installed_commit").get_to(n.llama_installed_commit);
-    if (j.contains("llama_remote_commit"))     j.at("llama_remote_commit").get_to(n.llama_remote_commit);
-    if (j.contains("llama_remote_error"))      j.at("llama_remote_error").get_to(n.llama_remote_error);
-    if (j.contains("llama_remote_checked_ms")) j.at("llama_remote_checked_ms").get_to(n.llama_remote_checked_ms);
-    if (j.contains("llama_update_available"))  j.at("llama_update_available").get_to(n.llama_update_available);
-    if (j.contains("llama_update_reason"))     j.at("llama_update_reason").get_to(n.llama_update_reason);
-    if (j.contains("llama_update_log_path"))   j.at("llama_update_log_path").get_to(n.llama_update_log_path);
+    if (j.contains("vllm_server_path")) j.at("vllm_server_path").get_to(n.vllm_server_path);
+    if (j.contains("vllm_gpu_budget")) j.at("vllm_gpu_budget").get_to(n.vllm_gpu_budget);
+    if (j.contains("vllm_gpu_fraction_used")) j.at("vllm_gpu_fraction_used").get_to(n.vllm_gpu_fraction_used);
 }
 
 // ─── ToolDefinition ───────────────────────────────────────────────────────────

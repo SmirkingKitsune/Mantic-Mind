@@ -4,18 +4,37 @@
 
 #include <httplib.h>
 #include <algorithm>
+#include <cstdlib>
 
 namespace mm {
 
 // ── URL helpers ───────────────────────────────────────────────────────────────
 namespace {
 
-httplib::Client make_cli(const std::string& base_url) {
+// Read-timeout floor for SSE streams, which usually carry LLM inference.
+// Slow hardware can spend a long time in prompt processing before the first
+// byte arrives, so the floor is large and env-overridable.
+int stream_read_timeout_floor_s() {
+    constexpr int kDefaultSeconds = 3600;
+    if (const char* env = std::getenv("MM_INFER_READ_TIMEOUT_S")) {
+        try {
+            int parsed = std::stoi(env);
+            if (parsed > 0) return parsed;
+        } catch (...) {
+        }
+    }
+    return kDefaultSeconds;
+}
+
+httplib::Client make_cli(const std::string& base_url,
+                         int connect_timeout_s,
+                         int read_timeout_s,
+                         int write_timeout_s) {
     auto [h, p] = util::parse_url(base_url);
     httplib::Client cli(h, p);
-    cli.set_connection_timeout(10);
-    cli.set_read_timeout(30);
-    cli.set_write_timeout(10);
+    cli.set_connection_timeout(connect_timeout_s);
+    cli.set_read_timeout(read_timeout_s);
+    cli.set_write_timeout(write_timeout_s);
     return cli;
 }
 
@@ -38,31 +57,37 @@ void HttpClient::set_bearer_token(const std::string& token) {
     bearer_token_ = token;
 }
 
+void HttpClient::set_timeouts(int connect_s, int read_s, int write_s) {
+    connect_timeout_s_ = connect_s > 0 ? connect_s : 10;
+    read_timeout_s_ = read_s > 0 ? read_s : 30;
+    write_timeout_s_ = write_s > 0 ? write_s : 10;
+}
+
 HttpResponse HttpClient::get(const std::string& path) {
-    auto cli = make_cli(base_url_);
+    auto cli = make_cli(base_url_, connect_timeout_s_, read_timeout_s_, write_timeout_s_);
     return to_resp(cli.Get(path, make_headers(bearer_token_)));
 }
 
 HttpResponse HttpClient::post(const std::string& path, const nlohmann::json& body) {
-    auto cli = make_cli(base_url_);
+    auto cli = make_cli(base_url_, connect_timeout_s_, read_timeout_s_, write_timeout_s_);
     return to_resp(cli.Post(path, make_headers(bearer_token_),
                             body.dump(), "application/json"));
 }
 
 HttpResponse HttpClient::put(const std::string& path, const nlohmann::json& body) {
-    auto cli = make_cli(base_url_);
+    auto cli = make_cli(base_url_, connect_timeout_s_, read_timeout_s_, write_timeout_s_);
     return to_resp(cli.Put(path, make_headers(bearer_token_),
                            body.dump(), "application/json"));
 }
 
 HttpResponse HttpClient::del(const std::string& path) {
-    auto cli = make_cli(base_url_);
+    auto cli = make_cli(base_url_, connect_timeout_s_, read_timeout_s_, write_timeout_s_);
     return to_resp(cli.Delete(path, make_headers(bearer_token_)));
 }
 
 bool HttpClient::stream_get(const std::string& path, SseLineCallback line_cb) {
-    auto cli = make_cli(base_url_);
-    cli.set_read_timeout(300);
+    auto cli = make_cli(base_url_, connect_timeout_s_, read_timeout_s_, write_timeout_s_);
+    cli.set_read_timeout(std::max(read_timeout_s_, stream_read_timeout_floor_s()));
 
     std::string buf;
     auto res = cli.Get(path, make_headers(bearer_token_),
@@ -87,9 +112,9 @@ bool HttpClient::stream_post(const std::string& path,
                               std::string* out_body) {
     auto [h, p] = util::parse_url(base_url_);
     httplib::Client cli(h, p);
-    cli.set_connection_timeout(10);
-    cli.set_read_timeout(300);
-    cli.set_write_timeout(30);
+    cli.set_connection_timeout(connect_timeout_s_);
+    cli.set_read_timeout(std::max(read_timeout_s_, stream_read_timeout_floor_s()));
+    cli.set_write_timeout(std::max(write_timeout_s_, 30));
 
     std::string body_str = body.dump();
     std::string sse_buf;

@@ -4,9 +4,7 @@
 #include "control/agent_config_validator.hpp"
 #include "common/agent.hpp"
 #include "common/agent_db.hpp"
-#include "common/gguf_metadata.hpp"
 #include "common/http_client.hpp"
-#include "common/model_catalog.hpp"
 #include "common/models.hpp"
 #include "common/logger.hpp"
 #include "common/tool_executor.hpp"
@@ -102,17 +100,6 @@ void ControlUI::run() {
     //
     int  node_sel      = 0;
     std::vector<std::string> node_entries;
-    int  catalog_sel   = 0;
-    std::vector<std::string> catalog_entries;
-    int  node_model_sel = 0;
-    std::vector<std::string> node_model_entries;
-    std::vector<std::string> control_catalog_filenames;
-    std::string node_models_cached_node_id;
-    std::vector<StoredModel> node_models_cached;
-    int64_t node_models_cached_disk_free_mb = 0;
-    int64_t node_models_cached_at_ms = 0;
-    int64_t control_catalog_cached_at_ms = 0;
-    std::string node_model_action_status;
 
     // Modals
     bool show_add_node  = false;
@@ -131,7 +118,6 @@ void ControlUI::run() {
     std::string ed_temp_s{"0.70"}, ed_topp_s{"0.90"}, ed_max_s{"1024"};
     std::string ed_extra_args_text;
     bool ed_flash{true}, ed_reasoning{false}, ed_memories{true}, ed_tools{false};
-    std::string ed_model_inspected_path;
     ModelCapabilityInfo ed_model_info;
     std::vector<ValidationIssue> ed_validation_issues;
     std::string ed_validation_signature;
@@ -248,91 +234,6 @@ void ControlUI::run() {
             return body;
         }
         return "(empty response body)";
-    };
-
-    auto refresh_control_catalog = [&](bool force) {
-        const int64_t now_ms = util::now_ms();
-        if (!force && (now_ms - control_catalog_cached_at_ms) < 30000) return;
-        control_catalog_cached_at_ms = now_ms;
-
-        control_catalog_filenames.clear();
-        std::set<std::string> unique_names;
-
-        HttpClient cli(control_base_url_);
-        auto resp = cli.get("/v1/models");
-        if (!resp.ok()) {
-            node_model_action_status = "control catalog refresh failed: " + parse_api_error(resp);
-        } else {
-            try {
-                auto j = nlohmann::json::parse(resp.body);
-                if (j.contains("models")) {
-                    auto models = j["models"].get<std::vector<StoredModel>>();
-                    for (const auto& m : models) {
-                        const std::string name = canonical_model_filename(m.model_path);
-                        if (is_safe_model_filename(name)) unique_names.insert(name);
-                    }
-                }
-            } catch (const std::exception& e) {
-                node_model_action_status = std::string("control catalog parse error: ") + e.what();
-            }
-        }
-
-        control_catalog_filenames.assign(unique_names.begin(), unique_names.end());
-        if (!control_catalog_filenames.empty() &&
-            catalog_sel >= static_cast<int>(control_catalog_filenames.size())) {
-            catalog_sel = static_cast<int>(control_catalog_filenames.size()) - 1;
-        } else if (control_catalog_filenames.empty()) {
-            catalog_sel = 0;
-        }
-    };
-
-    auto refresh_node_storage_cache = [&](const NodeId& node_id, bool force) {
-        const int64_t now_ms = util::now_ms();
-        if (!force &&
-            node_id == node_models_cached_node_id &&
-            (now_ms - node_models_cached_at_ms) < 10000) {
-            return;
-        }
-        node_models_cached_node_id = node_id;
-        node_models_cached_at_ms = now_ms;
-
-        node_models_cached.clear();
-        node_models_cached_disk_free_mb = 0;
-        if (node_id.empty()) return;
-
-        HttpClient cli(control_base_url_);
-        auto resp = cli.get("/v1/nodes/" + node_id + "/models");
-        if (!resp.ok()) {
-            node_model_action_status = "refresh failed for node storage (HTTP " +
-                                       std::to_string(resp.status) + ")";
-            return;
-        }
-
-        try {
-            auto j = nlohmann::json::parse(resp.body);
-            if (j.contains("stored_models"))
-                node_models_cached = j["stored_models"].get<std::vector<StoredModel>>();
-            if (j.contains("disk_free_mb"))
-                node_models_cached_disk_free_mb = j["disk_free_mb"].get<int64_t>();
-        } catch (const std::exception& e) {
-            node_model_action_status = std::string("refresh parse error: ") + e.what();
-            return;
-        }
-
-        if (!node_models_cached.empty() &&
-            node_model_sel >= static_cast<int>(node_models_cached.size())) {
-            node_model_sel = static_cast<int>(node_models_cached.size()) - 1;
-        } else if (node_models_cached.empty()) {
-            node_model_sel = 0;
-        }
-    };
-
-    auto selected_catalog_filename = [&]() -> std::string {
-        if (catalog_sel < 0 ||
-            catalog_sel >= static_cast<int>(control_catalog_filenames.size())) {
-            return {};
-        }
-        return control_catalog_filenames[static_cast<size_t>(catalog_sel)];
     };
 
     auto set_curation_status = [&](const std::string& status, const std::string& error) {
@@ -468,16 +369,7 @@ void ControlUI::run() {
         return metadata_found ? "no" : "unknown";
     };
 
-    auto refresh_editor_model_info = [&]() {
-        const std::string resolved = resolve_model_path_for_metadata(ed_model, models_dir_);
-        if (ed_model_inspected_path == ed_model && ed_model_info.source_path == resolved) return;
-        ed_model_inspected_path = ed_model;
-        ed_model_info = inspect_model_capabilities(ed_model, models_dir_);
-        ed_validation_signature.clear();
-    };
-
     auto refresh_editor_validation = [&]() {
-        refresh_editor_model_info();
         const std::string signature =
             ed_id + '\n' + ed_name + '\n' + ed_model + '\n' + ed_sysprompt + '\n' + ed_pref_node +
             '\n' + ed_ctx_s + '\n' + ed_gpu_s + '\n' + ed_thr_s + '\n' + ed_temp_s + '\n' +
@@ -534,29 +426,6 @@ void ControlUI::run() {
 
     // Connected (registered) nodes section
     auto node_menu   = Menu(&node_entries, &node_sel, MenuOption::Vertical());
-    auto trigger_node_update = [&](bool build) {
-        auto ns = registry_.list_nodes();
-        if (node_sel < 0 || node_sel >= static_cast<int>(ns.size())) return;
-        const auto& n = ns[node_sel];
-        std::string msg;
-        bool ok = registry_.request_llama_update(n.id, build, false, &msg);
-        if (ok) {
-            log(LogLevel::Info, "Update started on node " + n.id + ": " + msg);
-        } else {
-            log(LogLevel::Error, "Update failed for node " + n.id + ": " + msg);
-        }
-    };
-    auto btn_upd_n   = Button("[U] Update llama.cpp", [&] {
-        trigger_node_update(true);
-    }, ButtonOption::Simple());
-    auto btn_chk_n   = Button("[C] Check update", [&] {
-        auto ns = registry_.list_nodes();
-        if (node_sel < 0 || node_sel >= static_cast<int>(ns.size())) return;
-        std::string msg;
-        bool ok = registry_.request_llama_check_update(ns[node_sel].id, &msg);
-        if (ok) log(LogLevel::Info, "Check update on node " + ns[node_sel].id + ": " + msg);
-        else    log(LogLevel::Error, "Check update failed for node " + ns[node_sel].id + ": " + msg);
-    }, ButtonOption::Simple());
     auto forget_selected_node = [&]() {
         auto ns = registry_.list_nodes();
         if (node_sel < 0 || node_sel >= static_cast<int>(ns.size())) return;
@@ -576,89 +445,10 @@ void ControlUI::run() {
         }
     }, ButtonOption::Simple());
     auto node_menu_m  = Maybe(node_menu, [&]() { return !node_entries.empty(); });
-    auto node_btns    = Container::Horizontal({btn_upd_n, btn_chk_n, btn_forget_n, btn_rem_n});
+    auto node_btns    = Container::Horizontal({btn_forget_n, btn_rem_n});
     auto nodes_section = Container::Vertical({node_menu_m, node_btns});
 
-    auto catalog_menu = Menu(&catalog_entries, &catalog_sel, MenuOption::Vertical());
-    auto catalog_menu_m = Maybe(catalog_menu, [&]() { return !catalog_entries.empty(); });
-    auto node_models_menu = Menu(&node_model_entries, &node_model_sel, MenuOption::Vertical());
-    auto node_models_menu_m = Maybe(node_models_menu, [&]() { return !node_model_entries.empty(); });
-
-    auto pull_catalog_to_node = [&]() {
-        auto ns = registry_.list_nodes();
-        if (node_sel < 0 || node_sel >= static_cast<int>(ns.size())) {
-            node_model_action_status = "no node selected";
-            return;
-        }
-        const std::string filename = selected_catalog_filename();
-        if (!is_safe_model_filename(filename)) {
-            node_model_action_status = "select a valid catalog model first";
-            return;
-        }
-
-        HttpClient cli(control_base_url_);
-        auto resp = cli.post("/v1/nodes/" + ns[node_sel].id + "/models/pull",
-                             nlohmann::json{{"model_filename", filename}});
-        if (!resp.ok()) {
-            node_model_action_status = "pull failed: " + parse_api_error(resp);
-            log(LogLevel::Error,
-                "Node model pull failed on " + ns[node_sel].id + ": " + node_model_action_status);
-            return;
-        }
-
-        node_model_action_status = "pull requested: " + filename;
-        log(LogLevel::Info, "Requested node pull: " + filename + " -> " + ns[node_sel].id);
-        refresh_node_storage_cache(ns[node_sel].id, true);
-    };
-
-    auto delete_model_on_node = [&]() {
-        auto ns = registry_.list_nodes();
-        if (node_sel < 0 || node_sel >= static_cast<int>(ns.size())) {
-            node_model_action_status = "no node selected";
-            return;
-        }
-        if (node_model_sel < 0 || node_model_sel >= static_cast<int>(node_models_cached.size())) {
-            node_model_action_status = "no node model selected";
-            return;
-        }
-
-        const std::string filename = canonical_model_filename(
-            node_models_cached[static_cast<size_t>(node_model_sel)].model_path);
-        if (!is_safe_model_filename(filename)) {
-            node_model_action_status = "selected model has invalid filename";
-            return;
-        }
-
-        HttpClient cli(control_base_url_);
-        auto resp = cli.del("/v1/nodes/" + ns[node_sel].id + "/models/" + filename);
-        if (!resp.ok()) {
-            node_model_action_status = "delete failed: " + parse_api_error(resp);
-            log(LogLevel::Error,
-                "Node model delete failed on " + ns[node_sel].id + ": " + node_model_action_status);
-            return;
-        }
-
-        node_model_action_status = "deleted from node: " + filename;
-        log(LogLevel::Info, "Deleted node model copy: " + filename + " from " + ns[node_sel].id);
-        refresh_node_storage_cache(ns[node_sel].id, true);
-    };
-
-    auto btn_pull_model_n = Button("[P] Pull Model", [&] { pull_catalog_to_node(); }, ButtonOption::Simple());
-    auto btn_del_model_n  = Button("[D] Delete Model", [&] { delete_model_on_node(); }, ButtonOption::Simple());
-    auto btn_refresh_models_n = Button("[R] Refresh Models", [&] {
-        refresh_control_catalog(true);
-        auto ns = registry_.list_nodes();
-        if (node_sel >= 0 && node_sel < static_cast<int>(ns.size())) {
-            refresh_node_storage_cache(ns[node_sel].id, true);
-        }
-        node_model_action_status = "refreshed model views";
-    }, ButtonOption::Simple());
-    auto node_model_btns = Container::Horizontal(
-        {btn_pull_model_n, btn_del_model_n, btn_refresh_models_n});
-    auto node_model_section = Container::Vertical(
-        {catalog_menu_m, node_models_menu_m, node_model_btns});
-
-    auto nodes_comp  = Container::Vertical({disc_comp, nodes_section, node_model_section});
+    auto nodes_comp  = Container::Vertical({disc_comp, nodes_section});
 
     //
 
@@ -774,7 +564,6 @@ void ControlUI::run() {
         ed_temp_s = "0.70"; ed_topp_s = "0.90"; ed_max_s = "1024";
         ed_extra_args_text.clear();
         ed_flash = true; ed_reasoning = false; ed_memories = true; ed_tools = false;
-        ed_model_inspected_path.clear();
         ed_model_info = {};
         ed_validation_issues.clear();
         ed_validation_signature.clear();
@@ -808,7 +597,6 @@ void ControlUI::run() {
             ed_reasoning = c.reasoning_enabled;
             ed_memories  = c.memories_enabled;
             ed_tools     = c.tools_enabled;
-            ed_model_inspected_path.clear();
             ed_model_info = {};
             ed_validation_issues.clear();
             ed_validation_signature.clear();
@@ -939,15 +727,6 @@ void ControlUI::run() {
         if (fb_entry_is_dir[fb_sel]) { fb_navigate(); return; }
         auto chosen = fb_entry_paths[fb_sel];
         ed_model = chosen.string();
-        ed_model_inspected_path.clear();
-        refresh_editor_model_info();
-        if (ed_model_info.n_ctx_train > 0) {
-            ed_ctx_s = std::to_string(ed_model_info.n_ctx_train);
-        }
-        ed_reasoning = ed_model_info.supports_reasoning;
-        if (ed_model_info.supports_tool_calls) {
-            ed_tools = true;
-        }
         refresh_editor_validation();
         show_file_browser = false;
     };
@@ -1471,32 +1250,6 @@ void ControlUI::run() {
         else if (ns.empty())
             node_sel = 0;
 
-        refresh_control_catalog(false);
-        catalog_entries = control_catalog_filenames;
-        if (!catalog_entries.empty() && catalog_sel >= static_cast<int>(catalog_entries.size()))
-            catalog_sel = static_cast<int>(catalog_entries.size()) - 1;
-        else if (catalog_entries.empty())
-            catalog_sel = 0;
-
-        if (!ns.empty() && node_sel >= 0 && node_sel < static_cast<int>(ns.size())) {
-            refresh_node_storage_cache(ns[node_sel].id, false);
-        } else {
-            node_models_cached_node_id.clear();
-            node_models_cached.clear();
-            node_models_cached_disk_free_mb = 0;
-            node_model_sel = 0;
-        }
-
-        node_model_entries.resize(node_models_cached.size());
-        for (size_t i = 0; i < node_models_cached.size(); ++i) {
-            const auto& m = node_models_cached[i];
-            node_model_entries[i] = m.model_path + "  (" + mb_str(m.size_bytes / (1024 * 1024)) + ")";
-        }
-        if (!node_model_entries.empty() && node_model_sel >= static_cast<int>(node_model_entries.size()))
-            node_model_sel = static_cast<int>(node_model_entries.size()) - 1;
-        else if (node_model_entries.empty())
-            node_model_sel = 0;
-
         Element detail;
         if (!ns.empty() && node_sel < static_cast<int>(ns.size())) {
             auto& n  = ns[node_sel];
@@ -1550,31 +1303,6 @@ void ControlUI::run() {
                            + ", suspended " + std::to_string(slot_suspended)
                            + ", available " + std::to_string(slot_available) + ")")
                           | bold}),
-                hbox({text("  Llama   : "),
-                      text(n.llama_server_path.empty() ? "(unknown)" : n.llama_server_path)
-                          | color(Color::GrayDark)}),
-                hbox({text("  Updater : "),
-                      text(n.llama_update_status.empty() ? "idle" : n.llama_update_status)
-                          | (n.llama_update_status == "failed"
-                                 ? color(Color::RedLight)
-                                 : (n.llama_update_status == "succeeded"
-                                        ? color(Color::Green)
-                                        : color(Color::Yellow)))}),
-                hbox({text("  Versions: "),
-                      text((n.llama_installed_commit.empty() ? "?" : n.llama_installed_commit)
-                          + " -> "
-                          + (n.llama_remote_commit.empty() ? "?" : n.llama_remote_commit))
-                          | color(Color::GrayDark)}),
-                hbox({text("  Needs update: "),
-                      text(n.llama_update_available ? "yes" : "no")
-                          | (n.llama_update_available ? color(Color::Yellow) : color(Color::Green))}),
-                hbox({text("  Update msg: "),
-                      text(n.llama_update_message.empty() ? "(none)" : n.llama_update_message)
-                          | color(Color::GrayDark)}),
-                hbox({text("  Storage : "),
-                      text(std::to_string(node_models_cached.size()) + " model(s), free " +
-                           mb_str(node_models_cached_disk_free_mb))
-                          | color(Color::GrayDark)}),
                 separator(),
                 gauge_row("  CPU", n.metrics.cpu_percent, ""),
                 gauge_row("  RAM", n.metrics.ram_percent, ram),
@@ -1606,28 +1334,6 @@ void ControlUI::run() {
                 }
             }
 
-            detail_rows.push_back(separator());
-            detail_rows.push_back(text("  Stored models on selected node:") | bold);
-            if (node_models_cached.empty()) {
-                detail_rows.push_back(text("    (none)") | color(Color::GrayDark));
-            } else {
-                constexpr size_t kMaxModelLines = 8;
-                size_t shown = 0;
-                for (const auto& m : node_models_cached) {
-                    if (shown >= kMaxModelLines) break;
-                    detail_rows.push_back(
-                        text("    - " + compact_model(m.model_path) +
-                             " (" + mb_str(m.size_bytes / (1024 * 1024)) + ")")
-                        | color(Color::GrayDark));
-                    ++shown;
-                }
-                if (node_models_cached.size() > shown) {
-                    detail_rows.push_back(
-                        text("    ... +" + std::to_string(node_models_cached.size() - shown) + " more")
-                        | color(Color::GrayDark));
-                }
-            }
-
             detail = vbox(std::move(detail_rows));
         } else {
             detail = text("  No connected nodes.") | color(Color::GrayDark);
@@ -1653,34 +1359,6 @@ void ControlUI::run() {
                     node_btns->Render(),
                 }) | border | flex,
             }) | size(HEIGHT, EQUAL, 9),
-            vbox({
-                text(" Model Management") | bold,
-                separator(),
-                hbox({
-                    vbox({
-                        text(" Control Catalog") | bold,
-                        separator(),
-                        catalog_entries.empty()
-                            ? (text("  (no .gguf files in control models_dir)") | color(Color::GrayDark))
-                            : (catalog_menu->Render() | yframe | flex),
-                    }) | size(WIDTH, EQUAL, 58) | border,
-                    separator(),
-                    vbox({
-                        text(" Selected Node Inventory") | bold,
-                        separator(),
-                        node_model_entries.empty()
-                            ? (text("  (no models on selected node)") | color(Color::GrayDark))
-                            : (node_models_menu->Render() | yframe | flex),
-                    }) | border | flex,
-                }) | size(HEIGHT, LESS_THAN, 14) | flex,
-                separator(),
-                node_model_btns->Render(),
-                node_model_action_status.empty()
-                    ? text("  p:pull selected catalog model  d:delete selected node model")
-                        | color(Color::GrayDark)
-                    : text("  " + node_model_action_status)
-                        | color(Color::Yellow),
-            }) | border | size(HEIGHT, LESS_THAN, 16),
             separator(),
             detail | yframe | flex,
         });
@@ -2256,27 +1934,6 @@ void ControlUI::run() {
             if (ev == Event::Character('3')) { tab_index = 2; return true; }
             if (ev == Event::Character('4')) { tab_index = 3; return true; }
             if (ev == Event::Character('5')) { tab_index = 4; return true; }
-            if (ev == Event::Character('u') && tab_index == 0) {
-                trigger_node_update(true);
-                return true;
-            }
-            if (ev == Event::Character('p') && tab_index == 0) {
-                pull_catalog_to_node();
-                return true;
-            }
-            if (ev == Event::Character('d') && tab_index == 0) {
-                delete_model_on_node();
-                return true;
-            }
-            if (ev == Event::Character('r') && tab_index == 0) {
-                refresh_control_catalog(true);
-                auto ns = registry_.list_nodes();
-                if (node_sel >= 0 && node_sel < static_cast<int>(ns.size())) {
-                    refresh_node_storage_cache(ns[node_sel].id, true);
-                }
-                node_model_action_status = "refreshed model views";
-                return true;
-            }
             if (ev == Event::Character('f') && tab_index == 0) {
                 forget_selected_node();
                 return true;

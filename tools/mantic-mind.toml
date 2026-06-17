@@ -17,31 +17,58 @@ control_api_key = ""
 # Defaults to http://127.0.0.1:<listen_port> if not set.
 # self_url = "http://192.168.1.10:7070"
 
-# ── llama-server ───────────────────────────────────────────────────────────────
-# Full path to the llama-server binary (or just "llama-server" if on PATH).
-# Tip: run tools/update-llama-cpp.sh --build (or .ps1 -Build) to pull latest
-# llama.cpp and produce llama-server, then set this to that absolute path.
-llama_server_path = "llama-server"
-
-# Port llama-server listens on (must not conflict with listen_port).
-llama_port = 8080
-
-# Port range for concurrent llama-server processes (one per slot).
+# ── vLLM engine processes ──────────────────────────────────────────────────────
+# Port range for concurrent vLLM engine processes. Each engine slot binds one
+# port in this range; the range must not conflict with listen_port.
 llama_port_range_start = 8080
 llama_port_range_end   = 8090
 
-# Maximum number of concurrent model slots (llama-server processes).
+# Maximum number of concurrent model slots (vLLM engine processes).
 max_slots = 4
 
-# ── Storage ────────────────────────────────────────────────────────────────────
-# Directory scanned recursively for .gguf model files.
-models_dir = "models"
+# ── vLLM ───────────────────────────────────────────────────────────────────────
+# vLLM CLI executable or wrapper script (or just "vllm" if on PATH).
+# vllm_server_path = "vllm"
 
+# Total fraction of GPU memory all vLLM slots on this node may claim together.
+# Each vLLM slot reserves an explicit --gpu-memory-utilization slice out of
+# this budget; loads are clamped to the remaining budget and rejected when it
+# is exhausted. Range (0, 1].
+# vllm_gpu_budget = 0.90
+
+# ── Cluster / multi-node engine groups ─────────────────────────────────────────
+# Capabilities this node advertises to control. Leave unset to auto-detect.
+# comm_backends = "nccl,gloo"   # CSV; auto-detect picks nccl+gloo on Linux+CUDA, else gloo
+# supports_ray = true            # multi-node Ray membership; auto = true on Linux
+# node_gpu_count = 0             # 0 = auto via nvidia-smi
+# interconnect_gbps = 200        # node-to-node link hint for group scoring
+
+# Ray CLI used to form multi-node vLLM engine groups (Linux nodes only).
+# ray_path = "ray"
+# ray_port = 6379
+
+# ── Cluster capabilities (multi-node engine groups) ─────────────────────────────
+# These are auto-detected at startup; set them only to override what this node
+# advertises to control for multi-node vLLM engine-group planning.
+#
+# Collective-comms backends, highest preference first. Auto: Linux+CUDA →
+# "nccl,gloo"; native Windows (no NCCL yet) and CPU-only → "gloo".
+# comm_backends = "nccl,gloo"
+#
+# Whether this node can join a multi-node Ray engine group. Auto: true on
+# Linux/WSL, false on native Windows.
+# supports_ray = true
+#
+# GPUs visible to this node (0 = auto via nvidia-smi).
+# node_gpu_count = 0
+#
+# Node-to-node link bandwidth hint in Gbps (e.g. 200 for ConnectX 200GbE).
+# Used only as a tiebreak when ranking candidate engine groups.
+# interconnect_gbps = 0
+
+# ── Storage ────────────────────────────────────────────────────────────────────
 # Node runtime data root. Remembered pairing API keys live in {data_dir}/api_keys.json.
 data_dir = "data"
-
-# Directory for KV cache checkpoint files (suspend/resume).
-kv_cache_dir = "data/kv_cache"
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 log_file = "logs/mantic-mind.log"

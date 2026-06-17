@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS agent_config (
     name              TEXT    NOT NULL,
     model_path        TEXT    NOT NULL DEFAULT '',
     system_prompt     TEXT    NOT NULL DEFAULT '',
+    inference_backend TEXT    NOT NULL DEFAULT 'llama.cpp',
 
     -- LlamaSettings columns
     ctx_size          INTEGER NOT NULL DEFAULT 4096,
@@ -33,6 +34,7 @@ CREATE TABLE IF NOT EXISTS agent_config (
     max_tokens        INTEGER NOT NULL DEFAULT 1024,
     flash_attn        INTEGER NOT NULL DEFAULT 1,   -- stored as bool (0/1)
     extra_args_json   TEXT    NOT NULL DEFAULT '[]', -- JSON array of strings
+    vllm_settings_json TEXT   NOT NULL DEFAULT '{}',
 
     -- Feature flags
     reasoning_enabled INTEGER NOT NULL DEFAULT 0,
@@ -161,3 +163,4 @@ CREATE INDEX IF NOT EXISTS idx_tts_cache_expiry
 -- ── Seed migration marker ─────────────────────────────────────────────────────
 INSERT OR IGNORE INTO schema_migrations(version) VALUES (1);
 INSERT OR IGNORE INTO schema_migrations(version) VALUES (5);
+INSERT OR IGNORE INTO schema_migrations(version) VALUES (6);

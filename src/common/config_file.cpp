@@ -25,6 +25,24 @@ static std::string strip_quotes(const std::string& s) {
     return s;
 }
 
+// Remove an inline `#` comment, but only when the `#` is outside a quoted
+// string — values like passwords or URL fragments may legitimately contain it.
+static std::string strip_inline_comment(const std::string& line) {
+    char quote = 0;
+    for (size_t i = 0; i < line.size(); ++i) {
+        const char c = line[i];
+        if (quote != 0) {
+            if (quote == '"' && c == '\\') { ++i; continue; } // skip escaped char
+            if (c == quote) quote = 0;
+        } else if (c == '"' || c == '\'') {
+            quote = c;
+        } else if (c == '#') {
+            return line.substr(0, i);
+        }
+    }
+    return line;
+}
+
 // ── ConfigFile::load ───────────────────────────────────────────────────────────
 
 bool ConfigFile::load(const std::string& path) {
@@ -33,10 +51,7 @@ bool ConfigFile::load(const std::string& path) {
 
     std::string line;
     while (std::getline(f, line)) {
-        // Strip inline comment
-        auto hash = line.find('#');
-        if (hash != std::string::npos) line = line.substr(0, hash);
-
+        line = strip_inline_comment(line);
         line = trim_ws(line);
         if (line.empty()) continue;
         if (line.front() == '[') continue; // section header — ignored

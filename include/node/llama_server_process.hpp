@@ -12,22 +12,22 @@ namespace mm {
 
 enum class ProcessState { Stopped, Starting, Ready, Error };
 
-// Manages a llama-server child process.
+// Manages an inference engine child process (`vllm serve`).
 // Platform specifics are hidden behind a PIMPL.
 // Pipe output is forwarded via LogCallback on background threads.
 class LlamaServerProcess {
 public:
-    explicit LlamaServerProcess(std::string llama_server_path);
+    explicit LlamaServerProcess(std::string server_path);
     ~LlamaServerProcess();
 
     using LogCallback = std::function<void(const std::string& line, bool is_stderr)>;
     void set_log_callback(LogCallback cb);
 
-    // Launches llama-server on the given port; blocks until /health is ready
-    // or the startup timeout expires.  Returns true on success.
-    bool start(const std::string& model_path,
-               const LlamaSettings& settings,
-               uint16_t port = 8080);
+    // Launches `vllm serve` on the given port; blocks until /health is ready
+    // or the startup timeout expires. Returns true on success.
+    bool start_vllm(const std::string& model_ref,
+                    const VllmSettings& settings,
+                    uint16_t port = 8080);
 
     // Graceful SIGTERM → SIGKILL fallback.
     void stop();
@@ -47,14 +47,12 @@ private:
     std::string           last_error_;
     LogCallback           log_cb_;
 
+    bool start_with_args(const std::string& runtime_name,
+                         const std::string& executable_path,
+                         std::vector<std::string> args,
+                         uint16_t port,
+                         int health_timeout_seconds);
     bool poll_health(int timeout_seconds = 60);
 };
-
-#ifdef MM_TESTING
-std::vector<std::string> build_llama_server_args_for_test(
-    const std::string& model_path,
-    const LlamaSettings& settings,
-    uint16_t port);
-#endif
 
 } // namespace mm

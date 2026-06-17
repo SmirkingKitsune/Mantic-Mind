@@ -38,7 +38,9 @@ NodeId NodeRegistry::add_node(const std::string& url,
         if (n.url != url && (api_key.empty() || n.api_key != api_key)) continue;
 
         n.url = url;
-        n.api_key = api_key;
+        // Never wipe a stored credential with an empty one (e.g. a URL-only
+        // re-registration must not break a remembered node).
+        if (!api_key.empty()) n.api_key = api_key;
         if (!platform.empty()) n.platform = platform;
         if (remember) remembered_nodes_.insert(id);
         n.remembered = remembered_nodes_.count(id) > 0;
@@ -158,17 +160,6 @@ void NodeRegistry::update_node_slots(const NodeId& id,
     it->second.slot_available = std::max(0, it->second.max_slots - it->second.slot_in_use);
 }
 
-void NodeRegistry::update_node_storage(const NodeId& id,
-                                        const std::vector<StoredModel>& models,
-                                        int64_t disk_free_mb) {
-    std::lock_guard<std::mutex> g(mutex_);
-    auto it = nodes_.find(id);
-    if (it != nodes_.end()) {
-        it->second.stored_models = models;
-        it->second.disk_free_mb  = disk_free_mb;
-    }
-}
-
 std::vector<NodeInfo> NodeRegistry::nodes_with_model_loaded(
     const std::string& model_path) const
 {
@@ -178,23 +169,6 @@ std::vector<NodeInfo> NodeRegistry::nodes_with_model_loaded(
         if (!n.connected) continue;
         for (const auto& s : n.slots) {
             if (s.model_path == model_path && s.state == SlotState::Ready) {
-                out.push_back(n);
-                break;
-            }
-        }
-    }
-    return out;
-}
-
-std::vector<NodeInfo> NodeRegistry::nodes_with_model_stored(
-    const std::string& model_path) const
-{
-    std::lock_guard<std::mutex> g(mutex_);
-    std::vector<NodeInfo> out;
-    for (auto& [_, n] : nodes_) {
-        if (!n.connected) continue;
-        for (const auto& m : n.stored_models) {
-            if (m.model_path == model_path) {
                 out.push_back(n);
                 break;
             }
@@ -429,97 +403,27 @@ void NodeRegistry::save_remembered_nodes_unlocked() const {
     out << root.dump(2) << '\n';
 }
 
-bool NodeRegistry::request_llama_update(const NodeId& id,
-                                        bool build,
-                                        bool force,
-                                        std::string* out_message) {
-    NodeInfo info;
-    {
-        std::lock_guard<std::mutex> g(mutex_);
-        auto it = nodes_.find(id);
-        if (it == nodes_.end()) {
-            if (out_message) *out_message = "node not found";
-            return false;
-        }
-        info = it->second;
-    }
-
-    HttpClient cli(info.url);
-    cli.set_bearer_token(info.api_key);
-
-    auto res = cli.post("/api/node/llama/update",
-                        nlohmann::json{{"build", build}, {"force", force}});
-    if (!res.ok()) {
-        if (out_message) {
-            std::string msg = "HTTP " + std::to_string(res.status);
-            if (!res.body.empty()) msg += ": " + res.body;
-            *out_message = std::move(msg);
-        }
-        return false;
-    }
-
-    try {
-        auto j = nlohmann::json::parse(res.body);
-        bool accepted = j.value("accepted", false);
-        std::string message = j.value("message", std::string{});
-        if (out_message) *out_message = message.empty() ? "accepted" : message;
-        return accepted;
-    } catch (const std::exception& e) {
-        if (out_message) *out_message = e.what();
-        return false;
-    }
-}
-
-bool NodeRegistry::request_llama_check_update(const NodeId& id,
-                                              std::string* out_message) {
-    NodeInfo info;
-    {
-        std::lock_guard<std::mutex> g(mutex_);
-        auto it = nodes_.find(id);
-        if (it == nodes_.end()) {
-            if (out_message) *out_message = "node not found";
-            return false;
-        }
-        info = it->second;
-    }
-
-    HttpClient cli(info.url);
-    cli.set_bearer_token(info.api_key);
-    auto res = cli.post("/api/node/llama/check-update", nlohmann::json::object());
-    if (!res.ok()) {
-        if (out_message) {
-            std::string msg = "HTTP " + std::to_string(res.status);
-            if (!res.body.empty()) msg += ": " + res.body;
-            *out_message = std::move(msg);
-        }
-        return false;
-    }
-
-    try {
-        auto j = nlohmann::json::parse(res.body);
-        bool ok = j.value("ok", true);
-        std::string msg = j.value("message", std::string{});
-        if (out_message) *out_message = msg.empty() ? (ok ? "ok" : "failed") : msg;
-        return ok;
-    } catch (const std::exception& e) {
-        if (out_message) *out_message = e.what();
-        return false;
-    }
-}
-
 // ── Health polling ─────────────────────────────────────────────────────────────
 void NodeRegistry::start_health_poll(int interval_s) {
     if (polling_.exchange(true)) return;
     poll_thread_ = std::thread([this, interval_s]() {
         while (polling_) {
             poll_all_nodes();
-            std::this_thread::sleep_for(std::chrono::seconds(interval_s));
+            // Interruptible wait: stop_health_poll() wakes us immediately
+            // instead of letting shutdown lag by up to interval_s seconds.
+            std::unique_lock<std::mutex> lk(poll_mutex_);
+            poll_cv_.wait_for(lk, std::chrono::seconds(interval_s),
+                              [this] { return !polling_; });
         }
     });
 }
 
 void NodeRegistry::stop_health_poll() {
-    polling_ = false;
+    {
+        std::lock_guard<std::mutex> lk(poll_mutex_);
+        polling_ = false;
+    }
+    poll_cv_.notify_all();
     if (poll_thread_.joinable()) poll_thread_.join();
 }
 
@@ -555,7 +459,7 @@ bool NodeRegistry::ping_node(NodeInfo& info) {
         return false;
     }
 
-    // GET /api/node/status → slots, stored_models, loaded_model
+    // GET /api/node/status → slots, loaded_model
     auto status_res = cli.get("/api/node/status");
     if (status_res.ok()) {
         try {
@@ -565,8 +469,6 @@ bool NodeRegistry::ping_node(NodeInfo& info) {
             // Parse multi-slot fields if present
             if (sj.contains("slots"))
                 info.slots = sj["slots"].get<std::vector<SlotInfo>>();
-            if (sj.contains("stored_models"))
-                info.stored_models = sj["stored_models"].get<std::vector<StoredModel>>();
             if (sj.contains("disk_free_mb"))
                 info.disk_free_mb = sj["disk_free_mb"].get<int64_t>();
             if (sj.contains("max_slots"))
@@ -585,40 +487,14 @@ bool NodeRegistry::ping_node(NodeInfo& info) {
                 info.slot_suspended = sj["slot_suspended"].get<int>();
             if (sj.contains("slot_error"))
                 info.slot_error = sj["slot_error"].get<int>();
-            if (sj.contains("llama_server_path"))
-                info.llama_server_path = sj["llama_server_path"].get<std::string>();
-            if (sj.contains("llama_update_running"))
-                info.llama_update_running = sj["llama_update_running"].get<bool>();
-            if (sj.contains("llama_update_status"))
-                info.llama_update_status = sj["llama_update_status"].get<std::string>();
-            if (sj.contains("llama_update_message"))
-                info.llama_update_message = sj["llama_update_message"].get<std::string>();
-            if (sj.contains("llama_update_started_ms"))
-                info.llama_update_started_ms = sj["llama_update_started_ms"].get<int64_t>();
-            if (sj.contains("llama_update_finished_ms"))
-                info.llama_update_finished_ms = sj["llama_update_finished_ms"].get<int64_t>();
-            if (sj.contains("llama_install_root"))
-                info.llama_install_root = sj["llama_install_root"].get<std::string>();
-            if (sj.contains("llama_repo_dir"))
-                info.llama_repo_dir = sj["llama_repo_dir"].get<std::string>();
-            if (sj.contains("llama_build_dir"))
-                info.llama_build_dir = sj["llama_build_dir"].get<std::string>();
-            if (sj.contains("llama_binary_path"))
-                info.llama_binary_path = sj["llama_binary_path"].get<std::string>();
-            if (sj.contains("llama_installed_commit"))
-                info.llama_installed_commit = sj["llama_installed_commit"].get<std::string>();
-            if (sj.contains("llama_remote_commit"))
-                info.llama_remote_commit = sj["llama_remote_commit"].get<std::string>();
-            if (sj.contains("llama_remote_error"))
-                info.llama_remote_error = sj["llama_remote_error"].get<std::string>();
-            if (sj.contains("llama_remote_checked_ms"))
-                info.llama_remote_checked_ms = sj["llama_remote_checked_ms"].get<int64_t>();
-            if (sj.contains("llama_update_available"))
-                info.llama_update_available = sj["llama_update_available"].get<bool>();
-            if (sj.contains("llama_update_reason"))
-                info.llama_update_reason = sj["llama_update_reason"].get<std::string>();
-            if (sj.contains("llama_update_log_path"))
-                info.llama_update_log_path = sj["llama_update_log_path"].get<std::string>();
+            if (sj.contains("vllm_server_path"))
+                info.vllm_server_path = sj["vllm_server_path"].get<std::string>();
+            if (sj.contains("capabilities"))
+                info.capabilities = sj["capabilities"].get<NodeCapabilities>();
+            if (sj.contains("vllm_gpu_budget"))
+                info.vllm_gpu_budget = sj["vllm_gpu_budget"].get<double>();
+            if (sj.contains("vllm_gpu_fraction_used"))
+                info.vllm_gpu_fraction_used = sj["vllm_gpu_fraction_used"].get<double>();
 
             // Backfill occupancy counts when a node returns only raw slots.
             if (!sj.contains("slot_in_use")) {
@@ -645,31 +521,6 @@ bool NodeRegistry::ping_node(NodeInfo& info) {
             }
         } catch (const std::exception& e) {
             MM_WARN("NodeRegistry: status parse error for {}: {}", info.id, e.what());
-        }
-    }
-
-    auto llama_status_res = cli.get("/api/node/llama/status");
-    if (llama_status_res.ok()) {
-        try {
-            auto lj = nlohmann::json::parse(llama_status_res.body);
-            if (lj.contains("binary_path"))
-                info.llama_binary_path = lj["binary_path"].get<std::string>();
-            if (lj.contains("installed_commit"))
-                info.llama_installed_commit = lj["installed_commit"].get<std::string>();
-            if (lj.contains("remote_commit"))
-                info.llama_remote_commit = lj["remote_commit"].get<std::string>();
-            if (lj.contains("remote_error"))
-                info.llama_remote_error = lj["remote_error"].get<std::string>();
-            if (lj.contains("remote_checked_ms"))
-                info.llama_remote_checked_ms = lj["remote_checked_ms"].get<int64_t>();
-            if (lj.contains("update_available"))
-                info.llama_update_available = lj["update_available"].get<bool>();
-            if (lj.contains("update_reason"))
-                info.llama_update_reason = lj["update_reason"].get<std::string>();
-            if (lj.contains("last_log_path"))
-                info.llama_update_log_path = lj["last_log_path"].get<std::string>();
-        } catch (const std::exception& e) {
-            MM_WARN("NodeRegistry: llama status parse error for {}: {}", info.id, e.what());
         }
     }
 
@@ -709,7 +560,6 @@ void NodeRegistry::poll_all_nodes() {
                 it->second.metrics       = info.metrics;
                 it->second.loaded_model  = info.loaded_model;
                 it->second.slots         = info.slots;
-                it->second.stored_models = info.stored_models;
                 it->second.disk_free_mb  = info.disk_free_mb;
                 it->second.max_slots     = info.max_slots;
                 it->second.slot_in_use   = info.slot_in_use;
@@ -719,23 +569,10 @@ void NodeRegistry::poll_all_nodes() {
                 it->second.slot_suspending = info.slot_suspending;
                 it->second.slot_suspended = info.slot_suspended;
                 it->second.slot_error    = info.slot_error;
-                it->second.llama_server_path = info.llama_server_path;
-                it->second.llama_update_running     = info.llama_update_running;
-                it->second.llama_update_status      = info.llama_update_status;
-                it->second.llama_update_message     = info.llama_update_message;
-                it->second.llama_update_started_ms  = info.llama_update_started_ms;
-                it->second.llama_update_finished_ms = info.llama_update_finished_ms;
-                it->second.llama_install_root = info.llama_install_root;
-                it->second.llama_repo_dir = info.llama_repo_dir;
-                it->second.llama_build_dir = info.llama_build_dir;
-                it->second.llama_binary_path = info.llama_binary_path;
-                it->second.llama_installed_commit = info.llama_installed_commit;
-                it->second.llama_remote_commit = info.llama_remote_commit;
-                it->second.llama_remote_error = info.llama_remote_error;
-                it->second.llama_remote_checked_ms = info.llama_remote_checked_ms;
-                it->second.llama_update_available = info.llama_update_available;
-                it->second.llama_update_reason = info.llama_update_reason;
-                it->second.llama_update_log_path = info.llama_update_log_path;
+                it->second.vllm_server_path = info.vllm_server_path;
+                it->second.vllm_gpu_budget = info.vllm_gpu_budget;
+                it->second.vllm_gpu_fraction_used = info.vllm_gpu_fraction_used;
+                it->second.capabilities = info.capabilities;
             }
             cb = update_cb_;
         }

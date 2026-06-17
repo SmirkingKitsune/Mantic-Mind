@@ -22,6 +22,7 @@ public:
 
     // Optional bearer token applied to all requests.
     void set_bearer_token(const std::string& token);
+    void set_timeouts(int connect_s, int read_s, int write_s);
 
     HttpResponse get (const std::string& path);
     HttpResponse post(const std::string& path, const nlohmann::json& body);
@@ -43,6 +44,9 @@ public:
 private:
     std::string base_url_;
     std::string bearer_token_;
+    int connect_timeout_s_ = 10;
+    int read_timeout_s_ = 30;
+    int write_timeout_s_ = 10;
 };
 
 } // namespace mm

@@ -40,6 +40,14 @@ std::vector<std::string> deserialize_strings(const std::string& s) {
     catch (const std::exception& e) { MM_DEBUG("deserialize_strings: {}", e.what()); return {}; }
 }
 
+std::string serialize(const VllmSettings& s) {
+    return nlohmann::json(s).dump();
+}
+VllmSettings deserialize_vllm_settings(const std::string& s) {
+    try { return nlohmann::json::parse(s).get<VllmSettings>(); }
+    catch (const std::exception& e) { MM_DEBUG("deserialize_vllm_settings: {}", e.what()); return {}; }
+}
+
 bool is_transient_sqlite_lock(const SQLite::Exception& e) {
     const std::string msg = util::to_lower(e.what());
     return msg.find("locked") != std::string::npos ||
@@ -202,6 +210,7 @@ void AgentDB::run_migrations() {
                 name              TEXT    NOT NULL,
                 model_path        TEXT    NOT NULL DEFAULT '',
                 system_prompt     TEXT    NOT NULL DEFAULT '',
+                inference_backend TEXT    NOT NULL DEFAULT 'llama.cpp',
                 ctx_size          INTEGER NOT NULL DEFAULT 4096,
                 n_gpu_layers      INTEGER NOT NULL DEFAULT -1,
                 n_threads         INTEGER NOT NULL DEFAULT -1,
@@ -214,6 +223,7 @@ void AgentDB::run_migrations() {
                 max_tokens        INTEGER NOT NULL DEFAULT 1024,
                 flash_attn        INTEGER NOT NULL DEFAULT 1,
                 extra_args_json   TEXT    NOT NULL DEFAULT '[]',
+                vllm_settings_json TEXT   NOT NULL DEFAULT '{}',
                 reasoning_enabled INTEGER NOT NULL DEFAULT 0,
                 memories_enabled  INTEGER NOT NULL DEFAULT 1,
                 tools_enabled     INTEGER NOT NULL DEFAULT 0,
@@ -432,6 +442,18 @@ void AgentDB::run_migrations() {
         db_->exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (5)");
         tx.commit();
     }
+
+    if (!has_version(6)) {
+        SQLite::Transaction tx(*db_);
+        if (!has_column("agent_config", "inference_backend")) {
+            db_->exec("ALTER TABLE agent_config ADD COLUMN inference_backend TEXT NOT NULL DEFAULT 'llama.cpp'");
+        }
+        if (!has_column("agent_config", "vllm_settings_json")) {
+            db_->exec("ALTER TABLE agent_config ADD COLUMN vllm_settings_json TEXT NOT NULL DEFAULT '{}'");
+        }
+        db_->exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (6)");
+        tx.commit();
+    }
 }
 
 //
@@ -439,27 +461,31 @@ void AgentDB::save_config(const AgentConfig& cfg) {
     std::lock_guard g(mutex_);
     const auto& s = cfg.llama_settings;
     const auto extra_args_json = serialize(s.extra_args);
+    const auto vllm_settings_json = serialize(cfg.vllm_settings);
 
     run_with_sqlite_retry("save_config", [&] {
         SQLite::Statement q(*db_, R"(
             INSERT INTO agent_config
                 (id, name, model_path, system_prompt,
+                 inference_backend,
                  ctx_size, n_gpu_layers, n_threads, n_threads_http,
                  parallel, batch_size, ubatch_size, temperature, top_p,
-                 max_tokens, flash_attn, extra_args_json,
+                 max_tokens, flash_attn, extra_args_json, vllm_settings_json,
                  reasoning_enabled, memories_enabled, tools_enabled,
                  preferred_node_id, updated_at_ms)
             VALUES
                 (:id,:name,:model_path,:system_prompt,
+                 :inference_backend,
                  :ctx_size,:n_gpu_layers,:n_threads,:n_threads_http,
                  :parallel,:batch_size,:ubatch_size,:temperature,:top_p,
-                 :max_tokens,:flash_attn,:extra_args_json,
+                 :max_tokens,:flash_attn,:extra_args_json,:vllm_settings_json,
                  :reasoning,:memories,:tools,
                  :preferred_node_id,:now)
             ON CONFLICT(id) DO UPDATE SET
                 name              = excluded.name,
                 model_path        = excluded.model_path,
                 system_prompt     = excluded.system_prompt,
+                inference_backend = excluded.inference_backend,
                 ctx_size          = excluded.ctx_size,
                 n_gpu_layers      = excluded.n_gpu_layers,
                 n_threads         = excluded.n_threads,
@@ -472,6 +498,7 @@ void AgentDB::save_config(const AgentConfig& cfg) {
                 max_tokens        = excluded.max_tokens,
                 flash_attn        = excluded.flash_attn,
                 extra_args_json   = excluded.extra_args_json,
+                vllm_settings_json = excluded.vllm_settings_json,
                 reasoning_enabled = excluded.reasoning_enabled,
                 memories_enabled  = excluded.memories_enabled,
                 tools_enabled     = excluded.tools_enabled,
@@ -483,6 +510,8 @@ void AgentDB::save_config(const AgentConfig& cfg) {
         q.bind(":name",              cfg.name);
         q.bind(":model_path",        cfg.model_path);
         q.bind(":system_prompt",     cfg.system_prompt);
+        // Column retained for schema compatibility; this branch is vLLM-only.
+        q.bind(":inference_backend", std::string("vllm"));
         q.bind(":ctx_size",          s.ctx_size);
         q.bind(":n_gpu_layers",      s.n_gpu_layers);
         q.bind(":n_threads",         s.n_threads);
@@ -495,6 +524,7 @@ void AgentDB::save_config(const AgentConfig& cfg) {
         q.bind(":max_tokens",        s.max_tokens);
         q.bind(":flash_attn",        s.flash_attn ? 1 : 0);
         q.bind(":extra_args_json",   extra_args_json);
+        q.bind(":vllm_settings_json", vllm_settings_json);
         q.bind(":reasoning",         cfg.reasoning_enabled ? 1 : 0);
         q.bind(":memories",          cfg.memories_enabled ? 1 : 0);
         q.bind(":tools",             cfg.tools_enabled ? 1 : 0);
@@ -516,6 +546,7 @@ AgentConfig AgentDB::load_config() const {
     cfg.name         = q.getColumn("name").getText();
     cfg.model_path   = q.getColumn("model_path").getText();
     cfg.system_prompt= q.getColumn("system_prompt").getText();
+    // inference_backend column retained but ignored (this branch is vLLM-only).
 
     auto& s = cfg.llama_settings;
     s.ctx_size      = q.getColumn("ctx_size").getInt();
@@ -530,6 +561,8 @@ AgentConfig AgentDB::load_config() const {
     s.max_tokens    = q.getColumn("max_tokens").getInt();
     s.flash_attn    = q.getColumn("flash_attn").getInt() != 0;
     s.extra_args    = deserialize_strings(q.getColumn("extra_args_json").getText());
+    cfg.vllm_settings =
+        deserialize_vllm_settings(q.getColumn("vllm_settings_json").getText());
 
     cfg.reasoning_enabled  = q.getColumn("reasoning_enabled").getInt() != 0;
     cfg.memories_enabled   = q.getColumn("memories_enabled").getInt()  != 0;

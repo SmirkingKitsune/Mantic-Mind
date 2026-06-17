@@ -13,6 +13,19 @@ struct NodeConfig {
 
     // Subprocess
     std::string llama_server_path;          // full path to llama-server binary
+    std::string vllm_server_path = "vllm";  // vLLM CLI executable or wrapper
+    double      vllm_gpu_budget  = 0.90;    // total GPU fraction all vLLM slots may claim
+
+    // ── Cluster capabilities (multi-node vLLM engine groups) ─────────────────
+    // Empty/auto values are filled by runtime detection at startup. Set these
+    // to override what this node advertises to control.
+    std::string comm_backends;             // CSV e.g. "nccl,gloo"; "" = auto-detect
+    bool        supports_ray = false;      // multi-node Ray group membership
+    bool        supports_ray_set = false;  // true when supports_ray came from config
+    int         node_gpu_count = 0;        // 0 = auto (nvidia-smi)
+    double      interconnect_gbps = 0.0;   // node-to-node link bandwidth hint
+    std::string ray_path = "ray";          // Ray CLI executable or PATH name
+    uint16_t    ray_port = 6379;           // head GCS port for Ray clusters
     uint16_t    llama_port = 8080;          // deprecated: single-slot port
     uint16_t    llama_port_range_start = 8080;
     uint16_t    llama_port_range_end   = 8090;

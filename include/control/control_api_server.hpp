@@ -15,7 +15,6 @@ namespace mm {
 class AgentManager;
 class AgentQueue;
 class NodeRegistry;
-class ModelRouter;
 class AgentScheduler;
 class HttpServer;
 
@@ -33,7 +32,6 @@ public:
     ControlApiServer(AgentManager& agents,
                      AgentQueue& queue,
                      NodeRegistry& registry,
-                     ModelRouter& router,
                      AgentScheduler& scheduler,
                      std::string data_dir,
                      std::string models_dir,
@@ -61,7 +59,6 @@ private:
     AgentManager&   agents_;
     AgentQueue&     queue_;
     NodeRegistry&   registry_;
-    ModelRouter&    router_;
     AgentScheduler& scheduler_;
     std::string     data_dir_;
     std::string     models_dir_;

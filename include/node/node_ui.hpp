@@ -20,19 +20,9 @@ class NodeState;
 // post to the FTXUI event loop.
 class NodeUI {
 public:
-    using UpdateRequestCallback = std::function<void()>;
-    using ModelPullCallback = std::function<bool(
-        const std::string& model_filename,
-        std::string* out_message)>;
-    using ModelDeleteCallback = std::function<bool(
-        const std::string& model_filename,
-        std::string* out_message)>;
     using ForgetPairingCallback = std::function<bool(std::string* out_message)>;
 
     NodeUI(NodeState& state, uint16_t listen_port,
-           UpdateRequestCallback update_request_cb = {},
-           ModelPullCallback pull_cb = {},
-           ModelDeleteCallback delete_cb = {},
            ForgetPairingCallback forget_pairing_cb = {});
     ~NodeUI();
 
@@ -48,9 +38,6 @@ public:
 private:
     NodeState& state_;
     uint16_t   listen_port_;
-    UpdateRequestCallback update_request_cb_;
-    ModelPullCallback pull_cb_;
-    ModelDeleteCallback delete_cb_;
     ForgetPairingCallback forget_pairing_cb_;
 
     static constexpr size_t kMaxLogLines = 4000;

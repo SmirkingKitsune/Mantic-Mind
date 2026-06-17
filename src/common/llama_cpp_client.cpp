@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <sstream>
 #include <stdexcept>
@@ -170,11 +171,27 @@ nlohmann::json build_request(const InferenceRequest& req, bool stream) {
     return body;
 }
 
+// Read timeout between bytes during inference. Slow cluster hardware can take
+// a long time over prompt processing before the first token arrives, so the
+// default is deliberately large (the gap between streamed tokens is what this
+// bounds, not total generation time).
+int infer_read_timeout_seconds() {
+    constexpr int kDefaultSeconds = 3600;
+    if (const char* env = std::getenv("MM_INFER_READ_TIMEOUT_S")) {
+        try {
+            int parsed = std::stoi(env);
+            if (parsed > 0) return parsed;
+        } catch (...) {
+        }
+    }
+    return kDefaultSeconds;
+}
+
 // ── Tool call delta accumulator ───────────────────────────────────────────────
 httplib::Client make_client(const std::string& host, int port) {
     httplib::Client cli(host, port);
     cli.set_connection_timeout(10);
-    cli.set_read_timeout(300);
+    cli.set_read_timeout(infer_read_timeout_seconds());
     cli.set_write_timeout(30);
     return cli;
 }
@@ -336,8 +353,6 @@ void LlamaCppClient::stream_complete(const InferenceRequest& req,
         return true;
     };
 
-    // cpp-httplib requires ContentProviderWithoutLength to unlock the
-    // ContentReceiver overload (body-string + ContentReceiver has no overload).
     std::string body_str;
     try {
         body_str = body.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
@@ -347,14 +362,10 @@ void LlamaCppClient::stream_complete(const InferenceRequest& req,
     }
     auto res = cli.Post(
         "/v1/chat/completions",
-        [&](size_t /*offset*/, httplib::DataSink& sink) {
-            sink.write(body_str.data(), body_str.size());
-            sink.done();
-            return true;
-        },
+        httplib::Headers{},
+        body_str,
         "application/json",
-        content_recv,
-        nullptr   // no UploadProgress callback
+        content_recv
     );
 
     if (callback_failed) {

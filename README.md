@@ -9,15 +9,68 @@ Distributed LLM inference cluster — two executables that turn any collection o
 
 | Tool | Minimum version |
 |---|---|
-| CMake | 3.24 |
+| CMake | 3.25 |
 | vcpkg | latest |
 | MSVC (Windows) | VS 2022 |
 | GCC / Clang (Linux) | GCC 12 / Clang 15 |
+| Apple Clang (macOS) | Xcode 15 command-line tools |
 | llama-server | any recent llama.cpp build |
 
-Set the `VCPKG_ROOT` environment variable to your vcpkg installation directory.
+Set the `VCPKG_ROOT` environment variable to your vcpkg installation directory, or put `vcpkg` on `PATH`. If vcpkg is not available, CMake must be able to find all dependencies through the system package manager or another toolchain.
+
+On Ubuntu/Debian, the non-vcpkg build expects these development packages:
+
+```sh
+sudo apt-get install cmake g++ libftxui-dev libsqlitecpp-dev libcpp-httplib-dev nlohmann-json3-dev libspdlog-dev libssl-dev
+```
+
+For Linux x64-to-AArch64 cross builds, also install the GNU AArch64 toolchain:
+
+```sh
+sudo apt-get install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+```
 
 ## Build
+
+Use the portable wrapper for the host shell:
+
+Linux / macOS / WSL / Git Bash:
+
+```sh
+./scripts/build.sh
+```
+
+Windows PowerShell:
+
+```powershell
+.\scripts\build.ps1
+```
+
+By default the wrapper builds Release into `build/<os>-<arch>-release`, auto-detects vcpkg when possible, and uses all available CPU cores. Common options:
+
+```sh
+./scripts/build.sh --debug
+./scripts/build.sh --arch aarch64
+./scripts/build.sh --config RelWithDebInfo
+./scripts/build.sh --generator Ninja
+./scripts/build.sh --triplet x64-windows
+./scripts/build.sh --install-prefix dist
+./scripts/build.sh -- -DBUILD_TESTING=OFF
+```
+
+The same options are available in PowerShell:
+
+```powershell
+.\scripts\build.ps1 -DebugBuild
+.\scripts\build.ps1 -Arch aarch64
+.\scripts\build.ps1 -Config RelWithDebInfo
+.\scripts\build.ps1 -Generator Ninja
+.\scripts\build.ps1 -Triplet x64-windows
+.\scripts\build.ps1 -InstallPrefix dist
+.\scripts\build.ps1 -- -DBUILD_TESTING=OFF
+```
+
+You can also use CMake directly:
 
 ```sh
 # Configure (vcpkg installs all dependencies automatically)
@@ -25,13 +78,61 @@ cmake -B build -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cm
 
 # Build both executables
 cmake --build build
-
-# Binaries land at:
-#   build/src/node/Debug/mantic-mind[.exe]
-#   build/src/control/Debug/mantic-mind-control[.exe]
 ```
 
-For a Release build add `-DCMAKE_BUILD_TYPE=Release`.
+For a Release build with single-config generators, add `-DCMAKE_BUILD_TYPE=Release`. For multi-config generators such as Visual Studio or Xcode, build with `--config Release`.
+
+### AArch64 Builds
+
+Native AArch64 hosts work through the default wrapper path:
+
+```sh
+./scripts/build.sh
+```
+
+To request an AArch64 target explicitly:
+
+```sh
+./scripts/build.sh --arch aarch64
+.\scripts\build.ps1 -Arch aarch64
+```
+
+The wrapper maps `--arch aarch64` / `-Arch aarch64` to the appropriate vcpkg triplet when vcpkg is enabled:
+
+| Host target | vcpkg triplet | Extra behavior |
+|---|---|---|
+| Linux AArch64 | `arm64-linux` | Uses `aarch64-linux-gnu-gcc/g++` automatically when cross-building from non-AArch64 Linux |
+| macOS Apple Silicon | `arm64-osx` | Sets `CMAKE_OSX_ARCHITECTURES=arm64` |
+| Windows ARM64 | `arm64-windows` | Adds `-A ARM64` when using a Visual Studio generator |
+
+If your cross compiler is not named `aarch64-linux-gnu-g++`, pass a toolchain or compiler settings after `--`:
+
+```sh
+./scripts/build.sh --arch aarch64 --triplet arm64-linux -- \
+  -DCMAKE_SYSTEM_NAME=Linux \
+  -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+  -DCMAKE_C_COMPILER=/path/to/aarch64-gcc \
+  -DCMAKE_CXX_COMPILER=/path/to/aarch64-g++
+```
+
+CMake presets are available for IDEs and CLI workflows:
+
+```sh
+cmake --preset vcpkg-release
+cmake --build --preset vcpkg-release
+ctest --preset vcpkg-release
+
+cmake --preset vcpkg-aarch64-linux-release
+cmake --build --preset vcpkg-aarch64-linux-release
+```
+
+Install both binaries into a predictable layout with:
+
+```sh
+cmake --install build --config Release --prefix dist
+# dist/bin/mantic-mind[.exe]
+# dist/bin/mantic-mind-control[.exe]
+```
 
 ## Sync llama.cpp
 
@@ -59,6 +160,33 @@ You can also use env vars instead:
 ```sh
 MM_LLAMA_PATH=/path/to/llama-server
 ```
+
+## vLLM Runtime Development
+
+This branch starts the vLLM runtime path while keeping `llama.cpp` as the
+default active backend. Agent configs now carry an `inference_backend` field
+(`llama.cpp` or `vllm`) plus `vllm_settings` for `vllm serve` launch options.
+
+Runtime source policy:
+
+- Linux nodes target the upstream vLLM repository:
+  `https://github.com/vllm-project/vllm`
+- Windows nodes target the Windows fork and branch documented by that project:
+  `https://github.com/SystemPanic/vllm-windows`, branch `vllm-for-windows`
+
+The current vLLM scaffold builds deterministic `vllm serve` arguments such as
+`--host`, `--port`, `--max-model-len`, `--max-num-seqs`,
+`--gpu-memory-utilization`, tool parser flags, and tensor/pipeline parallelism
+flags. The next runtime step is wiring those settings into a managed vLLM
+process/slot implementation. Until that lands, `llama.cpp` remains the only
+fully managed node runtime.
+
+Qwen3-TTS can be routed directly to a vLLM-compatible speech endpoint by
+setting `tts_enabled = true` and `tts_backend = "vllm"` in
+`mantic-mind-control.toml` or with `MM_TTS_BACKEND=vllm`. The route, base URL,
+and served model are configurable through `tts_vllm_base_url`,
+`tts_vllm_speech_path`, and `tts_vllm_model_id`, while the older Python sidecar
+remains available as `tts_backend = "sidecar"`.
 
 ## Quick Start
 

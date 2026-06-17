@@ -1,0 +1,8 @@
+# Control config for live confirmation run (WSL).
+# external_api_token empty -> public API open (no bearer needed for /v1/*).
+listen_port = 9090
+data_dir = "data"
+models_dir = "models"
+node_health_poll_interval_s = 5
+tts_enabled = false
+log_file = "logs/control.log"

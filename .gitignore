@@ -21,6 +21,7 @@
 
 # Local third-party checkouts
 /external/llama.cpp/
+/.deps/
 
 # IDE / editor
 /.vscode/

@@ -1,9 +1,8 @@
 add_executable(mantic-mind-control
     main.cpp
     node_registry.cpp
-    model_router.cpp
-    model_distributor.cpp
     agent_scheduler.cpp
+    engine_group_planner.cpp
     agent_queue.cpp
     agent_manager.cpp
     agent_config_validator.cpp
@@ -22,4 +21,8 @@ target_link_libraries(mantic-mind-control PRIVATE
 
 target_include_directories(mantic-mind-control PRIVATE
     ${CMAKE_SOURCE_DIR}/include
+)
+
+install(TARGETS mantic-mind-control
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )

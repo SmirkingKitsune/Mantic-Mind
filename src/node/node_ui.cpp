@@ -51,15 +51,9 @@ std::string shorten_middle(const std::string& s, size_t max_len) {
 } // namespace
 
 NodeUI::NodeUI(NodeState& state, uint16_t listen_port,
-               UpdateRequestCallback update_request_cb,
-               ModelPullCallback pull_cb,
-               ModelDeleteCallback delete_cb,
                ForgetPairingCallback forget_pairing_cb)
     : state_(state)
     , listen_port_(listen_port)
-    , update_request_cb_(std::move(update_request_cb))
-    , pull_cb_(std::move(pull_cb))
-    , delete_cb_(std::move(delete_cb))
     , forget_pairing_cb_(std::move(forget_pairing_cb)) {
     log_file_path_ = make_temp_llama_log_path();
     if (!log_file_path_.empty()) {
@@ -115,9 +109,6 @@ void NodeUI::run() {
         "⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"
     };
     int frame = 0;
-    enum class ModelPromptMode { None, Pull, Delete };
-    ModelPromptMode prompt_mode = ModelPromptMode::None;
-    std::string prompt_buffer;
     std::string model_action_status;
     auto forget_pairing = [&]() {
         std::string msg;
@@ -141,12 +132,8 @@ void NodeUI::run() {
         auto loaded_model = state_.get_loaded_model();
         auto active_agent = state_.get_active_agent();
         auto slots        = state_.get_slots();
-        auto stored_models = state_.get_stored_models();
-        auto models_disk_free_mb = state_.get_models_disk_free_mb();
         auto node_id      = state_.get_node_id();
         auto last_error   = state_.get_last_error();
-        auto upd          = state_.get_llama_update_state();
-        auto rt           = state_.get_llama_runtime_summary();
         auto api_keys     = state_.get_api_keys();
         auto streaming    = state_.get_streaming_text();
 
@@ -199,44 +186,13 @@ void NodeUI::run() {
         if (metrics.gpu_vram_total_mb > 0)
             gpu_detail = mb_str(metrics.gpu_vram_used_mb) + " / " + mb_str(metrics.gpu_vram_total_mb);
 
-        auto short_commit = [](const std::string& s) -> std::string {
-            if (s.empty()) return "?";
-            return s.size() > 10 ? s.substr(0, 10) : s;
-        };
-
-        std::string runtime_summary = upd.status.empty() ? "idle" : upd.status;
-        runtime_summary += rt.update_available ? " | update available" : " | up-to-date";
-
-        if (!rt.installed_commit.empty() || !rt.remote_commit.empty()) {
-            runtime_summary += " | ";
-            runtime_summary += short_commit(rt.installed_commit);
-            runtime_summary += " -> ";
-            runtime_summary += short_commit(rt.remote_commit);
-        }
-
-        if (!upd.message.empty()) {
-            runtime_summary += " | ";
-            runtime_summary += upd.message;
-        }
-
-        if (!rt.remote_error.empty()) {
-            runtime_summary += " | remote: ";
-            runtime_summary += rt.remote_error;
-        }
-
+        std::string runtime_summary = "ready";
         if (!last_error.empty()) {
             runtime_summary += " | error: ";
             runtime_summary += last_error;
         }
 
-        Color runtime_color = Color::GrayDark;
-        if (upd.status == "failed" || !last_error.empty() || !rt.remote_error.empty()) {
-            runtime_color = Color::RedLight;
-        } else if (upd.status == "running" || rt.update_available) {
-            runtime_color = Color::Yellow;
-        } else if (upd.status == "succeeded") {
-            runtime_color = Color::Green;
-        }
+        Color runtime_color = last_error.empty() ? Color::GrayDark : Color::RedLight;
 
         if (!registered) {
             // ── Waiting state ─────────────────────────────────────────────────
@@ -307,7 +263,7 @@ void NodeUI::run() {
             waiting_elems.push_back(btn_forget_pairing->Render() | hcenter);
             waiting_elems.push_back(text(""));
             waiting_elems.push_back(
-                text("  Press u:update llama.cpp  p:pull model  d:delete model  f:forget pairing  q:quit")
+                text("  Press f:forget pairing  q:quit")
                 | color(Color::GrayDark));
 
             return vbox(waiting_elems) | border;
@@ -361,32 +317,8 @@ void NodeUI::run() {
                 paragraph(runtime_summary) | color(runtime_color) | flex,
             }),
         };
-        status_rows.push_back(
-            hbox({text("Storage  "),
-                  text(std::to_string(stored_models.size()) + " model(s), free " +
-                       mb_str(models_disk_free_mb)) | color(Color::GrayDark)}));
-        if (!stored_models.empty()) {
-            constexpr size_t kMaxStoredRows = 5;
-            for (size_t i = 0; i < std::min(stored_models.size(), kMaxStoredRows); ++i) {
-                const auto& m = stored_models[i];
-                status_rows.push_back(
-                    text("  " + std::to_string(i + 1) + ". " + compact_model(m.model_path))
-                    | color(Color::GrayDark));
-            }
-            if (stored_models.size() > kMaxStoredRows) {
-                status_rows.push_back(
-                    text("  ... +" + std::to_string(stored_models.size() - kMaxStoredRows) + " more")
-                    | color(Color::GrayDark));
-            }
-        }
         if (!model_action_status.empty()) {
             status_rows.push_back(text("Action   " + model_action_status) | color(Color::Yellow));
-        }
-        if (prompt_mode != ModelPromptMode::None) {
-            const bool pull = prompt_mode == ModelPromptMode::Pull;
-            status_rows.push_back(
-                text(std::string(pull ? "Pull model: " : "Delete model: ") + prompt_buffer + "_")
-                | color(Color::GreenLight));
         }
         if (!slots.empty()) {
             status_rows.push_back(text(" "));
@@ -563,66 +495,13 @@ void NodeUI::run() {
             separator(),
             hbox({
                 btn_forget_pairing->Render(),
-                text("  u:update llama.cpp  p:pull model  d:delete model  j/k or arrows:scroll logs  q:quit")
+                text("  f:forget pairing  j/k or arrows:scroll logs  q:quit")
                     | color(Color::GrayDark),
             }),
         }) | border;
     });
 
     auto component = CatchEvent(render, [&](Event ev) {
-        auto clear_prompt = [&]() {
-            prompt_mode = ModelPromptMode::None;
-            prompt_buffer.clear();
-        };
-        auto submit_prompt = [&]() {
-            const std::string filename = util::trim(prompt_buffer);
-            if (filename.empty()) {
-                model_action_status = "filename required";
-                clear_prompt();
-                return true;
-            }
-            std::string msg;
-            bool ok = false;
-            if (prompt_mode == ModelPromptMode::Pull) {
-                if (pull_cb_) ok = pull_cb_(filename, &msg);
-                else msg = "pull callback not configured";
-                if (msg.empty()) msg = ok ? "pull completed" : "pull failed";
-            } else if (prompt_mode == ModelPromptMode::Delete) {
-                if (delete_cb_) ok = delete_cb_(filename, &msg);
-                else msg = "delete callback not configured";
-                if (msg.empty()) msg = ok ? "delete completed" : "delete failed";
-            }
-            model_action_status = msg;
-            clear_prompt();
-            return true;
-        };
-        auto append_prompt_char = [&](const Event& event) -> bool {
-            if (!event.is_character()) return false;
-            const std::string ch = event.character();
-            if (ch.size() != 1) return false;
-            const unsigned char uc = static_cast<unsigned char>(ch[0]);
-            if (!std::isprint(uc) || std::isspace(uc)) return false;
-            prompt_buffer += ch;
-            return true;
-        };
-
-        if (prompt_mode != ModelPromptMode::None) {
-            if (ev == Event::Escape) {
-                model_action_status = "action cancelled";
-                clear_prompt();
-                return true;
-            }
-            if (ev == Event::Backspace) {
-                if (!prompt_buffer.empty()) prompt_buffer.pop_back();
-                return true;
-            }
-            if (ev == Event::Return) {
-                return submit_prompt();
-            }
-            if (append_prompt_char(ev)) return true;
-            return false;
-        }
-
         const int viewport = std::max(4, ftxui::Terminal::Size().dimy - 17);
         auto scroll_logs = [&](int delta) {
             std::lock_guard<std::mutex> lk(log_mutex_);
@@ -663,22 +542,6 @@ void NodeUI::run() {
         }
         if (ev == Event::End || ev == Event::Character('G')) {
             scroll_to_end();
-            return true;
-        }
-        if (ev == Event::Character('u') && update_request_cb_) {
-            update_request_cb_();
-            return true;
-        }
-        if (ev == Event::Character('p')) {
-            prompt_mode = ModelPromptMode::Pull;
-            prompt_buffer.clear();
-            model_action_status = "enter model filename and press Enter";
-            return true;
-        }
-        if (ev == Event::Character('d')) {
-            prompt_mode = ModelPromptMode::Delete;
-            prompt_buffer.clear();
-            model_action_status = "enter model filename and press Enter";
             return true;
         }
         if (ev == Event::Character('f')) {

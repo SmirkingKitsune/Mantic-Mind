@@ -1,6 +1,5 @@
 #include "control/agent_config_validator.hpp"
 
-#include "common/gguf_metadata.hpp"
 #include "common/util.hpp"
 #include "control/node_registry.hpp"
 
@@ -30,6 +29,12 @@ AgentValidationResult validate_agent_config(const AgentConfig& cfg,
                                             const std::string& models_dir,
                                             const ModelCapabilityInfo* precomputed_model_info) {
     AgentValidationResult result;
+
+    // models_dir and precomputed_model_info are no longer used now that model
+    // capability inspection (GGUF metadata) has been removed; the config is
+    // always vLLM and model_info is always empty.
+    (void)models_dir;
+    (void)precomputed_model_info;
 
     if (is_blank(cfg.name)) {
         add_issue(result, ValidationSeverity::Error, "name", "Name is required.");
@@ -81,59 +86,32 @@ AgentValidationResult validate_agent_config(const AgentConfig& cfg,
     if (cfg.llama_settings.ubatch_size != -1 && cfg.llama_settings.ubatch_size <= 0) {
         add_issue(result, ValidationSeverity::Error, "llama_settings.ubatch_size", "ubatch_size must be greater than 0, or -1 for the llama-server default.");
     }
-
-    ModelCapabilityInfo model_info;
-    if (precomputed_model_info) {
-        model_info = *precomputed_model_info;
-    } else if (!is_blank(cfg.model_path)) {
-        model_info = inspect_model_capabilities(cfg.model_path, models_dir);
+    if (cfg.vllm_settings.max_model_len <= 0) {
+        add_issue(result, ValidationSeverity::Error, "vllm_settings.max_model_len", "max_model_len must be greater than 0.");
     }
-
-    if (!is_blank(cfg.model_path)) {
-        result.model_info = model_info;
-
-        if (model_info.metadata_found && model_info.n_ctx_train > 0 &&
-            cfg.llama_settings.ctx_size > model_info.n_ctx_train) {
-            add_issue(result,
-                      ValidationSeverity::Error,
-                      "llama_settings.ctx_size",
-                      "ctx_size " + std::to_string(cfg.llama_settings.ctx_size) +
-                          " exceeds model training context " + std::to_string(model_info.n_ctx_train) +
-                          ". Lower ctx_size to <= " + std::to_string(model_info.n_ctx_train) + ".");
-        } else if (!model_info.metadata_found || model_info.n_ctx_train <= 0) {
-            add_issue(result,
-                      ValidationSeverity::Warning,
-                      "model_path",
-                      "Model metadata could not verify the maximum context size for this model.");
-        }
-
-        for (const auto& warning : model_info.warnings) {
-            add_issue(result, ValidationSeverity::Warning, "model_path", warning);
-        }
-
-        if (cfg.tools_enabled && !cfg.memories_enabled) {
-            add_issue(result,
-                      ValidationSeverity::Warning,
-                      "tools_enabled",
-                      "Tools are enabled, but no executable tools are currently available unless Memories is also enabled.");
-        }
-
-        if (cfg.tools_enabled &&
-            model_info.metadata_found &&
-            !model_info.supports_tool_calls &&
-            !model_info.used_filename_heuristics) {
-            add_issue(result,
-                      ValidationSeverity::Warning,
-                      "tools_enabled",
-                      "GGUF metadata did not advertise tool-call support for this model. Some models can still use tools if their prompt template supports them, so verify with a quick test chat.");
-        }
-
-        if (cfg.reasoning_enabled && !model_info.supports_reasoning) {
-            add_issue(result,
-                      ValidationSeverity::Warning,
-                      "reasoning_enabled",
-                      "The selected model does not appear to advertise a reasoning chat template.");
-        }
+    if (cfg.vllm_settings.max_num_seqs <= 0) {
+        add_issue(result, ValidationSeverity::Error, "vllm_settings.max_num_seqs", "max_num_seqs must be greater than 0.");
+    }
+    if (cfg.vllm_settings.max_num_batched_tokens != -1 &&
+        cfg.vllm_settings.max_num_batched_tokens <= 0) {
+        add_issue(result, ValidationSeverity::Error, "vllm_settings.max_num_batched_tokens", "max_num_batched_tokens must be greater than 0, or -1 for the vLLM default.");
+    }
+    if (cfg.vllm_settings.tensor_parallel_size <= 0) {
+        add_issue(result, ValidationSeverity::Error, "vllm_settings.tensor_parallel_size", "tensor_parallel_size must be greater than 0.");
+    }
+    if (cfg.vllm_settings.pipeline_parallel_size <= 0) {
+        add_issue(result, ValidationSeverity::Error, "vllm_settings.pipeline_parallel_size", "pipeline_parallel_size must be greater than 0.");
+    }
+    if (cfg.vllm_settings.gpu_memory_utilization <= 0.0 ||
+        cfg.vllm_settings.gpu_memory_utilization > 1.0 ||
+        !std::isfinite(cfg.vllm_settings.gpu_memory_utilization)) {
+        add_issue(result, ValidationSeverity::Error, "vllm_settings.gpu_memory_utilization", "gpu_memory_utilization must be within (0, 1].");
+    }
+    if (cfg.tools_enabled && !cfg.memories_enabled) {
+        add_issue(result,
+                  ValidationSeverity::Warning,
+                  "tools_enabled",
+                  "Tools are enabled, but no executable tools are currently available unless Memories is also enabled.");
     }
 
     if (!cfg.preferred_node_id.empty() && registry) {
@@ -154,33 +132,16 @@ AgentValidationResult validate_agent_config(const AgentConfig& cfg,
         }
     }
 
-    if (cfg.llama_settings.ctx_size > 131072) {
+    if (cfg.vllm_settings.max_model_len > 131072) {
         add_issue(result,
                   ValidationSeverity::Warning,
-                  "llama_settings.ctx_size",
-                  "ctx_size is extremely large and may fail to load or perform poorly.");
-    } else if (cfg.llama_settings.ctx_size > 65536) {
+                  "vllm_settings.max_model_len",
+                  "max_model_len is extremely large and may fail to load or perform poorly.");
+    } else if (cfg.vllm_settings.max_model_len > 65536) {
         add_issue(result,
                   ValidationSeverity::Warning,
-                  "llama_settings.ctx_size",
-                  "ctx_size is very large and may be slow or require substantial memory.");
-    }
-
-    if (cfg.llama_settings.ctx_size > 0 && cfg.llama_settings.parallel > 1) {
-        const int64_t server_ctx_size =
-            static_cast<int64_t>(cfg.llama_settings.ctx_size) *
-            static_cast<int64_t>(cfg.llama_settings.parallel);
-        if (server_ctx_size > 131072) {
-            add_issue(result,
-                      ValidationSeverity::Warning,
-                      "llama_settings.parallel",
-                      "ctx_size * parallel is extremely large and may fail to load or perform poorly.");
-        } else if (server_ctx_size > 65536) {
-            add_issue(result,
-                      ValidationSeverity::Warning,
-                      "llama_settings.parallel",
-                      "ctx_size * parallel is very large and may be slow or require substantial memory.");
-        }
+                  "vllm_settings.max_model_len",
+                  "max_model_len is very large and may be slow or require substantial memory.");
     }
 
     return result;

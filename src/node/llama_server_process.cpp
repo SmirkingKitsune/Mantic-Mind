@@ -1,6 +1,7 @@
 #include "node/llama_server_process.hpp"
 #include "common/logger.hpp"
 #include "common/util.hpp"
+#include "node/vllm_runtime.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -8,6 +9,7 @@
 #include <chrono>
 #include <array>
 #include <cctype>
+#include <cstdlib>
 #include <filesystem>
 #include <initializer_list>
 #include <mutex>
@@ -72,6 +74,23 @@ struct LlamaServerProcess::Impl {
         if (stderr_fd != -1) { ::close(stderr_fd); stderr_fd = -1; }
 #endif
     }
+
+    // True once the child process has terminated. Lets poll_health abort
+    // immediately on a crashed server instead of waiting out the timeout.
+    bool process_exited() {
+#ifdef _WIN32
+        if (proc_handle == INVALID_HANDLE_VALUE) return true;
+        return WaitForSingleObject(proc_handle, 0) == WAIT_OBJECT_0;
+#else
+        if (pid <= 0) return true;
+        int status = 0;
+        if (::waitpid(pid, &status, WNOHANG) == pid) {
+            pid = -1; // reaped; stop() must not signal it again
+            return true;
+        }
+        return false;
+#endif
+    }
 };
 
 // ── Arg builder ───────────────────────────────────────────────────────────────
@@ -89,53 +108,19 @@ std::string strip_wrapping_quotes(std::string s) {
     return s;
 }
 
-std::string normalize_model_path_for_runtime(std::string p) {
-    p = strip_wrapping_quotes(std::move(p));
-    if (p.empty()) return p;
-
-#ifdef _WIN32
-    // Accept WSL-style mount paths when node runtime is Windows:
-    // /mnt/y/foo/bar.gguf -> Y:\foo\bar.gguf
-    if (p.size() >= 6 &&
-        p[0] == '/' && p[1] == 'm' && p[2] == 'n' && p[3] == 't' && p[4] == '/' &&
-        std::isalpha(static_cast<unsigned char>(p[5])) &&
-        (p.size() == 6 || p[6] == '/')) {
-        char drive = static_cast<char>(std::toupper(static_cast<unsigned char>(p[5])));
-        std::string out;
-        out.reserve(p.size() + 2);
-        out.push_back(drive);
-        out.push_back(':');
-        if (p.size() == 6) {
-            out.push_back('\\');
-            return out;
+// Startup health timeout. Loading a large model from disk on slow cluster
+// hardware can take many minutes, so the default is generous; a crashed
+// process aborts the wait immediately (see Impl::process_exited).
+int load_health_timeout_seconds() {
+    constexpr int kDefaultSeconds = 600;
+    if (const char* env = std::getenv("MM_LOAD_TIMEOUT_S")) {
+        try {
+            int parsed = std::stoi(env);
+            if (parsed > 0) return parsed;
+        } catch (...) {
         }
-        for (size_t i = 6; i < p.size(); ++i) {
-            char ch = p[i];
-            out.push_back(ch == '/' ? '\\' : ch);
-        }
-        return out;
     }
-    return p;
-#else
-    // Best-effort support for Windows-style paths when node runtime is Linux:
-    // Y:\foo\bar.gguf -> /mnt/y/foo/bar.gguf
-    if (p.size() >= 3 &&
-        std::isalpha(static_cast<unsigned char>(p[0])) &&
-        p[1] == ':' &&
-        (p[2] == '\\' || p[2] == '/')) {
-        std::string out;
-        out.reserve(p.size() + 8);
-        out += "/mnt/";
-        out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(p[0]))));
-        for (size_t i = 2; i < p.size(); ++i) {
-            char ch = p[i];
-            out.push_back(ch == '\\' ? '/' : ch);
-        }
-        std::error_code ec;
-        if (std::filesystem::exists(out, ec)) return out;
-    }
-    return p;
-#endif
+    return kDefaultSeconds;
 }
 
 #ifdef _WIN32
@@ -203,109 +188,7 @@ std::string resolve_windows_executable(const std::string& exe_name) {
 }
 #endif
 
-std::vector<std::string> build_args(const std::string& model_path,
-                                    const LlamaSettings& s, uint16_t port) {
-    std::vector<std::string> args;
-    const auto& extra = s.extra_args;
-
-    auto arg_matches_flag = [](const std::string& raw, const std::string& flag) {
-        const std::string arg = mm::util::trim(raw);
-        return arg == flag
-            || arg.rfind(flag + "=", 0) == 0
-            || arg.rfind(flag + " ", 0) == 0;
-    };
-
-    auto has_any_flag = [&](std::initializer_list<const char*> flags) {
-        for (const auto& arg : extra) {
-            for (const char* flag : flags) {
-                if (arg_matches_flag(arg, flag)) return true;
-            }
-        }
-        return false;
-    };
-
-    auto find_flag_value = [&](std::initializer_list<const char*> flags) -> std::optional<std::string> {
-        for (size_t i = 0; i < extra.size(); ++i) {
-            const std::string arg = mm::util::trim(extra[i]);
-            for (const char* flag_raw : flags) {
-                const std::string flag(flag_raw);
-                if (arg == flag) {
-                    if (i + 1 < extra.size()) return mm::util::trim(extra[i + 1]);
-                    return std::nullopt;
-                }
-                if (arg.rfind(flag + "=", 0) == 0) {
-                    return mm::util::trim(arg.substr(flag.size() + 1));
-                }
-                if (arg.rfind(flag + " ", 0) == 0) {
-                    return mm::util::trim(arg.substr(flag.size() + 1));
-                }
-            }
-        }
-        return std::nullopt;
-    };
-
-    auto append_value_unless_extra = [&](std::initializer_list<const char*> flags,
-                                         const std::string& flag,
-                                         const std::string& value) {
-        if (has_any_flag(flags)) return;
-        args.push_back(flag);
-        args.push_back(value);
-    };
-
-    int parallel_for_ctx = s.parallel > 0 ? s.parallel : 1;
-    if (auto override = find_flag_value({"--parallel"})) {
-        try {
-            int parsed = std::stoi(*override);
-            if (parsed > 0) parallel_for_ctx = parsed;
-        } catch (...) {
-        }
-    }
-    const long long server_ctx_size =
-        static_cast<long long>(s.ctx_size) * static_cast<long long>(parallel_for_ctx);
-
-    args.push_back("--model");       args.push_back(strip_wrapping_quotes(model_path));
-    args.push_back("--port");        args.push_back(std::to_string(port));
-    append_value_unless_extra({"--ctx-size", "-c"},
-                              "--ctx-size", std::to_string(server_ctx_size));
-    append_value_unless_extra({"--gpu-layers", "-ngl"},
-                              "--gpu-layers", std::to_string(s.n_gpu_layers));
-    if (s.n_threads > 0) {
-        append_value_unless_extra({"--threads", "-t"},
-                                  "--threads", std::to_string(s.n_threads));
-    }
-    if (s.n_threads_http > 0) {
-        append_value_unless_extra({"--threads-http"},
-                                  "--threads-http", std::to_string(s.n_threads_http));
-    }
-    if (s.parallel > 1) {
-        append_value_unless_extra({"--parallel"},
-                                  "--parallel", std::to_string(s.parallel));
-    }
-    if (s.batch_size > 0) {
-        append_value_unless_extra({"--batch-size", "-b"},
-                                  "--batch-size", std::to_string(s.batch_size));
-    }
-    if (s.ubatch_size > 0) {
-        append_value_unless_extra({"--ubatch"},
-                                  "--ubatch", std::to_string(s.ubatch_size));
-    }
-    if (s.flash_attn && !has_any_flag({"--flash-attn", "-fa"})) {
-        args.push_back("--flash-attn");
-    }
-    for (auto& a : extra) args.push_back(a);
-    return args;
-}
-
 } // namespace
-
-#ifdef MM_TESTING
-std::vector<std::string> build_llama_server_args_for_test(
-    const std::string& model_path,
-    const LlamaSettings& settings,
-    uint16_t port) {
-    return build_args(model_path, settings, port);
-}
-#endif
 
 // ── Construction ──────────────────────────────────────────────────────────────
 LlamaServerProcess::LlamaServerProcess(std::string path)
@@ -320,47 +203,56 @@ void LlamaServerProcess::set_log_callback(LogCallback cb) {
     impl_->log_cb = std::move(cb);
 }
 
-// ── start ─────────────────────────────────────────────────────────────────────
-bool LlamaServerProcess::start(const std::string& model_path,
-                                const LlamaSettings& settings,
-                                uint16_t port) {
+bool LlamaServerProcess::start_vllm(const std::string& model_ref,
+                                    const VllmSettings& settings,
+                                    uint16_t port) {
+    if (settings.enable_sleep_mode) {
+        // The /sleep and /wake_up endpoints are only exposed in vLLM's dev
+        // mode. Children inherit the parent environment on both platforms.
+#ifdef _WIN32
+        SetEnvironmentVariableA("VLLM_SERVER_DEV_MODE", "1");
+#else
+        ::setenv("VLLM_SERVER_DEV_MODE", "1", 1);
+#endif
+    }
+    auto args = build_vllm_server_args(model_ref, settings, port);
+    return start_with_args("vLLM", strip_wrapping_quotes(llama_server_path_),
+                           std::move(args), port, load_health_timeout_seconds());
+}
+
+bool LlamaServerProcess::start_with_args(const std::string& runtime_name,
+                                         const std::string& executable_path,
+                                         std::vector<std::string> args,
+                                         uint16_t port,
+                                         int health_timeout_seconds) {
     if (state_ != ProcessState::Stopped) stop();
 
     port_  = port;
     state_ = ProcessState::Starting;
     last_error_.clear();
 
-    std::string exe_path = strip_wrapping_quotes(llama_server_path_);
+    std::string exe_path = strip_wrapping_quotes(executable_path);
     if (exe_path.empty()) {
-        MM_ERROR("llama_server_path is empty");
-        last_error_ = "llama_server_path is empty";
+        MM_ERROR("{} executable path is empty", runtime_name);
+        last_error_ = runtime_name + " executable path is empty";
         impl_->call_log(last_error_, true);
         state_ = ProcessState::Error;
         return false;
     }
-
-    const std::string runtime_model_path = normalize_model_path_for_runtime(model_path);
-    if (runtime_model_path != strip_wrapping_quotes(model_path)) {
-        MM_INFO("Normalized model path for runtime: '{}' -> '{}'",
-                strip_wrapping_quotes(model_path), runtime_model_path);
-    }
-
-    auto args = build_args(runtime_model_path, settings, port);
 
 #ifdef _WIN32
     std::string resolved_exe_path = resolve_windows_executable(exe_path);
     const bool exe_path_like = is_windows_path_like(exe_path);
     if (exe_path_like && !windows_file_exists(exe_path)) {
-        MM_ERROR("llama-server executable not found at path: {}", exe_path);
-        last_error_ = "llama-server executable not found at path: " + exe_path;
+        MM_ERROR("{} executable not found at path: {}", runtime_name, exe_path);
+        last_error_ = runtime_name + " executable not found at path: " + exe_path;
         impl_->call_log(last_error_, true);
         state_ = ProcessState::Error;
         return false;
     }
     if (!exe_path_like && !windows_file_exists(resolved_exe_path)) {
-        MM_ERROR("llama-server executable '{}' not found in PATH", exe_path);
-        last_error_ = "llama-server executable not found in PATH: " + exe_path
-                    + " (set llama_server_path or MM_LLAMA_PATH)";
+        MM_ERROR("{} executable '{}' not found in PATH", runtime_name, exe_path);
+        last_error_ = runtime_name + " executable not found in PATH: " + exe_path;
         impl_->call_log(last_error_, true);
         state_ = ProcessState::Error;
         return false;
@@ -551,8 +443,8 @@ bool LlamaServerProcess::start(const std::string& model_path,
     impl_->proc_handle = pi.hProcess;
     CloseHandle(pi.hThread); // not needed
 
-    MM_INFO("llama-server started (PID {}): {}", pi.dwProcessId, cmd_str);
-    impl_->call_log("spawned llama-server: " + cmd_str, false);
+    MM_INFO("{} started (PID {}): {}", runtime_name, pi.dwProcessId, cmd_str);
+    impl_->call_log("spawned " + runtime_name + ": " + cmd_str, false);
 
     // Start pipe reader threads (capture handle values)
     if (used_stdio
@@ -601,8 +493,9 @@ bool LlamaServerProcess::start(const std::string& model_path,
         });
     } else {
         impl_->pipe_running = false;
-        MM_WARN("llama-server started without stdio pipe capture (CreateProcess stdio fallback path)");
-        impl_->call_log("llama-server started, but stdout/stderr capture is unavailable in this launch mode", true);
+        MM_WARN("{} started without stdio pipe capture (CreateProcess stdio fallback path)",
+                runtime_name);
+        impl_->call_log(runtime_name + " started, but stdout/stderr capture is unavailable in this launch mode", true);
     }
 
 #else
@@ -632,12 +525,28 @@ bool LlamaServerProcess::start(const std::string& model_path,
         ::close(out_pipe[0]); ::close(out_pipe[1]);
         ::close(err_pipe[0]); ::close(err_pipe[1]);
 
+        // Reset signal state before exec. execvp resets caught handlers to
+        // default, but the *blocked signal mask* and SIG_IGN dispositions are
+        // inherited. A multithreaded server's worker thread (the one that
+        // forked) often has signals blocked; a blocked/ignored SIGCHLD breaks
+        // vLLM's asyncio child-watcher that manages its EngineCore subprocess,
+        // hanging engine startup until the load times out. Only async-signal-
+        // safe calls are permitted here between fork() and exec().
+        sigset_t empty_mask;
+        ::sigemptyset(&empty_mask);
+        ::sigprocmask(SIG_SETMASK, &empty_mask, nullptr);
+        struct sigaction dfl{};
+        dfl.sa_handler = SIG_DFL;
+        ::sigemptyset(&dfl.sa_mask);
+        ::sigaction(SIGCHLD, &dfl, nullptr);
+        ::sigaction(SIGPIPE, &dfl, nullptr);
+
         std::vector<const char*> argv;
-        argv.push_back(llama_server_path_.c_str());
+        argv.push_back(exe_path.c_str());
         for (auto& a : args) argv.push_back(a.c_str());
         argv.push_back(nullptr);
 
-        ::execvp(llama_server_path_.c_str(), const_cast<char* const*>(argv.data()));
+        ::execvp(exe_path.c_str(), const_cast<char* const*>(argv.data()));
         ::_exit(127);
     }
 
@@ -649,7 +558,7 @@ bool LlamaServerProcess::start(const std::string& model_path,
     impl_->stdout_fd = out_pipe[0];
     impl_->stderr_fd = err_pipe[0];
 
-    MM_INFO("llama-server started (PID {}): {}", pid, llama_server_path_);
+    MM_INFO("{} started (PID {}): {}", runtime_name, pid, exe_path);
 
     int fd_out = impl_->stdout_fd;
     int fd_err = impl_->stderr_fd;
@@ -693,17 +602,19 @@ bool LlamaServerProcess::start(const std::string& model_path,
 #endif
 
     // Poll /health until ready or timeout
-    bool ready = poll_health(60);
+    bool ready = poll_health(health_timeout_seconds);
     if (!ready) {
-        MM_ERROR("llama-server did not become healthy within 60s — aborting");
-        last_error_ = "llama-server did not become healthy within 60s (startup failed)";
+        MM_ERROR("{} did not become healthy within {}s - aborting",
+                 runtime_name, health_timeout_seconds);
+        last_error_ = runtime_name + " did not become healthy within "
+                    + std::to_string(health_timeout_seconds) + "s (startup failed)";
         impl_->call_log(last_error_, true);
         stop();
         return false;
     }
 
     state_ = ProcessState::Ready;
-    MM_INFO("llama-server is ready on port {}", port_);
+    MM_INFO("{} is ready on port {}", runtime_name, port_);
     return true;
 }
 
@@ -745,7 +656,7 @@ void LlamaServerProcess::stop() {
 #endif
 
     state_ = ProcessState::Stopped;
-    MM_INFO("llama-server stopped");
+    MM_INFO("server process stopped");
 }
 
 // ── Accessors ─────────────────────────────────────────────────────────────────
@@ -767,14 +678,20 @@ bool LlamaServerProcess::poll_health(int timeout_seconds) {
     auto deadline = std::chrono::steady_clock::now()
                     + std::chrono::seconds(timeout_seconds);
     while (std::chrono::steady_clock::now() < deadline) {
+        if (impl_->process_exited()) {
+            MM_WARN("poll_health: server process exited before becoming healthy");
+            return false;
+        }
         auto res = cli.Get("/health");
         if (res && res->status == 200) {
+            if (res->body.empty()) return true;
             try {
                 auto j = nlohmann::json::parse(res->body);
-                if (j.value("status", std::string{}) == "ok")
+                if (j.value("status", std::string{"ok"}) == "ok")
                     return true;
             } catch (const std::exception& e) {
                 MM_DEBUG("poll_health: parse error: {}", e.what());
+                return true;
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
