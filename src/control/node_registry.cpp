@@ -177,6 +177,20 @@ std::vector<NodeInfo> NodeRegistry::nodes_with_model_loaded(
     return out;
 }
 
+std::vector<NodeInfo> NodeRegistry::nodes_with_model_cached(
+    const std::string& model_ref) const
+{
+    std::lock_guard<std::mutex> g(mutex_);
+    std::vector<NodeInfo> out;
+    for (auto& [_, n] : nodes_) {
+        if (!n.connected) continue;
+        if (std::find(n.cached_models.begin(), n.cached_models.end(), model_ref)
+                != n.cached_models.end())
+            out.push_back(n);
+    }
+    return out;
+}
+
 std::vector<NodeInfo> NodeRegistry::nodes_with_available_vram(
     int64_t min_vram_mb) const
 {
@@ -469,6 +483,8 @@ bool NodeRegistry::ping_node(NodeInfo& info) {
             // Parse multi-slot fields if present
             if (sj.contains("slots"))
                 info.slots = sj["slots"].get<std::vector<SlotInfo>>();
+            if (sj.contains("cached_models"))
+                info.cached_models = sj["cached_models"].get<std::vector<std::string>>();
             if (sj.contains("disk_free_mb"))
                 info.disk_free_mb = sj["disk_free_mb"].get<int64_t>();
             if (sj.contains("max_slots"))
@@ -560,6 +576,7 @@ void NodeRegistry::poll_all_nodes() {
                 it->second.metrics       = info.metrics;
                 it->second.loaded_model  = info.loaded_model;
                 it->second.slots         = info.slots;
+                it->second.cached_models = info.cached_models;
                 it->second.disk_free_mb  = info.disk_free_mb;
                 it->second.max_slots     = info.max_slots;
                 it->second.slot_in_use   = info.slot_in_use;

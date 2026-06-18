@@ -26,13 +26,15 @@ struct NodeConfig {
     double      interconnect_gbps = 0.0;   // node-to-node link bandwidth hint
     std::string ray_path = "ray";          // Ray CLI executable or PATH name
     uint16_t    ray_port = 6379;           // head GCS port for Ray clusters
+    std::string hf_cli_path = "hf";        // Hugging Face CLI for model pre-fetch
+    std::string hf_cache_dir;              // HF hub cache dir override; "" = auto (HF_HOME/default)
     uint16_t    llama_port = 8080;          // deprecated: single-slot port
     uint16_t    llama_port_range_start = 8080;
     uint16_t    llama_port_range_end   = 8090;
     int         max_slots              = 4;
 
     // Storage
-    std::string models_dir    = "models";  // directory scanned for .gguf files
+    std::string models_dir    = "models";  // optional local model directory root
     std::string data_dir      = "data";
     std::string kv_cache_dir  = "data/kv_cache";
 

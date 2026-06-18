@@ -262,15 +262,25 @@ if [ "$os" = "linux" ] && [ "$arch" = "aarch64" ] && [ "$host_arch" != "aarch64"
   fi
 fi
 
-if [ "$os" = "windows" ] && [ "$arch" = "aarch64" ] && [ -n "$generator" ]; then
+# Visual Studio generators (incl. the default when -G is omitted on Windows)
+# need the target architecture via -A. Ninja/NMake derive it from the
+# compiler, so never pass -A there.
+if [ "$os" = "windows" ] && [ "$arch" = "aarch64" ]; then
   case "$generator" in
-    *Visual\ Studio*) cmake_configure+=(-A ARM64) ;;
+    ""|*Visual\ Studio*) cmake_configure+=(-A ARM64) ;;
   esac
 fi
 
 expected_toolchain_file=""
 if [ "$use_vcpkg" != "no" ]; then
   if vcpkg_root="$(detect_vcpkg_root)"; then
+    # Manifest-mode dependency install needs the bootstrapped vcpkg binary, not
+    # just the toolchain script (present in a freshly-cloned vcpkg).
+    if [ ! -x "$vcpkg_root/vcpkg" ] && [ ! -f "$vcpkg_root/vcpkg.exe" ]; then
+      printf 'vcpkg at %s is not bootstrapped. Run: %s/bootstrap-vcpkg.sh (or .bat on Windows)\n' \
+        "$vcpkg_root" "$vcpkg_root" >&2
+      exit 2
+    fi
     expected_toolchain_file="$vcpkg_root/scripts/buildsystems/vcpkg.cmake"
     cmake_configure+=(-DCMAKE_TOOLCHAIN_FILE="$expected_toolchain_file")
     if [ -z "$triplet" ] && [ -n "$target_arch" ] && [ "$(lower "$target_arch")" != "native" ]; then

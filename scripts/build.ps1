@@ -250,7 +250,10 @@ if ($Platform -eq "linux" -and $TargetArch -eq "aarch64" -and $HostArch -ne "aar
     }
 }
 
-if ($Platform -eq "windows" -and $TargetArch -eq "aarch64" -and $Generator -like "*Visual Studio*") {
+# Visual Studio generators (incl. the default when -G is omitted on Windows)
+# need the target architecture via -A. Ninja/NMake derive it from the
+# compiler, so never pass -A there.
+if ($Platform -eq "windows" -and $TargetArch -eq "aarch64" -and (-not $Generator -or $Generator -like "*Visual Studio*")) {
     $ConfigureArgs += @("-A", "ARM64")
 }
 
@@ -258,6 +261,12 @@ $ExpectedToolchainFile = $null
 if (-not $NoVcpkg) {
     $ResolvedVcpkgRoot = Find-VcpkgRoot
     if ($ResolvedVcpkgRoot) {
+        # Manifest-mode dependency install needs the bootstrapped vcpkg binary,
+        # not just the toolchain script (present in a freshly-cloned vcpkg).
+        if (-not (Test-Path (Join-Path $ResolvedVcpkgRoot "vcpkg.exe")) -and
+            -not (Test-Path (Join-Path $ResolvedVcpkgRoot "vcpkg"))) {
+            throw "vcpkg at $ResolvedVcpkgRoot is not bootstrapped. Run: $ResolvedVcpkgRoot\bootstrap-vcpkg.bat"
+        }
         $ExpectedToolchainFile = Join-Path $ResolvedVcpkgRoot "scripts/buildsystems/vcpkg.cmake"
         $ConfigureArgs += "-DCMAKE_TOOLCHAIN_FILE=$ExpectedToolchainFile"
         if (-not $Triplet -and $Arch -and $Arch.ToLowerInvariant() -ne "native") {

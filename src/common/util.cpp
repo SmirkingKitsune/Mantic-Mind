@@ -116,6 +116,28 @@ std::string replace_all(const std::string& s, const std::string& from, const std
     return result;
 }
 
+// ── HF repo id classification ─────────────────────────────────────────────────
+bool is_hf_repo_id(const std::string& ref) {
+    // HF repo id: exactly "org/name", each segment [A-Za-z0-9._-]. Anything
+    // that looks like a filesystem path is treated as a local model dir.
+    if (ref.empty()) return false;
+    if (ref.find('\\') != std::string::npos) return false;   // Windows path
+    if (ref.front() == '/' || ref.front() == '.') return false;
+    if (ref.size() > 1 && ref[1] == ':') return false;        // drive letter
+
+    const size_t slash = ref.find('/');
+    if (slash == std::string::npos) return false;             // need org/name
+    if (ref.find('/', slash + 1) != std::string::npos) return false; // one slash only
+
+    auto valid_segment = [](const std::string& s) {
+        if (s.empty()) return false;
+        return std::all_of(s.begin(), s.end(), [](unsigned char c) {
+            return std::isalnum(c) || c == '.' || c == '_' || c == '-';
+        });
+    };
+    return valid_segment(ref.substr(0, slash)) && valid_segment(ref.substr(slash + 1));
+}
+
 // ── Agent ID validation ───────────────────────────────────────────────────────
 bool is_valid_agent_id(const std::string& id) {
     if (id.empty() || id.size() > 128) return false;

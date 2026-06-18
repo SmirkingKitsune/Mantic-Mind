@@ -49,6 +49,11 @@
 /Makefile
 /install_manifest.txt
 
+# Python (tools/ sidecars)
+__pycache__/
+*.pyc
+*.pyo
+
 # OS
 .DS_Store
 Thumbs.db

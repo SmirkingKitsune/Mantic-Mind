@@ -34,6 +34,11 @@ bool starts_with(const std::string& s, const std::string& prefix);
 bool ends_with(const std::string& s, const std::string& suffix);
 std::string replace_all(const std::string& s, const std::string& from, const std::string& to);
 
+// True when ref looks like a Hugging Face repo id ("org/name", each segment
+// [A-Za-z0-9._-]) rather than a local filesystem path. Shared by the node (HF
+// cache) and control (placement preference).
+bool is_hf_repo_id(const std::string& ref);
+
 // ── URL / SSE helpers ───────────────────────────────────────────────────────
 // Parse "http://host:port/path" → {host, port}.  Defaults to port 80.
 std::pair<std::string, int> parse_url(const std::string& url);

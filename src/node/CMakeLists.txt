@@ -3,6 +3,7 @@ add_executable(mantic-mind
     llama_server_process.cpp
     vllm_runtime.cpp
     ray_orchestration.cpp
+    hf_cache.cpp
     node_api_server.cpp
     node_state.cpp
     node_ui.cpp

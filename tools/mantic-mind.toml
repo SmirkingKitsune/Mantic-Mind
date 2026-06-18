@@ -47,6 +47,20 @@ max_slots = 4
 # ray_path = "ray"
 # ray_port = 6379
 
+# ── Hugging Face model cache ────────────────────────────────────────────────────
+# vLLM resolves a model_path as an HF repo id (auto-downloaded to the HF cache),
+# a cache hit, or a local directory. The node reports which repos it has cached
+# so control can prefer a node that already holds the model.
+#
+# hf_cache_dir pins the HF hub cache directory. Point every node at one shared
+# location (e.g. an NFS export on the NAS) so a model downloads once for the
+# whole cluster. Leave unset to use HF_HUB_CACHE / HF_HOME / ~/.cache/huggingface.
+# hf_cache_dir = "/mnt/nas/hf-cache/hub"
+
+# CLI used to pre-fetch models out-of-band (POST /api/node/models/pull), so a
+# large download doesn't run inside the load-model health-timeout. Linux only.
+# hf_cli_path = "hf"
+
 # ── Cluster capabilities (multi-node engine groups) ─────────────────────────────
 # These are auto-detected at startup; set them only to override what this node
 # advertises to control for multi-node vLLM engine-group planning.

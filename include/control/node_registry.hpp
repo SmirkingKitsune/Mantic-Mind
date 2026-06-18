@@ -54,6 +54,8 @@ public:
     /// - preferred: enough free VRAM
     /// - fallback: VRAM + weighted RAM budget (CPU offload)
     std::vector<NodeInfo> nodes_with_available_vram(int64_t min_vram_mb) const;
+    /// Nodes whose HF cache already holds model_ref (avoids a fresh download).
+    std::vector<NodeInfo> nodes_with_model_cached(const std::string& model_ref) const;
 
     // Callback fired whenever node status changes (health poll results).
     using UpdateCallback = std::function<void(const NodeInfo&)>;

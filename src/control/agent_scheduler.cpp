@@ -184,6 +184,21 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         }
     }
 
+    // 3b. Prefer a node that already has this model in its HF cache — avoids a
+    // fresh multi-GB download. Only meaningful for HF repo ids; local-dir refs
+    // are assumed present wherever they resolve.
+    if (util::is_hf_repo_id(cfg.model_path)) {
+        for (const auto& node : registry_.nodes_with_model_cached(cfg.model_path)) {
+            if (node.id == cfg.preferred_node_id) continue; // already tried
+            auto slot_id = load_agent_on_node(cfg, node.id);
+            if (slot_id) {
+                MM_INFO("AgentScheduler: placed agent {} on node {} which already "
+                        "caches {}", cfg.id, node.id, cfg.model_path);
+                return place(node.id, *slot_id);
+            }
+        }
+    }
+
     // 3c. Any node has VRAM -> try load (the node makes the final budget call).
     auto vram_nodes = registry_.nodes_with_available_vram(vram_needed);
     for (const auto& node : vram_nodes) {

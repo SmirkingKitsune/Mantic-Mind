@@ -20,6 +20,7 @@
 #include "node/slot_manager.hpp"
 #include "node/vllm_runtime.hpp"
 #include "node/ray_orchestration.hpp"
+#include "node/hf_cache.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -658,6 +659,79 @@ bool test_engine_group_planner() {
         CHECK(parsed.interconnect_gbps > 199.0);
     }
 
+    return true;
+}
+
+bool test_hf_cache_helpers() {
+    // Repo-id classification: "org/name" yes, local paths no.
+    CHECK(mm::util::is_hf_repo_id("Qwen/Qwen2.5-0.5B-Instruct"));
+    CHECK(mm::util::is_hf_repo_id("meta-llama/Llama-3.1-8B"));
+    CHECK(!mm::util::is_hf_repo_id("/models/local-dir"));
+    CHECK(!mm::util::is_hf_repo_id("./rel/path"));
+    CHECK(!mm::util::is_hf_repo_id("C:\\models\\x"));
+    CHECK(!mm::util::is_hf_repo_id("bare-name"));
+    CHECK(!mm::util::is_hf_repo_id("a/b/c"));
+
+    // Cache dirname <-> repo id mapping ('/' encoded as '--', literal '-' kept).
+    CHECK(mm::hf_repo_id_from_cache_dirname("models--Qwen--Qwen2.5-0.5B-Instruct")
+          == "Qwen/Qwen2.5-0.5B-Instruct");
+    CHECK(mm::hf_repo_id_from_cache_dirname("models--meta-llama--Llama-3.1-8B")
+          == "meta-llama/Llama-3.1-8B");
+    CHECK(mm::hf_repo_id_from_cache_dirname("datasets--foo--bar").empty());
+
+    // Cache scan over a fake hub directory.
+    auto dir = temp_test_dir("hf-hub");
+    std::filesystem::create_directories(dir / "models--Qwen--Qwen2.5-0.5B-Instruct");
+    std::filesystem::create_directories(dir / "models--meta-llama--Llama-3.1-8B");
+    std::filesystem::create_directories(dir / "datasets--foo--bar");  // ignored
+    {
+        std::ofstream(dir / "version.txt") << "1";  // stray file ignored
+    }
+    auto found = mm::scan_hf_cache_models(dir.string());
+    CHECK(found.size() == 2);
+    CHECK(found[0] == "Qwen/Qwen2.5-0.5B-Instruct");          // sorted
+    CHECK(found[1] == "meta-llama/Llama-3.1-8B");
+    CHECK(mm::scan_hf_cache_models((dir / "does-not-exist").string()).empty());
+
+    // Hub-dir resolution precedence.
+    CHECK(mm::resolve_hf_hub_cache_dir("/cfg", "/env-hub", "/home-hf", "/home") == "/cfg");
+    CHECK(mm::resolve_hf_hub_cache_dir("", "/env-hub", "/home-hf", "/home") == "/env-hub");
+    {
+        auto r = mm::resolve_hf_hub_cache_dir("", "", "/home-hf", "/home");
+        CHECK(r == (std::filesystem::path("/home-hf") / "hub").string());
+    }
+    {
+        auto r = mm::resolve_hf_hub_cache_dir("", "", "", "/home");
+        CHECK(r == (std::filesystem::path("/home") / ".cache" / "huggingface" / "hub").string());
+    }
+
+    // Download args.
+    auto args = mm::build_hf_download_args("Qwen/Qwen2.5-0.5B-Instruct", "/cache");
+    CHECK(args.size() >= 2 && args[0] == "download");
+    CHECK(args[1] == "Qwen/Qwen2.5-0.5B-Instruct");
+    CHECK(has_arg_pair(args, "--cache-dir", "/cache"));
+    auto args_no_cache = mm::build_hf_download_args("Qwen/Qwen2.5-0.5B-Instruct", "");
+    CHECK(!has_arg(args_no_cache, "--cache-dir"));
+
+    // cached_models survives the node-status JSON round trip.
+    mm::NodeInfo n;
+    n.cached_models = {"Qwen/Qwen2.5-0.5B-Instruct", "meta-llama/Llama-3.1-8B"};
+    nlohmann::json j = n;
+    auto parsed = j.get<mm::NodeInfo>();
+    CHECK(parsed.cached_models.size() == 2);
+    CHECK(parsed.cached_models[0] == "Qwen/Qwen2.5-0.5B-Instruct");
+
+    // Pre-fetch is Linux-gated; on Windows it refuses cleanly.
+#ifdef _WIN32
+    CHECK(!mm::hf_prefetch_supported());
+    std::string err;
+    CHECK(!mm::hf_download("hf", "Qwen/Qwen2.5-0.5B-Instruct", "", &err));
+    CHECK(!err.empty());
+#else
+    CHECK(mm::hf_prefetch_supported());
+#endif
+
+    CHECK(remove_tree(dir));
     return true;
 }
 
@@ -2088,6 +2162,8 @@ int main(int argc, char** argv) {
          test_engine_group_planner},
         {"ray_start_args",
          test_ray_start_args},
+        {"hf_cache_helpers",
+         test_hf_cache_helpers},
         {"vllm_runtime_defaults_and_args",
          test_vllm_runtime_defaults_and_args},
         {"control_api_external_token_gate", test_control_api_external_token_gate},

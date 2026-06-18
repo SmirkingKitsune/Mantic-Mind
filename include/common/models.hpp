@@ -364,6 +364,7 @@ struct NodeInfo {
 
     // Multi-slot fields
     std::vector<SlotInfo>    slots;
+    std::vector<std::string> cached_models;  // HF repo ids present in this node's HF cache
     int64_t                  disk_free_mb = 0;
     int                      max_slots    = 1;
     int                      slot_in_use = 0;
@@ -987,6 +988,7 @@ inline void to_json(nlohmann::json& j, const NodeInfo& n) {
           {"capabilities",  n.capabilities},
           {"metrics",       n.metrics},
           {"slots",         n.slots},
+          {"cached_models", n.cached_models},
           {"disk_free_mb",  n.disk_free_mb},
           {"max_slots",     n.max_slots},
           {"slot_in_use",   n.slot_in_use},
@@ -1012,6 +1014,7 @@ inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     if (j.contains("capabilities"))  j.at("capabilities").get_to(n.capabilities);
     if (j.contains("metrics"))       j.at("metrics").get_to(n.metrics);
     if (j.contains("slots"))         j.at("slots").get_to(n.slots);
+    if (j.contains("cached_models")) j.at("cached_models").get_to(n.cached_models);
     if (j.contains("disk_free_mb"))  j.at("disk_free_mb").get_to(n.disk_free_mb);
     if (j.contains("max_slots"))     j.at("max_slots").get_to(n.max_slots);
     if (j.contains("slot_in_use"))   j.at("slot_in_use").get_to(n.slot_in_use);

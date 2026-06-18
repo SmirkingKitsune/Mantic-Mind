@@ -323,8 +323,6 @@ static void print_control_usage() {
         << "  nodes pair start <url>\n"
         << "  nodes pair complete <url> <nonce> <pin_or_psk> [remember]\n"
         << "  nodes pair psk <url> [psk] [remember]\n"
-        << "  nodes llama check <node_id>\n"
-        << "  nodes llama update <node_id> [build(true|false)] [force(true|false)]\n"
         << "  models list\n"
         << "  node-models list <node_id>\n"
         << "  node-models pull <node_id> <model_filename> [force(true|false)]\n"
@@ -467,7 +465,7 @@ static void run_control_cli(uint16_t listen_port,
 
         if (cmd0 == "nodes") {
             if (tokens.size() < 2) {
-                printer.line("usage: nodes list|discovered|add|remove|forget|pair|llama ...");
+                printer.line("usage: nodes list|discovered|add|remove|forget|pair ...");
                 continue;
             }
             const std::string sub = mm::util::to_lower(tokens[1]);
@@ -559,37 +557,6 @@ static void run_control_cli(uint16_t listen_port,
                     continue;
                 }
                 printer.line("error: unknown nodes pair subcommand");
-                continue;
-            }
-            if (sub == "llama") {
-                if (tokens.size() < 4) {
-                    printer.line("usage: nodes llama check|update <node_id> [build] [force]");
-                    continue;
-                }
-                const std::string llama_sub = mm::util::to_lower(tokens[2]);
-                if (llama_sub == "check") {
-                    emit_http_result("nodes llama check",
-                                     self.post("/v1/nodes/" + tokens[3] + "/llama/check-update", nlohmann::json::object()));
-                    continue;
-                }
-                if (llama_sub == "update") {
-                    bool build = true;
-                    if (tokens.size() >= 5 && !mm::cli::parse_bool_token(tokens[4], &build)) {
-                        printer.line("error: build must be true|false");
-                        continue;
-                    }
-                    bool force = false;
-                    if (tokens.size() >= 6 && !mm::cli::parse_bool_token(tokens[5], &force)) {
-                        printer.line("error: force must be true|false");
-                        continue;
-                    }
-                    emit_http_result(
-                        "nodes llama update",
-                        self.post("/v1/nodes/" + tokens[3] + "/llama/update",
-                                  nlohmann::json{{"build", build}, {"force", force}}));
-                    continue;
-                }
-                printer.line("error: unknown nodes llama subcommand");
                 continue;
             }
             printer.line("error: unknown nodes subcommand");

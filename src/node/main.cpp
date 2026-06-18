@@ -6,6 +6,7 @@
 #include "common/util.hpp"
 #include "node/node_api_server.hpp"
 #include "node/node_config.hpp"
+#include "node/hf_cache.hpp"
 #include "node/node_state.hpp"
 #include "node/node_ui.hpp"
 #include "node/singleton_lock.hpp"
@@ -104,6 +105,8 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
             file.get_float("interconnect_gbps", 0.0f));
         cfg.ray_path = file.get("ray_path", "ray");
         cfg.ray_port = static_cast<uint16_t>(file.get_int("ray_port", 6379));
+        cfg.hf_cli_path = file.get("hf_cli_path", "hf");
+        cfg.hf_cache_dir = file.get("hf_cache_dir", "");
         cfg.kv_cache_dir = file.get("kv_cache_dir", "data/kv_cache");
         cfg.pairing_key    = file.get("pairing_key",    "");
         cfg.discovery_port = static_cast<uint16_t>(
@@ -156,6 +159,8 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
     cfg.interconnect_gbps = env_double("MM_INTERCONNECT_GBPS", cfg.interconnect_gbps);
     cfg.ray_path = env("MM_RAY_PATH", cfg.ray_path);
     cfg.ray_port = env_port("MM_RAY_PORT", cfg.ray_port);
+    cfg.hf_cli_path = env("MM_HF_CLI_PATH", cfg.hf_cli_path);
+    cfg.hf_cache_dir = env("MM_HF_CACHE_DIR", cfg.hf_cache_dir);
     if (const char* sr = std::getenv("MM_SUPPORTS_RAY")) {
         const std::string v = mm::util::to_lower(sr);
         cfg.supports_ray     = (v == "1" || v == "true" || v == "yes");
@@ -170,6 +175,7 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
     if (cfg.kv_cache_dir.empty()) cfg.kv_cache_dir = "data/kv_cache";
     if (cfg.log_file.empty()) cfg.log_file = "logs/mantic-mind.log";
     if (cfg.ray_path.empty()) cfg.ray_path = "ray";
+    if (cfg.hf_cli_path.empty()) cfg.hf_cli_path = "hf";
     if (cfg.vllm_gpu_budget <= 0.0 || cfg.vllm_gpu_budget > 1.0) cfg.vllm_gpu_budget = 0.90;
 
     return cfg;
@@ -881,6 +887,33 @@ int main(int argc, char** argv) {
     mm::NodeApiServer api_server(state, slot_mgr,
                                  cfg.control_url, cfg.pairing_key);
     api_server.set_ray_config(cfg.ray_path, cfg.ray_port);
+    // Resolve the HF hub cache dir once (config override → HF_HUB_CACHE →
+    // HF_HOME/hub → ~/.cache/huggingface/hub) and share it with the API server
+    // (status scan + pre-fetch). When configured, also point the vLLM child at
+    // it so a cluster can share one cache (e.g. an NFS export on the NAS).
+    {
+        auto getenv_str = [](const char* k) -> std::string {
+            const char* v = std::getenv(k);
+            return v ? std::string(v) : std::string{};
+        };
+#ifdef _WIN32
+        const std::string home = getenv_str("USERPROFILE");
+#else
+        const std::string home = getenv_str("HOME");
+#endif
+        const std::string hub_dir = mm::resolve_hf_hub_cache_dir(
+            cfg.hf_cache_dir, getenv_str("HF_HUB_CACHE"), getenv_str("HF_HOME"), home);
+        api_server.set_hf_config(cfg.hf_cli_path, hub_dir);
+        if (!cfg.hf_cache_dir.empty()) {
+#ifdef _WIN32
+            _putenv_s("HF_HUB_CACHE", cfg.hf_cache_dir.c_str());
+#else
+            ::setenv("HF_HUB_CACHE", cfg.hf_cache_dir.c_str(), 1);
+#endif
+            MM_INFO("HF hub cache pinned to {} (shared with vLLM child)", cfg.hf_cache_dir);
+        }
+        MM_INFO("HF hub cache dir: {}", hub_dir.empty() ? "(default)" : hub_dir);
+    }
     api_server.set_remember_api_key_callback([&](const std::string& key) {
         remembered_api_keys.push_back(key);
         if (save_remembered_api_keys(remembered_keys_path, remembered_api_keys)) {

@@ -34,6 +34,8 @@ public:
     void set_remember_api_key_callback(RememberApiKeyCallback callback);
     // Ray CLI config for the multi-node engine-group endpoints.
     void set_ray_config(std::string ray_path, uint16_t ray_port);
+    // HF model-cache config: the `hf` CLI and the resolved hub cache directory.
+    void set_hf_config(std::string hf_cli_path, std::string hf_hub_cache_dir);
 
 private:
     NodeState&     state_;
@@ -42,6 +44,8 @@ private:
     std::string    pairing_key_;
     std::string    ray_path_ = "ray";
     uint16_t       ray_port_ = 6379;
+    std::string    hf_cli_path_ = "hf";
+    std::string    hf_hub_cache_dir_;
     std::unique_ptr<HttpServer> server_;
     RuntimeLogsProvider runtime_logs_provider_;
     RememberApiKeyCallback remember_api_key_cb_;

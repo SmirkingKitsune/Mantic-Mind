@@ -2,6 +2,7 @@
 #include "node/node_state.hpp"
 #include "node/slot_manager.hpp"
 #include "node/ray_orchestration.hpp"
+#include "node/hf_cache.hpp"
 #include "common/http_server.hpp"
 #include "common/llama_cpp_client.hpp"
 #include "common/models.hpp"
@@ -84,6 +85,12 @@ void NodeApiServer::set_ray_config(std::string ray_path, uint16_t ray_port) {
     ray_port_ = ray_port;
 }
 
+void NodeApiServer::set_hf_config(std::string hf_cli_path,
+                                  std::string hf_hub_cache_dir) {
+    hf_cli_path_ = std::move(hf_cli_path);
+    hf_hub_cache_dir_ = std::move(hf_hub_cache_dir);
+}
+
 // ── Auth check ────────────────────────────────────────────────────────────────
 bool NodeApiServer::check_auth(const std::string& auth_header) {
     static const std::string kBearer = "Bearer ";
@@ -144,6 +151,7 @@ void NodeApiServer::register_routes() {
         nlohmann::json j;
         j["node_id"]       = state_.get_node_id();
         j["slots"]         = slots;
+        j["cached_models"] = scan_hf_cache_models(hf_hub_cache_dir_);
         j["disk_free_mb"]  = metrics.disk_free_mb;
         j["health"]        = metrics;
         j["capabilities"]  = state_.get_capabilities();
@@ -373,6 +381,46 @@ void NodeApiServer::register_routes() {
             return;
         }
         res.set_content(R"({"status":"ray-stopped"})", "application/json");
+    });
+
+    // ── POST /api/node/models/pull ────────────────────────────────────────────
+    // Pre-fetch an HF model into this node's cache out-of-band, so the multi-GB
+    // download does not happen inside the load-model health-timeout window.
+    // Gated to Linux (hf_prefetch_supported); Windows nodes let vLLM download
+    // lazily at load time instead.
+    server_->Post("/api/node/models/pull", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401; return;
+        }
+        try {
+            auto j = nlohmann::json::parse(req.body);
+            const std::string model_ref = j.value("model_ref",
+                                                   j.value("model_path", std::string{}));
+            if (model_ref.empty()) {
+                res.status = 400;
+                res.set_content(R"({"error":"model_ref required"})", "application/json");
+                return;
+            }
+            if (!hf_prefetch_supported()) {
+                res.status = 501;
+                res.set_content(
+                    R"({"error":"HF pre-fetch is only supported on Linux nodes; vLLM downloads at load time"})",
+                    "application/json");
+                return;
+            }
+            std::string err;
+            if (!hf_download(hf_cli_path_, model_ref, hf_hub_cache_dir_, &err)) {
+                res.status = 500;
+                res.set_content(nlohmann::json{{"error", err}}.dump(), "application/json");
+                return;
+            }
+            res.set_content(nlohmann::json{{"status", "pulled"},
+                                           {"model_ref", model_ref}}.dump(),
+                            "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+        }
     });
 
     // ── POST /api/node/detach-agent ───────────────────────────────────────────
