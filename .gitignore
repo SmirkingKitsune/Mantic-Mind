@@ -1,6 +1,7 @@
 # Build artifacts
 /build/
 /out/
+/dist/
 /cmake-build-*/
 
 # vcpkg installed packages

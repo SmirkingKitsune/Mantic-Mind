@@ -1,6 +1,7 @@
 #include "node/node_ui.hpp"
 #include "node/node_state.hpp"
 #include "common/util.hpp"
+#include "common/logger.hpp"
 
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
@@ -36,6 +37,28 @@ std::string make_temp_llama_log_path() {
     if (ec || base.empty()) {
         return {};
     }
+    // Best-effort prune of stale logs from earlier runs so they don't accumulate in
+    // the temp dir. Only remove our own "mantic_mind_llama_output_*.log" files whose
+    // last-write time is >24h old, so a concurrently-running node's active log (which
+    // is appended to continuously) is preserved. The current run's file is created
+    // below, after this sweep, so it is never a candidate.
+    {
+        std::error_code lec;
+        const auto now = fs::file_time_type::clock::now();
+        for (const auto& entry : fs::directory_iterator(base, lec)) {
+            const auto& p = entry.path();
+            const std::string name = p.filename().string();
+            if (name.rfind("mantic_mind_llama_output_", 0) != 0) continue;
+            if (p.extension() != ".log") continue;
+            std::error_code fec;
+            const auto mtime = fs::last_write_time(p, fec);
+            if (fec) continue;
+            if (now - mtime > std::chrono::hours(24)) {
+                std::error_code rec;
+                fs::remove(p, rec);  // ignore failures (file in use, perms, etc.)
+            }
+        }
+    }
     const auto stamp = std::to_string(mm::util::now_ms());
     fs::path out = base / ("mantic_mind_llama_output_" + stamp + ".log");
     return out.string();
@@ -43,9 +66,14 @@ std::string make_temp_llama_log_path() {
 
 std::string shorten_middle(const std::string& s, size_t max_len) {
     if (s.size() <= max_len) return s;
-    if (max_len < 8) return s.substr(0, max_len);
+    if (max_len < 8) return mm::util::utf8_truncate(s, max_len);
     size_t keep = (max_len - 3) / 2;
-    return s.substr(0, keep) + "..." + s.substr(s.size() - keep);
+    std::string head = mm::util::utf8_truncate(s, keep);
+    // Advance the tail start past any UTF-8 continuation bytes so the slice begins
+    // on a codepoint boundary rather than mid-sequence.
+    size_t start = s.size() - keep;
+    while (start < s.size() && (static_cast<unsigned char>(s[start]) & 0xC0) == 0x80) ++start;
+    return head + "..." + s.substr(start);
 }
 
 } // namespace
@@ -68,29 +96,25 @@ void NodeUI::append_log(const std::string& line) {
     {
         std::lock_guard<std::mutex> lk(log_mutex_);
         if (log_lines_.size() >= kMaxLogLines)
-            log_lines_.erase(log_lines_.begin());
+            log_lines_.pop_front();
         log_lines_.push_back(line);
         if (log_file_.is_open()) {
             log_file_ << line << '\n';
             log_file_.flush();
         }
     }
-    std::function<void()> fn;
-    {
-        std::lock_guard<std::mutex> lk(screen_mutex_);
-        fn = refresh_fn_;
-    }
-    if (fn) fn();
+    // Invoke the refresh closure while holding screen_mutex_ so the snapshot-and-call
+    // is atomic with run()'s clear-on-exit. This thread (the llama-server log pump) is
+    // never joined by run(), so a copy-then-call would leave a window to PostEvent on a
+    // destroyed screen. PostEvent is thread-safe and the clear block never re-enters here.
+    std::lock_guard<std::mutex> lk(screen_mutex_);
+    if (refresh_fn_) refresh_fn_();
 }
 
 // ── quit (thread-safe) ────────────────────────────────────────────────────────
 void NodeUI::quit() {
-    std::function<void()> fn;
-    {
-        std::lock_guard<std::mutex> lk(screen_mutex_);
-        fn = quit_fn_;
-    }
-    if (fn) fn();
+    std::lock_guard<std::mutex> lk(screen_mutex_);
+    if (quit_fn_) quit_fn_();
 }
 
 // ── run ───────────────────────────────────────────────────────────────────────
@@ -108,7 +132,10 @@ void NodeUI::run() {
     static const std::array<const char*, 10> kSpinner{
         "⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"
     };
-    int frame = 0;
+    // Log viewport height as last computed by the renderer (which subtracts the
+    // generated-text panel). The scroll handler reads this so Home/PgUp can reach
+    // the oldest lines even while the generation panel is on screen.
+    int log_viewport = std::max(4, ftxui::Terminal::Size().dimy - 17);
     std::string model_action_status;
     auto forget_pairing = [&]() {
         std::string msg;
@@ -124,7 +151,6 @@ void NodeUI::run() {
 
     // ── Renderer ──────────────────────────────────────────────────────────────
     auto render = Renderer(btn_forget_pairing, [&]() -> Element {
-        frame = (frame + 1) % static_cast<int>(kSpinner.size());
 
         // Snapshot mutable state
         bool registered   = state_.is_registered();
@@ -137,12 +163,10 @@ void NodeUI::run() {
         auto api_keys     = state_.get_api_keys();
         auto streaming    = state_.get_streaming_text();
 
-        std::vector<std::string> log_snap;
         int log_scroll_from_bottom = 0;
         std::string log_file_path;
         {
             std::lock_guard<std::mutex> lk(log_mutex_);
-            log_snap = log_lines_;
             log_scroll_from_bottom = log_scroll_from_bottom_;
             log_file_path = log_file_path_;
         }
@@ -196,7 +220,12 @@ void NodeUI::run() {
 
         if (!registered) {
             // ── Waiting state ─────────────────────────────────────────────────
-            std::string spinner_text = std::string(kSpinner[static_cast<size_t>(frame)])
+            // Derive the spinner frame from wall-clock time so it advances at a steady
+            // ~10fps regardless of how often the renderer runs (renders also fire on
+            // every log line and keypress, which would otherwise make it race).
+            const size_t spin_frame =
+                static_cast<size_t>(mm::util::now_ms() / 100) % kSpinner.size();
+            std::string spinner_text = std::string(kSpinner[spin_frame])
                                      + "  Waiting for Mantic-Mind-Control...";
 
             // Check for a pending pairing request — show PIN prominently.
@@ -297,7 +326,7 @@ void NodeUI::run() {
             if (p.empty()) return "(none)";
             std::string name = std::filesystem::path(p).filename().string();
             if (name.empty()) name = p;
-            if (name.size() > 26) name = name.substr(0, 26) + "...";
+            if (name.size() > 26) name = mm::util::utf8_truncate(name, 26) + "...";
             return name;
         };
 
@@ -354,7 +383,8 @@ void NodeUI::run() {
         // ── Generated text panel ─────────────────────────────────────────────
         auto tail_text = [](const std::string& s, size_t max_chars) -> std::string {
             if (s.size() <= max_chars) return s;
-            return "..." + s.substr(s.size() - max_chars + 3);
+            if (max_chars <= 3) return s.substr(s.size() - max_chars);
+            return "..." + s.substr(s.size() - (max_chars - 3));
         };
 
         // Split text into wrapped lines that fit the terminal width
@@ -436,23 +466,35 @@ void NodeUI::run() {
 
         // Log panel — viewport adapts to terminal height
         const int effective_viewport = std::max(4, ftxui::Terminal::Size().dimy - 17 - gen_panel_lines);
+        log_viewport = effective_viewport;
         Elements log_elems;
-        size_t total_lines = log_snap.size();
-        size_t max_scroll = total_lines > static_cast<size_t>(effective_viewport)
-            ? total_lines - static_cast<size_t>(effective_viewport)
-            : 0;
-        size_t scroll = static_cast<size_t>(std::max(0, log_scroll_from_bottom));
-        if (scroll > max_scroll) scroll = max_scroll;
-
+        std::vector<std::string> visible;
+        size_t total_lines = 0;
         size_t start_idx = 0;
-        size_t end_idx = total_lines;
-        if (total_lines > 0) {
-            if (total_lines > static_cast<size_t>(effective_viewport) + scroll) {
-                start_idx = total_lines - static_cast<size_t>(effective_viewport) - scroll;
+        size_t end_idx = 0;
+        {
+            // Copy only the visible slice (tens of lines) rather than the whole ring
+            // buffer, holding log_mutex_ just for that span so append_log() from the
+            // llama-server pump thread isn't blocked behind a full copy each frame.
+            std::lock_guard<std::mutex> lk(log_mutex_);
+            total_lines = log_lines_.size();
+            size_t max_scroll = total_lines > static_cast<size_t>(effective_viewport)
+                ? total_lines - static_cast<size_t>(effective_viewport)
+                : 0;
+            size_t scroll = static_cast<size_t>(std::max(0, log_scroll_from_bottom));
+            if (scroll > max_scroll) scroll = max_scroll;
+            end_idx = total_lines;
+            if (total_lines > 0) {
+                if (total_lines > static_cast<size_t>(effective_viewport) + scroll) {
+                    start_idx = total_lines - static_cast<size_t>(effective_viewport) - scroll;
+                }
+                end_idx = total_lines - scroll;
+                if (end_idx > total_lines) end_idx = total_lines;
+                if (start_idx > end_idx) start_idx = end_idx;
             }
-            end_idx = total_lines - scroll;
-            if (end_idx > total_lines) end_idx = total_lines;
-            if (start_idx > end_idx) start_idx = end_idx;
+            for (size_t i = start_idx; i < end_idx; ++i) {
+                visible.push_back(log_lines_[i]);
+            }
         }
 
         std::string log_label = "node runtime output";
@@ -461,11 +503,11 @@ void NodeUI::run() {
         }
         log_elems.push_back(text(log_label) | bold | underlined);
 
-        if (log_snap.empty()) {
+        if (total_lines == 0) {
             log_elems.push_back(text("  (no output yet)") | color(Color::GrayDark));
         } else {
-            for (size_t i = start_idx; i < end_idx; ++i) {
-                log_elems.push_back(text("  > " + log_snap[i]) | color(Color::Cyan));
+            for (const auto& l : visible) {
+                log_elems.push_back(text("  > " + l) | color(Color::Cyan));
             }
         }
         char stat_buf[128];
@@ -502,7 +544,7 @@ void NodeUI::run() {
     });
 
     auto component = CatchEvent(render, [&](Event ev) {
-        const int viewport = std::max(4, ftxui::Terminal::Size().dimy - 17);
+        const int viewport = log_viewport;
         auto scroll_logs = [&](int delta) {
             std::lock_guard<std::mutex> lk(log_mutex_);
             const int total = static_cast<int>(log_lines_.size());
@@ -563,15 +605,31 @@ void NodeUI::run() {
         }
     });
 
-    screen.Loop(component);
+    // Run the loop under try/catch so an exception escaping a render lambda or event
+    // handler cannot unwind past the still-joinable ticker (whose destructor would
+    // call std::terminate and skip terminal restoration). Catch, then always clean up.
+    std::string loop_error;
+    try {
+        screen.Loop(component);
+    } catch (const std::exception& e) {
+        loop_error = e.what();
+    } catch (...) {
+        loop_error = "unknown exception";
+    }
 
-    ticker_running = false;
-    ticker.join();
-
+    // Clear the screen callbacks first so a late append_log()/quit() from another
+    // thread is a no-op instead of posting to an exited screen.
     {
         std::lock_guard<std::mutex> lk(screen_mutex_);
         quit_fn_    = {};
         refresh_fn_ = {};
+    }
+
+    ticker_running = false;
+    if (ticker.joinable()) ticker.join();
+
+    if (!loop_error.empty()) {
+        MM_ERROR("Node UI event loop terminated by exception: {}", loop_error);
     }
 }
 

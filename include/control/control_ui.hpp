@@ -4,6 +4,7 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include <deque>
 #include <mutex>
 
 namespace mm {
@@ -62,7 +63,7 @@ private:
 
     struct LogEntry { LogLevel level; std::string message; int64_t timestamp_ms = 0; };
     std::mutex             log_mutex_;
-    std::vector<LogEntry>  log_entries_;
+    std::deque<LogEntry>   log_entries_;
 
     std::string            pairing_key_;
 

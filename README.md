@@ -149,6 +149,21 @@ cmake --install build --config Release --prefix dist
 # dist/bin/mantic-mind-control[.exe]
 ```
 
+### GitHub Release Packages
+
+Create GitHub-ready ZIP assets from a Release build with:
+
+```powershell
+.\scripts\package-release.ps1
+```
+
+The packager writes `dist/mantic-mind-<version>-<platform>-<arch>.zip`, a
+matching `-symbols.zip` when PDBs are available, and `dist/checksums.txt`.
+The runtime archive includes `bin/`, default root config files, `tools/`,
+`README.md`, `LICENSE`, and a release manifest. It does not bundle vLLM,
+Python environments, model weights, runtime data, logs, or local agent
+databases.
+
 ## vLLM Runtime
 
 Each node manages one or more `vllm serve` engine subprocesses. Agent configs

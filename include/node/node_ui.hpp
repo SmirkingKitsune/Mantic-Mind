@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/models.hpp"
+#include <deque>
 #include <fstream>
 #include <functional>
 #include <mutex>
@@ -44,7 +45,7 @@ private:
     static constexpr int    kLogScrollPage = 8;
 
     mutable std::mutex       log_mutex_;
-    std::vector<std::string> log_lines_;
+    std::deque<std::string>  log_lines_;
     int                      log_scroll_from_bottom_ = 0;
     std::string              log_file_path_;
     std::ofstream            log_file_;

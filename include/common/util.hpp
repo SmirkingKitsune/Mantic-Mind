@@ -47,4 +47,15 @@ std::pair<std::string, int> parse_url(const std::string& url);
 // the "data: " prefix).  Incomplete trailing data stays in buf.
 std::vector<std::string> drain_sse_lines(std::string& buf);
 
+// Truncate s to at most max_bytes bytes WITHOUT splitting a multi-byte UTF-8
+// codepoint: if the cut would land inside a continuation-byte sequence, back up to
+// the preceding codepoint boundary. ASCII input is returned byte-for-byte. Does not
+// append an ellipsis — callers add "..." themselves.
+inline std::string utf8_truncate(const std::string& s, size_t max_bytes) {
+    if (s.size() <= max_bytes) return s;
+    size_t n = max_bytes;
+    while (n > 0 && (static_cast<unsigned char>(s[n]) & 0xC0) == 0x80) --n;
+    return s.substr(0, n);
+}
+
 } // namespace mm::util

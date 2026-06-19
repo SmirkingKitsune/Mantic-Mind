@@ -32,6 +32,41 @@
 
 namespace mm {
 
+namespace {
+
+// Post-order event catcher. FTXUI's built-in CatchEvent runs its handler BEFORE
+// the wrapped component, so global single-key shortcuts (1-5, f, q) would be
+// consumed before a focused Input on the Chat/Curation tabs could ever see them —
+// making it impossible to type those characters (and letting 'q' quit the app
+// mid-typing). This variant gives the wrapped component (and its focused
+// descendants) first chance at the event; the handler only runs for events that
+// nothing else consumed, so the shortcuts still work when focus is on a
+// menu/button but no longer steal keystrokes from text fields.
+class CatchEventAfter : public ftxui::ComponentBase {
+public:
+    explicit CatchEventAfter(std::function<bool(ftxui::Event)> on_event)
+        : on_event_(std::move(on_event)) {}
+
+    bool OnEvent(ftxui::Event event) override {
+        if (ftxui::ComponentBase::OnEvent(event)) {
+            return true;
+        }
+        return on_event_(event);
+    }
+
+private:
+    std::function<bool(ftxui::Event)> on_event_;
+};
+
+ftxui::Component MakeCatchEventAfter(ftxui::Component child,
+                                     std::function<bool(ftxui::Event)> on_event) {
+    auto component = std::make_shared<CatchEventAfter>(std::move(on_event));
+    component->Add(std::move(child));
+    return component;
+}
+
+} // namespace
+
 ControlUI::ControlUI(NodeRegistry& registry,
                      AgentManager& agents,
                      std::string models_dir,
@@ -52,7 +87,7 @@ void ControlUI::log(LogLevel level, const std::string& message) {
     {
         std::lock_guard<std::mutex> lk(log_mutex_);
         if (log_entries_.size() >= 500)
-            log_entries_.erase(log_entries_.begin());
+            log_entries_.pop_front();
         log_entries_.push_back({level, message, util::now_ms()});
     }
     refresh();
@@ -135,7 +170,7 @@ void ControlUI::run() {
     std::string chat_input;
 
     std::mutex              chat_mutex;
-    std::vector<std::string> chat_transcript;
+    std::deque<std::string> chat_transcript;
     std::string              chat_partial_assistant;
     std::string              chat_status{"idle"};
     std::string              chat_last_error;
@@ -143,6 +178,11 @@ void ControlUI::run() {
 
     std::atomic<bool> chat_inflight{false};
     std::thread       chat_thread;
+
+    // Set on shutdown so the chat stream callback can abort a long, never-timed-out
+    // inference promptly (returning false aborts the cpp-httplib stream) instead of
+    // making quit block on chat_thread.join().
+    std::atomic<bool> ui_shutting_down{false};
 
     // Curation tab
     int cur_agent_sel = 0;
@@ -167,6 +207,20 @@ void ControlUI::run() {
     std::string cur_last_error;
     std::atomic<bool> cur_inflight{false};
     std::thread cur_thread;
+
+    // Curation DB read cache. The curation render reloads conversations, memories,
+    // and the full selected conversation from SQLite on every frame/keypress. Cache
+    // them and refetch only on selection change, a short throttle, or an explicit
+    // mutation (cur_cache_dirty) — so typing into the curation inputs no longer
+    // triggers a full conversation reload per keystroke. The throttle also surfaces
+    // external writes (API server / chat stream) within the window.
+    std::string                            cur_cache_agent_id;
+    std::string                            cur_detail_loaded_id;
+    std::chrono::steady_clock::time_point  cur_cache_at{};
+    std::vector<Conversation>              cur_convs_cache;
+    std::vector<Memory>                    cur_mems_cache;
+    std::optional<Conversation>            cur_conv_detail_cache;
+    std::atomic<bool>                      cur_cache_dirty{false};
 
     // File browser
     bool show_file_browser = false;
@@ -205,10 +259,8 @@ void ControlUI::run() {
 
     auto trim_chat_transcript = [&]() {
         constexpr size_t kMaxLines = 400;
-        if (chat_transcript.size() > kMaxLines) {
-            const size_t erase_count = chat_transcript.size() - kMaxLines;
-            chat_transcript.erase(chat_transcript.begin(),
-                                  chat_transcript.begin() + erase_count);
+        while (chat_transcript.size() > kMaxLines) {
+            chat_transcript.pop_front();
         }
     };
 
@@ -256,6 +308,7 @@ void ControlUI::run() {
             std::string err = fn();
             if (err.empty()) set_curation_status("done: " + op_name, "");
             else             set_curation_status("failed", err);
+            cur_cache_dirty = true;  // op may have changed the DB; force a refetch
             cur_inflight = false;
             refresh();
         });
@@ -612,7 +665,10 @@ void ControlUI::run() {
         }
     }, ButtonOption::Simple());
     auto agent_list_btns = Container::Horizontal({btn_new_a, btn_edit_a, btn_del_a});
-    auto agent_list_comp = Container::Vertical({agent_menu, agent_list_btns});
+    // Maybe wrapper: keep agent_menu out of the component tree when empty, matching
+    // every other list menu, so FTXUI never indexes/focuses an empty entries vector.
+    auto agent_menu_m = Maybe(agent_menu, [&]() { return !agent_entries.empty(); });
+    auto agent_list_comp = Container::Vertical({agent_menu_m, agent_list_btns});
 
     // Editor inputs
     InputOption sl; sl.multiline = false;
@@ -833,6 +889,9 @@ void ControlUI::run() {
             const std::string base_url = control_base_url_;
 
             auto stream_cb = [&](const std::string& data) -> bool {
+                // Abort promptly on shutdown: returning false ends the cpp-httplib
+                // stream so chat_thread.join() doesn't block on a long inference.
+                if (ui_shutting_down.load()) return false;
                 if (data == "[DONE]") return true;
                 stream_payload_seen = true;
 
@@ -999,7 +1058,9 @@ void ControlUI::run() {
         chat_transcript.clear();
         chat_partial_assistant.clear();
         chat_last_error.clear();
-        chat_status = chat_inflight.load() ? "streaming" : "idle";
+        // Don't relabel an in-flight request; the worker thread owns chat_status
+        // (e.g. "sending"/"streaming"/"local fallback") while a request is active.
+        if (!chat_inflight.load()) chat_status = "idle";
     }, ButtonOption::Simple());
 
     auto chat_btn_row = Container::Horizontal({btn_chat_send, btn_chat_clear});
@@ -1033,21 +1094,26 @@ void ControlUI::run() {
         auto a = agents_.get_agent(agents[cur_agent_sel].id);
         if (!a) return;
 
-        auto convs = a->db().list_conversations();
-        ConvId parent_id;
-        if (cur_new_use_parent && cur_conv_sel >= 0 && cur_conv_sel < static_cast<int>(convs.size())) {
-            parent_id = convs[cur_conv_sel].id;
-        }
+        try {
+            auto convs = a->db().list_conversations();
+            ConvId parent_id;
+            if (cur_new_use_parent && cur_conv_sel >= 0 && cur_conv_sel < static_cast<int>(convs.size())) {
+                parent_id = convs[cur_conv_sel].id;
+            }
 
-        ConvId cid = a->db().create_conversation(cur_new_title, parent_id);
-        if (cid.empty()) {
-            set_curation_status("failed", "failed to create conversation");
-            refresh();
-            return;
+            ConvId cid = a->db().create_conversation(cur_new_title, parent_id);
+            if (cid.empty()) {
+                set_curation_status("failed", "failed to create conversation");
+                refresh();
+                return;
+            }
+            if (cur_new_set_active) a->db().set_active_conversation(cid);
+            cur_new_title.clear();
+            cur_cache_dirty = true;
+            set_curation_status("done: create conversation", "");
+        } catch (const std::exception& e) {
+            set_curation_status("failed", e.what());
         }
-        if (cur_new_set_active) a->db().set_active_conversation(cid);
-        cur_new_title.clear();
-        set_curation_status("done: create conversation", "");
         refresh();
     }, ButtonOption::Simple());
 
@@ -1056,10 +1122,15 @@ void ControlUI::run() {
         if (agents.empty() || cur_agent_sel < 0 || cur_agent_sel >= static_cast<int>(agents.size())) return;
         auto a = agents_.get_agent(agents[cur_agent_sel].id);
         if (!a) return;
-        auto convs = a->db().list_conversations();
-        if (cur_conv_sel < 0 || cur_conv_sel >= static_cast<int>(convs.size())) return;
-        a->db().set_active_conversation(convs[cur_conv_sel].id);
-        set_curation_status("done: set active conversation", "");
+        try {
+            auto convs = a->db().list_conversations();
+            if (cur_conv_sel < 0 || cur_conv_sel >= static_cast<int>(convs.size())) return;
+            a->db().set_active_conversation(convs[cur_conv_sel].id);
+            cur_cache_dirty = true;
+            set_curation_status("done: set active conversation", "");
+        } catch (const std::exception& e) {
+            set_curation_status("failed", e.what());
+        }
         refresh();
     }, ButtonOption::Simple());
 
@@ -1069,9 +1140,16 @@ void ControlUI::run() {
         const auto& agent_id = agents[cur_agent_sel].id;
         auto a = agents_.get_agent(agent_id);
         if (!a) return;
-        auto convs = a->db().list_conversations();
-        if (cur_conv_sel < 0 || cur_conv_sel >= static_cast<int>(convs.size())) return;
-        const std::string conv_id = convs[cur_conv_sel].id;
+        std::string conv_id;
+        try {
+            auto convs = a->db().list_conversations();
+            if (cur_conv_sel < 0 || cur_conv_sel >= static_cast<int>(convs.size())) return;
+            conv_id = convs[cur_conv_sel].id;
+        } catch (const std::exception& e) {
+            set_curation_status("failed", e.what());
+            refresh();
+            return;
+        }
 
         run_curation_async("force compact", [&, agent_id, conv_id]() -> std::string {
             HttpClient cli(control_base_url_);
@@ -1090,19 +1168,24 @@ void ControlUI::run() {
         const auto& agent_id = agents[cur_agent_sel].id;
         auto a = agents_.get_agent(agent_id);
         if (!a) return;
-        auto convs = a->db().list_conversations();
-        if (cur_conv_sel < 0 || cur_conv_sel >= static_cast<int>(convs.size())) return;
-        const auto& conv = convs[cur_conv_sel];
-        if (conv.is_active) {
-            set_curation_status("failed", "cannot delete active conversation; activate another first");
+        try {
+            auto convs = a->db().list_conversations();
+            if (cur_conv_sel < 0 || cur_conv_sel >= static_cast<int>(convs.size())) return;
+            const auto& conv = convs[cur_conv_sel];
+            if (conv.is_active) {
+                set_curation_status("failed", "cannot delete active conversation; activate another first");
+                refresh();
+                return;
+            }
+            cur_delete_is_memory = false;
+            cur_delete_agent_id = agent_id;
+            cur_delete_target_id = conv.id;
+            cur_delete_target_label = conv.title.empty() ? conv.id : conv.title;
+            show_cur_delete_confirm = true;
+        } catch (const std::exception& e) {
+            set_curation_status("failed", e.what());
             refresh();
-            return;
         }
-        cur_delete_is_memory = false;
-        cur_delete_agent_id = agent_id;
-        cur_delete_target_id = conv.id;
-        cur_delete_target_label = conv.title.empty() ? conv.id : conv.title;
-        show_cur_delete_confirm = true;
     }, ButtonOption::Simple());
 
     auto btn_cur_extract = Button(" Generate Memories ", [&] {
@@ -1111,22 +1194,31 @@ void ControlUI::run() {
         const auto& agent_id = agents[cur_agent_sel].id;
         auto a = agents_.get_agent(agent_id);
         if (!a) return;
-        auto convs = a->db().list_conversations();
-        if (cur_conv_sel < 0 || cur_conv_sel >= static_cast<int>(convs.size())) return;
-        auto conv = a->db().load_conversation(convs[cur_conv_sel].id);
-        if (!conv) return;
+
+        std::string conv_id;
+        int msg_count = 0;
+        try {
+            auto convs = a->db().list_conversations();
+            if (cur_conv_sel < 0 || cur_conv_sel >= static_cast<int>(convs.size())) return;
+            auto conv = a->db().load_conversation(convs[cur_conv_sel].id);
+            if (!conv) return;
+            conv_id = conv->id;
+            msg_count = static_cast<int>(conv->messages.size());
+        } catch (const std::exception& e) {
+            set_curation_status("failed", e.what());
+            refresh();
+            return;
+        }
 
         int start_i = parse_int_or(cur_start_s, 0);
         int end_i = parse_int_or(cur_end_s, start_i);
         int ctx_i = std::clamp(parse_int_or(cur_context_before_s, 2), 0, 20);
-        if (start_i < 0 || end_i < 0 || start_i > end_i ||
-            end_i >= static_cast<int>(conv->messages.size())) {
+        if (start_i < 0 || end_i < 0 || start_i > end_i || end_i >= msg_count) {
             set_curation_status("failed", "invalid message range");
             refresh();
             return;
         }
 
-        const std::string conv_id = conv->id;
         run_curation_async("memory extraction", [&, agent_id, conv_id, start_i, end_i, ctx_i]() -> std::string {
             HttpClient cli(control_base_url_);
             auto resp = cli.post(
@@ -1150,16 +1242,21 @@ void ControlUI::run() {
         const auto& agent_id = agents[cur_agent_sel].id;
         auto a = agents_.get_agent(agent_id);
         if (!a) return;
-        auto mems = a->db().list_memories();
-        if (cur_mem_sel < 0 || cur_mem_sel >= static_cast<int>(mems.size())) return;
-        cur_delete_is_memory = true;
-        cur_delete_agent_id = agent_id;
-        cur_delete_target_id = mems[cur_mem_sel].id;
-        cur_delete_target_label = mems[cur_mem_sel].content;
-        if (cur_delete_target_label.size() > 80) {
-            cur_delete_target_label = cur_delete_target_label.substr(0, 80) + "...";
+        try {
+            auto mems = a->db().list_memories();
+            if (cur_mem_sel < 0 || cur_mem_sel >= static_cast<int>(mems.size())) return;
+            cur_delete_is_memory = true;
+            cur_delete_agent_id = agent_id;
+            cur_delete_target_id = mems[cur_mem_sel].id;
+            cur_delete_target_label = mems[cur_mem_sel].content;
+            if (cur_delete_target_label.size() > 80) {
+                cur_delete_target_label = cur_delete_target_label.substr(0, 80) + "...";
+            }
+            show_cur_delete_confirm = true;
+        } catch (const std::exception& e) {
+            set_curation_status("failed", e.what());
+            refresh();
         }
-        show_cur_delete_confirm = true;
     }, ButtonOption::Simple());
 
     auto curation_comp = Container::Vertical({
@@ -1187,16 +1284,22 @@ void ControlUI::run() {
             return;
         }
 
-        if (cur_delete_is_memory) {
-            a->db().delete_memory(cur_delete_target_id);
-            set_curation_status("done: delete memory", "");
-        } else {
-            if (a->db().is_conversation_active(cur_delete_target_id)) {
-                set_curation_status("failed", "cannot delete active conversation; activate another first");
+        try {
+            if (cur_delete_is_memory) {
+                a->db().delete_memory(cur_delete_target_id);
+                cur_cache_dirty = true;
+                set_curation_status("done: delete memory", "");
             } else {
-                a->db().delete_conversation(cur_delete_target_id);
-                set_curation_status("done: delete conversation", "");
+                if (a->db().is_conversation_active(cur_delete_target_id)) {
+                    set_curation_status("failed", "cannot delete active conversation; activate another first");
+                } else {
+                    a->db().delete_conversation(cur_delete_target_id);
+                    cur_cache_dirty = true;
+                    set_curation_status("done: delete conversation", "");
+                }
             }
+        } catch (const std::exception& e) {
+            set_curation_status("failed", e.what());
         }
         show_cur_delete_confirm = false;
         refresh();
@@ -1286,7 +1389,7 @@ void ControlUI::run() {
                 if (p.empty()) return "(none)";
                 std::string name = std::filesystem::path(p).filename().string();
                 if (name.empty()) name = p;
-                if (name.size() > 28) name = name.substr(0, 28) + "...";
+                if (name.size() > 28) name = mm::util::utf8_truncate(name, 28) + "...";
                 return name;
             };
 
@@ -1372,7 +1475,7 @@ void ControlUI::run() {
         for (size_t i = 0; i < cs.size(); ++i) {
             auto& a  = cs[i];
             auto model_disp = a.model_path.empty() ? "no model"
-                : (a.model_path.size() > 22 ? a.model_path.substr(0, 22) + "..."
+                : (a.model_path.size() > 22 ? mm::util::utf8_truncate(a.model_path, 22) + "..."
                                              : a.model_path);
             agent_entries[i] = a.name + "  (" + model_disp + ")";
         }
@@ -1494,7 +1597,7 @@ void ControlUI::run() {
                       text(a.model_path.empty() ? "(none)" : a.model_path) | bold}),
                 hbox({text("  System : "),
                       text(a.system_prompt.empty() ? "(none)"
-                               : a.system_prompt.substr(0, 60) + "...")
+                               : mm::util::utf8_truncate(a.system_prompt, 60) + "...")
                           | color(Color::Cyan)}),
                 hbox({text("  ctx    : "),
                       text(std::to_string(a.llama_settings.ctx_size) + " tokens")}),
@@ -1513,7 +1616,9 @@ void ControlUI::run() {
 
         return vbox({
             vbox({
-                agent_menu->Render() | yframe | flex,
+                cs.empty()
+                    ? (text("  (no agents)") | color(Color::GrayDark) | flex)
+                    : (agent_menu->Render() | yframe | flex),
                 agent_list_btns->Render(),
             }) | size(HEIGHT, LESS_THAN, 14) | border,
             separator(),
@@ -1523,40 +1628,41 @@ void ControlUI::run() {
 
     // Tab 3
     auto activity_renderer = Renderer(activity_comp, [&]() {
-        std::vector<LogEntry> snap;
+        // Build the visible lines directly under the lock (read-only over the entries)
+        // instead of deep-copying the whole log_entries_ buffer each frame. A level
+        // filter can require scanning past the newest 300 entries, so iterate the full
+        // buffer back-to-front and stop once 300 matches are collected.
+        Elements lines;
         {
             std::lock_guard<std::mutex> lk(log_mutex_);
-            snap = log_entries_;
-        }
-
-        Elements lines;
-        for (int i = static_cast<int>(snap.size()) - 1;
-             i >= 0 && lines.size() < 300; --i) {
-            auto& e = snap[i];
-            if (log_filter == 1 && e.level != LogLevel::Info)  continue;
-            if (log_filter == 2 && e.level != LogLevel::Warn)  continue;
-            if (log_filter == 3 && e.level != LogLevel::Error) continue;
-            Color c = Color::White;
-            if (e.level == LogLevel::Warn)  c = Color::Yellow;
-            if (e.level == LogLevel::Error) c = Color::Red;
-            std::string prefix = e.level == LogLevel::Warn  ? "[WARN]  "
-                                : e.level == LogLevel::Error ? "[ERROR] "
-                                                              : "[INFO]  ";
-            std::string ts;
-            if (e.timestamp_ms > 0) {
-                time_t sec = static_cast<time_t>(e.timestamp_ms / 1000);
-                struct tm tm_buf{};
+            for (int i = static_cast<int>(log_entries_.size()) - 1;
+                 i >= 0 && lines.size() < 300; --i) {
+                const auto& e = log_entries_[static_cast<size_t>(i)];
+                if (log_filter == 1 && e.level != LogLevel::Info)  continue;
+                if (log_filter == 2 && e.level != LogLevel::Warn)  continue;
+                if (log_filter == 3 && e.level != LogLevel::Error) continue;
+                Color c = Color::White;
+                if (e.level == LogLevel::Warn)  c = Color::Yellow;
+                if (e.level == LogLevel::Error) c = Color::Red;
+                std::string prefix = e.level == LogLevel::Warn  ? "[WARN]  "
+                                    : e.level == LogLevel::Error ? "[ERROR] "
+                                                                 : "[INFO]  ";
+                std::string ts;
+                if (e.timestamp_ms > 0) {
+                    time_t sec = static_cast<time_t>(e.timestamp_ms / 1000);
+                    struct tm tm_buf{};
 #ifdef _WIN32
-                localtime_s(&tm_buf, &sec);
+                    localtime_s(&tm_buf, &sec);
 #else
-                localtime_r(&sec, &tm_buf);
+                    localtime_r(&sec, &tm_buf);
 #endif
-                char tbuf[16];
-                snprintf(tbuf, sizeof(tbuf), "%02d:%02d:%02d ",
-                         tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
-                ts = tbuf;
+                    char tbuf[16];
+                    snprintf(tbuf, sizeof(tbuf), "%02d:%02d:%02d ",
+                             tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
+                    ts = tbuf;
+                }
+                lines.push_back(text(ts + prefix + e.message) | color(c));
             }
-            lines.push_back(text(ts + prefix + e.message) | color(c));
         }
         if (lines.empty())
             lines.push_back(text("  (no events yet)") | color(Color::GrayDark));
@@ -1590,23 +1696,23 @@ void ControlUI::run() {
         const size_t connected_nodes = std::count_if(
             nodes.begin(), nodes.end(), [](const NodeInfo& n) { return n.connected; });
 
-        std::vector<std::string> transcript_snapshot;
+        // Build transcript Elements directly under the lock instead of deep-copying
+        // the whole transcript into an intermediate vector first.
+        Elements transcript_lines;
         std::string partial_snapshot;
         std::string status_snapshot;
         std::string error_snapshot;
         std::string conv_snapshot;
         {
             std::lock_guard<std::mutex> lk(chat_mutex);
-            transcript_snapshot = chat_transcript;
+            transcript_lines.reserve(chat_transcript.size() + 1);
+            for (const auto& line : chat_transcript) {
+                transcript_lines.push_back(text("  " + line));
+            }
             partial_snapshot = chat_partial_assistant;
             status_snapshot = chat_status;
             error_snapshot = chat_last_error;
             conv_snapshot = chat_last_conv_id;
-        }
-
-        Elements transcript_lines;
-        for (const auto& line : transcript_snapshot) {
-            transcript_lines.push_back(text("  " + line));
         }
         if (chat_inflight.load()) {
             if (partial_snapshot.empty()) {
@@ -1678,26 +1784,65 @@ void ControlUI::run() {
         else if (cs.empty())
             cur_agent_sel = 0;
 
-        std::vector<Conversation> convs;
-        std::vector<Memory> mems;
-        std::optional<Conversation> conv_detail;
-        std::optional<Memory> selected_mem;
         std::string selected_agent = "(none)";
+        std::string cur_db_error;  // set if a DB read throws this frame
+        const std::string cur_agent_id =
+            (!cs.empty() && cur_agent_sel >= 0 && cur_agent_sel < static_cast<int>(cs.size()))
+                ? cs[cur_agent_sel].id
+                : std::string{};
+        if (!cur_agent_id.empty())
+            selected_agent = cs[cur_agent_sel].name + " [" + cur_agent_id + "]";
 
-        if (!cs.empty() && cur_agent_sel >= 0 && cur_agent_sel < static_cast<int>(cs.size())) {
-            selected_agent = cs[cur_agent_sel].name + " [" + cs[cur_agent_sel].id + "]";
-            auto a = agents_.get_agent(cs[cur_agent_sel].id);
-            if (a) {
-                convs = a->db().list_conversations();
-                mems  = a->db().list_memories();
+        // Fetch the selected agent at most once per render, and only when actually
+        // needed — a cache-hit frame fetches nothing. Replaces the previous two
+        // get_agent() lookups per render.
+        std::shared_ptr<Agent> frame_agent;
+        bool frame_agent_fetched = false;
+        auto curation_agent = [&]() -> const std::shared_ptr<Agent>& {
+            if (!frame_agent_fetched) {
+                frame_agent_fetched = true;
+                if (!cur_agent_id.empty()) frame_agent = agents_.get_agent(cur_agent_id);
+            }
+            return frame_agent;
+        };
+
+        // Refetch conversations + memories from SQLite only when the agent selection
+        // changes, a mutation flagged the cache dirty, or the throttle elapses — this
+        // keeps the per-keystroke/per-frame render off the database. Reads run on the
+        // loop thread; a locked/busy DB throws, so catch and degrade rather than
+        // unwind out of Screen::Loop(). Do NOT log() here — log() calls refresh(),
+        // which would spin a redraw loop while the DB stays locked.
+        const auto cur_now = std::chrono::steady_clock::now();
+        const bool cur_force = cur_cache_dirty.exchange(false);
+        if (cur_force || cur_agent_id != cur_cache_agent_id ||
+            cur_now - cur_cache_at > std::chrono::milliseconds(1000)) {
+            cur_cache_agent_id = cur_agent_id;
+            cur_cache_at = cur_now;
+            cur_convs_cache.clear();
+            cur_mems_cache.clear();
+            cur_conv_detail_cache.reset();
+            cur_detail_loaded_id.clear();
+            if (!cur_agent_id.empty()) {
+                if (auto a = curation_agent()) {
+                    try {
+                        cur_convs_cache = a->db().list_conversations();
+                        cur_mems_cache  = a->db().list_memories();
+                    } catch (const std::exception& e) {
+                        cur_convs_cache.clear();
+                        cur_mems_cache.clear();
+                        cur_db_error = e.what();
+                    }
+                }
             }
         }
+        const std::vector<Conversation>& convs = cur_convs_cache;
+        const std::vector<Memory>&       mems  = cur_mems_cache;
 
         cur_conv_entries.resize(convs.size());
         for (size_t i = 0; i < convs.size(); ++i) {
             const auto& c = convs[i];
             std::string title = c.title.empty() ? "(untitled)" : c.title;
-            if (title.size() > 28) title = title.substr(0, 28) + "...";
+            if (title.size() > 28) title = mm::util::utf8_truncate(title, 28) + "...";
             std::string prefix = c.is_active ? "* " : "  ";
             std::string parent = c.parent_conv_id.empty() ? "" : (" <- " + c.parent_conv_id.substr(0, 8));
             cur_conv_entries[i] = prefix + title + " [" + std::to_string(c.total_tokens) + " tok]" + parent;
@@ -1707,18 +1852,38 @@ void ControlUI::run() {
         else if (convs.empty())
             cur_conv_sel = 0;
 
+        // Load the selected conversation's full detail, refetching only when the
+        // selected conversation id changes (the throttle above already reset the
+        // cached detail + loaded id when it elapsed or the agent changed).
         if (!convs.empty() && cur_conv_sel >= 0 && cur_conv_sel < static_cast<int>(convs.size())) {
-            auto a = agents_.get_agent(cs[cur_agent_sel].id);
-            if (a) conv_detail = a->db().load_conversation(convs[cur_conv_sel].id);
+            const std::string want_id = convs[cur_conv_sel].id;
+            if (want_id != cur_detail_loaded_id) {
+                cur_conv_detail_cache.reset();
+                if (auto a = curation_agent()) {
+                    try {
+                        cur_conv_detail_cache = a->db().load_conversation(want_id);
+                        cur_detail_loaded_id = want_id;
+                    } catch (const std::exception& e) {
+                        cur_conv_detail_cache.reset();
+                        cur_detail_loaded_id.clear();
+                        if (cur_db_error.empty()) cur_db_error = e.what();
+                    }
+                }
+            }
+        } else {
+            cur_conv_detail_cache.reset();
+            cur_detail_loaded_id.clear();
         }
+        const std::optional<Conversation>& conv_detail = cur_conv_detail_cache;
 
+        std::optional<Memory> selected_mem;
         cur_mem_entries.resize(mems.size());
         for (size_t i = 0; i < mems.size(); ++i) {
             const auto& m = mems[i];
             char imp[12];
             snprintf(imp, sizeof(imp), "%.2f", static_cast<double>(m.importance));
             std::string content = m.content;
-            if (content.size() > 44) content = content.substr(0, 44) + "...";
+            if (content.size() > 44) content = mm::util::utf8_truncate(content, 44) + "...";
             cur_mem_entries[i] = std::string("[") + imp + "] " + content;
         }
         if (cur_mem_sel >= static_cast<int>(mems.size()) && !mems.empty())
@@ -1781,15 +1946,12 @@ void ControlUI::run() {
                 }
             }
 
-            int start_i = parse_int_or(cur_start_s, 0);
-            int end_i = parse_int_or(cur_end_s, 0);
-            const int last_idx = static_cast<int>(msgs.size()) - 1;
-            if (start_i < 0 || start_i > last_idx) cur_start_s = "0";
-            if (end_i < 0 || end_i > last_idx) cur_end_s = std::to_string(last_idx);
+            // NOTE: deliberately no write-back to cur_start_s/cur_end_s here. They are
+            // bound to Input fields; mutating them during render fights the user's
+            // typing. The extraction range is validated at point-of-use in the Generate
+            // Memories handler (which reports "invalid message range").
         } else {
             conv_detail_lines.push_back(text("  (select a conversation)") | color(Color::GrayDark));
-            cur_start_s = "0";
-            cur_end_s = "0";
         }
 
         Elements mem_detail_lines;
@@ -1833,6 +1995,8 @@ void ControlUI::run() {
             }),
             error_snapshot.empty() ? text("")
                                    : (text(" Last error: " + error_snapshot) | color(Color::Red)),
+            cur_db_error.empty() ? text("")
+                                 : (text(" DB read error: " + cur_db_error) | color(Color::Red)),
             separator(),
             hbox({
                 vbox({
@@ -1925,7 +2089,7 @@ void ControlUI::run() {
 
     //
 
-    auto root = CatchEvent(top_renderer, [&](Event ev) {
+    auto root = MakeCatchEventAfter(top_renderer, [&](Event ev) {
         if (show_add_node || show_pin_entry || show_agent_validation_modal ||
             show_file_browser || show_cur_delete_confirm) return false;
         if (!show_editor) {
@@ -1969,22 +2133,37 @@ void ControlUI::run() {
         }
     });
 
-    screen.Loop(final_comp);
-
-    ticker_running = false;
-    ticker.join();
-
-    if (chat_thread.joinable()) {
-        chat_thread.join();
+    // Run the loop under try/catch: an exception escaping a render lambda or event
+    // handler (e.g. a SQLite throw) must not unwind past the still-joinable worker
+    // threads below — a joinable std::thread destructor calls std::terminate, which
+    // would skip terminal restoration. Catch, then always clean up.
+    std::string loop_error;
+    try {
+        screen.Loop(final_comp);
+    } catch (const std::exception& e) {
+        loop_error = e.what();
+    } catch (...) {
+        loop_error = "unknown exception";
     }
-    if (cur_thread.joinable()) {
-        cur_thread.join();
-    }
 
+    // Clear the screen callbacks first so any late refresh()/quit() from a worker
+    // thread during the joins is a no-op instead of posting to an exited screen.
     {
         std::lock_guard<std::mutex> lk(screen_mutex_);
         quit_fn_    = {};
         refresh_fn_ = {};
+    }
+
+    // Signal the chat stream to abort, then join every thread so none is destroyed
+    // while joinable (which would terminate the process) — including on the error path.
+    ui_shutting_down = true;
+    ticker_running = false;
+    if (ticker.joinable())      ticker.join();
+    if (chat_thread.joinable()) chat_thread.join();
+    if (cur_thread.joinable())  cur_thread.join();
+
+    if (!loop_error.empty()) {
+        MM_ERROR("Control UI event loop terminated by exception: {}", loop_error);
     }
 }
 
