@@ -49,13 +49,13 @@ struct TraceEvent {
 // ── Message ───────────────────────────────────────────────────────────────────
 struct Message {
     MessageRole          role         = MessageRole::User;
-    std::string          content;
-    std::vector<ToolCall> tool_calls;
-    std::string          tool_call_id;   // populated for role=Tool response messages
-    std::string          thinking_text;  // content stripped from <think>…</think>
+    std::string          content{};
+    std::vector<ToolCall> tool_calls{};
+    std::string          tool_call_id{};   // populated for role=Tool response messages
+    std::string          thinking_text{};  // content stripped from <think>…</think>
     int                  token_count  = 0;
     int64_t              timestamp_ms = 0;
-    std::vector<TraceEvent> trace_events;
+    std::vector<TraceEvent> trace_events{};
 };
 
 // ── LlamaSettings ─────────────────────────────────────────────────────────────
