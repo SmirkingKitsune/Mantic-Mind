@@ -272,6 +272,21 @@ $NodeOutputDir = Get-BuildOutputDir "node" $NodeExe
 $ControlOutputDir = Get-BuildOutputDir "control" $ControlExe
 $OutputDirs = @($NodeOutputDir, $ControlOutputDir)
 
+Write-Host "==> Copy executables"
+# This CMake tree has no install() rules, so `cmake --install` does not populate
+# bin/. Copy the built executables explicitly (as we do for DLLs) so the package
+# actually contains the binaries the manifest advertises.
+$NodeExePath = Join-Path $NodeOutputDir $NodeExe
+$ControlExePath = Join-Path $ControlOutputDir $ControlExe
+if (-not (Test-Path -LiteralPath $NodeExePath)) {
+    throw "Node executable not found at $NodeExePath. Build the project before packaging."
+}
+if (-not (Test-Path -LiteralPath $ControlExePath)) {
+    throw "Control executable not found at $ControlExePath. Build the project before packaging."
+}
+Copy-Item -LiteralPath $NodeExePath -Destination (Join-Path $BinDir $NodeExe) -Force
+Copy-Item -LiteralPath $ControlExePath -Destination (Join-Path $BinDir $ControlExe) -Force
+
 Write-Host "==> Copy runtime DLLs"
 Copy-MatchingFiles $OutputDirs "*.dll" $BinDir
 
