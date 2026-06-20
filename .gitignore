@@ -1,6 +1,7 @@
 # Build artifacts
 /build/
 /out/
+/dist/
 /cmake-build-*/
 
 # vcpkg installed packages
@@ -21,6 +22,7 @@
 
 # Local third-party checkouts
 /external/llama.cpp/
+/.deps/
 
 # IDE / editor
 /.vscode/
@@ -47,6 +49,11 @@
 /cmake_install.cmake
 /Makefile
 /install_manifest.txt
+
+# Python (tools/ sidecars)
+__pycache__/
+*.pyc
+*.pyo
 
 # OS
 .DS_Store
