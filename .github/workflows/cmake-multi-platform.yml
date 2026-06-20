@@ -1,0 +1,105 @@
+name: CMake on multiple platforms
+
+on:
+  push:
+    branches: [ "vllm-runtime" ]
+  pull_request:
+    branches: [ "vllm-runtime" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-msvc-release
+            os: windows-latest
+            build_type: Release
+            cpp_compiler: ""
+            vcpkg_triplet: x64-windows
+          - name: linux-gcc-release
+            os: ubuntu-latest
+            build_type: Release
+            cpp_compiler: g++
+            vcpkg_triplet: x64-linux
+          - name: linux-clang-release
+            os: ubuntu-latest
+            build_type: Release
+            cpp_compiler: clang++
+            vcpkg_triplet: x64-linux
+
+    env:
+      BUILD_DIR: ${{ github.workspace }}/build/${{ matrix.name }}
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.vcpkg-cache,readwrite
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-${{ matrix.name }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-${{ matrix.name }}-
+
+      - name: Locate or bootstrap vcpkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item -ItemType Directory -Path "${{ github.workspace }}/.vcpkg-cache" -Force | Out-Null
+
+          $existingRoot = $env:VCPKG_INSTALLATION_ROOT
+          $existingToolchain = if ($existingRoot) { Join-Path $existingRoot "scripts/buildsystems/vcpkg.cmake" } else { "" }
+          $existingExe = if ($existingRoot) { Join-Path $existingRoot "vcpkg.exe" } else { "" }
+          $existingUnixExe = if ($existingRoot) { Join-Path $existingRoot "vcpkg" } else { "" }
+
+          if ($existingRoot -and
+              (Test-Path $existingToolchain) -and
+              ((Test-Path $existingExe) -or (Test-Path $existingUnixExe))) {
+            $vcpkgRoot = $existingRoot
+          } else {
+            $vcpkgRoot = Join-Path $env:RUNNER_TEMP "vcpkg"
+            git clone https://github.com/microsoft/vcpkg $vcpkgRoot
+            if ($IsWindows) {
+              & (Join-Path $vcpkgRoot "bootstrap-vcpkg.bat") -disableMetrics
+            } else {
+              & (Join-Path $vcpkgRoot "bootstrap-vcpkg.sh") -disableMetrics
+            }
+          }
+
+          "VCPKG_ROOT=$vcpkgRoot" >> $env:GITHUB_ENV
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $args = @(
+            "-S", "${{ github.workspace }}",
+            "-B", "$env:BUILD_DIR",
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake",
+            "-DVCPKG_TARGET_TRIPLET=${{ matrix.vcpkg_triplet }}",
+            "-DCMAKE_BUILD_TYPE=${{ matrix.build_type }}"
+          )
+
+          if ("${{ matrix.cpp_compiler }}") {
+            $args += "-DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }}"
+          }
+
+          cmake @args
+
+      - name: Build
+        run: cmake --build "${{ env.BUILD_DIR }}" --config "${{ matrix.build_type }}" --parallel
+
+      - name: Test
+        run: ctest --test-dir "${{ env.BUILD_DIR }}" -C "${{ matrix.build_type }}" --output-on-failure
