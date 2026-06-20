@@ -25,24 +25,6 @@ models_dir = "models"
 node_health_poll_interval_s = 30
 
 # ── Logging ────────────────────────────────────────────────────────────────────
-# Local Qwen3-TTS sidecar. Disabled by default.
-# Environment variables:
-#   MM_TTS_ENABLED, MM_TTS_SERVICE_URL, MM_TTS_SERVICE_COMMAND
-#   MM_TTS_VOICE_DESIGN_MODEL_ID, MM_TTS_CLONE_MODEL_ID
-#   MM_TTS_CUSTOM_VOICE_MODEL_ID, MM_TTS_CACHE_DIR
-#   MM_TTS_CACHE_TTL_MS, MM_TTS_TIMEOUT_S
-tts_enabled = false
-tts_service_url = "http://127.0.0.1:9188"
-# tts_service_command = "python tools/qwen_tts_service.py --host 127.0.0.1 --port 9188"
-# Empty uses {data_dir}/agents/{agent_id}/tts/cache.
-# tts_cache_dir = ""
-tts_voice_design_model_id = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
-tts_clone_model_id = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
-tts_custom_voice_model_id = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
-# 24 hours
-tts_cache_ttl_ms = 86400000
-tts_timeout_s = 120
-
 log_file = "logs/mantic-mind-control.log"
 
 # ── Discovery & Pairing ────────────────────────────────────────────────────────

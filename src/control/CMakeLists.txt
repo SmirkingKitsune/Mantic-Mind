@@ -8,7 +8,6 @@ add_executable(mantic-mind-control
     agent_manager.cpp
     agent_config_validator.cpp
     control_api_server.cpp
-    tts_service_client.cpp
     control_ui.cpp
 )
 
