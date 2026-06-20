@@ -34,6 +34,11 @@ bool starts_with(const std::string& s, const std::string& prefix);
 bool ends_with(const std::string& s, const std::string& suffix);
 std::string replace_all(const std::string& s, const std::string& from, const std::string& to);
 
+// True when ref looks like a Hugging Face repo id ("org/name", each segment
+// [A-Za-z0-9._-]) rather than a local filesystem path. Shared by the node (HF
+// cache) and control (placement preference).
+bool is_hf_repo_id(const std::string& ref);
+
 // ── URL / SSE helpers ───────────────────────────────────────────────────────
 // Parse "http://host:port/path" → {host, port}.  Defaults to port 80.
 std::pair<std::string, int> parse_url(const std::string& url);
@@ -41,5 +46,16 @@ std::pair<std::string, int> parse_url(const std::string& url);
 // Drain complete SSE "data: ..." lines from buf, returning payloads (after
 // the "data: " prefix).  Incomplete trailing data stays in buf.
 std::vector<std::string> drain_sse_lines(std::string& buf);
+
+// Truncate s to at most max_bytes bytes WITHOUT splitting a multi-byte UTF-8
+// codepoint: if the cut would land inside a continuation-byte sequence, back up to
+// the preceding codepoint boundary. ASCII input is returned byte-for-byte. Does not
+// append an ellipsis — callers add "..." themselves.
+inline std::string utf8_truncate(const std::string& s, size_t max_bytes) {
+    if (s.size() <= max_bytes) return s;
+    size_t n = max_bytes;
+    while (n > 0 && (static_cast<unsigned char>(s[n]) & 0xC0) == 0x80) --n;
+    return s.substr(0, n);
+}
 
 } // namespace mm::util

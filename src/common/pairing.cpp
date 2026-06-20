@@ -2,28 +2,46 @@
 
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
+#include <openssl/rand.h>
 
+#include <cstdint>
 #include <iomanip>
-#include <random>
 #include <sstream>
+#include <stdexcept>
+#include <vector>
 
 namespace mm::pairing {
 
+// PINs and nonces are authentication material, so they must come from a
+// CSPRNG. Rejection sampling keeps the PIN uniform over [0, 1000000).
 std::string generate_pin() {
-    static thread_local std::mt19937 rng{std::random_device{}()};
-    std::uniform_int_distribution<int> dist(0, 999999);
+    // Largest multiple of 1'000'000 that fits in uint32_t.
+    constexpr uint32_t kRejectAbove = 4294000000u;
+    uint32_t v = 0;
+    do {
+        unsigned char buf[4];
+        if (RAND_bytes(buf, sizeof(buf)) != 1)
+            throw std::runtime_error("generate_pin: RAND_bytes failed");
+        v = (static_cast<uint32_t>(buf[0]) << 24) |
+            (static_cast<uint32_t>(buf[1]) << 16) |
+            (static_cast<uint32_t>(buf[2]) << 8)  |
+             static_cast<uint32_t>(buf[3]);
+    } while (v >= kRejectAbove);
+
     char buf[8];
-    snprintf(buf, sizeof(buf), "%06d", dist(rng));
+    snprintf(buf, sizeof(buf), "%06u", v % 1000000u);
     return std::string(buf);
 }
 
 std::string generate_nonce(size_t bytes) {
-    static thread_local std::mt19937 rng{std::random_device{}()};
-    std::uniform_int_distribution<unsigned int> dist(0, 255u);
+    std::vector<unsigned char> raw(bytes);
+    if (!raw.empty() && RAND_bytes(raw.data(), static_cast<int>(raw.size())) != 1)
+        throw std::runtime_error("generate_nonce: RAND_bytes failed");
+
     std::ostringstream oss;
     oss << std::hex << std::setfill('0');
-    for (size_t i = 0; i < bytes; ++i)
-        oss << std::setw(2) << dist(rng);
+    for (unsigned char b : raw)
+        oss << std::setw(2) << static_cast<unsigned int>(b);
     return oss.str();
 }
 
