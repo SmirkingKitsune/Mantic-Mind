@@ -29,6 +29,17 @@ namespace mm {
 
 static constexpr int64_t kNodeStalenessMs = 30000; // 30 s
 
+// A node with MM_SELF_URL unset broadcasts the loopback default
+// "http://127.0.0.1:<port>". That URL is only reachable on the node's own host,
+// so a control on any other machine — or in a different network namespace such
+// as WSL/Hyper-V — would record an address that points back at itself. Detect
+// such hosts so the listener can substitute the packet's real source IP.
+static bool is_loopback_or_unspecified_host(const std::string& host) {
+    const std::string h = mm::util::to_lower(host);
+    if (h == "localhost" || h == "::1" || h == "::" || h == "0.0.0.0") return true;
+    return h.rfind("127.", 0) == 0; // 127.0.0.0/8
+}
+
 // ── NodeDiscoveryBroadcaster ──────────────────────────────────────────────────
 
 void NodeDiscoveryBroadcaster::start(const std::string& url,
@@ -169,6 +180,22 @@ void NodeDiscoveryListener::start(uint16_t port) {
                 dn.last_seen_ms = mm::util::now_ms();
 
                 if (dn.url.empty() || dn.node_id.empty()) continue;
+
+                // If the node advertised a loopback/unspecified host (e.g.
+                // MM_SELF_URL unset), that URL is unreachable from here. Rewrite
+                // the host to the packet's real source IP, preserving scheme and
+                // port. The listener socket is AF_INET, so `sender` is IPv4.
+                auto [adv_host, adv_port] = mm::util::parse_url(dn.url);
+                if (is_loopback_or_unspecified_host(adv_host)) {
+                    char ip[INET_ADDRSTRLEN] = {};
+                    if (inet_ntop(AF_INET, &sender.sin_addr, ip, sizeof(ip)) &&
+                        !is_loopback_or_unspecified_host(ip)) {
+                        const std::string scheme =
+                            mm::util::starts_with(mm::util::to_lower(dn.url), "https://")
+                                ? "https://" : "http://";
+                        dn.url = scheme + std::string(ip) + ":" + std::to_string(adv_port);
+                    }
+                }
 
                 Callback cb;
                 {

@@ -950,6 +950,21 @@ int main(int argc, char** argv) {
         : "http://127.0.0.1:" + std::to_string(cfg.listen_port);
     std::string broadcast_id = mm::util::generate_uuid();
 
+    // Warn when we advertise a loopback host: control on another machine (or in
+    // a different network namespace, e.g. WSL/Hyper-V) cannot reach it. The
+    // control-side listener now substitutes the packet's source IP, but setting
+    // MM_SELF_URL to a routable address is the correct fix.
+    {
+        const auto [adv_host, adv_port] = mm::util::parse_url(broadcast_url);
+        (void)adv_port;
+        const std::string h = mm::util::to_lower(adv_host);
+        const bool loopback = h == "localhost" || h == "::1" || h == "::" ||
+                              h == "0.0.0.0" || h.rfind("127.", 0) == 0;
+        if (loopback)
+            MM_WARN("Discovery broadcasting loopback URL {} — set MM_SELF_URL to a "
+                    "routable address for multi-host clusters", broadcast_url);
+    }
+
     mm::NodeDiscoveryBroadcaster broadcaster;
     broadcaster.start(broadcast_url, broadcast_id, cfg.discovery_port);
     MM_INFO("Discovery broadcaster started on port {} (id={})",
