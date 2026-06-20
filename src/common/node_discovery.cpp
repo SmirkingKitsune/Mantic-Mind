@@ -12,7 +12,6 @@
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
    using SockType = SOCKET;
-   static constexpr SockType kInvalidSock = INVALID_SOCKET;
    inline static int  sock_close(SockType s) { return closesocket(s); }
    inline static bool sock_valid(SockType s) { return s != INVALID_SOCKET; }
 #else
@@ -22,7 +21,6 @@
 #  include <sys/time.h>
 #  include <unistd.h>
    using SockType = int;
-   static constexpr SockType kInvalidSock = -1;
    inline static int  sock_close(SockType s) { return ::close(s); }
    inline static bool sock_valid(SockType s) { return s >= 0; }
 #endif
