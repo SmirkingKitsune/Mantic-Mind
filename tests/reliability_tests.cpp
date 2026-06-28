@@ -472,31 +472,45 @@ bool test_control_api_external_token_gate() {
             RECORD(resp.body.find(expected_text) != std::string::npos);
         };
 
-        auto missing = client.get("/v1/nodes");
+        // Loopback HTTP can transiently fail to establish a connection under
+        // load — HttpClient surfaces that as status 0 with an empty body. Retry
+        // such drops so these assertions exercise the auth gate, not socket
+        // flakiness. A dropped connection never reaches the server, so re-
+        // issuing the request (even a mutation) is safe.
+        auto with_retry = [](auto&& make_request) {
+            auto resp = make_request();
+            for (int attempt = 1; attempt < 8 && resp.status == 0; ++attempt) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                resp = make_request();
+            }
+            return resp;
+        };
+
+        auto missing = with_retry([&] { return client.get("/v1/nodes"); });
         expect_error(missing, 401, "missing bearer token");
 
         client.set_bearer_token("wrong-secret");
-        auto invalid = client.get("/v1/nodes");
+        auto invalid = with_retry([&] { return client.get("/v1/nodes"); });
         expect_error(invalid, 403, "invalid bearer token");
 
         registry.add_node("http://127.0.0.1:1", "node-secret", "test", false);
 
         client.set_bearer_token("node-secret");
-        auto node_token_on_external = client.get("/v1/nodes");
+        auto node_token_on_external = with_retry([&] { return client.get("/v1/nodes"); });
         expect_error(node_token_on_external, 403, "invalid bearer token");
 
         client.set_bearer_token("control-secret");
-        auto valid = client.get("/v1/nodes");
+        auto valid = with_retry([&] { return client.get("/v1/nodes"); });
         RECORD(valid.status == 200);
 
         mm::HttpClient external_on_internal(base_url);
         external_on_internal.set_bearer_token("control-secret");
-        auto external_token_internal = external_on_internal.get("/api/control/models");
+        auto external_token_internal = with_retry([&] { return external_on_internal.get("/api/control/models"); });
         expect_error(external_token_internal, 401, "invalid node api key");
 
         mm::HttpClient node_client(base_url);
         node_client.set_bearer_token("node-secret");
-        auto node_internal = node_client.get("/api/control/models");
+        auto node_internal = with_retry([&] { return node_client.get("/api/control/models"); });
         RECORD(node_internal.status == 200);
 
         struct StreamAttempt {
@@ -507,18 +521,23 @@ bool test_control_api_external_token_gate() {
         };
         auto stream_chat = [&](const std::string& token,
                                const nlohmann::json& body) {
-            mm::HttpClient stream_client(base_url);
-            if (!token.empty()) stream_client.set_bearer_token(token);
             StreamAttempt attempt;
-            attempt.ok = stream_client.stream_post(
-                "/v1/agents/agent-a/chat",
-                body,
-                [&](const std::string& event) {
-                    attempt.events.push_back(event);
-                    return true;
-                },
-                &attempt.status,
-                &attempt.body);
+            for (int retry = 0; retry < 8; ++retry) {
+                mm::HttpClient stream_client(base_url);
+                if (!token.empty()) stream_client.set_bearer_token(token);
+                attempt = StreamAttempt{};
+                attempt.ok = stream_client.stream_post(
+                    "/v1/agents/agent-a/chat",
+                    body,
+                    [&](const std::string& event) {
+                        attempt.events.push_back(event);
+                        return true;
+                    },
+                    &attempt.status,
+                    &attempt.body);
+                if (attempt.status != 0) break;  // status 0 = transient drop; retry
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
             return attempt;
         };
 
@@ -546,59 +565,59 @@ bool test_control_api_external_token_gate() {
         RECORD(valid_chat_route.body.find("message required") != std::string::npos);
 
         mm::HttpClient missing_mutator(base_url);
-        auto missing_create_conversation = missing_mutator.post(
+        auto missing_create_conversation = with_retry([&] { return missing_mutator.post(
             "/v1/agents/agent-a/conversations",
-            nlohmann::json{{"title", "Blocked"}, {"set_active", true}});
+            nlohmann::json{{"title", "Blocked"}, {"set_active", true}}); });
         expect_error(missing_create_conversation, 401, "missing bearer token");
 
         mm::HttpClient node_mutator(base_url);
         node_mutator.set_bearer_token("node-secret");
-        auto node_create_conversation = node_mutator.post(
+        auto node_create_conversation = with_retry([&] { return node_mutator.post(
             "/v1/agents/agent-a/conversations",
-            nlohmann::json{{"title", "Blocked"}, {"set_active", true}});
+            nlohmann::json{{"title", "Blocked"}, {"set_active", true}}); });
         expect_error(node_create_conversation, 403, "invalid bearer token");
 
-        auto create_conversation = client.post(
+        auto create_conversation = with_retry([&] { return client.post(
             "/v1/agents/agent-a/conversations",
-            nlohmann::json{{"title", "Original title"}, {"set_active", true}});
+            nlohmann::json{{"title", "Original title"}, {"set_active", true}}); });
         RECORD(create_conversation.status == 201);
         auto conversation_body = nlohmann::json::parse(create_conversation.body);
         const std::string conversation_id =
             conversation_body["conversation"]["id"].get<std::string>();
 
         mm::HttpClient missing_put(base_url);
-        auto missing_rename = missing_put.put(
+        auto missing_rename = with_retry([&] { return missing_put.put(
             "/v1/agents/agent-a/conversations/" + conversation_id,
-            nlohmann::json{{"title", "Blocked rename"}});
+            nlohmann::json{{"title", "Blocked rename"}}); });
         expect_error(missing_rename, 401, "missing bearer token");
 
-        auto rename = client.put(
+        auto rename = with_retry([&] { return client.put(
             "/v1/agents/agent-a/conversations/" + conversation_id,
-            nlohmann::json{{"title", "Renamed by authorized client"}});
+            nlohmann::json{{"title", "Renamed by authorized client"}}); });
         RECORD(rename.status == 200);
         auto renamed_body = nlohmann::json::parse(rename.body);
         RECORD(renamed_body["title"] == "Renamed by authorized client");
 
         mm::HttpClient invalid_memory_client(base_url);
         invalid_memory_client.set_bearer_token("wrong-secret");
-        auto invalid_create_memory = invalid_memory_client.post(
+        auto invalid_create_memory = with_retry([&] { return invalid_memory_client.post(
             "/v1/agents/agent-a/memories",
-            nlohmann::json{{"content", "Blocked memory"}, {"source_conv_id", conversation_id}});
+            nlohmann::json{{"content", "Blocked memory"}, {"source_conv_id", conversation_id}}); });
         expect_error(invalid_create_memory, 403, "invalid bearer token");
 
-        auto create_memory = client.post(
+        auto create_memory = with_retry([&] { return client.post(
             "/v1/agents/agent-a/memories",
-            nlohmann::json{{"content", "Authorized memory"}, {"source_conv_id", conversation_id}});
+            nlohmann::json{{"content", "Authorized memory"}, {"source_conv_id", conversation_id}}); });
         RECORD(create_memory.status == 201);
         auto memory_body = nlohmann::json::parse(create_memory.body);
         const std::string memory_id = memory_body["id"].get<std::string>();
 
         mm::HttpClient missing_delete(base_url);
-        auto missing_delete_memory = missing_delete.del(
-            "/v1/agents/agent-a/memories/" + memory_id);
+        auto missing_delete_memory = with_retry([&] { return missing_delete.del(
+            "/v1/agents/agent-a/memories/" + memory_id); });
         expect_error(missing_delete_memory, 401, "missing bearer token");
 
-        auto delete_memory = client.del("/v1/agents/agent-a/memories/" + memory_id);
+        auto delete_memory = with_retry([&] { return client.del("/v1/agents/agent-a/memories/" + memory_id); });
         RECORD(delete_memory.status == 200);
 
         api.stop();
