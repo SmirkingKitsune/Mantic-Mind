@@ -112,6 +112,7 @@ ConvId ConversationManager::compact_conversation(const ConvId& conv_id,
     }
 
     InferenceRequest req;
+    req.model = cfg.model_path;
     req.settings = cfg.llama_settings;
     req.messages = {{ .role = MessageRole::User, .content = prompt.str() }};
 

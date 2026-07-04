@@ -2,6 +2,7 @@
 #include "node/node_state.hpp"
 #include "common/util.hpp"
 #include "common/logger.hpp"
+#include "common/tui_widgets.hpp"
 
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
@@ -15,6 +16,8 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -76,6 +79,28 @@ std::string shorten_middle(const std::string& s, size_t max_len) {
     return head + "..." + s.substr(start);
 }
 
+// Byte-wise tail of a string with a leading ellipsis when truncated.
+std::string tail_text(const std::string& s, size_t max_chars) {
+    if (max_chars < 2) return s.substr(s.size() > max_chars ? s.size() - max_chars : 0);
+    if (s.size() <= max_chars) return s;
+    size_t start = s.size() - (max_chars - 1);
+    while (start < s.size() && (static_cast<unsigned char>(s[start]) & 0xC0) == 0x80) ++start;
+    return "…" + s.substr(start);
+}
+
+std::string clock_hms() {
+    std::time_t now = std::time(nullptr);
+    std::tm tmv{};
+#ifdef _WIN32
+    localtime_s(&tmv, &now);
+#else
+    localtime_r(&now, &tmv);
+#endif
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    return buf;
+}
+
 } // namespace
 
 NodeUI::NodeUI(NodeState& state, uint16_t listen_port,
@@ -83,6 +108,7 @@ NodeUI::NodeUI(NodeState& state, uint16_t listen_port,
     : state_(state)
     , listen_port_(listen_port)
     , forget_pairing_cb_(std::move(forget_pairing_cb)) {
+    started_ms_ = mm::util::now_ms();
     log_file_path_ = make_temp_llama_log_path();
     if (!log_file_path_.empty()) {
         log_file_.open(log_file_path_, std::ios::out | std::ios::app);
@@ -120,6 +146,11 @@ void NodeUI::quit() {
 // ── run ───────────────────────────────────────────────────────────────────────
 void NodeUI::run() {
     using namespace ftxui;
+    using mm::tui::panel;
+    using mm::tui::gauge_line;
+    using mm::tui::braille_graph;
+    using mm::tui::slot_table;
+    using mm::tui::mb_str;
 
     auto screen = ScreenInteractive::Fullscreen();
 
@@ -132,9 +163,8 @@ void NodeUI::run() {
     static const std::array<const char*, 10> kSpinner{
         "⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"
     };
-    // Log viewport height as last computed by the renderer (which subtracts the
-    // generated-text panel). The scroll handler reads this so Home/PgUp can reach
-    // the oldest lines even while the generation panel is on screen.
+    // Log viewport height as last computed by the renderer. The scroll handler reads
+    // this so Home/PgUp can reach the oldest lines.
     int log_viewport = std::max(4, ftxui::Terminal::Size().dimy - 17);
     std::string model_action_status;
     auto forget_pairing = [&]() {
@@ -171,67 +201,17 @@ void NodeUI::run() {
             log_file_path = log_file_path_;
         }
 
-        // ── Helper: gauge row ─────────────────────────────────────────────────
-        auto gauge_row = [&](const std::string& label, float pct,
-                              const std::string& detail) -> Element {
-            float ratio = pct / 100.0f;
-            if (ratio < 0.0f) ratio = 0.0f;
-            if (ratio > 1.0f) ratio = 1.0f;
-            Color bar_color = Color::Green;
-            if (pct > 80.0f)      bar_color = Color::Red;
-            else if (pct > 60.0f) bar_color = Color::Yellow;
+        // Wall-clock spinner + cursor so they advance steadily regardless of how
+        // often the renderer runs (renders also fire on every log line / keypress).
+        const size_t spin_frame =
+            static_cast<size_t>(mm::util::now_ms() / 100) % kSpinner.size();
+        const char* spin = kSpinner[spin_frame];
+        const bool cursor_on = (mm::util::now_ms() / 500) % 2 == 0;
 
-            // Build percent string
-            char pct_buf[16];
-            snprintf(pct_buf, sizeof(pct_buf), "%5.1f%%", static_cast<double>(pct));
-
-            return hbox({
-                text(label) | size(WIDTH, EQUAL, 4),
-                text(" "),
-                gauge(ratio) | color(bar_color) | flex,
-                text(" "),
-                text(pct_buf),
-                detail.empty() ? text("") : text("  " + detail),
-            });
-        };
-
-        // ── RAM detail string ─────────────────────────────────────────────────
-        auto mb_str = [](int64_t mb) -> std::string {
-            if (mb >= 1024) {
-                char buf[32];
-                snprintf(buf, sizeof(buf), "%.1fG", static_cast<double>(mb) / 1024.0);
-                return buf;
-            }
-            return std::to_string(mb) + "M";
-        };
-
-        std::string ram_detail = mb_str(metrics.ram_used_mb) + " / " + mb_str(metrics.ram_total_mb);
-        std::string gpu_detail;
-        if (metrics.gpu_vram_total_mb > 0)
-            gpu_detail = mb_str(metrics.gpu_vram_used_mb) + " / " + mb_str(metrics.gpu_vram_total_mb);
-
-        std::string runtime_summary = "ready";
-        if (!last_error.empty()) {
-            runtime_summary += " | error: ";
-            runtime_summary += last_error;
-        }
-
-        Color runtime_color = last_error.empty() ? Color::GrayDark : Color::RedLight;
-
+        // ── Waiting (unregistered) state ──────────────────────────────────────
         if (!registered) {
-            // ── Waiting state ─────────────────────────────────────────────────
-            // Derive the spinner frame from wall-clock time so it advances at a steady
-            // ~10fps regardless of how often the renderer runs (renders also fire on
-            // every log line and keypress, which would otherwise make it race).
-            const size_t spin_frame =
-                static_cast<size_t>(mm::util::now_ms() / 100) % kSpinner.size();
-            std::string spinner_text = std::string(kSpinner[spin_frame])
-                                     + "  Waiting for Mantic-Mind-Control...";
-
-            // Check for a pending pairing request — show PIN prominently.
+            std::string spinner_text = std::string(spin) + "  Waiting for Mantic-Mind-Control...";
             auto pp = state_.get_pending_pair();
-
-            // Compute time remaining for the PIN display
             int64_t expires_s = 0;
             if (pp) {
                 int64_t ms_left = pp->expiry_ms - mm::util::now_ms();
@@ -245,31 +225,17 @@ void NodeUI::run() {
                 text(""),
                 text(spinner_text) | hcenter,
                 text(""),
-                hbox({
-                    text("  Listen port : "),
-                    text(std::to_string(listen_port_)) | bold,
-                }),
-                hbox({
-                    text("  Node ID     : "),
-                    text(node_id.empty() ? "(pending)" : node_id) | bold,
-                }),
+                hbox({text("  Listen port : "), text(std::to_string(listen_port_)) | bold}),
+                hbox({text("  Node ID     : "), text(node_id.empty() ? "(pending)" : node_id) | bold}),
             };
 
             if (pp && !pp->pin.empty()) {
-                // Show PIN prominently
                 waiting_elems.push_back(text(""));
                 waiting_elems.push_back(
-                    hbox({
-                        text("  PIN: "),
-                        text(pp->pin) | bold | color(Color::Yellow),
-                    })
-                );
+                    hbox({text("  PIN: "), text(pp->pin) | bold | color(Color::Yellow)}));
                 waiting_elems.push_back(
-                    text("  Expires in " + std::to_string(expires_s) + "s")
-                    | color(Color::GrayDark)
-                );
+                    text("  Expires in " + std::to_string(expires_s) + "s") | color(Color::GrayDark));
             } else {
-                // Show truncated API key as before
                 std::string keys_text;
                 if (!api_keys.empty())
                     keys_text = api_keys.front().size() > 20
@@ -277,12 +243,7 @@ void NodeUI::run() {
                         : api_keys.front();
                 else
                     keys_text = "(none)";
-                waiting_elems.push_back(
-                    hbox({
-                        text("  API key     : "),
-                        text(keys_text) | bold,
-                    })
-                );
+                waiting_elems.push_back(hbox({text("  API key     : "), text(keys_text) | bold}));
             }
 
             waiting_elems.push_back(text(""));
@@ -292,18 +253,15 @@ void NodeUI::run() {
             waiting_elems.push_back(btn_forget_pairing->Render() | hcenter);
             waiting_elems.push_back(text(""));
             waiting_elems.push_back(
-                text("  Press f:forget pairing  q:quit")
-                | color(Color::GrayDark));
+                text("  Press f:forget pairing  q:quit") | color(Color::GrayDark));
 
             return vbox(waiting_elems) | border;
         }
 
-        // ── Connected state ───────────────────────────────────────────────────
-        int slot_ready = 0;
-        int slot_loading = 0;
-        int slot_suspending = 0;
-        int slot_suspended = 0;
-        int slot_error = 0;
+        // ── Connected state — 1c "Operator" console ───────────────────────────
+
+        // Slot tallies
+        int slot_ready = 0, slot_loading = 0, slot_suspending = 0, slot_suspended = 0, slot_error = 0;
         for (const auto& s : slots) {
             switch (s.state) {
                 case SlotState::Ready:      ++slot_ready; break;
@@ -312,234 +270,228 @@ void NodeUI::run() {
                 case SlotState::Suspended:  ++slot_suspended; break;
                 case SlotState::Error:      ++slot_error; break;
                 case SlotState::Empty:
-                default:
-                    break;
+                default: break;
             }
         }
         const int slot_in_use = slot_ready + slot_loading + slot_suspending + slot_error;
 
-        auto compact_id = [](const std::string& s, size_t n = 8) -> std::string {
-            if (s.empty()) return "-";
-            return s.size() <= n ? s : s.substr(0, n);
-        };
-        auto compact_model = [](const std::string& p) -> std::string {
-            if (p.empty()) return "(none)";
-            std::string name = std::filesystem::path(p).filename().string();
-            if (name.empty()) name = p;
-            if (name.size() > 26) name = mm::util::utf8_truncate(name, 26) + "...";
-            return name;
-        };
+        // Sample metric history at ~1 Hz. This lambda runs only on the FTXUI loop
+        // thread, so the deques need no separate lock.
+        const int64_t nowms = mm::util::now_ms();
+        if (nowms - last_hist_ms_ >= 1000) {
+            last_hist_ms_ = nowms;
+            auto push = [](std::deque<float>& d, float v) {
+                d.push_back(v);
+                while (d.size() > kHistLen) d.pop_front();
+            };
+            push(hist_cpu_, metrics.cpu_percent);
+            push(hist_ram_, metrics.ram_percent);
+            push(hist_gpu_, metrics.gpu_percent);
+            float vram_pct = metrics.gpu_vram_total_mb > 0
+                ? static_cast<float>(metrics.gpu_vram_used_mb) /
+                      static_cast<float>(metrics.gpu_vram_total_mb) * 100.0f
+                : 0.0f;
+            push(hist_vram_, vram_pct);
+        }
 
-        // Status panel
+        const bool has_gpu = metrics.gpu_vram_total_mb > 0 || metrics.gpu_backend_available;
+        std::string ram_detail = mb_str(metrics.ram_used_mb) + " / " + mb_str(metrics.ram_total_mb);
+        std::string gpu_detail = metrics.gpu_vram_total_mb > 0
+            ? mb_str(metrics.gpu_vram_used_mb) + " / " + mb_str(metrics.gpu_vram_total_mb)
+            : "";
+
+        std::string runtime_summary = "ready";
+        Color runtime_color = Color::Green;
+        if (!last_error.empty()) {
+            runtime_summary = "error: " + last_error;
+            runtime_color = Color::RedLight;
+        }
+
+        // ── STATUS panel ──────────────────────────────────────────────────────
+        auto field = [](const std::string& label, Element val) -> Element {
+            return hbox({text(label) | dim | size(WIDTH, EQUAL, 9), std::move(val)});
+        };
+        Element slots_summary = hbox({
+            text(std::to_string(slot_in_use) + " active  "),
+            text("(") | dim,
+            text(std::to_string(slot_ready) + " ready") | color(Color::Green),
+            text(", ") | dim,
+            text(std::to_string(slot_loading) + " loading") | color(Color::Yellow),
+            text(", ") | dim,
+            text(std::to_string(slot_suspended) + " sleeping") | dim,
+            text(")") | dim,
+        });
         Elements status_rows = {
-            text("Status") | bold | underlined,
-            text(""),
-            hbox({text("Model    "), text(loaded_model.empty() ? "(none)" : loaded_model) | bold}),
-            hbox({text("Agent    "), text(active_agent.empty() ? "(none)" : active_agent) | bold}),
-            hbox({text("Slots    "),
-                  text(std::to_string(slot_in_use) + " active  (ready " + std::to_string(slot_ready)
-                       + ", loading " + std::to_string(slot_loading)
-                       + ", suspended " + std::to_string(slot_suspended) + ")")
-                      | bold}),
-            hbox({
-                text("Runtime  "),
-                paragraph(runtime_summary) | color(runtime_color) | flex,
-            }),
+            field("model", text(loaded_model.empty() ? "(none)" : loaded_model) | bold),
+            field("agent", text(active_agent.empty() ? "(none)" : active_agent) | bold),
+            field("slots", std::move(slots_summary)),
+            field("runtime", text(runtime_summary) | color(runtime_color)),
         };
-        if (!model_action_status.empty()) {
-            status_rows.push_back(text("Action   " + model_action_status) | color(Color::Yellow));
-        }
-        if (!slots.empty()) {
-            status_rows.push_back(text(" "));
-            status_rows.push_back(text("Slots Detail") | color(Color::GrayDark));
-            constexpr size_t kMaxSlotLines = 4;
-            size_t shown = 0;
-            for (const auto& s : slots) {
-                if (shown >= kMaxSlotLines) break;
-                status_rows.push_back(
-                    text("  [" + to_string(s.state) + "] slot:" + compact_id(s.id, 10) +
-                         " agent:" + compact_id(s.assigned_agent, 12) +
-                         " model:" + compact_model(s.model_path))
-                    | color(Color::GrayDark));
-                ++shown;
-            }
-            if (slots.size() > shown) {
-                status_rows.push_back(
-                    text("  ... +" + std::to_string(slots.size() - shown) + " more")
-                    | color(Color::GrayDark));
-            }
-        }
-        auto status_panel = vbox(std::move(status_rows)) | flex;
+        if (!model_action_status.empty())
+            status_rows.push_back(field("action", text(model_action_status) | color(Color::Yellow)));
+        Element status_panel = panel("STATUS", vbox(std::move(status_rows)));
 
-        // Health panel
-        auto health_panel = vbox({
-            text("Health") | bold | underlined,
-            text(""),
-            gauge_row("CPU", metrics.cpu_percent, ""),
-            gauge_row("RAM", metrics.ram_percent, ram_detail),
-            gauge_row("GPU", metrics.gpu_percent, gpu_detail),
+        // ── HEALTH panel (gauges + braille history) ───────────────────────────
+        Elements health_rows = {
+            gauge_line("CPU", metrics.cpu_percent),
+            gauge_line("RAM", metrics.ram_percent, ram_detail),
+        };
+        if (has_gpu)
+            health_rows.push_back(gauge_line("GPU", metrics.gpu_percent, gpu_detail));
+        else
+            health_rows.push_back(text("GPU   — no discrete GPU") | dim);
+        health_rows.push_back(text(""));
+        health_rows.push_back(hbox({
+            vbox({text("gpu% 60s") | dim, braille_graph(hist_gpu_, 20, 3, Color::Green)}),
+            text("   "),
+            vbox({text("vram% 60s") | dim, braille_graph(hist_vram_, 20, 3, Color::Cyan)}),
+        }));
+        Element health_panel = panel("HEALTH", vbox(std::move(health_rows)));
+
+        Element left_col = vbox({
+            status_panel,
+            health_panel | flex,
+        }) | size(WIDTH, EQUAL, 48);
+
+        // ── GENERATED TEXT panel ──────────────────────────────────────────────
+        std::string gen_caption;
+        Elements gen_body;
+        if (streaming.active) {
+            int64_t elapsed_ms = mm::util::now_ms() - streaming.started_ms;
+            char cap[96];
+            std::snprintf(cap, sizeof(cap), "%s  %.1fs",
+                          streaming.slot_id.empty() ? "slot ?" : streaming.slot_id.c_str(),
+                          static_cast<double>(elapsed_ms) / 1000.0);
+            gen_caption = std::string(spin) + " " + cap;
+            if (!streaming.thinking.empty()) {
+                gen_body.push_back(text("[thinking]") | dim);
+                std::string th = tail_text(streaming.thinking, 600);
+                if (streaming.content.empty() && cursor_on) th += "▌";
+                gen_body.push_back(paragraph(th) | dim);
+            }
+            if (!streaming.content.empty()) {
+                std::string bd = tail_text(streaming.content, 1400);
+                if (cursor_on) bd += "▌";
+                gen_body.push_back(paragraph(bd));
+            }
+            char cnt[64];
+            std::snprintf(cnt, sizeof(cnt), "content:%zuB  thinking:%zuB",
+                          streaming.content.size(), streaming.thinking.size());
+            gen_body.push_back(text(cnt) | dim);
+        } else if (!streaming.finish_reason.empty()) {
+            int64_t dur = streaming.updated_ms - streaming.started_ms;
+            char cap[96];
+            std::snprintf(cap, sizeof(cap), "✓ %s · %d tok · %.1fs",
+                          streaming.finish_reason.c_str(), streaming.tokens_used,
+                          static_cast<double>(dur) / 1000.0);
+            gen_caption = cap;
+            if (!streaming.content.empty())
+                gen_body.push_back(paragraph(tail_text(streaming.content, 1400)));
+            else
+                gen_body.push_back(text("  (no content)") | dim);
+        } else {
+            gen_caption = "idle";
+            gen_body.push_back(text("  (idle — waiting for inference)") | dim);
+        }
+        Element gen_panel = panel("GENERATED TEXT", gen_caption, vbox(std::move(gen_body))) | flex;
+
+        // ── SLOTS panel ───────────────────────────────────────────────────────
+        Element slots_panel =
+            panel("SLOTS", std::to_string(slots.size()) + " tracked", slot_table(slots, false));
+
+        Element right_col = vbox({
+            gen_panel,
+            slots_panel,
         }) | flex;
 
-        // ── Generated text panel ─────────────────────────────────────────────
-        auto tail_text = [](const std::string& s, size_t max_chars) -> std::string {
-            if (s.size() <= max_chars) return s;
-            if (max_chars <= 3) return s.substr(s.size() - max_chars);
-            return "..." + s.substr(s.size() - (max_chars - 3));
-        };
+        const int dimy = ftxui::Terminal::Size().dimy;
+        const int top_h = std::clamp(dimy - 16, 14, 26);
+        Element top_region = hbox({
+            left_col,
+            text(" "),
+            right_col,
+        }) | size(HEIGHT, EQUAL, top_h);
 
-        // Split text into wrapped lines that fit the terminal width
-        auto wrap_lines = [](const std::string& s, size_t width) -> Elements {
-            Elements result;
-            std::istringstream iss(s);
-            std::string line;
-            while (std::getline(iss, line)) {
-                while (line.size() > width) {
-                    result.push_back(text("    " + line.substr(0, width)));
-                    line = line.substr(width);
-                }
-                result.push_back(text("    " + line));
-            }
-            if (result.empty()) result.push_back(text("    " + s));
-            return result;
-        };
-
-        const int term_width = std::max(40, ftxui::Terminal::Size().dimx - 6);
-        Elements gen_elems;
-        int gen_panel_lines = 0; // track how many lines the gen panel uses
-
-        if (streaming.active) {
-            char header_buf[128];
-            int64_t elapsed_ms = mm::util::now_ms() - streaming.started_ms;
-            snprintf(header_buf, sizeof(header_buf),
-                     "Generated Text  (streaming slot:%s agent:%s  %.1fs)",
-                     streaming.slot_id.empty() ? "?" : shorten_middle(streaming.slot_id, 8).c_str(),
-                     streaming.agent_id.empty() ? "?" : shorten_middle(streaming.agent_id, 12).c_str(),
-                     static_cast<double>(elapsed_ms) / 1000.0);
-            gen_elems.push_back(text(header_buf) | bold | underlined | color(Color::Green));
-
-            if (!streaming.thinking.empty()) {
-                gen_elems.push_back(text("  [thinking]") | color(Color::GrayDark));
-                auto thinking_tail = tail_text(streaming.thinking, 500);
-                auto lines = wrap_lines(thinking_tail, static_cast<size_t>(term_width - 4));
-                for (auto& l : lines) gen_elems.push_back(std::move(l) | color(Color::GrayDark));
-            }
-            if (!streaming.content.empty()) {
-                auto content_tail = tail_text(streaming.content, 1000);
-                auto lines = wrap_lines(content_tail, static_cast<size_t>(term_width - 4));
-                for (auto& l : lines) gen_elems.push_back(std::move(l) | color(Color::GreenLight));
-            }
-
-            char count_buf[64];
-            snprintf(count_buf, sizeof(count_buf),
-                     "  content:%zuB  thinking:%zuB",
-                     streaming.content.size(), streaming.thinking.size());
-            gen_elems.push_back(text(count_buf) | color(Color::GrayDark));
-        } else if (!streaming.finish_reason.empty()) {
-            // Show last completed generation
-            char header_buf[128];
-            int64_t duration_ms = streaming.updated_ms - streaming.started_ms;
-            snprintf(header_buf, sizeof(header_buf),
-                     "Generated Text  (done: %s  tokens:%d  %.1fs  slot:%s)",
-                     streaming.finish_reason.c_str(),
-                     streaming.tokens_used,
-                     static_cast<double>(duration_ms) / 1000.0,
-                     streaming.slot_id.empty() ? "?" : shorten_middle(streaming.slot_id, 8).c_str());
-            gen_elems.push_back(text(header_buf) | bold | underlined);
-
-            if (!streaming.content.empty()) {
-                auto content_tail = tail_text(streaming.content, 1000);
-                auto lines = wrap_lines(content_tail, static_cast<size_t>(term_width - 4));
-                for (auto& l : lines) gen_elems.push_back(std::move(l) | color(Color::GreenLight));
-            }
-
-            char count_buf[64];
-            snprintf(count_buf, sizeof(count_buf),
-                     "  content:%zuB  thinking:%zuB",
-                     streaming.content.size(), streaming.thinking.size());
-            gen_elems.push_back(text(count_buf) | color(Color::GrayDark));
-        } else {
-            gen_elems.push_back(text("Generated Text") | bold | underlined);
-            gen_elems.push_back(text("  (idle)") | color(Color::GrayDark));
-        }
-        gen_panel_lines = static_cast<int>(gen_elems.size()) + 1; // +1 for separator
-        auto gen_panel = vbox(gen_elems);
-
-        // Log panel — viewport adapts to terminal height
-        const int effective_viewport = std::max(4, ftxui::Terminal::Size().dimy - 17 - gen_panel_lines);
+        // ── LOG panel (full width) ────────────────────────────────────────────
+        const int effective_viewport = std::max(4, dimy - top_h - 7);
         log_viewport = effective_viewport;
-        Elements log_elems;
+
         std::vector<std::string> visible;
         size_t total_lines = 0;
         size_t start_idx = 0;
         size_t end_idx = 0;
         {
-            // Copy only the visible slice (tens of lines) rather than the whole ring
-            // buffer, holding log_mutex_ just for that span so append_log() from the
-            // llama-server pump thread isn't blocked behind a full copy each frame.
             std::lock_guard<std::mutex> lk(log_mutex_);
             total_lines = log_lines_.size();
+            size_t scroll = static_cast<size_t>(std::max(0, log_scroll_from_bottom));
             size_t max_scroll = total_lines > static_cast<size_t>(effective_viewport)
                 ? total_lines - static_cast<size_t>(effective_viewport)
                 : 0;
-            size_t scroll = static_cast<size_t>(std::max(0, log_scroll_from_bottom));
             if (scroll > max_scroll) scroll = max_scroll;
             end_idx = total_lines;
             if (total_lines > 0) {
-                if (total_lines > static_cast<size_t>(effective_viewport) + scroll) {
+                if (total_lines > static_cast<size_t>(effective_viewport) + scroll)
                     start_idx = total_lines - static_cast<size_t>(effective_viewport) - scroll;
-                }
                 end_idx = total_lines - scroll;
                 if (end_idx > total_lines) end_idx = total_lines;
                 if (start_idx > end_idx) start_idx = end_idx;
             }
-            for (size_t i = start_idx; i < end_idx; ++i) {
-                visible.push_back(log_lines_[i]);
-            }
+            for (size_t i = start_idx; i < end_idx; ++i) visible.push_back(log_lines_[i]);
         }
 
-        std::string log_label = "node runtime output";
-        if (!log_file_path.empty()) {
-            log_label += "  (" + shorten_middle(log_file_path, 56) + ")";
-        }
-        log_elems.push_back(text(log_label) | bold | underlined);
+        Elements log_rows;
+        if (total_lines == 0)
+            log_rows.push_back(text("  (no output yet)") | dim);
+        else
+            for (const auto& l : visible) log_rows.push_back(text("› " + l) | color(Color::Cyan));
 
-        if (total_lines == 0) {
-            log_elems.push_back(text("  (no output yet)") | color(Color::GrayDark));
-        } else {
-            for (const auto& l : visible) {
-                log_elems.push_back(text("  > " + l) | color(Color::Cyan));
-            }
-        }
-        char stat_buf[128];
-        std::snprintf(stat_buf, sizeof(stat_buf),
-                      "  showing %zu-%zu of %zu  [k/up:older  j/down:newer  PgUp/PgDn  End:follow]",
-                      total_lines == 0 ? 0 : (start_idx + 1),
-                      end_idx,
-                      total_lines);
-        log_elems.push_back(text(stat_buf) | color(Color::GrayDark));
-        auto log_panel = vbox(log_elems);
+        char stat_buf[192];
+        std::snprintf(stat_buf, sizeof(stat_buf), "  showing %zu-%zu of %zu   [j/k · PgUp/PgDn · End follow]",
+                      total_lines == 0 ? 0 : (start_idx + 1), end_idx, total_lines);
+        Element live = log_scroll_from_bottom > 0
+            ? (text("  ▲ scrolled") | color(Color::Yellow))
+            : (text("  ● live") | color(Color::Green));
+        Element log_body = vbox({
+            vbox(std::move(log_rows)) | flex,
+            separator(),
+            hbox({text(stat_buf) | dim, live}),
+        });
+        Element log_panel = panel("runtime output",
+                                  log_file_path.empty() ? "" : shorten_middle(log_file_path, 56),
+                                  std::move(log_body)) | flex;
+
+        // ── Header + footer ───────────────────────────────────────────────────
+        std::string serving = slot_ready > 0 ? "serving" : (slot_loading > 0 ? "loading" : "idle");
+        int64_t up_s = (mm::util::now_ms() - started_ms_) / 1000;
+        char upbuf[24];
+        std::snprintf(upbuf, sizeof(upbuf), "%02d:%02d:%02d",
+                      static_cast<int>(up_s / 3600),
+                      static_cast<int>((up_s / 60) % 60),
+                      static_cast<int>(up_s % 60));
+
+        Element header = hbox({
+            text(" mantic-mind ") | bold,
+            text(node_id) | dim,
+            filler(),
+            text(spin) | color(Color::Green), text(" " + serving) | dim,
+            text("  │  ") | dim, text("✓ registered") | color(Color::Green),
+            text("  │  ") | dim, text("up " + std::string(upbuf)) | dim,
+            text("  │  ") | dim, text(clock_hms()) | dim,
+            text(" "),
+        });
+
+        Element footer = hbox({
+            btn_forget_pairing->Render(),
+            text("  f forget · j/k scroll · PgUp/PgDn · Home/End · q quit") | dim,
+            filler(),
+            text("mantic-mind · node ") | dim,
+        });
 
         return vbox({
-            hbox({
-                text(" Mantic-Mind Node") | bold,
-                text("  [" + node_id + "]") | color(Color::GrayDark) | flex,
-            }),
-            separator(),
-            hbox({
-                status_panel,
-                separator(),
-                health_panel,
-            }),
-            separator(),
-            gen_panel,
-            separator(),
-            log_panel | flex,
-            separator(),
-            hbox({
-                btn_forget_pairing->Render(),
-                text("  f:forget pairing  j/k or arrows:scroll logs  q:quit")
-                    | color(Color::GrayDark),
-            }),
+            header,
+            top_region,
+            log_panel,
+            footer,
         }) | border;
     });
 

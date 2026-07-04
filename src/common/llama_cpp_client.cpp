@@ -187,9 +187,22 @@ int infer_read_timeout_seconds() {
     return kDefaultSeconds;
 }
 
+std::string client_base_url(const std::string& base_url) {
+    std::string url = util::trim(base_url);
+    if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) {
+        return url;
+    }
+    return "http://" + url;
+}
+
+httplib::Headers auth_headers(const std::string& api_key) {
+    if (api_key.empty()) return {};
+    return {{"Authorization", "Bearer " + api_key}};
+}
+
 // ── Tool call delta accumulator ───────────────────────────────────────────────
-httplib::Client make_client(const std::string& host, int port) {
-    httplib::Client cli(host, port);
+httplib::Client make_client(const std::string& base_url) {
+    httplib::Client cli(client_base_url(base_url));
     cli.set_connection_timeout(10);
     cli.set_read_timeout(infer_read_timeout_seconds());
     cli.set_write_timeout(30);
@@ -199,12 +212,19 @@ httplib::Client make_client(const std::string& host, int port) {
 } // namespace
 
 // ── Construction ──────────────────────────────────────────────────────────────
-LlamaCppClient::LlamaCppClient(std::string base_url)
+LlamaCppClient::LlamaCppClient(std::string base_url,
+                               std::string api_key,
+                               std::string chat_completions_path)
     : base_url_(std::move(base_url))
+    , api_key_(std::move(api_key))
+    , chat_completions_path_(std::move(chat_completions_path))
 {
     auto [h, p] = util::parse_url(base_url_);
     host_ = h;
     port_ = p;
+    if (chat_completions_path_.empty()) {
+        chat_completions_path_ = "/v1/chat/completions";
+    }
 }
 
 // ── <think>…</think> extraction ───────────────────────────────────────────────
@@ -214,7 +234,7 @@ LlamaCppClient::LlamaCppClient(std::string base_url)
 // ── complete (non-streaming) ──────────────────────────────────────────────────
 Message LlamaCppClient::complete(const InferenceRequest& req) {
     auto body = build_request(req, false);
-    auto cli  = make_client(host_, port_);
+    auto cli  = make_client(base_url_);
 
     std::string body_str;
     try {
@@ -224,7 +244,10 @@ Message LlamaCppClient::complete(const InferenceRequest& req) {
         return {};
     }
 
-    auto res = cli.Post("/v1/chat/completions", body_str, "application/json");
+    auto res = cli.Post(chat_completions_path_,
+                        auth_headers(api_key_),
+                        body_str,
+                        "application/json");
     if (!res) {
         MM_ERROR("LlamaCppClient::complete: connection failed to {}", base_url_);
         return {};
@@ -247,7 +270,7 @@ void LlamaCppClient::stream_complete(const InferenceRequest& req,
                                      ChunkCallback chunk_cb,
                                      ErrorCallback error_cb) {
     auto body = build_request(req, true);
-    auto cli  = make_client(host_, port_);
+    auto cli  = make_client(base_url_);
 
     std::string  sse_buf;
     std::string  raw_body;
@@ -361,8 +384,8 @@ void LlamaCppClient::stream_complete(const InferenceRequest& req,
         return;
     }
     auto res = cli.Post(
-        "/v1/chat/completions",
-        httplib::Headers{},
+        chat_completions_path_,
+        auth_headers(api_key_),
         body_str,
         "application/json",
         content_recv
@@ -389,7 +412,7 @@ void LlamaCppClient::stream_complete(const InferenceRequest& req,
 
 // ── count_tokens ──────────────────────────────────────────────────────────────
 int LlamaCppClient::count_tokens(const std::string& text) {
-    auto cli = make_client(host_, port_);
+    auto cli = make_client(base_url_);
     auto res = cli.Post("/tokenize",
                         nlohmann::json{{"content", text}}.dump(),
                         "application/json");
@@ -413,7 +436,7 @@ bool LlamaCppClient::load_model(const std::string& /*model_path*/,
 bool LlamaCppClient::is_model_loaded() const { return model_loaded_.load(); }
 
 bool LlamaCppClient::health_check() {
-    auto cli = make_client(host_, port_);
+    auto cli = make_client(base_url_);
     cli.set_connection_timeout(3);
     cli.set_read_timeout(5);
     auto res = cli.Get("/health");

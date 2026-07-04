@@ -137,4 +137,33 @@ std::optional<EngineGroupCandidate> best_engine_group(
     return std::nullopt;
 }
 
+std::string derive_ray_head_address(const std::string& node_url, int gcs_port) {
+    // Strip scheme.
+    std::string rest = node_url;
+    const auto scheme_pos = rest.find("://");
+    if (scheme_pos != std::string::npos) rest = rest.substr(scheme_pos + 3);
+
+    // Cut path, then the API port. IPv6 hosts ([::1]:7070) keep their brackets.
+    const auto slash = rest.find('/');
+    if (slash != std::string::npos) rest = rest.substr(0, slash);
+    std::string host;
+    if (!rest.empty() && rest.front() == '[') {
+        const auto close = rest.find(']');
+        if (close == std::string::npos) return {};
+        host = rest.substr(0, close + 1);
+    } else {
+        const auto colon = rest.find(':');
+        host = colon == std::string::npos ? rest : rest.substr(0, colon);
+    }
+    if (host.empty()) return {};
+    return host + ":" + std::to_string(gcs_port);
+}
+
+VllmSettings apply_group_plan(const EngineGroupCandidate& group,
+                              VllmSettings settings) {
+    settings.tensor_parallel_size   = group.tensor_parallel_size;
+    settings.pipeline_parallel_size = group.pipeline_parallel_size;
+    return settings;
+}
+
 } // namespace mm

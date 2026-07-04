@@ -50,6 +50,14 @@ private:
     std::string              log_file_path_;
     std::ofstream            log_file_;
 
+    // Metric history for the health sparkline/braille graphs. Sampled once per
+    // second from inside the render lambda (which only ever runs on the FTXUI
+    // loop thread), so these need no separate lock.
+    static constexpr size_t  kHistLen = 60;   // ~60s window at 1 sample/s
+    std::deque<float>        hist_cpu_, hist_ram_, hist_gpu_, hist_vram_;
+    int64_t                  last_hist_ms_ = 0;
+    int64_t                  started_ms_   = 0;   // process/UI start, for uptime
+
     std::mutex            screen_mutex_;
     std::function<void()> quit_fn_;
     std::function<void()> refresh_fn_;

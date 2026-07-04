@@ -17,6 +17,17 @@ struct ScheduleResult {
     SlotId slot_id;
 };
 
+/// A live multi-node vLLM engine group: one engine slot on the head node,
+/// backed by a Ray cluster spanning all members.
+struct EngineGroupRecord {
+    NodeId              head_node;
+    SlotId              head_slot;
+    std::vector<NodeId> members;       // head first, launch order
+    std::string         comm_backend;  // "nccl" | "gloo"
+    std::string         model_path;
+    VllmSettings        effective_settings;  // planned tp/pp applied
+};
+
 /// VRAM-aware agent scheduler.
 /// Routes agent requests to nodes, managing placements, suspension, and model
 /// distribution. Thread-safe — the entire scheduling decision is serialized.
@@ -63,6 +74,8 @@ private:
     std::mutex                                      schedule_mutex_;
     mutable std::mutex                              state_mutex_;
     std::unordered_map<AgentId, AgentPlacement>     placements_;
+    // Live multi-node engine groups keyed by their head slot (state_mutex_).
+    std::unordered_map<SlotId, EngineGroupRecord>   engine_groups_;
     std::string                                      last_error_;
 
     /// Copy a placement out of the map (state_mutex_).
@@ -105,9 +118,28 @@ private:
                                                 const AgentConfig& cfg,
                                                 const NodeId& node_id);
 
-    /// Load a fresh model on a node for an agent.
+    /// Load a fresh model on a node for an agent. vllm_override, when set,
+    /// replaces the agent's own engine settings in the request (used to send
+    /// the planned tp/pp split of an engine group).
     std::optional<SlotId> load_agent_on_node(const AgentConfig& cfg,
-                                             const NodeId& node_id);
+                                             const NodeId& node_id,
+                                             const VllmSettings* vllm_override = nullptr);
+
+    /// Place an agent on a multi-node engine group (pipeline_parallel_size > 1):
+    /// join a live group serving the model, or plan one, start Ray on the
+    /// members, and launch the engine on the head. Called with schedule_mutex_
+    /// held.
+    std::optional<ScheduleResult> ensure_engine_group_running(const AgentConfig& cfg);
+
+    /// Copy the group record whose head slot is slot_id, if any (state_mutex_).
+    std::optional<EngineGroupRecord> find_group_by_slot(const SlotId& slot_id) const;
+
+    /// Best-effort `ray stop` on every listed node; failures are logged only.
+    void teardown_ray_members(const std::vector<NodeId>& members);
+
+    /// If slot_id headed an engine group and the engine is gone, stop Ray on
+    /// the members and drop the record.
+    void teardown_engine_group_for_slot(const SlotId& slot_id);
 
     /// True when a node API failure body indicates slot exhaustion.
     static bool response_indicates_max_slots(const std::string& body);

@@ -13,7 +13,9 @@ namespace mm {
 class LlamaCppClient {
 public:
     // base_url: "http://127.0.0.1:8080"
-    explicit LlamaCppClient(std::string base_url);
+    explicit LlamaCppClient(std::string base_url,
+                            std::string api_key = {},
+                            std::string chat_completions_path = "/v1/chat/completions");
     virtual ~LlamaCppClient() = default;
 
     // Non-streaming: waits for the full response.
@@ -33,6 +35,8 @@ public:
 
 private:
     std::string         base_url_;
+    std::string         api_key_;
+    std::string         chat_completions_path_;
     std::string         host_;
     int                 port_ = 8080;
     std::atomic<bool>   model_loaded_{false};

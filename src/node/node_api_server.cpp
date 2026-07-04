@@ -354,7 +354,8 @@ void NodeApiServer::register_routes() {
                 return;
             }
             res.set_content(nlohmann::json{{"status", "ray-started"},
-                                           {"role", role}}.dump(),
+                                           {"role", role},
+                                           {"port", ray_port_}}.dump(),
                             "application/json");
         } catch (const std::exception& e) {
             res.status = 400;

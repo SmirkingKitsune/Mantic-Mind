@@ -44,33 +44,10 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     }
 
     // Multi-node engine group: pipeline_parallel_size > 1 means this model is
-    // meant to span nodes. Plan the group from advertised node capabilities.
-    // The live Ray launch is not yet implemented, so fail clearly here rather
-    // than handing a multi-node config to a single node and getting a cryptic
-    // engine error.
+    // meant to span nodes. Plan the group from advertised node capabilities
+    // and drive the Ray + engine launch.
     if (cfg.vllm_settings.pipeline_parallel_size > 1) {
-        EngineGroupRequest greq;
-        greq.model_path = cfg.model_path;
-        greq.world_size = std::max(1, cfg.vllm_settings.tensor_parallel_size) *
-                          std::max(1, cfg.vllm_settings.pipeline_parallel_size);
-        auto group = best_engine_group(greq, registry_.available_nodes());
-        if (group) {
-            MM_INFO("AgentScheduler: agent {} needs a {}-node engine group for {} "
-                    "(tp={}, pp={}, backend={}); nodes=[{}]",
-                    cfg.id, group->pipeline_parallel_size, cfg.model_path,
-                    group->tensor_parallel_size, group->pipeline_parallel_size,
-                    group->comm_backend, util::join(group->nodes, ","));
-            set_last_error("engine group planned (" +
-                           std::to_string(group->pipeline_parallel_size) +
-                           " nodes, " + group->comm_backend +
-                           ") but multi-node Ray engine launch is not yet "
-                           "implemented");
-        } else {
-            set_last_error("no feasible multi-node engine group: need world_size " +
-                           std::to_string(greq.world_size) +
-                           " across Ray-capable nodes sharing a vLLM build");
-        }
-        return std::nullopt;
+        return ensure_engine_group_running(cfg);
     }
 
     // vLLM nodes enforce their own GPU-memory budget at load time and reject
@@ -232,6 +209,207 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     return std::nullopt;
 }
 
+std::optional<ScheduleResult> AgentScheduler::ensure_engine_group_running(
+    const AgentConfig& cfg)
+{
+    auto place = [&](const NodeId& node_id, const SlotId& slot_id) {
+        AgentPlacement p;
+        p.agent_id       = cfg.id;
+        p.node_id        = node_id;
+        p.slot_id        = slot_id;
+        p.placed_at_ms   = util::now_ms();
+        p.last_active_ms = p.placed_at_ms;
+        store_placement(p);
+        return ScheduleResult{node_id, slot_id};
+    };
+    auto preview = [](std::string body) {
+        if (body.size() > 300) body = body.substr(0, 300) + "...";
+        return body;
+    };
+
+    // A suspended placement is meaningless for a group engine (vLLM restores
+    // are fresh starts) — drop it and place from scratch.
+    erase_placement_entry(cfg.id);
+
+    // 1. A live group already serves this model — join it on the head. The
+    // node attaches when the request matches the engine's launch settings, so
+    // we send the group's planned split, not the agent's own tp/pp ask.
+    std::vector<EngineGroupRecord> live_groups;
+    {
+        std::lock_guard g(state_mutex_);
+        for (const auto& [slot, rec] : engine_groups_) {
+            if (rec.model_path == cfg.model_path) live_groups.push_back(rec);
+        }
+    }
+    for (const auto& rec : live_groups) {
+        auto slot_id = load_agent_on_node(cfg, rec.head_node,
+                                          &rec.effective_settings);
+        if (slot_id) {
+            MM_INFO("AgentScheduler: agent {} joined live engine group on head {} "
+                    "(slot={})", cfg.id, rec.head_node, *slot_id);
+            return place(rec.head_node, *slot_id);
+        }
+    }
+
+    // 2. Plan a group from advertised node capabilities.
+    EngineGroupRequest greq;
+    greq.model_path = cfg.model_path;
+    greq.world_size = std::max(1, cfg.vllm_settings.tensor_parallel_size) *
+                      std::max(1, cfg.vllm_settings.pipeline_parallel_size);
+    auto group = best_engine_group(greq, registry_.available_nodes());
+    if (!group) {
+        set_last_error("no feasible multi-node engine group: need world_size " +
+                       std::to_string(greq.world_size) +
+                       " across Ray-capable nodes sharing a vLLM build");
+        return std::nullopt;
+    }
+
+    const VllmSettings effective = apply_group_plan(*group, cfg.vllm_settings);
+    const NodeId head = group->nodes.front();
+
+    MM_INFO("AgentScheduler: agent {} needs engine group for {} — {} node(s), "
+            "tp={}, pp={}, backend={}, nodes=[{}]",
+            cfg.id, cfg.model_path, group->pipeline_parallel_size,
+            group->tensor_parallel_size, group->pipeline_parallel_size,
+            group->comm_backend, util::join(group->nodes, ","));
+
+    // 3. The planned world fits on one node — no Ray, just a plain engine
+    // load with the planned split (tp = all its GPUs, pp = 1).
+    if (!group->spans_nodes()) {
+        auto slot_id = load_agent_on_node(cfg, head, &effective);
+        if (!slot_id) return std::nullopt;  // load_agent_on_node set last_error
+        return place(head, *slot_id);
+    }
+
+    // 4. Start Ray: head first, workers join its GCS address.
+    std::vector<NodeId> ray_started;
+    std::string head_address;
+    try {
+        auto head_node = registry_.get_node(head);
+        HttpClient cli(head_node.url);
+        cli.set_bearer_token(head_node.api_key);
+        cli.set_timeouts(5, 120, 30);
+        auto resp = cli.post("/api/node/ray/start",
+                             nlohmann::json{{"role", "head"}});
+        if (!resp.ok()) {
+            set_last_error("ray head start failed on node " + head + " (HTTP " +
+                           std::to_string(resp.status) + "): " + preview(resp.body));
+            return std::nullopt;
+        }
+        ray_started.push_back(head);
+        int gcs_port = 6379;
+        try {
+            gcs_port = nlohmann::json::parse(resp.body).value("port", 6379);
+        } catch (const std::exception&) {
+            // Older node build without the port field — default GCS port.
+        }
+        head_address = derive_ray_head_address(head_node.url, gcs_port);
+    } catch (const std::exception& e) {
+        set_last_error("ray head start exception on node " + head + ": " + e.what());
+        teardown_ray_members(ray_started);
+        return std::nullopt;
+    }
+    if (head_address.empty()) {
+        set_last_error("could not derive a Ray head address from node URL for " + head);
+        teardown_ray_members(ray_started);
+        return std::nullopt;
+    }
+
+    for (size_t i = 1; i < group->nodes.size(); ++i) {
+        const NodeId& member = group->nodes[i];
+        try {
+            auto node = registry_.get_node(member);
+            HttpClient cli(node.url);
+            cli.set_bearer_token(node.api_key);
+            cli.set_timeouts(5, 120, 30);
+            auto resp = cli.post("/api/node/ray/start",
+                                 nlohmann::json{{"role", "worker"},
+                                                {"head_address", head_address}});
+            if (!resp.ok()) {
+                set_last_error("ray worker start failed on node " + member +
+                               " (HTTP " + std::to_string(resp.status) + "): " +
+                               preview(resp.body));
+                teardown_ray_members(ray_started);
+                return std::nullopt;
+            }
+            ray_started.push_back(member);
+        } catch (const std::exception& e) {
+            set_last_error("ray worker start exception on node " + member + ": " +
+                           e.what());
+            teardown_ray_members(ray_started);
+            return std::nullopt;
+        }
+    }
+
+    // 5. Launch the engine on the head — vLLM discovers the Ray cluster and
+    // spreads pipeline stages across the workers.
+    auto slot_id = load_agent_on_node(cfg, head, &effective);
+    if (!slot_id) {
+        teardown_ray_members(ray_started);
+        return std::nullopt;  // load_agent_on_node set last_error
+    }
+
+    EngineGroupRecord rec;
+    rec.head_node          = head;
+    rec.head_slot          = *slot_id;
+    rec.members            = group->nodes;
+    rec.comm_backend       = group->comm_backend;
+    rec.model_path         = cfg.model_path;
+    rec.effective_settings = effective;
+    {
+        std::lock_guard g(state_mutex_);
+        engine_groups_[*slot_id] = rec;
+    }
+
+    MM_INFO("AgentScheduler: engine group live for {} — head {} slot {} over {} "
+            "node(s) via {}", cfg.model_path, head, *slot_id,
+            group->nodes.size(), group->comm_backend);
+    return place(head, *slot_id);
+}
+
+std::optional<EngineGroupRecord> AgentScheduler::find_group_by_slot(
+    const SlotId& slot_id) const
+{
+    std::lock_guard g(state_mutex_);
+    auto it = engine_groups_.find(slot_id);
+    if (it == engine_groups_.end()) return std::nullopt;
+    return it->second;
+}
+
+void AgentScheduler::teardown_ray_members(const std::vector<NodeId>& members) {
+    for (const auto& member : members) {
+        try {
+            auto node = registry_.get_node(member);
+            HttpClient cli(node.url);
+            cli.set_bearer_token(node.api_key);
+            cli.set_timeouts(5, 60, 30);
+            auto resp = cli.post("/api/node/ray/stop", nlohmann::json::object());
+            if (!resp.ok()) {
+                MM_WARN("AgentScheduler: ray stop failed on node {} (HTTP {})",
+                        member, resp.status);
+            }
+        } catch (const std::exception& e) {
+            MM_WARN("AgentScheduler: ray stop failed on node {}: {}",
+                    member, e.what());
+        }
+    }
+}
+
+void AgentScheduler::teardown_engine_group_for_slot(const SlotId& slot_id) {
+    std::optional<EngineGroupRecord> rec;
+    {
+        std::lock_guard g(state_mutex_);
+        auto it = engine_groups_.find(slot_id);
+        if (it == engine_groups_.end()) return;
+        rec = it->second;
+        engine_groups_.erase(it);
+    }
+    MM_INFO("AgentScheduler: engine group on head {} (slot {}) is gone — "
+            "stopping Ray on {} member(s)",
+            rec->head_node, slot_id, rec->members.size());
+    teardown_ray_members(rec->members);
+}
+
 void AgentScheduler::release_agent(const AgentId& agent_id) {
     std::optional<AgentPlacement> placement;
 
@@ -251,9 +429,15 @@ void AgentScheduler::release_agent(const AgentId& agent_id) {
             auto node = registry_.get_node(placement->node_id);
             HttpClient cli(node.url);
             cli.set_bearer_token(node.api_key);
-            cli.post("/api/node/detach-agent",
-                     nlohmann::json{{"slot_id", placement->slot_id},
-                                    {"agent_id", agent_id}});
+            auto resp = cli.post("/api/node/detach-agent",
+                                 nlohmann::json{{"slot_id", placement->slot_id},
+                                                {"agent_id", agent_id}});
+            // Last agent gone and the engine unloaded → if it headed a
+            // multi-node group, stop Ray on the members too.
+            if (resp.ok() &&
+                nlohmann::json::parse(resp.body).value("unloaded", false)) {
+                teardown_engine_group_for_slot(placement->slot_id);
+            }
         } catch (const std::exception& e) {
             MM_WARN("AgentScheduler: failed to detach slot for agent {}: {}",
                     agent_id, e.what());
@@ -362,9 +546,13 @@ void AgentScheduler::housekeeping(const std::vector<AgentConfig>& active_agents)
             auto node = registry_.get_node(unload.node_id);
             HttpClient cli(node.url);
             cli.set_bearer_token(node.api_key);
-            cli.post("/api/node/detach-agent",
-                     nlohmann::json{{"slot_id", unload.slot_id},
-                                    {"agent_id", unload.agent_id}});
+            auto resp = cli.post("/api/node/detach-agent",
+                                 nlohmann::json{{"slot_id", unload.slot_id},
+                                                {"agent_id", unload.agent_id}});
+            if (resp.ok() &&
+                nlohmann::json::parse(resp.body).value("unloaded", false)) {
+                teardown_engine_group_for_slot(unload.slot_id);
+            }
         } catch (const std::exception& e) {
             MM_WARN("AgentScheduler: housekeeping failed to detach slot for deleted agent {}: {}",
                     unload.agent_id, e.what());
@@ -421,6 +609,15 @@ bool AgentScheduler::suspend_agent(const AgentId& agent_id) {
     auto placement = find_placement_copy(agent_id);
     if (!placement || placement->suspended)
         return false;
+
+    // Multi-node engines never sleep: vLLM sleep mode does not cover Ray
+    // workers, and a "suspended" group would strand its members. Groups are
+    // released whole, not suspended.
+    if (find_group_by_slot(placement->slot_id)) {
+        MM_INFO("AgentScheduler: not suspending agent {} — slot {} heads a "
+                "multi-node engine group", agent_id, placement->slot_id);
+        return false;
+    }
 
     // Shared engine: suspending the slot suspends every agent placed on it,
     // and never while any of them is mid-inference.
@@ -533,7 +730,8 @@ std::optional<SlotId> AgentScheduler::restore_agent_on_node(
 
 std::optional<SlotId> AgentScheduler::load_agent_on_node(
     const AgentConfig& cfg,
-    const NodeId& node_id)
+    const NodeId& node_id,
+    const VllmSettings* vllm_override)
 {
     try {
         auto node = registry_.get_node(node_id);
@@ -543,7 +741,8 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
         for (int attempt = 0; attempt < 3; ++attempt) {
             nlohmann::json body = {
                 {"model_path", cfg.model_path},
-                {"vllm_settings", cfg.vllm_settings},
+                {"vllm_settings", vllm_override ? *vllm_override
+                                                : cfg.vllm_settings},
                 {"agent_id",   cfg.id}
             };
 
@@ -673,6 +872,10 @@ bool AgentScheduler::evict_slots_on_node(const NodeId& node_id,
             // from under requests control may not know about.
             if (s.engine_metrics_valid &&
                 (s.num_requests_running > 0 || s.num_requests_waiting > 0)) continue;
+            // Multi-node engine heads are never evicted to make room for a
+            // single-node load — tearing down an N-node engine to fit one
+            // small model is always a bad trade.
+            if (find_group_by_slot(s.id)) continue;
             candidates.push_back(s);
         }
 

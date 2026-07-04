@@ -101,6 +101,15 @@ struct VllmSettings {
     std::vector<std::string> extra_args; // additional vllm serve CLI flags
 };
 
+// OpenAI-compatible remote API settings for agents whose inference_backend is
+// "api". model_path remains the served model id sent in the request body.
+struct ApiSettings {
+    std::string base_url = "https://api.openai.com";
+    std::string chat_completions_path = "/v1/chat/completions";
+    std::string api_key; // accepted from JSON for process-local use; never serialized
+    std::string api_key_env = "OPENAI_API_KEY";
+};
+
 /// True when two vLLM configurations describe the same engine launch, i.e.
 /// agents using either can share one vllm-serve process. gpu_memory_utilization
 /// is excluded: it sizes the engine on its node, it does not change what the
@@ -128,8 +137,10 @@ struct AgentConfig {
     std::string   name;
     std::string   model_path;
     std::string   system_prompt;
+    std::string   inference_backend = "vllm"; // vllm | api
     LlamaSettings llama_settings;
     VllmSettings  vllm_settings;
+    ApiSettings   api_settings;
     bool          reasoning_enabled = false;
     bool          memories_enabled  = true;
     bool          tools_enabled     = false;
@@ -591,14 +602,29 @@ inline void from_json(const nlohmann::json& j, VllmSettings& s) {
     if (j.contains("extra_args"))              j.at("extra_args").get_to(s.extra_args);
 }
 
+inline void to_json(nlohmann::json& j, const ApiSettings& s) {
+    j = { {"base_url",              s.base_url},
+          {"chat_completions_path", s.chat_completions_path},
+          {"api_key_env",           s.api_key_env},
+          {"api_key_configured",    !s.api_key.empty()} };
+}
+inline void from_json(const nlohmann::json& j, ApiSettings& s) {
+    if (j.contains("base_url"))              j.at("base_url").get_to(s.base_url);
+    if (j.contains("chat_completions_path")) j.at("chat_completions_path").get_to(s.chat_completions_path);
+    if (j.contains("api_key"))               j.at("api_key").get_to(s.api_key);
+    if (j.contains("api_key_env"))           j.at("api_key_env").get_to(s.api_key_env);
+}
+
 // ─── AgentConfig ─────────────────────────────────────────────────────────────
 inline void to_json(nlohmann::json& j, const AgentConfig& a) {
     j = { {"id",                a.id},
           {"name",              a.name},
           {"model_path",        a.model_path},
           {"system_prompt",     a.system_prompt},
+          {"inference_backend", a.inference_backend},
           {"llama_settings",    a.llama_settings},
           {"vllm_settings",     a.vllm_settings},
+          {"api_settings",      a.api_settings},
           {"reasoning_enabled", a.reasoning_enabled},
           {"memories_enabled",  a.memories_enabled},
           {"tools_enabled",     a.tools_enabled},
@@ -609,8 +635,10 @@ inline void from_json(const nlohmann::json& j, AgentConfig& a) {
     j.at("name").get_to(a.name);
     if (j.contains("model_path"))        j.at("model_path").get_to(a.model_path);
     if (j.contains("system_prompt"))     j.at("system_prompt").get_to(a.system_prompt);
+    if (j.contains("inference_backend")) j.at("inference_backend").get_to(a.inference_backend);
     if (j.contains("llama_settings"))    j.at("llama_settings").get_to(a.llama_settings);
     if (j.contains("vllm_settings"))     j.at("vllm_settings").get_to(a.vllm_settings);
+    if (j.contains("api_settings"))      j.at("api_settings").get_to(a.api_settings);
     if (j.contains("reasoning_enabled")) j.at("reasoning_enabled").get_to(a.reasoning_enabled);
     if (j.contains("memories_enabled"))  j.at("memories_enabled").get_to(a.memories_enabled);
     if (j.contains("tools_enabled"))     j.at("tools_enabled").get_to(a.tools_enabled);

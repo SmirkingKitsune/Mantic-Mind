@@ -210,6 +210,35 @@ configurable through `tts_vllm_base_url`, `tts_vllm_speech_path`, and
 `tts_vllm_model_id`; the older Python sidecar remains available as
 `tts_backend = "sidecar"`.
 
+## Agent API Mode
+
+Agents can also run against an OpenAI-compatible chat completions API instead of
+a local node engine. Set `inference_backend` to `api`, keep `model_path` as the
+remote model id, and configure `api_settings` with the provider base URL and
+chat route:
+
+```sh
+curl -X POST http://localhost:9090/v1/agents \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "frontier-assistant",
+    "inference_backend": "api",
+    "model_path": "gpt-4.1",
+    "api_settings": {
+      "base_url": "https://api.openai.com",
+      "chat_completions_path": "/v1/chat/completions",
+      "api_key_env": "OPENAI_API_KEY"
+    }
+  }' | jq
+```
+
+`api_settings.api_key` may be supplied in a create/update request for the
+current control process, but it is not serialized in API responses and is not
+persisted to SQLite. Prefer `api_key_env` for restart-safe deployments. API
+agents bypass node placement, but they still use the normal Mantic-Mind agent
+harness: conversations, streaming chat, memory extraction, compaction, and tool
+rounds.
+
 ## Quick Start
 
 Local `mantic-mind.toml` and `mantic-mind-control.toml` copies are intentionally gitignored. Keep committed defaults in `tools/`, then copy them into the working directory for local runs.
@@ -357,6 +386,7 @@ Legacy keys `llama_server_path` (`MM_LLAMA_PATH`) and `llama_port` (`MM_LLAMA_PO
 | Key | Env var | Default | Description |
 |---|---|---|---|
 | `listen_port` | `MM_CONTROL_PORT` | `9090` | API server port |
+| `openai_compat_port` | `MM_OPENAI_COMPAT_PORT` | `9091` | OpenAI-compatible text API port; set `0` to disable |
 | `data_dir` | `MM_DATA_DIR` | `data` | Agent database root; remembered nodes are stored in `nodes.json` |
 | `models_dir` | `MM_MODELS_DIR` | `models` | Optional local model directory root |
 | `node_health_poll_interval_s` | `MM_POLL_INTERVAL_S` | `30` | Health/metrics poll interval |
@@ -466,7 +496,27 @@ POST           /v1/nodes/pair/complete                    { url, nonce, pin_or_p
 POST           /v1/nodes/pair/psk                         { url, psk?, remember? }   (falls back to MM_PAIRING_KEY)
 GET            /v1/placements                             -> current agent → node/slot placements
 GET            /v1/activity?tail=n&level=info|warn|error|0|1|2
+GET            /v1/models                                 -> agent model catalog for compatibility clients
 ```
+
+### OpenAI-Compatible API (`openai_compat_port`, default `:9091`)
+
+This listener is intentionally separate from the Mantic API port. It is for
+clients that support an OpenAI-compatible custom base URL, while richer app
+integrations should keep using the Mantic `/v1/agents`, `/v1/nodes`, and
+conversation/memory routes on `listen_port`.
+
+```
+GET  /v1/models
+GET  /v1/models/{model}
+POST /v1/chat/completions
+```
+
+`/v1/models` exposes agents as model IDs in the form `agent:{agent_id}`. The
+chat-completions route also accepts a bare agent ID, unique agent name, unique
+`model_path`, or unique `served_model_name`, but `agent:{agent_id}` is the
+stable form to configure in external clients. When `external_api_token` is set,
+the compatibility port uses the same `Authorization: Bearer <token>` gate.
 
 ### SSE Chat Events
 

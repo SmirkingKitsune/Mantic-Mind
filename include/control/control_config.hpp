@@ -9,6 +9,7 @@ namespace mm {
 
 struct ControlConfig {
     uint16_t    listen_port = 9090;
+    uint16_t    openai_compat_port = 9091; // 0 disables the compatibility listener
     std::string data_dir    = "data";
     std::string log_file    = "logs/mantic-mind-control.log";
     uint32_t    node_health_poll_interval_s = 30;

@@ -385,6 +385,23 @@ void set_json_error(httplib::Response& res,
     res.set_content(body.dump(), "application/json");
 }
 
+void set_openai_error(httplib::Response& res,
+                      int status,
+                      const std::string& message,
+                      const std::string& type = "invalid_request_error") {
+    res.status = status;
+    res.set_content(
+        nlohmann::json{
+            {"error", {
+                {"message", message},
+                {"type", type},
+                {"param", nullptr},
+                {"code", nullptr}
+            }}
+        }.dump(),
+        "application/json");
+}
+
 nlohmann::json parse_request_json(const httplib::Request& req) {
     if (util::trim(req.body).empty()) return nlohmann::json::object();
     auto j = nlohmann::json::parse(req.body);
@@ -413,6 +430,250 @@ std::string extract_json_object_text(const std::string& text) {
         throw std::invalid_argument("model did not return a JSON object");
     }
     return trimmed.substr(first, last - first + 1);
+}
+
+std::string openai_agent_model_id(const AgentConfig& cfg) {
+    return "agent:" + cfg.id;
+}
+
+std::string agent_backend(const AgentConfig& cfg) {
+    std::string backend = util::to_lower(util::trim(cfg.inference_backend));
+    if (backend.empty() || backend == "llama.cpp") return "vllm";
+    return backend;
+}
+
+bool agent_uses_api_backend(const AgentConfig& cfg) {
+    return agent_backend(cfg) == "api";
+}
+
+std::string resolve_api_key(const ApiSettings& settings) {
+    if (!settings.api_key.empty()) return settings.api_key;
+    const std::string env_name = util::trim(settings.api_key_env);
+    if (env_name.empty()) return {};
+    const char* value = std::getenv(env_name.c_str());
+    return value ? std::string(value) : std::string{};
+}
+
+std::unique_ptr<LlamaCppClient> make_api_llama_client(const AgentConfig& cfg) {
+    return std::make_unique<LlamaCppClient>(
+        cfg.api_settings.base_url,
+        resolve_api_key(cfg.api_settings),
+        cfg.api_settings.chat_completions_path);
+}
+
+nlohmann::json openai_model_entry(const AgentConfig& cfg) {
+    return nlohmann::json{
+        {"id", openai_agent_model_id(cfg)},
+        {"object", "model"},
+        {"created", 0},
+        {"owned_by", "mantic-mind"},
+        {"metadata", {
+            {"agent_id", cfg.id},
+            {"agent_name", cfg.name},
+            {"inference_backend", agent_backend(cfg)},
+            {"model_path", cfg.model_path},
+            {"served_model_name", cfg.vllm_settings.served_model_name},
+            {"api_base_url", agent_uses_api_backend(cfg) ? cfg.api_settings.base_url : ""}
+        }}
+    };
+}
+
+nlohmann::json mantic_model_entry(const AgentConfig& cfg) {
+    return nlohmann::json{
+        {"id", openai_agent_model_id(cfg)},
+        {"agent_id", cfg.id},
+        {"agent_name", cfg.name},
+        {"inference_backend", agent_backend(cfg)},
+        {"model_path", cfg.model_path},
+        {"served_model_name", cfg.vllm_settings.served_model_name},
+        {"api_base_url", agent_uses_api_backend(cfg) ? cfg.api_settings.base_url : ""}
+    };
+}
+
+nlohmann::json openai_model_list(const std::vector<AgentConfig>& configs) {
+    nlohmann::json data = nlohmann::json::array();
+    for (const auto& cfg : configs) data.push_back(openai_model_entry(cfg));
+    return nlohmann::json{{"object", "list"}, {"data", data}};
+}
+
+nlohmann::json mantic_model_list(const std::vector<AgentConfig>& configs) {
+    nlohmann::json data = nlohmann::json::array();
+    for (const auto& cfg : configs) data.push_back(mantic_model_entry(cfg));
+    return nlohmann::json{
+        {"models", data},
+        {"openai_compat_note", "Use agent:{agent_id} as the OpenAI model id."}
+    };
+}
+
+std::optional<AgentConfig> resolve_openai_agent_model(AgentManager& agents,
+                                                      const std::string& raw_model,
+                                                      std::string* error) {
+    const std::string requested = util::trim(raw_model);
+    if (requested.empty()) {
+        if (error) *error = "model is required";
+        return std::nullopt;
+    }
+
+    const auto configs = agents.list_agents();
+    const std::string prefix = "agent:";
+    const bool explicit_agent_id = requested.rfind(prefix, 0) == 0;
+    const std::string requested_id =
+        explicit_agent_id ? requested.substr(prefix.size()) : requested;
+
+    for (const auto& cfg : configs) {
+        if (cfg.id == requested_id) return cfg;
+    }
+    if (explicit_agent_id) {
+        if (error) *error = "model not found: " + requested;
+        return std::nullopt;
+    }
+
+    std::vector<AgentConfig> matches;
+    auto add_match = [&matches](const AgentConfig& cfg) {
+        for (const auto& existing : matches) {
+            if (existing.id == cfg.id) return;
+        }
+        matches.push_back(cfg);
+    };
+
+    for (const auto& cfg : configs) {
+        if (cfg.name == requested) add_match(cfg);
+        if (cfg.model_path == requested) add_match(cfg);
+        if (!cfg.vllm_settings.served_model_name.empty() &&
+            cfg.vllm_settings.served_model_name == requested) {
+            add_match(cfg);
+        }
+    }
+
+    if (matches.size() == 1) return matches.front();
+    if (matches.empty()) {
+        if (error) *error = "model not found: " + requested + "; use agent:{agent_id}";
+    } else if (error) {
+        *error = "model matches multiple agents; use agent:{agent_id}";
+    }
+    return std::nullopt;
+}
+
+std::string openai_content_to_text(const nlohmann::json& content) {
+    if (content.is_null()) return {};
+    if (content.is_string()) return content.get<std::string>();
+    if (!content.is_array()) return content.dump();
+
+    std::vector<std::string> parts;
+    for (const auto& part : content) {
+        if (part.is_string()) {
+            parts.push_back(part.get<std::string>());
+            continue;
+        }
+        if (!part.is_object()) continue;
+        if (part.contains("text") && part.at("text").is_string()) {
+            parts.push_back(part.at("text").get<std::string>());
+        }
+    }
+
+    std::ostringstream out;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        if (i > 0) out << "\n";
+        out << parts[i];
+    }
+    return out.str();
+}
+
+std::string openai_messages_to_prompt(const nlohmann::json& messages) {
+    if (!messages.is_array()) {
+        throw std::invalid_argument("messages must be an array");
+    }
+    if (messages.empty()) {
+        throw std::invalid_argument("messages must not be empty");
+    }
+
+    if (messages.size() == 1 && messages.front().is_object()) {
+        const std::string role = util::to_lower(messages.front().value("role", "user"));
+        const std::string content = util::trim(
+            openai_content_to_text(messages.front().value("content", nlohmann::json{})));
+        if (role == "user" && !content.empty()) return content;
+    }
+
+    std::ostringstream prompt;
+    bool has_content = false;
+    for (const auto& msg : messages) {
+        if (!msg.is_object()) {
+            throw std::invalid_argument("each message must be an object");
+        }
+        std::string role = util::to_lower(util::trim(msg.value("role", "user")));
+        if (role.empty()) role = "user";
+        const std::string content = util::trim(
+            openai_content_to_text(msg.value("content", nlohmann::json{})));
+        if (!content.empty()) {
+            prompt << role << ": " << content << "\n\n";
+            has_content = true;
+        }
+        if (msg.contains("tool_calls") && !msg.at("tool_calls").is_null()) {
+            prompt << role << " tool_calls: " << msg.at("tool_calls").dump() << "\n\n";
+            has_content = true;
+        }
+    }
+    const std::string text = util::trim(prompt.str());
+    if (!has_content || text.empty()) {
+        throw std::invalid_argument("messages must include text content");
+    }
+    return text;
+}
+
+nlohmann::json openai_stream_chunk(const std::string& id,
+                                   int64_t created,
+                                   const std::string& model,
+                                   nlohmann::json delta,
+                                   nlohmann::json finish_reason) {
+    return nlohmann::json{
+        {"id", id},
+        {"object", "chat.completion.chunk"},
+        {"created", created},
+        {"model", model},
+        {"choices", nlohmann::json::array({
+            {
+                {"index", 0},
+                {"delta", std::move(delta)},
+                {"finish_reason", std::move(finish_reason)}
+            }
+        })}
+    };
+}
+
+nlohmann::json openai_chat_completion_response(const std::string& id,
+                                               int64_t created,
+                                               const std::string& model,
+                                               const ConvId& conv_id,
+                                               const std::vector<InferenceChunk>& chunks) {
+    std::string content;
+    int completion_tokens = 0;
+    for (const auto& chunk : chunks) {
+        content += chunk.delta_content;
+        completion_tokens = std::max(completion_tokens, chunk.tokens_used);
+    }
+
+    return nlohmann::json{
+        {"id", id},
+        {"object", "chat.completion"},
+        {"created", created},
+        {"model", model},
+        {"choices", nlohmann::json::array({
+            {
+                {"index", 0},
+                {"message", {
+                    {"role", "assistant"},
+                    {"content", content}
+                }},
+                {"finish_reason", "stop"}
+            }
+        })},
+        {"usage", {
+            {"prompt_tokens", 0},
+            {"completion_tokens", completion_tokens},
+            {"total_tokens", completion_tokens}
+        }},
+        {"mantic_conversation_id", conv_id}
+    };
 }
 
 std::string sha256_hex(const std::string& text) {
@@ -512,6 +773,7 @@ ControlApiServer::ControlApiServer(AgentManager& agents,
     , external_api_token_(std::move(external_api_token))
     , tts_(std::move(tts_config))
     , server_(std::make_unique<HttpServer>())
+    , openai_server_(std::make_unique<HttpServer>())
 {}
 
 ControlApiServer::~ControlApiServer() { stop(); }
@@ -525,7 +787,23 @@ bool ControlApiServer::listen(uint16_t port) {
     MM_INFO("ControlApiServer listening on port {}", port);
     return server_->listen("0.0.0.0", port);
 }
-void ControlApiServer::stop() { server_->stop(); }
+
+bool ControlApiServer::listen_openai_compat(uint16_t port) {
+    openai_server_->SetPreRoutingHandler([this](const httplib::Request& req,
+                                                httplib::Response& res) {
+        return authorize_openai_compat_request(req, res);
+    });
+    register_openai_compat_routes();
+    MM_INFO("OpenAI-compatible API listening on port {}", port);
+    return openai_server_->listen("0.0.0.0", port);
+}
+
+void ControlApiServer::stop() {
+    server_->stop();
+    stop_openai_compat();
+}
+
+void ControlApiServer::stop_openai_compat() { openai_server_->stop(); }
 
 void ControlApiServer::cleanup_expired_tts_cache() {
     const int64_t now = util::now_ms();
@@ -584,6 +862,225 @@ bool ControlApiServer::authorize_external_request(const httplib::Request& req,
         return false;
     }
     return true;
+}
+
+bool ControlApiServer::authorize_openai_compat_request(const httplib::Request& req,
+                                                       httplib::Response& res) const {
+    if (external_api_token_.empty()) return true;
+
+    static const std::string kBearer = "Bearer ";
+    const std::string auth = req.get_header_value("Authorization");
+    if (auth.rfind(kBearer, 0) != 0) {
+        set_openai_error(res, 401, "missing bearer token", "authentication_error");
+        return false;
+    }
+    if (auth.substr(kBearer.size()) != external_api_token_) {
+        set_openai_error(res, 403, "invalid bearer token", "authentication_error");
+        return false;
+    }
+    return true;
+}
+
+void ControlApiServer::register_openai_compat_routes() {
+    using namespace httplib;
+
+    openai_server_->Get("/v1/models", [this](const Request& /*req*/, Response& res) {
+        res.set_content(openai_model_list(agents_.list_agents()).dump(), "application/json");
+    });
+
+    openai_server_->Get("/v1/models/:model", [this](const Request& req, Response& res) {
+        std::string error;
+        auto cfg = resolve_openai_agent_model(agents_, req.path_params.at("model"), &error);
+        if (!cfg) {
+            set_openai_error(res, 404, error.empty() ? "model not found" : error);
+            return;
+        }
+        res.set_content(openai_model_entry(*cfg).dump(), "application/json");
+    });
+
+    openai_server_->Post("/v1/chat/completions", [this](const Request& req, Response& res) {
+        nlohmann::json body;
+        std::string requested_model;
+        std::string prompt;
+        ConvId conv_id_hint;
+        int max_tokens_override = 0;
+        bool stream = false;
+
+        try {
+            body = parse_request_json(req);
+            requested_model = util::trim(body.value("model", std::string{}));
+            if (!body.contains("messages")) {
+                throw std::invalid_argument("messages is required");
+            }
+            prompt = openai_messages_to_prompt(body.at("messages"));
+            conv_id_hint = util::trim(body.value("conversation_id", std::string{}));
+            if (conv_id_hint.empty()) {
+                conv_id_hint = util::trim(body.value("mantic_conversation_id", std::string{}));
+            }
+            if (body.contains("stream") && !body.at("stream").is_null()) {
+                if (!body.at("stream").is_boolean()) {
+                    throw std::invalid_argument("stream must be a boolean");
+                }
+                stream = body.at("stream").get<bool>();
+            }
+            for (const char* key : {"max_tokens", "max_completion_tokens"}) {
+                if (!body.contains(key) || body.at(key).is_null()) continue;
+                if (!body.at(key).is_number_integer()) {
+                    throw std::invalid_argument(std::string(key) + " must be an integer");
+                }
+                max_tokens_override = std::max(0, body.at(key).get<int>());
+            }
+        } catch (const std::exception& e) {
+            set_openai_error(res, 400, e.what());
+            return;
+        }
+
+        std::string resolve_error;
+        auto cfg = resolve_openai_agent_model(agents_, requested_model, &resolve_error);
+        if (!cfg) {
+            set_openai_error(res, 404,
+                             resolve_error.empty() ? "model not found" : resolve_error);
+            return;
+        }
+
+        const std::string response_id = "chatcmpl-" + util::generate_uuid();
+        const int64_t created = util::now_ms() / 1000;
+
+        if (!stream) {
+            auto result = chat_local(cfg->id, prompt, conv_id_hint, max_tokens_override);
+            if (!result.success) {
+                set_openai_error(res,
+                                 500,
+                                 result.error.empty() ? "chat completion failed" : result.error,
+                                 "server_error");
+                return;
+            }
+            res.set_content(
+                openai_chat_completion_response(response_id,
+                                                created,
+                                                requested_model,
+                                                result.conv_id,
+                                                result.chunks).dump(),
+                "application/json");
+            return;
+        }
+
+        auto ctx = std::make_shared<SseInferCtx>();
+        auto push_event = [ctx](const nlohmann::json& payload) {
+            std::lock_guard<std::mutex> lk(ctx->mx);
+            ctx->lines.push_back("data: " + payload.dump() + "\n\n");
+            ctx->cv.notify_one();
+        };
+
+        push_event(openai_stream_chunk(response_id,
+                                       created,
+                                       requested_model,
+                                       nlohmann::json{{"role", "assistant"}},
+                                       nullptr));
+
+        auto chunk_fn = [push_event,
+                         response_id,
+                         created,
+                         requested_model](const InferenceChunk& chunk) {
+            if (chunk.delta_content.empty()) return;
+            push_event(openai_stream_chunk(response_id,
+                                           created,
+                                           requested_model,
+                                           nlohmann::json{{"content", chunk.delta_content}},
+                                           nullptr));
+        };
+
+        auto done_sent = std::make_shared<std::atomic_bool>(false);
+        auto done_fn = [ctx,
+                        push_event,
+                        done_sent,
+                        response_id,
+                        created,
+                        requested_model](const ConvId& /*conv_id*/,
+                                         bool success,
+                                         const std::string& error) {
+            if (done_sent->exchange(true)) return;
+            if (success) {
+                push_event(openai_stream_chunk(response_id,
+                                               created,
+                                               requested_model,
+                                               nlohmann::json::object(),
+                                               "stop"));
+            } else {
+                push_event(nlohmann::json{
+                    {"error", {
+                        {"message", error.empty() ? "chat completion failed" : error},
+                        {"type", "server_error"},
+                        {"param", nullptr},
+                        {"code", nullptr}
+                    }}
+                });
+            }
+            std::lock_guard<std::mutex> lk(ctx->mx);
+            ctx->done = true;
+            ctx->cv.notify_one();
+        };
+
+        InferenceJob job;
+        job.job_id = util::generate_uuid();
+        job.agent_id = cfg->id;
+        job.conversation_id = conv_id_hint;
+        job.done_cb = [done_fn](const ConvId& conv_id, bool success) mutable {
+            done_fn(conv_id, success, success ? std::string{} : "queued chat job failed");
+        };
+        job.process_fn = [this,
+                          agent_id = cfg->id,
+                          prompt,
+                          conv_id_hint,
+                          max_tokens_override,
+                          chunk_fn,
+                          done_for_handle = done_fn,
+                          done_for_catch = done_fn]() mutable {
+            try {
+                handle_chat(agent_id,
+                            prompt,
+                            conv_id_hint,
+                            std::move(chunk_fn),
+                            std::move(done_for_handle),
+                            max_tokens_override);
+            } catch (const std::exception& e) {
+                MM_ERROR("OpenAI-compatible chat job for agent '{}' failed: {}",
+                         agent_id,
+                         e.what());
+                done_for_catch(conv_id_hint, false, e.what());
+            } catch (...) {
+                MM_ERROR("OpenAI-compatible chat job for agent '{}' failed with unknown exception",
+                         agent_id);
+                done_for_catch(conv_id_hint, false, "queued chat job failed");
+            }
+        };
+        queue_.enqueue(std::move(job));
+
+        res.set_chunked_content_provider("text/event-stream",
+            [ctx](size_t /*offset*/, httplib::DataSink& sink) -> bool {
+                std::unique_lock<std::mutex> lk(ctx->mx);
+                ctx->cv.wait(lk, [&] {
+                    return !ctx->lines.empty() || ctx->done;
+                });
+
+                while (!ctx->lines.empty()) {
+                    std::string payload = std::move(ctx->lines.front());
+                    ctx->lines.pop_front();
+                    lk.unlock();
+                    if (!sink.write(payload.data(), payload.size())) return false;
+                    lk.lock();
+                }
+
+                if (ctx->done && ctx->lines.empty()) {
+                    lk.unlock();
+                    const std::string fin = "data: [DONE]\n\n";
+                    sink.write(fin.data(), fin.size());
+                    sink.done();
+                    return true;
+                }
+                return true;
+            });
+    });
 }
 
 ControlApiServer::LocalChatResult ControlApiServer::chat_local(
@@ -714,7 +1211,9 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     AgentConfig cfg = agent->get_config();
     AgentDB& db = agent->db();
 
-    activity_log(0, "Chat started: agent='" + agent_id + "' model='" + cfg.model_path + "'");
+    const bool api_backend = agent_uses_api_backend(cfg);
+    activity_log(0, "Chat started: agent='" + agent_id + "' backend='" +
+                    agent_backend(cfg) + "' model='" + cfg.model_path + "'");
 
     // 2. Get or create active conversation
     ConvId conv_id = conv_id_hint;
@@ -742,7 +1241,21 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     user_msg.timestamp_ms = util::now_ms();
     db.append_message(conv_id, user_msg, seq);
 
-    // 4. Route to a node via AgentScheduler. If capacity is temporarily unavailable,
+    // 4. Route to either a control-local API client or a node slot.
+    std::unique_ptr<LlamaCppClient> api_llm_storage;
+    std::unique_ptr<NodeProxyLlamaClient> node_llm_storage;
+    LlamaCppClient* selected_llama = nullptr;
+    std::optional<ScheduleResult> schedule_result;
+    NodeInfo node;
+    SlotId active_slot_id;
+
+    if (api_backend) {
+        api_llm_storage = make_api_llama_client(cfg);
+        selected_llama = api_llm_storage.get();
+        activity_log(0, "Chat routed: agent='" + agent_id + "' -> api=" +
+                        cfg.api_settings.base_url);
+    } else {
+    // Route to a node via AgentScheduler. If capacity is temporarily unavailable,
     // wait and retry so queued prompts can run when the next node/slot opens up.
     int64_t wait_budget_ms = 180000; // default: 3 minutes
     if (const char* env_wait = std::getenv("MM_CHAT_QUEUE_WAIT_MS")) {
@@ -753,7 +1266,6 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     }
     constexpr int64_t kRetrySleepMs = 1000;
 
-    std::optional<ScheduleResult> schedule_result;
     std::string sched_err;
     const int64_t wait_started_ms = util::now_ms();
     int wait_attempt = 0;
@@ -806,7 +1318,6 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
 
     scheduler_.mark_agent_active(agent_id);
 
-    NodeInfo node;
     try { node = registry_.get_node(schedule_result->node_id); }
     catch (const std::exception& e) {
         scheduler_.mark_agent_idle(agent_id);
@@ -816,7 +1327,7 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
         return;
     }
 
-    SlotId active_slot_id = schedule_result->slot_id;
+    active_slot_id = schedule_result->slot_id;
 
     activity_log(0, "Chat routed: agent='" + agent_id + "' -> node=" +
                  schedule_result->node_id.substr(0, 8) + " slot=" +
@@ -825,7 +1336,12 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     // 5. Real LLM client routed through the node API.
     //    (llama-server is bound to localhost on the node machine; control
     //     cannot reach it directly — all LLM calls go via /api/node/infer.)
-    NodeProxyLlamaClient real_llama(node.url, node.api_key, active_slot_id);
+    node_llm_storage = std::make_unique<NodeProxyLlamaClient>(
+        node.url, node.api_key, active_slot_id);
+    selected_llama = node_llm_storage.get();
+    }
+
+    LlamaCppClient& real_llama = *selected_llama;
 
     // 6. Compact the conversation if it is approaching context limits.
     //    may_compact() creates a new conversation with a summary if >80% full.
@@ -954,6 +1470,67 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
             if (force_prefill_safe) {
                 enforce_prefill_safe_tail(req_to_send.messages);
             }
+            if (api_backend) {
+                if (stream_mode) {
+                    bool api_ok = true;
+                    real_llama.stream_complete(
+                        req_to_send,
+                        [&](const InferenceChunk& chunk) {
+                            if (chunk.is_done) {
+                                infer_done_seen = true;
+                                total_tokens = chunk.tokens_used;
+                                finish_reason = chunk.finish_reason;
+                                return;
+                            }
+                            if (!chunk.thinking_delta.empty()) {
+                                thinking_content += chunk.thinking_delta;
+                            }
+                            if (!chunk.delta_content.empty()) {
+                                assistant_content += chunk.delta_content;
+                            }
+                            if (chunk.tool_call_delta) {
+                                accumulated_tool_calls.push_back(*chunk.tool_call_delta);
+                            }
+                            chunk_cb(chunk);
+                        },
+                        [&](const std::string& error) {
+                            api_ok = false;
+                            stream_had_error = true;
+                            stream_error_message = error;
+                            infer_http_body = error;
+                        });
+                    return api_ok;
+                }
+
+                Message response = real_llama.complete(req_to_send);
+                if (response.role != MessageRole::Assistant) {
+                    stream_had_error = true;
+                    stream_error_message = "API chat completion failed";
+                    infer_http_body = stream_error_message;
+                    return false;
+                }
+                thinking_content = response.thinking_text;
+                assistant_content = response.content;
+                total_tokens = response.token_count;
+                accumulated_tool_calls = response.tool_calls;
+                infer_done_seen = true;
+                if (!thinking_content.empty()) {
+                    InferenceChunk c;
+                    c.thinking_delta = thinking_content;
+                    chunk_cb(c);
+                }
+                if (!assistant_content.empty()) {
+                    InferenceChunk c;
+                    c.delta_content = assistant_content;
+                    chunk_cb(c);
+                }
+                for (const auto& tc : accumulated_tool_calls) {
+                    InferenceChunk c;
+                    c.tool_call_delta = tc;
+                    chunk_cb(c);
+                }
+                return true;
+            }
             nlohmann::json infer_body = nlohmann::json(req_to_send);
             infer_body["slot_id"] = active_slot_id;
             return node_cli.stream_post(
@@ -966,28 +1543,29 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
         };
 
         auto finalize_attempt = [&](bool transport_ok) -> bool {
+            const std::string infer_label = api_backend ? "api infer" : "node infer";
             bool ok_now = transport_ok;
             if (!ok_now) {
                 if (infer_done_seen && !stream_had_error) {
-                    MM_WARN("handle_chat: node infer transport ended non-successfully after done event;"
+                    MM_WARN("handle_chat: {} transport ended non-successfully after done event;"
                             " accepting completion (agent='{}', conv='{}')",
-                            agent_id, conv_id);
+                            infer_label, agent_id, conv_id);
                     ok_now = true;
                 } else if (infer_http_status > 0) {
                     std::string body = util::trim(infer_http_body);
                     if (body.size() > 400) body = body.substr(0, 400) + "...";
-                    failure_reason = "node infer failed (HTTP " + std::to_string(infer_http_status) + ")";
+                    failure_reason = infer_label + " failed (HTTP " + std::to_string(infer_http_status) + ")";
                     if (!body.empty()) failure_reason += ": " + body;
                 } else {
-                    failure_reason = "node infer stream failed (connection error or non-2xx)";
+                    failure_reason = infer_label + " stream failed (connection error or non-2xx)";
                 }
             }
             if (stream_had_error) {
                 ok_now = false;
-                MM_WARN("handle_chat: node infer stream error for agent '{}': {}",
-                        agent_id, stream_error_message);
+                MM_WARN("handle_chat: {} stream error for agent '{}': {}",
+                        infer_label, agent_id, stream_error_message);
                 failure_reason = stream_error_message.empty()
-                    ? "node reported infer stream error" : stream_error_message;
+                    ? infer_label + " reported stream error" : stream_error_message;
             }
             return ok_now;
         };
@@ -1106,13 +1684,21 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
             activity_log(0, buf);
         } else {
             char buf[256];
-            snprintf(buf, sizeof(buf),
-                     "Chat error: agent='%s' node=%s slot=%s reason='%s' duration=%lldms",
-                     agent_id.c_str(),
-                     schedule_result->node_id.substr(0, 8).c_str(),
-                     active_slot_id.substr(0, 8).c_str(),
-                     failure_reason.substr(0, 80).c_str(),
-                     static_cast<long long>(duration_ms));
+            if (api_backend) {
+                snprintf(buf, sizeof(buf),
+                         "Chat error: agent='%s' backend=api reason='%s' duration=%lldms",
+                         agent_id.c_str(),
+                         failure_reason.substr(0, 80).c_str(),
+                         static_cast<long long>(duration_ms));
+            } else {
+                snprintf(buf, sizeof(buf),
+                         "Chat error: agent='%s' node=%s slot=%s reason='%s' duration=%lldms",
+                         agent_id.c_str(),
+                         schedule_result ? schedule_result->node_id.substr(0, 8).c_str() : "",
+                         active_slot_id.substr(0, 8).c_str(),
+                         failure_reason.substr(0, 80).c_str(),
+                         static_cast<long long>(duration_ms));
+            }
             activity_log(2, buf);
         }
     }
@@ -1123,7 +1709,9 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     }
 
     // 10. Mark agent idle in scheduler.
-    scheduler_.mark_agent_idle(agent_id);
+    if (!api_backend) {
+        scheduler_.mark_agent_idle(agent_id);
+    }
 
     // 11. Signal completion to the SSE client.
     done_cb(conv_id, ok, failure_reason);
@@ -1155,23 +1743,37 @@ void ControlApiServer::queue_global_recall(const AgentId& agent_id,
 
         activity_log(0, "Global recall starting: agent='" + agent_id + "'");
 
-        // Schedule agent on a node
-        auto sched_result = scheduler_.ensure_agent_running(acfg);
-        if (!sched_result) {
-            MM_WARN("Global recall: no node for agent '{}': {}",
-                    agent_id, scheduler_.last_error());
-            activity_log(1, "Global recall failed: agent='" + agent_id + "' no node");
-            return;
-        }
-
-        scheduler_.mark_agent_active(agent_id);
-
+        const bool recall_api_backend = agent_uses_api_backend(acfg);
+        std::unique_ptr<LlamaCppClient> api_recall_storage;
+        std::unique_ptr<NodeProxyLlamaClient> node_recall_storage;
+        LlamaCppClient* recall_client = nullptr;
+        std::optional<ScheduleResult> sched_result;
         NodeInfo ni;
-        try { ni = registry_.get_node(sched_result->node_id); }
-        catch (const std::exception& e) {
-            scheduler_.mark_agent_idle(agent_id);
-            MM_WARN("Global recall: node lookup failed: {}", e.what());
-            return;
+
+        if (recall_api_backend) {
+            api_recall_storage = make_api_llama_client(acfg);
+            recall_client = api_recall_storage.get();
+        } else {
+            sched_result = scheduler_.ensure_agent_running(acfg);
+            if (!sched_result) {
+                MM_WARN("Global recall: no node for agent '{}': {}",
+                        agent_id, scheduler_.last_error());
+                activity_log(1, "Global recall failed: agent='" + agent_id + "' no node");
+                return;
+            }
+
+            scheduler_.mark_agent_active(agent_id);
+
+            try { ni = registry_.get_node(sched_result->node_id); }
+            catch (const std::exception& e) {
+                scheduler_.mark_agent_idle(agent_id);
+                MM_WARN("Global recall: node lookup failed: {}", e.what());
+                return;
+            }
+
+            node_recall_storage = std::make_unique<NodeProxyLlamaClient>(
+                ni.url, ni.api_key, sched_result->slot_id);
+            recall_client = node_recall_storage.get();
         }
 
         AgentDB& db = a->db();
@@ -1240,7 +1842,7 @@ void ControlApiServer::queue_global_recall(const AgentId& agent_id,
         recall_ctx.push_back(recall_prompt);
 
         // Run tool call loop (internal, not streamed to client)
-        NodeProxyLlamaClient recall_llama(ni.url, ni.api_key, sched_result->slot_id);
+        LlamaCppClient& recall_llama = *recall_client;
         static constexpr int kMaxRecallRounds = 5;
 
         for (int round = 0; round < kMaxRecallRounds; ++round) {
@@ -1282,7 +1884,9 @@ void ControlApiServer::queue_global_recall(const AgentId& agent_id,
             }
         }
 
-        scheduler_.mark_agent_idle(agent_id);
+        if (!recall_api_backend) {
+            scheduler_.mark_agent_idle(agent_id);
+        }
         activity_log(0, "Global recall complete: agent='" + agent_id + "'");
     };
     queue_.enqueue(std::move(recall_job));
@@ -1294,7 +1898,16 @@ void ControlApiServer::register_routes() {
     using namespace httplib;
 
     // Helper: compute node_compatibility info for an agent config.
-    auto compute_node_compat = [this](const AgentConfig& /*cfg*/) -> nlohmann::json {
+    auto compute_node_compat = [this](const AgentConfig& cfg) -> nlohmann::json {
+        if (agent_uses_api_backend(cfg)) {
+            return nlohmann::json{
+                {"backend", "api"},
+                {"requires_node", false},
+                {"compatible_nodes", 0},
+                {"total_nodes", 0}
+            };
+        }
+
         const int64_t estimated_vram = 2048; // conservative default
 
         auto compatible = registry_.nodes_with_available_vram(estimated_vram);
@@ -1568,6 +2181,10 @@ void ControlApiServer::register_routes() {
     });
 
     // ── GET /v1/agents ────────────────────────────────────────────────────────
+    server_->Get("/v1/models", [this](const Request& /*req*/, Response& res) {
+        res.set_content(mantic_model_list(agents_.list_agents()).dump(), "application/json");
+    });
+
     server_->Get("/v1/agents", [this](const Request& /*req*/, Response& res) {
         auto configs = agents_.list_agents();
         nlohmann::json arr = nlohmann::json::array();
@@ -1579,6 +2196,8 @@ void ControlApiServer::register_routes() {
                 j["status"] = placement->suspended
                     ? "suspended"
                     : (placement->is_active ? "active" : "idle");
+            } else if (agent_uses_api_backend(c)) {
+                j["status"] = "api";
             } else {
                 j["status"] = "unplaced";
             }
@@ -1632,6 +2251,8 @@ void ControlApiServer::register_routes() {
             j["status"] = placement->suspended
                 ? "suspended"
                 : (placement->is_active ? "active" : "idle");
+        } else if (agent_uses_api_backend(cfg)) {
+            j["status"] = "api";
         } else {
             j["status"] = "unplaced";
         }
@@ -1691,23 +2312,35 @@ void ControlApiServer::register_routes() {
     auto infer_voice_design_proposal =
         [this](const AgentConfig& acfg,
                std::string* error) -> std::optional<VoiceDesignProposal> {
-        auto sched_result = scheduler_.ensure_agent_running(acfg);
-        if (!sched_result) {
-            if (error) *error = scheduler_.last_error().empty()
-                ? "no node available for voice design proposal"
-                : scheduler_.last_error();
-            return std::nullopt;
-        }
+        const bool voice_api_backend = agent_uses_api_backend(acfg);
+        std::unique_ptr<LlamaCppClient> api_voice_client;
+        std::unique_ptr<NodeProxyLlamaClient> node_voice_client;
+        LlamaCppClient* client = nullptr;
+        if (voice_api_backend) {
+            api_voice_client = make_api_llama_client(acfg);
+            client = api_voice_client.get();
+        } else {
+            auto sched_result = scheduler_.ensure_agent_running(acfg);
+            if (!sched_result) {
+                if (error) *error = scheduler_.last_error().empty()
+                    ? "no node available for voice design proposal"
+                    : scheduler_.last_error();
+                return std::nullopt;
+            }
 
-        NodeInfo node;
-        try {
-            node = registry_.get_node(sched_result->node_id);
-        } catch (const std::exception& e) {
-            if (error) *error = e.what();
-            return std::nullopt;
-        }
+            NodeInfo node;
+            try {
+                node = registry_.get_node(sched_result->node_id);
+            } catch (const std::exception& e) {
+                if (error) *error = e.what();
+                return std::nullopt;
+            }
 
-        scheduler_.mark_agent_active(acfg.id);
+            scheduler_.mark_agent_active(acfg.id);
+            node_voice_client = std::make_unique<NodeProxyLlamaClient>(
+                node.url, node.api_key, sched_result->slot_id);
+            client = node_voice_client.get();
+        }
         try {
             std::vector<Message> messages;
             Message sys;
@@ -1736,9 +2369,10 @@ void ControlApiServer::register_routes() {
             req.settings.max_tokens = std::min(std::max(req.settings.max_tokens, 256), 768);
             req.stream = false;
 
-            NodeProxyLlamaClient client(node.url, node.api_key, sched_result->slot_id);
-            Message response = client.complete(req);
-            scheduler_.mark_agent_idle(acfg.id);
+            Message response = client->complete(req);
+            if (!voice_api_backend) {
+                scheduler_.mark_agent_idle(acfg.id);
+            }
 
             const auto parsed = nlohmann::json::parse(extract_json_object_text(response.content));
             VoiceDesignProposal proposal;
@@ -1750,7 +2384,9 @@ void ControlApiServer::register_routes() {
             proposal.rationale = util::trim(parsed.value("rationale", std::string{}));
             return proposal;
         } catch (const std::exception& e) {
-            scheduler_.mark_agent_idle(acfg.id);
+            if (!voice_api_backend) {
+                scheduler_.mark_agent_idle(acfg.id);
+            }
             if (error) *error = e.what();
             return std::nullopt;
         }
@@ -2702,6 +3338,27 @@ void ControlApiServer::register_routes() {
         if (!a->db().conversation_exists(cid)) { res.status = 404; return; }
 
         auto cfg = a->get_config();
+        if (agent_uses_api_backend(cfg)) {
+            try {
+                auto api_llama = make_api_llama_client(cfg);
+                ConversationManager conv_mgr(a->db(), *api_llama);
+                ConvId new_id = conv_mgr.force_compact(cid, cfg);
+
+                res.set_content(
+                    nlohmann::json{
+                        {"status", "ok"},
+                        {"old_conversation_id", cid},
+                        {"new_conversation_id", new_id}
+                    }.dump(),
+                    "application/json");
+            } catch (const std::exception& e) {
+                res.status = 500;
+                res.set_content(nlohmann::json{{"error", e.what()}}.dump(),
+                                "application/json");
+            }
+            return;
+        }
+
         auto sched_result = scheduler_.ensure_agent_running(cfg);
         if (!sched_result) {
             std::string err = scheduler_.last_error();
@@ -2912,6 +3569,17 @@ void ControlApiServer::register_routes() {
                 if (!a_local) return;
 
                 AgentConfig cfg = a_local->get_config();
+                if (agent_uses_api_backend(cfg)) {
+                    try {
+                        auto api_llama = make_api_llama_client(cfg);
+                        MemoryManager mem_mgr(a_local->db(), *api_llama);
+                        mem_mgr.extract_and_store_memories_from_messages(conv_id, selected, cfg);
+                    } catch (const std::exception& e) {
+                        MM_WARN("Manual memory extraction failed for '{}': {}", id, e.what());
+                    }
+                    return;
+                }
+
                 auto sched_result = scheduler_.ensure_agent_running(cfg);
                 if (!sched_result) {
                     MM_WARN("Manual memory extraction: no node for agent '{}': {}",

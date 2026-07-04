@@ -50,4 +50,15 @@ std::optional<EngineGroupCandidate> best_engine_group(
     const EngineGroupRequest& req,
     const std::vector<NodeInfo>& nodes);
 
+// Derive the "ip:port" Ray workers join from the head node's API URL and the
+// head's GCS port, e.g. ("http://192.168.68.82:7070", 6379) →
+// "192.168.68.82:6379". Empty string when the URL has no parsable host.
+std::string derive_ray_head_address(const std::string& node_url, int gcs_port);
+
+// Apply a planned group split to an agent's engine settings: the candidate's
+// tensor/pipeline sizes replace whatever the agent asked for (the plan is the
+// authority on how the world size maps onto the actual fleet).
+VllmSettings apply_group_plan(const EngineGroupCandidate& group,
+                              VllmSettings settings);
+
 } // namespace mm

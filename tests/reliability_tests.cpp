@@ -46,7 +46,9 @@ class FixedSummaryLlamaClient : public mm::LlamaCppClient {
 public:
     FixedSummaryLlamaClient() : mm::LlamaCppClient("http://127.0.0.1:1") {}
 
-    mm::Message complete(const mm::InferenceRequest&) override {
+    mm::Message complete(const mm::InferenceRequest& req) override {
+        last_model = req.model;
+
         mm::Message summary;
         summary.role = mm::MessageRole::Assistant;
         summary.content = "Summary: original source conversation kept the launch thermal review context.";
@@ -54,6 +56,8 @@ public:
         summary.timestamp_ms = mm::util::now_ms();
         return summary;
     }
+
+    std::string last_model;
 };
 
 const mm::TraceEvent* find_trace_event(const std::vector<mm::TraceEvent>& events,
@@ -75,6 +79,41 @@ bool check(bool condition, const char* expression, int line) {
 std::filesystem::path temp_test_dir(const std::string& name) {
     return std::filesystem::temp_directory_path()
         / ("mantic-mind-" + name + "-" + mm::util::generate_uuid());
+}
+
+// Windows reserves shifting blocks of high ports (Hyper-V/WSL excluded port
+// ranges, see `netsh int ipv4 show excludedportrange`); a hardcoded test port
+// can land inside one after a reboot and the server under test silently fails
+// to bind. Probe for a port we can actually bind. Socket headers/WSA init come
+// with <httplib.h>.
+uint16_t find_free_test_port() {
+    static uint16_t next_candidate = 42800;
+    for (int p = next_candidate; p < 65000; ++p) {
+        sockaddr_in addr{};
+        addr.sin_family      = AF_INET;
+        addr.sin_port        = htons(static_cast<uint16_t>(p));
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+#ifdef _WIN32
+        SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == INVALID_SOCKET) continue;
+        const bool ok =
+            bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
+        closesocket(s);
+#else
+        int s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s < 0) continue;
+        int opt = 1;
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        const bool ok =
+            ::bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
+        ::close(s);
+#endif
+        if (ok) {
+            next_candidate = static_cast<uint16_t>(p + 1);
+            return static_cast<uint16_t>(p);
+        }
+    }
+    return 0;
 }
 
 bool remove_tree(const std::filesystem::path& dir) {
@@ -235,6 +274,54 @@ bool test_agent_manager_rejects_duplicates_and_defers_cleanup_until_handles_rele
 
     held.reset();
     CHECK(!std::filesystem::exists(agent_dir));
+
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_agent_api_settings_round_trip_without_key_persistence() {
+    auto dir = temp_test_dir("agent-api-settings");
+    std::filesystem::create_directories(dir);
+
+    {
+        mm::AgentManager manager(dir.string());
+        mm::AgentConfig cfg;
+        cfg.id = "api-agent";
+        cfg.name = "API Agent";
+        cfg.model_path = "frontier-test-model";
+        cfg.inference_backend = "api";
+        cfg.api_settings.base_url = "https://api.openai.com";
+        cfg.api_settings.chat_completions_path = "/v1/chat/completions";
+        cfg.api_settings.api_key = "secret-not-persisted";
+        cfg.api_settings.api_key_env = "MANTIC_TEST_API_KEY";
+
+        CHECK(manager.create_agent(cfg) == "api-agent");
+        auto agent = manager.get_agent("api-agent");
+        CHECK(static_cast<bool>(agent));
+
+        auto live = agent->get_config();
+        CHECK(live.inference_backend == "api");
+        CHECK(live.api_settings.api_key == "secret-not-persisted");
+
+        nlohmann::json live_json = live;
+        const std::string live_dump = live_json.dump();
+        CHECK(live_dump.find("secret-not-persisted") == std::string::npos);
+        CHECK(live_json["api_settings"]["api_key_configured"] == true);
+        CHECK(live_json["api_settings"]["api_key_env"] == "MANTIC_TEST_API_KEY");
+
+        mm::AgentDB persisted("api-agent", dir.string());
+        auto loaded = persisted.load_config();
+        CHECK(loaded.inference_backend == "api");
+        CHECK(loaded.model_path == "frontier-test-model");
+        CHECK(loaded.api_settings.base_url == "https://api.openai.com");
+        CHECK(loaded.api_settings.chat_completions_path == "/v1/chat/completions");
+        CHECK(loaded.api_settings.api_key.empty());
+        CHECK(loaded.api_settings.api_key_env == "MANTIC_TEST_API_KEY");
+
+        nlohmann::json loaded_json = loaded;
+        CHECK(loaded_json.dump().find("secret-not-persisted") == std::string::npos);
+        CHECK(loaded_json["api_settings"]["api_key_configured"] == false);
+    }
 
     CHECK(remove_tree(dir));
     return true;
@@ -662,6 +749,39 @@ bool test_engine_group_planner() {
     return true;
 }
 
+bool test_engine_group_launch_helpers() {
+    // Head address derivation: host comes from the node's API URL, port from
+    // the head's advertised GCS port.
+    CHECK(mm::derive_ray_head_address("http://192.168.68.82:7070", 6379)
+          == "192.168.68.82:6379");
+    CHECK(mm::derive_ray_head_address("https://spark1.local:7070/", 6380)
+          == "spark1.local:6380");
+    CHECK(mm::derive_ray_head_address("http://10.0.0.5", 6379)
+          == "10.0.0.5:6379");
+    CHECK(mm::derive_ray_head_address("http://[::1]:7070", 6379)
+          == "[::1]:6379");
+    CHECK(mm::derive_ray_head_address("", 6379).empty());
+    CHECK(mm::derive_ray_head_address("http://", 6379).empty());
+
+    // The planned split overrides the agent's own tp/pp ask; everything else
+    // in the settings is preserved (it keys engine-attach compatibility).
+    mm::EngineGroupCandidate group;
+    group.tensor_parallel_size   = 2;
+    group.pipeline_parallel_size = 3;
+    mm::VllmSettings s;
+    s.tensor_parallel_size   = 1;
+    s.pipeline_parallel_size = 6;
+    s.max_model_len          = 32768;
+    s.dtype                  = "bfloat16";
+    auto effective = mm::apply_group_plan(group, s);
+    CHECK(effective.tensor_parallel_size == 2);
+    CHECK(effective.pipeline_parallel_size == 3);
+    CHECK(effective.max_model_len == 32768);
+    CHECK(effective.dtype == "bfloat16");
+
+    return true;
+}
+
 bool test_hf_cache_helpers() {
     // Repo-id classification: "org/name" yes, local paths no.
     CHECK(mm::util::is_hf_repo_id("Qwen/Qwen2.5-0.5B-Instruct"));
@@ -856,7 +976,8 @@ bool test_control_api_external_token_gate() {
             agents, queue, registry, scheduler,
             dir.string(), (dir / "models").string(), "control-secret");
 
-        const uint16_t port = 49287;
+        const uint16_t port = find_free_test_port();
+        CHECK(port != 0);
         const std::string base_url = "http://127.0.0.1:" + std::to_string(port);
         std::atomic<bool> listen_returned{false};
         std::atomic<bool> listen_ok{false};
@@ -882,7 +1003,7 @@ bool test_control_api_external_token_gate() {
         // fail at the transport level (status == 0). Retry those.
         auto with_retry = [](auto&& request) {
             mm::HttpResponse resp;
-            for (int attempt = 0; attempt < 3; ++attempt) {
+            for (int attempt = 0; attempt < 8; ++attempt) {
                 resp = request();
                 if (resp.status != 0) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -923,6 +1044,9 @@ bool test_control_api_external_token_gate() {
         client.set_bearer_token("control-secret");
         auto valid = with_retry([&] { return client.get("/v1/nodes"); });
         RECORD(valid.status == 200);
+        auto valid_models = with_retry([&] { return client.get("/v1/models"); });
+        RECORD(valid_models.status == 200);
+        RECORD(valid_models.body.find("agent:agent-a") != std::string::npos);
         auto valid_voice = with_retry([&] { return client.get("/v1/agents/agent-a/voice"); });
         RECORD(valid_voice.status == 200);
 
@@ -1066,6 +1190,335 @@ bool test_control_api_external_token_gate() {
     return ok;
 }
 
+bool test_openai_compat_api_listener_and_model_catalog() {
+    auto dir = temp_test_dir("openai-compat");
+    std::filesystem::create_directories(dir);
+    std::filesystem::create_directories(dir / "models");
+
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    {
+        mm::AgentManager agents(dir.string());
+        mm::AgentConfig cfg;
+        cfg.id = "agent-a";
+        cfg.name = "agent-a-name";
+        cfg.model_path = "model-a.gguf";
+        cfg.vllm_settings.served_model_name = "served-agent-a";
+        agents.create_agent(cfg);
+
+        mm::AgentQueue queue;
+        mm::NodeRegistry registry(dir.string());
+        mm::AgentScheduler scheduler(registry, (dir / "models").string());
+        mm::ControlApiServer api(
+            agents, queue, registry, scheduler,
+            dir.string(), (dir / "models").string(), "control-secret");
+
+        const uint16_t port = find_free_test_port();
+        CHECK(port != 0);
+        const std::string base_url = "http://127.0.0.1:" + std::to_string(port);
+        std::atomic<bool> listen_returned{false};
+        std::atomic<bool> listen_ok{false};
+        std::thread server_thread([&] {
+            listen_ok = api.listen_openai_compat(port);
+            listen_returned = true;
+        });
+
+        mm::HttpClient client(base_url);
+        auto with_retry = [](auto&& request) {
+            mm::HttpResponse resp;
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                resp = request();
+                if (resp.status != 0) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            return resp;
+        };
+
+        bool server_ready = false;
+        for (int i = 0; i < 50; ++i) {
+            auto resp = client.get("/v1/models");
+            if (resp.status != 0) {
+                server_ready = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        RECORD(server_ready);
+
+        auto missing = with_retry([&] { return client.get("/v1/models"); });
+        RECORD(missing.status == 401);
+        RECORD(missing.body.find("missing bearer token") != std::string::npos);
+        RECORD(missing.body.find("\"type\":\"authentication_error\"") != std::string::npos);
+
+        client.set_bearer_token("control-secret");
+        auto models = with_retry([&] { return client.get("/v1/models"); });
+        RECORD(models.status == 200);
+        auto models_body = nlohmann::json::parse(models.body);
+        RECORD(models_body["object"] == "list");
+        RECORD(models_body["data"].size() == 1);
+        RECORD(models_body["data"][0]["id"] == "agent:agent-a");
+
+        auto model = with_retry([&] { return client.get("/v1/models/served-agent-a"); });
+        RECORD(model.status == 200);
+        auto model_body = nlohmann::json::parse(model.body);
+        RECORD(model_body["id"] == "agent:agent-a");
+        RECORD(model_body["metadata"]["agent_id"] == "agent-a");
+
+        auto missing_model = with_retry([&] {
+            return client.post(
+                "/v1/chat/completions",
+                nlohmann::json{
+                    {"model", "missing-model"},
+                    {"messages", nlohmann::json::array({{
+                        {"role", "user"},
+                        {"content", "hello"}
+                    }})}
+                });
+        });
+        RECORD(missing_model.status == 404);
+        RECORD(missing_model.body.find("use agent:{agent_id}") != std::string::npos);
+
+        auto invalid_messages = with_retry([&] {
+            return client.post(
+                "/v1/chat/completions",
+                nlohmann::json{
+                    {"model", "agent:agent-a"},
+                    {"messages", nlohmann::json::array()}
+                });
+        });
+        RECORD(invalid_messages.status == 400);
+        RECORD(invalid_messages.body.find("messages must not be empty") != std::string::npos);
+
+        api.stop_openai_compat();
+        if (server_thread.joinable()) server_thread.join();
+        RECORD(listen_ok);
+        RECORD(listen_returned);
+        queue.shutdown();
+    }
+    RECORD(remove_tree(dir));
+#undef RECORD
+    return ok;
+}
+
+bool test_control_api_agent_api_mode_chat() {
+    auto dir = temp_test_dir("control-api-agent-mode");
+    std::filesystem::create_directories(dir);
+    std::filesystem::create_directories(dir / "models");
+
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    const uint16_t backend_port = find_free_test_port();
+    CHECK(backend_port != 0);
+    const std::string backend_url = "http://127.0.0.1:" + std::to_string(backend_port);
+
+    httplib::Server backend;
+    std::mutex captured_mx;
+    std::string captured_auth;
+    nlohmann::json captured_body;
+    int captured_requests = 0;
+
+    backend.Get("/health", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(nlohmann::json{{"ok", true}}.dump(), "application/json");
+    });
+    backend.Post("/v1/chat/completions",
+        [&](const httplib::Request& req, httplib::Response& res) {
+            {
+                std::lock_guard<std::mutex> lock(captured_mx);
+                captured_auth = req.get_header_value("Authorization");
+                captured_body = nlohmann::json::parse(req.body);
+                ++captured_requests;
+            }
+            const std::string body =
+                "data: {\"choices\":[{\"delta\":{\"content\":\"frontier \"}}]}\n\n"
+                "data: {\"choices\":[{\"delta\":{\"content\":\"reply\"}}]}\n\n"
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],"
+                "\"usage\":{\"completion_tokens\":2}}\n\n"
+                "data: [DONE]\n\n";
+            res.set_content(body, "text/event-stream");
+        });
+
+    std::atomic<bool> backend_listen_returned{false};
+    std::atomic<bool> backend_listen_ok{false};
+    std::thread backend_thread([&] {
+        backend_listen_ok = backend.listen("127.0.0.1", backend_port);
+        backend_listen_returned = true;
+    });
+
+    mm::HttpClient backend_client(backend_url);
+    bool backend_ready = false;
+    for (int i = 0; i < 50; ++i) {
+        auto resp = backend_client.get("/health");
+        if (resp.status == 200) {
+            backend_ready = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    RECORD(backend_ready);
+
+    {
+        mm::AgentManager agents(dir.string());
+        mm::AgentQueue queue;
+        mm::NodeRegistry registry(dir.string());
+        mm::AgentScheduler scheduler(registry, (dir / "models").string());
+        mm::ControlApiServer api(
+            agents, queue, registry, scheduler,
+            dir.string(), (dir / "models").string(), "");
+
+        const uint16_t port = find_free_test_port();
+        CHECK(port != 0);
+        const std::string base_url = "http://127.0.0.1:" + std::to_string(port);
+        std::atomic<bool> listen_returned{false};
+        std::atomic<bool> listen_ok{false};
+        std::thread server_thread([&] {
+            listen_ok = api.listen(port);
+            listen_returned = true;
+        });
+
+        mm::HttpClient client(base_url);
+        bool server_ready = false;
+        for (int i = 0; i < 50; ++i) {
+            auto resp = client.get("/v1/agents");
+            if (resp.status != 0) {
+                server_ready = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        RECORD(server_ready);
+
+        auto with_retry = [](auto&& request) {
+            mm::HttpResponse resp;
+            for (int attempt = 0; attempt < 8; ++attempt) {
+                resp = request();
+                if (resp.status != 0) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            return resp;
+        };
+
+        auto create = with_retry([&] {
+            return client.post(
+                "/v1/agents",
+                nlohmann::json{
+                    {"id", "api-agent"},
+                    {"name", "API Agent"},
+                    {"inference_backend", "api"},
+                    {"model_path", "frontier-test-model"},
+                    {"memories_enabled", false},
+                    {"tools_enabled", false},
+                    {"api_settings", {
+                        {"base_url", backend_url},
+                        {"chat_completions_path", "/v1/chat/completions"},
+                        {"api_key", "test-secret"},
+                        {"api_key_env", ""}
+                    }}
+                });
+        });
+        RECORD(create.status == 201);
+        RECORD(create.body.find("test-secret") == std::string::npos);
+        if (create.status == 201) {
+            auto body = nlohmann::json::parse(create.body);
+            RECORD(body["inference_backend"] == "api");
+            RECORD(body["api_settings"]["api_key_configured"] == true);
+            RECORD(body["node_compatibility"]["backend"] == "api");
+            RECORD(body["node_compatibility"]["requires_node"] == false);
+        }
+
+        auto agent_resp = with_retry([&] { return client.get("/v1/agents/api-agent"); });
+        RECORD(agent_resp.status == 200);
+        RECORD(agent_resp.body.find("test-secret") == std::string::npos);
+        if (agent_resp.status == 200) {
+            auto body = nlohmann::json::parse(agent_resp.body);
+            RECORD(body["status"] == "api");
+            RECORD(body["inference_backend"] == "api");
+            RECORD(body["node_compatibility"]["backend"] == "api");
+            RECORD(body["node_compatibility"]["requires_node"] == false);
+        }
+
+        struct StreamAttempt {
+            bool ok = false;
+            int status = 0;
+            std::string body;
+            std::vector<std::string> events;
+        };
+        auto stream_chat = [&] {
+            StreamAttempt attempt;
+            for (int retry = 0; retry < 3; ++retry) {
+                attempt = StreamAttempt{};
+                attempt.ok = client.stream_post(
+                    "/v1/agents/api-agent/chat",
+                    nlohmann::json{{"message", "hello from test"}},
+                    [&](const std::string& event) {
+                        attempt.events.push_back(event);
+                        return true;
+                    },
+                    &attempt.status,
+                    &attempt.body);
+                if (attempt.ok || attempt.status != 0) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            return attempt;
+        };
+
+        auto chat = stream_chat();
+        RECORD(chat.ok);
+        RECORD(chat.status == 200);
+
+        std::string combined_delta;
+        bool saw_done = false;
+        for (const auto& event : chat.events) {
+            if (event == "[DONE]") continue;
+            auto j = nlohmann::json::parse(event);
+            const std::string type = j.value("type", std::string{});
+            if (type == "delta") {
+                combined_delta += j.value("content", std::string{});
+            } else if (type == "done") {
+                saw_done = j.value("success", false);
+            }
+        }
+        RECORD(combined_delta == "frontier reply");
+        RECORD(saw_done);
+
+        std::string auth;
+        nlohmann::json sent;
+        int request_count = 0;
+        {
+            std::lock_guard<std::mutex> lock(captured_mx);
+            auth = captured_auth;
+            sent = captured_body;
+            request_count = captured_requests;
+        }
+        RECORD(request_count == 1);
+        RECORD(auth == "Bearer test-secret");
+        RECORD(sent["model"] == "frontier-test-model");
+        RECORD(sent["stream"] == true);
+        RECORD(sent.dump().find("hello from test") != std::string::npos);
+
+        api.stop();
+        if (server_thread.joinable()) server_thread.join();
+        RECORD(listen_ok);
+        RECORD(listen_returned);
+        queue.shutdown();
+    }
+
+    backend.stop();
+    if (backend_thread.joinable()) backend_thread.join();
+    RECORD(backend_listen_ok);
+    RECORD(backend_listen_returned);
+    RECORD(remove_tree(dir));
+#undef RECORD
+    return ok;
+}
+
 bool test_agent_voice_db_and_cache_lifecycle() {
     auto dir = temp_test_dir("agent-voice-db");
     std::filesystem::create_directories(dir);
@@ -1147,7 +1600,8 @@ bool test_agent_voice_db_and_cache_lifecycle() {
 }
 
 bool test_tts_service_client_fake_sidecar_paths() {
-    const uint16_t port = 49290;
+    const uint16_t port = find_free_test_port();
+    CHECK(port != 0);
     httplib::Server server;
 
     server.Get("/health", [](const httplib::Request&, httplib::Response& res) {
@@ -1249,7 +1703,8 @@ bool test_tts_service_client_fake_sidecar_paths() {
 }
 
 bool test_tts_service_client_vllm_backend_paths() {
-    const uint16_t port = 49291;
+    const uint16_t port = find_free_test_port();
+    CHECK(port != 0);
     httplib::Server server;
     std::mutex requests_mutex;
     std::vector<nlohmann::json> requests;
@@ -1412,7 +1867,8 @@ bool test_control_api_tts_routes_disabled() {
             agents, queue, registry, scheduler,
             dir.string(), (dir / "models").string());
 
-        const uint16_t port = 49289;
+        const uint16_t port = find_free_test_port();
+        CHECK(port != 0);
         std::atomic<bool> listen_returned{false};
         std::atomic<bool> listen_ok{false};
         std::thread server_thread([&] {
@@ -1499,7 +1955,8 @@ bool test_control_api_curation_routes() {
         agents, queue, registry, scheduler,
         dir.string(), (dir / "models").string());
 
-    const uint16_t port = 49288;
+    const uint16_t port = find_free_test_port();
+    CHECK(port != 0);
     std::atomic<bool> listen_returned{false};
     std::atomic<bool> listen_ok{false};
     std::thread server_thread([&] {
@@ -1975,6 +2432,7 @@ bool test_compaction_followup_trace_provenance_survives() {
         const mm::ConvId continued_conv_id = conv_mgr.force_compact(source_conv_id, cfg);
         CHECK(!continued_conv_id.empty());
         CHECK(continued_conv_id != source_conv_id);
+        CHECK(llama.last_model == "model.gguf");
 
         auto source = db.load_conversation(source_conv_id);
         auto continued = db.load_conversation(continued_conv_id);
@@ -2143,6 +2601,8 @@ int main(int argc, char** argv) {
         {"agent_queue_survives_throwing_job", test_agent_queue_survives_throwing_job},
         {"agent_manager_rejects_duplicates_and_defers_cleanup_until_handles_release",
          test_agent_manager_rejects_duplicates_and_defers_cleanup_until_handles_release},
+        {"agent_api_settings_round_trip_without_key_persistence",
+         test_agent_api_settings_round_trip_without_key_persistence},
         {"slot_manager_not_found_statuses", test_slot_manager_not_found_statuses},
         {"slot_lease_blocks_unload_and_suspend_while_busy",
          test_slot_lease_blocks_unload_and_suspend_while_busy},
@@ -2160,6 +2620,8 @@ int main(int argc, char** argv) {
          test_vllm_metrics_parse_and_slot_info_round_trip},
         {"engine_group_planner",
          test_engine_group_planner},
+        {"engine_group_launch_helpers",
+         test_engine_group_launch_helpers},
         {"ray_start_args",
          test_ray_start_args},
         {"hf_cache_helpers",
@@ -2167,6 +2629,10 @@ int main(int argc, char** argv) {
         {"vllm_runtime_defaults_and_args",
          test_vllm_runtime_defaults_and_args},
         {"control_api_external_token_gate", test_control_api_external_token_gate},
+        {"openai_compat_api_listener_and_model_catalog",
+         test_openai_compat_api_listener_and_model_catalog},
+        {"control_api_agent_api_mode_chat",
+         test_control_api_agent_api_mode_chat},
         {"agent_voice_db_and_cache_lifecycle",
          test_agent_voice_db_and_cache_lifecycle},
         {"tts_service_client_fake_sidecar_paths",

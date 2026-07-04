@@ -40,7 +40,9 @@ public:
     ~ControlApiServer();
 
     bool listen(uint16_t port);
+    bool listen_openai_compat(uint16_t port);
     void stop();
+    void stop_openai_compat();
     void cleanup_expired_tts_cache();
 
     // Activity logging callback — 0=Info, 1=Warn, 2=Error.
@@ -65,6 +67,7 @@ private:
     std::string     external_api_token_;
     TtsServiceClient tts_;
     std::unique_ptr<HttpServer> server_;
+    std::unique_ptr<HttpServer> openai_server_;
     LogCallback     log_cb_;
     mutable std::mutex activity_mutex_;
     std::deque<nlohmann::json> activity_entries_;
@@ -74,8 +77,11 @@ private:
     using DoneCb  = std::function<void(const ConvId&, bool, const std::string&)>;
 
     void register_routes();
+    void register_openai_compat_routes();
     bool authorize_external_request(const httplib::Request& req,
                                     httplib::Response& res) const;
+    bool authorize_openai_compat_request(const httplib::Request& req,
+                                         httplib::Response& res) const;
 
     // Runs on the AgentQueue worker thread: builds context, routes to node,
     // proxies SSE, persists messages, fires callbacks.

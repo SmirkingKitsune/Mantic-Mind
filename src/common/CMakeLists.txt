@@ -29,8 +29,11 @@ target_link_libraries(mm_common PUBLIC
     httplib::httplib
     nlohmann_json::nlohmann_json
     spdlog::spdlog
+    OpenSSL::SSL
     OpenSSL::Crypto
     ${MM_PLATFORM_LIBS}
 )
+
+target_compile_definitions(mm_common PUBLIC CPPHTTPLIB_OPENSSL_SUPPORT)
 
 target_compile_features(mm_common PUBLIC cxx_std_20)

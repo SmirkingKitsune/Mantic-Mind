@@ -87,6 +87,8 @@ static mm::ControlConfig load_config(
     if (!loaded_from.empty()) {
         cfg.listen_port = static_cast<uint16_t>(
             file.get_int("listen_port", static_cast<int>(cfg.listen_port)));
+        cfg.openai_compat_port = static_cast<uint16_t>(
+            file.get_int("openai_compat_port", static_cast<int>(cfg.openai_compat_port)));
         cfg.data_dir    = file.get("data_dir",  cfg.data_dir);
         cfg.log_file    = file.get("log_file",   cfg.log_file);
         cfg.node_health_poll_interval_s = static_cast<uint32_t>(
@@ -143,6 +145,8 @@ static mm::ControlConfig load_config(
 
     cfg.listen_port = static_cast<uint16_t>(
         env_int("MM_CONTROL_PORT", static_cast<int>(cfg.listen_port)));
+    cfg.openai_compat_port = static_cast<uint16_t>(
+        env_int("MM_OPENAI_COMPAT_PORT", static_cast<int>(cfg.openai_compat_port)));
     cfg.data_dir    = env("MM_DATA_DIR",    cfg.data_dir);
     cfg.log_file    = env("MM_LOG_FILE",    cfg.log_file);
     cfg.models_dir  = env("MM_MODELS_DIR",  cfg.models_dir);
@@ -906,6 +910,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if (cfg.openai_compat_port != 0 && cfg.openai_compat_port == cfg.listen_port) {
+        std::fprintf(stderr,
+                     "openai_compat_port must differ from listen_port, or be 0 to disable it.\n");
+        return 1;
+    }
+
     // Ensure models directory exists.
     {
         namespace fs = std::filesystem;
@@ -921,6 +931,9 @@ int main(int argc, char** argv) {
         spdlog::level::trace);
 
     MM_INFO("mantic-mind-control starting on port {}", cfg.listen_port);
+    if (cfg.openai_compat_port != 0) {
+        MM_INFO("OpenAI-compatible API starting on port {}", cfg.openai_compat_port);
+    }
     MM_INFO("Control config source: {}",
             cfg_path.empty() ? "(defaults/env only; no config file found)" : cfg_path);
 
@@ -1015,6 +1028,26 @@ int main(int argc, char** argv) {
         }
     });
 
+    std::thread openai_server_thread;
+    if (cfg.openai_compat_port != 0) {
+        openai_server_thread = std::thread([&] {
+            MM_INFO("OpenAI-compatible API listening on 0.0.0.0:{}", cfg.openai_compat_port);
+            api_server.publish_activity(
+                0,
+                "OpenAI-compatible API listening on port " +
+                    std::to_string(cfg.openai_compat_port));
+            if (!api_server.listen_openai_compat(cfg.openai_compat_port)) {
+                MM_ERROR("OpenAI-compatible API failed on port {}", cfg.openai_compat_port);
+                api_server.publish_activity(
+                    2,
+                    "OpenAI-compatible API failed to start on port " +
+                        std::to_string(cfg.openai_compat_port));
+                ui.quit();
+                if (g_control_cli_stop) g_control_cli_stop->store(true);
+            }
+        });
+    }
+
     // ── TUI on main thread (blocks until user quits) ──────────────────────────
 
     if (args.mode == ControlRunMode::Tui) {
@@ -1042,10 +1075,12 @@ int main(int argc, char** argv) {
     if (housekeeping_thread.joinable()) housekeeping_thread.join();
 
     api_server.stop();
+    api_server.stop_openai_compat();
     registry.stop_discovery_listen();
     registry.stop_health_poll();
     queue.shutdown();
     if (server_thread.joinable()) server_thread.join();
+    if (openai_server_thread.joinable()) openai_server_thread.join();
     MM_INFO("mantic-mind-control stopped");
 
     return 0;

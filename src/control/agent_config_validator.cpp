@@ -22,6 +22,12 @@ bool is_blank(const std::string& s) {
     return util::trim(s).empty();
 }
 
+std::string normalized_backend(const AgentConfig& cfg) {
+    std::string backend = util::to_lower(util::trim(cfg.inference_backend));
+    if (backend.empty() || backend == "llama.cpp") return "vllm";
+    return backend;
+}
+
 } // namespace
 
 AgentValidationResult validate_agent_config(const AgentConfig& cfg,
@@ -41,6 +47,13 @@ AgentValidationResult validate_agent_config(const AgentConfig& cfg,
     }
     if (is_blank(cfg.model_path)) {
         add_issue(result, ValidationSeverity::Error, "model_path", "Model path is required.");
+    }
+    const std::string backend = normalized_backend(cfg);
+    if (backend != "vllm" && backend != "api") {
+        add_issue(result,
+                  ValidationSeverity::Error,
+                  "inference_backend",
+                  "inference_backend must be 'vllm' or 'api'.");
     }
     if (!cfg.id.empty() && !util::is_valid_agent_id(cfg.id)) {
         add_issue(result,
@@ -86,26 +99,49 @@ AgentValidationResult validate_agent_config(const AgentConfig& cfg,
     if (cfg.llama_settings.ubatch_size != -1 && cfg.llama_settings.ubatch_size <= 0) {
         add_issue(result, ValidationSeverity::Error, "llama_settings.ubatch_size", "ubatch_size must be greater than 0, or -1 for the llama-server default.");
     }
-    if (cfg.vllm_settings.max_model_len <= 0) {
-        add_issue(result, ValidationSeverity::Error, "vllm_settings.max_model_len", "max_model_len must be greater than 0.");
-    }
-    if (cfg.vllm_settings.max_num_seqs <= 0) {
-        add_issue(result, ValidationSeverity::Error, "vllm_settings.max_num_seqs", "max_num_seqs must be greater than 0.");
-    }
-    if (cfg.vllm_settings.max_num_batched_tokens != -1 &&
-        cfg.vllm_settings.max_num_batched_tokens <= 0) {
-        add_issue(result, ValidationSeverity::Error, "vllm_settings.max_num_batched_tokens", "max_num_batched_tokens must be greater than 0, or -1 for the vLLM default.");
-    }
-    if (cfg.vllm_settings.tensor_parallel_size <= 0) {
-        add_issue(result, ValidationSeverity::Error, "vllm_settings.tensor_parallel_size", "tensor_parallel_size must be greater than 0.");
-    }
-    if (cfg.vllm_settings.pipeline_parallel_size <= 0) {
-        add_issue(result, ValidationSeverity::Error, "vllm_settings.pipeline_parallel_size", "pipeline_parallel_size must be greater than 0.");
-    }
-    if (cfg.vllm_settings.gpu_memory_utilization <= 0.0 ||
-        cfg.vllm_settings.gpu_memory_utilization > 1.0 ||
-        !std::isfinite(cfg.vllm_settings.gpu_memory_utilization)) {
-        add_issue(result, ValidationSeverity::Error, "vllm_settings.gpu_memory_utilization", "gpu_memory_utilization must be within (0, 1].");
+    if (backend == "vllm") {
+        if (cfg.vllm_settings.max_model_len <= 0) {
+            add_issue(result, ValidationSeverity::Error, "vllm_settings.max_model_len", "max_model_len must be greater than 0.");
+        }
+        if (cfg.vllm_settings.max_num_seqs <= 0) {
+            add_issue(result, ValidationSeverity::Error, "vllm_settings.max_num_seqs", "max_num_seqs must be greater than 0.");
+        }
+        if (cfg.vllm_settings.max_num_batched_tokens != -1 &&
+            cfg.vllm_settings.max_num_batched_tokens <= 0) {
+            add_issue(result, ValidationSeverity::Error, "vllm_settings.max_num_batched_tokens", "max_num_batched_tokens must be greater than 0, or -1 for the vLLM default.");
+        }
+        if (cfg.vllm_settings.tensor_parallel_size <= 0) {
+            add_issue(result, ValidationSeverity::Error, "vllm_settings.tensor_parallel_size", "tensor_parallel_size must be greater than 0.");
+        }
+        if (cfg.vllm_settings.pipeline_parallel_size <= 0) {
+            add_issue(result, ValidationSeverity::Error, "vllm_settings.pipeline_parallel_size", "pipeline_parallel_size must be greater than 0.");
+        }
+        if (cfg.vllm_settings.gpu_memory_utilization <= 0.0 ||
+            cfg.vllm_settings.gpu_memory_utilization > 1.0 ||
+            !std::isfinite(cfg.vllm_settings.gpu_memory_utilization)) {
+            add_issue(result, ValidationSeverity::Error, "vllm_settings.gpu_memory_utilization", "gpu_memory_utilization must be within (0, 1].");
+        }
+    } else if (backend == "api") {
+        if (is_blank(cfg.api_settings.base_url)) {
+            add_issue(result, ValidationSeverity::Error, "api_settings.base_url", "API base_url is required.");
+        }
+        if (is_blank(cfg.api_settings.chat_completions_path)) {
+            add_issue(result,
+                      ValidationSeverity::Error,
+                      "api_settings.chat_completions_path",
+                      "chat_completions_path is required.");
+        } else if (cfg.api_settings.chat_completions_path.front() != '/') {
+            add_issue(result,
+                      ValidationSeverity::Error,
+                      "api_settings.chat_completions_path",
+                      "chat_completions_path must start with '/'.");
+        }
+        if (!cfg.preferred_node_id.empty()) {
+            add_issue(result,
+                      ValidationSeverity::Warning,
+                      "preferred_node_id",
+                      "Preferred node is ignored for API-backed agents.");
+        }
     }
     if (cfg.tools_enabled && !cfg.memories_enabled) {
         add_issue(result,
@@ -114,7 +150,7 @@ AgentValidationResult validate_agent_config(const AgentConfig& cfg,
                   "Tools are enabled, but no executable tools are currently available unless Memories is also enabled.");
     }
 
-    if (!cfg.preferred_node_id.empty() && registry) {
+    if (backend == "vllm" && !cfg.preferred_node_id.empty() && registry) {
         const auto nodes = registry->list_nodes();
         auto it = std::find_if(nodes.begin(), nodes.end(), [&](const NodeInfo& node) {
             return node.id == cfg.preferred_node_id;
@@ -132,12 +168,12 @@ AgentValidationResult validate_agent_config(const AgentConfig& cfg,
         }
     }
 
-    if (cfg.vllm_settings.max_model_len > 131072) {
+    if (backend == "vllm" && cfg.vllm_settings.max_model_len > 131072) {
         add_issue(result,
                   ValidationSeverity::Warning,
                   "vllm_settings.max_model_len",
                   "max_model_len is extremely large and may fail to load or perform poorly.");
-    } else if (cfg.vllm_settings.max_model_len > 65536) {
+    } else if (backend == "vllm" && cfg.vllm_settings.max_model_len > 65536) {
         add_issue(result,
                   ValidationSeverity::Warning,
                   "vllm_settings.max_model_len",

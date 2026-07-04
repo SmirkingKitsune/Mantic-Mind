@@ -26,12 +26,19 @@ int stream_read_timeout_floor_s() {
     return kDefaultSeconds;
 }
 
+std::string client_base_url(const std::string& base_url) {
+    std::string url = util::trim(base_url);
+    if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) {
+        return url;
+    }
+    return "http://" + url;
+}
+
 httplib::Client make_cli(const std::string& base_url,
                          int connect_timeout_s,
                          int read_timeout_s,
                          int write_timeout_s) {
-    auto [h, p] = util::parse_url(base_url);
-    httplib::Client cli(h, p);
+    httplib::Client cli(client_base_url(base_url));
     cli.set_connection_timeout(connect_timeout_s);
     cli.set_read_timeout(read_timeout_s);
     cli.set_write_timeout(write_timeout_s);
@@ -110,8 +117,7 @@ bool HttpClient::stream_post(const std::string& path,
                               SseLineCallback line_cb,
                               int* out_status,
                               std::string* out_body) {
-    auto [h, p] = util::parse_url(base_url_);
-    httplib::Client cli(h, p);
+    httplib::Client cli(client_base_url(base_url_));
     cli.set_connection_timeout(connect_timeout_s_);
     cli.set_read_timeout(std::max(read_timeout_s_, stream_read_timeout_floor_s()));
     cli.set_write_timeout(std::max(write_timeout_s_, 30));

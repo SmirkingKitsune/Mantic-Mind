@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS agent_config (
     name              TEXT    NOT NULL,
     model_path        TEXT    NOT NULL DEFAULT '',
     system_prompt     TEXT    NOT NULL DEFAULT '',
-    inference_backend TEXT    NOT NULL DEFAULT 'llama.cpp',
+    inference_backend TEXT    NOT NULL DEFAULT 'vllm',
 
     -- LlamaSettings columns
     ctx_size          INTEGER NOT NULL DEFAULT 4096,
@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS agent_config (
     flash_attn        INTEGER NOT NULL DEFAULT 1,   -- stored as bool (0/1)
     extra_args_json   TEXT    NOT NULL DEFAULT '[]', -- JSON array of strings
     vllm_settings_json TEXT   NOT NULL DEFAULT '{}',
+    api_settings_json TEXT    NOT NULL DEFAULT '{}',
 
     -- Feature flags
     reasoning_enabled INTEGER NOT NULL DEFAULT 0,

@@ -8,6 +8,7 @@
 #include "common/models.hpp"
 #include "common/logger.hpp"
 #include "common/tool_executor.hpp"
+#include "common/tui_widgets.hpp"
 #include "common/util.hpp"
 
 #include <ftxui/component/component.hpp>
@@ -19,11 +20,14 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <ctime>
+#include <deque>
 #include <filesystem>
+#include <map>
 #include <set>
 #include <string>
 #include <thread>
@@ -63,6 +67,62 @@ ftxui::Component MakeCatchEventAfter(ftxui::Component child,
     auto component = std::make_shared<CatchEventAfter>(std::move(on_event));
     component->Add(std::move(child));
     return component;
+}
+
+// A vertical divider the user can drag left/right to resize an adjacent pane.
+// It writes the new pane width (in columns) through `split_`, clamped to
+// [lo_, hi_]. On mouse-press it grabs the mouse capture so drag continues even
+// when the cursor leaves the 1-column bar; once dragging, it consumes Moved
+// events regardless of position. The ◄/► buttons remain a keyboard fallback.
+class DragDivider : public ftxui::ComponentBase {
+public:
+    DragDivider(int* split, int lo, int hi) : split_(split), lo_(lo), hi_(hi) {}
+
+    ftxui::Element OnRender() override {
+        using namespace ftxui;
+        Element bar = dragging_ ? (separatorHeavy() | color(Color::Cyan))
+                                : (separator() | color(Color::GrayDark));
+        return bar | reflect(box_);
+    }
+
+    bool OnEvent(ftxui::Event event) override {
+        using namespace ftxui;
+        if (!event.is_mouse()) return false;
+        auto& m = event.mouse();
+        if (m.button == Mouse::Left && m.motion == Mouse::Pressed &&
+            box_.Contain(m.x, m.y)) {
+            captured_ = CaptureMouse(event);
+            if (!captured_) return false;
+            dragging_ = true;
+            start_x_ = m.x;
+            start_split_ = *split_;
+            return true;
+        }
+        if (dragging_ && m.motion == Mouse::Moved) {
+            *split_ = std::clamp(start_split_ + (m.x - start_x_), lo_, hi_);
+            return true;
+        }
+        if (dragging_ && m.motion == Mouse::Released) {
+            dragging_ = false;
+            captured_.reset();
+            return true;
+        }
+        return false;
+    }
+
+private:
+    int* split_;
+    int  lo_;
+    int  hi_;
+    ftxui::Box  box_{};
+    bool dragging_ = false;
+    int  start_x_ = 0;
+    int  start_split_ = 0;
+    ftxui::CapturedMouse captured_;
+};
+
+ftxui::Component MakeDragDivider(int* split, int lo, int hi) {
+    return std::make_shared<DragDivider>(split, lo, hi);
 }
 
 } // namespace
@@ -136,6 +196,18 @@ void ControlUI::run() {
     int  node_sel      = 0;
     std::vector<std::string> node_entries;
 
+    // 1a "Overview" dashboard state. node_rows is the per-frame node snapshot the
+    // node-menu transform indexes into (set at the top of nodes_renderer, read
+    // during node_menu->Render() in the same frame). The history maps back the
+    // per-node CPU/GPU sparklines and the cluster GPU braille graph; they are
+    // sampled at ~1 Hz from inside the renderer (FTXUI loop thread only, no lock).
+    std::vector<NodeInfo>                  node_rows;
+    std::map<NodeId, std::deque<float>>    node_hist_cpu;
+    std::map<NodeId, std::deque<float>>    node_hist_gpu;
+    std::deque<float>                      cluster_gpu_hist;
+    int64_t                                nodes_last_sample_ms = 0;
+    constexpr size_t                       kHistLen = 60;
+
     // Modals
     bool show_add_node  = false;
     bool show_pin_entry = false;
@@ -144,15 +216,26 @@ void ControlUI::run() {
     std::string add_url;
     std::string pin_input, pair_url, pair_nonce;
 
-    // Agents tab
+    // Agents tab — the editor is re-fielded to vLLM engine settings (1b).
     int  agent_sel    = 0;
     bool show_editor  = false;
+    std::vector<AgentConfig> agent_rows;   // per-frame snapshot the menu transform indexes
     std::string ed_id, ed_id_orig, ed_name, ed_model, ed_sysprompt, ed_pref_node;
-    std::string ed_ctx_s{"4096"}, ed_gpu_s{"-1"}, ed_thr_s{"-1"}, ed_http_thr_s{"-1"};
-    std::string ed_parallel_s{"1"}, ed_batch_s{"-1"}, ed_ubatch_s{"-1"};
+    // Sampling (generation settings still flow through LlamaSettings in the request contract)
     std::string ed_temp_s{"0.70"}, ed_topp_s{"0.90"}, ed_max_s{"1024"};
-    std::string ed_extra_args_text;
-    bool ed_flash{true}, ed_reasoning{false}, ed_memories{true}, ed_tools{false};
+    // Engine · vLLM
+    std::string ed_mml_s{"4096"};      // max_model_len
+    std::string ed_seqs_s{"16"};       // max_num_seqs
+    std::string ed_batched_s{"-1"};    // max_num_batched_tokens
+    std::string ed_tp_s{"1"};          // tensor_parallel_size
+    std::string ed_pp_s{"1"};          // pipeline_parallel_size
+    std::string ed_gpumem_s{"0.90"};   // gpu_memory_utilization
+    std::string ed_dtype{"auto"};      // dtype
+    std::string ed_quant;              // quantization
+    std::string ed_toolparser;         // tool_call_parser
+    std::string ed_extra_args_text;    // vllm_settings.extra_args (one per line)
+    bool ed_reasoning{false}, ed_memories{true}, ed_tools{false};
+    bool ed_sleep{true}, ed_prefix{true}, ed_trust{false}, ed_autotool{false};
     ModelCapabilityInfo ed_model_info;
     std::vector<ValidationIssue> ed_validation_issues;
     std::string ed_validation_signature;
@@ -167,6 +250,7 @@ void ControlUI::run() {
     // Chat tab
     int chat_agent_sel = 0;
     std::vector<std::string> chat_agent_entries;
+    std::vector<AgentConfig> chat_agent_rows;   // per-frame snapshot for the rich menu rows
     std::string chat_input;
 
     std::mutex              chat_mutex;
@@ -231,22 +315,6 @@ void ControlUI::run() {
     int fb_sel = 0;
 
     //
-
-    auto gauge_row = [](const std::string& label, float pct,
-                        const std::string& detail) -> Element {
-        float r = std::max(0.0f, std::min(1.0f, pct / 100.0f));
-        Color c = pct > 80.0f ? Color::Red
-                : pct > 60.0f ? Color::Yellow
-                              : Color::Green;
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%5.1f%%", static_cast<double>(pct));
-        return hbox({
-            text(label) | size(WIDTH, EQUAL, 5),
-            gauge(r) | color(c) | size(WIDTH, EQUAL, 16),
-            text(" "), text(buf),
-            detail.empty() ? text("") : (text("  " + detail) | color(Color::GrayDark)),
-        });
-    };
 
     auto mb_str = [](int64_t mb) -> std::string {
         if (mb >= 1024) {
@@ -385,29 +453,38 @@ void ControlUI::run() {
         cfg.model_path = ed_model;
         cfg.system_prompt = ed_sysprompt;
         cfg.preferred_node_id = ed_pref_node;
-        try { cfg.llama_settings.ctx_size = std::stoi(ed_ctx_s); } catch (...) {}
-        try { cfg.llama_settings.n_gpu_layers = std::stoi(ed_gpu_s); } catch (...) {}
-        try { cfg.llama_settings.n_threads = std::stoi(ed_thr_s); } catch (...) {}
-        try { cfg.llama_settings.n_threads_http = std::stoi(ed_http_thr_s); } catch (...) {}
-        try { cfg.llama_settings.parallel = std::stoi(ed_parallel_s); } catch (...) {}
-        try { cfg.llama_settings.batch_size = std::stoi(ed_batch_s); } catch (...) {}
-        try { cfg.llama_settings.ubatch_size = std::stoi(ed_ubatch_s); } catch (...) {}
+        // Generation (shared request contract → LlamaSettings)
         try { cfg.llama_settings.temperature = std::stof(ed_temp_s); } catch (...) {}
         try { cfg.llama_settings.top_p = std::stof(ed_topp_s); } catch (...) {}
         try { cfg.llama_settings.max_tokens = std::stoi(ed_max_s); } catch (...) {}
-        cfg.llama_settings.flash_attn = ed_flash;
+        // Engine · vLLM
+        try { cfg.vllm_settings.max_model_len = std::stoi(ed_mml_s); } catch (...) {}
+        try { cfg.vllm_settings.max_num_seqs = std::stoi(ed_seqs_s); } catch (...) {}
+        try { cfg.vllm_settings.max_num_batched_tokens = std::stoi(ed_batched_s); } catch (...) {}
+        try { cfg.vllm_settings.tensor_parallel_size = std::stoi(ed_tp_s); } catch (...) {}
+        try { cfg.vllm_settings.pipeline_parallel_size = std::stoi(ed_pp_s); } catch (...) {}
+        try { cfg.vllm_settings.gpu_memory_utilization = std::stod(ed_gpumem_s); } catch (...) {}
+        cfg.vllm_settings.dtype = ed_dtype.empty() ? "auto" : ed_dtype;
+        cfg.vllm_settings.quantization = ed_quant;
+        cfg.vllm_settings.tool_call_parser = ed_toolparser;
+        cfg.vllm_settings.enable_sleep_mode = ed_sleep;
+        cfg.vllm_settings.enable_prefix_caching = ed_prefix;
+        cfg.vllm_settings.trust_remote_code = ed_trust;
+        cfg.vllm_settings.enable_auto_tool_choice = ed_autotool;
+        // Keep ctx_size aligned with max_model_len so the shared contract has a context.
+        cfg.llama_settings.ctx_size = cfg.vllm_settings.max_model_len;
         cfg.reasoning_enabled = ed_reasoning;
         cfg.memories_enabled = ed_memories;
         cfg.tools_enabled = ed_tools;
 
-        cfg.llama_settings.extra_args.clear();
+        cfg.vllm_settings.extra_args.clear();
         size_t start = 0;
         while (start <= ed_extra_args_text.size()) {
             size_t end = ed_extra_args_text.find('\n', start);
             std::string line = ed_extra_args_text.substr(
                 start, end == std::string::npos ? std::string::npos : (end - start));
             line = util::trim(line);
-            if (!line.empty()) cfg.llama_settings.extra_args.push_back(line);
+            if (!line.empty()) cfg.vllm_settings.extra_args.push_back(line);
             if (end == std::string::npos) break;
             start = end + 1;
         }
@@ -425,11 +502,13 @@ void ControlUI::run() {
     auto refresh_editor_validation = [&]() {
         const std::string signature =
             ed_id + '\n' + ed_name + '\n' + ed_model + '\n' + ed_sysprompt + '\n' + ed_pref_node +
-            '\n' + ed_ctx_s + '\n' + ed_gpu_s + '\n' + ed_thr_s + '\n' + ed_temp_s + '\n' +
-            ed_http_thr_s + '\n' + ed_parallel_s + '\n' + ed_batch_s + '\n' + ed_ubatch_s + '\n' +
-            ed_topp_s + '\n' + ed_max_s + '\n' + ed_extra_args_text + '\n' +
-            (ed_flash ? "1" : "0") + (ed_reasoning ? "1" : "0") +
-            (ed_memories ? "1" : "0") + (ed_tools ? "1" : "0");
+            '\n' + ed_temp_s + '\n' + ed_topp_s + '\n' + ed_max_s + '\n' +
+            ed_mml_s + '\n' + ed_seqs_s + '\n' + ed_batched_s + '\n' + ed_tp_s + '\n' + ed_pp_s +
+            '\n' + ed_gpumem_s + '\n' + ed_dtype + '\n' + ed_quant + '\n' + ed_toolparser + '\n' +
+            ed_extra_args_text + '\n' +
+            (ed_reasoning ? "1" : "0") + (ed_memories ? "1" : "0") + (ed_tools ? "1" : "0") +
+            (ed_sleep ? "1" : "0") + (ed_prefix ? "1" : "0") + (ed_trust ? "1" : "0") +
+            (ed_autotool ? "1" : "0");
         if (signature == ed_validation_signature) return;
         ed_validation_signature = signature;
         auto validation = validate_agent_config(build_editor_cfg(), &registry_, models_dir_, &ed_model_info);
@@ -477,8 +556,76 @@ void ControlUI::run() {
     auto disc_menu_m  = Maybe(disc_menu, [&]() { return !disc_entries.empty(); });
     auto disc_comp    = Container::Vertical({disc_menu_m, disc_btns});
 
-    // Connected (registered) nodes section
-    auto node_menu   = Menu(&node_entries, &node_sel, MenuOption::Vertical());
+    // Connected (registered) nodes section. The menu keeps FTXUI's keyboard
+    // navigation + click-to-select, but each entry is rendered as a rich 1a table
+    // row (health, CPU/GPU sparklines, VRAM gauge, slot dots) by indexing the
+    // per-frame node_rows snapshot the renderer fills in.
+    MenuOption node_menu_opt = MenuOption::Vertical();
+    node_menu_opt.entries_option.transform = [&](const EntryState& st) -> Element {
+        if (st.index < 0 || st.index >= static_cast<int>(node_rows.size()))
+            return text(st.label);
+        const NodeInfo& n = node_rows[static_cast<size_t>(st.index)];
+        auto sep = [] { return text(" │ ") | dim; };
+
+        std::string short_id = n.id;
+        if (short_id.rfind("node-", 0) == 0) short_id = short_id.substr(5);
+
+        Color hc = n.health == NodeHealthStatus::Healthy    ? Color::Green
+                 : n.health == NodeHealthStatus::Degraded   ? Color::Yellow
+                 : n.health == NodeHealthStatus::Unhealthy  ? Color::Red
+                                                            : Color::GrayDark;
+        Element health = text("● " + to_string(n.health)) | color(hc);
+
+        const bool gpu = n.metrics.gpu_vram_total_mb > 0 || n.metrics.gpu_backend_available;
+        char cpu_pct[8], gpu_pct[8];
+        std::snprintf(cpu_pct, sizeof(cpu_pct), "%3d%%", static_cast<int>(n.metrics.cpu_percent + 0.5f));
+        std::snprintf(gpu_pct, sizeof(gpu_pct), "%3d%%", static_cast<int>(n.metrics.gpu_percent + 0.5f));
+
+        Element cpu_cell = hbox({mm::tui::sparkline(node_hist_cpu[n.id], 7), text(" "),
+                                 text(cpu_pct) | dim});
+        Element gpu_cell = gpu ? hbox({mm::tui::sparkline(node_hist_gpu[n.id], 7), text(" "),
+                                       text(gpu_pct) | dim})
+                               : (text("— metal") | dim);
+
+        float vram_pct = n.metrics.gpu_vram_total_mb > 0
+            ? static_cast<float>(n.metrics.gpu_vram_used_mb) /
+                  static_cast<float>(n.metrics.gpu_vram_total_mb) * 100.0f
+            : 0.0f;
+        Element vram_cell = gpu ? hbox({mm::tui::gauge_bar(vram_pct, 8), text(" "),
+                                        text(mm::tui::mb_str(n.metrics.gpu_vram_used_mb)) | dim})
+                                : (text("—") | dim);
+
+        int used = 0;
+        for (const auto& s : n.slots)
+            if (s.state != SlotState::Empty) ++used;
+        Elements dots;
+        dots.push_back(text(std::to_string(used) + "/" + std::to_string(n.max_slots) + " ") | dim);
+        for (const auto& s : n.slots) {
+            switch (s.state) {
+                case SlotState::Ready:      dots.push_back(text("●") | color(Color::Green)); break;
+                case SlotState::Loading:    dots.push_back(text("◐") | color(Color::Yellow)); break;
+                case SlotState::Suspending: dots.push_back(text("◑") | color(Color::Yellow)); break;
+                case SlotState::Suspended:  dots.push_back(text("◌") | dim); break;
+                case SlotState::Error:      dots.push_back(text("✗") | color(Color::Red)); break;
+                case SlotState::Empty:
+                default:                    dots.push_back(text("○") | dim); break;
+            }
+        }
+        std::string arch = n.capabilities.arch.empty() ? "—" : n.capabilities.arch;
+
+        Element row = hbox({
+            mm::tui::col(text(short_id) | bold, 12), sep(),
+            mm::tui::col(std::move(health), 11), sep(),
+            mm::tui::col(std::move(cpu_cell), 12), sep(),
+            mm::tui::col(std::move(gpu_cell), 12), sep(),
+            mm::tui::col(std::move(vram_cell), 15), sep(),
+            mm::tui::col(hbox(std::move(dots)), 12), sep(),
+            mm::tui::col(text(arch) | dim, 8),
+        });
+        if (st.active) row = std::move(row) | inverted;
+        return row;
+    };
+    auto node_menu   = Menu(&node_entries, &node_sel, node_menu_opt);
     auto forget_selected_node = [&]() {
         auto ns = registry_.list_nodes();
         if (node_sel < 0 || node_sel >= static_cast<int>(ns.size())) return;
@@ -608,15 +755,41 @@ void ControlUI::run() {
 
     //
 
-    auto agent_menu   = Menu(&agent_entries, &agent_sel, MenuOption::Vertical());
+    // Agent list — rich 1b rows (NAME | MODEL | R M T | NODE) via the menu transform.
+    MenuOption agent_menu_opt = MenuOption::Vertical();
+    agent_menu_opt.entries_option.transform = [&](const EntryState& st) -> Element {
+        if (st.index < 0 || st.index >= static_cast<int>(agent_rows.size()))
+            return text(st.label);
+        const AgentConfig& a = agent_rows[static_cast<size_t>(st.index)];
+        auto sep = [] { return text(" │ ") | dim; };
+        auto flag = [](bool on, const char* ch) -> Element {
+            return on ? (text(ch) | bold) : (text(ch) | dim);
+        };
+        Element flags = hbox({flag(a.reasoning_enabled, "R"), text(" "),
+                              flag(a.memories_enabled, "M"), text(" "),
+                              flag(a.tools_enabled, "T")});
+        std::string node = a.preferred_node_id.empty() ? "auto" : a.preferred_node_id;
+        if (node.rfind("node-", 0) == 0) node = node.substr(5);
+        Element row = hbox({
+            mm::tui::col(text(a.name) | bold, 14), sep(),
+            mm::tui::col(text(mm::tui::short_model(a.model_path, 26)), 26), sep(),
+            mm::tui::col(std::move(flags), 7), sep(),
+            mm::tui::col(text(node) | (a.preferred_node_id.empty() ? dim : color(Color::Cyan)), 10),
+        });
+        if (st.active) row = std::move(row) | inverted;
+        return row;
+    };
+    auto agent_menu   = Menu(&agent_entries, &agent_sel, agent_menu_opt);
     auto btn_new_a    = Button("[+] New", [&] {
         ed_id.clear(); ed_id_orig.clear(); ed_name = "New Agent"; ed_model.clear();
         ed_sysprompt.clear(); ed_pref_node.clear();
-        ed_ctx_s = "4096"; ed_gpu_s = "-1"; ed_thr_s = "-1"; ed_http_thr_s = "-1";
-        ed_parallel_s = "1"; ed_batch_s = "-1"; ed_ubatch_s = "-1";
         ed_temp_s = "0.70"; ed_topp_s = "0.90"; ed_max_s = "1024";
+        ed_mml_s = "4096"; ed_seqs_s = "16"; ed_batched_s = "-1";
+        ed_tp_s = "1"; ed_pp_s = "1"; ed_gpumem_s = "0.90";
+        ed_dtype = "auto"; ed_quant.clear(); ed_toolparser.clear();
         ed_extra_args_text.clear();
-        ed_flash = true; ed_reasoning = false; ed_memories = true; ed_tools = false;
+        ed_reasoning = false; ed_memories = true; ed_tools = false;
+        ed_sleep = true; ed_prefix = true; ed_trust = false; ed_autotool = false;
         ed_model_info = {};
         ed_validation_issues.clear();
         ed_validation_signature.clear();
@@ -628,25 +801,31 @@ void ControlUI::run() {
             auto& c = cs[agent_sel];
             ed_id = c.id; ed_id_orig = c.id; ed_name = c.name; ed_model = c.model_path;
             ed_sysprompt = c.system_prompt; ed_pref_node = c.preferred_node_id;
-            ed_ctx_s = std::to_string(c.llama_settings.ctx_size);
-            ed_gpu_s = std::to_string(c.llama_settings.n_gpu_layers);
-            ed_thr_s = std::to_string(c.llama_settings.n_threads);
-            ed_http_thr_s = std::to_string(c.llama_settings.n_threads_http);
-            ed_parallel_s = std::to_string(c.llama_settings.parallel);
-            ed_batch_s = std::to_string(c.llama_settings.batch_size);
-            ed_ubatch_s = std::to_string(c.llama_settings.ubatch_size);
             char tmp[32];
             snprintf(tmp, sizeof(tmp), "%.2f", static_cast<double>(c.llama_settings.temperature));
             ed_temp_s = tmp;
             snprintf(tmp, sizeof(tmp), "%.2f", static_cast<double>(c.llama_settings.top_p));
             ed_topp_s = tmp;
             ed_max_s = std::to_string(c.llama_settings.max_tokens);
+            ed_mml_s = std::to_string(c.vllm_settings.max_model_len);
+            ed_seqs_s = std::to_string(c.vllm_settings.max_num_seqs);
+            ed_batched_s = std::to_string(c.vllm_settings.max_num_batched_tokens);
+            ed_tp_s = std::to_string(c.vllm_settings.tensor_parallel_size);
+            ed_pp_s = std::to_string(c.vllm_settings.pipeline_parallel_size);
+            snprintf(tmp, sizeof(tmp), "%.2f", c.vllm_settings.gpu_memory_utilization);
+            ed_gpumem_s = tmp;
+            ed_dtype = c.vllm_settings.dtype.empty() ? "auto" : c.vllm_settings.dtype;
+            ed_quant = c.vllm_settings.quantization;
+            ed_toolparser = c.vllm_settings.tool_call_parser;
             ed_extra_args_text.clear();
-            for (size_t i = 0; i < c.llama_settings.extra_args.size(); ++i) {
+            for (size_t i = 0; i < c.vllm_settings.extra_args.size(); ++i) {
                 if (i > 0) ed_extra_args_text += '\n';
-                ed_extra_args_text += c.llama_settings.extra_args[i];
+                ed_extra_args_text += c.vllm_settings.extra_args[i];
             }
-            ed_flash = c.llama_settings.flash_attn;
+            ed_sleep = c.vllm_settings.enable_sleep_mode;
+            ed_prefix = c.vllm_settings.enable_prefix_caching;
+            ed_trust = c.vllm_settings.trust_remote_code;
+            ed_autotool = c.vllm_settings.enable_auto_tool_choice;
             ed_reasoning = c.reasoning_enabled;
             ed_memories  = c.memories_enabled;
             ed_tools     = c.tools_enabled;
@@ -670,6 +849,12 @@ void ControlUI::run() {
     auto agent_menu_m = Maybe(agent_menu, [&]() { return !agent_entries.empty(); });
     auto agent_list_comp = Container::Vertical({agent_menu_m, agent_list_btns});
 
+    // 1b editor: collapsible sections + resizable split.
+    bool ed_open_sampling = false;   // section expanded?
+    bool ed_open_engine   = true;    // vLLM engine is the focus of the re-field → open by default
+    bool ed_open_caps     = false;
+    int  ed_split         = 26;      // AGENTS context-list width (columns)
+
     // Editor inputs
     InputOption sl; sl.multiline = false;
     InputOption ml; ml.multiline = true;
@@ -681,22 +866,27 @@ void ControlUI::run() {
     auto ed_inp_model = Input(&ed_model,     sl);
     auto ed_inp_sys   = Input(&ed_sysprompt, ml);
     auto ed_inp_pnode = Input(&ed_pref_node, sl);
-    auto ed_inp_ctx   = Input(&ed_ctx_s,     sl);
-    auto ed_inp_gpu   = Input(&ed_gpu_s,     sl);
-    auto ed_inp_thr   = Input(&ed_thr_s,     sl);
-    auto ed_inp_http_thr = Input(&ed_http_thr_s, sl);
-    auto ed_inp_parallel = Input(&ed_parallel_s, sl);
-    auto ed_inp_batch = Input(&ed_batch_s, sl);
-    auto ed_inp_ubatch = Input(&ed_ubatch_s, sl);
     auto ed_inp_temp  = Input(&ed_temp_s,    sl);
     auto ed_inp_topp  = Input(&ed_topp_s,    sl);
     auto ed_inp_max   = Input(&ed_max_s,     sl);
+    auto ed_inp_mml       = Input(&ed_mml_s,      sl);
+    auto ed_inp_seqs      = Input(&ed_seqs_s,     sl);
+    auto ed_inp_batched   = Input(&ed_batched_s,  sl);
+    auto ed_inp_tp        = Input(&ed_tp_s,       sl);
+    auto ed_inp_pp        = Input(&ed_pp_s,       sl);
+    auto ed_inp_gpumem    = Input(&ed_gpumem_s,   sl);
+    auto ed_inp_dtype     = Input(&ed_dtype,      sl);
+    auto ed_inp_quant     = Input(&ed_quant,      sl);
+    auto ed_inp_toolparser = Input(&ed_toolparser, sl);
     auto ed_inp_extra = Input(&ed_extra_args_text, ml);
 
-    auto ed_cb_flash     = Checkbox("Flash Attention", &ed_flash);
-    auto ed_cb_reasoning = Checkbox("Reasoning",       &ed_reasoning);
-    auto ed_cb_memories  = Checkbox("Memories",        &ed_memories);
-    auto ed_cb_tools     = Checkbox("Tools",            &ed_tools);
+    auto ed_cb_sleep     = Checkbox("sleep_mode",   &ed_sleep);
+    auto ed_cb_prefix    = Checkbox("prefix_cache", &ed_prefix);
+    auto ed_cb_trust     = Checkbox("trust_remote", &ed_trust);
+    auto ed_cb_autotool  = Checkbox("auto_tool",    &ed_autotool);
+    auto ed_cb_reasoning = Checkbox("Reasoning",    &ed_reasoning);
+    auto ed_cb_memories  = Checkbox("Memories",     &ed_memories);
+    auto ed_cb_tools     = Checkbox("Tools",        &ed_tools);
 
     auto btn_browse_model = Button("[Browse]", [&] {
         fs::path init;
@@ -751,13 +941,55 @@ void ControlUI::run() {
                                ButtonOption::Simple());
     auto ed_form_btns = Container::Horizontal({btn_save_a, btn_cancel_a});
 
+    // Resizable split controls.
+    auto ed_split_dec = Button("◄", [&] { ed_split = std::max(18, ed_split - 3); }, ButtonOption::Simple());
+    auto ed_split_inc = Button("►", [&] { ed_split = std::min(46, ed_split + 3); }, ButtonOption::Simple());
+    auto ed_split_row = Container::Horizontal({ed_split_dec, ed_split_inc});
+    auto ed_divider   = MakeDragDivider(&ed_split, 18, 46);
+
+    // Collapsible section headers — clickable buttons whose transform draws the
+    // ▾/▸ caret + title + (when collapsed) a live summary.
+    auto section_header = [](bool* open, const char* title,
+                             std::function<std::string()> summary) -> ButtonOption {
+        ButtonOption o = ButtonOption::Simple();
+        o.transform = [open, title, summary = std::move(summary)](const EntryState& s) -> Element {
+            Element caret = text(*open ? "▾ " : "▸ ") | color(Color::Cyan);
+            Element head = hbox({caret, text(title) | bold});
+            if (!*open) head = hbox({std::move(head), text("   " + summary()) | dim});
+            return s.focused ? (std::move(head) | inverted) : head;
+        };
+        return o;
+    };
+    auto ed_sec_sampling_btn = Button("Sampling", [&] { ed_open_sampling = !ed_open_sampling; },
+        section_header(&ed_open_sampling, "Sampling",
+            [&] { return "temp " + ed_temp_s + " · top_p " + ed_topp_s + " · " + ed_max_s + " tok"; }));
+    auto ed_sec_engine_btn = Button("Engine", [&] { ed_open_engine = !ed_open_engine; },
+        section_header(&ed_open_engine, "Engine · vLLM",
+            [&] { return "mml " + ed_mml_s + " · seqs " + ed_seqs_s + " · gpu " + ed_gpumem_s +
+                         " · tp" + ed_tp_s + "/pp" + ed_pp_s; }));
+    auto ed_sec_caps_btn = Button("Caps", [&] { ed_open_caps = !ed_open_caps; },
+        section_header(&ed_open_caps, "Capabilities & options",
+            [&] { return std::string("tools ") + (ed_tools ? "y" : "n") + " · reason " +
+                         (ed_reasoning ? "y" : "n") + " · mem " + (ed_memories ? "y" : "n"); }));
+
+    // Section field groups, Maybe-gated so collapsed sections leave the focus tree.
+    auto sampling_fields = Container::Vertical({ed_inp_temp, ed_inp_topp, ed_inp_max});
+    auto sampling_m = Maybe(sampling_fields, [&] { return ed_open_sampling; });
+    auto engine_fields = Container::Vertical({
+        ed_inp_mml, ed_inp_seqs, ed_inp_batched, ed_inp_tp, ed_inp_pp,
+        ed_inp_gpumem, ed_inp_dtype, ed_inp_quant, ed_inp_toolparser,
+        ed_cb_sleep, ed_cb_prefix, ed_cb_trust, ed_cb_autotool});
+    auto engine_m = Maybe(engine_fields, [&] { return ed_open_engine; });
+    auto caps_fields = Container::Vertical({ed_cb_reasoning, ed_cb_memories, ed_cb_tools});
+    auto caps_m = Maybe(caps_fields, [&] { return ed_open_caps; });
+
     auto editor_comp  = Container::Vertical({
-        ed_inp_id, ed_inp_name, model_row, ed_inp_sys, ed_inp_pnode,
-        ed_inp_ctx, ed_inp_gpu, ed_inp_thr,
-        ed_inp_http_thr, ed_inp_parallel, ed_inp_batch, ed_inp_ubatch,
-        ed_inp_temp, ed_inp_topp, ed_inp_max,
+        ed_divider, ed_split_row,
+        ed_inp_id, ed_inp_name, model_row, ed_inp_pnode, ed_inp_sys,
+        ed_sec_sampling_btn, sampling_m,
+        ed_sec_engine_btn, engine_m,
+        ed_sec_caps_btn, caps_m,
         ed_inp_extra,
-        ed_cb_flash, ed_cb_reasoning, ed_cb_memories, ed_cb_tools,
         ed_form_btns
     });
 
@@ -837,7 +1069,21 @@ void ControlUI::run() {
     chat_iopt.multiline = false;
     chat_iopt.placeholder = "Type a prompt to test the selected agent";
     auto chat_input_comp = Input(&chat_input, chat_iopt);
-    auto chat_agent_menu = Menu(&chat_agent_entries, &chat_agent_sel, MenuOption::Vertical());
+    // Chat agent list — 1b NAME │ MODEL rows via the menu transform.
+    MenuOption chat_menu_opt = MenuOption::Vertical();
+    chat_menu_opt.entries_option.transform = [&](const EntryState& st) -> Element {
+        if (st.index < 0 || st.index >= static_cast<int>(chat_agent_rows.size()))
+            return text(st.label);
+        const AgentConfig& a = chat_agent_rows[static_cast<size_t>(st.index)];
+        Element row = hbox({
+            mm::tui::col(text(a.name) | bold, 12),
+            text(" │ ") | dim,
+            mm::tui::col(text(mm::tui::short_model(a.model_path, 16)) | dim, 16),
+        });
+        if (st.active) row = std::move(row) | inverted;
+        return row;
+    };
+    auto chat_agent_menu = Menu(&chat_agent_entries, &chat_agent_sel, chat_menu_opt);
     auto chat_agent_menu_m = Maybe(chat_agent_menu, [&]() { return !chat_agent_entries.empty(); });
 
     auto btn_chat_send = Button(" Send ", [&] {
@@ -1069,8 +1315,49 @@ void ControlUI::run() {
     //
 
     auto cur_agent_menu = Menu(&cur_agent_entries, &cur_agent_sel, MenuOption::Vertical());
-    auto cur_conv_menu  = Menu(&cur_conv_entries, &cur_conv_sel, MenuOption::Vertical());
-    auto cur_mem_menu   = Menu(&cur_mem_entries, &cur_mem_sel, MenuOption::Vertical());
+
+    // Conversations — active marker + title + token bar (1b memList style).
+    MenuOption cur_conv_opt = MenuOption::Vertical();
+    cur_conv_opt.entries_option.transform = [&](const EntryState& st) -> Element {
+        if (st.index < 0 || st.index >= static_cast<int>(cur_convs_cache.size()))
+            return text(st.label);
+        const Conversation& c = cur_convs_cache[static_cast<size_t>(st.index)];
+        int maxtok = 1;
+        for (const auto& x : cur_convs_cache) maxtok = std::max(maxtok, x.total_tokens);
+        float pct = static_cast<float>(c.total_tokens) / static_cast<float>(maxtok) * 100.0f;
+        std::string title = c.title.empty() ? "(untitled)" : c.title;
+        Element marker = c.is_active ? (text("*") | color(Color::Green) | bold) : text(" ");
+        Element row = hbox({
+            marker, text(" "),
+            mm::tui::col(text(title), 18), text(" "),
+            mm::tui::gauge_bar(pct, 10), text(" "),
+            mm::tui::col_right(text(std::to_string(c.total_tokens) + " tok") | dim, 9),
+        });
+        if (st.active) row = std::move(row) | inverted;
+        return row;
+    };
+    auto cur_conv_menu  = Menu(&cur_conv_entries, &cur_conv_sel, cur_conv_opt);
+
+    // Memories — importance value + gauge + content (1b importance style).
+    MenuOption cur_mem_opt = MenuOption::Vertical();
+    cur_mem_opt.entries_option.transform = [&](const EntryState& st) -> Element {
+        if (st.index < 0 || st.index >= static_cast<int>(cur_mems_cache.size()))
+            return text(st.label);
+        const Memory& m = cur_mems_cache[static_cast<size_t>(st.index)];
+        float pct = std::clamp(m.importance, 0.0f, 1.0f) * 100.0f;
+        Color ic = m.importance > 0.7f ? Color::Green
+                 : m.importance > 0.5f ? Color::Yellow : Color::GrayDark;
+        char imp[8];
+        std::snprintf(imp, sizeof(imp), "%.2f", static_cast<double>(m.importance));
+        Element row = hbox({
+            text(imp) | color(ic) | bold, text(" "),
+            mm::tui::gauge_bar(pct, 8), text("  "),
+            paragraph(m.content) | flex,
+        });
+        if (st.active) row = std::move(row) | inverted;
+        return row;
+    };
+    auto cur_mem_menu   = Menu(&cur_mem_entries, &cur_mem_sel, cur_mem_opt);
     auto cur_agent_menu_m = Maybe(cur_agent_menu, [&]() { return !cur_agent_entries.empty(); });
     auto cur_conv_menu_m  = Maybe(cur_conv_menu,  [&]() { return !cur_conv_entries.empty(); });
     auto cur_mem_menu_m   = Maybe(cur_mem_menu,   [&]() { return !cur_mem_entries.empty(); });
@@ -1321,368 +1608,469 @@ void ControlUI::run() {
 
     //
 
-    // Tab 1
+    // Tab 1 — 1a "Overview" dashboard
     auto nodes_renderer = Renderer(nodes_comp, [&]() {
-        //
+        using mm::tui::panel;
+        using mm::tui::gauge_line;
+        using mm::tui::braille_graph;
+        using mm::tui::slot_table;
+        using mm::tui::col;
+
+        // Discovered (unregistered) nodes
         auto dns = registry_.get_discovered_nodes();
         disc_entries.resize(dns.size());
         for (size_t i = 0; i < dns.size(); ++i)
-            disc_entries[i] = dns[i].url + "  [" + dns[i].node_id.substr(0, 8) + "...]";
-        // Clamp: when empty, leave sel at 0 (Maybe wrapper prevents menu access)
+            disc_entries[i] = dns[i].url + "  [" + dns[i].node_id.substr(0, 8) + "…]";
         if (!dns.empty() && disc_sel >= static_cast<int>(dns.size()))
             disc_sel = static_cast<int>(dns.size()) - 1;
         else if (dns.empty())
             disc_sel = 0;
 
-        //
-        auto ns = registry_.list_nodes();
-        node_entries.resize(ns.size());
-        for (size_t i = 0; i < ns.size(); ++i) {
-            auto& n = ns[i];
-            char buf[160];
-            snprintf(buf, sizeof(buf), "%-35s  %-18s  [%s]%s",
-                     n.url.c_str(),
-                     n.loaded_model.empty() ? "(no model)"
-                         : n.loaded_model.substr(0, 18).c_str(),
-                     to_string(n.health).c_str(),
-                     n.remembered ? " saved" : "");
-            node_entries[i] = buf;
+        // Connected nodes — snapshot the rich menu transform indexes into.
+        node_rows = registry_.list_nodes();
+        node_entries.resize(node_rows.size());
+        for (size_t i = 0; i < node_rows.size(); ++i) {
+            std::string sid = node_rows[i].id;
+            if (sid.rfind("node-", 0) == 0) sid = sid.substr(5);
+            node_entries[i] = sid;  // fallback; the transform renders the real row
         }
-        if (!ns.empty() && node_sel >= static_cast<int>(ns.size()))
-            node_sel = static_cast<int>(ns.size()) - 1;
-        else if (ns.empty())
+        if (!node_rows.empty() && node_sel >= static_cast<int>(node_rows.size()))
+            node_sel = static_cast<int>(node_rows.size()) - 1;
+        else if (node_rows.empty())
             node_sel = 0;
 
-        Element detail;
-        if (!ns.empty() && node_sel < static_cast<int>(ns.size())) {
-            auto& n  = ns[node_sel];
-            auto ram = mb_str(n.metrics.ram_used_mb) + "/" + mb_str(n.metrics.ram_total_mb);
-            auto gpu = n.metrics.gpu_vram_total_mb > 0
-                           ? mb_str(n.metrics.gpu_vram_used_mb) + "/" +
-                             mb_str(n.metrics.gpu_vram_total_mb)
-                           : std::string{};
-            int slot_ready = 0;
-            int slot_loading = 0;
-            int slot_suspending = 0;
-            int slot_suspended = 0;
-            int slot_error = 0;
-            for (const auto& s : n.slots) {
-                switch (s.state) {
-                    case SlotState::Ready:      ++slot_ready; break;
-                    case SlotState::Loading:    ++slot_loading; break;
-                    case SlotState::Suspending: ++slot_suspending; break;
-                    case SlotState::Suspended:  ++slot_suspended; break;
-                    case SlotState::Error:      ++slot_error; break;
-                    case SlotState::Empty:
-                    default:
-                        break;
-                }
+        // Sample metric history at ~1 Hz for the sparklines + cluster graph.
+        const int64_t nowms = util::now_ms();
+        if (nowms - nodes_last_sample_ms >= 1000) {
+            nodes_last_sample_ms = nowms;
+            auto push = [](std::deque<float>& d, float v) {
+                d.push_back(v);
+                while (d.size() > kHistLen) d.pop_front();
+            };
+            float gsum = 0.0f; int gn = 0;
+            for (const auto& n : node_rows) {
+                const bool gpu = n.metrics.gpu_vram_total_mb > 0 || n.metrics.gpu_backend_available;
+                push(node_hist_cpu[n.id], n.metrics.cpu_percent);
+                push(node_hist_gpu[n.id], gpu ? n.metrics.gpu_percent : 0.0f);
+                if (gpu && n.connected) { gsum += n.metrics.gpu_percent; ++gn; }
             }
-            const int slot_in_use = slot_ready + slot_loading + slot_suspending + slot_error;
-            const int slot_available = std::max(0, n.max_slots - slot_in_use);
-
-            auto compact_id = [](const std::string& s, size_t max_len = 8) -> std::string {
-                if (s.empty()) return "-";
-                return s.size() <= max_len ? s : s.substr(0, max_len);
-            };
-            auto compact_model = [](const std::string& p) -> std::string {
-                if (p.empty()) return "(none)";
-                std::string name = std::filesystem::path(p).filename().string();
-                if (name.empty()) name = p;
-                if (name.size() > 28) name = mm::util::utf8_truncate(name, 28) + "...";
-                return name;
-            };
-
-            Elements detail_rows = {
-                hbox({text("  URL     : "), text(n.url) | bold}),
-                hbox({text("  Saved   : "), text(n.remembered ? "yes" : "no")}),
-                hbox({text("  Platform: "), text(n.platform.empty() ? "-" : n.platform)}),
-                hbox({text("  Model   : "),
-                      text(n.loaded_model.empty() ? "(none)" : n.loaded_model) | bold}),
-                hbox({text("  Slots   : "),
-                      text(std::to_string(slot_in_use) + "/" + std::to_string(n.max_slots)
-                           + " in use  (ready " + std::to_string(slot_ready)
-                           + ", loading " + std::to_string(slot_loading)
-                           + ", suspended " + std::to_string(slot_suspended)
-                           + ", available " + std::to_string(slot_available) + ")")
-                          | bold}),
-                separator(),
-                gauge_row("  CPU", n.metrics.cpu_percent, ""),
-                gauge_row("  RAM", n.metrics.ram_percent, ram),
-                gauge_row("  GPU", n.metrics.gpu_percent, gpu),
-                separator(),
-                text("  Slot occupancy:") | bold,
-            };
-
-            if (n.slots.empty()) {
-                detail_rows.push_back(text("    (no tracked slots)") | color(Color::GrayDark));
-            } else {
-                constexpr size_t kMaxSlotLines = 6;
-                size_t shown = 0;
-                for (const auto& s : n.slots) {
-                    if (shown >= kMaxSlotLines) break;
-                    const std::string state_txt = to_string(s.state);
-                    const std::string slot_txt = compact_id(s.id, 10);
-                    const std::string agent_txt = compact_id(s.assigned_agent, 12);
-                    const std::string model_txt = compact_model(s.model_path);
-                    detail_rows.push_back(
-                        text("    [" + state_txt + "] slot:" + slot_txt +
-                             " agent:" + agent_txt + " model:" + model_txt));
-                    ++shown;
-                }
-                if (n.slots.size() > shown) {
-                    detail_rows.push_back(
-                        text("    ... +" + std::to_string(n.slots.size() - shown) + " more slot(s)")
-                        | color(Color::GrayDark));
-                }
-            }
-
-            detail = vbox(std::move(detail_rows));
-        } else {
-            detail = text("  No connected nodes.") | color(Color::GrayDark);
+            cluster_gpu_hist.push_back(gn ? gsum / static_cast<float>(gn) : 0.0f);
+            while (cluster_gpu_hist.size() > kHistLen) cluster_gpu_hist.pop_front();
         }
 
-        return vbox({
-            hbox({
-                vbox({
-                    text(" Discovered Nodes") | bold,
-                    separator(),
-                    dns.empty()
-                        ? text("  Listening for nodes...") | color(Color::GrayDark)
-                        : (disc_menu->Render() | yframe | flex),
-                    disc_btns->Render(),
-                }) | border | flex,
-                separator(),
-                vbox({
-                    text(" Connected Nodes (" + std::to_string(ns.size()) + ")") | bold,
-                    separator(),
-                    ns.empty()
-                        ? text("  No connected nodes.") | color(Color::GrayDark)
-                        : (node_menu->Render() | yframe | flex),
-                    node_btns->Render(),
-                }) | border | flex,
-            }) | size(HEIGHT, EQUAL, 9),
+        // ── Cluster summary tiles ────────────────────────────────────────
+        float sum_cpu = 0.0f, sum_gpu = 0.0f;
+        int up = 0, gnodes = 0, engines = 0;
+        int64_t vram_used = 0, vram_total = 0;
+        size_t placed = 0;
+        for (const auto& n : node_rows) {
+            if (!n.connected) continue;
+            ++up;
+            sum_cpu += n.metrics.cpu_percent;
+            const bool gpu = n.metrics.gpu_vram_total_mb > 0 || n.metrics.gpu_backend_available;
+            if (gpu) {
+                ++gnodes;
+                sum_gpu += n.metrics.gpu_percent;
+                vram_used += n.metrics.gpu_vram_used_mb;
+                vram_total += n.metrics.gpu_vram_total_mb;
+            }
+            for (const auto& s : n.slots) {
+                if (s.state == SlotState::Ready || s.state == SlotState::Loading) ++engines;
+                placed += s.agent_ids.size();
+            }
+        }
+        float avg_cpu = up ? sum_cpu / static_cast<float>(up) : 0.0f;
+        float avg_gpu = gnodes ? sum_gpu / static_cast<float>(gnodes) : 0.0f;
+        float vram_pct = vram_total
+            ? static_cast<float>(vram_used) / static_cast<float>(vram_total) * 100.0f : 0.0f;
+
+        Element cluster_panel = panel("CLUSTER", vbox({
+            gauge_line("CPU", avg_cpu),
+            gauge_line("GPU", avg_gpu),
+            gauge_line("VRM", vram_pct, mb_str(vram_used) + " / " + mb_str(vram_total)),
+            text("  " + std::to_string(engines) + " engines · " + std::to_string(placed) +
+                 " agents placed") | dim,
+        }));
+
+        char gcap[24];
+        std::snprintf(gcap, sizeof(gcap), "60s · %d%%", static_cast<int>(avg_gpu + 0.5f));
+        Element gpu_panel = panel("GPU", gcap, braille_graph(cluster_gpu_hist, 34, 4, Color::Green));
+
+        Element disc_panel = panel("DISCOVERED", std::to_string(dns.size()), vbox({
+            dns.empty() ? (text("  listening…") | dim) : (disc_menu->Render() | yframe | flex),
+            disc_btns->Render(),
+        }));
+
+        Element top_strip = hbox({
+            cluster_panel | flex,
+            gpu_panel | size(WIDTH, EQUAL, 44),
+            disc_panel | size(WIDTH, EQUAL, 40),
+        }) | size(HEIGHT, EQUAL, 8);
+
+        // ── Node table ───────────────────────────────────────────────────
+        auto sep = [] { return text(" │ ") | dim; };
+        Element head = hbox({
+            col(text("NODE"), 12), sep(),
+            col(text("HEALTH"), 11), sep(),
+            col(text("CPU%"), 12), sep(),
+            col(text("GPU%"), 12), sep(),
+            col(text("VRAM"), 15), sep(),
+            col(text("SLOTS"), 12), sep(),
+            col(text("ARCH"), 8),
+        }) | dim | bold;
+        Element table_body = node_rows.empty()
+            ? (text("  No connected nodes.") | dim | flex)
+            : (node_menu->Render() | yframe | flex);
+        Element table_panel = panel("NODES", std::to_string(node_rows.size()) + " total", vbox({
+            head,
             separator(),
-            detail | yframe | flex,
+            table_body,
+            node_btns->Render(),
+        })) | flex;
+
+        // ── Detail (selected node) ───────────────────────────────────────
+        Element detail_body;
+        std::string detail_title = "DETAIL";
+        std::string detail_cap;
+        if (!node_rows.empty() && node_sel >= 0 && node_sel < static_cast<int>(node_rows.size())) {
+            const NodeInfo& n = node_rows[static_cast<size_t>(node_sel)];
+            detail_title = "DETAIL · " + n.id;
+            detail_cap = n.url;
+            // Per-node CPU/GPU/VRAM live in the NODES table row (sparklines/gauge)
+            // and the CLUSTER tile; matching 1a, the detail shows the slot table +
+            // capabilities only — no duplicate gauges here.
+            Elements rows = {
+                hbox({text("saved ") | dim, text(n.remembered ? "yes" : "no"),
+                      text("   platform ") | dim, text(n.platform.empty() ? "—" : n.platform),
+                      text("   model ") | dim,
+                      text(n.loaded_model.empty() ? "(engine-managed)" : n.loaded_model)}),
+                text(""),
+                slot_table(n.slots, true),
+                text(""),
+            };
+            char bud[48];
+            std::snprintf(bud, sizeof(bud), "%.2f/%.2f", n.vllm_gpu_fraction_used, n.vllm_gpu_budget);
+            std::vector<std::string> caps = {
+                "arch " + (n.capabilities.arch.empty() ? std::string("—") : n.capabilities.arch),
+                std::to_string(n.capabilities.gpu_count) + " GPU",
+                "vLLM " + (n.capabilities.vllm_version.empty() ? std::string("—") : n.capabilities.vllm_version),
+                std::string("ray ") + (n.capabilities.supports_ray ? "yes" : "no"),
+                n.capabilities.comm_backends.empty() ? std::string("comm —")
+                                                     : util::join(n.capabilities.comm_backends, ","),
+                std::string("budget ") + bud,
+            };
+            rows.push_back(text("  " + util::join(caps, "  ·  ")) | dim);
+            detail_body = vbox(std::move(rows));
+        } else {
+            detail_body = text("  No connected nodes.") | dim;
+        }
+        Element detail_panel = panel(detail_title, detail_cap, std::move(detail_body)) |
+                               size(HEIGHT, EQUAL, 13);
+
+        return vbox({
+            top_strip,
+            table_panel,
+            detail_panel,
         });
     });
 
-    // Tab 2
+    // Tab 2 — 1b "Commander" agent editor
     auto agents_renderer = Renderer(agents_comp, [&]() {
-        auto cs = agents_.list_agents();
+        using mm::tui::panel;
+        using mm::tui::col;
 
+        auto cs = agents_.list_agents();
+        agent_rows = cs;                    // snapshot for the rich menu transform
         agent_entries.resize(cs.size());
-        for (size_t i = 0; i < cs.size(); ++i) {
-            auto& a  = cs[i];
-            auto model_disp = a.model_path.empty() ? "no model"
-                : (a.model_path.size() > 22 ? mm::util::utf8_truncate(a.model_path, 22) + "..."
-                                             : a.model_path);
-            agent_entries[i] = a.name + "  (" + model_disp + ")";
-        }
+        for (size_t i = 0; i < cs.size(); ++i)
+            agent_entries[i] = cs[i].name;  // fallback; the transform renders the real row
         if (agent_sel >= static_cast<int>(cs.size()) && !cs.empty())
             agent_sel = static_cast<int>(cs.size()) - 1;
+        else if (cs.empty())
+            agent_sel = 0;
+
+        auto fmt2 = [](double v) { char b[16]; std::snprintf(b, sizeof(b), "%.2f", v); return std::string(b); };
+        auto field = [](const std::string& label, Element input, int label_w = 15) -> Element {
+            return hbox({text(label) | dim | size(WIDTH, EQUAL, label_w), std::move(input)});
+        };
 
         if (show_editor) {
             refresh_editor_validation();
 
-            Elements warning_lines;
+            Elements validation;
+            bool has_issues = false;
             for (const auto& issue : ed_validation_issues) {
-                if (issue.severity != ValidationSeverity::Warning) continue;
-                warning_lines.push_back(paragraph(" - " + issue.field + ": " + issue.message) | color(Color::Yellow));
+                const bool err = issue.severity == ValidationSeverity::Error;
+                validation.push_back(
+                    paragraph(std::string(err ? "✗ " : "⚠ ") + issue.field + ": " + issue.message) |
+                    color(err ? Color::Red : Color::Yellow));
+                has_issues = true;
             }
-            if (warning_lines.empty()) {
-                warning_lines.push_back(text(" No current warnings.") | color(Color::GrayDark));
-            }
+            if (!has_issues) validation.push_back(text("✓ configuration valid") | color(Color::Green));
 
             std::vector<ToolDefinition> local_tools;
             if (ed_tools && ed_memories) local_tools = ToolExecutor::local_tool_catalog();
-
             Elements tool_lines;
-            if (!ed_tools) {
-                tool_lines.push_back(text(" Tools disabled.") | color(Color::GrayDark));
-            } else if (!ed_memories) {
-                tool_lines.push_back(paragraph(" No executable tools until Memories is enabled.") | color(Color::Yellow));
-            } else {
-                for (const auto& tool : local_tools) {
-                    tool_lines.push_back(text(" - " + tool.name) | color(Color::Cyan));
-                    tool_lines.push_back(paragraph("   " + tool.description) | color(Color::GrayDark));
+            if (!ed_tools) tool_lines.push_back(text("tools disabled") | dim);
+            else if (!ed_memories)
+                tool_lines.push_back(paragraph("no executable tools until Memories is enabled") | color(Color::Yellow));
+            else
+                for (const auto& t : local_tools) {
+                    tool_lines.push_back(text("· " + t.name) | color(Color::Cyan));
+                    tool_lines.push_back(paragraph("   " + t.description) | dim);
                 }
+
+            // Left context list — highlights the agent being edited.
+            Elements list_rows;
+            for (const auto& a : cs) {
+                if (a.id == ed_id_orig && !ed_id_orig.empty())
+                    list_rows.push_back((text("▌ " + a.name) | bold) | inverted);
+                else
+                    list_rows.push_back(text("  " + a.name) | dim);
             }
+            if (list_rows.empty()) list_rows.push_back(text("  (new agent)") | dim);
+            Element left = panel("AGENTS", vbox(std::move(list_rows)) | yframe | flex) |
+                           size(WIDTH, EQUAL, ed_split);
 
-            return vbox({
-                text(ed_id.empty() ? " New Agent" : " Edit: " + ed_name) | bold,
-                separator(),
-                hbox({
-                    // Left column: fields
-                    vbox({
-                        hbox({text(" ID            : "), ed_inp_id->Render()    | flex}),
-                        hbox({text(" Name          : "), ed_inp_name->Render()  | flex}),
-                        hbox({text(" Model path    : "), ed_inp_model->Render() | flex,
-                              text(" "), btn_browse_model->Render()}),
-                        hbox({text(" Preferred node: "), ed_inp_pnode->Render() | flex}),
-                        separator(),
-                        text(" System Prompt:"),
-                        ed_inp_sys->Render() | size(HEIGHT, LESS_THAN, 5) | border,
-                        separator(),
-                        text(" LLM Settings:"),
-                        hbox({text("  ctx_size    : "), ed_inp_ctx->Render()  | flex,
-                              text("  max_tokens  : "), ed_inp_max->Render()  | flex}),
-                        hbox({text("  gpu_layers  : "), ed_inp_gpu->Render()  | flex,
-                              text("  threads     : "), ed_inp_thr->Render()  | flex}),
-                        hbox({text("  http_threads: "), ed_inp_http_thr->Render() | flex,
-                              text("  parallel    : "), ed_inp_parallel->Render() | flex}),
-                        hbox({text("  batch_size  : "), ed_inp_batch->Render() | flex,
-                              text("  ubatch_size : "), ed_inp_ubatch->Render() | flex}),
-                        hbox({text("  temperature : "), ed_inp_temp->Render() | flex,
-                              text("  top_p       : "), ed_inp_topp->Render() | flex}),
-                        separator(),
-                        text(" Extra llama args (one per line):"),
-                        ed_inp_extra->Render() | size(HEIGHT, LESS_THAN, 5) | border,
-                    }) | flex,
-                    separator(),
-                    // Right column: toggles + status
-                    vbox({
-                        text(" Options:"),
-                        ed_cb_flash->Render(),
-                        ed_cb_reasoning->Render(),
-                        ed_cb_memories->Render(),
-                        ed_cb_tools->Render(),
-                        separator(),
-                        text(" Model Capabilities:") | bold,
-                        text(" Context limit: " +
-                             (ed_model_info.n_ctx_train > 0
-                                  ? std::to_string(ed_model_info.n_ctx_train) + " tokens"
-                                  : "unknown")),
-                        text(" Tool calling: " + capability_status(
-                                 ed_model_info.supports_tool_calls,
-                                 ed_model_info.metadata_found,
-                                 ed_model_info.used_filename_heuristics)),
-                        text(" Reasoning: " + capability_status(
-                                 ed_model_info.supports_reasoning,
-                                 ed_model_info.metadata_found,
-                                 ed_model_info.used_filename_heuristics)),
-                        paragraph(" Source: " +
-                                  (ed_model_info.source_path.empty() ? "(unresolved)" : ed_model_info.source_path))
-                            | color(Color::GrayDark),
-                        separator(),
-                        text(" Available Tools:") | bold,
-                        vbox(std::move(tool_lines)) | size(HEIGHT, LESS_THAN, 8) | yframe,
-                        separator(),
-                        text(" Warnings:") | bold,
-                        vbox(std::move(warning_lines)) | size(HEIGHT, LESS_THAN, 8) | yframe,
-                        separator(),
-                        text(""),
-                        ed_form_btns->Render(),
-                        text(""),
-                        text(" Esc to cancel") | color(Color::GrayDark),
-                    }) | size(WIDTH, EQUAL, 44),
-                }),
-            });
-        }
-
-        // List view with detail panel
-        Element detail;
-        if (cs.empty()) {
-            detail = text("  No agents. Press [+] New to create one.")
-                     | color(Color::GrayDark);
-        } else if (agent_sel < static_cast<int>(cs.size())) {
-            auto& a = cs[agent_sel];
-            auto feat = [](bool v, const std::string& label) {
-                return hbox({text(label + ": "),
-                             text(v ? "on" : "off")
-                                 | color(v ? Color::Green : Color::GrayDark)});
+            // Flat sections (1b sec() style): a header line + an indented body.
+            auto sec_static = [](const std::string& title, Element body) -> Element {
+                return vbox({
+                    text("  " + title) | bold | color(Color::Cyan),
+                    hbox({text("  "), std::move(body) | flex}),
+                    text(""),
+                });
             };
-            detail = vbox({
-                hbox({text("  Model  : "),
-                      text(a.model_path.empty() ? "(none)" : a.model_path) | bold}),
-                hbox({text("  System : "),
-                      text(a.system_prompt.empty() ? "(none)"
-                               : mm::util::utf8_truncate(a.system_prompt, 60) + "...")
-                          | color(Color::Cyan)}),
-                hbox({text("  ctx    : "),
-                      text(std::to_string(a.llama_settings.ctx_size) + " tokens")}),
-                hbox({text("  "),
-                      feat(a.reasoning_enabled, "reasoning"),
-                      text("   "),
-                      feat(a.memories_enabled,  "memories"),
-                      text("   "),
-                      feat(a.tools_enabled,     "tools")}),
-                text(""),
-                text("  POST /v1/agents/" + a.id + "/chat") | color(Color::GrayDark),
+            auto sec_toggle = [](Element header, bool open, Element body) -> Element {
+                Elements v = {std::move(header)};
+                if (open) v.push_back(hbox({text("  "), std::move(body) | flex}));
+                v.push_back(text(""));
+                return vbox(std::move(v));
+            };
+
+            Element sections = vbox({
+                sec_static("Identity", vbox({
+                    field(" id", ed_inp_id->Render() | flex),
+                    field(" name", ed_inp_name->Render() | flex),
+                })),
+                sec_static("Model & placement", vbox({
+                    hbox({text(" model_path") | dim | size(WIDTH, EQUAL, 15),
+                          ed_inp_model->Render() | flex, text(" "), btn_browse_model->Render()}),
+                    field(" preferred_node", ed_inp_pnode->Render() | flex),
+                })),
+                sec_static("System prompt",
+                           ed_inp_sys->Render() | size(HEIGHT, LESS_THAN, 5) | border),
+                sec_toggle(ed_sec_sampling_btn->Render(), ed_open_sampling, hbox({
+                    field(" temperature", ed_inp_temp->Render() | flex, 13),
+                    field(" top_p", ed_inp_topp->Render() | flex, 8),
+                    field(" max_tokens", ed_inp_max->Render() | flex, 12),
+                })),
+                sec_toggle(ed_sec_engine_btn->Render(), ed_open_engine, vbox({
+                    hbox({field(" max_model_len", ed_inp_mml->Render() | flex),
+                          field(" max_num_seqs", ed_inp_seqs->Render() | flex)}),
+                    hbox({field(" gpu_mem_util", ed_inp_gpumem->Render() | flex),
+                          field(" max_batched", ed_inp_batched->Render() | flex)}),
+                    hbox({field(" tensor_par", ed_inp_tp->Render() | flex),
+                          field(" pipeline_par", ed_inp_pp->Render() | flex)}),
+                    hbox({field(" dtype", ed_inp_dtype->Render() | flex),
+                          field(" quantization", ed_inp_quant->Render() | flex)}),
+                    field(" tool_call_parser", ed_inp_toolparser->Render() | flex),
+                    hbox({ed_cb_sleep->Render(), text("  "), ed_cb_prefix->Render(), text("  "),
+                          ed_cb_trust->Render(), text("  "), ed_cb_autotool->Render()}),
+                })),
+                sec_toggle(ed_sec_caps_btn->Render(), ed_open_caps, vbox({
+                    hbox({ed_cb_reasoning->Render(), text("   "), ed_cb_memories->Render(), text("   "),
+                          ed_cb_tools->Render()}),
+                    text("context limit: " +
+                         (ed_model_info.n_ctx_train > 0
+                              ? std::to_string(ed_model_info.n_ctx_train) + " tokens"
+                              : "unknown")) | dim,
+                    text("tool calling: " + capability_status(ed_model_info.supports_tool_calls,
+                                                              ed_model_info.metadata_found,
+                                                              ed_model_info.used_filename_heuristics)) | dim,
+                    text("reasoning: " + capability_status(ed_model_info.supports_reasoning,
+                                                           ed_model_info.metadata_found,
+                                                           ed_model_info.used_filename_heuristics)) | dim,
+                    vbox(std::move(tool_lines)) | size(HEIGHT, LESS_THAN, 6) | yframe,
+                })),
+                sec_static("Extra vLLM args (one per line)",
+                           ed_inp_extra->Render() | size(HEIGHT, LESS_THAN, 4) | border),
+                sec_static("Validation", vbox(std::move(validation))),
+                hbox({ed_form_btns->Render(), text("   Esc cancel · click ▸ to expand") | dim}),
             });
-        } else {
-            detail = text("");
+
+            Element edit_body = vbox({
+                hbox({text(" split ") | dim, ed_split_dec->Render(), text(" "), ed_split_inc->Render(),
+                      filler(), text("◄ ► or drag the divider ") | dim}),
+                separator(),
+                sections | yframe | flex,
+            });
+            Element right = panel("EDIT · " + (ed_name.empty() ? "(new)" : ed_name), edit_body) | flex;
+            return hbox({left, ed_divider->Render(), right});
         }
 
-        return vbox({
-            vbox({
-                cs.empty()
-                    ? (text("  (no agents)") | color(Color::GrayDark) | flex)
-                    : (agent_menu->Render() | yframe | flex),
-                agent_list_btns->Render(),
-            }) | size(HEIGHT, LESS_THAN, 14) | border,
-            separator(),
-            detail,
-        });
+        // ── List view (1b) ──────────────────────────────────────────────
+        auto sep = [] { return text(" │ ") | dim; };
+        Element head = hbox({
+            col(text("NAME"), 14), sep(),
+            col(text("MODEL"), 26), sep(),
+            col(text("R M T"), 7), sep(),
+            col(text("NODE"), 10),
+        }) | dim | bold;
+        Element list_body = cs.empty()
+            ? (text("  No agents. Press [+] New to create one.") | dim | flex)
+            : (agent_menu->Render() | yframe | flex);
+        Element list_panel = panel("AGENTS", std::to_string(cs.size()) + " total", vbox({
+            head, separator(), list_body, agent_list_btns->Render(),
+        })) | flex;
+
+        Element detail_panel;
+        if (!cs.empty() && agent_sel >= 0 && agent_sel < static_cast<int>(cs.size())) {
+            const auto& a = cs[static_cast<size_t>(agent_sel)];
+            auto feat = [](bool v, const std::string& label) {
+                return hbox({text(label + " ") | dim,
+                             text(v ? "yes" : "no") | color(v ? Color::Green : Color::GrayDark)});
+            };
+            detail_panel = panel("AGENT · " + a.name, "POST /v1/agents/" + a.id + "/chat", vbox({
+                hbox({text("model    ") | dim,
+                      text(a.model_path.empty() ? "(none)" : a.model_path) | bold}),
+                hbox({text("system   ") | dim,
+                      paragraph(a.system_prompt.empty() ? "(none)" : a.system_prompt) |
+                          color(Color::Cyan) | flex}),
+                hbox({text("sampling ") | dim,
+                      text("temp " + fmt2(a.llama_settings.temperature) + " · top_p " +
+                           fmt2(a.llama_settings.top_p) + " · " +
+                           std::to_string(a.llama_settings.max_tokens) + " tok")}),
+                hbox({text("engine   ") | dim,
+                      text("mml " + std::to_string(a.vllm_settings.max_model_len) + " · seqs " +
+                           std::to_string(a.vllm_settings.max_num_seqs) + " · gpu " +
+                           fmt2(a.vllm_settings.gpu_memory_utilization) + " · tp" +
+                           std::to_string(a.vllm_settings.tensor_parallel_size) + "/pp" +
+                           std::to_string(a.vllm_settings.pipeline_parallel_size) +
+                           (a.vllm_settings.enable_sleep_mode ? " · sleep" : ""))}),
+                hbox({text("caps     ") | dim, feat(a.reasoning_enabled, "reasoning"), text("  "),
+                      feat(a.memories_enabled, "memories"), text("  "),
+                      feat(a.tools_enabled, "tools")}),
+            })) | size(HEIGHT, EQUAL, 9);
+        } else {
+            detail_panel = panel("AGENT", text("  (no agents)") | dim) | size(HEIGHT, EQUAL, 9);
+        }
+
+        return vbox({list_panel, detail_panel});
     });
 
-    // Tab 3
+    // Tab 3 — 1a "Overview" activity dashboard
     auto activity_renderer = Renderer(activity_comp, [&]() {
-        // Build the visible lines directly under the lock (read-only over the entries)
-        // instead of deep-copying the whole log_entries_ buffer each frame. A level
-        // filter can require scanning past the newest 300 entries, so iterate the full
-        // buffer back-to-front and stop once 300 matches are collected.
-        Elements lines;
+        using mm::tui::panel;
+        using mm::tui::count_tile;
+        using mm::tui::braille_graph;
+        using mm::tui::col;
+
+        auto sep = [] { return text(" │ ") | dim; };
+        int c_info = 0, c_warn = 0, c_err = 0;
+        // Event-rate histogram over the last 30 minutes for the "events/min" graph.
+        constexpr int kRateBuckets = 40;
+        constexpr int64_t kRateSpanMs = 30LL * 60 * 1000;
+        std::vector<float> rate(kRateBuckets, 0.0f);
+        const int64_t act_now = util::now_ms();
+        Elements rows;
         {
             std::lock_guard<std::mutex> lk(log_mutex_);
+            for (const auto& e : log_entries_) {
+                if (e.level == LogLevel::Warn)       ++c_warn;
+                else if (e.level == LogLevel::Error) ++c_err;
+                else                                 ++c_info;
+                if (e.timestamp_ms > 0) {
+                    const int64_t age = act_now - e.timestamp_ms;
+                    if (age >= 0 && age < kRateSpanMs) {
+                        const int b = kRateBuckets - 1 -
+                                      static_cast<int>(age / (kRateSpanMs / kRateBuckets));
+                        if (b >= 0 && b < kRateBuckets) rate[static_cast<size_t>(b)] += 1.0f;
+                    }
+                }
+            }
+            // Newest-first, up to 300 matching the level filter.
             for (int i = static_cast<int>(log_entries_.size()) - 1;
-                 i >= 0 && lines.size() < 300; --i) {
+                 i >= 0 && rows.size() < 300; --i) {
                 const auto& e = log_entries_[static_cast<size_t>(i)];
                 if (log_filter == 1 && e.level != LogLevel::Info)  continue;
                 if (log_filter == 2 && e.level != LogLevel::Warn)  continue;
                 if (log_filter == 3 && e.level != LogLevel::Error) continue;
-                Color c = Color::White;
-                if (e.level == LogLevel::Warn)  c = Color::Yellow;
-                if (e.level == LogLevel::Error) c = Color::Red;
-                std::string prefix = e.level == LogLevel::Warn  ? "[WARN]  "
-                                    : e.level == LogLevel::Error ? "[ERROR] "
-                                                                 : "[INFO]  ";
+
+                std::string lvl = e.level == LogLevel::Warn  ? "WARN"
+                                : e.level == LogLevel::Error ? "ERROR" : "INFO";
                 std::string ts;
                 if (e.timestamp_ms > 0) {
-                    time_t sec = static_cast<time_t>(e.timestamp_ms / 1000);
+                    time_t secs = static_cast<time_t>(e.timestamp_ms / 1000);
                     struct tm tm_buf{};
 #ifdef _WIN32
-                    localtime_s(&tm_buf, &sec);
+                    localtime_s(&tm_buf, &secs);
 #else
-                    localtime_r(&sec, &tm_buf);
+                    localtime_r(&secs, &tm_buf);
 #endif
                     char tbuf[16];
-                    snprintf(tbuf, sizeof(tbuf), "%02d:%02d:%02d ",
+                    snprintf(tbuf, sizeof(tbuf), "%02d:%02d:%02d",
                              tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
                     ts = tbuf;
                 }
-                lines.push_back(text(ts + prefix + e.message) | color(c));
+                Element lvl_el = text(lvl);
+                Element msg_el = paragraph(e.message);
+                if (e.level == LogLevel::Warn) {
+                    lvl_el = std::move(lvl_el) | color(Color::Yellow) | bold;
+                    msg_el = std::move(msg_el) | color(Color::Yellow);
+                } else if (e.level == LogLevel::Error) {
+                    lvl_el = std::move(lvl_el) | color(Color::Red) | bold;
+                    msg_el = std::move(msg_el) | color(Color::Red);
+                } else {
+                    lvl_el = std::move(lvl_el) | dim;
+                }
+                rows.push_back(hbox({
+                    col(text(ts) | dim, 9), sep(),
+                    col(std::move(lvl_el), 6), sep(),
+                    std::move(msg_el) | flex,
+                }));
             }
         }
-        if (lines.empty())
-            lines.push_back(text("  (no events yet)") | color(Color::GrayDark));
+        if (rows.empty())
+            rows.push_back(text("  (no events yet)") | dim);
 
-        return vbox({
-            hbox({text(" Filter: "), filter_toggle->Render()}),
+        // Scale the rate histogram to 0..100 (relative heights) for the graph.
+        float rmax = 1.0f;
+        for (float v : rate) rmax = std::max(rmax, v);
+        for (float& v : rate) v = v / rmax * 100.0f;
+
+        const int total = c_info + c_warn + c_err;
+        Element tiles = hbox({
+            count_tile("EVENTS", std::to_string(total), Color::Default),
+            count_tile("INFO", std::to_string(c_info), Color::Green),
+            count_tile("WARN", std::to_string(c_warn), Color::Yellow),
+            count_tile("ERROR", std::to_string(c_err), Color::Red),
+            panel("EVENTS/MIN", "30m", braille_graph(rate, 16, 2, Color::Cyan)),
+            panel("FILTER", hbox({filter_toggle->Render(), filler()})) | flex,
+        }) | size(HEIGHT, EQUAL, 4);
+
+        Element head = hbox({
+            col(text("TIME"), 9), sep(),
+            col(text("LVL"), 6), sep(),
+            text("EVENT") | flex,
+        }) | dim | bold;
+
+        Element table = panel("ACTIVITY", "GET /v1/activity", vbox({
+            head,
             separator(),
-            vbox(std::move(lines)) | yframe | flex,
-        });
+            vbox(std::move(rows)) | yframe | flex,
+        })) | flex;
+
+        return vbox({tiles, table});
     });
 
     // Tab 4
     auto chat_renderer = Renderer(chat_comp, [&]() {
         auto cs = agents_.list_agents();
 
+        chat_agent_rows = cs;               // snapshot for the rich menu transform
         chat_agent_entries.resize(cs.size());
-        for (size_t i = 0; i < cs.size(); ++i) {
-            auto& a = cs[i];
-            chat_agent_entries[i] = a.name + " [" + a.id + "]";
-        }
+        for (size_t i = 0; i < cs.size(); ++i)
+            chat_agent_entries[i] = cs[i].name;  // fallback; the transform renders the row
         if (chat_agent_sel >= static_cast<int>(cs.size()) && !cs.empty())
             chat_agent_sel = static_cast<int>(cs.size()) - 1;
         else if (cs.empty())
@@ -1726,50 +2114,39 @@ void ControlUI::run() {
             transcript_lines.push_back(text("  (no chat yet)") | color(Color::GrayDark));
         }
 
+        using mm::tui::panel;
         Color status_color = Color::GrayDark;
         if (status_snapshot == "done") status_color = Color::Green;
         if (status_snapshot == "streaming" || status_snapshot == "sending") status_color = Color::Yellow;
         if (status_snapshot == "failed") status_color = Color::Red;
 
-        return vbox({
-            hbox({
-                text(" Connected nodes: " + std::to_string(connected_nodes)),
-                text("  |  "),
-                text(" Selected agent: " + selected_agent),
-                text("  |  "),
-                text(" Status: " + status_snapshot) | color(status_color),
-            }),
-            error_snapshot.empty()
-                ? text("")
-                : (text(" Last error: " + error_snapshot) | color(Color::Red)),
-            conv_snapshot.empty()
-                ? text("")
-                : (text(" Last conversation: " + conv_snapshot) | color(Color::GrayDark)),
-            separator(),
-            hbox({
-                vbox({
-                    text(" Agent") | bold,
-                    separator(),
-                    cs.empty()
-                        ? (text("  No agents configured.") | color(Color::GrayDark))
-                        : (chat_agent_menu->Render() | yframe | flex),
-                    separator(),
-                    text(" Prompt") | bold,
-                    chat_input_comp->Render(),
-                    chat_btn_row->Render(),
-                    text(chat_inflight.load()
-                             ? "  Send is blocked while a stream is active."
-                             : "  Send a prompt to test this agent.")
-                        | color(Color::GrayDark),
-                }) | size(WIDTH, LESS_THAN, 52) | border,
-                separator(),
-                vbox({
-                    text(" Transcript") | bold,
-                    separator(),
-                    vbox(std::move(transcript_lines)) | yframe | flex,
-                }) | border | flex,
-            }) | flex,
+        Element header = hbox({
+            text(" nodes ") | dim, text(std::to_string(connected_nodes)),
+            text("  ·  ") | dim, text("agent ") | dim, text(selected_agent) | bold,
+            text("  ·  ") | dim, text("status ") | dim, text(status_snapshot) | color(status_color),
+            filler(),
+            error_snapshot.empty() ? text("") : (text("error: " + error_snapshot + " ") | color(Color::Red)),
         });
+
+        Element chat_head = hbox({
+            mm::tui::col(text("NAME"), 12), text(" │ ") | dim, text("MODEL"),
+        }) | dim | bold;
+        Element left = panel("AGENT", vbox({
+            chat_head,
+            separator(),
+            cs.empty() ? (text("  No agents configured.") | dim)
+                       : (chat_agent_menu->Render() | yframe | flex),
+            separator(),
+            text(" prompt") | dim,
+            chat_input_comp->Render() | border,
+            chat_btn_row->Render(),
+            text(chat_inflight.load() ? "  send blocked while streaming" : "  streams SSE") | dim,
+        })) | size(WIDTH, EQUAL, 42);
+
+        Element right = panel("TRANSCRIPT", conv_snapshot,
+                              vbox(std::move(transcript_lines)) | yframe | flex) | flex;
+
+        return vbox({header, hbox({left, text(" "), right}) | flex});
     });
 
     // Tab 5
@@ -1777,7 +2154,7 @@ void ControlUI::run() {
         auto cs = agents_.list_agents();
         cur_agent_entries.resize(cs.size());
         for (size_t i = 0; i < cs.size(); ++i) {
-            cur_agent_entries[i] = cs[i].name + " [" + cs[i].id + "]";
+            cur_agent_entries[i] = " " + cs[i].name;
         }
         if (cur_agent_sel >= static_cast<int>(cs.size()) && !cs.empty())
             cur_agent_sel = static_cast<int>(cs.size()) - 1;
@@ -1791,7 +2168,7 @@ void ControlUI::run() {
                 ? cs[cur_agent_sel].id
                 : std::string{};
         if (!cur_agent_id.empty())
-            selected_agent = cs[cur_agent_sel].name + " [" + cur_agent_id + "]";
+            selected_agent = cs[cur_agent_sel].name;
 
         // Fetch the selected agent at most once per render, and only when actually
         // needed — a cache-hit frame fetches nothing. Replaces the previous two
@@ -1876,103 +2253,14 @@ void ControlUI::run() {
         }
         const std::optional<Conversation>& conv_detail = cur_conv_detail_cache;
 
-        std::optional<Memory> selected_mem;
         cur_mem_entries.resize(mems.size());
         for (size_t i = 0; i < mems.size(); ++i) {
-            const auto& m = mems[i];
-            char imp[12];
-            snprintf(imp, sizeof(imp), "%.2f", static_cast<double>(m.importance));
-            std::string content = m.content;
-            if (content.size() > 44) content = mm::util::utf8_truncate(content, 44) + "...";
-            cur_mem_entries[i] = std::string("[") + imp + "] " + content;
+            cur_mem_entries[i] = mems[i].content;  // fallback; the transform renders the row
         }
         if (cur_mem_sel >= static_cast<int>(mems.size()) && !mems.empty())
             cur_mem_sel = static_cast<int>(mems.size()) - 1;
         else if (mems.empty())
             cur_mem_sel = 0;
-
-        if (!mems.empty() && cur_mem_sel >= 0 && cur_mem_sel < static_cast<int>(mems.size())) {
-            selected_mem = mems[cur_mem_sel];
-        }
-
-        Elements conv_detail_lines;
-        if (conv_detail && !conv_detail->messages.empty()) {
-            const auto& msgs = conv_detail->messages;
-            const std::string conv_title = conv_detail->title.empty() ? "(untitled)" : conv_detail->title;
-            conv_detail_lines.push_back(text(" Title: " + conv_title) | bold);
-            conv_detail_lines.push_back(text(" ID: " + conv_detail->id) | dim);
-            conv_detail_lines.push_back(
-                text(" Messages: " + std::to_string(msgs.size()) +
-                     "  |  Tokens: " + std::to_string(conv_detail->total_tokens) +
-                     "  |  Active: " + std::string(conv_detail->is_active ? "yes" : "no"))
-            );
-            if (!conv_detail->parent_conv_id.empty()) {
-                conv_detail_lines.push_back(text(" Parent: " + conv_detail->parent_conv_id) | dim);
-            }
-            conv_detail_lines.push_back(separator());
-
-            for (size_t i = 0; i < msgs.size(); ++i) {
-                const auto& msg = msgs[i];
-                const std::string role = to_string(msg.role);
-                conv_detail_lines.push_back(
-                    text(" [" + std::to_string(i) + "] " + role +
-                         "  |  tokens: " + std::to_string(msg.token_count))
-                    | bold
-                );
-
-                const auto content_lines = util::split(msg.content.empty() ? "(empty)" : msg.content, '\n');
-                for (const auto& line : content_lines) {
-                    conv_detail_lines.push_back(paragraph("   " + (line.empty() ? " " : line)));
-                }
-
-                if (!msg.thinking_text.empty()) {
-                    conv_detail_lines.push_back(text("   Thinking:") | dim);
-                    const auto thinking_lines = util::split(msg.thinking_text, '\n');
-                    for (const auto& line : thinking_lines) {
-                        conv_detail_lines.push_back(paragraph("   " + (line.empty() ? " " : line)) | dim);
-                    }
-                }
-
-                if (!msg.tool_calls.empty()) {
-                    conv_detail_lines.push_back(
-                        text("   Tool calls: " + std::to_string(msg.tool_calls.size())) | color(Color::Cyan)
-                    );
-                }
-                if (!msg.tool_call_id.empty()) {
-                    conv_detail_lines.push_back(text("   Tool call id: " + msg.tool_call_id) | dim);
-                }
-                if (i + 1 < msgs.size()) {
-                    conv_detail_lines.push_back(separatorLight());
-                }
-            }
-
-            // NOTE: deliberately no write-back to cur_start_s/cur_end_s here. They are
-            // bound to Input fields; mutating them during render fights the user's
-            // typing. The extraction range is validated at point-of-use in the Generate
-            // Memories handler (which reports "invalid message range").
-        } else {
-            conv_detail_lines.push_back(text("  (select a conversation)") | color(Color::GrayDark));
-        }
-
-        Elements mem_detail_lines;
-        if (selected_mem) {
-            char imp[12];
-            snprintf(imp, sizeof(imp), "%.2f", static_cast<double>(selected_mem->importance));
-            mem_detail_lines.push_back(text(" Importance: " + std::string(imp)) | bold);
-            mem_detail_lines.push_back(text(" ID: " + selected_mem->id) | dim);
-            if (!selected_mem->source_conv_id.empty()) {
-                mem_detail_lines.push_back(text(" Source conversation: " + selected_mem->source_conv_id) | dim);
-            }
-            mem_detail_lines.push_back(separator());
-            const auto mem_lines = util::split(
-                selected_mem->content.empty() ? "(empty)" : selected_mem->content,
-                '\n');
-            for (const auto& line : mem_lines) {
-                mem_detail_lines.push_back(paragraph(" " + (line.empty() ? " " : line)));
-            }
-        } else {
-            mem_detail_lines.push_back(text("  (select a memory)") | color(Color::GrayDark));
-        }
 
         std::string status_snapshot;
         std::string error_snapshot;
@@ -1981,80 +2269,92 @@ void ControlUI::run() {
             status_snapshot = cur_status;
             error_snapshot = cur_last_error;
         }
-        Color status_color = Color::GrayDark;
-        if (status_snapshot.rfind("done:", 0) == 0) status_color = Color::Green;
-        else if (status_snapshot.rfind("running:", 0) == 0) status_color = Color::Yellow;
-        else if (status_snapshot == "failed") status_color = Color::Red;
+
+        // ── 1b layout: three columns + a compact DETAIL/actions bar ─────
+        using mm::tui::panel;
+        using mm::tui::col;
+
+        Element c_agents = panel("AGENTS", vbox({
+            text(" NAME") | dim | bold,
+            separator(),
+            cs.empty() ? (text("  (none)") | dim)
+                       : (cur_agent_menu->Render() | yframe | flex),
+        })) | size(WIDTH, EQUAL, 20);
+
+        Element conv_head = hbox({
+            text("  "), col(text("TITLE"), 19), text("TOKENS"),
+        }) | dim | bold;
+        Element c_convs = panel("CONVERSATIONS", std::to_string(convs.size()), vbox({
+            conv_head,
+            separator(),
+            convs.empty() ? (text("  No conversations.") | dim)
+                          : (cur_conv_menu->Render() | yframe | flex),
+        })) | size(WIDTH, EQUAL, 48);
+
+        Element mem_head = hbox({
+            col(text("IMP"), 15), text("CONTENT"),
+        }) | dim | bold;
+        Element c_mems = panel("MEMORIES · importance", std::to_string(mems.size()), vbox({
+            mem_head,
+            separator(),
+            mems.empty() ? (text("  No memories.") | dim)
+                         : (cur_mem_menu->Render() | yframe | flex),
+        })) | flex;
+
+        // DETAIL bar: conversation summary · extract range · actions · new conversation.
+        Elements dl;
+        if (!convs.empty() && cur_conv_sel >= 0 && cur_conv_sel < static_cast<int>(convs.size())) {
+            const auto& c = convs[static_cast<size_t>(cur_conv_sel)];
+            const std::string title = c.title.empty() ? "(untitled)" : c.title;
+            const int msgs = conv_detail ? static_cast<int>(conv_detail->messages.size()) : 0;
+            Elements sum = {
+                text("conversation ") | dim, text(title) | bold,
+                text(" · " + std::to_string(c.total_tokens) + " tokens · ") | dim,
+                c.is_active ? (text("active") | color(Color::Green)) : (text("inactive") | dim),
+                text(" · " + std::to_string(msgs) + " messages") | dim,
+            };
+            if (msgs > 0)
+                sum.push_back(text("   ·   extract range 0–" + std::to_string(msgs - 1)) |
+                              color(Color::Cyan));
+            dl.push_back(hbox(std::move(sum)));
+        } else {
+            dl.push_back(text("(no conversation selected)") | dim);
+        }
+        dl.push_back(hbox({
+            text("extract ") | dim,
+            text("start ") | dim, cur_start_input->Render() | size(WIDTH, EQUAL, 6),
+            text(" end ") | dim, cur_end_input->Render() | size(WIDTH, EQUAL, 6),
+            text(" context ") | dim, cur_ctx_input->Render() | size(WIDTH, EQUAL, 6),
+            text(" "), btn_cur_extract->Render(),
+            filler(),
+        }));
+        dl.push_back(hbox({
+            btn_cur_activate->Render(), text(" "),
+            btn_cur_compact->Render(), text(" "),
+            btn_cur_delete_conv->Render(), text(" "),
+            btn_cur_delete_mem->Render(),
+            filler(),
+        }));
+        dl.push_back(hbox({
+            text("new ") | dim,
+            cur_new_title_input->Render() | size(WIDTH, EQUAL, 28),
+            text(" "), cur_new_active_cb->Render(),
+            text(" "), cur_new_parent_cb->Render(),
+            text(" "), btn_cur_new_conv->Render(),
+            filler(),
+        }));
+        if (!error_snapshot.empty())
+            dl.push_back(text("error: " + error_snapshot) | color(Color::Red));
+        if (!cur_db_error.empty())
+            dl.push_back(text("db: " + cur_db_error) | color(Color::Red));
+
+        const std::string busy = cur_inflight.load() ? " · busy" : "";
+        Element detail = panel("DETAIL · " + selected_agent, status_snapshot + busy,
+                               vbox(std::move(dl)));
 
         return vbox({
-            hbox({
-                text(" Selected agent: " + selected_agent),
-                text("  |  "),
-                text(" Status: " + status_snapshot) | color(status_color),
-                text(cur_inflight.load() ? "  (busy)" : ""),
-            }),
-            error_snapshot.empty() ? text("")
-                                   : (text(" Last error: " + error_snapshot) | color(Color::Red)),
-            cur_db_error.empty() ? text("")
-                                 : (text(" DB read error: " + cur_db_error) | color(Color::Red)),
-            separator(),
-            hbox({
-                vbox({
-                    text(" Agent") | bold,
-                    separator(),
-                    cs.empty() ? (text("  No agents configured.") | color(Color::GrayDark))
-                               : (cur_agent_menu->Render() | yframe | flex),
-                    separator(),
-                    text(" New Conversation") | bold,
-                    cur_new_title_input->Render(),
-                    cur_new_active_cb->Render(),
-                    cur_new_parent_cb->Render(),
-                    btn_cur_new_conv->Render(),
-                }) | size(WIDTH, EQUAL, 38) | border,
-                separator(),
-                vbox({
-                    text(" Conversations") | bold,
-                    separator(),
-                    convs.empty() ? (text("  No conversations.") | color(Color::GrayDark))
-                                  : (cur_conv_menu->Render() | yframe | flex),
-                    separator(),
-                    text(" Actions") | dim,
-                    hbox({btn_cur_activate->Render(), text(" "), btn_cur_compact->Render()}),
-                    btn_cur_delete_conv->Render(),
-                }) | size(WIDTH, EQUAL, 52) | border,
-                separator(),
-                vbox({
-                    text(" Memories") | bold,
-                    separator(),
-                    mems.empty() ? (text("  No memories.") | color(Color::GrayDark))
-                                 : (cur_mem_menu->Render() | yframe | flex),
-                    separator(),
-                    btn_cur_delete_mem->Render(),
-                }) | border | flex,
-            }) | flex,
-            separator(),
-            vbox({
-                text(" Memory Extraction") | bold,
-                hbox({
-                    text(" start:"), cur_start_input->Render() | size(WIDTH, EQUAL, 8),
-                    text("  end:"), cur_end_input->Render() | size(WIDTH, EQUAL, 8),
-                    text("  context_before:"), cur_ctx_input->Render() | size(WIDTH, EQUAL, 8),
-                    text("  "), btn_cur_extract->Render(),
-                }),
-            }) | border,
-            hbox({
-                vbox({
-                    text(" Conversation Detail") | bold,
-                    separator(),
-                    vbox(std::move(conv_detail_lines)) | yframe | flex,
-                }) | border | flex,
-                separator(),
-                vbox({
-                    text(" Selected Memory") | bold,
-                    separator(),
-                    vbox(std::move(mem_detail_lines)) | yframe | flex,
-                }) | border | size(WIDTH, EQUAL, 46),
-            }) | flex,
+            hbox({c_agents, text(" "), c_convs, text(" "), c_mems}) | flex,
+            detail,
         });
     });
 
@@ -2063,27 +2363,60 @@ void ControlUI::run() {
     auto main_tabs = Container::Tab(
         {nodes_renderer, agents_renderer, activity_renderer, chat_renderer, curation_renderer}, &tab_index);
 
-    auto top_renderer = Renderer(main_tabs, [&]() -> Element {
-        auto tab_item = [&](int idx, const std::string& label) {
-            return text(tab_index == idx ? " [" + label + "] " : "  " + label + "  ")
-                   | (tab_index == idx ? bold : nothing);
+    // Mockup-style header: the tab strip is real Button components (clickable +
+    // focusable) rendered as `n Label` chips, the active one inverted.
+    static const std::array<const char*, 5> kTabLabels = {
+        "1 Nodes", "2 Agents", "3 Activity", "4 Chat", "5 Curation"};
+    Components tab_buttons;
+    for (int i = 0; i < static_cast<int>(kTabLabels.size()); ++i) {
+        ButtonOption opt = ButtonOption::Simple();
+        opt.transform = [&, i](const EntryState& s) -> Element {
+            Element e = text(" " + std::string(kTabLabels[static_cast<size_t>(i)]) + " ");
+            if (tab_index == i)  e = std::move(e) | bold | inverted;
+            else if (s.focused)  e = std::move(e) | underlined;
+            else                 e = std::move(e) | dim;
+            return e;
         };
+        tab_buttons.push_back(Button(kTabLabels[static_cast<size_t>(i)],
+                                     [&, i] { tab_index = i; }, opt));
+    }
+    auto tab_btn_row   = Container::Horizontal(tab_buttons);
+    auto top_container = Container::Vertical({tab_btn_row, main_tabs});
+
+    auto top_renderer = Renderer(top_container, [&]() -> Element {
+        auto ns = registry_.list_nodes();
+        const int tot = static_cast<int>(ns.size());
+        const int conn = static_cast<int>(std::count_if(
+            ns.begin(), ns.end(), [](const NodeInfo& n) { return n.connected; }));
+        const Color dot = (tot > 0 && conn == tot) ? Color::Green
+                        : (conn > 0)               ? Color::Yellow
+                                                   : Color::Red;
         auto header = hbox({
             text(" mantic-mind-control ") | bold,
-            separator(),
-            tab_item(0, "1: Nodes"),
-            tab_item(1, "2: Agents"),
-            tab_item(2, "3: Activity"),
-            tab_item(3, "4: Chat"),
-            tab_item(4, "5: Curation"),
+            text("│ ") | dim,
+            tab_btn_row->Render(),
             filler(),
-            text(" q:quit  Esc:back ") | color(Color::GrayDark),
+            text(mm::tui::spinner_frame()) | color(Color::Green),
+            text(" polling") | dim,
+            text("  │  ") | dim,
+            text("●") | color(dot),
+            text(" " + std::to_string(conn) + "/" + std::to_string(tot) + " nodes"),
+            text("  │  ") | dim,
+            text(mm::tui::clock_hms()) | dim,
+            text(" "),
+        });
+        auto footer = hbox({
+            text(" 1-5 tabs · ↑/↓ select · click rows · q quit") | dim,
+            filler(),
+            text("mantic-mind · control ") | dim,
         });
 
         return vbox({
             header,
             separator(),
             main_tabs->Render() | flex,
+            separator(),
+            footer,
         }) | border;
     });
 
@@ -2125,10 +2458,12 @@ void ControlUI::run() {
 
     //
 
+    // 250ms keeps the header spinner/clock moving without redrawing excessively;
+    // renders are also triggered by refresh()/log events as before.
     std::atomic<bool> ticker_running{true};
     std::thread ticker([&] {
         while (ticker_running.load()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
             screen.PostEvent(Event::Custom);
         }
     });

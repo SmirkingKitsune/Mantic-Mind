@@ -6,6 +6,11 @@
 # Port the REST + SSE API listens on.
 listen_port = 9090
 
+# Port for OpenAI-compatible text clients. Set to 0 to disable.
+# Exposes GET /v1/models and POST /v1/chat/completions.
+# Models are Mantic agents; use model id agent:{agent_id}.
+openai_compat_port = 9091
+
 # Optional bearer token for external /v1 and /v1/* API clients such as Yappy-Agent.
 # Applies to streaming chat and mutating agent routes. Internal /api/control/*
 # node routes keep using registered node api keys.
