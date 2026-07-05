@@ -65,6 +65,8 @@ public:
     // ── Cluster capabilities (advertised to control) ──────────────────────────
     NodeCapabilities get_capabilities() const;
     void             set_capabilities(const NodeCapabilities& caps);
+    VllmRuntimeStatus get_vllm_runtime() const;
+    void              set_vllm_runtime(const VllmRuntimeStatus& runtime);
 
     // ── Diagnostics ───────────────────────────────────────────────────────────
     std::string get_last_error() const;
@@ -110,6 +112,7 @@ private:
     std::vector<SlotInfo>        slots_;
     NodeHealthMetrics            metrics_;
     NodeCapabilities             capabilities_;
+    VllmRuntimeStatus            vllm_runtime_;
     std::string                  last_error_;
     std::string                  llama_server_path_;
     std::unordered_set<std::string> api_keys_;

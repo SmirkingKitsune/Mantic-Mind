@@ -15,6 +15,11 @@ struct NodeConfig {
     std::string llama_server_path;          // full path to llama-server binary
     std::string vllm_server_path = "vllm";  // vLLM CLI executable or wrapper
     double      vllm_gpu_budget  = 0.90;    // total GPU fraction all vLLM slots may claim
+    bool        vllm_auto_provision = true;
+    std::string vllm_provision_dir;
+    std::string vllm_install_method = "auto"; // auto|wheel|source
+    std::string vllm_version = "latest";
+    std::string vllm_python_path;
 
     // ── Cluster capabilities (multi-node vLLM engine groups) ─────────────────
     // Empty/auto values are filled by runtime detection at startup. Set these

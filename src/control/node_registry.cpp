@@ -505,6 +505,8 @@ bool NodeRegistry::ping_node(NodeInfo& info) {
                 info.slot_error = sj["slot_error"].get<int>();
             if (sj.contains("vllm_server_path"))
                 info.vllm_server_path = sj["vllm_server_path"].get<std::string>();
+            if (sj.contains("vllm_runtime"))
+                info.vllm_runtime = sj["vllm_runtime"].get<VllmRuntimeStatus>();
             if (sj.contains("capabilities"))
                 info.capabilities = sj["capabilities"].get<NodeCapabilities>();
             if (sj.contains("vllm_gpu_budget"))
@@ -587,6 +589,7 @@ void NodeRegistry::poll_all_nodes() {
                 it->second.slot_suspended = info.slot_suspended;
                 it->second.slot_error    = info.slot_error;
                 it->second.vllm_server_path = info.vllm_server_path;
+                it->second.vllm_runtime = info.vllm_runtime;
                 it->second.vllm_gpu_budget = info.vllm_gpu_budget;
                 it->second.vllm_gpu_fraction_used = info.vllm_gpu_fraction_used;
                 it->second.capabilities = info.capabilities;

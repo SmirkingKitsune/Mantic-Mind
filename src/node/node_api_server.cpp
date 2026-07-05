@@ -80,6 +80,10 @@ void NodeApiServer::set_remember_api_key_callback(RememberApiKeyCallback callbac
     remember_api_key_cb_ = std::move(callback);
 }
 
+void NodeApiServer::set_vllm_provision_callback(VllmProvisionCallback callback) {
+    vllm_provision_cb_ = std::move(callback);
+}
+
 void NodeApiServer::set_ray_config(std::string ray_path, uint16_t ray_port) {
     ray_path_ = std::move(ray_path);
     ray_port_ = ray_port;
@@ -164,6 +168,7 @@ void NodeApiServer::register_routes() {
         j["slot_suspended"] = suspended_slots;
         j["slot_error"]    = error_slots;
         j["vllm_server_path"] = slot_mgr_.vllm_server_path();
+        j["vllm_runtime"] = state_.get_vllm_runtime();
         j["vllm_gpu_budget"] = slot_mgr_.vllm_gpu_budget();
         j["vllm_gpu_fraction_used"] = slot_mgr_.vllm_gpu_fraction_used();
 
@@ -207,6 +212,32 @@ void NodeApiServer::register_routes() {
         res.set_content(nlohmann::json{{"lines", lines}}.dump(), "application/json");
     });
 
+    server_->Get("/api/node/runtime/vllm", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401; return;
+        }
+        res.set_content(nlohmann::json{{"vllm_runtime", state_.get_vllm_runtime()}}.dump(),
+                        "application/json");
+    });
+
+    server_->Post("/api/node/runtime/vllm/provision", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401; return;
+        }
+        if (!vllm_provision_cb_) {
+            res.status = 501;
+            res.set_content(R"({"error":"vLLM provisioning is not configured"})",
+                            "application/json");
+            return;
+        }
+        auto runtime = vllm_provision_cb_();
+        state_.set_vllm_runtime(runtime);
+        if (!runtime.last_error.empty()) state_.set_last_error(runtime.last_error);
+        res.status = (runtime.status == "failed" || runtime.status == "disabled") ? 500 : 200;
+        res.set_content(nlohmann::json{{"vllm_runtime", runtime}}.dump(),
+                        "application/json");
+    });
+
     // ── POST /api/node/load-model ─────────────────────────────────────────────
     server_->Post("/api/node/load-model", [this](const Request& req, Response& res) {
         if (!check_auth(req.get_header_value("Authorization"))) {
@@ -235,6 +266,7 @@ void NodeApiServer::register_routes() {
                 nlohmann::json err = {{"error", "failed to load model"}};
                 auto detail = slot_mgr_.last_error();
                 err["vllm_server_path"] = slot_mgr_.vllm_server_path();
+                err["vllm_runtime"] = state_.get_vllm_runtime();
                 err["model_path"] = model_path;
                 state_.set_last_error(detail.empty() ? "failed to load model" : detail);
                 if (!detail.empty()) err["detail"] = detail;
@@ -524,6 +556,8 @@ void NodeApiServer::register_routes() {
                 res.status = 500;
                 nlohmann::json err = {{"error", "failed to restore slot"}};
                 auto detail = slot_mgr_.last_error();
+                err["vllm_server_path"] = slot_mgr_.vllm_server_path();
+                err["vllm_runtime"] = state_.get_vllm_runtime();
                 state_.set_last_error(detail.empty() ? "failed to restore slot" : detail);
                 if (!detail.empty()) err["detail"] = detail;
                 res.set_content(err.dump(), "application/json");

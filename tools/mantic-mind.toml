@@ -30,6 +30,16 @@ max_slots = 4
 # vLLM CLI executable or wrapper script (or just "vllm" if on PATH).
 # vllm_server_path = "vllm"
 
+# If vllm_server_path cannot be resolved, the node can create a managed vLLM
+# runtime under vllm_provision_dir and use that executable for engine slots.
+# Windows uses SystemPanic/vllm-windows, Linux uses vllm-project/vllm, and
+# Apple Silicon macOS uses vllm-project/vllm-metal.
+# vllm_auto_provision = true
+# vllm_provision_dir = "data/runtimes/vllm"
+# vllm_install_method = "auto"  # auto | wheel | source
+# vllm_version = "latest"
+# vllm_python_path = ""
+
 # Total fraction of GPU memory all vLLM slots on this node may claim together.
 # Each vLLM slot reserves an explicit --gpu-memory-utilization slice out of
 # this budget; loads are clamped to the remaining budget and rejected when it

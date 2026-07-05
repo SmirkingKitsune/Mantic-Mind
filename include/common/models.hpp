@@ -361,6 +361,17 @@ struct NodeCapabilities {
 };
 
 // ── NodeInfo ──────────────────────────────────────────────────────────────────
+struct VllmRuntimeStatus {
+    std::string status = "disabled"; // resolved|provisioning|ready|failed|disabled
+    std::string platform;
+    std::string method;
+    std::string source_repo;
+    std::string version;
+    bool        managed = false;
+    std::string executable_path;
+    std::string last_error;
+};
+
 struct NodeInfo {
     NodeId           id;
     std::string      url;
@@ -386,6 +397,7 @@ struct NodeInfo {
     int                      slot_suspended = 0;
     int                      slot_error = 0;
     std::string              vllm_server_path;
+    VllmRuntimeStatus        vllm_runtime;
     double                   vllm_gpu_budget = 0.0;         // total GPU fraction vLLM slots may claim
     double                   vllm_gpu_fraction_used = 0.0;  // fraction currently claimed (incl. loads in flight)
 };
@@ -1005,6 +1017,27 @@ inline void from_json(const nlohmann::json& j, NodeCapabilities& c) {
 // external clients (/v1/nodes) and must never leak node credentials. The
 // persistence path (NodeRegistry::save_remembered_nodes) writes api_key
 // explicitly.
+inline void to_json(nlohmann::json& j, const VllmRuntimeStatus& r) {
+    j = { {"status",          r.status},
+          {"platform",        r.platform},
+          {"method",          r.method},
+          {"source_repo",     r.source_repo},
+          {"version",         r.version},
+          {"managed",         r.managed},
+          {"executable_path", r.executable_path},
+          {"last_error",      r.last_error} };
+}
+inline void from_json(const nlohmann::json& j, VllmRuntimeStatus& r) {
+    if (j.contains("status"))          j.at("status").get_to(r.status);
+    if (j.contains("platform"))        j.at("platform").get_to(r.platform);
+    if (j.contains("method"))          j.at("method").get_to(r.method);
+    if (j.contains("source_repo"))     j.at("source_repo").get_to(r.source_repo);
+    if (j.contains("version"))         j.at("version").get_to(r.version);
+    if (j.contains("managed"))         j.at("managed").get_to(r.managed);
+    if (j.contains("executable_path")) j.at("executable_path").get_to(r.executable_path);
+    if (j.contains("last_error"))      j.at("last_error").get_to(r.last_error);
+}
+
 inline void to_json(nlohmann::json& j, const NodeInfo& n) {
     j = { {"id",            n.id},
           {"url",           n.url},
@@ -1027,6 +1060,7 @@ inline void to_json(nlohmann::json& j, const NodeInfo& n) {
           {"slot_suspended", n.slot_suspended},
           {"slot_error",    n.slot_error},
           {"vllm_server_path",         n.vllm_server_path},
+          {"vllm_runtime",             n.vllm_runtime},
           {"vllm_gpu_budget",          n.vllm_gpu_budget},
           {"vllm_gpu_fraction_used",   n.vllm_gpu_fraction_used} };
 }
@@ -1053,6 +1087,7 @@ inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     if (j.contains("slot_suspended")) j.at("slot_suspended").get_to(n.slot_suspended);
     if (j.contains("slot_error"))    j.at("slot_error").get_to(n.slot_error);
     if (j.contains("vllm_server_path")) j.at("vllm_server_path").get_to(n.vllm_server_path);
+    if (j.contains("vllm_runtime")) j.at("vllm_runtime").get_to(n.vllm_runtime);
     if (j.contains("vllm_gpu_budget")) j.at("vllm_gpu_budget").get_to(n.vllm_gpu_budget);
     if (j.contains("vllm_gpu_fraction_used")) j.at("vllm_gpu_fraction_used").get_to(n.vllm_gpu_fraction_used);
 }

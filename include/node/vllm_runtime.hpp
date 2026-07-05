@@ -13,7 +13,17 @@ inline constexpr const char* kOfficialVllmRepoUrl =
 inline constexpr const char* kWindowsVllmRepoUrl =
     "https://github.com/SystemPanic/vllm-windows";
 inline constexpr const char* kWindowsVllmBranch = "vllm-for-windows";
+inline constexpr const char* kMetalVllmRepoUrl =
+    "https://github.com/vllm-project/vllm-metal";
 
+std::string current_vllm_platform();
+std::string current_vllm_arch();
+bool is_apple_silicon_environment(const std::string& platform,
+                                  const std::string& arch);
+std::string default_vllm_repo_url_for_environment(const std::string& platform,
+                                                  const std::string& arch);
+std::string default_vllm_branch_for_environment(const std::string& platform,
+                                                const std::string& arch);
 std::string default_vllm_repo_url_for_platform();
 std::string default_vllm_branch_for_platform();
 

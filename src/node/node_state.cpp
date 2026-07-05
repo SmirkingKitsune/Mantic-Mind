@@ -208,6 +208,16 @@ void NodeState::set_capabilities(const NodeCapabilities& caps) {
     capabilities_ = caps;
 }
 
+VllmRuntimeStatus NodeState::get_vllm_runtime() const {
+    std::lock_guard<std::mutex> g(mutex_);
+    return vllm_runtime_;
+}
+
+void NodeState::set_vllm_runtime(const VllmRuntimeStatus& runtime) {
+    std::lock_guard<std::mutex> g(mutex_);
+    vllm_runtime_ = runtime;
+}
+
 // ── Platform metrics sampling ──────────────────────────────────────────────────
 NodeHealthMetrics NodeState::sample_metrics(const std::string& llama_server_path) {
     NodeHealthMetrics m;

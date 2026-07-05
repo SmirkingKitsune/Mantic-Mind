@@ -11,6 +11,8 @@
 #include "node/node_ui.hpp"
 #include "node/singleton_lock.hpp"
 #include "node/slot_manager.hpp"
+#include "node/vllm_provisioner.hpp"
+#include "node/vllm_runtime.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -81,6 +83,11 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
         cfg.control_api_key   = file.get("control_api_key",   "");
         cfg.llama_server_path = file.get("llama_server_path", "llama-server");
         cfg.vllm_server_path  = file.get("vllm_server_path",  "vllm");
+        cfg.vllm_auto_provision = file.get_bool("vllm_auto_provision", true);
+        cfg.vllm_provision_dir = file.get("vllm_provision_dir", "");
+        cfg.vllm_install_method = file.get("vllm_install_method", "auto");
+        cfg.vllm_version = file.get("vllm_version", "latest");
+        cfg.vllm_python_path = file.get("vllm_python_path", "");
         cfg.models_dir        = file.get("models_dir",        "models");
         cfg.data_dir          = file.get("data_dir",          "data");
         cfg.log_file          = file.get("log_file", "logs/mantic-mind.log");
@@ -125,11 +132,24 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
         if (!v) return cur;
         try { return static_cast<uint16_t>(std::stoi(v)); } catch (...) { return cur; }
     };
+    auto env_bool = [](const char* name, bool cur) -> bool {
+        const char* v = std::getenv(name);
+        if (!v) return cur;
+        const std::string s = mm::util::to_lower(mm::util::trim(v));
+        if (s == "1" || s == "true" || s == "yes") return true;
+        if (s == "0" || s == "false" || s == "no") return false;
+        return cur;
+    };
 
     cfg.control_url       = env("MM_CONTROL_URL",     cfg.control_url);
     cfg.control_api_key   = env("MM_CONTROL_API_KEY", cfg.control_api_key);
     cfg.llama_server_path = env("MM_LLAMA_PATH",      cfg.llama_server_path);
     cfg.vllm_server_path  = env("MM_VLLM_PATH",       cfg.vllm_server_path);
+    cfg.vllm_auto_provision = env_bool("MM_VLLM_AUTO_PROVISION", cfg.vllm_auto_provision);
+    cfg.vllm_provision_dir = env("MM_VLLM_PROVISION_DIR", cfg.vllm_provision_dir);
+    cfg.vllm_install_method = env("MM_VLLM_INSTALL_METHOD", cfg.vllm_install_method);
+    cfg.vllm_version = env("MM_VLLM_VERSION", cfg.vllm_version);
+    cfg.vllm_python_path = env("MM_VLLM_PYTHON_PATH", cfg.vllm_python_path);
     cfg.models_dir        = env("MM_MODELS_DIR",      cfg.models_dir);
     cfg.data_dir          = env("MM_DATA_DIR",        cfg.data_dir);
     cfg.log_file          = env("MM_LOG_FILE",        cfg.log_file);
@@ -170,8 +190,14 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
     // Keep node startup resilient if env/config accidentally provide empty strings.
     if (cfg.llama_server_path.empty()) cfg.llama_server_path = "llama-server";
     if (cfg.vllm_server_path.empty()) cfg.vllm_server_path = "vllm";
+    if (cfg.vllm_install_method.empty()) cfg.vllm_install_method = "auto";
+    cfg.vllm_install_method = mm::normalize_vllm_install_method(cfg.vllm_install_method);
+    if (cfg.vllm_version.empty()) cfg.vllm_version = "latest";
     if (cfg.models_dir.empty()) cfg.models_dir = "models";
     if (cfg.data_dir.empty()) cfg.data_dir = "data";
+    if (cfg.vllm_provision_dir.empty())
+        cfg.vllm_provision_dir =
+            (std::filesystem::path(cfg.data_dir) / "runtimes" / "vllm").string();
     if (cfg.kv_cache_dir.empty()) cfg.kv_cache_dir = "data/kv_cache";
     if (cfg.log_file.empty()) cfg.log_file = "logs/mantic-mind.log";
     if (cfg.ray_path.empty()) cfg.ray_path = "ray";
@@ -244,11 +270,8 @@ mm::NodeCapabilities detect_node_capabilities(const mm::NodeConfig& cfg,
     caps.arch = "";
 #endif
 
-#ifdef _WIN32
-    const bool is_linux = false;
-#else
-    const bool is_linux = true;
-#endif
+    const std::string platform = mm::current_vllm_platform();
+    const bool is_linux = platform == "linux";
 
     caps.gpu_count = cfg.node_gpu_count > 0 ? cfg.node_gpu_count : detect_gpu_count();
     caps.interconnect_gbps = cfg.interconnect_gbps;
@@ -349,11 +372,7 @@ static bool try_register(const mm::NodeConfig& cfg,
         ? std::string(self_env)
         : "http://127.0.0.1:" + std::to_string(cfg.listen_port);
 
-#ifdef _WIN32
-    const std::string platform = "windows";
-#else
-    const std::string platform = "linux";
-#endif
+    const std::string platform = mm::current_vllm_platform();
 
     mm::HttpClient ctrl(cfg.control_url);
     if (!cfg.control_api_key.empty())
@@ -802,6 +821,24 @@ int main(int argc, char** argv) {
     state.set_llama_server_path(cfg.llama_server_path);
     MM_INFO("Local node identity: {}", local_node_id);
 
+    mm::VllmProvisionConfig vllm_provision_cfg;
+    vllm_provision_cfg.requested_executable = cfg.vllm_server_path;
+    vllm_provision_cfg.provision_dir = cfg.vllm_provision_dir;
+    vllm_provision_cfg.auto_provision = cfg.vllm_auto_provision;
+    vllm_provision_cfg.install_method = cfg.vllm_install_method;
+    vllm_provision_cfg.version = cfg.vllm_version;
+    vllm_provision_cfg.python_path = cfg.vllm_python_path;
+    mm::VllmProvisioner vllm_provisioner(vllm_provision_cfg);
+    auto vllm_runtime = vllm_provisioner.ensure_runtime();
+    state.set_vllm_runtime(vllm_runtime);
+    if (mm::vllm_runtime_usable(vllm_runtime)) {
+        cfg.vllm_server_path = vllm_runtime.executable_path;
+        MM_INFO("Using vLLM executable: {}", cfg.vllm_server_path);
+    } else if (!vllm_runtime.last_error.empty()) {
+        state.set_last_error(vllm_runtime.last_error);
+        MM_WARN("vLLM runtime is not ready: {}", vllm_runtime.last_error);
+    }
+
     const auto remembered_keys_path = remembered_api_keys_file(cfg);
     std::vector<std::string> remembered_api_keys =
         load_remembered_api_keys(remembered_keys_path);
@@ -914,6 +951,23 @@ int main(int argc, char** argv) {
         }
         MM_INFO("HF hub cache dir: {}", hub_dir.empty() ? "(default)" : hub_dir);
     }
+    api_server.set_vllm_provision_callback([&]() {
+        auto runtime = vllm_provisioner.ensure_runtime();
+        state.set_vllm_runtime(runtime);
+        if (mm::vllm_runtime_usable(runtime)) {
+            cfg.vllm_server_path = runtime.executable_path;
+            slot_mgr.set_vllm_server_path(cfg.vllm_server_path);
+            auto caps = detect_node_capabilities(
+                cfg, state.get_metrics().gpu_backend_available);
+            state.set_capabilities(caps);
+            state.set_last_error("");
+            MM_INFO("vLLM runtime reprovisioned: {}", cfg.vllm_server_path);
+        } else if (!runtime.last_error.empty()) {
+            state.set_last_error(runtime.last_error);
+            MM_WARN("vLLM runtime reprovision failed: {}", runtime.last_error);
+        }
+        return runtime;
+    });
     api_server.set_remember_api_key_callback([&](const std::string& key) {
         remembered_api_keys.push_back(key);
         if (save_remembered_api_keys(remembered_keys_path, remembered_api_keys)) {

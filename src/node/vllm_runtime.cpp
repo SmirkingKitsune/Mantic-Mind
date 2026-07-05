@@ -52,20 +52,53 @@ void append_flag_unless_extra(std::vector<std::string>& args,
 
 } // namespace
 
-std::string default_vllm_repo_url_for_platform() {
+std::string current_vllm_platform() {
 #ifdef _WIN32
-    return kWindowsVllmRepoUrl;
+    return "windows";
+#elif defined(__APPLE__)
+    return "macos";
 #else
-    return kOfficialVllmRepoUrl;
+    return "linux";
 #endif
 }
 
-std::string default_vllm_branch_for_platform() {
-#ifdef _WIN32
-    return kWindowsVllmBranch;
+std::string current_vllm_arch() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return "aarch64";
+#elif defined(__x86_64__) || defined(_M_X64) || defined(__amd64__)
+    return "x86_64";
 #else
-    return "main";
+    return {};
 #endif
+}
+
+bool is_apple_silicon_environment(const std::string& platform,
+                                  const std::string& arch) {
+    return platform == "macos" && (arch == "aarch64" || arch == "arm64");
+}
+
+std::string default_vllm_repo_url_for_environment(const std::string& platform,
+                                                  const std::string& arch) {
+    if (platform == "windows") return kWindowsVllmRepoUrl;
+    if (is_apple_silicon_environment(platform, arch)) return kMetalVllmRepoUrl;
+    return kOfficialVllmRepoUrl;
+}
+
+std::string default_vllm_branch_for_environment(const std::string& platform,
+                                                const std::string& arch) {
+    (void)arch;
+    if (platform == "windows") return kWindowsVllmBranch;
+    return "main";
+}
+
+std::string default_vllm_repo_url_for_platform() {
+    return default_vllm_repo_url_for_environment(current_vllm_platform(),
+                                                 current_vllm_arch());
+}
+
+std::string default_vllm_branch_for_platform() {
+    return default_vllm_branch_for_environment(current_vllm_platform(),
+                                               current_vllm_arch());
 }
 
 std::vector<std::string> build_vllm_server_args(const std::string& model_ref,

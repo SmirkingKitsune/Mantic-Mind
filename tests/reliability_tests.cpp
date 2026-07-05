@@ -18,6 +18,7 @@
 #include "control/tts_service_client.hpp"
 #include "node/llama_server_process.hpp"
 #include "node/slot_manager.hpp"
+#include "node/vllm_provisioner.hpp"
 #include "node/vllm_runtime.hpp"
 #include "node/ray_orchestration.hpp"
 #include "node/hf_cache.hpp"
@@ -836,10 +837,20 @@ bool test_hf_cache_helpers() {
     // cached_models survives the node-status JSON round trip.
     mm::NodeInfo n;
     n.cached_models = {"Qwen/Qwen2.5-0.5B-Instruct", "meta-llama/Llama-3.1-8B"};
+    n.vllm_runtime.status = "ready";
+    n.vllm_runtime.platform = "linux";
+    n.vllm_runtime.method = "auto";
+    n.vllm_runtime.source_repo = mm::kOfficialVllmRepoUrl;
+    n.vllm_runtime.version = "vllm 9.9.9-test";
+    n.vllm_runtime.managed = true;
+    n.vllm_runtime.executable_path = "/tmp/vllm/bin/vllm";
     nlohmann::json j = n;
     auto parsed = j.get<mm::NodeInfo>();
     CHECK(parsed.cached_models.size() == 2);
     CHECK(parsed.cached_models[0] == "Qwen/Qwen2.5-0.5B-Instruct");
+    CHECK(parsed.vllm_runtime.status == "ready");
+    CHECK(parsed.vllm_runtime.managed);
+    CHECK(parsed.vllm_runtime.executable_path == "/tmp/vllm/bin/vllm");
 
     // Pre-fetch is Linux-gated; on Windows it refuses cleanly.
 #ifdef _WIN32
@@ -942,11 +953,132 @@ bool test_vllm_runtime_defaults_and_args() {
 #ifdef _WIN32
     CHECK(mm::default_vllm_repo_url_for_platform() == mm::kWindowsVllmRepoUrl);
     CHECK(mm::default_vllm_branch_for_platform() == mm::kWindowsVllmBranch);
+#elif defined(__APPLE__) && defined(__aarch64__)
+    CHECK(mm::default_vllm_repo_url_for_platform() == mm::kMetalVllmRepoUrl);
+    CHECK(mm::default_vllm_branch_for_platform() == "main");
 #else
     CHECK(mm::default_vllm_repo_url_for_platform() == mm::kOfficialVllmRepoUrl);
     CHECK(mm::default_vllm_branch_for_platform() == "main");
 #endif
 
+    return true;
+}
+
+bool test_vllm_provisioner_helpers() {
+    CHECK(mm::normalize_vllm_install_method("wheel") == "wheel");
+    CHECK(mm::normalize_vllm_install_method("source") == "source");
+    CHECK(mm::normalize_vllm_install_method("bogus") == "auto");
+
+    CHECK(mm::is_apple_silicon_environment("macos", "aarch64"));
+    CHECK(mm::is_apple_silicon_environment("macos", "arm64"));
+    CHECK(!mm::is_apple_silicon_environment("macos", "x86_64"));
+    CHECK(mm::default_vllm_repo_url_for_environment("windows", "x86_64")
+          == mm::kWindowsVllmRepoUrl);
+    CHECK(mm::default_vllm_repo_url_for_environment("linux", "x86_64")
+          == mm::kOfficialVllmRepoUrl);
+    CHECK(mm::default_vllm_repo_url_for_environment("macos", "aarch64")
+          == mm::kMetalVllmRepoUrl);
+
+    auto dir = temp_test_dir("vllm-provisioner");
+    mm::VllmProvisionConfig linux_cfg;
+    linux_cfg.requested_executable = "definitely-missing-vllm-for-test";
+    linux_cfg.provision_dir = dir.string();
+    linux_cfg.platform = "linux";
+    linux_cfg.arch = "x86_64";
+    linux_cfg.install_method = "auto";
+
+    auto linux_script = mm::build_vllm_provision_script(linux_cfg);
+    CHECK(linux_script.find("uv pip install") != std::string::npos);
+    CHECK(linux_script.find("--torch-backend=auto") != std::string::npos);
+    CHECK(mm::managed_vllm_executable_path(linux_cfg).string().find("bin") !=
+          std::string::npos);
+
+    mm::VllmProvisionConfig mac_cfg = linux_cfg;
+    mac_cfg.platform = "macos";
+    mac_cfg.arch = "aarch64";
+    auto mac_script = mm::build_vllm_provision_script(mac_cfg);
+    CHECK(mac_script.find("vllm-project/vllm-metal") != std::string::npos);
+    CHECK(mac_script.find("native arm64 Python 3.12") != std::string::npos);
+
+    bool command_ran = false;
+    mm::VllmCommandRunner runner;
+    runner.run = [&](const std::vector<std::string>&,
+                     const std::filesystem::path&,
+                     std::string*) {
+        command_ran = true;
+        const auto exe = mm::managed_vllm_executable_path(linux_cfg);
+        std::filesystem::create_directories(exe.parent_path());
+        std::ofstream(exe) << "fake vllm";
+        return 0;
+    };
+    runner.capture_first_line = [&](const std::vector<std::string>& args,
+                                    const std::filesystem::path&) {
+        if (!args.empty() && args.front() == mm::managed_vllm_executable_path(linux_cfg).string())
+            return std::string{"vllm 9.9.9-test"};
+        return std::string{};
+    };
+    mm::VllmProvisioner provisioner(linux_cfg, runner);
+    auto ready = provisioner.ensure_runtime();
+    CHECK(command_ran);
+    CHECK(ready.status == "ready");
+    CHECK(ready.managed);
+    CHECK(ready.executable_path == mm::managed_vllm_executable_path(linux_cfg).string());
+    CHECK(ready.version == "vllm 9.9.9-test");
+    CHECK(mm::vllm_runtime_usable(ready));
+
+    mm::VllmProvisionConfig disabled_cfg = linux_cfg;
+    disabled_cfg.provision_dir = (dir / "disabled").string();
+    disabled_cfg.auto_provision = false;
+    bool disabled_ran = false;
+    mm::VllmCommandRunner disabled_runner;
+    disabled_runner.run = [&](const std::vector<std::string>&,
+                              const std::filesystem::path&,
+                              std::string*) {
+        disabled_ran = true;
+        return 0;
+    };
+    disabled_runner.capture_first_line = [](const std::vector<std::string>&,
+                                            const std::filesystem::path&) {
+        return std::string{};
+    };
+    mm::VllmProvisioner disabled(disabled_cfg, disabled_runner);
+    auto disabled_status = disabled.ensure_runtime();
+    CHECK(!disabled_ran);
+    CHECK(disabled_status.status == "disabled");
+    CHECK(disabled_status.last_error.find("auto-provisioning is disabled") !=
+          std::string::npos);
+
+    mm::VllmProvisionConfig locked_cfg = linux_cfg;
+    locked_cfg.provision_dir = (dir / "locked").string();
+    std::filesystem::create_directories(
+        std::filesystem::path(locked_cfg.provision_dir) / ".provision.lock");
+    bool locked_ran = false;
+    mm::VllmCommandRunner locked_runner;
+    locked_runner.run = [&](const std::vector<std::string>&,
+                            const std::filesystem::path&,
+                            std::string*) {
+        locked_ran = true;
+        return 0;
+    };
+    locked_runner.capture_first_line = [](const std::vector<std::string>&,
+                                          const std::filesystem::path&) {
+        return std::string{};
+    };
+    mm::VllmProvisioner locked(locked_cfg, locked_runner);
+    auto locked_status = locked.ensure_runtime();
+    CHECK(!locked_ran);
+    CHECK(locked_status.status == "failed");
+    CHECK(locked_status.last_error.find("already active") != std::string::npos);
+
+    mm::VllmProvisionConfig unsupported_mac = linux_cfg;
+    unsupported_mac.platform = "macos";
+    unsupported_mac.arch = "x86_64";
+    mm::VllmProvisioner mac_provisioner(unsupported_mac, disabled_runner);
+    auto mac_status = mac_provisioner.ensure_runtime();
+    CHECK(mac_status.status == "failed");
+    CHECK(mac_status.last_error.find("Apple Silicon") != std::string::npos);
+
+    CHECK(remove_tree(dir));
     return true;
 }
 
@@ -2628,6 +2760,8 @@ int main(int argc, char** argv) {
          test_hf_cache_helpers},
         {"vllm_runtime_defaults_and_args",
          test_vllm_runtime_defaults_and_args},
+        {"vllm_provisioner_helpers",
+         test_vllm_provisioner_helpers},
         {"control_api_external_token_gate", test_control_api_external_token_gate},
         {"openai_compat_api_listener_and_model_catalog",
          test_openai_compat_api_listener_and_model_catalog},

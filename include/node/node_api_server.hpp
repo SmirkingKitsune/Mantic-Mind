@@ -30,8 +30,10 @@ public:
 
     using RuntimeLogsProvider = std::function<std::vector<std::string>(int tail)>;
     using RememberApiKeyCallback = std::function<void(const std::string& key)>;
+    using VllmProvisionCallback = std::function<VllmRuntimeStatus()>;
     void set_runtime_logs_provider(RuntimeLogsProvider provider);
     void set_remember_api_key_callback(RememberApiKeyCallback callback);
+    void set_vllm_provision_callback(VllmProvisionCallback callback);
     // Ray CLI config for the multi-node engine-group endpoints.
     void set_ray_config(std::string ray_path, uint16_t ray_port);
     // HF model-cache config: the `hf` CLI and the resolved hub cache directory.
@@ -49,6 +51,7 @@ private:
     std::unique_ptr<HttpServer> server_;
     RuntimeLogsProvider runtime_logs_provider_;
     RememberApiKeyCallback remember_api_key_cb_;
+    VllmProvisionCallback vllm_provision_cb_;
 
     void register_routes();
     bool check_auth(const std::string& auth_header);

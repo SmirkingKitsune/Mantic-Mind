@@ -17,7 +17,7 @@ Distributed LLM inference cluster — two executables that turn any collection o
 | MSVC (Windows) | VS 2022 |
 | GCC / Clang (Linux) | GCC 12 / Clang 15 |
 | Apple Clang (macOS) | Xcode 15 command-line tools |
-| Python + vLLM | on each node — the node launches `vllm serve` (install vLLM in the node's environment) |
+| Python + vLLM | on each node — the node launches `vllm serve`; it can use an existing `vllm` executable or auto-provision a managed runtime |
 
 Runtime extras (node side, optional):
 
@@ -176,6 +176,15 @@ Engine source policy (for nodes that build vLLM from source):
 
 - Linux nodes target the upstream vLLM repository: `https://github.com/vllm-project/vllm`
 - Windows nodes target the Windows fork: `https://github.com/SystemPanic/vllm-windows`, branch `vllm-for-windows`
+- Apple Silicon macOS nodes target the Metal plugin: `https://github.com/vllm-project/vllm-metal`
+
+When `vllm_server_path` / `MM_VLLM_PATH` cannot be resolved, nodes can
+auto-provision a managed runtime under `vllm_provision_dir` (default
+`data/runtimes/vllm`). Windows prefers release wheels from
+`SystemPanic/vllm-windows`, Linux uses a managed venv for official vLLM, and
+Apple Silicon macOS uses `vllm-metal` with native arm64 Python 3.12 plus Xcode
+command line tools. Release packages still do not bundle vLLM, Python
+environments, or model weights.
 
 The runtime is designed to use vLLM to its full capability:
 
@@ -360,6 +369,11 @@ After file loading, matching environment variables override config values.
 | `control_url` | `MM_CONTROL_URL` | *(empty)* | Control base URL (empty = standalone) |
 | `control_api_key` | `MM_CONTROL_API_KEY` | *(empty)* | Bearer token for control |
 | `vllm_server_path` | `MM_VLLM_PATH` | `vllm` | `vllm` CLI / wrapper used to launch engines |
+| `vllm_auto_provision` | `MM_VLLM_AUTO_PROVISION` | `true` | Auto-create a managed vLLM runtime when `vllm_server_path` is unresolved |
+| `vllm_provision_dir` | `MM_VLLM_PROVISION_DIR` | `data/runtimes/vllm` | Managed vLLM runtime root |
+| `vllm_install_method` | `MM_VLLM_INSTALL_METHOD` | `auto` | Provisioning method: `auto`, `wheel`, or `source` |
+| `vllm_version` | `MM_VLLM_VERSION` | `latest` | vLLM release tag/version/commit used by provisioning |
+| `vllm_python_path` | `MM_VLLM_PYTHON_PATH` | *(auto)* | Python executable used for managed venv creation |
 | `vllm_gpu_budget` | `MM_VLLM_GPU_BUDGET` | `0.90` | Total GPU fraction all vLLM engines on this node may claim |
 | `max_slots` | `MM_MAX_SLOTS` | `4` | Maximum concurrent engine slots |
 | `llama_port_range_start` | `MM_LLAMA_PORT_RANGE_START` | `8080` | First port in the per-engine port range |
@@ -433,10 +447,12 @@ POST   /api/node/suspend-slot   { slot_id }             (vLLM sleep, or stop)
 POST   /api/node/restore-slot   { model_path, vllm_settings?, agent_id? }
 POST   /api/node/infer          { InferenceRequest, slot_id? }  -> SSE
 POST   /api/node/models/pull    { model_ref }           (HF pre-fetch; Linux only, 501 elsewhere)
+GET    /api/node/runtime/vllm   -> { vllm_runtime }
+POST   /api/node/runtime/vllm/provision -> { vllm_runtime }
 POST   /api/node/ray/start      { role: "head"|"worker", head_address? }  (Linux only)
 POST   /api/node/ray/stop
 GET    /api/node/health         -> NodeHealthMetrics
-GET    /api/node/status         -> { node_id, slots, cached_models, capabilities, vllm_gpu_budget, ... }
+GET    /api/node/status         -> { node_id, slots, cached_models, capabilities, vllm_runtime, vllm_gpu_budget, ... }
 GET    /api/node/logs?tail=n    -> { lines: [...] }
 GET    /api/node/api-keys       -> { keys: [...] }
 POST   /api/node/api-keys       { key }
