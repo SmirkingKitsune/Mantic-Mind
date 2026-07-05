@@ -585,7 +585,7 @@ void ControlUI::run() {
                                  text(cpu_pct) | dim});
         Element gpu_cell = gpu ? hbox({mm::tui::sparkline(node_hist_gpu[n.id], 7), text(" "),
                                        text(gpu_pct) | dim})
-                               : (text("— metal") | dim);
+                               : (text("— cpu") | dim);
 
         float vram_pct = n.metrics.gpu_vram_total_mb > 0
             ? static_cast<float>(n.metrics.gpu_vram_used_mb) /
@@ -1662,11 +1662,14 @@ void ControlUI::run() {
         float sum_cpu = 0.0f, sum_gpu = 0.0f;
         int up = 0, gnodes = 0, engines = 0;
         int64_t vram_used = 0, vram_total = 0;
+        int64_t ram_used = 0, ram_total = 0;
         size_t placed = 0;
         for (const auto& n : node_rows) {
             if (!n.connected) continue;
             ++up;
             sum_cpu += n.metrics.cpu_percent;
+            ram_used  += n.metrics.ram_used_mb;
+            ram_total += n.metrics.ram_total_mb;
             const bool gpu = n.metrics.gpu_vram_total_mb > 0 || n.metrics.gpu_backend_available;
             if (gpu) {
                 ++gnodes;
@@ -1683,9 +1686,12 @@ void ControlUI::run() {
         float avg_gpu = gnodes ? sum_gpu / static_cast<float>(gnodes) : 0.0f;
         float vram_pct = vram_total
             ? static_cast<float>(vram_used) / static_cast<float>(vram_total) * 100.0f : 0.0f;
+        float ram_pct = ram_total
+            ? static_cast<float>(ram_used) / static_cast<float>(ram_total) * 100.0f : 0.0f;
 
         Element cluster_panel = panel("CLUSTER", vbox({
             gauge_line("CPU", avg_cpu),
+            gauge_line("RAM", ram_pct, mb_str(ram_used) + " / " + mb_str(ram_total)),
             gauge_line("GPU", avg_gpu),
             gauge_line("VRM", vram_pct, mb_str(vram_used) + " / " + mb_str(vram_total)),
             text("  " + std::to_string(engines) + " engines · " + std::to_string(placed) +
