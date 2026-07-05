@@ -71,6 +71,7 @@ std::string shell_quote_posix(const std::string& value) {
     return out;
 }
 
+#ifdef _WIN32
 std::string shell_quote_windows(const std::string& value) {
     std::string out = "\"";
     for (char ch : value) {
@@ -80,6 +81,7 @@ std::string shell_quote_windows(const std::string& value) {
     out += "\"";
     return out;
 }
+#endif
 
 std::string shell_quote(const std::string& value) {
 #ifdef _WIN32
