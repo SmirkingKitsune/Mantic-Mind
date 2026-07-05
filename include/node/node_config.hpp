@@ -12,7 +12,6 @@ struct NodeConfig {
     uint16_t    listen_port = 7070;
 
     // Subprocess
-    std::string llama_server_path;          // full path to llama-server binary
     std::string vllm_server_path = "vllm";  // vLLM CLI executable or wrapper
     double      vllm_gpu_budget  = 0.90;    // total GPU fraction all vLLM slots may claim
     bool        vllm_auto_provision = true;
@@ -33,9 +32,8 @@ struct NodeConfig {
     uint16_t    ray_port = 6379;           // head GCS port for Ray clusters
     std::string hf_cli_path = "hf";        // Hugging Face CLI for model pre-fetch
     std::string hf_cache_dir;              // HF hub cache dir override; "" = auto (HF_HOME/default)
-    uint16_t    llama_port = 8080;          // deprecated: single-slot port
-    uint16_t    llama_port_range_start = 8080;
-    uint16_t    llama_port_range_end   = 8090;
+    uint16_t    runtime_port_range_start = 8080;
+    uint16_t    runtime_port_range_end   = 8090;
     int         max_slots              = 4;
 
     // Storage

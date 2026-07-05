@@ -71,8 +71,6 @@ public:
     // ── Diagnostics ───────────────────────────────────────────────────────────
     std::string get_last_error() const;
     void        set_last_error(const std::string& err);
-    std::string get_llama_server_path() const;
-    void        set_llama_server_path(const std::string& path);
 
     // ── Streaming text (for TUI display of generated output) ─────────────────
     StreamingTextState get_streaming_text() const;
@@ -114,7 +112,6 @@ private:
     NodeCapabilities             capabilities_;
     VllmRuntimeStatus            vllm_runtime_;
     std::string                  last_error_;
-    std::string                  llama_server_path_;
     std::unordered_set<std::string> api_keys_;
 
     std::optional<PendingPair>   pending_pair_;
@@ -127,7 +124,7 @@ private:
     std::condition_variable      poll_cv_;      // wakes the poll loop on stop
     MetricsCallback              metrics_cb_;
 
-    static NodeHealthMetrics sample_metrics(const std::string& llama_server_path = "");
+    static NodeHealthMetrics sample_metrics();
 };
 
 } // namespace mm

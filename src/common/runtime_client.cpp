@@ -1,4 +1,4 @@
-#include "common/llama_cpp_client.hpp"
+#include "common/runtime_client.hpp"
 #include "common/inference_response_parser.hpp"
 #include "common/logger.hpp"
 #include "common/util.hpp"
@@ -212,7 +212,7 @@ httplib::Client make_client(const std::string& base_url) {
 } // namespace
 
 // ── Construction ──────────────────────────────────────────────────────────────
-LlamaCppClient::LlamaCppClient(std::string base_url,
+RuntimeClient::RuntimeClient(std::string base_url,
                                std::string api_key,
                                std::string chat_completions_path)
     : base_url_(std::move(base_url))
@@ -232,7 +232,7 @@ LlamaCppClient::LlamaCppClient(std::string base_url,
 // Keeps the last (tag.size()-1) bytes in buf to handle tags split across chunks.
 // ── parse_sse_line ────────────────────────────────────────────────────────────
 // ── complete (non-streaming) ──────────────────────────────────────────────────
-Message LlamaCppClient::complete(const InferenceRequest& req) {
+Message RuntimeClient::complete(const InferenceRequest& req) {
     auto body = build_request(req, false);
     auto cli  = make_client(base_url_);
 
@@ -240,7 +240,7 @@ Message LlamaCppClient::complete(const InferenceRequest& req) {
     try {
         body_str = body.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
     } catch (const std::exception& e) {
-        MM_ERROR("LlamaCppClient::complete request serialization error: {}", e.what());
+        MM_ERROR("RuntimeClient::complete request serialization error: {}", e.what());
         return {};
     }
 
@@ -249,24 +249,24 @@ Message LlamaCppClient::complete(const InferenceRequest& req) {
                         body_str,
                         "application/json");
     if (!res) {
-        MM_ERROR("LlamaCppClient::complete: connection failed to {}", base_url_);
+        MM_ERROR("RuntimeClient::complete: connection failed to {}", base_url_);
         return {};
     }
     if (res->status != 200) {
-        MM_ERROR("LlamaCppClient::complete HTTP {}: {}", res->status, res->body);
+        MM_ERROR("RuntimeClient::complete HTTP {}: {}", res->status, res->body);
         return {};
     }
     std::string parse_error;
     auto parsed = inference::parse_openai_chat_completion(res->body, util::now_ms(), &parse_error);
     if (!parsed) {
-        MM_ERROR("LlamaCppClient::complete parse error: {}", parse_error);
+        MM_ERROR("RuntimeClient::complete parse error: {}", parse_error);
         return {};
     }
     return *parsed;
 }
 
 // ── stream_complete ───────────────────────────────────────────────────────────
-void LlamaCppClient::stream_complete(const InferenceRequest& req,
+void RuntimeClient::stream_complete(const InferenceRequest& req,
                                      ChunkCallback chunk_cb,
                                      ErrorCallback error_cb) {
     auto body = build_request(req, true);
@@ -287,9 +287,9 @@ void LlamaCppClient::stream_complete(const InferenceRequest& req,
     auto safe_error = [&](const std::string& msg) {
         try { error_cb(msg); }
         catch (const std::exception& e) {
-            MM_ERROR("LlamaCppClient::stream_complete error callback threw: {}", e.what());
+            MM_ERROR("RuntimeClient::stream_complete error callback threw: {}", e.what());
         } catch (...) {
-            MM_ERROR("LlamaCppClient::stream_complete error callback threw unknown exception");
+            MM_ERROR("RuntimeClient::stream_complete error callback threw unknown exception");
         }
     };
 
@@ -411,7 +411,7 @@ void LlamaCppClient::stream_complete(const InferenceRequest& req,
 }
 
 // ── count_tokens ──────────────────────────────────────────────────────────────
-int LlamaCppClient::count_tokens(const std::string& text) {
+int RuntimeClient::count_tokens(const std::string& text) {
     auto cli = make_client(base_url_);
     auto res = cli.Post("/tokenize",
                         nlohmann::json{{"content", text}}.dump(),
@@ -421,21 +421,21 @@ int LlamaCppClient::count_tokens(const std::string& text) {
         auto j = nlohmann::json::parse(res->body);
         if (j.contains("tokens")) return static_cast<int>(j["tokens"].size());
     } catch (const std::exception& e) {
-        MM_WARN("LlamaCppClient::count_tokens parse error: {}", e.what());
+        MM_WARN("RuntimeClient::count_tokens parse error: {}", e.what());
     }
     return 0;
 }
 
 // ── load_model / health ───────────────────────────────────────────────────────
-bool LlamaCppClient::load_model(const std::string& /*model_path*/,
-                                 const LlamaSettings& /*settings*/) {
-    // llama-server loads its model at startup; we just verify it's responding.
+bool RuntimeClient::load_model(const std::string& /*model_path*/,
+                                 const RuntimeSettings& /*settings*/) {
+    // The runtime loads its model at startup; we just verify it's responding.
     return health_check();
 }
 
-bool LlamaCppClient::is_model_loaded() const { return model_loaded_.load(); }
+bool RuntimeClient::is_model_loaded() const { return model_loaded_.load(); }
 
-bool LlamaCppClient::health_check() {
+bool RuntimeClient::health_check() {
     auto cli = make_client(base_url_);
     cli.set_connection_timeout(3);
     cli.set_read_timeout(5);
@@ -447,7 +447,7 @@ bool LlamaCppClient::health_check() {
         model_loaded_ = ok;
         return ok;
     } catch (const std::exception& e) {
-        MM_WARN("LlamaCppClient::health_check parse error: {}", e.what());
+        MM_WARN("RuntimeClient::health_check parse error: {}", e.what());
         model_loaded_ = false;
         return false;
     }

@@ -8,15 +8,15 @@
 
 namespace mm {
 
-// HTTP client for a running llama-server instance (OpenAI-compatible API).
+// OpenAI-compatible HTTP client for a running runtime engine (e.g. vLLM).
 // All calls block on the calling thread.
-class LlamaCppClient {
+class RuntimeClient {
 public:
     // base_url: "http://127.0.0.1:8080"
-    explicit LlamaCppClient(std::string base_url,
+    explicit RuntimeClient(std::string base_url,
                             std::string api_key = {},
                             std::string chat_completions_path = "/v1/chat/completions");
-    virtual ~LlamaCppClient() = default;
+    virtual ~RuntimeClient() = default;
 
     // Non-streaming: waits for the full response.
     virtual Message complete(const InferenceRequest& req);
@@ -29,7 +29,7 @@ public:
                          ErrorCallback error_cb);
 
     int  count_tokens(const std::string& text);
-    bool load_model(const std::string& model_path, const LlamaSettings& settings);
+    bool load_model(const std::string& model_path, const RuntimeSettings& settings);
     bool is_model_loaded() const;
     bool health_check();
 

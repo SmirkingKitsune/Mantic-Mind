@@ -27,7 +27,7 @@ public:
            ForgetPairingCallback forget_pairing_cb = {});
     ~NodeUI();
 
-    // Append a log line from llama-server (thread-safe, posts to UI event loop).
+    // Append a log line from the runtime engine (thread-safe, posts to UI event loop).
     void append_log(const std::string& line);
 
     // Blocks until the user quits (ESC / q / window close).

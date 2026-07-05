@@ -13,7 +13,7 @@
 #include "common/conversation_manager.hpp"
 #include "common/tool_executor.hpp"
 #include "common/trace_provenance.hpp"
-#include "common/llama_cpp_client.hpp"
+#include "common/runtime_client.hpp"
 #include "common/logger.hpp"
 #include "common/util.hpp"
 #include "common/sse_infer_ctx.hpp"
@@ -454,8 +454,8 @@ std::string resolve_api_key(const ApiSettings& settings) {
     return value ? std::string(value) : std::string{};
 }
 
-std::unique_ptr<LlamaCppClient> make_api_llama_client(const AgentConfig& cfg) {
-    return std::make_unique<LlamaCppClient>(
+std::unique_ptr<RuntimeClient> make_api_runtime_client(const AgentConfig& cfg) {
+    return std::make_unique<RuntimeClient>(
         cfg.api_settings.base_url,
         resolve_api_key(cfg.api_settings),
         cfg.api_settings.chat_completions_path);
@@ -1109,12 +1109,12 @@ ControlApiServer::LocalChatResult ControlApiServer::chat_local(
 namespace {
 
 // Routes LLM calls through the Node API (/api/node/infer) instead of talking
-// directly to llama-server — necessary because llama-server is bound to
+// directly to the runtime engine — necessary because the runtime is bound to
 // localhost on the node machine and not reachable from the control process.
-class NodeProxyLlamaClient : public LlamaCppClient {
+class NodeProxyRuntimeClient : public RuntimeClient {
 public:
-    NodeProxyLlamaClient(std::string node_url, std::string api_key, std::string slot_id = {})
-        : LlamaCppClient(node_url)
+    NodeProxyRuntimeClient(std::string node_url, std::string api_key, std::string slot_id = {})
+        : RuntimeClient(node_url)
         , node_url_(std::move(node_url))
         , api_key_(std::move(api_key))
         , slot_id_(std::move(slot_id))
@@ -1155,13 +1155,13 @@ public:
                         result.token_count = j.value("tokens_used", 0);
                     }
                 } catch (const std::exception& e) {
-                    MM_WARN("NodeProxyLlamaClient::complete: parse error: {}", e.what());
+                    MM_WARN("NodeProxyRuntimeClient::complete: parse error: {}", e.what());
                 }
                 return true;
             });
 
         if (!ok) {
-            MM_WARN("NodeProxyLlamaClient::complete: stream failed to {}", node_url_);
+            MM_WARN("NodeProxyRuntimeClient::complete: stream failed to {}", node_url_);
         }
         return result;
     }
@@ -1242,16 +1242,16 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     db.append_message(conv_id, user_msg, seq);
 
     // 4. Route to either a control-local API client or a node slot.
-    std::unique_ptr<LlamaCppClient> api_llm_storage;
-    std::unique_ptr<NodeProxyLlamaClient> node_llm_storage;
-    LlamaCppClient* selected_llama = nullptr;
+    std::unique_ptr<RuntimeClient> api_llm_storage;
+    std::unique_ptr<NodeProxyRuntimeClient> node_llm_storage;
+    RuntimeClient* selected_runtime = nullptr;
     std::optional<ScheduleResult> schedule_result;
     NodeInfo node;
     SlotId active_slot_id;
 
     if (api_backend) {
-        api_llm_storage = make_api_llama_client(cfg);
-        selected_llama = api_llm_storage.get();
+        api_llm_storage = make_api_runtime_client(cfg);
+        selected_runtime = api_llm_storage.get();
         activity_log(0, "Chat routed: agent='" + agent_id + "' -> api=" +
                         cfg.api_settings.base_url);
     } else {
@@ -1334,18 +1334,18 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
                  active_slot_id.substr(0, 8));
 
     // 5. Real LLM client routed through the node API.
-    //    (llama-server is bound to localhost on the node machine; control
+    //    (the runtime is bound to localhost on the node machine; control
     //     cannot reach it directly — all LLM calls go via /api/node/infer.)
-    node_llm_storage = std::make_unique<NodeProxyLlamaClient>(
+    node_llm_storage = std::make_unique<NodeProxyRuntimeClient>(
         node.url, node.api_key, active_slot_id);
-    selected_llama = node_llm_storage.get();
+    selected_runtime = node_llm_storage.get();
     }
 
-    LlamaCppClient& real_llama = *selected_llama;
+    RuntimeClient& real_runtime = *selected_runtime;
 
     // 6. Compact the conversation if it is approaching context limits.
     //    may_compact() creates a new conversation with a summary if >80% full.
-    ConversationManager conv_mgr(db, real_llama);
+    ConversationManager conv_mgr(db, real_runtime);
     const ConvId conv_id_before_compact = conv_id;
     conv_id = conv_mgr.maybe_compact(conv_id, cfg);
     if (conv_id != conv_id_before_compact) {
@@ -1360,7 +1360,7 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     // 7. Retrieve memories and build the full context to send to the LLM.
     std::vector<Memory> memories;
     if (cfg.memories_enabled) {
-        MemoryManager mem_mgr(db, real_llama);
+        MemoryManager mem_mgr(db, real_runtime);
         memories = mem_mgr.get_relevant_memories(conv_id, cfg);
     }
 
@@ -1387,7 +1387,7 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
         InferenceRequest infer_req;
         infer_req.model    = cfg.model_path;
         infer_req.messages = context_msgs;
-        infer_req.settings = cfg.llama_settings;
+        infer_req.settings = cfg.runtime_settings;
         infer_req.stream   = true;
 
         // Tools are only advertised when explicitly enabled.
@@ -1473,7 +1473,7 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
             if (api_backend) {
                 if (stream_mode) {
                     bool api_ok = true;
-                    real_llama.stream_complete(
+                    real_runtime.stream_complete(
                         req_to_send,
                         [&](const InferenceChunk& chunk) {
                             if (chunk.is_done) {
@@ -1502,7 +1502,7 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
                     return api_ok;
                 }
 
-                Message response = real_llama.complete(req_to_send);
+                Message response = real_runtime.complete(req_to_send);
                 if (response.role != MessageRole::Assistant) {
                     stream_had_error = true;
                     stream_error_message = "API chat completion failed";
@@ -1744,14 +1744,14 @@ void ControlApiServer::queue_global_recall(const AgentId& agent_id,
         activity_log(0, "Global recall starting: agent='" + agent_id + "'");
 
         const bool recall_api_backend = agent_uses_api_backend(acfg);
-        std::unique_ptr<LlamaCppClient> api_recall_storage;
-        std::unique_ptr<NodeProxyLlamaClient> node_recall_storage;
-        LlamaCppClient* recall_client = nullptr;
+        std::unique_ptr<RuntimeClient> api_recall_storage;
+        std::unique_ptr<NodeProxyRuntimeClient> node_recall_storage;
+        RuntimeClient* recall_client = nullptr;
         std::optional<ScheduleResult> sched_result;
         NodeInfo ni;
 
         if (recall_api_backend) {
-            api_recall_storage = make_api_llama_client(acfg);
+            api_recall_storage = make_api_runtime_client(acfg);
             recall_client = api_recall_storage.get();
         } else {
             sched_result = scheduler_.ensure_agent_running(acfg);
@@ -1771,7 +1771,7 @@ void ControlApiServer::queue_global_recall(const AgentId& agent_id,
                 return;
             }
 
-            node_recall_storage = std::make_unique<NodeProxyLlamaClient>(
+            node_recall_storage = std::make_unique<NodeProxyRuntimeClient>(
                 ni.url, ni.api_key, sched_result->slot_id);
             recall_client = node_recall_storage.get();
         }
@@ -1842,18 +1842,18 @@ void ControlApiServer::queue_global_recall(const AgentId& agent_id,
         recall_ctx.push_back(recall_prompt);
 
         // Run tool call loop (internal, not streamed to client)
-        LlamaCppClient& recall_llama = *recall_client;
+        RuntimeClient& recall_runtime = *recall_client;
         static constexpr int kMaxRecallRounds = 5;
 
         for (int round = 0; round < kMaxRecallRounds; ++round) {
             InferenceRequest req;
             req.model    = acfg.model_path;
             req.messages = recall_ctx;
-            req.settings = acfg.llama_settings;
+            req.settings = acfg.runtime_settings;
             req.tools    = tool_exec.get_all_tool_definitions();
             req.stream   = false;
 
-            Message response = recall_llama.complete(req);
+            Message response = recall_runtime.complete(req);
 
             // Add assistant response to context
             recall_ctx.push_back(response);
@@ -2313,11 +2313,11 @@ void ControlApiServer::register_routes() {
         [this](const AgentConfig& acfg,
                std::string* error) -> std::optional<VoiceDesignProposal> {
         const bool voice_api_backend = agent_uses_api_backend(acfg);
-        std::unique_ptr<LlamaCppClient> api_voice_client;
-        std::unique_ptr<NodeProxyLlamaClient> node_voice_client;
-        LlamaCppClient* client = nullptr;
+        std::unique_ptr<RuntimeClient> api_voice_client;
+        std::unique_ptr<NodeProxyRuntimeClient> node_voice_client;
+        RuntimeClient* client = nullptr;
         if (voice_api_backend) {
-            api_voice_client = make_api_llama_client(acfg);
+            api_voice_client = make_api_runtime_client(acfg);
             client = api_voice_client.get();
         } else {
             auto sched_result = scheduler_.ensure_agent_running(acfg);
@@ -2337,7 +2337,7 @@ void ControlApiServer::register_routes() {
             }
 
             scheduler_.mark_agent_active(acfg.id);
-            node_voice_client = std::make_unique<NodeProxyLlamaClient>(
+            node_voice_client = std::make_unique<NodeProxyRuntimeClient>(
                 node.url, node.api_key, sched_result->slot_id);
             client = node_voice_client.get();
         }
@@ -2365,7 +2365,7 @@ void ControlApiServer::register_routes() {
             InferenceRequest req;
             req.model = acfg.model_path;
             req.messages = std::move(messages);
-            req.settings = acfg.llama_settings;
+            req.settings = acfg.runtime_settings;
             req.settings.max_tokens = std::min(std::max(req.settings.max_tokens, 256), 768);
             req.stream = false;
 
@@ -3340,8 +3340,8 @@ void ControlApiServer::register_routes() {
         auto cfg = a->get_config();
         if (agent_uses_api_backend(cfg)) {
             try {
-                auto api_llama = make_api_llama_client(cfg);
-                ConversationManager conv_mgr(a->db(), *api_llama);
+                auto api_runtime = make_api_runtime_client(cfg);
+                ConversationManager conv_mgr(a->db(), *api_runtime);
                 ConvId new_id = conv_mgr.force_compact(cid, cfg);
 
                 res.set_content(
@@ -3373,8 +3373,8 @@ void ControlApiServer::register_routes() {
 
         try {
             NodeInfo node = registry_.get_node(sched_result->node_id);
-            NodeProxyLlamaClient real_llama(node.url, node.api_key, sched_result->slot_id);
-            ConversationManager conv_mgr(a->db(), real_llama);
+            NodeProxyRuntimeClient real_runtime(node.url, node.api_key, sched_result->slot_id);
+            ConversationManager conv_mgr(a->db(), real_runtime);
             ConvId new_id = conv_mgr.force_compact(cid, cfg);
             mark_idle();
 
@@ -3571,8 +3571,8 @@ void ControlApiServer::register_routes() {
                 AgentConfig cfg = a_local->get_config();
                 if (agent_uses_api_backend(cfg)) {
                     try {
-                        auto api_llama = make_api_llama_client(cfg);
-                        MemoryManager mem_mgr(a_local->db(), *api_llama);
+                        auto api_runtime = make_api_runtime_client(cfg);
+                        MemoryManager mem_mgr(a_local->db(), *api_runtime);
                         mem_mgr.extract_and_store_memories_from_messages(conv_id, selected, cfg);
                     } catch (const std::exception& e) {
                         MM_WARN("Manual memory extraction failed for '{}': {}", id, e.what());
@@ -3592,8 +3592,8 @@ void ControlApiServer::register_routes() {
 
                 try {
                     NodeInfo node = registry_.get_node(sched_result->node_id);
-                    NodeProxyLlamaClient ext_llama(node.url, node.api_key, sched_result->slot_id);
-                    MemoryManager mem_mgr(a_local->db(), ext_llama);
+                    NodeProxyRuntimeClient ext_runtime(node.url, node.api_key, sched_result->slot_id);
+                    MemoryManager mem_mgr(a_local->db(), ext_runtime);
                     mem_mgr.extract_and_store_memories_from_messages(conv_id, selected, cfg);
                     mark_idle();
                 } catch (const std::exception& e) {

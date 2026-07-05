@@ -221,7 +221,7 @@ void ControlUI::run() {
     bool show_editor  = false;
     std::vector<AgentConfig> agent_rows;   // per-frame snapshot the menu transform indexes
     std::string ed_id, ed_id_orig, ed_name, ed_model, ed_sysprompt, ed_pref_node;
-    // Sampling (generation settings still flow through LlamaSettings in the request contract)
+    // Sampling (generation settings still flow through RuntimeSettings in the request contract)
     std::string ed_temp_s{"0.70"}, ed_topp_s{"0.90"}, ed_max_s{"1024"};
     // Engine · vLLM
     std::string ed_mml_s{"4096"};      // max_model_len
@@ -453,10 +453,10 @@ void ControlUI::run() {
         cfg.model_path = ed_model;
         cfg.system_prompt = ed_sysprompt;
         cfg.preferred_node_id = ed_pref_node;
-        // Generation (shared request contract → LlamaSettings)
-        try { cfg.llama_settings.temperature = std::stof(ed_temp_s); } catch (...) {}
-        try { cfg.llama_settings.top_p = std::stof(ed_topp_s); } catch (...) {}
-        try { cfg.llama_settings.max_tokens = std::stoi(ed_max_s); } catch (...) {}
+        // Generation (shared request contract → RuntimeSettings)
+        try { cfg.runtime_settings.temperature = std::stof(ed_temp_s); } catch (...) {}
+        try { cfg.runtime_settings.top_p = std::stof(ed_topp_s); } catch (...) {}
+        try { cfg.runtime_settings.max_tokens = std::stoi(ed_max_s); } catch (...) {}
         // Engine · vLLM
         try { cfg.vllm_settings.max_model_len = std::stoi(ed_mml_s); } catch (...) {}
         try { cfg.vllm_settings.max_num_seqs = std::stoi(ed_seqs_s); } catch (...) {}
@@ -472,7 +472,7 @@ void ControlUI::run() {
         cfg.vllm_settings.trust_remote_code = ed_trust;
         cfg.vllm_settings.enable_auto_tool_choice = ed_autotool;
         // Keep ctx_size aligned with max_model_len so the shared contract has a context.
-        cfg.llama_settings.ctx_size = cfg.vllm_settings.max_model_len;
+        cfg.runtime_settings.ctx_size = cfg.vllm_settings.max_model_len;
         cfg.reasoning_enabled = ed_reasoning;
         cfg.memories_enabled = ed_memories;
         cfg.tools_enabled = ed_tools;
@@ -802,11 +802,11 @@ void ControlUI::run() {
             ed_id = c.id; ed_id_orig = c.id; ed_name = c.name; ed_model = c.model_path;
             ed_sysprompt = c.system_prompt; ed_pref_node = c.preferred_node_id;
             char tmp[32];
-            snprintf(tmp, sizeof(tmp), "%.2f", static_cast<double>(c.llama_settings.temperature));
+            snprintf(tmp, sizeof(tmp), "%.2f", static_cast<double>(c.runtime_settings.temperature));
             ed_temp_s = tmp;
-            snprintf(tmp, sizeof(tmp), "%.2f", static_cast<double>(c.llama_settings.top_p));
+            snprintf(tmp, sizeof(tmp), "%.2f", static_cast<double>(c.runtime_settings.top_p));
             ed_topp_s = tmp;
-            ed_max_s = std::to_string(c.llama_settings.max_tokens);
+            ed_max_s = std::to_string(c.runtime_settings.max_tokens);
             ed_mml_s = std::to_string(c.vllm_settings.max_model_len);
             ed_seqs_s = std::to_string(c.vllm_settings.max_num_seqs);
             ed_batched_s = std::to_string(c.vllm_settings.max_num_batched_tokens);
@@ -1943,9 +1943,9 @@ void ControlUI::run() {
                       paragraph(a.system_prompt.empty() ? "(none)" : a.system_prompt) |
                           color(Color::Cyan) | flex}),
                 hbox({text("sampling ") | dim,
-                      text("temp " + fmt2(a.llama_settings.temperature) + " · top_p " +
-                           fmt2(a.llama_settings.top_p) + " · " +
-                           std::to_string(a.llama_settings.max_tokens) + " tok")}),
+                      text("temp " + fmt2(a.runtime_settings.temperature) + " · top_p " +
+                           fmt2(a.runtime_settings.top_p) + " · " +
+                           std::to_string(a.runtime_settings.max_tokens) + " tok")}),
                 hbox({text("engine   ") | dim,
                       text("mml " + std::to_string(a.vllm_settings.max_model_len) + " · seqs " +
                            std::to_string(a.vllm_settings.max_num_seqs) + " · gpu " +

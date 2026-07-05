@@ -87,16 +87,6 @@ void NodeState::set_last_error(const std::string& err) {
     last_error_ = err;
 }
 
-std::string NodeState::get_llama_server_path() const {
-    std::lock_guard<std::mutex> g(mutex_);
-    return llama_server_path_;
-}
-
-void NodeState::set_llama_server_path(const std::string& path) {
-    std::lock_guard<std::mutex> g(mutex_);
-    llama_server_path_ = path;
-}
-
 // ── Streaming text ─────────────────────────────────────────────────────────────
 StreamingTextState NodeState::get_streaming_text() const {
     std::lock_guard<std::mutex> g(mutex_);
@@ -174,12 +164,7 @@ void NodeState::start_metrics_poll(int interval_ms) {
     if (polling_.exchange(true)) return;
     poll_thread_ = std::thread([this, interval_ms]() {
         while (polling_) {
-            std::string path;
-            {
-                std::lock_guard<std::mutex> g(mutex_);
-                path = llama_server_path_;
-            }
-            update_metrics(sample_metrics(path));
+            update_metrics(sample_metrics());
             // Interruptible wait: stop_metrics_poll() wakes us immediately so
             // node shutdown is not delayed by up to interval_ms.
             std::unique_lock<std::mutex> lk(poll_mutex_);
@@ -219,7 +204,7 @@ void NodeState::set_vllm_runtime(const VllmRuntimeStatus& runtime) {
 }
 
 // ── Platform metrics sampling ──────────────────────────────────────────────────
-NodeHealthMetrics NodeState::sample_metrics(const std::string& llama_server_path) {
+NodeHealthMetrics NodeState::sample_metrics() {
     NodeHealthMetrics m;
 
 #ifdef _WIN32
@@ -351,16 +336,10 @@ NodeHealthMetrics NodeState::sample_metrics(const std::string& llama_server_path
         }
     }
 
-    // ── Check if llama-server was built with GPU (CUDA) support ──────────────
-    if (!llama_server_path.empty()) {
-        std::error_code ec;
-        auto exe_dir = std::filesystem::path(llama_server_path).parent_path();
-        if (!exe_dir.empty()) {
-            bool has_cuda = std::filesystem::exists(exe_dir / "ggml-cuda.dll", ec)
-                         || std::filesystem::exists(exe_dir / "libggml-cuda.so", ec);
-            m.gpu_backend_available = has_cuda;
-        }
-    }
+    // A CUDA-capable GPU backend is available whenever nvidia-smi reported a
+    // GPU above. vLLM uses the GPU directly, so presence of VRAM is sufficient;
+    // this also drives NCCL advertisement in capability detection.
+    m.gpu_backend_available = m.gpu_vram_total_mb > 0;
 
     return m;
 }

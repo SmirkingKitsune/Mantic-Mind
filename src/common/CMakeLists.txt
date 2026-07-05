@@ -3,7 +3,7 @@ set(MM_COMMON_SOURCES
     logger.cpp
     agent.cpp
     agent_db.cpp
-    llama_cpp_client.cpp
+    runtime_client.cpp
     conversation_manager.cpp
     memory_manager.cpp
     tool_executor.cpp

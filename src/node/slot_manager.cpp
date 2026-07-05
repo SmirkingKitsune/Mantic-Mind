@@ -21,7 +21,7 @@
 
 namespace mm {
 
-SlotManager::SlotLease::SlotLease(SlotManager* manager, SlotId slot_id, LlamaCppClient* client)
+SlotManager::SlotLease::SlotLease(SlotManager* manager, SlotId slot_id, RuntimeClient* client)
     : manager_(manager)
     , slot_id_(std::move(slot_id))
     , client_(client)
@@ -143,7 +143,7 @@ SlotId SlotManager::load_model(const std::string& model_path,
     slot->state          = SlotState::Loading;
     slot->last_active_ms = util::now_ms();
 
-    slot->process = std::make_unique<LlamaServerProcess>(vllm_server_path_);
+    slot->process = std::make_unique<RuntimeProcess>(vllm_server_path_);
     if (log_cb) slot->process->set_log_callback(log_cb);
 
     MM_INFO("SlotManager: loading vllm model {} on port {} (slot {})",
@@ -179,7 +179,7 @@ SlotId SlotManager::load_model(const std::string& model_path,
             vllm_fraction * static_cast<double>(gpu_vram_total_mb_));
     }
 
-    slot->client = std::make_unique<LlamaCppClient>(
+    slot->client = std::make_unique<RuntimeClient>(
         "http://127.0.0.1:" + std::to_string(port));
     slot->state = SlotState::Ready;
 
@@ -367,7 +367,7 @@ SlotId SlotManager::restore_slot(const std::string& model_path,
     slot->launch_settings = vllm_cfg;
     slot->state          = SlotState::Loading;
     slot->last_active_ms = util::now_ms();
-    slot->process = std::make_unique<LlamaServerProcess>(vllm_server_path_);
+    slot->process = std::make_unique<RuntimeProcess>(vllm_server_path_);
     if (log_cb) slot->process->set_log_callback(log_cb);
 
     MM_INFO("SlotManager: restoring vllm model {} on port {} (slot {})",
@@ -386,7 +386,7 @@ SlotId SlotManager::restore_slot(const std::string& model_path,
         return {};
     }
 
-    slot->client = std::make_unique<LlamaCppClient>(
+    slot->client = std::make_unique<RuntimeClient>(
         "http://127.0.0.1:" + std::to_string(port));
     slot->state = SlotState::Ready;
     slot->effective_ctx_size = vllm_cfg.max_model_len;
@@ -570,7 +570,7 @@ SlotId SlotManager::add_ready_test_slot(std::string model_path,
     slot->model_path = std::move(model_path);
     if (!agent_id.empty()) slot->agents.push_back(std::move(agent_id));
     slot->gpu_mem_fraction = gpu_mem_fraction;
-    slot->client = std::make_unique<LlamaCppClient>("http://127.0.0.1:0");
+    slot->client = std::make_unique<RuntimeClient>("http://127.0.0.1:0");
     slot->state = SlotState::Ready;
     slot->last_active_ms = util::now_ms();
 

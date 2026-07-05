@@ -4,7 +4,7 @@
 #include "common/config_file.hpp"
 #include "common/conversation_manager.hpp"
 #include "common/http_client.hpp"
-#include "common/llama_cpp_client.hpp"
+#include "common/runtime_client.hpp"
 #include "common/memory_manager.hpp"
 #include "common/trace_provenance.hpp"
 #include "common/tool_executor.hpp"
@@ -16,7 +16,7 @@
 #include "control/control_api_server.hpp"
 #include "control/node_registry.hpp"
 #include "control/tts_service_client.hpp"
-#include "node/llama_server_process.hpp"
+#include "node/runtime_process.hpp"
 #include "node/slot_manager.hpp"
 #include "node/vllm_provisioner.hpp"
 #include "node/vllm_runtime.hpp"
@@ -43,9 +43,9 @@
 
 namespace {
 
-class FixedSummaryLlamaClient : public mm::LlamaCppClient {
+class FixedSummaryRuntimeClient : public mm::RuntimeClient {
 public:
-    FixedSummaryLlamaClient() : mm::LlamaCppClient("http://127.0.0.1:1") {}
+    FixedSummaryRuntimeClient() : mm::RuntimeClient("http://127.0.0.1:1") {}
 
     mm::Message complete(const mm::InferenceRequest& req) override {
         last_model = req.model;
@@ -2529,7 +2529,7 @@ bool test_compaction_followup_trace_provenance_survives() {
         cfg.model_path = "model.gguf";
         cfg.system_prompt = "Use memory provenance carefully.";
         cfg.memories_enabled = true;
-        cfg.llama_settings.ctx_size = 128;
+        cfg.runtime_settings.ctx_size = 128;
 
         const mm::ConvId source_conv_id = db.create_conversation("Launch review");
         db.set_active_conversation(source_conv_id);
@@ -2559,12 +2559,12 @@ bool test_compaction_followup_trace_provenance_survives() {
         global.created_at_ms = mm::util::now_ms();
         db.add_memory(global);
 
-        FixedSummaryLlamaClient llama;
-        mm::ConversationManager conv_mgr(db, llama);
+        FixedSummaryRuntimeClient runtime;
+        mm::ConversationManager conv_mgr(db, runtime);
         const mm::ConvId continued_conv_id = conv_mgr.force_compact(source_conv_id, cfg);
         CHECK(!continued_conv_id.empty());
         CHECK(continued_conv_id != source_conv_id);
-        CHECK(llama.last_model == "model.gguf");
+        CHECK(runtime.last_model == "model.gguf");
 
         auto source = db.load_conversation(source_conv_id);
         auto continued = db.load_conversation(continued_conv_id);

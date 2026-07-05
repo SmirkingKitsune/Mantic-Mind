@@ -1,6 +1,6 @@
 #include "common/memory_manager.hpp"
 #include "common/agent_db.hpp"
-#include "common/llama_cpp_client.hpp"
+#include "common/runtime_client.hpp"
 #include "common/logger.hpp"
 #include "common/util.hpp"
 
@@ -148,8 +148,8 @@ std::vector<Memory> fallback_selected_memories(const std::vector<Memory>& candid
 
 } // namespace
 
-MemoryManager::MemoryManager(AgentDB& db, LlamaCppClient& llama)
-    : db_(db), llama_(llama) {}
+MemoryManager::MemoryManager(AgentDB& db, RuntimeClient& runtime)
+    : db_(db), runtime_(runtime) {}
 
 void MemoryManager::extract_and_store_memories(const ConvId& conv_id,
                                                const AgentConfig& cfg) {
@@ -182,12 +182,12 @@ void MemoryManager::extract_and_store_memories_from_messages(
 
     InferenceRequest req;
     req.model = cfg.model_path;
-    req.settings = cfg.llama_settings;
+    req.settings = cfg.runtime_settings;
     req.settings.max_tokens = 512;
     req.settings.temperature = 0.2f;
     req.messages = {{.role = MessageRole::User, .content = extraction_prompt}};
 
-    Message resp = llama_.complete(req);
+    Message resp = runtime_.complete(req);
     if (resp.content.empty()) {
         MM_WARN("Memory extraction returned empty response for conv {}", conv_id);
         return;
@@ -241,13 +241,13 @@ std::vector<Memory> MemoryManager::get_relevant_memories(const ConvId& conv_id,
 
     InferenceRequest req;
     req.model = cfg.model_path;
-    req.settings = cfg.llama_settings;
+    req.settings = cfg.runtime_settings;
     req.settings.max_tokens = 256;
     req.settings.temperature = 0.1f;
     req.messages = {{.role = MessageRole::User,
                      .content = build_relevance_prompt(db_, conv_id, cfg, candidates, max_selected)}};
 
-    Message response = llama_.complete(req);
+    Message response = runtime_.complete(req);
     if (response.content.empty()) {
         MM_WARN("Relevant memory selection returned empty response for conv {}", conv_id);
         return fallback_selected_memories(candidates, max_selected);

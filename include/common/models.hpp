@@ -62,24 +62,24 @@ struct Message {
     std::vector<TraceEvent> trace_events;
 };
 
-// ── LlamaSettings ─────────────────────────────────────────────────────────────
-struct LlamaSettings {
+// ── RuntimeSettings ─────────────────────────────────────────────────────────────
+struct RuntimeSettings {
     int   ctx_size     = 4096;
     int   n_gpu_layers = -1;   // -1 = all layers on GPU
     int   n_threads    = -1;   // -1 = auto-detect
-    int   n_threads_http = -1; // -1 = llama-server default
-    int   parallel     = 1;    // llama-server request slots; ctx_size is per slot
-    int   batch_size   = -1;   // -1 = llama-server default
-    int   ubatch_size  = -1;   // -1 = llama-server default
+    int   n_threads_http = -1; // -1 = runtime default
+    int   parallel     = 1;    // request slots; ctx_size is per slot
+    int   batch_size   = -1;   // -1 = runtime default
+    int   ubatch_size  = -1;   // -1 = runtime default
     float temperature  = 0.7f;
     float top_p        = 0.9f;
     int   max_tokens   = 1024;
     bool  flash_attn   = true;
-    std::vector<std::string> extra_args;  // additional llama-server CLI flags
+    std::vector<std::string> extra_args;  // additional runtime CLI flags
 };
 
-// vLLM server launch settings. Generation settings that are common to both
-// backends still flow through LlamaSettings in the current request contract.
+// vLLM server launch settings. Common generation settings still flow through
+// RuntimeSettings in the current request contract.
 struct VllmSettings {
     int         max_model_len = 4096;
     int         max_num_seqs = 16;
@@ -138,7 +138,7 @@ struct AgentConfig {
     std::string   model_path;
     std::string   system_prompt;
     std::string   inference_backend = "vllm"; // vllm | api
-    LlamaSettings llama_settings;
+    RuntimeSettings runtime_settings;
     VllmSettings  vllm_settings;
     ApiSettings   api_settings;
     bool          reasoning_enabled = false;
@@ -413,7 +413,7 @@ struct ToolDefinition {
 struct InferenceRequest {
     std::string          model;
     std::vector<Message> messages;
-    LlamaSettings        settings;
+    RuntimeSettings        settings;
     bool                 stream = true;
     std::vector<ToolDefinition> tools;
 };
@@ -549,8 +549,8 @@ inline void from_json(const nlohmann::json& j, Message& m) {
     if (j.contains("trace_events")) j.at("trace_events").get_to(m.trace_events);
 }
 
-// ─── LlamaSettings ───────────────────────────────────────────────────────────
-inline void to_json(nlohmann::json& j, const LlamaSettings& s) {
+// ─── RuntimeSettings ───────────────────────────────────────────────────────────
+inline void to_json(nlohmann::json& j, const RuntimeSettings& s) {
     j = { {"ctx_size",     s.ctx_size},
           {"n_gpu_layers", s.n_gpu_layers},
           {"n_threads",    s.n_threads},
@@ -564,7 +564,7 @@ inline void to_json(nlohmann::json& j, const LlamaSettings& s) {
           {"flash_attn",   s.flash_attn},
           {"extra_args",   s.extra_args} };
 }
-inline void from_json(const nlohmann::json& j, LlamaSettings& s) {
+inline void from_json(const nlohmann::json& j, RuntimeSettings& s) {
     if (j.contains("ctx_size"))     j.at("ctx_size").get_to(s.ctx_size);
     if (j.contains("n_gpu_layers")) j.at("n_gpu_layers").get_to(s.n_gpu_layers);
     if (j.contains("n_threads"))    j.at("n_threads").get_to(s.n_threads);
@@ -634,7 +634,7 @@ inline void to_json(nlohmann::json& j, const AgentConfig& a) {
           {"model_path",        a.model_path},
           {"system_prompt",     a.system_prompt},
           {"inference_backend", a.inference_backend},
-          {"llama_settings",    a.llama_settings},
+          {"runtime_settings",    a.runtime_settings},
           {"vllm_settings",     a.vllm_settings},
           {"api_settings",      a.api_settings},
           {"reasoning_enabled", a.reasoning_enabled},
@@ -648,7 +648,7 @@ inline void from_json(const nlohmann::json& j, AgentConfig& a) {
     if (j.contains("model_path"))        j.at("model_path").get_to(a.model_path);
     if (j.contains("system_prompt"))     j.at("system_prompt").get_to(a.system_prompt);
     if (j.contains("inference_backend")) j.at("inference_backend").get_to(a.inference_backend);
-    if (j.contains("llama_settings"))    j.at("llama_settings").get_to(a.llama_settings);
+    if (j.contains("runtime_settings"))    j.at("runtime_settings").get_to(a.runtime_settings);
     if (j.contains("vllm_settings"))     j.at("vllm_settings").get_to(a.vllm_settings);
     if (j.contains("api_settings"))      j.at("api_settings").get_to(a.api_settings);
     if (j.contains("reasoning_enabled")) j.at("reasoning_enabled").get_to(a.reasoning_enabled);

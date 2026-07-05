@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS agent_config (
     system_prompt     TEXT    NOT NULL DEFAULT '',
     inference_backend TEXT    NOT NULL DEFAULT 'vllm',
 
-    -- LlamaSettings columns
+    -- RuntimeSettings columns
     ctx_size          INTEGER NOT NULL DEFAULT 4096,
     n_gpu_layers      INTEGER NOT NULL DEFAULT -1,
     n_threads         INTEGER NOT NULL DEFAULT -1,

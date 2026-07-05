@@ -7,13 +7,13 @@
 namespace mm {
 
 class AgentDB;
-class LlamaCppClient;
+class RuntimeClient;
 
 // Extracts memories from completed conversations and retrieves relevant
 // memories to inject into context.
 class MemoryManager {
 public:
-    MemoryManager(AgentDB& db, LlamaCppClient& llama);
+    MemoryManager(AgentDB& db, RuntimeClient& runtime);
 
     // Prompt the model to extract facts from a conversation; persist results.
     // Designed to run asynchronously after conversation ends.
@@ -35,7 +35,7 @@ public:
 
 private:
     AgentDB&        db_;
-    LlamaCppClient& llama_;
+    RuntimeClient& runtime_;
 };
 
 } // namespace mm

@@ -30,7 +30,7 @@ namespace mm {
 
 namespace {
 
-std::string make_temp_llama_log_path() {
+std::string make_temp_runtime_log_path() {
     namespace fs = std::filesystem;
     std::error_code ec;
     fs::path base = fs::temp_directory_path(ec);
@@ -41,7 +41,7 @@ std::string make_temp_llama_log_path() {
         return {};
     }
     // Best-effort prune of stale logs from earlier runs so they don't accumulate in
-    // the temp dir. Only remove our own "mantic_mind_llama_output_*.log" files whose
+    // the temp dir. Only remove our own "mantic_mind_runtime_output_*.log" files whose
     // last-write time is >24h old, so a concurrently-running node's active log (which
     // is appended to continuously) is preserved. The current run's file is created
     // below, after this sweep, so it is never a candidate.
@@ -51,7 +51,7 @@ std::string make_temp_llama_log_path() {
         for (const auto& entry : fs::directory_iterator(base, lec)) {
             const auto& p = entry.path();
             const std::string name = p.filename().string();
-            if (name.rfind("mantic_mind_llama_output_", 0) != 0) continue;
+            if (name.rfind("mantic_mind_runtime_output_", 0) != 0) continue;
             if (p.extension() != ".log") continue;
             std::error_code fec;
             const auto mtime = fs::last_write_time(p, fec);
@@ -63,7 +63,7 @@ std::string make_temp_llama_log_path() {
         }
     }
     const auto stamp = std::to_string(mm::util::now_ms());
-    fs::path out = base / ("mantic_mind_llama_output_" + stamp + ".log");
+    fs::path out = base / ("mantic_mind_runtime_output_" + stamp + ".log");
     return out.string();
 }
 
@@ -109,7 +109,7 @@ NodeUI::NodeUI(NodeState& state, uint16_t listen_port,
     , listen_port_(listen_port)
     , forget_pairing_cb_(std::move(forget_pairing_cb)) {
     started_ms_ = mm::util::now_ms();
-    log_file_path_ = make_temp_llama_log_path();
+    log_file_path_ = make_temp_runtime_log_path();
     if (!log_file_path_.empty()) {
         log_file_.open(log_file_path_, std::ios::out | std::ios::app);
     }
@@ -130,7 +130,7 @@ void NodeUI::append_log(const std::string& line) {
         }
     }
     // Invoke the refresh closure while holding screen_mutex_ so the snapshot-and-call
-    // is atomic with run()'s clear-on-exit. This thread (the llama-server log pump) is
+    // is atomic with run()'s clear-on-exit. This thread (the runtime log pump) is
     // never joined by run(), so a copy-then-call would leave a window to PostEvent on a
     // destroyed screen. PostEvent is thread-safe and the clear block never re-enters here.
     std::lock_guard<std::mutex> lk(screen_mutex_);

@@ -376,8 +376,8 @@ After file loading, matching environment variables override config values.
 | `vllm_python_path` | `MM_VLLM_PYTHON_PATH` | *(auto)* | Python executable used for managed venv creation |
 | `vllm_gpu_budget` | `MM_VLLM_GPU_BUDGET` | `0.90` | Total GPU fraction all vLLM engines on this node may claim |
 | `max_slots` | `MM_MAX_SLOTS` | `4` | Maximum concurrent engine slots |
-| `llama_port_range_start` | `MM_LLAMA_PORT_RANGE_START` | `8080` | First port in the per-engine port range |
-| `llama_port_range_end` | `MM_LLAMA_PORT_RANGE_END` | `8090` | Last port in the per-engine port range |
+| `runtime_port_range_start` | `MM_RUNTIME_PORT_RANGE_START` | `8080` | First port in the per-engine port range |
+| `runtime_port_range_end` | `MM_RUNTIME_PORT_RANGE_END` | `8090` | Last port in the per-engine port range |
 | `models_dir` | `MM_MODELS_DIR` | `models` | Optional local model directory root |
 | `data_dir` | `MM_DATA_DIR` | `data` | Node runtime data root; remembered pairing keys live in `api_keys.json` |
 | `kv_cache_dir` | `MM_KV_CACHE_DIR` | `data/kv_cache` | KV-cache checkpoint directory |
@@ -392,8 +392,6 @@ After file loading, matching environment variables override config values.
 | `pairing_key` | `MM_PAIRING_KEY` | *(empty)* | PSK for automatic node/control pairing |
 | `discovery_port` | `MM_DISCOVERY_PORT` | `7072` | UDP discovery port |
 | `log_file` | `MM_LOG_FILE` | `logs/mantic-mind.log` | Log file |
-
-Legacy keys `llama_server_path` (`MM_LLAMA_PATH`) and `llama_port` (`MM_LLAMA_PORT`) are still parsed for compatibility but are unused on this branch.
 
 ### `mantic-mind-control.toml` — control config
 
@@ -563,16 +561,15 @@ mantic-mind-control  (:9090)
 mantic-mind  (:7070)
   ├─ NodeState          — API keys, metrics, capabilities
   ├─ SlotManager        — per-engine slots: GPU budget, shared engines, sleep/wake
-  ├─ LlamaServerProcess — engine subprocess supervisor (Windows CreateProcess / POSIX fork+exec)
-  ├─ LlamaCppClient     — OpenAI-compatible HTTP client → the engine
+  ├─ RuntimeProcess     — engine subprocess supervisor (Windows CreateProcess / POSIX fork+exec)
+  ├─ RuntimeClient      — OpenAI-compatible HTTP client → the engine
   └─ NodeApiServer      — node endpoints + SSE infer proxy
          │  HTTP (OpenAI-compatible)
          ▼
    vllm serve  (engine, :8080+)
 ```
 
-(`LlamaServerProcess` / `LlamaCppClient` keep their original names but now
-supervise and talk to `vllm serve`.)
+(`RuntimeProcess` supervises and `RuntimeClient` talks to `vllm serve`.)
 
 ## TUI Keyboard Shortcuts
 

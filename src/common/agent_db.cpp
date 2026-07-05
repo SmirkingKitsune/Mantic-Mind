@@ -485,7 +485,7 @@ void AgentDB::run_migrations() {
 //
 void AgentDB::save_config(const AgentConfig& cfg) {
     std::lock_guard g(mutex_);
-    const auto& s = cfg.llama_settings;
+    const auto& s = cfg.runtime_settings;
     const auto extra_args_json = serialize(s.extra_args);
     const auto vllm_settings_json = serialize(cfg.vllm_settings);
     const auto api_settings_json = serialize(cfg.api_settings);
@@ -580,7 +580,7 @@ AgentConfig AgentDB::load_config() const {
     cfg.inference_backend = normalize_inference_backend(
         q.getColumn("inference_backend").getText());
 
-    auto& s = cfg.llama_settings;
+    auto& s = cfg.runtime_settings;
     s.ctx_size      = q.getColumn("ctx_size").getInt();
     s.n_gpu_layers  = q.getColumn("n_gpu_layers").getInt();
     s.n_threads     = q.getColumn("n_threads").getInt();

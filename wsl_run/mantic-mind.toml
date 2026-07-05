@@ -11,8 +11,8 @@ vllm_gpu_budget = 0.50
 
 # Allow several concurrent engines.
 max_slots = 6
-llama_port_range_start = 8100
-llama_port_range_end   = 8120
+runtime_port_range_start = 8100
+runtime_port_range_end   = 8120
 
 models_dir = "models"
 data_dir   = "data"

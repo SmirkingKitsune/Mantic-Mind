@@ -8,7 +8,7 @@
 namespace mm {
 
 class AgentDB;
-class LlamaCppClient;
+class RuntimeClient;
 
 // Manages context building and automatic compaction for a single agent.
 //
@@ -17,7 +17,7 @@ class LlamaCppClient;
 // Conversation with the summary as first user message, mark old conv inactive.
 class ConversationManager {
 public:
-    ConversationManager(AgentDB& db, LlamaCppClient& llama);
+    ConversationManager(AgentDB& db, RuntimeClient& runtime);
 
     // Build the message list to send to the model:
     //   system prompt → memories injection → compaction_summary (if any) → messages
@@ -33,7 +33,7 @@ public:
 
 private:
     AgentDB&        db_;
-    LlamaCppClient& llama_;
+    RuntimeClient& runtime_;
 
     // Summarise old messages and return a new active ConvId.
     ConvId compact_conversation(const ConvId& conv_id, const AgentConfig& cfg);

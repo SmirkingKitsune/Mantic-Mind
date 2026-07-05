@@ -4,7 +4,7 @@
 #include "node/ray_orchestration.hpp"
 #include "node/hf_cache.hpp"
 #include "common/http_server.hpp"
-#include "common/llama_cpp_client.hpp"
+#include "common/runtime_client.hpp"
 #include "common/models.hpp"
 #include "common/logger.hpp"
 #include "common/pairing.hpp"
@@ -774,7 +774,7 @@ void NodeApiServer::register_routes() {
                      infer_req,
                      ctx,
                      slot_lease = std::move(slot_lease)]() mutable {
-            LlamaCppClient* client = slot_lease.get();
+            RuntimeClient* client = slot_lease.get();
             auto emit_line = [ctx](const std::string& payload, bool done) {
                 std::lock_guard<std::mutex> lk(ctx->mx);
                 ctx->lines.push_back(payload);

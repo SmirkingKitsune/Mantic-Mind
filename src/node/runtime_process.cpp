@@ -1,4 +1,4 @@
-#include "node/llama_server_process.hpp"
+#include "node/runtime_process.hpp"
 #include "common/logger.hpp"
 #include "common/util.hpp"
 #include "node/vllm_runtime.hpp"
@@ -32,7 +32,7 @@
 namespace mm {
 
 // ── Impl ──────────────────────────────────────────────────────────────────────
-struct LlamaServerProcess::Impl {
+struct RuntimeProcess::Impl {
     std::atomic<bool> pipe_running{false};
     std::thread       stdout_reader;
     std::thread       stderr_reader;
@@ -191,19 +191,19 @@ std::string resolve_windows_executable(const std::string& exe_name) {
 } // namespace
 
 // ── Construction ──────────────────────────────────────────────────────────────
-LlamaServerProcess::LlamaServerProcess(std::string path)
+RuntimeProcess::RuntimeProcess(std::string path)
     : impl_(std::make_unique<Impl>())
-    , llama_server_path_(std::move(path))
+    , runtime_path_(std::move(path))
 {}
 
-LlamaServerProcess::~LlamaServerProcess() { stop(); }
+RuntimeProcess::~RuntimeProcess() { stop(); }
 
-void LlamaServerProcess::set_log_callback(LogCallback cb) {
+void RuntimeProcess::set_log_callback(LogCallback cb) {
     std::lock_guard<std::mutex> lk(impl_->cb_mutex);
     impl_->log_cb = std::move(cb);
 }
 
-bool LlamaServerProcess::start_vllm(const std::string& model_ref,
+bool RuntimeProcess::start_vllm(const std::string& model_ref,
                                     const VllmSettings& settings,
                                     uint16_t port) {
     if (settings.enable_sleep_mode) {
@@ -216,11 +216,11 @@ bool LlamaServerProcess::start_vllm(const std::string& model_ref,
 #endif
     }
     auto args = build_vllm_server_args(model_ref, settings, port);
-    return start_with_args("vLLM", strip_wrapping_quotes(llama_server_path_),
+    return start_with_args("vLLM", strip_wrapping_quotes(runtime_path_),
                            std::move(args), port, load_health_timeout_seconds());
 }
 
-bool LlamaServerProcess::start_with_args(const std::string& runtime_name,
+bool RuntimeProcess::start_with_args(const std::string& runtime_name,
                                          const std::string& executable_path,
                                          std::vector<std::string> args,
                                          uint16_t port,
@@ -619,7 +619,7 @@ bool LlamaServerProcess::start_with_args(const std::string& runtime_name,
 }
 
 // ── stop ──────────────────────────────────────────────────────────────────────
-void LlamaServerProcess::stop() {
+void RuntimeProcess::stop() {
     if (state_ == ProcessState::Stopped) return;
 
     impl_->pipe_running = false;
@@ -660,17 +660,17 @@ void LlamaServerProcess::stop() {
 }
 
 // ── Accessors ─────────────────────────────────────────────────────────────────
-ProcessState LlamaServerProcess::get_state() const { return state_.load(); }
-uint16_t     LlamaServerProcess::get_port()  const { return port_; }
+ProcessState RuntimeProcess::get_state() const { return state_.load(); }
+uint16_t     RuntimeProcess::get_port()  const { return port_; }
 
-std::string LlamaServerProcess::get_url() const {
+std::string RuntimeProcess::get_url() const {
     return "http://127.0.0.1:" + std::to_string(port_);
 }
 
-std::string LlamaServerProcess::last_error() const { return last_error_; }
+std::string RuntimeProcess::last_error() const { return last_error_; }
 
 // ── poll_health ───────────────────────────────────────────────────────────────
-bool LlamaServerProcess::poll_health(int timeout_seconds) {
+bool RuntimeProcess::poll_health(int timeout_seconds) {
     httplib::Client cli("127.0.0.1", port_);
     cli.set_connection_timeout(2);
     cli.set_read_timeout(3);

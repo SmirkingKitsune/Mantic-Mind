@@ -61,43 +61,43 @@ AgentValidationResult validate_agent_config(const AgentConfig& cfg,
                   "id",
                   "Agent ID must be 1-128 characters, start with an alphanumeric character, and use only [a-zA-Z0-9_-].");
     }
-    if (cfg.llama_settings.ctx_size <= 0) {
-        add_issue(result, ValidationSeverity::Error, "llama_settings.ctx_size", "ctx_size must be greater than 0.");
+    if (cfg.runtime_settings.ctx_size <= 0) {
+        add_issue(result, ValidationSeverity::Error, "runtime_settings.ctx_size", "ctx_size must be greater than 0.");
     }
-    if (cfg.llama_settings.max_tokens == -1) {
+    if (cfg.runtime_settings.max_tokens == -1) {
         add_issue(result,
                   ValidationSeverity::Warning,
-                  "llama_settings.max_tokens",
+                  "runtime_settings.max_tokens",
                   "max_tokens is -1 (unlimited generation). Responses may run indefinitely until stopped.");
-    } else if (cfg.llama_settings.max_tokens <= 0) {
+    } else if (cfg.runtime_settings.max_tokens <= 0) {
         add_issue(result,
                   ValidationSeverity::Error,
-                  "llama_settings.max_tokens",
+                  "runtime_settings.max_tokens",
                   "max_tokens must be greater than 0, or -1 for unlimited generation.");
     }
-    if (cfg.llama_settings.top_p <= 0.0f || cfg.llama_settings.top_p > 1.0f || !std::isfinite(cfg.llama_settings.top_p)) {
-        add_issue(result, ValidationSeverity::Error, "llama_settings.top_p", "top_p must be within (0, 1].");
+    if (cfg.runtime_settings.top_p <= 0.0f || cfg.runtime_settings.top_p > 1.0f || !std::isfinite(cfg.runtime_settings.top_p)) {
+        add_issue(result, ValidationSeverity::Error, "runtime_settings.top_p", "top_p must be within (0, 1].");
     }
-    if (cfg.llama_settings.temperature < 0.0f || !std::isfinite(cfg.llama_settings.temperature)) {
-        add_issue(result, ValidationSeverity::Error, "llama_settings.temperature", "temperature must be a finite value >= 0.");
+    if (cfg.runtime_settings.temperature < 0.0f || !std::isfinite(cfg.runtime_settings.temperature)) {
+        add_issue(result, ValidationSeverity::Error, "runtime_settings.temperature", "temperature must be a finite value >= 0.");
     }
-    if (cfg.llama_settings.n_gpu_layers < -1) {
-        add_issue(result, ValidationSeverity::Error, "llama_settings.n_gpu_layers", "n_gpu_layers must be -1 or greater.");
+    if (cfg.runtime_settings.n_gpu_layers < -1) {
+        add_issue(result, ValidationSeverity::Error, "runtime_settings.n_gpu_layers", "n_gpu_layers must be -1 or greater.");
     }
-    if (cfg.llama_settings.n_threads < -1) {
-        add_issue(result, ValidationSeverity::Error, "llama_settings.n_threads", "n_threads must be -1 or greater.");
+    if (cfg.runtime_settings.n_threads < -1) {
+        add_issue(result, ValidationSeverity::Error, "runtime_settings.n_threads", "n_threads must be -1 or greater.");
     }
-    if (cfg.llama_settings.n_threads_http < -1) {
-        add_issue(result, ValidationSeverity::Error, "llama_settings.n_threads_http", "n_threads_http must be -1 or greater.");
+    if (cfg.runtime_settings.n_threads_http < -1) {
+        add_issue(result, ValidationSeverity::Error, "runtime_settings.n_threads_http", "n_threads_http must be -1 or greater.");
     }
-    if (cfg.llama_settings.parallel <= 0) {
-        add_issue(result, ValidationSeverity::Error, "llama_settings.parallel", "parallel must be greater than 0.");
+    if (cfg.runtime_settings.parallel <= 0) {
+        add_issue(result, ValidationSeverity::Error, "runtime_settings.parallel", "parallel must be greater than 0.");
     }
-    if (cfg.llama_settings.batch_size != -1 && cfg.llama_settings.batch_size <= 0) {
-        add_issue(result, ValidationSeverity::Error, "llama_settings.batch_size", "batch_size must be greater than 0, or -1 for the llama-server default.");
+    if (cfg.runtime_settings.batch_size != -1 && cfg.runtime_settings.batch_size <= 0) {
+        add_issue(result, ValidationSeverity::Error, "runtime_settings.batch_size", "batch_size must be greater than 0, or -1 for the runtime default.");
     }
-    if (cfg.llama_settings.ubatch_size != -1 && cfg.llama_settings.ubatch_size <= 0) {
-        add_issue(result, ValidationSeverity::Error, "llama_settings.ubatch_size", "ubatch_size must be greater than 0, or -1 for the llama-server default.");
+    if (cfg.runtime_settings.ubatch_size != -1 && cfg.runtime_settings.ubatch_size <= 0) {
+        add_issue(result, ValidationSeverity::Error, "runtime_settings.ubatch_size", "ubatch_size must be greater than 0, or -1 for the runtime default.");
     }
     if (backend == "vllm") {
         if (cfg.vllm_settings.max_model_len <= 0) {

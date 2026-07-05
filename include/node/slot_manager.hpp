@@ -1,8 +1,8 @@
 #pragma once
 
 #include "common/models.hpp"
-#include "common/llama_cpp_client.hpp"
-#include "node/llama_server_process.hpp"
+#include "common/runtime_client.hpp"
+#include "node/runtime_process.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -45,7 +45,7 @@ struct DetachResult {
 /// by multiple agents; idle engines can sleep (weights to host RAM) and wake.
 class SlotManager {
 public:
-    using LogCallback = LlamaServerProcess::LogCallback;
+    using LogCallback = RuntimeProcess::LogCallback;
 
     class SlotLease {
     public:
@@ -57,18 +57,18 @@ public:
         ~SlotLease();
 
         explicit operator bool() const { return client_ != nullptr; }
-        LlamaCppClient* get() const { return client_; }
+        RuntimeClient* get() const { return client_; }
         const SlotId& slot_id() const { return slot_id_; }
 
     private:
         friend class SlotManager;
-        SlotLease(SlotManager* manager, SlotId slot_id, LlamaCppClient* client);
+        SlotLease(SlotManager* manager, SlotId slot_id, RuntimeClient* client);
 
         void reset();
 
         SlotManager* manager_ = nullptr;
         SlotId slot_id_;
-        LlamaCppClient* client_ = nullptr;
+        RuntimeClient* client_ = nullptr;
     };
 
     SlotManager(uint16_t port_range_start,
@@ -174,8 +174,8 @@ private:
         std::string                         model_path;
         std::vector<AgentId>                agents;          // attached agents
         VllmSettings                        launch_settings; // engine identity for sharing
-        std::unique_ptr<LlamaServerProcess> process;
-        std::unique_ptr<LlamaCppClient>     client;
+        std::unique_ptr<RuntimeProcess> process;
+        std::unique_ptr<RuntimeClient>     client;
         int                                 active_requests = 0;
         int64_t                             vram_usage_mb  = 0;
         double                              gpu_mem_fraction = 0.0;

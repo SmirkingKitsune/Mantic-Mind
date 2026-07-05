@@ -81,7 +81,6 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
     if (!loaded_from.empty()) {
         cfg.control_url       = file.get("control_url",       "");
         cfg.control_api_key   = file.get("control_api_key",   "");
-        cfg.llama_server_path = file.get("llama_server_path", "llama-server");
         cfg.vllm_server_path  = file.get("vllm_server_path",  "vllm");
         cfg.vllm_auto_provision = file.get_bool("vllm_auto_provision", true);
         cfg.vllm_provision_dir = file.get("vllm_provision_dir", "");
@@ -93,12 +92,10 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
         cfg.log_file          = file.get("log_file", "logs/mantic-mind.log");
         cfg.listen_port = static_cast<uint16_t>(
             file.get_int("listen_port", 7070));
-        cfg.llama_port  = static_cast<uint16_t>(
-            file.get_int("llama_port",  8080));
-        cfg.llama_port_range_start = static_cast<uint16_t>(
-            file.get_int("llama_port_range_start", cfg.llama_port));
-        cfg.llama_port_range_end = static_cast<uint16_t>(
-            file.get_int("llama_port_range_end", cfg.llama_port_range_start + 10));
+        cfg.runtime_port_range_start = static_cast<uint16_t>(
+            file.get_int("runtime_port_range_start", 8080));
+        cfg.runtime_port_range_end = static_cast<uint16_t>(
+            file.get_int("runtime_port_range_end", cfg.runtime_port_range_start + 10));
         cfg.max_slots    = file.get_int("max_slots", 4);
         cfg.vllm_gpu_budget = static_cast<double>(
             file.get_float("vllm_gpu_budget", 0.90f));
@@ -143,7 +140,6 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
 
     cfg.control_url       = env("MM_CONTROL_URL",     cfg.control_url);
     cfg.control_api_key   = env("MM_CONTROL_API_KEY", cfg.control_api_key);
-    cfg.llama_server_path = env("MM_LLAMA_PATH",      cfg.llama_server_path);
     cfg.vllm_server_path  = env("MM_VLLM_PATH",       cfg.vllm_server_path);
     cfg.vllm_auto_provision = env_bool("MM_VLLM_AUTO_PROVISION", cfg.vllm_auto_provision);
     cfg.vllm_provision_dir = env("MM_VLLM_PROVISION_DIR", cfg.vllm_provision_dir);
@@ -156,7 +152,6 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
     cfg.kv_cache_dir      = env("MM_KV_CACHE_DIR",   cfg.kv_cache_dir);
     cfg.pairing_key       = env("MM_PAIRING_KEY",     cfg.pairing_key);
     cfg.listen_port       = env_port("MM_LISTEN_PORT",    cfg.listen_port);
-    cfg.llama_port        = env_port("MM_LLAMA_PORT",     cfg.llama_port);
     cfg.discovery_port    = env_port("MM_DISCOVERY_PORT", cfg.discovery_port);
 
     auto env_int = [](const char* name, int cur) -> int {
@@ -164,8 +159,8 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
         if (!v) return cur;
         try { return std::stoi(v); } catch (...) { return cur; }
     };
-    cfg.llama_port_range_start = env_port("MM_LLAMA_PORT_RANGE_START", cfg.llama_port_range_start);
-    cfg.llama_port_range_end   = env_port("MM_LLAMA_PORT_RANGE_END",   cfg.llama_port_range_end);
+    cfg.runtime_port_range_start = env_port("MM_RUNTIME_PORT_RANGE_START", cfg.runtime_port_range_start);
+    cfg.runtime_port_range_end   = env_port("MM_RUNTIME_PORT_RANGE_END",   cfg.runtime_port_range_end);
     cfg.max_slots              = env_int("MM_MAX_SLOTS", cfg.max_slots);
 
     auto env_double = [](const char* name, double cur) -> double {
@@ -188,7 +183,6 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
     }
 
     // Keep node startup resilient if env/config accidentally provide empty strings.
-    if (cfg.llama_server_path.empty()) cfg.llama_server_path = "llama-server";
     if (cfg.vllm_server_path.empty()) cfg.vllm_server_path = "vllm";
     if (cfg.vllm_install_method.empty()) cfg.vllm_install_method = "auto";
     cfg.vllm_install_method = mm::normalize_vllm_install_method(cfg.vllm_install_method);
@@ -806,11 +800,11 @@ int main(int argc, char** argv) {
         spdlog::level::trace);
     MM_INFO("mantic-mind node starting — listen port {}, slots {}, port range {}-{}",
             cfg.listen_port, cfg.max_slots,
-            cfg.llama_port_range_start, cfg.llama_port_range_end);
+            cfg.runtime_port_range_start, cfg.runtime_port_range_end);
     MM_INFO("Node config source: {}",
             cfg_path.empty() ? "(defaults/env only; no config file found)" : cfg_path);
-    MM_INFO("Node config — control_url='{}', llama_server_path='{}', models_dir='{}'",
-            cfg.control_url, cfg.llama_server_path, cfg.models_dir);
+    MM_INFO("Node config — control_url='{}', models_dir='{}'",
+            cfg.control_url, cfg.models_dir);
     MM_INFO("Node vLLM path: {}", cfg.vllm_server_path);
 
     // ── NodeState ─────────────────────────────────────────────────────────────
@@ -818,7 +812,6 @@ int main(int argc, char** argv) {
     mm::NodeState state;
     const std::string local_node_id = "local-" + mm::util::generate_uuid();
     state.set_registered(false, local_node_id);
-    state.set_llama_server_path(cfg.llama_server_path);
     MM_INFO("Local node identity: {}", local_node_id);
 
     mm::VllmProvisionConfig vllm_provision_cfg;
@@ -860,21 +853,14 @@ int main(int argc, char** argv) {
 
     state.start_metrics_poll(2000);
 
-    // Brief wait for first metrics sample, then warn if GPU detected but no CUDA backend.
+    // Give the first metrics sample time to land (nvidia-smi probe) so
+    // gpu_backend_available is populated before capability detection reads it.
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    {
-        auto m = state.get_metrics();
-        if (m.gpu_vram_total_mb > 0 && !m.gpu_backend_available) {
-            MM_WARN("NVIDIA GPU detected ({} MB VRAM) but llama-server lacks CUDA backend. "
-                    "Models will load on CPU. Rebuild llama-server with -DGGML_CUDA=ON.",
-                    static_cast<long long>(m.gpu_vram_total_mb));
-        }
-    }
 
     // ── SlotManager ───────────────────────────────────────────────────────────
 
-    mm::SlotManager slot_mgr(cfg.llama_port_range_start,
-                             cfg.llama_port_range_end,
+    mm::SlotManager slot_mgr(cfg.runtime_port_range_start,
+                             cfg.runtime_port_range_end,
                              cfg.max_slots,
                              cfg.vllm_server_path,
                              cfg.vllm_gpu_budget);

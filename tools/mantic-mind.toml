@@ -20,8 +20,8 @@ control_api_key = ""
 # ── vLLM engine processes ──────────────────────────────────────────────────────
 # Port range for concurrent vLLM engine processes. Each engine slot binds one
 # port in this range; the range must not conflict with listen_port.
-llama_port_range_start = 8080
-llama_port_range_end   = 8090
+runtime_port_range_start = 8080
+runtime_port_range_end   = 8090
 
 # Maximum number of concurrent model slots (vLLM engine processes).
 max_slots = 4

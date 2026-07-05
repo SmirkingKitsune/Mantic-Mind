@@ -15,10 +15,10 @@ enum class ProcessState { Stopped, Starting, Ready, Error };
 // Manages an inference engine child process (`vllm serve`).
 // Platform specifics are hidden behind a PIMPL.
 // Pipe output is forwarded via LogCallback on background threads.
-class LlamaServerProcess {
+class RuntimeProcess {
 public:
-    explicit LlamaServerProcess(std::string server_path);
-    ~LlamaServerProcess();
+    explicit RuntimeProcess(std::string server_path);
+    ~RuntimeProcess();
 
     using LogCallback = std::function<void(const std::string& line, bool is_stderr)>;
     void set_log_callback(LogCallback cb);
@@ -41,7 +41,7 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 
-    std::string           llama_server_path_;
+    std::string           runtime_path_;
     uint16_t              port_  = 8080;
     std::atomic<ProcessState> state_{ProcessState::Stopped};
     std::string           last_error_;

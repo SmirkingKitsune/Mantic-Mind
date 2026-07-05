@@ -1,6 +1,6 @@
 #include "common/conversation_manager.hpp"
 #include "common/agent_db.hpp"
-#include "common/llama_cpp_client.hpp"
+#include "common/runtime_client.hpp"
 #include "common/util.hpp"
 #include "common/logger.hpp"
 
@@ -12,8 +12,8 @@ namespace mm {
 static constexpr double kCompactionThreshold  = 0.80;
 static constexpr int    kCompactionKeepRecent = 4;
 
-ConversationManager::ConversationManager(AgentDB& db, LlamaCppClient& llama)
-    : db_(db), llama_(llama) {}
+ConversationManager::ConversationManager(AgentDB& db, RuntimeClient& runtime)
+    : db_(db), runtime_(runtime) {}
 
 // ── Context building ──────────────────────────────────────────────────────────
 std::vector<Message> ConversationManager::build_context(
@@ -69,7 +69,7 @@ std::vector<Message> ConversationManager::build_context(
 ConvId ConversationManager::maybe_compact(const ConvId& conv_id,
                                            const AgentConfig& cfg) {
     int total   = db_.get_total_tokens(conv_id);
-    int ctx_sz  = cfg.llama_settings.ctx_size;
+    int ctx_sz  = cfg.runtime_settings.ctx_size;
     double ratio = ctx_sz > 0 ? static_cast<double>(total) / ctx_sz : 0.0;
 
     if (ratio >= kCompactionThreshold) {
@@ -113,10 +113,10 @@ ConvId ConversationManager::compact_conversation(const ConvId& conv_id,
 
     InferenceRequest req;
     req.model = cfg.model_path;
-    req.settings = cfg.llama_settings;
+    req.settings = cfg.runtime_settings;
     req.messages = {{ .role = MessageRole::User, .content = prompt.str() }};
 
-    Message summary = llama_.complete(req);
+    Message summary = runtime_.complete(req);
     if (summary.content.empty()) {
         MM_WARN("Compaction summary is empty — skipping compaction");
         return conv_id;
