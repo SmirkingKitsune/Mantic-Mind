@@ -315,15 +315,23 @@ NodeHealthMetrics NodeState::sample_metrics() {
 #else
         FILE* f = ::popen(cmd, "r");
 #endif
+        bool gpu_present = false;
         if (f) {
             char buf[256] = {};
-            if (fgets(buf, static_cast<int>(sizeof(buf)), f)) {
+            if (fgets(buf, static_cast<int>(sizeof(buf)), f) &&
+                !mm::util::trim(buf).empty()) {
+                // A CSV row means nvidia-smi sees a GPU — even when fields read
+                // "[N/A]", as unified-memory parts (GB10/GH200, Jetson) do for
+                // memory.total.
+                gpu_present = true;
                 float gpu_util = 0, vram_used = 0, vram_total = 0;
-                // nvidia-smi may use " , " or ", " separators
-                if (sscanf(buf, "%f , %f , %f", &gpu_util, &vram_used, &vram_total) == 3 ||
-                    sscanf(buf, "%f, %f, %f",   &gpu_util, &vram_used, &vram_total) == 3 ||
-                    sscanf(buf, "%f,%f,%f",      &gpu_util, &vram_used, &vram_total) == 3) {
-                    m.gpu_percent       = gpu_util;
+                // Utilization is reported even when memory.total is "[N/A]".
+                if (sscanf(buf, "%f", &gpu_util) == 1)
+                    m.gpu_percent = gpu_util;
+                // nvidia-smi may use " , " or ", " separators.
+                if (sscanf(buf, "%*f , %f , %f", &vram_used, &vram_total) == 2 ||
+                    sscanf(buf, "%*f, %f, %f",   &vram_used, &vram_total) == 2 ||
+                    sscanf(buf, "%*f,%f,%f",      &vram_used, &vram_total) == 2) {
                     m.gpu_vram_used_mb  = static_cast<int64_t>(vram_used);
                     m.gpu_vram_total_mb = static_cast<int64_t>(vram_total);
                 }
@@ -334,12 +342,14 @@ NodeHealthMetrics NodeState::sample_metrics() {
             ::pclose(f);
 #endif
         }
-    }
 
-    // A CUDA-capable GPU backend is available whenever nvidia-smi reported a
-    // GPU above. vLLM uses the GPU directly, so presence of VRAM is sufficient;
-    // this also drives NCCL advertisement in capability detection.
-    m.gpu_backend_available = m.gpu_vram_total_mb > 0;
+        // A CUDA-capable GPU backend is available whenever nvidia-smi reports a
+        // GPU, regardless of whether it exposes a discrete VRAM total. Unified-
+        // memory parts (GB10/GH200, Jetson) return "[N/A]" for memory.total, so
+        // gating on VRAM size would wrongly hide the GPU — and NCCL — there.
+        // This drives NCCL advertisement in capability detection.
+        m.gpu_backend_available = gpu_present;
+    }
 
     return m;
 }
