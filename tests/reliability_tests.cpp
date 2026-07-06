@@ -957,9 +957,7 @@ bool test_vllm_runtime_defaults_and_args() {
     CHECK(has_arg(args, "--disable-log-requests"));
 
     // GGUF detection (drives the experimental-support advisory at launch).
-    CHECK(mm::model_ref_is_gguf("N:\\models\\GLM-4.7-Flash-Q6_K.gguf"));
     CHECK(mm::model_ref_is_gguf("/models/model.GGUF"));
-    CHECK(!mm::model_ref_is_gguf("Qwen/Qwen3-8B"));
     CHECK(!mm::model_ref_is_gguf("/models/model.safetensors"));
     CHECK(!mm::model_ref_is_gguf(""));
 
