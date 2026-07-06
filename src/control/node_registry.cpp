@@ -569,6 +569,7 @@ void NodeRegistry::poll_all_nodes() {
 
         // Write updated info back; grab callback outside the lock
         UpdateCallback cb;
+        bool version_bumped = false;
         {
             std::lock_guard<std::mutex> g(mutex_);
             auto it = nodes_.find(id);
@@ -595,12 +596,74 @@ void NodeRegistry::poll_all_nodes() {
                 it->second.capabilities = info.capabilities;
             }
             cb = update_cb_;
+
+            // Detect a vLLM runtime version bump so we can converge peers. First
+            // observation only seeds the baseline (no nudge on initial connect).
+            const std::string& newv = info.vllm_runtime.version;
+            std::string& prev = last_vllm_version_[id];
+            if (info.connected && !newv.empty() && newv != prev) {
+                version_bumped = !prev.empty();
+                prev = newv;
+            }
         }
 
         if (info.connected != was_connected)
             MM_INFO("Node {} is now {}", id, info.connected ? "connected" : "disconnected");
 
+        if (version_bumped) {
+            MM_INFO("Node {} vLLM updated to {}; nudging same-environment peers",
+                    id, info.vllm_runtime.version);
+            nudge_environment_peers(id);
+        }
+
         if (cb) cb(info);
+    }
+}
+
+std::vector<NodeId> select_vllm_update_peers(const std::vector<NodeInfo>& nodes,
+                                             const NodeId& source_id) {
+    auto env_key = [](const NodeInfo& n) {
+        return n.vllm_runtime.accelerator + "|" + n.vllm_runtime.platform + "|" +
+               n.capabilities.arch;
+    };
+    const NodeInfo* source = nullptr;
+    for (const auto& n : nodes) {
+        if (n.id == source_id) { source = &n; break; }
+    }
+    std::vector<NodeId> out;
+    if (!source) return out;
+
+    const std::string source_env = env_key(*source);
+    const std::string source_ver = source->vllm_runtime.version;
+    for (const auto& n : nodes) {
+        if (n.id == source_id || !n.connected) continue;
+        if (env_key(n) != source_env) continue;
+        if (n.vllm_runtime.version == source_ver) continue;  // already converged
+        out.push_back(n.id);
+    }
+    return out;
+}
+
+void NodeRegistry::nudge_environment_peers(const NodeId& source_id) {
+    // Snapshot the registry under the lock; select + POST without it.
+    std::vector<NodeInfo> snapshot;
+    {
+        std::lock_guard<std::mutex> g(mutex_);
+        snapshot.reserve(nodes_.size());
+        for (const auto& [id, n] : nodes_) snapshot.push_back(n);
+    }
+
+    const std::vector<NodeId> peer_ids = select_vllm_update_peers(snapshot, source_id);
+    for (const auto& pid : peer_ids) {
+        const NodeInfo* peer = nullptr;
+        for (const auto& n : snapshot) {
+            if (n.id == pid) { peer = &n; break; }
+        }
+        if (!peer) continue;
+        HttpClient cli(peer->url);
+        cli.set_bearer_token(peer->api_key);
+        auto res = cli.post("/api/node/runtime/vllm/check-update", nlohmann::json::object());
+        MM_INFO("  nudged peer {} ({}): HTTP {}", pid, peer->url, res.status);
     }
 }
 

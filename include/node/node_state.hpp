@@ -68,6 +68,10 @@ public:
     VllmRuntimeStatus get_vllm_runtime() const;
     void              set_vllm_runtime(const VllmRuntimeStatus& runtime);
 
+    // Live install/upgrade progress for the node TUI loading bar.
+    VllmInstallProgress get_vllm_install_progress() const;
+    void                set_vllm_install_progress(const VllmInstallProgress& p);
+
     // ── Diagnostics ───────────────────────────────────────────────────────────
     std::string get_last_error() const;
     void        set_last_error(const std::string& err);
@@ -111,6 +115,7 @@ private:
     NodeHealthMetrics            metrics_;
     NodeCapabilities             capabilities_;
     VllmRuntimeStatus            vllm_runtime_;
+    VllmInstallProgress          vllm_install_progress_;
     std::string                  last_error_;
     std::unordered_set<std::string> api_keys_;
 

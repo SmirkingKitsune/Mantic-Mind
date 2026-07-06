@@ -45,10 +45,13 @@ max_slots = 4
 # The node picks the accelerator-correct build for its hardware automatically
 # (CUDA / ROCm / CPU on Linux, Metal on Apple Silicon, the SystemPanic build on
 # Windows).
-#   prompt (default) — detect newer builds and flag them; update only when you
-#                      approve it (node TUI 'u' key, or POST the update endpoint)
+#   prompt (default) — detect newer builds and prompt; update only when you
+#                      approve it (node TUI Update button/popup, or the update
+#                      REST endpoint). A live progress bar shows the install.
 #   auto             — download and apply updates as soon as they are found
 #   manual           — never check for or apply updates automatically
+# When one node updates, control nudges same-environment peers to check too, so
+# the cluster converges on a consistent version (each peer honors its own policy).
 # vllm_update_policy = "prompt"
 # vllm_update_check = true                  # run the periodic online version check
 # vllm_update_check_interval_hours = 24

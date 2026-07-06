@@ -55,6 +55,7 @@ VllmProvisionConfig normalized_config(VllmProvisionConfig cfg) {
     cfg.python_path = strip_wrapping_quotes(cfg.python_path);
     if (cfg.platform.empty()) cfg.platform = current_vllm_platform();
     if (cfg.arch.empty()) cfg.arch = current_vllm_arch();
+    cfg.package_manager = util::to_lower(util::trim(cfg.package_manager));
     cfg.accelerator = util::to_lower(util::trim(cfg.accelerator));
     if (cfg.accelerator.empty()) {
         // The variants we can infer without a runtime GPU probe. cuda/rocm/cpu
@@ -77,6 +78,7 @@ std::string torch_backend_for_accelerator(const std::string& accelerator) {
     return "auto";
 }
 
+#ifndef _WIN32
 std::string shell_quote_posix(const std::string& value) {
     std::string out = "'";
     for (char ch : value) {
@@ -86,6 +88,7 @@ std::string shell_quote_posix(const std::string& value) {
     out += "'";
     return out;
 }
+#endif
 
 #ifdef _WIN32
 std::string shell_quote_windows(const std::string& value) {
@@ -107,14 +110,6 @@ std::string shell_quote(const std::string& value) {
 #endif
 }
 
-std::string ps_quote(const std::string& value) {
-    return "'" + util::replace_all(value, "'", "''") + "'";
-}
-
-std::string bash_quote(const std::string& value) {
-    return shell_quote_posix(value);
-}
-
 std::string join_shell_command(const std::vector<std::string>& args) {
     std::string out;
     for (size_t i = 0; i < args.size(); ++i) {
@@ -122,28 +117,6 @@ std::string join_shell_command(const std::vector<std::string>& args) {
         out += shell_quote(args[i]);
     }
     return out;
-}
-
-int default_run_command(const std::vector<std::string>& args,
-                        const fs::path& cwd,
-                        std::string* error) {
-    if (args.empty()) {
-        if (error) *error = "empty command";
-        return 1;
-    }
-    std::string cmd = join_shell_command(args);
-    if (!cwd.empty()) {
-#ifdef _WIN32
-        cmd = "cd /d " + shell_quote(cwd.string()) + " && " + cmd;
-#else
-        cmd = "cd " + shell_quote(cwd.string()) + " && " + cmd;
-#endif
-    }
-    const int rc = std::system(cmd.c_str());
-    if (rc != 0 && error) {
-        *error = "command exited with status " + std::to_string(rc) + ": " + args.front();
-    }
-    return rc;
 }
 
 std::string default_capture_first_line(const std::vector<std::string>& args,
@@ -205,124 +178,178 @@ private:
     bool acquired_ = false;
 };
 
-std::string build_windows_script(const VllmProvisionConfig& cfg, bool upgrade) {
-    const fs::path root(cfg.provision_dir);
-    const fs::path venv = root / "venv";
-    const fs::path src = root / "vllm-windows-src";
-    const std::string python = cfg.python_path.empty() ? "python" : cfg.python_path;
-    const std::string version = cfg.version;
-    const std::string method = cfg.install_method;
-    const std::string pip_upgrade = upgrade ? " --upgrade" : "";
-
-    std::ostringstream s;
-    s << "$ErrorActionPreference = 'Stop'\n";
-    s << "$Venv = " << ps_quote(venv.string()) << "\n";
-    s << "$Src = " << ps_quote(src.string()) << "\n";
-    s << "$Python = " << ps_quote(python) << "\n";
-    s << "$Method = " << ps_quote(method) << "\n";
-    s << "$Version = " << ps_quote(version) << "\n";
-    s << "New-Item -ItemType Directory -Force -Path " << ps_quote(root.string()) << " | Out-Null\n";
-    s << "if (Get-Command uv -ErrorAction SilentlyContinue) { uv venv $Venv --python $Python } else { & $Python -m venv $Venv }\n";
-    s << "$VenvPython = Join-Path $Venv 'Scripts\\python.exe'\n";
-    s << "& $VenvPython -m pip install --upgrade pip\n";
-    s << "function Install-Source {\n";
-    s << "  if (!(Test-Path (Join-Path $Src '.git'))) { git clone " << ps_quote(kWindowsVllmRepoUrl) << " $Src }\n";
-    s << "  Push-Location $Src\n";
-    s << "  git fetch --tags --all\n";
-    s << "  git checkout " << ps_quote(windows_source_checkout_ref(cfg)) << "\n";
-    if (upgrade && cfg.version == "latest")
-        s << "  try { git pull --ff-only } catch { }\n";
-    s << "  & $VenvPython -m pip install" << pip_upgrade << " -e .\n";
-    s << "  Pop-Location\n";
-    s << "}\n";
-    s << "if ($Method -eq 'source') { Install-Source; exit 0 }\n";
-    s << "$ReleaseUri = if ($Version -eq 'latest') { 'https://api.github.com/repos/SystemPanic/vllm-windows/releases/latest' } else { \"https://api.github.com/repos/SystemPanic/vllm-windows/releases/tags/$Version\" }\n";
-    s << "$Release = Invoke-RestMethod -Uri $ReleaseUri\n";
-    s << "$Asset = $Release.assets | Where-Object { $_.name -like '*.whl' } | Select-Object -First 1\n";
-    s << "if ($null -eq $Asset) {\n";
-    s << "  if ($Method -eq 'auto') { Install-Source; exit 0 }\n";
-    s << "  throw 'No vLLM Windows wheel found in the requested release.'\n";
-    s << "}\n";
-    s << "$Wheel = Join-Path $env:TEMP $Asset.name\n";
-    s << "Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $Wheel\n";
-    const std::string wheel_flags = upgrade ? " --upgrade --force-reinstall" : "";
-    s << "& $VenvPython -m pip install" << wheel_flags << " $Wheel\n";
-    return s.str();
+// The venv's Python interpreter for this platform.
+std::string venv_python(const fs::path& venv, const std::string& platform) {
+    if (platform == "windows") return (venv / "Scripts" / "python.exe").string();
+    return (venv / "bin" / "python").string();
 }
 
-std::string build_linux_script(const VllmProvisionConfig& cfg, bool upgrade) {
+bool tool_on_path(const std::string& name) {
+    return !resolve_vllm_executable(name).empty();
+}
+
+std::vector<VllmInstallStep> build_linux_plan(const VllmProvisionConfig& cfg, bool upgrade) {
     const fs::path root(cfg.provision_dir);
     const fs::path venv = root / "venv";
     const fs::path src = root / "vllm-src";
     const std::string python = cfg.python_path.empty() ? "python3" : cfg.python_path;
+    const std::string vpy = venv_python(venv, "linux");
     const std::string pkg = "vllm" + version_package_suffix(cfg.version);
     const std::string torch_backend = torch_backend_for_accelerator(cfg.accelerator);
-    const std::string upgrade_flag = upgrade ? " --upgrade" : "";
 
-    std::ostringstream s;
-    s << "#!/usr/bin/env bash\n";
-    s << "set -euo pipefail\n";
-    s << "ROOT=" << bash_quote(root.string()) << "\n";
-    s << "VENV=" << bash_quote(venv.string()) << "\n";
-    s << "SRC=" << bash_quote(src.string()) << "\n";
-    s << "PY=" << bash_quote(python) << "\n";
-    s << "METHOD=" << bash_quote(cfg.install_method) << "\n";
-    s << "VERSION=" << bash_quote(cfg.version) << "\n";
-    s << "mkdir -p \"$ROOT\"\n";
-    s << "install_source() {\n";
-    s << "  if [[ ! -d \"$SRC/.git\" ]]; then git clone " << bash_quote(kOfficialVllmRepoUrl) << " \"$SRC\"; fi\n";
-    s << "  cd \"$SRC\"\n";
-    s << "  git fetch --tags --all\n";
-    s << "  if [[ \"$VERSION\" == \"latest\" ]]; then git checkout main; git pull --ff-only || true; else git checkout \"$VERSION\"; fi\n";
-    s << "  \"$PY\" -m venv \"$VENV\"\n";
-    s << "  \"$VENV/bin/python\" -m pip install --upgrade pip\n";
-    s << "  \"$VENV/bin/python\" -m pip install -e .\n";
-    s << "}\n";
-    s << "if [[ \"$METHOD\" == \"source\" ]]; then install_source; exit 0; fi\n";
-    s << "if command -v uv >/dev/null 2>&1; then\n";
-    s << "  uv venv \"$VENV\" --python \"$PY\"\n";
-    s << "  uv pip install --python \"$VENV/bin/python\"" << upgrade_flag << " "
-      << bash_quote(pkg) << " --torch-backend=" << torch_backend << "\n";
-    s << "else\n";
-    s << "  \"$PY\" -m venv \"$VENV\"\n";
-    s << "  \"$VENV/bin/python\" -m pip install --upgrade pip\n";
-    s << "  \"$VENV/bin/python\" -m pip install" << upgrade_flag << " " << bash_quote(pkg) << "\n";
-    s << "fi\n";
-    return s.str();
+    std::vector<VllmInstallStep> plan;
+    if (cfg.install_method == "source") {
+        if (!fs::exists(src / ".git"))
+            plan.push_back({"Cloning vLLM source", {"git", "clone", kOfficialVllmRepoUrl, src.string()}, root, false});
+        plan.push_back({"Fetching tags", {"git", "fetch", "--tags", "--all"}, src, false});
+        const std::string ref = cfg.version == "latest" ? std::string("main") : cfg.version;
+        plan.push_back({"Checking out " + ref, {"git", "checkout", ref}, src, false});
+        if (cfg.version == "latest")
+            plan.push_back({"Updating source", {"git", "pull", "--ff-only"}, src, true});
+        plan.push_back({"Creating virtualenv", {python, "-m", "venv", venv.string()}, root, false});
+        plan.push_back({"Upgrading pip", {vpy, "-m", "pip", "install", "--upgrade", "pip"}, root, false});
+        std::vector<std::string> ins = {vpy, "-m", "pip", "install"};
+        if (upgrade) ins.push_back("--upgrade");
+        ins.push_back("-e");
+        ins.push_back(".");
+        plan.push_back({"Installing vLLM (building from source)", ins, src, false});
+        return plan;
+    }
+
+    if (cfg.package_manager == "uv") {
+        plan.push_back({"Creating virtualenv (uv)", {"uv", "venv", venv.string(), "--python", python}, root, false});
+        std::vector<std::string> ins = {"uv", "pip", "install", "--python", vpy};
+        if (upgrade) ins.push_back("--upgrade");
+        ins.push_back(pkg);
+        ins.push_back("--torch-backend=" + torch_backend);
+        plan.push_back({"Downloading & installing vLLM", ins, root, false});
+    } else {
+        plan.push_back({"Creating virtualenv", {python, "-m", "venv", venv.string()}, root, false});
+        plan.push_back({"Upgrading pip", {vpy, "-m", "pip", "install", "--upgrade", "pip"}, root, false});
+        std::vector<std::string> ins = {vpy, "-m", "pip", "install"};
+        if (upgrade) ins.push_back("--upgrade");
+        ins.push_back(pkg);
+        plan.push_back({"Downloading & installing vLLM", ins, root, false});
+    }
+    return plan;
 }
 
-std::string build_macos_metal_script(const VllmProvisionConfig& cfg, bool upgrade) {
-    // The Metal build is source-based: the fetch/checkout/pull below already
-    // moves to the newest ref for "latest" and to the exact tag otherwise, and
-    // install.sh rebuilds from the checked-out tree — so a fresh install and an
-    // upgrade run the same steps.
+std::vector<VllmInstallStep> build_windows_plan(const VllmProvisionConfig& cfg, bool upgrade) {
+    const fs::path root(cfg.provision_dir);
+    const fs::path venv = root / "venv";
+    const fs::path src = root / "vllm-windows-src";
+    const std::string python = cfg.python_path.empty() ? "python" : cfg.python_path;
+    const std::string vpy = venv_python(venv, "windows");
+
+    std::vector<VllmInstallStep> plan;
+    if (cfg.package_manager == "uv")
+        plan.push_back({"Creating virtualenv (uv)", {"uv", "venv", venv.string(), "--python", python}, root, false});
+    else
+        plan.push_back({"Creating virtualenv", {python, "-m", "venv", venv.string()}, root, false});
+    plan.push_back({"Upgrading pip", {vpy, "-m", "pip", "install", "--upgrade", "pip"}, root, false});
+
+    if (cfg.install_method == "source") {
+        const std::string ref = windows_source_checkout_ref(cfg);
+        if (!fs::exists(src / ".git"))
+            plan.push_back({"Cloning vLLM (Windows) source", {"git", "clone", kWindowsVllmRepoUrl, src.string()}, root, false});
+        plan.push_back({"Fetching tags", {"git", "fetch", "--tags", "--all"}, src, false});
+        plan.push_back({"Checking out " + ref, {"git", "checkout", ref}, src, false});
+        if (cfg.version == "latest")
+            plan.push_back({"Updating source", {"git", "pull", "--ff-only"}, src, true});
+        std::vector<std::string> ins = {vpy, "-m", "pip", "install"};
+        if (upgrade) ins.push_back("--upgrade");
+        ins.push_back("-e");
+        ins.push_back(".");
+        plan.push_back({"Installing vLLM (building from source)", ins, src, false});
+        return plan;
+    }
+
+    // wheel/auto: resolve + download the release wheel (the single unavoidable
+    // inline HTTP call — no in-process HTTPS), then pip install it (which pulls
+    // torch + deps with visible progress).
+    const fs::path wheel = root / "vllm-windows.whl";
+    const std::string rel_uri = cfg.version == "latest"
+        ? std::string("https://api.github.com/repos/SystemPanic/vllm-windows/releases/latest")
+        : "https://api.github.com/repos/SystemPanic/vllm-windows/releases/tags/" + cfg.version;
+    std::ostringstream ps;
+    ps << "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; ";
+    ps << "$r = Invoke-RestMethod -Uri '" << rel_uri << "' -Headers @{ 'User-Agent'='mantic-mind' }; ";
+    ps << "$a = $r.assets | Where-Object { $_.name -like '*.whl' } | Select-Object -First 1; ";
+    ps << "if ($null -eq $a) { throw 'No vLLM Windows wheel found in the requested release.' }; ";
+    ps << "Write-Host ('Downloading ' + $a.name); ";
+    ps << "Invoke-WebRequest -Uri $a.browser_download_url -OutFile '" << wheel.string() << "'";
+    plan.push_back({"Resolving & downloading vLLM wheel",
+                    {"powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps.str()},
+                    root, false});
+
+    std::vector<std::string> ins = {vpy, "-m", "pip", "install"};
+    if (upgrade) { ins.push_back("--upgrade"); ins.push_back("--force-reinstall"); }
+    ins.push_back(wheel.string());
+    plan.push_back({"Downloading & installing vLLM", ins, root, false});
+    return plan;
+}
+
+std::vector<VllmInstallStep> build_macos_metal_plan(const VllmProvisionConfig& cfg, bool upgrade) {
+    // Metal is a source build: the fetch/checkout/pull below moves to the newest
+    // ref for "latest" (or the exact tag otherwise) and install.sh rebuilds — so
+    // fresh install and upgrade run the same steps.
     (void)upgrade;
     const fs::path root(cfg.provision_dir);
     const fs::path src = root / "vllm-metal-src";
     const std::string python = cfg.python_path.empty() ? "python3" : cfg.python_path;
+    const std::string ref = cfg.version == "latest" ? std::string("main") : cfg.version;
 
-    std::ostringstream s;
-    s << "#!/usr/bin/env bash\n";
-    s << "set -euo pipefail\n";
-    s << "ROOT=" << bash_quote(root.string()) << "\n";
-    s << "SRC=" << bash_quote(src.string()) << "\n";
-    s << "PY=" << bash_quote(python) << "\n";
-    s << "VERSION=" << bash_quote(cfg.version) << "\n";
-    s << "if [[ \"$(uname -s)\" != \"Darwin\" || \"$(uname -m)\" != \"arm64\" ]]; then echo 'vllm-metal requires macOS on Apple Silicon.' >&2; exit 2; fi\n";
-    s << "\"$PY\" - <<'PY'\n";
-    s << "import platform, sys\n";
-    s << "if platform.machine() != 'arm64' or sys.version_info[:2] != (3, 12):\n";
-    s << "    raise SystemExit('vllm-metal requires native arm64 Python 3.12')\n";
-    s << "PY\n";
-    s << "xcode-select -p >/dev/null\n";
-    s << "mkdir -p \"$ROOT\"\n";
-    s << "if [[ ! -d \"$SRC/.git\" ]]; then git clone " << bash_quote(kMetalVllmRepoUrl) << " \"$SRC\"; fi\n";
-    s << "cd \"$SRC\"\n";
-    s << "git fetch --tags --all\n";
-    s << "if [[ \"$VERSION\" == \"latest\" ]]; then git checkout main; git pull --ff-only || true; else git checkout \"$VERSION\"; fi\n";
-    s << "export PATH=\"$(dirname \"$PY\"):$PATH\"\n";
-    s << "bash ./install.sh\n";
-    return s.str();
+    std::vector<VllmInstallStep> plan;
+    if (!fs::exists(src / ".git"))
+        plan.push_back({"Cloning vLLM Metal source", {"git", "clone", kMetalVllmRepoUrl, src.string()}, root, false});
+    plan.push_back({"Fetching tags", {"git", "fetch", "--tags", "--all"}, src, false});
+    plan.push_back({"Checking out " + ref, {"git", "checkout", ref}, src, false});
+    if (cfg.version == "latest")
+        plan.push_back({"Updating source", {"git", "pull", "--ff-only"}, src, true});
+    // install.sh is the vendor build entry point; run it with the chosen Python
+    // on PATH via an inline `bash -c` (a command, not a persisted script file).
+    const fs::path py_path(python);
+    std::string sh = "set -e; ";
+    if (py_path.has_parent_path())
+        sh += "export PATH=\"" + py_path.parent_path().string() + ":$PATH\"; ";
+    sh += "bash ./install.sh";
+    plan.push_back({"Building vLLM Metal (install.sh)", {"bash", "-c", sh}, src, false});
+    return plan;
+}
+
+// Best-effort progress extraction from a pip/uv/git output line. Prefers an
+// explicit "NN%"; falls back to an "A/B" byte ratio. Returns <0 for no signal,
+// so the caller shows an indeterminate bar.
+double parse_vllm_install_fraction_impl(const std::string& line) {
+    auto is_num = [](char c) { return (c >= '0' && c <= '9') || c == '.'; };
+    auto clamp01 = [](double v) { return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v); };
+
+    if (const size_t p = line.rfind('%'); p != std::string::npos && p > 0) {
+        size_t b = p;
+        while (b > 0 && is_num(line[b - 1])) --b;
+        if (b < p) {
+            try {
+                const double pct = std::stod(line.substr(b, p - b));
+                if (pct >= 0.0 && pct <= 100.0) return clamp01(pct / 100.0);
+            } catch (...) {}
+        }
+    }
+
+    for (size_t slash = line.find('/'); slash != std::string::npos;
+         slash = line.find('/', slash + 1)) {
+        size_t b = slash;
+        while (b > 0 && is_num(line[b - 1])) --b;
+        size_t e = slash + 1;
+        while (e < line.size() && is_num(line[e])) ++e;
+        if (b < slash && slash + 1 < e) {
+            try {
+                const double num = std::stod(line.substr(b, slash - b));
+                const double den = std::stod(line.substr(slash + 1, e - (slash + 1)));
+                if (den > 0.0 && num >= 0.0 && num <= den) return clamp01(num / den);
+            } catch (...) {}
+        }
+    }
+    return -1.0;
 }
 
 // Default upstream-version probe. Reuses the command-capture seam so it stays
@@ -386,11 +413,18 @@ fs::path managed_vllm_executable_path(const VllmProvisionConfig& raw_cfg) {
     return root / "venv" / "bin" / "vllm";
 }
 
-std::string build_vllm_provision_script(const VllmProvisionConfig& raw_cfg, bool upgrade) {
-    const VllmProvisionConfig cfg = normalized_config(raw_cfg);
-    if (cfg.platform == "windows") return build_windows_script(cfg, upgrade);
-    if (cfg.platform == "macos") return build_macos_metal_script(cfg, upgrade);
-    return build_linux_script(cfg, upgrade);
+std::vector<VllmInstallStep> build_vllm_install_plan(const VllmProvisionConfig& raw_cfg,
+                                                     bool upgrade) {
+    VllmProvisionConfig cfg = normalized_config(raw_cfg);
+    if (cfg.package_manager.empty())
+        cfg.package_manager = tool_on_path("uv") ? "uv" : "pip";
+    if (cfg.platform == "windows") return build_windows_plan(cfg, upgrade);
+    if (cfg.platform == "macos") return build_macos_metal_plan(cfg, upgrade);
+    return build_linux_plan(cfg, upgrade);
+}
+
+double parse_vllm_install_fraction(const std::string& line) {
+    return parse_vllm_install_fraction_impl(line);
 }
 
 std::string resolve_vllm_executable(const std::string& raw_executable) {
@@ -432,7 +466,14 @@ VllmProvisioner::VllmProvisioner(VllmProvisionConfig cfg,
     : cfg_(normalized_config(std::move(cfg)))
     , runner_(std::move(runner))
 {
-    if (!runner_.run) runner_.run = default_run_command;
+    if (!runner_.run) {
+        runner_.run = [](const std::vector<std::string>& argv,
+                         const fs::path& cwd,
+                         const StreamLineCallback& on_line,
+                         std::string* error) {
+            return run_streamed_command(argv, cwd, on_line, error);
+        };
+    }
     if (!runner_.capture_first_line) runner_.capture_first_line = default_capture_first_line;
     if (!runner_.fetch_latest) {
         runner_.fetch_latest =
@@ -441,6 +482,18 @@ VllmProvisioner::VllmProvisioner(VllmProvisionConfig cfg,
             };
     }
     status_ = make_base_status();
+}
+
+void VllmProvisioner::set_log_sink(LogSink sink) {
+    log_sink_ = std::move(sink);
+}
+
+void VllmProvisioner::set_progress_sink(ProgressSink sink) {
+    progress_sink_ = std::move(sink);
+}
+
+void VllmProvisioner::emit_progress(const VllmInstallProgress& p) {
+    if (progress_sink_) progress_sink_(p);
 }
 
 VllmRuntimeStatus VllmProvisioner::make_base_status() const {
@@ -472,15 +525,6 @@ VllmProvisionConfig VllmProvisioner::config() const {
 
 std::string VllmProvisioner::capture_version(const std::string& executable) const {
     return runner_.capture_first_line({executable, "--version"}, {});
-}
-
-int VllmProvisioner::run_script(const fs::path& script_path, std::string* error) {
-    if (cfg_.platform == "windows") {
-        return runner_.run({"powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                            "-File", script_path.string()},
-                           fs::path(cfg_.provision_dir), error);
-    }
-    return runner_.run({"bash", script_path.string()}, fs::path(cfg_.provision_dir), error);
 }
 
 VllmRuntimeStatus VllmProvisioner::ensure_runtime() {
@@ -568,44 +612,58 @@ VllmRuntimeStatus VllmProvisioner::run_managed_install(bool upgrade) {
     status.managed = true;
     set_status(status);
 
-    const fs::path script_path = root / (cfg_.platform == "windows"
-        ? "install-vllm.ps1"
-        : "install-vllm.sh");
-    {
-        std::ofstream script(script_path, std::ios::out | std::ios::trunc);
-        if (!script) {
+    auto finish_progress = [&]() {
+        VllmInstallProgress done;   // active=false
+        emit_progress(done);
+    };
+
+    const std::vector<VllmInstallStep> plan = build_vllm_install_plan(cfg_, upgrade);
+    const int total = static_cast<int>(plan.size());
+    MM_INFO("vLLM {} plan: {} step(s)", upgrade ? "upgrade" : "install", total);
+
+    for (int i = 0; i < total; ++i) {
+        const VllmInstallStep& step = plan[static_cast<size_t>(i)];
+
+        VllmInstallProgress prog;
+        prog.active = true;
+        prog.step = i + 1;
+        prog.total_steps = total;
+        prog.fraction = -1.0;   // indeterminate until a line carries progress
+        prog.stage = step.label;
+        emit_progress(prog);
+        if (log_sink_) log_sink_("[vllm-install] " + step.label, false);
+
+        // run_streamed_command serializes on_line across its reader threads, so
+        // mutating `prog` here is race-free.
+        auto on_line = [&](const std::string& line, bool is_stderr) {
+            if (log_sink_) log_sink_(line, is_stderr);
+            const double f = parse_vllm_install_fraction_impl(line);
+            if (f >= 0.0) prog.fraction = f;
+            prog.last_line = line;
+            emit_progress(prog);
+        };
+
+        std::string step_err;
+        const fs::path cwd = step.cwd.empty() ? root : step.cwd;
+        const int rc = runner_.run(step.argv, cwd, on_line, &step_err);
+        if (rc != 0 && !step.allow_failure) {
             status.status = "failed";
-            status.last_error = "failed to write vLLM provisioning script: "
-                              + script_path.string();
+            status.last_error = "vLLM install step '" + step.label + "' failed"
+                + (step_err.empty() ? (" (exit " + std::to_string(rc) + ")")
+                                    : (": " + step_err));
             set_status(status);
+            finish_progress();
             return status;
         }
-        script << build_vllm_provision_script(cfg_, upgrade);
-    }
-
-#ifndef _WIN32
-    fs::permissions(script_path,
-                    fs::perms::owner_exec | fs::perms::owner_read | fs::perms::owner_write,
-                    fs::perm_options::add, ec);
-#endif
-
-    std::string run_error;
-    const int rc = run_script(script_path, &run_error);
-    if (rc != 0) {
-        status.status = "failed";
-        status.last_error = run_error.empty()
-            ? "vLLM provisioning command failed"
-            : run_error;
-        set_status(status);
-        return status;
     }
 
     const fs::path managed = managed_vllm_executable_path(cfg_);
     if (!file_exists(managed)) {
         status.status = "failed";
-        status.last_error = "vLLM provisioning finished but no managed executable was found at "
+        status.last_error = "vLLM install finished but no managed executable was found at "
                           + managed.string();
         set_status(status);
+        finish_progress();
         return status;
     }
 
@@ -615,6 +673,7 @@ VllmRuntimeStatus VllmProvisioner::run_managed_install(bool upgrade) {
         status.last_error = "managed vLLM executable failed validation: "
                           + managed.string() + " --version produced no output";
         set_status(status);
+        finish_progress();
         return status;
     }
 
@@ -626,6 +685,7 @@ VllmRuntimeStatus VllmProvisioner::run_managed_install(bool upgrade) {
     status.update_available = false;
     status.last_error.clear();
     set_status(status);
+    finish_progress();
     MM_INFO("vLLM runtime {}: {}", upgrade ? "updated" : "ready", status.executable_path);
     return status;
 }

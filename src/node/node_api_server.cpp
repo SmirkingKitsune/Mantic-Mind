@@ -177,6 +177,7 @@ void NodeApiServer::register_routes() {
         j["slot_error"]    = error_slots;
         j["vllm_server_path"] = slot_mgr_.vllm_server_path();
         j["vllm_runtime"] = state_.get_vllm_runtime();
+        j["vllm_install_progress"] = state_.get_vllm_install_progress();
         j["vllm_gpu_budget"] = slot_mgr_.vllm_gpu_budget();
         j["vllm_gpu_fraction_used"] = slot_mgr_.vllm_gpu_fraction_used();
 

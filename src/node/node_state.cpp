@@ -203,6 +203,16 @@ void NodeState::set_vllm_runtime(const VllmRuntimeStatus& runtime) {
     vllm_runtime_ = runtime;
 }
 
+VllmInstallProgress NodeState::get_vllm_install_progress() const {
+    std::lock_guard<std::mutex> g(mutex_);
+    return vllm_install_progress_;
+}
+
+void NodeState::set_vllm_install_progress(const VllmInstallProgress& p) {
+    std::lock_guard<std::mutex> g(mutex_);
+    vllm_install_progress_ = p;
+}
+
 // ── Platform metrics sampling ──────────────────────────────────────────────────
 NodeHealthMetrics NodeState::sample_metrics() {
     NodeHealthMetrics m;

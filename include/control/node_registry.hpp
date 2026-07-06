@@ -15,6 +15,12 @@
 
 namespace mm {
 
+// Peers that should be nudged to re-check for a vLLM update when the node
+// `source_id` just updated: connected, same environment (accelerator | platform
+// | arch), and on a different version. Excludes the source. Pure; unit-tested.
+std::vector<NodeId> select_vllm_update_peers(const std::vector<NodeInfo>& nodes,
+                                             const NodeId& source_id);
+
 // Tracks all registered nodes and runs background health polling.
 class NodeRegistry {
 public:
@@ -94,6 +100,9 @@ private:
     std::unordered_set<NodeId>            remembered_nodes_;
     std::string                           remembered_nodes_path_;
     UpdateCallback                        update_cb_;
+    // Last vLLM runtime version seen per node, used to detect an update and nudge
+    // same-environment peers to check (cluster version convergence).
+    std::unordered_map<NodeId, std::string> last_vllm_version_;
 
     std::atomic<bool>       polling_{false};
     std::thread             poll_thread_;
@@ -104,6 +113,11 @@ private:
 
     void poll_all_nodes();
     bool ping_node(NodeInfo& info);
+    // When node `source_id` just updated its vLLM runtime, POST a check-update to
+    // every same-environment peer (see select_vllm_update_peers). Each peer then
+    // follows its own policy (prompt/auto/manual). Makes HTTP calls; call without
+    // mutex_ held.
+    void nudge_environment_peers(const NodeId& source_id);
     void load_remembered_nodes();
     void save_remembered_nodes_unlocked() const;
 };

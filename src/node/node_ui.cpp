@@ -181,8 +181,38 @@ void NodeUI::run() {
     auto btn_forget_pairing = Button("[F] Forget Pairing", [&] { forget_pairing(); },
                                      ButtonOption::Simple());
 
+    // ── vLLM update prompt state ────────────────────────────────────────────────
+    // These are recomputed each frame by the renderer; the buttons and modal read
+    // them by reference.
+    bool        show_update_modal  = false;
+    bool        show_update_button = false;
+    std::string cur_latest;          // latest_version this frame (for button lambdas)
+    std::string modal_ack_version;   // latest_version the user has acted on/dismissed
+
+    auto request_update = [&] {
+        if (request_vllm_update_cb_) request_vllm_update_cb_();
+    };
+    auto btn_update = Button("[ Update vLLM ]", [&] {
+        request_update();
+        modal_ack_version = cur_latest;   // close the modal until a newer build appears
+    }, ButtonOption::Simple());
+    auto btn_update_maybe = Maybe(btn_update, &show_update_button);
+
+    auto modal_update_now = Button("  Update now  ", [&] {
+        request_update();
+        modal_ack_version = cur_latest;
+        show_update_modal = false;
+    }, ButtonOption::Simple());
+    auto modal_later = Button("    Later    ", [&] {
+        modal_ack_version = cur_latest;
+        show_update_modal = false;
+    }, ButtonOption::Simple());
+    auto modal_btns = Container::Horizontal({modal_update_now, modal_later});
+
+    auto main_container = Container::Horizontal({btn_forget_pairing, btn_update_maybe});
+
     // ── Renderer ──────────────────────────────────────────────────────────────
-    auto render = Renderer(btn_forget_pairing, [&]() -> Element {
+    auto render = Renderer(main_container, [&]() -> Element {
 
         // Snapshot mutable state
         bool registered   = state_.is_registered();
@@ -193,8 +223,16 @@ void NodeUI::run() {
         auto node_id      = state_.get_node_id();
         auto last_error   = state_.get_last_error();
         auto vllm_rt      = state_.get_vllm_runtime();
+        auto vllm_prog    = state_.get_vllm_install_progress();
         auto api_keys     = state_.get_api_keys();
         auto streaming    = state_.get_streaming_text();
+
+        // Drive the update button/modal from current runtime state.
+        cur_latest = vllm_rt.latest_version;
+        const bool can_update = vllm_rt.update_available && vllm_rt.managed &&
+                                static_cast<bool>(request_vllm_update_cb_) && !vllm_prog.active;
+        show_update_button = can_update;
+        show_update_modal  = can_update && (modal_ack_version != vllm_rt.latest_version);
 
         int log_scroll_from_bottom = 0;
         std::string log_file_path;
@@ -334,13 +372,32 @@ void NodeUI::run() {
         };
         if (!model_action_status.empty())
             status_rows.push_back(field("action", text(model_action_status) | color(Color::Yellow)));
-        if (vllm_rt.update_available) {
-            const bool can_update = vllm_rt.managed && request_vllm_update_cb_;
-            const std::string upd =
-                "vLLM " + (vllm_rt.version.empty() ? std::string{"?"} : vllm_rt.version) +
-                " → " + vllm_rt.latest_version +
-                (can_update ? "  [press u to update]" : "  (update via package manager)");
-            status_rows.push_back(field("update", text(upd) | color(Color::Cyan) | bold));
+        if (vllm_prog.active) {
+            // Loading bar for an in-progress install/upgrade.
+            std::string head = vllm_prog.stage.empty() ? "installing" : vllm_prog.stage;
+            if (vllm_prog.total_steps > 0)
+                head += "  (" + std::to_string(vllm_prog.step) + "/"
+                      + std::to_string(vllm_prog.total_steps) + ")";
+            Elements pr = { text(head) | color(Color::Cyan) | bold };
+            if (vllm_prog.fraction >= 0.0) {
+                const int pct = static_cast<int>(vllm_prog.fraction * 100.0 + 0.5);
+                pr.push_back(hbox({ gauge(static_cast<float>(vllm_prog.fraction)) | flex,
+                                    text(" " + std::to_string(pct) + "%") }));
+            } else {
+                pr.push_back(text(std::string(spin) + " working…") | color(Color::Yellow));
+            }
+            if (!vllm_prog.last_line.empty())
+                pr.push_back(text(shorten_middle(vllm_prog.last_line, 44)) | dim);
+            status_rows.push_back(field("install", vbox(std::move(pr))));
+        } else if (vllm_rt.update_available) {
+            Element line = text("vLLM " +
+                (vllm_rt.version.empty() ? std::string{"?"} : vllm_rt.version) +
+                " → " + vllm_rt.latest_version) | color(Color::Cyan) | bold;
+            if (show_update_button)
+                status_rows.push_back(field("update", vbox({ line, btn_update->Render() })));
+            else
+                status_rows.push_back(field("update",
+                    vbox({ line, text("(update via package manager)") | dim })));
         }
         Element status_panel = panel("STATUS", vbox(std::move(status_rows)));
 
@@ -508,7 +565,33 @@ void NodeUI::run() {
         }) | border;
     });
 
-    auto component = CatchEvent(render, [&](Event ev) {
+    // ── Update-available prompt (FTXUI modal with buttons) ──────────────────────
+    auto update_modal_renderer = Renderer(modal_btns, [&]() -> Element {
+        auto rt = state_.get_vllm_runtime();
+        return vbox({
+            text(" vLLM update available ") | bold | hcenter,
+            separator(),
+            hbox({text(" installed : "),
+                  text(rt.version.empty() ? std::string{"(unknown)"} : rt.version)}),
+            hbox({text(" latest    : "), text(rt.latest_version) | color(Color::Green)}),
+            hbox({text(" build     : "),
+                  text(rt.accelerator.empty() ? std::string{"?"} : rt.accelerator) | dim}),
+            separator(),
+            modal_btns->Render() | hcenter,
+        }) | border | size(WIDTH, EQUAL, 46);
+    });
+    auto with_modal = Modal(render, update_modal_renderer, &show_update_modal);
+
+    auto component = CatchEvent(with_modal, [&](Event ev) {
+        if (show_update_modal) {
+            // While the prompt is up, its buttons handle input; Esc dismisses it.
+            if (ev == Event::Escape) {
+                modal_ack_version = cur_latest;
+                show_update_modal = false;
+                return true;
+            }
+            return false;
+        }
         const int viewport = log_viewport;
         auto scroll_logs = [&](int delta) {
             std::lock_guard<std::mutex> lk(log_mutex_);
@@ -553,14 +636,6 @@ void NodeUI::run() {
         }
         if (ev == Event::Character('f')) {
             return forget_pairing();
-        }
-        if (ev == Event::Character('u')) {
-            const auto rt = state_.get_vllm_runtime();
-            if (request_vllm_update_cb_ && rt.update_available && rt.managed) {
-                request_vllm_update_cb_();
-                return true;
-            }
-            return false;
         }
         if (ev == Event::Escape || ev == Event::Character('q')) {
             screen.ExitLoopClosure()();

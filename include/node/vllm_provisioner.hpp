@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/models.hpp"
+#include "node/process_exec.hpp"
 
 #include <filesystem>
 #include <functional>
@@ -20,16 +21,31 @@ struct VllmProvisionConfig {
     // Accelerator-correct build variant: cuda|rocm|cpu|metal|windows. Empty =>
     // let the install fall back to torch-backend auto-detection.
     std::string accelerator;
+    // Installer backend: "uv" | "pip" | "" (auto: uv when present, else pip).
+    std::string package_manager;
 
     // Test hooks; empty means use the build host.
     std::string platform;
     std::string arch;
 };
 
+// One command in a vLLM install/upgrade plan. Steps are executed in order,
+// each streaming its output live to the UI. No script file is written to disk.
+struct VllmInstallStep {
+    std::string              label;   // shown as the loading-bar stage
+    std::vector<std::string> argv;    // executable + args (no shell)
+    std::filesystem::path    cwd;     // working directory ("" = provision root)
+    bool                     allow_failure = false;  // e.g. best-effort git pull
+};
+
 struct VllmCommandRunner {
-    using RunFn = std::function<int(const std::vector<std::string>&,
-                                    const std::filesystem::path&,
-                                    std::string*)>;
+    // Run a command to completion, streaming each output line to `on_line` as it
+    // arrives. Returns the exit code (non-zero => failure). This is the seam
+    // tests inject to avoid spawning real processes.
+    using RunFn = std::function<int(const std::vector<std::string>& argv,
+                                    const std::filesystem::path& cwd,
+                                    const StreamLineCallback& on_line,
+                                    std::string* error)>;
     using CaptureFn = std::function<std::string(const std::vector<std::string>&,
                                                 const std::filesystem::path&)>;
     // Return the newest vLLM version available upstream for this environment, or
@@ -42,7 +58,12 @@ struct VllmCommandRunner {
 
 std::string normalize_vllm_install_method(const std::string& method);
 std::filesystem::path managed_vllm_executable_path(const VllmProvisionConfig& cfg);
-std::string build_vllm_provision_script(const VllmProvisionConfig& cfg, bool upgrade = false);
+// Build the ordered, in-program install/upgrade plan for this environment.
+std::vector<VllmInstallStep> build_vllm_install_plan(const VllmProvisionConfig& cfg,
+                                                     bool upgrade = false);
+// Extract a 0..1 progress fraction from a pip/uv/git output line, or <0 when the
+// line carries no parseable progress. Pure; unit-tested.
+double parse_vllm_install_fraction(const std::string& line);
 std::string resolve_vllm_executable(const std::string& executable);
 bool vllm_runtime_usable(const VllmRuntimeStatus& status);
 
@@ -50,6 +71,13 @@ class VllmProvisioner {
 public:
     explicit VllmProvisioner(VllmProvisionConfig cfg,
                              VllmCommandRunner runner = {});
+
+    // Sinks for visible installs: streamed output lines and coarse+fine
+    // progress. Both optional; set before ensure_runtime()/update_runtime().
+    using LogSink = std::function<void(const std::string& line, bool is_stderr)>;
+    using ProgressSink = std::function<void(const VllmInstallProgress&)>;
+    void set_log_sink(LogSink sink);
+    void set_progress_sink(ProgressSink sink);
 
     VllmRuntimeStatus ensure_runtime();
     // Query upstream for the newest available build and update latest_version /
@@ -65,16 +93,18 @@ public:
 private:
     VllmProvisionConfig cfg_;
     VllmCommandRunner runner_;
+    LogSink log_sink_;
+    ProgressSink progress_sink_;
     mutable std::mutex status_mutex_;
     VllmRuntimeStatus status_;
 
     VllmRuntimeStatus make_base_status() const;
     std::string capture_version(const std::string& executable) const;
-    int run_script(const std::filesystem::path& script_path, std::string* error);
-    // Lock, write the install script (upgrade=true adds --upgrade / git pull),
-    // run it, and validate the managed executable. Shared by ensure_runtime()
-    // (bootstrap) and update_runtime() (forced upgrade).
+    // Lock, run the install plan step-by-step with live streaming + progress
+    // (upgrade=true adds --upgrade / git pull), then validate the managed
+    // executable. Shared by ensure_runtime() (bootstrap) and update_runtime().
     VllmRuntimeStatus run_managed_install(bool upgrade);
+    void emit_progress(const VllmInstallProgress& p);
     void set_status(const VllmRuntimeStatus& status);
 };
 

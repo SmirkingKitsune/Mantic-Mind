@@ -9,6 +9,7 @@ add_executable(mm_reliability_tests
     ${CMAKE_SOURCE_DIR}/src/control/tts_service_client.cpp
     ${CMAKE_SOURCE_DIR}/src/control/node_registry.cpp
     ${CMAKE_SOURCE_DIR}/src/node/slot_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/node/process_exec.cpp
     ${CMAKE_SOURCE_DIR}/src/node/runtime_process.cpp
     ${CMAKE_SOURCE_DIR}/src/node/vllm_provisioner.cpp
     ${CMAKE_SOURCE_DIR}/src/node/vllm_runtime.cpp

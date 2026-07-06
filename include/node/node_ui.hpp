@@ -22,9 +22,9 @@ class NodeState;
 class NodeUI {
 public:
     using ForgetPairingCallback = std::function<bool(std::string* out_message)>;
-    // Invoked when the user approves a vLLM update (the 'u' key). Must return
-    // promptly — the implementation should run the (slow) install off the UI
-    // thread.
+    // Invoked when the user approves a vLLM update (the Update button or the
+    // update prompt's "Update now"). Must return promptly — the implementation
+    // should run the (slow) install off the UI thread.
     using RequestVllmUpdateCallback = std::function<void()>;
 
     NodeUI(NodeState& state, uint16_t listen_port,

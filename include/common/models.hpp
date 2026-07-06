@@ -379,6 +379,17 @@ struct VllmRuntimeStatus {
     bool        update_available = false;
 };
 
+// Live progress of an in-program vLLM runtime install/upgrade, surfaced so the
+// node TUI can render a loading bar instead of running a script blind.
+struct VllmInstallProgress {
+    bool        active = false;   // true while an install/upgrade is running
+    int         step = 0;         // 1-based index of the current step
+    int         total_steps = 0;  // number of steps in the plan
+    double      fraction = -1.0;  // 0..1 within the current step; <0 = indeterminate
+    std::string stage;            // human label of the current step
+    std::string last_line;        // most recent streamed output line
+};
+
 struct NodeInfo {
     NodeId           id;
     std::string      url;
@@ -1049,6 +1060,23 @@ inline void from_json(const nlohmann::json& j, VllmRuntimeStatus& r) {
     if (j.contains("accelerator"))      j.at("accelerator").get_to(r.accelerator);
     if (j.contains("latest_version"))   j.at("latest_version").get_to(r.latest_version);
     if (j.contains("update_available")) j.at("update_available").get_to(r.update_available);
+}
+
+inline void to_json(nlohmann::json& j, const VllmInstallProgress& p) {
+    j = { {"active",      p.active},
+          {"step",        p.step},
+          {"total_steps", p.total_steps},
+          {"fraction",    p.fraction},
+          {"stage",       p.stage},
+          {"last_line",   p.last_line} };
+}
+inline void from_json(const nlohmann::json& j, VllmInstallProgress& p) {
+    if (j.contains("active"))      j.at("active").get_to(p.active);
+    if (j.contains("step"))        j.at("step").get_to(p.step);
+    if (j.contains("total_steps")) j.at("total_steps").get_to(p.total_steps);
+    if (j.contains("fraction"))    j.at("fraction").get_to(p.fraction);
+    if (j.contains("stage"))       j.at("stage").get_to(p.stage);
+    if (j.contains("last_line"))   j.at("last_line").get_to(p.last_line);
 }
 
 inline void to_json(nlohmann::json& j, const NodeInfo& n) {

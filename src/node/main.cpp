@@ -982,9 +982,9 @@ int main(int argc, char** argv) {
         });
     }
 
-    // On-demand update worker for the TUI 'u' key: runs the (slow) install off
-    // the UI thread on a tracked thread that shutdown joins, so the update never
-    // outlives the objects it captures. One at a time.
+    // On-demand update worker for the TUI Update button/prompt: runs the (slow)
+    // install off the UI thread on a tracked thread that shutdown joins, so the
+    // update never outlives the objects it captures. One at a time.
     std::atomic<bool> manual_update_running{false};
     std::thread manual_update_thread;
     auto request_manual_update = [&]() {
@@ -1011,6 +1011,17 @@ int main(int argc, char** argv) {
         const std::string out = is_stderr ? "[stderr] " + line : line;
         append_runtime_log(out);
         if (ui_ptr) ui_ptr->append_log(out);
+    });
+
+    // Stream vLLM install/upgrade output into the runtime log and TUI, and mirror
+    // install progress into NodeState so the UI can render a loading bar.
+    vllm_provisioner.set_log_sink([&](const std::string& line, bool is_stderr) {
+        const std::string out = is_stderr ? "[stderr] " + line : line;
+        append_runtime_log(out);
+        if (ui_ptr) ui_ptr->append_log(out);
+    });
+    vllm_provisioner.set_progress_sink([&](const mm::VllmInstallProgress& p) {
+        state.set_vllm_install_progress(p);
     });
 
     // ── API server ────────────────────────────────────────────────────────────
@@ -1053,7 +1064,7 @@ int main(int argc, char** argv) {
             MM_WARN("vLLM runtime reprovision failed: {}", runtime.last_error);
         return runtime;
     });
-    // User-approved update (TUI 'u' key or POST .../provision {"update":true}).
+    // User-approved update (TUI Update button or POST .../provision {"update":true}).
     api_server.set_vllm_update_callback([&]() {
         MM_INFO("vLLM update requested by user");
         return do_vllm_update();

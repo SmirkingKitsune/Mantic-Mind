@@ -1,5 +1,6 @@
 add_executable(mantic-mind
     main.cpp
+    process_exec.cpp
     runtime_process.cpp
     vllm_provisioner.cpp
     vllm_runtime.cpp

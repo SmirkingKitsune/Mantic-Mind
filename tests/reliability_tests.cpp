@@ -985,6 +985,17 @@ bool test_vllm_provisioner_helpers() {
     CHECK(mm::default_vllm_repo_url_for_environment("macos", "aarch64")
           == mm::kMetalVllmRepoUrl);
 
+    // True when any step's joined argv contains `needle`.
+    auto plan_has = [](const std::vector<mm::VllmInstallStep>& plan,
+                       const std::string& needle) {
+        for (const auto& s : plan) {
+            std::string joined;
+            for (const auto& a : s.argv) { joined += a; joined += ' '; }
+            if (joined.find(needle) != std::string::npos) return true;
+        }
+        return false;
+    };
+
     auto dir = temp_test_dir("vllm-provisioner");
     mm::VllmProvisionConfig linux_cfg;
     linux_cfg.requested_executable = "definitely-missing-vllm-for-test";
@@ -992,24 +1003,29 @@ bool test_vllm_provisioner_helpers() {
     linux_cfg.platform = "linux";
     linux_cfg.arch = "x86_64";
     linux_cfg.install_method = "auto";
+    linux_cfg.package_manager = "uv";  // deterministic plan (don't probe host PATH)
 
-    auto linux_script = mm::build_vllm_provision_script(linux_cfg);
-    CHECK(linux_script.find("uv pip install") != std::string::npos);
-    CHECK(linux_script.find("--torch-backend=auto") != std::string::npos);
+    auto linux_plan = mm::build_vllm_install_plan(linux_cfg);
+    CHECK(plan_has(linux_plan, "uv"));
+    CHECK(plan_has(linux_plan, "pip"));
+    CHECK(plan_has(linux_plan, "install"));
+    CHECK(plan_has(linux_plan, "--torch-backend=auto"));
+    CHECK(plan_has(linux_plan, "vllm"));
     CHECK(mm::managed_vllm_executable_path(linux_cfg).string().find("bin") !=
           std::string::npos);
 
     mm::VllmProvisionConfig mac_cfg = linux_cfg;
     mac_cfg.platform = "macos";
     mac_cfg.arch = "aarch64";
-    auto mac_script = mm::build_vllm_provision_script(mac_cfg);
-    CHECK(mac_script.find("vllm-project/vllm-metal") != std::string::npos);
-    CHECK(mac_script.find("native arm64 Python 3.12") != std::string::npos);
+    auto mac_plan = mm::build_vllm_install_plan(mac_cfg);
+    CHECK(plan_has(mac_plan, "vllm-project/vllm-metal"));
+    CHECK(plan_has(mac_plan, "install.sh"));
 
     bool command_ran = false;
     mm::VllmCommandRunner runner;
     runner.run = [&](const std::vector<std::string>&,
                      const std::filesystem::path&,
+                     const mm::StreamLineCallback&,
                      std::string*) {
         command_ran = true;
         const auto exe = mm::managed_vllm_executable_path(linux_cfg);
@@ -1039,6 +1055,7 @@ bool test_vllm_provisioner_helpers() {
     mm::VllmCommandRunner disabled_runner;
     disabled_runner.run = [&](const std::vector<std::string>&,
                               const std::filesystem::path&,
+                              const mm::StreamLineCallback&,
                               std::string*) {
         disabled_ran = true;
         return 0;
@@ -1062,6 +1079,7 @@ bool test_vllm_provisioner_helpers() {
     mm::VllmCommandRunner locked_runner;
     locked_runner.run = [&](const std::vector<std::string>&,
                             const std::filesystem::path&,
+                            const mm::StreamLineCallback&,
                             std::string*) {
         locked_ran = true;
         return 0;
@@ -1106,27 +1124,35 @@ bool test_vllm_update_flow() {
     CHECK(mm::detect_vllm_accelerator("linux", "x86_64", false, true) == "rocm");
     CHECK(mm::detect_vllm_accelerator("linux", "x86_64", false, false) == "cpu");
 
-    // The Linux script pins the torch backend from the accelerator.
+    // The Linux plan pins the torch backend from the accelerator.
+    auto plan_has = [](const std::vector<mm::VllmInstallStep>& plan,
+                       const std::string& needle) {
+        for (const auto& s : plan) {
+            std::string joined;
+            for (const auto& a : s.argv) { joined += a; joined += ' '; }
+            if (joined.find(needle) != std::string::npos) return true;
+        }
+        return false;
+    };
+
     mm::VllmProvisionConfig lc;
     lc.requested_executable = "definitely-missing-vllm-for-test";
     lc.provision_dir = temp_test_dir("vllm-update-script").string();
     lc.platform = "linux";
     lc.arch = "x86_64";
     lc.accelerator = "cpu";
-    CHECK(mm::build_vllm_provision_script(lc, false).find("--torch-backend=cpu") !=
-          std::string::npos);
+    lc.package_manager = "uv";
+    CHECK(plan_has(mm::build_vllm_install_plan(lc, false), "--torch-backend=cpu"));
     mm::VllmProvisionConfig lc_cuda = lc;
     lc_cuda.accelerator = "cuda";
-    CHECK(mm::build_vllm_provision_script(lc_cuda, false).find("--torch-backend=auto") !=
-          std::string::npos);
+    CHECK(plan_has(mm::build_vllm_install_plan(lc_cuda, false), "--torch-backend=auto"));
 
     // An upgrade run forces a wheel reinstall on Windows; a fresh install does not.
     mm::VllmProvisionConfig wc = lc;
     wc.platform = "windows";
-    CHECK(mm::build_vllm_provision_script(wc, /*upgrade=*/true).find("--force-reinstall") !=
-          std::string::npos);
-    CHECK(mm::build_vllm_provision_script(wc, /*upgrade=*/false).find("--force-reinstall") ==
-          std::string::npos);
+    wc.package_manager = "pip";
+    CHECK(plan_has(mm::build_vllm_install_plan(wc, /*upgrade=*/true), "--force-reinstall"));
+    CHECK(!plan_has(mm::build_vllm_install_plan(wc, /*upgrade=*/false), "--force-reinstall"));
     CHECK(remove_tree(std::filesystem::path(lc.provision_dir)));
 
     // check_for_update() / update_runtime() with a fully injected runner.
@@ -1137,12 +1163,14 @@ bool test_vllm_update_flow() {
     cfg.platform = "linux";
     cfg.arch = "x86_64";
     cfg.accelerator = "cuda";
+    cfg.package_manager = "pip";  // deterministic step count
 
     int run_count = 0;
     std::string latest = "0.6.4";
     mm::VllmCommandRunner runner;
     runner.run = [&](const std::vector<std::string>&,
                      const std::filesystem::path&,
+                     const mm::StreamLineCallback&,
                      std::string*) {
         ++run_count;
         const auto exe = mm::managed_vllm_executable_path(cfg);
@@ -1161,7 +1189,8 @@ bool test_vllm_update_flow() {
     mm::VllmProvisioner prov(cfg, runner);
     auto ready = prov.ensure_runtime();
     CHECK(ready.status == "ready");
-    CHECK(run_count == 1);
+    const int after_ensure = run_count;
+    CHECK(after_ensure >= 1);        // ran the install plan's step(s)
     CHECK(ready.version == "0.6.3");
     CHECK(ready.accelerator == "cuda");
 
@@ -1184,10 +1213,54 @@ bool test_vllm_update_flow() {
     latest = "0.6.4";
     auto updated = prov.update_runtime();
     CHECK(updated.status == "ready");
-    CHECK(run_count == 2);
+    CHECK(run_count > after_ensure);   // installer re-ran (forced)
     CHECK(!updated.update_available);
 
     CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_vllm_install_progress_parser() {
+    auto approx = [](double v, double target) { return v > target - 0.02 && v < target + 0.02; };
+
+    CHECK(approx(mm::parse_vllm_install_fraction("Downloading torch (2.1 GB) ... 45%"), 0.45));
+    CHECK(approx(mm::parse_vllm_install_fraction("vllm  12.3/45.6 MB"), 12.3 / 45.6));
+    CHECK(mm::parse_vllm_install_fraction("100%") >= 0.999);
+    // No parseable progress -> indeterminate (<0).
+    CHECK(mm::parse_vllm_install_fraction("Collecting vllm") < 0.0);
+    CHECK(mm::parse_vllm_install_fraction("") < 0.0);
+    // A path with slashes must not be mistaken for a ratio.
+    CHECK(mm::parse_vllm_install_fraction("saving to /root/vllm-windows.whl") < 0.0);
+    return true;
+}
+
+bool test_vllm_peer_selection() {
+    auto mk = [](const std::string& id, bool conn, const std::string& accel,
+                 const std::string& plat, const std::string& arch, const std::string& ver) {
+        mm::NodeInfo n;
+        n.id = id;
+        n.connected = conn;
+        n.vllm_runtime.accelerator = accel;
+        n.vllm_runtime.platform = plat;
+        n.vllm_runtime.version = ver;
+        n.capabilities.arch = arch;
+        return n;
+    };
+
+    const std::vector<mm::NodeInfo> nodes = {
+        mk("src",       true,  "cuda", "linux", "x86_64", "0.6.4"),  // just updated
+        mk("same_old",  true,  "cuda", "linux", "x86_64", "0.6.3"),  // same env, behind -> nudge
+        mk("same_cur",  true,  "cuda", "linux", "x86_64", "0.6.4"),  // same env, converged -> skip
+        mk("diff_acc",  true,  "rocm", "linux", "x86_64", "0.6.3"),  // different accelerator -> skip
+        mk("diff_arch", true,  "cuda", "linux", "aarch64","0.6.3"),  // different arch -> skip
+        mk("offline",   false, "cuda", "linux", "x86_64", "0.6.3"),  // disconnected -> skip
+    };
+
+    const auto peers = mm::select_vllm_update_peers(nodes, "src");
+    CHECK(peers.size() == 1);
+    CHECK(!peers.empty() && peers.front() == "same_old");
+    // Unknown source id -> no peers.
+    CHECK(mm::select_vllm_update_peers(nodes, "does-not-exist").empty());
     return true;
 }
 
@@ -2873,6 +2946,10 @@ int main(int argc, char** argv) {
          test_vllm_provisioner_helpers},
         {"vllm_update_flow",
          test_vllm_update_flow},
+        {"vllm_install_progress_parser",
+         test_vllm_install_progress_parser},
+        {"vllm_peer_selection",
+         test_vllm_peer_selection},
         {"control_api_external_token_gate", test_control_api_external_token_gate},
         {"openai_compat_api_listener_and_model_catalog",
          test_openai_compat_api_listener_and_model_catalog},
