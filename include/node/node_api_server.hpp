@@ -31,9 +31,15 @@ public:
     using RuntimeLogsProvider = std::function<std::vector<std::string>(int tail)>;
     using RememberApiKeyCallback = std::function<void(const std::string& key)>;
     using VllmProvisionCallback = std::function<VllmRuntimeStatus()>;
+    // User-approved update: force a managed upgrade to the target version.
+    using VllmUpdateCallback = std::function<VllmRuntimeStatus()>;
+    // On-demand online probe for a newer build; never installs.
+    using VllmCheckUpdateCallback = std::function<VllmRuntimeStatus()>;
     void set_runtime_logs_provider(RuntimeLogsProvider provider);
     void set_remember_api_key_callback(RememberApiKeyCallback callback);
     void set_vllm_provision_callback(VllmProvisionCallback callback);
+    void set_vllm_update_callback(VllmUpdateCallback callback);
+    void set_vllm_check_update_callback(VllmCheckUpdateCallback callback);
     // Ray CLI config for the multi-node engine-group endpoints.
     void set_ray_config(std::string ray_path, uint16_t ray_port);
     // HF model-cache config: the `hf` CLI and the resolved hub cache directory.
@@ -52,6 +58,8 @@ private:
     RuntimeLogsProvider runtime_logs_provider_;
     RememberApiKeyCallback remember_api_key_cb_;
     VllmProvisionCallback vllm_provision_cb_;
+    VllmUpdateCallback vllm_update_cb_;
+    VllmCheckUpdateCallback vllm_check_update_cb_;
 
     void register_routes();
     bool check_auth(const std::string& auth_header);

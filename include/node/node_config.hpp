@@ -19,6 +19,11 @@ struct NodeConfig {
     std::string vllm_install_method = "auto"; // auto|wheel|source
     std::string vllm_version = "latest";
     std::string vllm_python_path;
+    // Runtime update management. Missing runtimes are always bootstrapped (per
+    // vllm_auto_provision); these govern *updating* an existing install.
+    std::string vllm_update_policy = "prompt";        // prompt|auto|manual
+    bool        vllm_update_check  = true;            // run periodic online checks
+    int         vllm_update_check_interval_hours = 24;
 
     // ── Cluster capabilities (multi-node vLLM engine groups) ─────────────────
     // Empty/auto values are filled by runtime detection at startup. Set these

@@ -55,10 +55,26 @@ VllmProvisionConfig normalized_config(VllmProvisionConfig cfg) {
     cfg.python_path = strip_wrapping_quotes(cfg.python_path);
     if (cfg.platform.empty()) cfg.platform = current_vllm_platform();
     if (cfg.arch.empty()) cfg.arch = current_vllm_arch();
+    cfg.accelerator = util::to_lower(util::trim(cfg.accelerator));
+    if (cfg.accelerator.empty()) {
+        // The variants we can infer without a runtime GPU probe. cuda/rocm/cpu
+        // are supplied by the caller after detection; otherwise fall through to
+        // torch-backend auto-detection at install time.
+        if (is_apple_silicon_environment(cfg.platform, cfg.arch)) cfg.accelerator = "metal";
+        else if (cfg.platform == "windows") cfg.accelerator = "windows";
+    }
     if (cfg.provision_dir.empty()) {
         cfg.provision_dir = (fs::path("data") / "runtimes" / "vllm").string();
     }
     return cfg;
+}
+
+// Map a detected accelerator to an explicit uv/pip --torch-backend value for the
+// Linux install. "auto" lets uv resolve the exact CUDA/ROCm build; only CPU-only
+// nodes pin an explicit backend.
+std::string torch_backend_for_accelerator(const std::string& accelerator) {
+    if (accelerator == "cpu") return "cpu";
+    return "auto";
 }
 
 std::string shell_quote_posix(const std::string& value) {
@@ -189,13 +205,14 @@ private:
     bool acquired_ = false;
 };
 
-std::string build_windows_script(const VllmProvisionConfig& cfg) {
+std::string build_windows_script(const VllmProvisionConfig& cfg, bool upgrade) {
     const fs::path root(cfg.provision_dir);
     const fs::path venv = root / "venv";
     const fs::path src = root / "vllm-windows-src";
     const std::string python = cfg.python_path.empty() ? "python" : cfg.python_path;
     const std::string version = cfg.version;
     const std::string method = cfg.install_method;
+    const std::string pip_upgrade = upgrade ? " --upgrade" : "";
 
     std::ostringstream s;
     s << "$ErrorActionPreference = 'Stop'\n";
@@ -213,7 +230,9 @@ std::string build_windows_script(const VllmProvisionConfig& cfg) {
     s << "  Push-Location $Src\n";
     s << "  git fetch --tags --all\n";
     s << "  git checkout " << ps_quote(windows_source_checkout_ref(cfg)) << "\n";
-    s << "  & $VenvPython -m pip install -e .\n";
+    if (upgrade && cfg.version == "latest")
+        s << "  try { git pull --ff-only } catch { }\n";
+    s << "  & $VenvPython -m pip install" << pip_upgrade << " -e .\n";
     s << "  Pop-Location\n";
     s << "}\n";
     s << "if ($Method -eq 'source') { Install-Source; exit 0 }\n";
@@ -226,16 +245,19 @@ std::string build_windows_script(const VllmProvisionConfig& cfg) {
     s << "}\n";
     s << "$Wheel = Join-Path $env:TEMP $Asset.name\n";
     s << "Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $Wheel\n";
-    s << "& $VenvPython -m pip install $Wheel\n";
+    const std::string wheel_flags = upgrade ? " --upgrade --force-reinstall" : "";
+    s << "& $VenvPython -m pip install" << wheel_flags << " $Wheel\n";
     return s.str();
 }
 
-std::string build_linux_script(const VllmProvisionConfig& cfg) {
+std::string build_linux_script(const VllmProvisionConfig& cfg, bool upgrade) {
     const fs::path root(cfg.provision_dir);
     const fs::path venv = root / "venv";
     const fs::path src = root / "vllm-src";
     const std::string python = cfg.python_path.empty() ? "python3" : cfg.python_path;
     const std::string pkg = "vllm" + version_package_suffix(cfg.version);
+    const std::string torch_backend = torch_backend_for_accelerator(cfg.accelerator);
+    const std::string upgrade_flag = upgrade ? " --upgrade" : "";
 
     std::ostringstream s;
     s << "#!/usr/bin/env bash\n";
@@ -259,16 +281,22 @@ std::string build_linux_script(const VllmProvisionConfig& cfg) {
     s << "if [[ \"$METHOD\" == \"source\" ]]; then install_source; exit 0; fi\n";
     s << "if command -v uv >/dev/null 2>&1; then\n";
     s << "  uv venv \"$VENV\" --python \"$PY\"\n";
-    s << "  uv pip install --python \"$VENV/bin/python\" " << bash_quote(pkg) << " --torch-backend=auto\n";
+    s << "  uv pip install --python \"$VENV/bin/python\"" << upgrade_flag << " "
+      << bash_quote(pkg) << " --torch-backend=" << torch_backend << "\n";
     s << "else\n";
     s << "  \"$PY\" -m venv \"$VENV\"\n";
     s << "  \"$VENV/bin/python\" -m pip install --upgrade pip\n";
-    s << "  \"$VENV/bin/python\" -m pip install " << bash_quote(pkg) << "\n";
+    s << "  \"$VENV/bin/python\" -m pip install" << upgrade_flag << " " << bash_quote(pkg) << "\n";
     s << "fi\n";
     return s.str();
 }
 
-std::string build_macos_metal_script(const VllmProvisionConfig& cfg) {
+std::string build_macos_metal_script(const VllmProvisionConfig& cfg, bool upgrade) {
+    // The Metal build is source-based: the fetch/checkout/pull below already
+    // moves to the newest ref for "latest" and to the exact tag otherwise, and
+    // install.sh rebuilds from the checked-out tree — so a fresh install and an
+    // upgrade run the same steps.
+    (void)upgrade;
     const fs::path root(cfg.provision_dir);
     const fs::path src = root / "vllm-metal-src";
     const std::string python = cfg.python_path.empty() ? "python3" : cfg.python_path;
@@ -297,6 +325,46 @@ std::string build_macos_metal_script(const VllmProvisionConfig& cfg) {
     return s.str();
 }
 
+// Default upstream-version probe. Reuses the command-capture seam so it stays
+// injectable in tests. Windows queries the SystemPanic release tag via
+// PowerShell (system cert store); POSIX uses the node's Python + urllib (the
+// same interpreter vLLM needs) against PyPI (official) or the vllm-metal
+// releases (Apple Silicon). Returns "" on any failure — callers treat an empty
+// result as "unknown", never as "up to date".
+std::string default_fetch_latest(const VllmProvisionConfig& cfg,
+                                 const VllmCommandRunner::CaptureFn& capture) {
+    if (!capture) return {};
+
+    if (cfg.platform == "windows") {
+        const std::string url =
+            "https://api.github.com/repos/SystemPanic/vllm-windows/releases/latest";
+        const std::string ps =
+            "try { (Invoke-RestMethod -Uri '" + url +
+            "' -Headers @{ 'User-Agent' = 'mantic-mind' }).tag_name } catch { '' }";
+        return util::trim(capture({"powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                                   "-Command", ps}, {}));
+    }
+
+    const std::string python = cfg.python_path.empty() ? "python3" : cfg.python_path;
+    std::string url;
+    std::string expr;
+    if (is_apple_silicon_environment(cfg.platform, cfg.arch)) {
+        url = "https://api.github.com/repos/vllm-project/vllm-metal/releases/latest";
+        expr = "d.get(\"tag_name\", \"\")";
+    } else {
+        url = "https://pypi.org/pypi/vllm/json";
+        expr = "d.get(\"info\", {}).get(\"version\", \"\")";
+    }
+    // Double-quoted Python string literals keep the whole program free of single
+    // quotes so POSIX shell-quoting wraps it in one clean '...' argument.
+    const std::string program =
+        "import json, urllib.request\n"
+        "req = urllib.request.Request(\"" + url + "\", headers={\"User-Agent\": \"mantic-mind\"})\n"
+        "d = json.load(urllib.request.urlopen(req, timeout=10))\n"
+        "print(" + expr + ")\n";
+    return util::trim(capture({python, "-c", program}, {}));
+}
+
 } // namespace
 
 std::string normalize_vllm_install_method(const std::string& method) {
@@ -318,11 +386,11 @@ fs::path managed_vllm_executable_path(const VllmProvisionConfig& raw_cfg) {
     return root / "venv" / "bin" / "vllm";
 }
 
-std::string build_vllm_provision_script(const VllmProvisionConfig& raw_cfg) {
+std::string build_vllm_provision_script(const VllmProvisionConfig& raw_cfg, bool upgrade) {
     const VllmProvisionConfig cfg = normalized_config(raw_cfg);
-    if (cfg.platform == "windows") return build_windows_script(cfg);
-    if (cfg.platform == "macos") return build_macos_metal_script(cfg);
-    return build_linux_script(cfg);
+    if (cfg.platform == "windows") return build_windows_script(cfg, upgrade);
+    if (cfg.platform == "macos") return build_macos_metal_script(cfg, upgrade);
+    return build_linux_script(cfg, upgrade);
 }
 
 std::string resolve_vllm_executable(const std::string& raw_executable) {
@@ -366,6 +434,12 @@ VllmProvisioner::VllmProvisioner(VllmProvisionConfig cfg,
 {
     if (!runner_.run) runner_.run = default_run_command;
     if (!runner_.capture_first_line) runner_.capture_first_line = default_capture_first_line;
+    if (!runner_.fetch_latest) {
+        runner_.fetch_latest =
+            [capture = runner_.capture_first_line](const VllmProvisionConfig& c) {
+                return default_fetch_latest(c, capture);
+            };
+    }
     status_ = make_base_status();
 }
 
@@ -378,6 +452,7 @@ VllmRuntimeStatus VllmProvisioner::make_base_status() const {
         : cfg_.install_method;
     status.source_repo = default_vllm_repo_url_for_environment(cfg_.platform, cfg_.arch);
     status.version = cfg_.version;
+    status.accelerator = cfg_.accelerator;
     return status;
 }
 
@@ -423,6 +498,21 @@ VllmRuntimeStatus VllmProvisioner::ensure_runtime() {
         return status;
     }
 
+    // An already-provisioned managed runtime is usable regardless of the
+    // auto-provision setting — that flag only gates *new* installs.
+    if (const fs::path managed = managed_vllm_executable_path(cfg_);
+        file_exists(managed)) {
+        const std::string version = capture_version(managed.string());
+        if (!version.empty()) {
+            status.status = "ready";
+            status.managed = true;
+            status.executable_path = managed.string();
+            status.version = version;
+            set_status(status);
+            return status;
+        }
+    }
+
     if (cfg_.platform == "macos" &&
         !is_apple_silicon_environment(cfg_.platform, cfg_.arch)) {
         status.status = "failed";
@@ -440,6 +530,21 @@ VllmRuntimeStatus VllmProvisioner::ensure_runtime() {
         return status;
     }
 
+    return run_managed_install(/*upgrade=*/false);
+}
+
+VllmRuntimeStatus VllmProvisioner::run_managed_install(bool upgrade) {
+    VllmRuntimeStatus status = make_base_status();
+
+    if (cfg_.platform == "macos" &&
+        !is_apple_silicon_environment(cfg_.platform, cfg_.arch)) {
+        status.status = "failed";
+        status.last_error = "vllm-metal requires macOS on Apple Silicon; detected arch="
+                          + (cfg_.arch.empty() ? std::string{"unknown"} : cfg_.arch);
+        set_status(status);
+        return status;
+    }
+
     const fs::path root(cfg_.provision_dir);
     std::error_code ec;
     fs::create_directories(root, ec);
@@ -448,19 +553,6 @@ VllmRuntimeStatus VllmProvisioner::ensure_runtime() {
         status.last_error = "failed to create vLLM provision directory: " + ec.message();
         set_status(status);
         return status;
-    }
-
-    if (const fs::path managed = managed_vllm_executable_path(cfg_);
-        file_exists(managed)) {
-        const std::string version = capture_version(managed.string());
-        if (!version.empty()) {
-            status.status = "ready";
-            status.managed = true;
-            status.executable_path = managed.string();
-            status.version = version;
-            set_status(status);
-            return status;
-        }
     }
 
     ProvisionLock lock(root / ".provision.lock");
@@ -488,7 +580,7 @@ VllmRuntimeStatus VllmProvisioner::ensure_runtime() {
             set_status(status);
             return status;
         }
-        script << build_vllm_provision_script(cfg_);
+        script << build_vllm_provision_script(cfg_, upgrade);
     }
 
 #ifndef _WIN32
@@ -530,10 +622,47 @@ VllmRuntimeStatus VllmProvisioner::ensure_runtime() {
     status.managed = true;
     status.executable_path = managed.string();
     status.version = version;
+    status.latest_version.clear();
+    status.update_available = false;
     status.last_error.clear();
     set_status(status);
-    MM_INFO("vLLM runtime ready: {}", status.executable_path);
+    MM_INFO("vLLM runtime {}: {}", upgrade ? "updated" : "ready", status.executable_path);
     return status;
+}
+
+VllmRuntimeStatus VllmProvisioner::check_for_update() {
+    VllmRuntimeStatus status = this->status();
+
+    const std::string latest =
+        runner_.fetch_latest ? util::trim(runner_.fetch_latest(cfg_)) : std::string{};
+    status.latest_version = latest;
+
+    const std::string installed = util::trim(status.version);
+    status.update_available =
+        !latest.empty() && !installed.empty() &&
+        compare_vllm_versions(installed, latest) < 0;
+
+    if (status.update_available) {
+        MM_INFO("vLLM update available: {} -> {}", installed, latest);
+    }
+    set_status(status);
+    return status;
+}
+
+VllmRuntimeStatus VllmProvisioner::update_runtime() {
+    // A vLLM resolved from PATH lives in an environment the node does not own;
+    // refuse to mutate it rather than shadow it with a divergent managed copy.
+    if (const std::string resolved = resolve_vllm_executable(cfg_.requested_executable);
+        !resolved.empty()) {
+        VllmRuntimeStatus status = this->status();
+        status.last_error =
+            "vLLM is resolved from PATH (" + resolved +
+            "); update it via your package manager (e.g. pip install -U vllm). "
+            "Point vllm_server_path at a managed runtime to let the node update it.";
+        set_status(status);
+        return status;
+    }
+    return run_managed_install(/*upgrade=*/true);
 }
 
 } // namespace mm

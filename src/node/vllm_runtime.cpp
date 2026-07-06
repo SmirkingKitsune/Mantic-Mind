@@ -2,8 +2,14 @@
 
 #include "common/util.hpp"
 
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <filesystem>
 #include <initializer_list>
 #include <sstream>
+#include <system_error>
+#include <vector>
 
 namespace mm {
 
@@ -75,6 +81,85 @@ std::string current_vllm_arch() {
 bool is_apple_silicon_environment(const std::string& platform,
                                   const std::string& arch) {
     return platform == "macos" && (arch == "aarch64" || arch == "arm64");
+}
+
+std::string detect_vllm_accelerator(const std::string& platform,
+                                    const std::string& arch,
+                                    bool has_cuda,
+                                    bool has_rocm) {
+    if (is_apple_silicon_environment(platform, arch)) return "metal";
+    if (platform == "windows") return "windows";
+    if (has_cuda) return "cuda";
+    if (has_rocm) return "rocm";
+    return "cpu";
+}
+
+bool detect_rocm_present() {
+#ifdef _WIN32
+    return false;
+#else
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (fs::exists("/opt/rocm", ec)) return true;
+    if (const char* path_env = std::getenv("PATH")) {
+        for (const auto& dir : mm::util::split(path_env, ':')) {
+            if (dir.empty()) continue;
+            if (fs::exists(fs::path(dir) / "rocminfo", ec)) return true;
+        }
+    }
+    return false;
+#endif
+}
+
+namespace {
+
+// Extract the leading dotted-numeric components of a version string. Accepts a
+// bare "0.6.3", a "v0.6.3" tag, or a full "vllm 0.6.3.dev1+g..." line, stopping
+// at the first non-numeric component. Returns {} when nothing parses.
+std::vector<int> parse_vllm_version_components(const std::string& raw) {
+    std::string s = mm::util::trim(raw);
+    if (s.find(' ') != std::string::npos) {
+        for (const auto& tok : mm::util::split(s, ' ')) {
+            const std::string t = mm::util::trim(tok);
+            if (t.empty()) continue;
+            const bool starts_digit = std::isdigit(static_cast<unsigned char>(t[0])) != 0;
+            const bool starts_v_digit = (t[0] == 'v' || t[0] == 'V') && t.size() > 1 &&
+                std::isdigit(static_cast<unsigned char>(t[1])) != 0;
+            if (starts_digit || starts_v_digit) { s = t; break; }
+        }
+    }
+    if (!s.empty() && (s[0] == 'v' || s[0] == 'V')) s = s.substr(1);
+
+    std::vector<int> comps;
+    for (const auto& part : mm::util::split(s, '.')) {
+        std::string digits;
+        for (char c : part) {
+            if (std::isdigit(static_cast<unsigned char>(c))) digits.push_back(c);
+            else break;
+        }
+        if (digits.empty()) break;
+        try {
+            comps.push_back(std::stoi(digits));
+        } catch (...) {
+            break;
+        }
+    }
+    return comps;
+}
+
+} // namespace
+
+int compare_vllm_versions(const std::string& a, const std::string& b) {
+    const std::vector<int> va = parse_vllm_version_components(a);
+    const std::vector<int> vb = parse_vllm_version_components(b);
+    if (va.empty() || vb.empty()) return 0;
+    const size_t n = std::max(va.size(), vb.size());
+    for (size_t i = 0; i < n; ++i) {
+        const int x = i < va.size() ? va[i] : 0;
+        const int y = i < vb.size() ? vb[i] : 0;
+        if (x != y) return x < y ? -1 : 1;
+    }
+    return 0;
 }
 
 std::string default_vllm_repo_url_for_environment(const std::string& platform,

@@ -40,6 +40,19 @@ max_slots = 4
 # vllm_version = "latest"
 # vllm_python_path = ""
 
+# Runtime update management. A missing runtime is always bootstrapped (per
+# vllm_auto_provision above); these keys govern *updating* an existing install.
+# The node picks the accelerator-correct build for its hardware automatically
+# (CUDA / ROCm / CPU on Linux, Metal on Apple Silicon, the SystemPanic build on
+# Windows).
+#   prompt (default) — detect newer builds and flag them; update only when you
+#                      approve it (node TUI 'u' key, or POST the update endpoint)
+#   auto             — download and apply updates as soon as they are found
+#   manual           — never check for or apply updates automatically
+# vllm_update_policy = "prompt"
+# vllm_update_check = true                  # run the periodic online version check
+# vllm_update_check_interval_hours = 24
+
 # Total fraction of GPU memory all vLLM slots on this node may claim together.
 # Each vLLM slot reserves an explicit --gpu-memory-utilization slice out of
 # this budget; loads are clamped to the remaining budget and rejected when it

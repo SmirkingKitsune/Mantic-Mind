@@ -844,6 +844,9 @@ bool test_hf_cache_helpers() {
     n.vllm_runtime.version = "vllm 9.9.9-test";
     n.vllm_runtime.managed = true;
     n.vllm_runtime.executable_path = "/tmp/vllm/bin/vllm";
+    n.vllm_runtime.accelerator = "cuda";
+    n.vllm_runtime.latest_version = "9.9.10";
+    n.vllm_runtime.update_available = true;
     nlohmann::json j = n;
     auto parsed = j.get<mm::NodeInfo>();
     CHECK(parsed.cached_models.size() == 2);
@@ -851,6 +854,9 @@ bool test_hf_cache_helpers() {
     CHECK(parsed.vllm_runtime.status == "ready");
     CHECK(parsed.vllm_runtime.managed);
     CHECK(parsed.vllm_runtime.executable_path == "/tmp/vllm/bin/vllm");
+    CHECK(parsed.vllm_runtime.accelerator == "cuda");
+    CHECK(parsed.vllm_runtime.latest_version == "9.9.10");
+    CHECK(parsed.vllm_runtime.update_available);
 
     // Pre-fetch is Linux-gated; on Windows it refuses cleanly.
 #ifdef _WIN32
@@ -1077,6 +1083,109 @@ bool test_vllm_provisioner_helpers() {
     auto mac_status = mac_provisioner.ensure_runtime();
     CHECK(mac_status.status == "failed");
     CHECK(mac_status.last_error.find("Apple Silicon") != std::string::npos);
+
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_vllm_update_flow() {
+    // Version comparison is numeric, tolerant of tags/suffixes, and never
+    // reports a spurious ordering for unparseable input.
+    CHECK(mm::compare_vllm_versions("0.6.3", "0.6.4") < 0);
+    CHECK(mm::compare_vllm_versions("0.6.4", "0.6.3") > 0);
+    CHECK(mm::compare_vllm_versions("0.6.3", "0.6.3") == 0);
+    CHECK(mm::compare_vllm_versions("v0.6.10", "v0.6.9") > 0);        // numeric, not lexical
+    CHECK(mm::compare_vllm_versions("vllm 0.6.3.dev1+gabc", "0.6.3") == 0);
+    CHECK(mm::compare_vllm_versions("1.0", "0.9.9") > 0);
+    CHECK(mm::compare_vllm_versions("garbage", "0.6.3") == 0);
+
+    // Accelerator-correct build variant per environment.
+    CHECK(mm::detect_vllm_accelerator("macos", "aarch64", false, false) == "metal");
+    CHECK(mm::detect_vllm_accelerator("windows", "x86_64", true, false) == "windows");
+    CHECK(mm::detect_vllm_accelerator("linux", "x86_64", true, false) == "cuda");
+    CHECK(mm::detect_vllm_accelerator("linux", "x86_64", false, true) == "rocm");
+    CHECK(mm::detect_vllm_accelerator("linux", "x86_64", false, false) == "cpu");
+
+    // The Linux script pins the torch backend from the accelerator.
+    mm::VllmProvisionConfig lc;
+    lc.requested_executable = "definitely-missing-vllm-for-test";
+    lc.provision_dir = temp_test_dir("vllm-update-script").string();
+    lc.platform = "linux";
+    lc.arch = "x86_64";
+    lc.accelerator = "cpu";
+    CHECK(mm::build_vllm_provision_script(lc, false).find("--torch-backend=cpu") !=
+          std::string::npos);
+    mm::VllmProvisionConfig lc_cuda = lc;
+    lc_cuda.accelerator = "cuda";
+    CHECK(mm::build_vllm_provision_script(lc_cuda, false).find("--torch-backend=auto") !=
+          std::string::npos);
+
+    // An upgrade run forces a wheel reinstall on Windows; a fresh install does not.
+    mm::VllmProvisionConfig wc = lc;
+    wc.platform = "windows";
+    CHECK(mm::build_vllm_provision_script(wc, /*upgrade=*/true).find("--force-reinstall") !=
+          std::string::npos);
+    CHECK(mm::build_vllm_provision_script(wc, /*upgrade=*/false).find("--force-reinstall") ==
+          std::string::npos);
+    CHECK(remove_tree(std::filesystem::path(lc.provision_dir)));
+
+    // check_for_update() / update_runtime() with a fully injected runner.
+    auto dir = temp_test_dir("vllm-update-run");
+    mm::VllmProvisionConfig cfg;
+    cfg.requested_executable = "definitely-missing-vllm-for-test";
+    cfg.provision_dir = dir.string();
+    cfg.platform = "linux";
+    cfg.arch = "x86_64";
+    cfg.accelerator = "cuda";
+
+    int run_count = 0;
+    std::string latest = "0.6.4";
+    mm::VllmCommandRunner runner;
+    runner.run = [&](const std::vector<std::string>&,
+                     const std::filesystem::path&,
+                     std::string*) {
+        ++run_count;
+        const auto exe = mm::managed_vllm_executable_path(cfg);
+        std::filesystem::create_directories(exe.parent_path());
+        std::ofstream(exe) << "fake vllm";
+        return 0;
+    };
+    runner.capture_first_line = [&](const std::vector<std::string>& args,
+                                    const std::filesystem::path&) {
+        if (!args.empty() && args.front() == mm::managed_vllm_executable_path(cfg).string())
+            return std::string{"0.6.3"};
+        return std::string{};
+    };
+    runner.fetch_latest = [&](const mm::VllmProvisionConfig&) { return latest; };
+
+    mm::VllmProvisioner prov(cfg, runner);
+    auto ready = prov.ensure_runtime();
+    CHECK(ready.status == "ready");
+    CHECK(run_count == 1);
+    CHECK(ready.version == "0.6.3");
+    CHECK(ready.accelerator == "cuda");
+
+    // Newer upstream -> update_available.
+    auto checked = prov.check_for_update();
+    CHECK(checked.latest_version == "0.6.4");
+    CHECK(checked.update_available);
+
+    // Equal upstream -> no update.
+    latest = "0.6.3";
+    CHECK(!prov.check_for_update().update_available);
+
+    // Unknown upstream (offline) -> no spurious update.
+    latest = "";
+    auto offline = prov.check_for_update();
+    CHECK(offline.latest_version.empty());
+    CHECK(!offline.update_available);
+
+    // update_runtime() forces a reinstall even though a managed exe exists.
+    latest = "0.6.4";
+    auto updated = prov.update_runtime();
+    CHECK(updated.status == "ready");
+    CHECK(run_count == 2);
+    CHECK(!updated.update_available);
 
     CHECK(remove_tree(dir));
     return true;
@@ -2762,6 +2871,8 @@ int main(int argc, char** argv) {
          test_vllm_runtime_defaults_and_args},
         {"vllm_provisioner_helpers",
          test_vllm_provisioner_helpers},
+        {"vllm_update_flow",
+         test_vllm_update_flow},
         {"control_api_external_token_gate", test_control_api_external_token_gate},
         {"openai_compat_api_listener_and_model_catalog",
          test_openai_compat_api_listener_and_model_catalog},

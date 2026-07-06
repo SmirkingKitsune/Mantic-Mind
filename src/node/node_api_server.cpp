@@ -84,6 +84,14 @@ void NodeApiServer::set_vllm_provision_callback(VllmProvisionCallback callback) 
     vllm_provision_cb_ = std::move(callback);
 }
 
+void NodeApiServer::set_vllm_update_callback(VllmUpdateCallback callback) {
+    vllm_update_cb_ = std::move(callback);
+}
+
+void NodeApiServer::set_vllm_check_update_callback(VllmCheckUpdateCallback callback) {
+    vllm_check_update_cb_ = std::move(callback);
+}
+
 void NodeApiServer::set_ray_config(std::string ray_path, uint16_t ray_port) {
     ray_path_ = std::move(ray_path);
     ray_port_ = ray_port;
@@ -224,16 +232,48 @@ void NodeApiServer::register_routes() {
         if (!check_auth(req.get_header_value("Authorization"))) {
             res.status = 401; return;
         }
-        if (!vllm_provision_cb_) {
+        // Optional {"update": true} approves a managed upgrade to the target
+        // version; the default (no body / update=false) ensures a runtime exists.
+        bool want_update = false;
+        if (!req.body.empty()) {
+            try {
+                const auto j = nlohmann::json::parse(req.body);
+                want_update = j.value("update", false);
+            } catch (...) {
+                res.status = 400;
+                res.set_content(R"({"error":"invalid JSON body"})", "application/json");
+                return;
+            }
+        }
+        auto* cb = want_update ? &vllm_update_cb_ : &vllm_provision_cb_;
+        if (!*cb) {
             res.status = 501;
-            res.set_content(R"({"error":"vLLM provisioning is not configured"})",
+            res.set_content(want_update
+                                ? R"({"error":"vLLM update is not configured"})"
+                                : R"({"error":"vLLM provisioning is not configured"})",
                             "application/json");
             return;
         }
-        auto runtime = vllm_provision_cb_();
+        auto runtime = (*cb)();
         state_.set_vllm_runtime(runtime);
         if (!runtime.last_error.empty()) state_.set_last_error(runtime.last_error);
         res.status = (runtime.status == "failed" || runtime.status == "disabled") ? 500 : 200;
+        res.set_content(nlohmann::json{{"vllm_runtime", runtime}}.dump(),
+                        "application/json");
+    });
+
+    server_->Post("/api/node/runtime/vllm/check-update", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401; return;
+        }
+        if (!vllm_check_update_cb_) {
+            res.status = 501;
+            res.set_content(R"({"error":"vLLM update checking is not configured"})",
+                            "application/json");
+            return;
+        }
+        auto runtime = vllm_check_update_cb_();
+        state_.set_vllm_runtime(runtime);
         res.set_content(nlohmann::json{{"vllm_runtime", runtime}}.dump(),
                         "application/json");
     });

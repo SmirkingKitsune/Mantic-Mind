@@ -104,10 +104,12 @@ std::string clock_hms() {
 } // namespace
 
 NodeUI::NodeUI(NodeState& state, uint16_t listen_port,
-               ForgetPairingCallback forget_pairing_cb)
+               ForgetPairingCallback forget_pairing_cb,
+               RequestVllmUpdateCallback request_vllm_update_cb)
     : state_(state)
     , listen_port_(listen_port)
-    , forget_pairing_cb_(std::move(forget_pairing_cb)) {
+    , forget_pairing_cb_(std::move(forget_pairing_cb))
+    , request_vllm_update_cb_(std::move(request_vllm_update_cb)) {
     started_ms_ = mm::util::now_ms();
     log_file_path_ = make_temp_runtime_log_path();
     if (!log_file_path_.empty()) {
@@ -190,6 +192,7 @@ void NodeUI::run() {
         auto slots        = state_.get_slots();
         auto node_id      = state_.get_node_id();
         auto last_error   = state_.get_last_error();
+        auto vllm_rt      = state_.get_vllm_runtime();
         auto api_keys     = state_.get_api_keys();
         auto streaming    = state_.get_streaming_text();
 
@@ -305,6 +308,8 @@ void NodeUI::run() {
         if (!last_error.empty()) {
             runtime_summary = "error: " + last_error;
             runtime_color = Color::RedLight;
+        } else if (!vllm_rt.accelerator.empty()) {
+            runtime_summary = "ready (" + vllm_rt.accelerator + ")";
         }
 
         // ── STATUS panel ──────────────────────────────────────────────────────
@@ -329,6 +334,14 @@ void NodeUI::run() {
         };
         if (!model_action_status.empty())
             status_rows.push_back(field("action", text(model_action_status) | color(Color::Yellow)));
+        if (vllm_rt.update_available) {
+            const bool can_update = vllm_rt.managed && request_vllm_update_cb_;
+            const std::string upd =
+                "vLLM " + (vllm_rt.version.empty() ? std::string{"?"} : vllm_rt.version) +
+                " → " + vllm_rt.latest_version +
+                (can_update ? "  [press u to update]" : "  (update via package manager)");
+            status_rows.push_back(field("update", text(upd) | color(Color::Cyan) | bold));
+        }
         Element status_panel = panel("STATUS", vbox(std::move(status_rows)));
 
         // ── HEALTH panel (gauges + braille history) ───────────────────────────
@@ -540,6 +553,14 @@ void NodeUI::run() {
         }
         if (ev == Event::Character('f')) {
             return forget_pairing();
+        }
+        if (ev == Event::Character('u')) {
+            const auto rt = state_.get_vllm_runtime();
+            if (request_vllm_update_cb_ && rt.update_available && rt.managed) {
+                request_vllm_update_cb_();
+                return true;
+            }
+            return false;
         }
         if (ev == Event::Escape || ev == Event::Character('q')) {
             screen.ExitLoopClosure()();

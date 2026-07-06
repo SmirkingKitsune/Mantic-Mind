@@ -370,6 +370,13 @@ struct VllmRuntimeStatus {
     bool        managed = false;
     std::string executable_path;
     std::string last_error;
+    // Accelerator-correct build variant this node targets: cuda|rocm|cpu|metal|windows.
+    std::string accelerator;
+    // Newest build available upstream; "" when unknown (offline / not yet checked).
+    std::string latest_version;
+    // True when the installed runtime is older than latest_version. Orthogonal to
+    // `status`: a runtime stays "ready" while advertising an available update.
+    bool        update_available = false;
 };
 
 struct NodeInfo {
@@ -1018,24 +1025,30 @@ inline void from_json(const nlohmann::json& j, NodeCapabilities& c) {
 // persistence path (NodeRegistry::save_remembered_nodes) writes api_key
 // explicitly.
 inline void to_json(nlohmann::json& j, const VllmRuntimeStatus& r) {
-    j = { {"status",          r.status},
-          {"platform",        r.platform},
-          {"method",          r.method},
-          {"source_repo",     r.source_repo},
-          {"version",         r.version},
-          {"managed",         r.managed},
-          {"executable_path", r.executable_path},
-          {"last_error",      r.last_error} };
+    j = { {"status",           r.status},
+          {"platform",         r.platform},
+          {"method",           r.method},
+          {"source_repo",      r.source_repo},
+          {"version",          r.version},
+          {"managed",          r.managed},
+          {"executable_path",  r.executable_path},
+          {"last_error",       r.last_error},
+          {"accelerator",      r.accelerator},
+          {"latest_version",   r.latest_version},
+          {"update_available", r.update_available} };
 }
 inline void from_json(const nlohmann::json& j, VllmRuntimeStatus& r) {
-    if (j.contains("status"))          j.at("status").get_to(r.status);
-    if (j.contains("platform"))        j.at("platform").get_to(r.platform);
-    if (j.contains("method"))          j.at("method").get_to(r.method);
-    if (j.contains("source_repo"))     j.at("source_repo").get_to(r.source_repo);
-    if (j.contains("version"))         j.at("version").get_to(r.version);
-    if (j.contains("managed"))         j.at("managed").get_to(r.managed);
-    if (j.contains("executable_path")) j.at("executable_path").get_to(r.executable_path);
-    if (j.contains("last_error"))      j.at("last_error").get_to(r.last_error);
+    if (j.contains("status"))           j.at("status").get_to(r.status);
+    if (j.contains("platform"))         j.at("platform").get_to(r.platform);
+    if (j.contains("method"))           j.at("method").get_to(r.method);
+    if (j.contains("source_repo"))      j.at("source_repo").get_to(r.source_repo);
+    if (j.contains("version"))          j.at("version").get_to(r.version);
+    if (j.contains("managed"))          j.at("managed").get_to(r.managed);
+    if (j.contains("executable_path"))  j.at("executable_path").get_to(r.executable_path);
+    if (j.contains("last_error"))       j.at("last_error").get_to(r.last_error);
+    if (j.contains("accelerator"))      j.at("accelerator").get_to(r.accelerator);
+    if (j.contains("latest_version"))   j.at("latest_version").get_to(r.latest_version);
+    if (j.contains("update_available")) j.at("update_available").get_to(r.update_available);
 }
 
 inline void to_json(nlohmann::json& j, const NodeInfo& n) {

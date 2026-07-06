@@ -22,9 +22,14 @@ class NodeState;
 class NodeUI {
 public:
     using ForgetPairingCallback = std::function<bool(std::string* out_message)>;
+    // Invoked when the user approves a vLLM update (the 'u' key). Must return
+    // promptly — the implementation should run the (slow) install off the UI
+    // thread.
+    using RequestVllmUpdateCallback = std::function<void()>;
 
     NodeUI(NodeState& state, uint16_t listen_port,
-           ForgetPairingCallback forget_pairing_cb = {});
+           ForgetPairingCallback forget_pairing_cb = {},
+           RequestVllmUpdateCallback request_vllm_update_cb = {});
     ~NodeUI();
 
     // Append a log line from the runtime engine (thread-safe, posts to UI event loop).
@@ -40,6 +45,7 @@ private:
     NodeState& state_;
     uint16_t   listen_port_;
     ForgetPairingCallback forget_pairing_cb_;
+    RequestVllmUpdateCallback request_vllm_update_cb_;
 
     static constexpr size_t kMaxLogLines = 4000;
     static constexpr int    kLogScrollPage = 8;
