@@ -149,6 +149,19 @@ SlotId SlotManager::load_model(const std::string& model_path,
     MM_INFO("SlotManager: loading vllm model {} on port {} (slot {})",
             model_path, port, slot->id);
 
+    // GGUF-in-vLLM is experimental and architecture-limited; surface an advisory
+    // in the streamed runtime output so a startup failure isn't a mystery.
+    const bool model_is_gguf = mm::model_ref_is_gguf(model_path);
+    if (model_is_gguf) {
+        MM_WARN("SlotManager: {} is a GGUF file — vLLM GGUF support is experimental",
+                model_path);
+        if (log_cb)
+            log_cb("[advisory] Loading a GGUF model via vLLM. GGUF support in vLLM is "
+                   "experimental and limited to certain architectures; some models "
+                   "(e.g. GLM/ChatGLM) also require trust_remote_code. If startup "
+                   "fails, the vLLM error appears below.", true);
+    }
+
     // Phase 2 (unlocked): spawn the engine and wait for health. The slot is
     // private to this thread until it is pushed into slots_.
     bool started = slot->process->start_vllm(model_path, vllm_settings, port);
@@ -167,6 +180,12 @@ SlotId SlotManager::load_model(const std::string& model_path,
         } else {
             last_error_ = "failed to start vLLM (path=" + vllm_server_path_
                         + "; check model_path/settings)";
+        }
+        if (model_is_gguf) {
+            last_error_ += " [GGUF: vLLM's GGUF support is experimental — this "
+                           "model's architecture may be unsupported, or it needs "
+                           "trust_remote_code; see the node runtime output for the "
+                           "vLLM error]";
         }
         release_port(port);
         return {};

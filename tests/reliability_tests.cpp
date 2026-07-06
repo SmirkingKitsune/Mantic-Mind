@@ -956,6 +956,13 @@ bool test_vllm_runtime_defaults_and_args() {
     CHECK(has_arg_pair(args, "--tool-call-parser", "hermes"));
     CHECK(has_arg(args, "--disable-log-requests"));
 
+    // GGUF detection (drives the experimental-support advisory at launch).
+    CHECK(mm::model_ref_is_gguf("N:\\models\\GLM-4.7-Flash-Q6_K.gguf"));
+    CHECK(mm::model_ref_is_gguf("/models/model.GGUF"));
+    CHECK(!mm::model_ref_is_gguf("Qwen/Qwen3-8B"));
+    CHECK(!mm::model_ref_is_gguf("/models/model.safetensors"));
+    CHECK(!mm::model_ref_is_gguf(""));
+
 #ifdef _WIN32
     CHECK(mm::default_vllm_repo_url_for_platform() == mm::kWindowsVllmRepoUrl);
     CHECK(mm::default_vllm_branch_for_platform() == mm::kWindowsVllmBranch);

@@ -186,6 +186,13 @@ std::string default_vllm_branch_for_platform() {
                                                current_vllm_arch());
 }
 
+bool model_ref_is_gguf(const std::string& model_ref) {
+    const std::string s = mm::util::to_lower(mm::util::trim(model_ref));
+    static const std::string ext = ".gguf";
+    return s.size() > ext.size() &&
+           s.compare(s.size() - ext.size(), ext.size(), ext) == 0;
+}
+
 std::vector<std::string> build_vllm_server_args(const std::string& model_ref,
                                                 const VllmSettings& settings,
                                                 uint16_t port) {

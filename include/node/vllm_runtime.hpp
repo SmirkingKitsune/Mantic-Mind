@@ -53,6 +53,11 @@ std::vector<std::string> build_vllm_server_args(const std::string& model_ref,
                                                 const VllmSettings& settings,
                                                 uint16_t port);
 
+// True when a model reference points at a GGUF file (case-insensitive .gguf).
+// vLLM's GGUF support is experimental and architecture-limited, so callers use
+// this to attach a diagnostic advisory at launch. Pure.
+bool model_ref_is_gguf(const std::string& model_ref);
+
 /// Load signals scraped from a vLLM engine's Prometheus /metrics endpoint.
 struct VllmEngineMetrics {
     int    num_requests_running = 0;
