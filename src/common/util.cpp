@@ -138,6 +138,37 @@ bool is_hf_repo_id(const std::string& ref) {
     return valid_segment(ref.substr(0, slash)) && valid_segment(ref.substr(slash + 1));
 }
 
+bool model_ref_is_local_path(const std::string& ref) {
+    if (ref.empty()) return false;
+    if (is_hf_repo_id(ref)) return false;
+    if (ref.find('/') != std::string::npos || ref.find('\\') != std::string::npos) return true;
+    if (ref.size() >= 2 && std::isalpha(static_cast<unsigned char>(ref[0])) && ref[1] == ':')
+        return true;
+    return false;
+}
+
+std::string model_id_from_ref(const std::string& ref) {
+    std::string r = trim(ref);
+    if (r.size() >= 2 &&
+        ((r.front() == '"' && r.back() == '"') || (r.front() == '\'' && r.back() == '\'')))
+        r = trim(r.substr(1, r.size() - 2));
+    while (!r.empty() && (r.back() == '/' || r.back() == '\\')) r.pop_back();
+
+    const size_t pos = r.find_last_of("/\\");
+    const std::string base = (pos == std::string::npos) ? r : r.substr(pos + 1);
+
+    std::string id;
+    id.reserve(base.size());
+    for (unsigned char c : base) {
+        if (std::isalnum(c) || c == '.' || c == '_' || c == '-')
+            id.push_back(static_cast<char>(c));
+        else
+            id.push_back('_');
+    }
+    if (id.empty() || id == "." || id == "..") id = "model";
+    return id;
+}
+
 // ── Agent ID validation ───────────────────────────────────────────────────────
 bool is_valid_agent_id(const std::string& id) {
     if (id.empty() || id.size() > 128) return false;

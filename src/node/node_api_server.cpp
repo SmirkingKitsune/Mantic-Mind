@@ -3,6 +3,7 @@
 #include "node/slot_manager.hpp"
 #include "node/ray_orchestration.hpp"
 #include "node/hf_cache.hpp"
+#include "node/model_store.hpp"
 #include "common/http_server.hpp"
 #include "common/runtime_client.hpp"
 #include "common/models.hpp"
@@ -15,9 +16,11 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -26,6 +29,30 @@ namespace mm {
 namespace fs = std::filesystem;
 
 namespace {
+
+// True when a model reference is a filesystem path (contains a separator or a
+// Windows drive prefix) rather than a bare model name or HF repo id.
+bool looks_like_fs_path(const std::string& s) {
+    if (s.find('/') != std::string::npos || s.find('\\') != std::string::npos) return true;
+    if (s.size() >= 2 &&
+        std::isalpha(static_cast<unsigned char>(s[0])) && s[1] == ':') return true;
+    return false;
+}
+
+// A vLLM runtime is usable for launching engines once it resolves to an
+// executable (found on PATH or a completed managed install).
+bool node_vllm_runtime_ready(const VllmRuntimeStatus& rt) {
+    return (rt.status == "resolved" || rt.status == "ready") && !rt.executable_path.empty();
+}
+
+// Load paths currently backing a live slot — models the store must never
+// evict out from under a running engine.
+std::set<std::string> loaded_model_paths(SlotManager& mgr) {
+    std::set<std::string> paths;
+    for (const auto& s : mgr.get_slot_info())
+        if (!s.model_path.empty()) paths.insert(s.model_path);
+    return paths;
+}
 
 std::string sanitize_path_for_runtime(std::string p) {
     p = mm::util::trim(p);
@@ -65,6 +92,9 @@ NodeApiServer::NodeApiServer(NodeState& state,
 NodeApiServer::~NodeApiServer() { stop(); }
 
 bool NodeApiServer::listen(uint16_t port) {
+    // Streamed model uploads far exceed cpp-httplib's 100 MB default body cap;
+    // raise it so /api/node/models/receive can accept multi-GB model files.
+    server_->set_payload_max_length(std::size_t{1} << 42);  // 4 TiB
     register_routes();
     MM_INFO("NodeApiServer listening on port {}", port);
     return server_->listen("0.0.0.0", port);
@@ -101,6 +131,10 @@ void NodeApiServer::set_hf_config(std::string hf_cli_path,
                                   std::string hf_hub_cache_dir) {
     hf_cli_path_ = std::move(hf_cli_path);
     hf_hub_cache_dir_ = std::move(hf_hub_cache_dir);
+}
+
+void NodeApiServer::set_model_store(ModelStore* store) {
+    model_store_ = store;
 }
 
 // ── Auth check ────────────────────────────────────────────────────────────────
@@ -164,6 +198,16 @@ void NodeApiServer::register_routes() {
         j["node_id"]       = state_.get_node_id();
         j["slots"]         = slots;
         j["cached_models"] = scan_hf_cache_models(hf_hub_cache_dir_);
+        if (model_store_) {
+            nlohmann::json managed = nlohmann::json::array();
+            for (const auto& m : model_store_->list())
+                managed.push_back({{"id", m.id},
+                                   {"size_bytes", m.size_bytes},
+                                   {"pinned", m.pinned},
+                                   {"last_used_ms", m.last_used_ms}});
+            j["managed_models"] = managed;
+            j["model_cache_free_bytes"] = model_store_->free_bytes();
+        }
         j["disk_free_mb"]  = metrics.disk_free_mb;
         j["health"]        = metrics;
         j["capabilities"]  = state_.get_capabilities();
@@ -288,6 +332,10 @@ void NodeApiServer::register_routes() {
             auto j = nlohmann::json::parse(req.body);
             std::string model_ref  = j.value("model_path", std::string{});
             std::string agent_id   = j.value("agent_id",   std::string{});
+            // Optional: identity + pin flag for a control-transferred model, so
+            // the node can refresh the LRU use-queue and pinned state on load.
+            const std::string model_id = j.value("model_id", std::string{});
+            const bool model_pin       = j.value("pin", false);
             VllmSettings vllm_settings;
             if (j.contains("vllm_settings")) vllm_settings = j["vllm_settings"].get<VllmSettings>();
 
@@ -300,6 +348,43 @@ void NodeApiServer::register_routes() {
 
             // vLLM resolves the model from an HF id / cache / local dir.
             const std::string model_path = sanitize_path_for_runtime(model_ref);
+
+            // Fail fast rather than spawn an engine we know will die: without a
+            // usable runtime the launch reports a misleading "did not become
+            // healthy within 600s" instead of the real cause.
+            if (const auto rt = state_.get_vllm_runtime(); !node_vllm_runtime_ready(rt)) {
+                res.status = 503;
+                const std::string msg = rt.last_error.empty()
+                    ? "vLLM runtime is not ready on this node (status=" + rt.status + ")"
+                    : "vLLM runtime is not ready on this node: " + rt.last_error;
+                state_.set_last_error(msg);
+                res.set_content(nlohmann::json{{"error", "vllm runtime not ready"},
+                                               {"detail", msg},
+                                               {"vllm_runtime", rt}}.dump(),
+                                "application/json");
+                return;
+            }
+
+            // A path-like ref that is not an HF repo id must exist on this node.
+            // This catches a control-side local/UNC/Windows path (e.g. N:\...)
+            // handed to a node that cannot resolve it, with a clear error
+            // instead of a 10-minute vLLM startup timeout.
+            if (!mm::util::is_hf_repo_id(model_path) && looks_like_fs_path(model_path)) {
+                std::error_code ec;
+                if (!fs::exists(model_path, ec)) {
+                    res.status = 400;
+                    const std::string msg =
+                        "model path not found on this node: " + model_path +
+                        " (control must transfer the model here, or use an HF repo "
+                        "id or a node-local path)";
+                    state_.set_last_error(msg);
+                    res.set_content(nlohmann::json{{"error", "model not found on node"},
+                                                   {"detail", msg},
+                                                   {"model_path", model_path}}.dump(),
+                                    "application/json");
+                    return;
+                }
+            }
 
             auto slot_id = slot_mgr_.load_model(model_path, vllm_settings, agent_id);
             if (slot_id.empty()) {
@@ -319,6 +404,17 @@ void NodeApiServer::register_routes() {
                 state_.set_loaded_model(model_path);
                 if (!agent_id.empty()) state_.set_active_agent(agent_id);
                 state_.set_last_error("");
+
+                // Refresh the local cache's use-queue and pin state for a
+                // transferred model. Pin is STICKY: a load from a preferred
+                // agent pins the model, but a later load from a non-preferred
+                // agent (pin=false) must not clear a pin another agent set —
+                // otherwise the model would become evictable despite a standing
+                // preference. Unpinning is a separate, explicit lifecycle event.
+                if (model_store_ && !model_id.empty()) {
+                    if (model_pin) model_store_->set_pinned(model_id, true);
+                    model_store_->touch(model_id);
+                }
 
                 // Find the effective_ctx_size for the newly loaded slot.
                 int effective_ctx = 0;
@@ -495,6 +591,148 @@ void NodeApiServer::register_routes() {
             res.status = 400;
             res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
         }
+    });
+
+    // ── POST /api/node/models/receive ─────────────────────────────────────────
+    // Accept one file of a control-transferred model, streamed as the raw
+    // request body (no in-memory buffering). Metadata rides in headers:
+    //   X-MM-Model-Id  stable model id (identical on control and node)
+    //   X-MM-Rel-Path  this file's path within the model
+    //   X-MM-Size      this file's byte length (used to make room); optional
+    //   X-MM-Pin       "true" to pin the model on this node (survives shutdown)
+    // Before writing, LRU-evicts unpinned models if disk is tight. Returns
+    // {status, model_id, load_path, evicted[]} once the file is in place.
+    server_->PostUpload("/api/node/models/receive",
+        [this](const httplib::Request& req, httplib::Response& res,
+               const HttpServer::UploadPump& pump) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401;
+            res.set_content(R"({"error":"unauthorized"})", "application/json");
+            return;
+        }
+        if (!model_store_) {
+            res.status = 501;
+            res.set_content(R"({"error":"model store is not configured on this node"})",
+                            "application/json");
+            return;
+        }
+        const std::string id  = util::trim(req.get_header_value("X-MM-Model-Id"));
+        const std::string rel = util::trim(req.get_header_value("X-MM-Rel-Path"));
+        const bool pin =
+            util::to_lower(util::trim(req.get_header_value("X-MM-Pin"))) == "true";
+        int64_t size = 0;
+        if (req.has_header("X-MM-Size")) {
+            try { size = std::stoll(req.get_header_value("X-MM-Size")); } catch (...) {}
+        }
+        if (id.empty() || rel.empty()) {
+            res.status = 400;
+            res.set_content(R"({"error":"X-MM-Model-Id and X-MM-Rel-Path required"})",
+                            "application/json");
+            return;
+        }
+
+        // Reserve this model for the whole (possibly multi-file, multi-request)
+        // transfer so neither make_room_for here nor the background disk-pressure
+        // thread can evict files we have already received for it. The reservation
+        // is refreshed on every file and self-expires if the transfer is
+        // abandoned. 1h matches the upload write-timeout ceiling.
+        model_store_->reserve(id, 3600LL * 1000);
+
+        const auto in_use = loaded_model_paths(slot_mgr_);
+        std::vector<std::string> evicted = model_store_->make_room_for(size, in_use);
+
+        auto slot = model_store_->begin_file(id, rel);
+        if (!slot.ok) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", slot.error}}.dump(), "application/json");
+            return;
+        }
+
+        std::ofstream out(slot.temp_path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            res.status = 500;
+            res.set_content(R"({"error":"cannot open destination file for writing"})",
+                            "application/json");
+            return;
+        }
+        bool write_ok = true;
+        const bool pumped = pump([&](const char* data, size_t len) -> bool {
+            out.write(data, static_cast<std::streamsize>(len));
+            if (!out) { write_ok = false; return false; }
+            return true;
+        });
+        out.close();
+        // close() flushes the final buffered block; a full-disk ENOSPC can
+        // surface only here, so re-check the stream before declaring success.
+        if (!out) write_ok = false;
+        if (!pumped || !write_ok) {
+            std::error_code ec;
+            fs::remove(slot.temp_path, ec);
+            res.status = 500;
+            res.set_content(R"({"error":"upload interrupted or write failed"})",
+                            "application/json");
+            return;
+        }
+
+        std::string commit_err;
+        if (!model_store_->commit_file(slot, &commit_err)) {
+            res.status = 500;
+            res.set_content(nlohmann::json{{"error", commit_err}}.dump(), "application/json");
+            return;
+        }
+        model_store_->register_model(id, pin);
+        if (!evicted.empty())
+            MM_INFO("ModelStore: evicted {} model(s) to receive {}", evicted.size(), id);
+
+        res.set_content(nlohmann::json{{"status", "stored"},
+                                       {"model_id", id},
+                                       {"load_path", model_store_->load_path(id)},
+                                       {"evicted", evicted}}.dump(),
+                        "application/json");
+    });
+
+    // ── GET /api/node/models/local ────────────────────────────────────────────
+    // Report the node-local managed model cache. With ?id=<model_id> it answers
+    // whether that model is already present (size + load path), so control can
+    // skip a transfer the node already holds.
+    server_->Get("/api/node/models/local", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401; return;
+        }
+        if (!model_store_) {
+            res.set_content(nlohmann::json{{"available", false},
+                                           {"models", nlohmann::json::array()}}.dump(),
+                            "application/json");
+            return;
+        }
+        if (req.has_param("id")) {
+            const std::string id = req.get_param_value("id");
+            auto m = model_store_->get(id);
+            nlohmann::json j;
+            j["available"] = true;
+            j["present"]   = static_cast<bool>(m);
+            if (m) {
+                j["size_bytes"] = m->size_bytes;
+                j["pinned"]     = m->pinned;
+                j["load_path"]  = model_store_->load_path(id);
+            }
+            res.set_content(j.dump(), "application/json");
+            return;
+        }
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& m : model_store_->list()) {
+            arr.push_back({{"id", m.id},
+                           {"size_bytes", m.size_bytes},
+                           {"last_used_ms", m.last_used_ms},
+                           {"pinned", m.pinned},
+                           {"load_path", model_store_->load_path(m.id)}});
+        }
+        res.set_content(nlohmann::json{{"available", true},
+                                       {"root", model_store_->root()},
+                                       {"free_bytes", model_store_->free_bytes()},
+                                       {"min_free_mb", model_store_->min_free_mb()},
+                                       {"models", arr}}.dump(),
+                        "application/json");
     });
 
     // ── POST /api/node/detach-agent ───────────────────────────────────────────

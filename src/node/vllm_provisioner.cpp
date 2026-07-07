@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -16,6 +17,10 @@
 
 #ifdef _WIN32
 #  include <Windows.h>
+#else
+#  include <csignal>
+#  include <cerrno>
+#  include <unistd.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -66,6 +71,17 @@ VllmProvisionConfig normalized_config(VllmProvisionConfig cfg) {
     }
     if (cfg.provision_dir.empty()) {
         cfg.provision_dir = (fs::path("data") / "runtimes" / "vllm").string();
+    }
+    // Absolutize the provision dir. Install steps run with cwd=provision_dir and
+    // pass the venv path as an argument; a relative provision_dir would resolve
+    // that argument against the step cwd and nest a second copy
+    // (data/runtimes/vllm/data/runtimes/vllm/venv), which then never matches the
+    // executable path we validate. An absolute root makes every derived path
+    // cwd-independent and self-consistent.
+    {
+        std::error_code ec;
+        const fs::path abs = fs::absolute(cfg.provision_dir, ec);
+        if (!ec) cfg.provision_dir = abs.lexically_normal().string();
     }
     return cfg;
 }
@@ -160,11 +176,39 @@ std::string windows_source_checkout_ref(const VllmProvisionConfig& cfg) {
     return cfg.version == "latest" ? kWindowsVllmBranch : cfg.version;
 }
 
+long current_process_id() {
+#ifdef _WIN32
+    return static_cast<long>(::GetCurrentProcessId());
+#else
+    return static_cast<long>(::getpid());
+#endif
+}
+
+// True when a process with this id is currently running. Best-effort and
+// cross-platform: a false positive keeps a lock we would otherwise steal, a
+// false negative never happens for a live owner.
+bool process_is_alive(long pid) {
+    if (pid <= 0) return false;
+#ifdef _WIN32
+    HANDLE h = ::OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
+    if (h == nullptr) return false;
+    const DWORD w = ::WaitForSingleObject(h, 0);
+    ::CloseHandle(h);
+    return w == WAIT_TIMEOUT;   // still running (not yet signaled)
+#else
+    if (::kill(static_cast<pid_t>(pid), 0) == 0) return true;
+    return errno == EPERM;      // exists but owned by another user
+#endif
+}
+
+// A directory-based provisioning lock that survives a crashed owner. The lock
+// dir records the owning PID; a contender steals it when that PID is gone (or
+// when a PID-less dir is older than a short grace window), so a node killed
+// mid-install does not brick provisioning forever.
 class ProvisionLock {
 public:
     explicit ProvisionLock(fs::path path) : path_(std::move(path)) {
-        std::error_code ec;
-        acquired_ = fs::create_directory(path_, ec);
+        acquire();
     }
     ~ProvisionLock() {
         if (!acquired_) return;
@@ -174,6 +218,41 @@ public:
     bool acquired() const { return acquired_; }
 
 private:
+    void acquire() {
+        std::error_code ec;
+        if (fs::create_directory(path_, ec)) {
+            write_owner();
+            acquired_ = true;
+            return;
+        }
+        if (owner_is_dead()) {
+            fs::remove_all(path_, ec);
+            if (fs::create_directory(path_, ec)) {
+                write_owner();
+                acquired_ = true;
+                return;
+            }
+        }
+        acquired_ = false;
+    }
+
+    void write_owner() {
+        std::ofstream f(path_ / "owner.pid", std::ios::trunc);
+        if (f) f << current_process_id() << "\n";
+    }
+
+    bool owner_is_dead() const {
+        std::ifstream f(path_ / "owner.pid");
+        long pid = 0;
+        if (f && (f >> pid) && pid > 0) return !process_is_alive(pid);
+        // No or unreadable PID file: only steal once the dir is past a short
+        // grace window, so we never race a creator that hasn't written it yet.
+        std::error_code ec;
+        const auto mtime = fs::last_write_time(path_, ec);
+        if (ec) return false;
+        return (fs::file_time_type::clock::now() - mtime) > std::chrono::seconds(30);
+    }
+
     fs::path path_;
     bool acquired_ = false;
 };

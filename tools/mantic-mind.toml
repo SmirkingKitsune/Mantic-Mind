@@ -107,6 +107,22 @@ max_slots = 4
 # interconnect_gbps = 0
 
 # ── Storage ────────────────────────────────────────────────────────────────────
+# Local model cache root. When a node lacks a model given as a local path,
+# control transfers it here; the node then loads from its own copy. The node
+# keeps an LRU use-queue over this directory and evicts unpinned models under
+# disk pressure. Pinned models (control marked this node preferred for the
+# agent) are never auto-evicted.
+models_dir = "models"
+
+# Evict least-recently-used unpinned models once free space on the models_dir
+# filesystem drops below this many MB. 0 disables the proactive threshold (a
+# transfer still evicts just enough to fit the incoming model).
+model_cache_min_free_mb = 10240
+
+# On shutdown, delete every model except those pinned to this node. Set false to
+# retain the full local cache across restarts.
+model_cache_clear_on_shutdown = true
+
 # Node runtime data root. Remembered pairing API keys live in {data_dir}/api_keys.json.
 data_dir = "data"
 

@@ -5,6 +5,10 @@
 #include <httplib.h>
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <vector>
 
 namespace mm {
 
@@ -90,6 +94,50 @@ HttpResponse HttpClient::put(const std::string& path, const nlohmann::json& body
 HttpResponse HttpClient::del(const std::string& path) {
     auto cli = make_cli(base_url_, connect_timeout_s_, read_timeout_s_, write_timeout_s_);
     return to_resp(cli.Delete(path, make_headers(bearer_token_)));
+}
+
+HttpResponse HttpClient::post_file(
+    const std::string& path,
+    const std::string& file_path,
+    const std::vector<std::pair<std::string, std::string>>& extra_headers,
+    const std::string& content_type) {
+    std::error_code ec;
+    const auto file_bytes = std::filesystem::file_size(file_path, ec);
+    if (ec) {
+        MM_WARN("HttpClient::post_file cannot stat {}: {}", file_path, ec.message());
+        return { 0, "" };
+    }
+    auto fp = std::make_shared<std::ifstream>(file_path, std::ios::binary);
+    if (!fp->is_open()) {
+        MM_WARN("HttpClient::post_file cannot open {}", file_path);
+        return { 0, "" };
+    }
+
+    httplib::Headers headers = make_headers(bearer_token_);
+    for (const auto& [k, v] : extra_headers) headers.emplace(k, v);
+
+    // Large transfers can take a while; lift the write timeout to the same
+    // generous floor used for streaming reads.
+    auto cli = make_cli(base_url_, connect_timeout_s_, read_timeout_s_,
+                        std::max(write_timeout_s_, stream_read_timeout_floor_s()));
+
+    // Known-length content provider: httplib drives it with the absolute body
+    // offset and the remaining length; we seek + hand back one bounded chunk
+    // per call so the file streams from disk to socket without buffering.
+    auto provider = [fp](size_t offset, size_t length, httplib::DataSink& sink) -> bool {
+        constexpr size_t kChunk = 1u << 20; // 1 MiB
+        fp->clear();
+        fp->seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        const size_t want = std::min(length, kChunk);
+        std::vector<char> buf(want);
+        fp->read(buf.data(), static_cast<std::streamsize>(want));
+        const std::streamsize got = fp->gcount();
+        if (got <= 0) return false;
+        return sink.write(buf.data(), static_cast<size_t>(got));
+    };
+
+    return to_resp(cli.Post(path, headers, static_cast<size_t>(file_bytes),
+                            provider, content_type));
 }
 
 bool HttpClient::stream_get(const std::string& path, SseLineCallback line_cb) {

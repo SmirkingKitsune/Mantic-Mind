@@ -33,6 +33,24 @@ void HttpServer::Delete(const std::string& pattern, Handler h) {
     impl_->srv.Delete(pattern, std::move(h));
 }
 
+void HttpServer::PostUpload(const std::string& pattern, UploadHandler h) {
+    impl_->srv.Post(
+        pattern,
+        [handler = std::move(h)](const httplib::Request& req, httplib::Response& res,
+                                 const httplib::ContentReader& content_reader) {
+            UploadPump pump = [&content_reader](const BodySink& sink) -> bool {
+                return content_reader([&sink](const char* data, size_t len) {
+                    return sink(data, len);
+                });
+            };
+            handler(req, res, pump);
+        });
+}
+
+void HttpServer::set_payload_max_length(std::size_t length) {
+    impl_->srv.set_payload_max_length(length);
+}
+
 bool HttpServer::listen(const std::string& host, uint16_t port) {
     return impl_->srv.listen(host, port);
 }

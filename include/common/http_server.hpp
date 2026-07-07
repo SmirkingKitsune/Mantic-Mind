@@ -3,6 +3,7 @@
 #include <string>
 #include <functional>
 #include <memory>
+#include <cstddef>
 #include <cstdint>
 
 // Thin wrapper around cpp-httplib Server.
@@ -20,11 +21,27 @@ public:
     // fully handled the request.
     using PreRoutingHandler = std::function<bool(const httplib::Request&, httplib::Response&)>;
 
+    // Streaming upload route. The request body is delivered incrementally so a
+    // multi-GB upload never buffers in memory: the handler calls
+    // `pump(sink)`, and `sink(data, len)` is invoked for each chunk as it
+    // arrives (return false from the sink to abort). `pump` returns false if
+    // the client disconnected mid-body.
+    using BodySink = std::function<bool(const char* data, std::size_t len)>;
+    using UploadPump = std::function<bool(const BodySink&)>;
+    using UploadHandler = std::function<void(const httplib::Request& req,
+                                             httplib::Response& res,
+                                             const UploadPump& pump)>;
+
     void SetPreRoutingHandler(PreRoutingHandler h);
     void Get(const std::string& pattern, Handler h);
     void Post(const std::string& pattern, Handler h);
     void Put(const std::string& pattern, Handler h);
     void Delete(const std::string& pattern, Handler h);
+    void PostUpload(const std::string& pattern, UploadHandler h);
+
+    // Raise the maximum accepted request-body size (cpp-httplib defaults to
+    // 100 MB, which would reject streamed model uploads). Applies to all routes.
+    void set_payload_max_length(std::size_t length);
 
     // Blocks until stop() is called from another thread.
     bool listen(const std::string& host, uint16_t port);

@@ -2041,6 +2041,47 @@ void ControlApiServer::register_routes() {
                         "application/json");
     });
 
+    // Trigger an out-of-band HF pre-fetch on a node. The CLI/UI target this
+    // control route; it forwards to the node's /api/node/models/pull so the
+    // multi-GB download happens outside any load-model health-timeout window.
+    server_->Post("/v1/nodes/:id/models/pull", [this](const Request& req, Response& res) {
+        const std::string node_id = req.path_params.at("id");
+        NodeInfo node;
+        try {
+            node = registry_.get_node(node_id);
+        } catch (...) {
+            res.status = 404;
+            res.set_content(R"({"error":"node not found"})", "application/json");
+            return;
+        }
+        try {
+            auto j = nlohmann::json::parse(req.body);
+            // Accept model_ref, model_path, or the CLI's model_filename spelling.
+            std::string model_ref = util::trim(j.value("model_ref",
+                                    j.value("model_path",
+                                    j.value("model_filename", std::string{}))));
+            if (model_ref.empty()) {
+                res.status = 400;
+                res.set_content(R"({"error":"model_ref required"})", "application/json");
+                return;
+            }
+            nlohmann::json fwd = {{"model_ref", model_ref}};
+            if (j.contains("force")) fwd["force"] = j.value("force", false);
+
+            HttpClient node_cli(node.url);
+            node_cli.set_bearer_token(node.api_key);
+            auto pull = node_cli.post("/api/node/models/pull", fwd);
+            res.status = pull.status ? pull.status : 502;
+            res.set_content(pull.body.empty()
+                                ? R"({"error":"node did not respond"})"
+                                : pull.body,
+                            "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+        }
+    });
+
     server_->Post("/v1/nodes/pair/start", [this](const Request& req, Response& res) {
         try {
             auto j = nlohmann::json::parse(req.body);

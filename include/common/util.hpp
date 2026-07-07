@@ -39,6 +39,19 @@ std::string replace_all(const std::string& s, const std::string& from, const std
 // cache) and control (placement preference).
 bool is_hf_repo_id(const std::string& ref);
 
+// True when ref is a local filesystem path (has a separator or a Windows drive
+// prefix) rather than an HF repo id or a bare model name. Handles both '/' and
+// '\\' separators so it is correct regardless of host OS. Used by control to
+// decide whether a model must be transferred to a node.
+bool model_ref_is_local_path(const std::string& ref);
+
+// A stable, filesystem-safe identity for a model reference: the final path
+// component (a file name like "Qwen3-8B.gguf" or a directory name), with any
+// character outside [A-Za-z0-9._-] replaced by '_'. Both control and node
+// compute the same id from the same ref so they agree on the node-local
+// destination folder and the cache dedup key. Handles '/' and '\\'.
+std::string model_id_from_ref(const std::string& ref);
+
 // ── URL / SSE helpers ───────────────────────────────────────────────────────
 // Parse "http://host:port/path" → {host, port}.  Defaults to port 80.
 std::pair<std::string, int> parse_url(const std::string& url);

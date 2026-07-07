@@ -9,12 +9,116 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
+#include <optional>
 #include <regex>
+#include <string>
+#include <system_error>
 #include <tuple>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace mm {
+
+namespace {
+
+// Stream a control-local model (single file or directory) to a node's local
+// model cache, skipping files it already holds, and return the node-local load
+// path the runtime should open. Returns nullopt on failure (with *error set).
+//
+// The transfer reuses the existing authenticated control→node channel: the
+// node in this topology may have no route back to control, but control always
+// holds the node's url + api_key. Files stream chunk-by-chunk (no multi-GB
+// buffering) via HttpClient::post_file.
+std::optional<std::string> transfer_model_to_node(const NodeInfo& node,
+                                                  const std::string& model_ref,
+                                                  bool pin,
+                                                  bool force,
+                                                  std::string* error) {
+    namespace fs = std::filesystem;
+    const std::string model_id = util::model_id_from_ref(model_ref);
+
+    struct FileEntry { std::string abs; std::string rel; int64_t size; };
+    std::vector<FileEntry> files;
+    int64_t total = 0;
+    std::error_code ec;
+
+    const fs::path root(model_ref);
+    if (fs::is_regular_file(root, ec)) {
+        const int64_t sz = static_cast<int64_t>(fs::file_size(root, ec));
+        files.push_back({root.string(), root.filename().string(), sz});
+        total += sz;
+    } else if (fs::is_directory(root, ec)) {
+        for (auto it = fs::recursive_directory_iterator(root, ec);
+             !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+            std::error_code fec;
+            if (!it->is_regular_file(fec)) continue;
+            const fs::path rel = fs::relative(it->path(), root, fec);
+            const int64_t sz = static_cast<int64_t>(it->file_size(fec));
+            files.push_back({it->path().string(), rel.generic_string(), sz});
+            total += sz;
+        }
+    } else {
+        if (error) *error = "model path is neither a file nor a directory: " + model_ref;
+        return std::nullopt;
+    }
+    if (files.empty()) {
+        if (error) *error = "no files found for model: " + model_ref;
+        return std::nullopt;
+    }
+
+    HttpClient cli(node.url);
+    cli.set_bearer_token(node.api_key);
+    cli.set_timeouts(10, 3600, 3600);  // large transfers can take a while
+
+    // Skip the transfer when the node already holds this model at the same size
+    // (unless forced — e.g. a retry after the node evicted it mid-flight).
+    if (!force) {
+        auto q = cli.get("/api/node/models/local?id=" + model_id);
+        if (q.ok()) {
+            try {
+                auto j = nlohmann::json::parse(q.body);
+                if (j.value("present", false) &&
+                    j.value("size_bytes", static_cast<int64_t>(-1)) == total) {
+                    const std::string lp = j.value("load_path", std::string{});
+                    if (!lp.empty()) return lp;
+                }
+            } catch (...) {}
+        }
+    }
+
+    std::string load_path;
+    for (const auto& fe : files) {
+        const std::vector<std::pair<std::string, std::string>> headers = {
+            {"X-MM-Model-Id", model_id},
+            {"X-MM-Rel-Path", fe.rel},
+            {"X-MM-Size",     std::to_string(fe.size)},
+            {"X-MM-Pin",      pin ? "true" : "false"},
+        };
+        auto resp = cli.post_file("/api/node/models/receive", fe.abs, headers);
+        if (!resp.ok()) {
+            if (error) {
+                std::string body = resp.body.size() > 200 ? resp.body.substr(0, 200)
+                                                          : resp.body;
+                *error = "receive failed for " + fe.rel + " (HTTP " +
+                         std::to_string(resp.status) + "): " + body;
+            }
+            return std::nullopt;
+        }
+        try {
+            auto j = nlohmann::json::parse(resp.body);
+            load_path = j.value("load_path", load_path);
+        } catch (...) {}
+    }
+    if (load_path.empty()) {
+        if (error) *error = "node did not report a load path after transfer";
+        return std::nullopt;
+    }
+    return load_path;
+}
+
+}  // namespace
 
 AgentScheduler::AgentScheduler(NodeRegistry& registry,
                                std::string models_dir)
@@ -738,13 +842,52 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
         HttpClient cli(node.url);
         cli.set_bearer_token(node.api_key);
 
+        // A model given as a control-local path (e.g. a SAMBA share the node
+        // cannot resolve) is transferred to the node's local cache first; the
+        // node then loads from its own copy. Pin it when this node is the
+        // agent's preferred node so the node keeps it across shutdown/eviction.
+        // Done once, before the retry loop (this runs under schedule_mutex_, so
+        // a large transfer serializes scheduling — acceptable for correctness).
+        std::string effective_model_path = cfg.model_path;
+        std::string transferred_model_id;
+        const bool pin_on_node =
+            !cfg.preferred_node_id.empty() && cfg.preferred_node_id == node_id;
+
+        if (util::model_ref_is_local_path(cfg.model_path)) {
+            std::error_code ec;
+            if (std::filesystem::exists(cfg.model_path, ec)) {
+                std::string xfer_err;
+                auto local = transfer_model_to_node(node, cfg.model_path,
+                                                    pin_on_node, /*force=*/false,
+                                                    &xfer_err);
+                if (!local) {
+                    set_last_error("failed to transfer model to node " + node_id +
+                                   ": " + xfer_err);
+                    MM_WARN("AgentScheduler: model transfer to node {} failed: {}",
+                            node_id, xfer_err);
+                    return std::nullopt;
+                }
+                transferred_model_id = util::model_id_from_ref(cfg.model_path);
+                effective_model_path = *local;
+                MM_INFO("AgentScheduler: transferred model {} to node {} -> {}",
+                        transferred_model_id, node_id, effective_model_path);
+            }
+            // If control cannot see the path either, fall through with the
+            // original ref and let the node resolve (or fail-fast) it.
+        }
+
+        bool retried_transfer = false;
         for (int attempt = 0; attempt < 3; ++attempt) {
             nlohmann::json body = {
-                {"model_path", cfg.model_path},
+                {"model_path", effective_model_path},
                 {"vllm_settings", vllm_override ? *vllm_override
                                                 : cfg.vllm_settings},
                 {"agent_id",   cfg.id}
             };
+            if (!transferred_model_id.empty()) {
+                body["model_id"] = transferred_model_id;
+                body["pin"]      = pin_on_node;
+            }
 
             auto resp = cli.post("/api/node/load-model", body);
             if (resp.ok()) {
@@ -768,6 +911,26 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
                 if (attempt == 1 && evict_slots_on_node(node_id, cfg.id, -1)) {
                     MM_INFO("AgentScheduler: load-model still constrained on node {}; evicted remaining slots and retrying",
                             node_id);
+                    continue;
+                }
+            }
+
+            // The node evicted our transferred model between the transfer and
+            // this load (disk pressure). Re-send it once, forcing past the
+            // idempotency check, and retry the load.
+            if (!transferred_model_id.empty() && !retried_transfer &&
+                util::to_lower(resp.body).find("model not found on node") !=
+                    std::string::npos) {
+                std::string xfer_err;
+                auto local = transfer_model_to_node(node, cfg.model_path,
+                                                    pin_on_node, /*force=*/true,
+                                                    &xfer_err);
+                if (local) {
+                    effective_model_path = *local;
+                    retried_transfer = true;
+                    MM_INFO("AgentScheduler: node {} was missing transferred "
+                            "model {}; re-sent and retrying load",
+                            node_id, transferred_model_id);
                     continue;
                 }
             }

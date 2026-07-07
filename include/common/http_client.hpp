@@ -3,6 +3,8 @@
 #include <string>
 #include <functional>
 #include <optional>
+#include <utility>
+#include <vector>
 #include <nlohmann/json.hpp>
 
 namespace mm {
@@ -28,6 +30,15 @@ public:
     HttpResponse post(const std::string& path, const nlohmann::json& body);
     HttpResponse put (const std::string& path, const nlohmann::json& body);
     HttpResponse del (const std::string& path);
+
+    // Stream a file as the raw request body without buffering it in memory —
+    // for large model transfers. extra_headers carry out-of-band metadata
+    // (destination path, model id, etc.). Blocks until the upload completes.
+    HttpResponse post_file(
+        const std::string& path,
+        const std::string& file_path,
+        const std::vector<std::pair<std::string, std::string>>& extra_headers = {},
+        const std::string& content_type = "application/octet-stream");
 
     // SSE streaming GET.  line_cb is called for each raw "data: ..." line.
     // Returns false if the connection could not be established.

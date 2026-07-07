@@ -12,6 +12,7 @@ namespace mm {
 class NodeState;
 class SlotManager;
 class HttpServer;
+class ModelStore;
 
 // Hosts the node REST API.
 // Most endpoints require "Authorization: Bearer <node-api-key>".
@@ -44,10 +45,14 @@ public:
     void set_ray_config(std::string ray_path, uint16_t ray_port);
     // HF model-cache config: the `hf` CLI and the resolved hub cache directory.
     void set_hf_config(std::string hf_cli_path, std::string hf_hub_cache_dir);
+    // Local model cache: control-transferred models + LRU eviction. Optional;
+    // when unset the model transfer/receive endpoints report unavailable.
+    void set_model_store(ModelStore* store);
 
 private:
     NodeState&     state_;
     SlotManager&   slot_mgr_;
+    ModelStore*    model_store_ = nullptr;
     std::string    control_url_;
     std::string    pairing_key_;
     std::string    ray_path_ = "ray";

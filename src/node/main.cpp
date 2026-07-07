@@ -7,6 +7,7 @@
 #include "node/node_api_server.hpp"
 #include "node/node_config.hpp"
 #include "node/hf_cache.hpp"
+#include "node/model_store.hpp"
 #include "node/node_state.hpp"
 #include "node/node_ui.hpp"
 #include "node/singleton_lock.hpp"
@@ -28,6 +29,7 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -116,6 +118,11 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
         cfg.hf_cli_path = file.get("hf_cli_path", "hf");
         cfg.hf_cache_dir = file.get("hf_cache_dir", "");
         cfg.kv_cache_dir = file.get("kv_cache_dir", "data/kv_cache");
+        cfg.model_cache_min_free_mb = static_cast<int64_t>(
+            file.get_int("model_cache_min_free_mb",
+                         static_cast<int>(cfg.model_cache_min_free_mb)));
+        cfg.model_cache_clear_on_shutdown =
+            file.get_bool("model_cache_clear_on_shutdown", cfg.model_cache_clear_on_shutdown);
         cfg.pairing_key    = file.get("pairing_key",    "");
         cfg.discovery_port = static_cast<uint16_t>(
             file.get_int("discovery_port", 7072));
@@ -170,6 +177,11 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
     cfg.max_slots              = env_int("MM_MAX_SLOTS", cfg.max_slots);
     cfg.vllm_update_check_interval_hours =
         env_int("MM_VLLM_UPDATE_CHECK_INTERVAL_HOURS", cfg.vllm_update_check_interval_hours);
+    cfg.model_cache_min_free_mb = static_cast<int64_t>(
+        env_int("MM_MODEL_CACHE_MIN_FREE_MB",
+                static_cast<int>(cfg.model_cache_min_free_mb)));
+    cfg.model_cache_clear_on_shutdown =
+        env_bool("MM_MODEL_CACHE_CLEAR_ON_SHUTDOWN", cfg.model_cache_clear_on_shutdown);
 
     auto env_double = [](const char* name, double cur) -> double {
         const char* v = std::getenv(name);
@@ -202,6 +214,7 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
     }
     if (cfg.vllm_update_check_interval_hours < 1) cfg.vllm_update_check_interval_hours = 24;
     if (cfg.models_dir.empty()) cfg.models_dir = "models";
+    if (cfg.model_cache_min_free_mb < 0) cfg.model_cache_min_free_mb = 0;
     if (cfg.data_dir.empty()) cfg.data_dir = "data";
     if (cfg.vllm_provision_dir.empty())
         cfg.vllm_provision_dir =
@@ -887,6 +900,16 @@ int main(int argc, char** argv) {
                              cfg.vllm_gpu_budget);
     slot_mgr.set_gpu_vram_total_mb(state.get_metrics().gpu_vram_total_mb);
 
+    // ── Local model cache ─────────────────────────────────────────────────────
+    // Control transfers models into models_dir; the store keeps an LRU
+    // use-queue, evicts unpinned models under disk pressure, and clears
+    // unpinned models on shutdown. Pinned models — those control marked this
+    // node preferred for — are retained.
+    mm::ModelStore model_store(cfg.models_dir, cfg.model_cache_min_free_mb);
+    MM_INFO("Model cache: root={} min_free={}MB clear_on_shutdown={}",
+            model_store.root(), cfg.model_cache_min_free_mb,
+            cfg.model_cache_clear_on_shutdown);
+
     // Advertise cluster capabilities (arch, GPUs, comm backends, vLLM build)
     // for multi-node engine-group planning on control.
     {
@@ -902,9 +925,16 @@ int main(int argc, char** argv) {
     // Periodically scrape running vLLM engines' /metrics so node status
     // reports per-engine load (running/waiting requests, KV cache usage).
     std::atomic<bool> stop_engine_metrics{false};
-    std::thread engine_metrics_thread([&slot_mgr, &stop_engine_metrics]() {
+    std::thread engine_metrics_thread([&slot_mgr, &model_store, &stop_engine_metrics]() {
         while (!stop_engine_metrics) {
             slot_mgr.refresh_vllm_metrics();
+            // Relieve disk pressure: evict LRU unpinned models that are not
+            // backing a live slot.
+            std::set<std::string> in_use;
+            for (const auto& s : slot_mgr.get_slot_info())
+                if (!s.model_path.empty()) in_use.insert(s.model_path);
+            for (const auto& id : model_store.enforce_min_free(in_use))
+                MM_INFO("Model cache: disk pressure evicted {}", id);
             for (int i = 0; i < 25 && !stop_engine_metrics; ++i)
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
@@ -1029,6 +1059,7 @@ int main(int argc, char** argv) {
     mm::NodeApiServer api_server(state, slot_mgr,
                                  cfg.control_url, cfg.pairing_key);
     api_server.set_ray_config(cfg.ray_path, cfg.ray_port);
+    api_server.set_model_store(&model_store);
     // Resolve the HF hub cache dir once (config override → HF_HUB_CACHE →
     // HF_HOME/hub → ~/.cache/huggingface/hub) and share it with the API server
     // (status scan + pre-fetch). When configured, also point the vLLM child at
@@ -1259,6 +1290,15 @@ int main(int argc, char** argv) {
 
     state.stop_metrics_poll();
     slot_mgr.unload_all();
+
+    // With all slots down nothing is in use; drop every unpinned model so the
+    // node keeps only the models control pinned to it.
+    if (cfg.model_cache_clear_on_shutdown) {
+        const auto cleared = model_store.clear_unpinned({});
+        if (!cleared.empty())
+            MM_INFO("Model cache: cleared {} unpinned model(s) on shutdown",
+                    cleared.size());
+    }
 
     MM_INFO("mantic-mind node stopped");
     return 0;

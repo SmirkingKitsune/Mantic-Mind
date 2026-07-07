@@ -6,6 +6,7 @@ add_executable(mantic-mind
     vllm_runtime.cpp
     ray_orchestration.cpp
     hf_cache.cpp
+    model_store.cpp
     node_api_server.cpp
     node_state.cpp
     node_ui.cpp
