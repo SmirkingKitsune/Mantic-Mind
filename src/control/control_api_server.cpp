@@ -438,7 +438,9 @@ std::string openai_agent_model_id(const AgentConfig& cfg) {
 
 std::string agent_backend(const AgentConfig& cfg) {
     std::string backend = util::to_lower(util::trim(cfg.inference_backend));
-    if (backend.empty() || backend == "llama.cpp") return "vllm";
+    if (backend.empty()) return "llama-cpp";  // unspecified => default runtime
+    if (backend == "llama.cpp" || backend == "llama" || backend == "llama-cpp")
+        return "llama-cpp";
     return backend;
 }
 

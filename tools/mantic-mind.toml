@@ -26,15 +26,18 @@ runtime_port_range_end   = 8090
 # Maximum number of concurrent model slots (vLLM engine processes).
 max_slots = 4
 
-# ── vLLM ───────────────────────────────────────────────────────────────────────
-# vLLM CLI executable or wrapper script (or just "vllm" if on PATH).
+# ── vLLM (opt-in peer backend) ─────────────────────────────────────────────────
+# llama.cpp is the default runtime on this branch; vLLM-as-default is preserved
+# on the vLLM-runtime branch. A vLLM already on PATH (or previously provisioned)
+# is used for agents with inference_backend = "vllm", but a missing vLLM is NOT
+# installed unless you enable auto-provisioning below.
 # vllm_server_path = "vllm"
 
 # If vllm_server_path cannot be resolved, the node can create a managed vLLM
 # runtime under vllm_provision_dir and use that executable for engine slots.
 # Windows uses SystemPanic/vllm-windows, Linux uses vllm-project/vllm, and
 # Apple Silicon macOS uses vllm-project/vllm-metal.
-# vllm_auto_provision = true
+# vllm_auto_provision = false
 # vllm_provision_dir = "data/runtimes/vllm"
 # vllm_install_method = "auto"  # auto | wheel | source
 # vllm_version = "latest"
@@ -55,6 +58,25 @@ max_slots = 4
 # vllm_update_policy = "prompt"
 # vllm_update_check = true                  # run the periodic online version check
 # vllm_update_check_interval_hours = 24
+
+# ── llama.cpp (default runtime) ────────────────────────────────────────────────
+# Agents default to inference_backend = "llama-cpp" and serve a local GGUF via
+# llama-server. vLLM runs alongside as an opt-in peer on the same node (its own
+# slots, its own runtime). llama.cpp is the reliable path for GGUF models,
+# Windows-native inference, and accelerators without a vLLM build (e.g. the
+# NVIDIA DGX Spark GB10).
+# llama_server_path = "llama-server"        # or MM_LLAMA_PATH; "" resolves from PATH
+# If llama_server_path cannot be resolved, the node builds a managed llama.cpp
+# under llama_provision_dir in the background (a source build can take minutes;
+# node startup and vLLM serving never block on it).
+# llama_auto_provision = true
+# llama_provision_dir = "data/runtimes/llama.cpp"
+# llama_install_method = "auto"   # auto | source | release  (auto builds from source)
+# llama_version = "latest"        # git ref / release tag, or "latest"
+# llama_accelerator = ""          # cuda | rocm | vulkan | metal | cpu; "" = auto-detect
+# For the DGX Spark GB10 (aarch64, sm_121) a source build with CUDA 13+ is
+# required; set the compute capability so CMake targets it:
+# llama_cuda_arch = "121"
 
 # Total fraction of GPU memory all vLLM slots on this node may claim together.
 # Each vLLM slot reserves an explicit --gpu-memory-utilization slice out of

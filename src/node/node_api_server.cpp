@@ -221,7 +221,10 @@ void NodeApiServer::register_routes() {
         j["slot_error"]    = error_slots;
         j["vllm_server_path"] = slot_mgr_.vllm_server_path();
         j["vllm_runtime"] = state_.get_vllm_runtime();
+        j["llama_server_path"] = slot_mgr_.llama_server_path();
+        j["llama_runtime"] = state_.get_llama_runtime();
         j["vllm_install_progress"] = state_.get_vllm_install_progress();
+        j["action_progress"] = state_.get_action_progress();
         j["vllm_gpu_budget"] = slot_mgr_.vllm_gpu_budget();
         j["vllm_gpu_fraction_used"] = slot_mgr_.vllm_gpu_fraction_used();
 
@@ -336,8 +339,15 @@ void NodeApiServer::register_routes() {
             // the node can refresh the LRU use-queue and pinned state on load.
             const std::string model_id = j.value("model_id", std::string{});
             const bool model_pin       = j.value("pin", false);
+            // llama.cpp is the default runtime: a payload without an explicit
+            // backend loads through llama-server. Control always sends the
+            // field, so this default only decides hand-written requests.
+            const std::string backend  = j.value("backend", std::string{"llama-cpp"});
+            const bool is_llama = (engine_backend_from_string(backend) == EngineBackend::LlamaCpp);
             VllmSettings vllm_settings;
             if (j.contains("vllm_settings")) vllm_settings = j["vllm_settings"].get<VllmSettings>();
+            RuntimeSettings runtime_settings;
+            if (j.contains("runtime_settings")) runtime_settings = j["runtime_settings"].get<RuntimeSettings>();
 
             if (model_ref.empty()) {
                 res.status = 400;
@@ -346,23 +356,28 @@ void NodeApiServer::register_routes() {
                 return;
             }
 
-            // vLLM resolves the model from an HF id / cache / local dir.
+            // vLLM resolves the model from an HF id / cache / local dir; llama.cpp
+            // always loads a local GGUF file.
             const std::string model_path = sanitize_path_for_runtime(model_ref);
 
             // Fail fast rather than spawn an engine we know will die: without a
             // usable runtime the launch reports a misleading "did not become
-            // healthy within 600s" instead of the real cause.
-            if (const auto rt = state_.get_vllm_runtime(); !node_vllm_runtime_ready(rt)) {
-                res.status = 503;
-                const std::string msg = rt.last_error.empty()
-                    ? "vLLM runtime is not ready on this node (status=" + rt.status + ")"
-                    : "vLLM runtime is not ready on this node: " + rt.last_error;
-                state_.set_last_error(msg);
-                res.set_content(nlohmann::json{{"error", "vllm runtime not ready"},
-                                               {"detail", msg},
-                                               {"vllm_runtime", rt}}.dump(),
-                                "application/json");
-                return;
+            // healthy within 600s" instead of the real cause. (vLLM only — the
+            // llama.cpp runtime gate is handled by the path-existence check and
+            // the load_model_llama failure path.)
+            if (!is_llama) {
+                if (const auto rt = state_.get_vllm_runtime(); !node_vllm_runtime_ready(rt)) {
+                    res.status = 503;
+                    const std::string msg = rt.last_error.empty()
+                        ? "vLLM runtime is not ready on this node (status=" + rt.status + ")"
+                        : "vLLM runtime is not ready on this node: " + rt.last_error;
+                    state_.set_last_error(msg);
+                    res.set_content(nlohmann::json{{"error", "vllm runtime not ready"},
+                                                   {"detail", msg},
+                                                   {"vllm_runtime", rt}}.dump(),
+                                    "application/json");
+                    return;
+                }
             }
 
             // A path-like ref that is not an HF repo id must exist on this node.
@@ -386,13 +401,20 @@ void NodeApiServer::register_routes() {
                 }
             }
 
-            auto slot_id = slot_mgr_.load_model(model_path, vllm_settings, agent_id);
+            auto slot_id = is_llama
+                ? slot_mgr_.load_model_llama(model_path, runtime_settings, agent_id)
+                : slot_mgr_.load_model(model_path, vllm_settings, agent_id);
             if (slot_id.empty()) {
                 res.status = 500;
                 nlohmann::json err = {{"error", "failed to load model"}};
                 auto detail = slot_mgr_.last_error();
-                err["vllm_server_path"] = slot_mgr_.vllm_server_path();
-                err["vllm_runtime"] = state_.get_vllm_runtime();
+                if (is_llama) {
+                    err["llama_server_path"] = slot_mgr_.llama_server_path();
+                    err["llama_runtime"] = state_.get_llama_runtime();
+                } else {
+                    err["vllm_server_path"] = slot_mgr_.vllm_server_path();
+                    err["vllm_runtime"] = state_.get_vllm_runtime();
+                }
                 err["model_path"] = model_path;
                 state_.set_last_error(detail.empty() ? "failed to load model" : detail);
                 if (!detail.empty()) err["detail"] = detail;
@@ -631,6 +653,29 @@ void NodeApiServer::register_routes() {
             return;
         }
 
+        const std::string operation_id =
+            "receive-" + id + "-" + mm::util::generate_uuid();
+        int64_t received = 0;
+        auto publish_receive_progress =
+            [&](const std::string& stage, const std::string& detail) {
+            NodeActionProgress progress;
+            progress.active = true;
+            progress.operation_id = operation_id;
+            progress.kind = "model_receive";
+            progress.action = "Downloading model";
+            progress.target = id;
+            progress.stage = stage;
+            progress.detail = detail;
+            progress.bytes_done = received;
+            progress.bytes_total = size;
+            progress.fraction = size > 0
+                ? std::min(1.0, static_cast<double>(received) / static_cast<double>(size))
+                : -1.0;
+            progress.cancelable = true;
+            state_.set_action_progress(progress);
+        };
+        publish_receive_progress("preparing cache", rel);
+
         // Reserve this model for the whole (possibly multi-file, multi-request)
         // transfer so neither make_room_for here nor the background disk-pressure
         // thread can evict files we have already received for it. The reservation
@@ -643,6 +688,7 @@ void NodeApiServer::register_routes() {
 
         auto slot = model_store_->begin_file(id, rel);
         if (!slot.ok) {
+            state_.clear_action_progress(operation_id);
             res.status = 400;
             res.set_content(nlohmann::json{{"error", slot.error}}.dump(), "application/json");
             return;
@@ -650,24 +696,49 @@ void NodeApiServer::register_routes() {
 
         std::ofstream out(slot.temp_path, std::ios::binary | std::ios::trunc);
         if (!out) {
+            state_.clear_action_progress(operation_id);
             res.status = 500;
             res.set_content(R"({"error":"cannot open destination file for writing"})",
                             "application/json");
             return;
         }
         bool write_ok = true;
+        bool canceled = false;
+        publish_receive_progress("receiving", rel);
         const bool pumped = pump([&](const char* data, size_t len) -> bool {
+            if (state_.action_cancel_requested(operation_id)) {
+                canceled = true;
+                return false;
+            }
             out.write(data, static_cast<std::streamsize>(len));
             if (!out) { write_ok = false; return false; }
+            received += static_cast<int64_t>(len);
+            publish_receive_progress("receiving", rel);
+            if (state_.action_cancel_requested(operation_id)) {
+                canceled = true;
+                return false;
+            }
             return true;
         });
         out.close();
         // close() flushes the final buffered block; a full-disk ENOSPC can
         // surface only here, so re-check the stream before declaring success.
         if (!out) write_ok = false;
+        if (canceled) {
+            std::error_code ec;
+            fs::remove(slot.temp_path, ec);
+            state_.set_last_error("model download canceled: " + id);
+            state_.clear_action_progress(operation_id);
+            res.status = 499;
+            res.set_content(nlohmann::json{{"error", "model receive canceled"},
+                                           {"model_id", id}}.dump(),
+                            "application/json");
+            return;
+        }
         if (!pumped || !write_ok) {
             std::error_code ec;
             fs::remove(slot.temp_path, ec);
+            state_.clear_action_progress(operation_id);
             res.status = 500;
             res.set_content(R"({"error":"upload interrupted or write failed"})",
                             "application/json");
@@ -676,6 +747,7 @@ void NodeApiServer::register_routes() {
 
         std::string commit_err;
         if (!model_store_->commit_file(slot, &commit_err)) {
+            state_.clear_action_progress(operation_id);
             res.status = 500;
             res.set_content(nlohmann::json{{"error", commit_err}}.dump(), "application/json");
             return;
@@ -683,6 +755,7 @@ void NodeApiServer::register_routes() {
         model_store_->register_model(id, pin);
         if (!evicted.empty())
             MM_INFO("ModelStore: evicted {} model(s) to receive {}", evicted.size(), id);
+        state_.clear_action_progress(operation_id);
 
         res.set_content(nlohmann::json{{"status", "stored"},
                                        {"model_id", id},
@@ -818,8 +891,13 @@ void NodeApiServer::register_routes() {
             std::string model_path = sanitize_path_for_runtime(
                 j.value("model_path", std::string{}));
             std::string agent_id   = j.value("agent_id", std::string{});
+            const std::string backend = j.value("backend", std::string{"llama-cpp"});
+            const bool is_llama = (engine_backend_from_string(backend) == EngineBackend::LlamaCpp);
+            const std::string kv_cache_path = j.value("kv_cache_path", std::string{});
             VllmSettings vllm_settings;
             if (j.contains("vllm_settings")) vllm_settings = j["vllm_settings"].get<VllmSettings>();
+            RuntimeSettings runtime_settings;
+            if (j.contains("runtime_settings")) runtime_settings = j["runtime_settings"].get<RuntimeSettings>();
 
             if (model_path.empty()) {
                 res.status = 400;
@@ -828,15 +906,22 @@ void NodeApiServer::register_routes() {
                 return;
             }
 
-            auto slot_id = slot_mgr_.restore_slot(model_path, vllm_settings, agent_id);
+            auto slot_id = is_llama
+                ? slot_mgr_.restore_slot_llama(model_path, runtime_settings, kv_cache_path, agent_id)
+                : slot_mgr_.restore_slot(model_path, vllm_settings, agent_id);
             state_.set_slots(slot_mgr_.get_slot_info());
 
             if (slot_id.empty()) {
                 res.status = 500;
                 nlohmann::json err = {{"error", "failed to restore slot"}};
                 auto detail = slot_mgr_.last_error();
-                err["vllm_server_path"] = slot_mgr_.vllm_server_path();
-                err["vllm_runtime"] = state_.get_vllm_runtime();
+                if (is_llama) {
+                    err["llama_server_path"] = slot_mgr_.llama_server_path();
+                    err["llama_runtime"] = state_.get_llama_runtime();
+                } else {
+                    err["vllm_server_path"] = slot_mgr_.vllm_server_path();
+                    err["vllm_runtime"] = state_.get_vllm_runtime();
+                }
                 state_.set_last_error(detail.empty() ? "failed to restore slot" : detail);
                 if (!detail.empty()) err["detail"] = detail;
                 res.set_content(err.dump(), "application/json");

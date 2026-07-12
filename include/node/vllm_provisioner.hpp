@@ -45,6 +45,7 @@ struct VllmCommandRunner {
     using RunFn = std::function<int(const std::vector<std::string>& argv,
                                     const std::filesystem::path& cwd,
                                     const StreamLineCallback& on_line,
+                                    const CancelCheckCallback& cancel_requested,
                                     std::string* error)>;
     using CaptureFn = std::function<std::string(const std::vector<std::string>&,
                                                 const std::filesystem::path&)>;
@@ -76,8 +77,10 @@ public:
     // progress. Both optional; set before ensure_runtime()/update_runtime().
     using LogSink = std::function<void(const std::string& line, bool is_stderr)>;
     using ProgressSink = std::function<void(const VllmInstallProgress&)>;
+    using CancelCheck = CancelCheckCallback;
     void set_log_sink(LogSink sink);
     void set_progress_sink(ProgressSink sink);
+    void set_cancel_check(CancelCheck check);
 
     VllmRuntimeStatus ensure_runtime();
     // Query upstream for the newest available build and update latest_version /
@@ -95,6 +98,7 @@ private:
     VllmCommandRunner runner_;
     LogSink log_sink_;
     ProgressSink progress_sink_;
+    CancelCheck cancel_check_;
     mutable std::mutex status_mutex_;
     VllmRuntimeStatus status_;
 

@@ -2,11 +2,14 @@
 
 Distributed LLM inference cluster — two executables that turn any collection of machines into a coordinated AI backend.
 
-- **mantic-mind** — cluster node; spawns and manages `vllm serve` engine subprocesses; FTXUI status TUI
+- **mantic-mind** — cluster node; spawns and manages inference engine subprocesses (`llama-server` by default, `vllm serve` as an opt-in peer); FTXUI status TUI
 - **mantic-mind-control** — cluster head; manages nodes, agents, conversations, memories; FTXUI management TUI
 
-> **Branch note:** this is the `vllm-runtime` line — vLLM is the inference backend.
-> The earlier llama.cpp-based runtime is preserved on the `llama-cpp-runtime` branch.
+> **Branch note:** llama.cpp is the default runtime on this line — agents default to
+> `inference_backend = "llama-cpp"` and serve local GGUF models via `llama-server`.
+> vLLM remains available as an opt-in peer backend per agent; the vLLM-as-default
+> line is preserved on the `vLLM-runtime` branch, and the original llama.cpp-only
+> line on the `llama-cpp-runtime` branch.
 
 ## Prerequisites
 
@@ -17,7 +20,8 @@ Distributed LLM inference cluster — two executables that turn any collection o
 | MSVC (Windows) | VS 2022 |
 | GCC / Clang (Linux) | GCC 12 / Clang 15 |
 | Apple Clang (macOS) | Xcode 15 command-line tools |
-| Python + vLLM | on each node — the node launches `vllm serve`; it can use an existing `vllm` executable or auto-provision a managed runtime |
+| llama.cpp (`llama-server`) | on each node — resolved from PATH or auto-built by the node (managed source build; DGX Spark needs CUDA 13+ for `sm_121`) |
+| Python + vLLM | optional, per node — only for agents with `inference_backend = "vllm"`; an existing `vllm` executable is used, and a managed install is created only when `vllm_auto_provision = true` |
 
 Runtime extras (node side, optional):
 
@@ -368,8 +372,15 @@ After file loading, matching environment variables override config values.
 | `listen_port` | `MM_LISTEN_PORT` | `7070` | Node API port |
 | `control_url` | `MM_CONTROL_URL` | *(empty)* | Control base URL (empty = standalone) |
 | `control_api_key` | `MM_CONTROL_API_KEY` | *(empty)* | Bearer token for control |
-| `vllm_server_path` | `MM_VLLM_PATH` | `vllm` | `vllm` CLI / wrapper used to launch engines |
-| `vllm_auto_provision` | `MM_VLLM_AUTO_PROVISION` | `true` | Auto-create a managed vLLM runtime when `vllm_server_path` is unresolved |
+| `llama_server_path` | `MM_LLAMA_PATH` | `llama-server` | `llama-server` executable used for llama.cpp engine slots (default runtime) |
+| `llama_auto_provision` | `MM_LLAMA_AUTO_PROVISION` | `true` | Build a managed llama.cpp when `llama_server_path` is unresolved |
+| `llama_provision_dir` | `MM_LLAMA_PROVISION_DIR` | `data/runtimes/llama.cpp` | Managed llama.cpp runtime root |
+| `llama_install_method` | `MM_LLAMA_INSTALL_METHOD` | `auto` | Provisioning method: `auto` (source), `source`, or `release` |
+| `llama_version` | `MM_LLAMA_VERSION` | `latest` | llama.cpp git ref / release tag used by provisioning |
+| `llama_accelerator` | `MM_LLAMA_ACCELERATOR` | *(auto)* | Build accelerator: `cuda`, `rocm`, `vulkan`, `metal`, `cpu` |
+| `llama_cuda_arch` | `MM_LLAMA_CUDA_ARCH` | *(default)* | CUDA compute capability for source builds (e.g. `121` for DGX Spark GB10) |
+| `vllm_server_path` | `MM_VLLM_PATH` | `vllm` | `vllm` CLI / wrapper used to launch engines (opt-in peer backend) |
+| `vllm_auto_provision` | `MM_VLLM_AUTO_PROVISION` | `false` | Auto-create a managed vLLM runtime when `vllm_server_path` is unresolved |
 | `vllm_provision_dir` | `MM_VLLM_PROVISION_DIR` | `data/runtimes/vllm` | Managed vLLM runtime root |
 | `vllm_install_method` | `MM_VLLM_INSTALL_METHOD` | `auto` | Provisioning method: `auto`, `wheel`, or `source` |
 | `vllm_version` | `MM_VLLM_VERSION` | `latest` | vLLM release tag/version/commit used by provisioning |

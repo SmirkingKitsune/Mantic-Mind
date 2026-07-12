@@ -91,6 +91,15 @@ public:
                       VllmSettings vllm_settings,
                       const AgentId& agent_id = {});
 
+    /// Load a GGUF model into a new llama.cpp engine slot. Mirrors load_model
+    /// for the llama-server backend: attaches to a compatible ready llama slot
+    /// when one exists, otherwise spawns a fresh llama-server. llama slots do
+    /// not draw on the vLLM GPU-fraction budget; their footprint is estimated
+    /// from the on-disk GGUF size for node VRAM accounting.
+    SlotId load_model_llama(const std::string& model_path,
+                            RuntimeSettings settings,
+                            const AgentId& agent_id = {});
+
     /// Unload a slot — stops its engine process, frees the port.
     SlotOperationResult unload_slot(const SlotId& slot_id);
 
@@ -109,6 +118,15 @@ public:
     SlotId restore_slot(const std::string& model_path,
                         const VllmSettings& vllm_settings,
                         const AgentId& agent_id = {});
+
+    /// Restore a suspended llama.cpp agent. Starts a fresh llama-server (with
+    /// the KV-cache slot endpoints enabled) and, when kv_cache_path names an
+    /// existing saved cache, replays it via /slots/0?action=restore so context
+    /// survives the suspend. A missing/failed cache degrades to a cold start.
+    SlotId restore_slot_llama(const std::string& model_path,
+                              const RuntimeSettings& settings,
+                              const std::string& kv_cache_path,
+                              const AgentId& agent_id = {});
 
     /// Gracefully stop all slots. force=true is intended for shutdown cleanup.
     SlotOperationResult unload_all(bool force = true);
@@ -162,18 +180,37 @@ public:
 
     /// Test-only: put a slot into the sleeping-suspended state.
     bool mark_test_slot_sleeping(const SlotId& slot_id);
+
+    /// Test-only: add a ready llama.cpp slot (backend=LlamaCpp) without spawning
+    /// llama-server, for exercising backend-tagged slot info and suspension.
+    SlotId add_ready_test_slot_llama(std::string model_path = "model.gguf",
+                                     AgentId agent_id = {},
+                                     RuntimeSettings settings = {});
 #endif
 
     void        set_vllm_server_path(const std::string& path);
     std::string vllm_server_path() const;
+
+    /// llama.cpp engine executable (llama-server) and where KV-cache slot saves
+    /// land. models_dir lets the VRAM estimate resolve a transferred GGUF by
+    /// basename when the model_path is not directly present. Set once at startup.
+    void        set_llama_server_path(const std::string& path);
+    std::string llama_server_path() const;
+    void        set_kv_cache_dir(const std::string& dir);
+    void        set_models_dir(const std::string& dir);
 
 private:
     struct Slot {
         SlotId                              id;
         uint16_t                            port       = 0;
         std::string                         model_path;
+        // Every creation path stamps this explicitly; the default matches the
+        // branch default runtime.
+        EngineBackend                       backend    = EngineBackend::LlamaCpp;
         std::vector<AgentId>                agents;          // attached agents
-        VllmSettings                        launch_settings; // engine identity for sharing
+        VllmSettings                        launch_settings; // vLLM engine identity for sharing
+        RuntimeSettings                     llama_launch_settings; // llama.cpp engine identity
+        std::string                         kv_cache_path;   // llama.cpp: saved KV on suspend
         std::unique_ptr<RuntimeProcess> process;
         std::unique_ptr<RuntimeClient>     client;
         int                                 active_requests = 0;
@@ -191,6 +228,9 @@ private:
     };
 
     std::string        vllm_server_path_;
+    std::string        llama_server_path_ = "llama-server";
+    std::string        kv_cache_dir_      = "data/kv_cache";
+    std::string        models_dir_;
     uint16_t           port_range_start_;
     uint16_t           port_range_end_;
     int                max_slots_;
@@ -224,6 +264,17 @@ private:
     /// settings, or nullptr. Caller must hold mutex_.
     Slot* find_compatible_vllm_slot_locked(const std::string& model_path,
                                            const VllmSettings& settings);
+
+    /// Attach an agent to a ready compatible llama.cpp slot if one exists.
+    /// Returns the slot ID on success, nullopt to spawn a fresh engine. Unlike
+    /// vLLM there is no sleeping llama process to wake — suspend stops it — so
+    /// this only shares live engines. Takes mutex_ internally.
+    std::optional<SlotId> try_attach_llama(const std::string& model_path,
+                                           const RuntimeSettings& settings,
+                                           const AgentId& agent_id);
+
+    /// Delete a slot's saved KV-cache file, if any. Caller must hold mutex_.
+    void remove_kv_cache_file_locked(const Slot& slot) const;
 
     /// Attach to a ready compatible engine, or wake a sleeping one and attach.
     /// Returns the slot ID on success; nullopt means the caller should proceed

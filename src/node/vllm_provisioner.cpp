@@ -549,8 +549,9 @@ VllmProvisioner::VllmProvisioner(VllmProvisionConfig cfg,
         runner_.run = [](const std::vector<std::string>& argv,
                          const fs::path& cwd,
                          const StreamLineCallback& on_line,
+                         const CancelCheckCallback& cancel_requested,
                          std::string* error) {
-            return run_streamed_command(argv, cwd, on_line, error);
+            return run_streamed_command(argv, cwd, on_line, cancel_requested, error);
         };
     }
     if (!runner_.capture_first_line) runner_.capture_first_line = default_capture_first_line;
@@ -569,6 +570,10 @@ void VllmProvisioner::set_log_sink(LogSink sink) {
 
 void VllmProvisioner::set_progress_sink(ProgressSink sink) {
     progress_sink_ = std::move(sink);
+}
+
+void VllmProvisioner::set_cancel_check(CancelCheck check) {
+    cancel_check_ = std::move(check);
 }
 
 void VllmProvisioner::emit_progress(const VllmInstallProgress& p) {
@@ -695,6 +700,16 @@ VllmRuntimeStatus VllmProvisioner::run_managed_install(bool upgrade) {
         VllmInstallProgress done;   // active=false
         emit_progress(done);
     };
+    auto canceled_status = [&]() {
+        status.status = "failed";
+        status.managed = true;
+        status.last_error = std::string("vLLM ")
+                          + (upgrade ? "update" : "install")
+                          + " canceled";
+        set_status(status);
+        finish_progress();
+        return status;
+    };
 
     const std::vector<VllmInstallStep> plan = build_vllm_install_plan(cfg_, upgrade);
     const int total = static_cast<int>(plan.size());
@@ -702,6 +717,9 @@ VllmRuntimeStatus VllmProvisioner::run_managed_install(bool upgrade) {
 
     for (int i = 0; i < total; ++i) {
         const VllmInstallStep& step = plan[static_cast<size_t>(i)];
+        if (cancel_check_ && cancel_check_()) {
+            return canceled_status();
+        }
 
         VllmInstallProgress prog;
         prog.active = true;
@@ -724,7 +742,10 @@ VllmRuntimeStatus VllmProvisioner::run_managed_install(bool upgrade) {
 
         std::string step_err;
         const fs::path cwd = step.cwd.empty() ? root : step.cwd;
-        const int rc = runner_.run(step.argv, cwd, on_line, &step_err);
+        const int rc = runner_.run(step.argv, cwd, on_line, cancel_check_, &step_err);
+        if (cancel_check_ && cancel_check_()) {
+            return canceled_status();
+        }
         if (rc != 0 && !step.allow_failure) {
             status.status = "failed";
             status.last_error = "vLLM install step '" + step.label + "' failed"

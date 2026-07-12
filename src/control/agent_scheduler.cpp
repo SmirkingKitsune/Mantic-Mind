@@ -213,10 +213,21 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         store_placement(p);
         return ScheduleResult{node_id, slot_id};
     };
+    std::unordered_set<NodeId> attempted_nodes;
+    auto try_load_on_node = [&](const NodeId& node_id) -> std::optional<SlotId> {
+        if (node_id.empty()) return std::nullopt;
+        if (!attempted_nodes.insert(node_id).second) return std::nullopt;
+        auto slot_id = load_agent_on_node(cfg, node_id);
+        if (!slot_id) {
+            MM_WARN("AgentScheduler: node {} could not run agent {}; trying another candidate if available",
+                    node_id, cfg.id);
+        }
+        return slot_id;
+    };
 
     // 3a. Preferred node has model stored + VRAM?
     if (!cfg.preferred_node_id.empty()) {
-        auto slot_id = load_agent_on_node(cfg, cfg.preferred_node_id);
+        auto slot_id = try_load_on_node(cfg.preferred_node_id);
         if (slot_id) {
             return place(cfg.preferred_node_id, *slot_id);
         }
@@ -254,7 +265,7 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         }
         std::sort(engine_nodes.begin(), engine_nodes.end());
         for (const auto& cand : engine_nodes) {
-            auto slot_id = load_agent_on_node(cfg, cand.node_id);
+            auto slot_id = try_load_on_node(cand.node_id);
             if (slot_id) {
                 MM_INFO("AgentScheduler: agent {} joining existing vLLM engine "
                         "for {} on node {} (waiting={}, running={})",
@@ -270,8 +281,7 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     // are assumed present wherever they resolve.
     if (util::is_hf_repo_id(cfg.model_path)) {
         for (const auto& node : registry_.nodes_with_model_cached(cfg.model_path)) {
-            if (node.id == cfg.preferred_node_id) continue; // already tried
-            auto slot_id = load_agent_on_node(cfg, node.id);
+            auto slot_id = try_load_on_node(node.id);
             if (slot_id) {
                 MM_INFO("AgentScheduler: placed agent {} on node {} which already "
                         "caches {}", cfg.id, node.id, cfg.model_path);
@@ -283,7 +293,7 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     // 3c. Any node has VRAM -> try load (the node makes the final budget call).
     auto vram_nodes = registry_.nodes_with_available_vram(vram_needed);
     for (const auto& node : vram_nodes) {
-        auto slot_id = load_agent_on_node(cfg, node.id);
+        auto slot_id = try_load_on_node(node.id);
         if (slot_id) {
             return place(node.id, *slot_id);
         }
@@ -793,12 +803,18 @@ std::optional<SlotId> AgentScheduler::restore_agent_on_node(
         HttpClient cli(node.url);
         cli.set_bearer_token(node.api_key);
         for (int attempt = 0; attempt < 3; ++attempt) {
+            const EngineBackend backend =
+                engine_backend_from_string(cfg.inference_backend);
             nlohmann::json body = {
                 {"model_path",    cfg.model_path},
                 {"vllm_settings", cfg.vllm_settings},
                 {"kv_cache_path", placement.kv_cache_node_path},
+                {"backend",       to_string(backend)},
                 {"agent_id",      cfg.id}
             };
+            if (backend == EngineBackend::LlamaCpp) {
+                body["runtime_settings"] = cfg.runtime_settings;
+            }
 
             auto resp = cli.post("/api/node/restore-slot", body);
             if (resp.ok()) {
@@ -878,12 +894,22 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
 
         bool retried_transfer = false;
         for (int attempt = 0; attempt < 3; ++attempt) {
+            const EngineBackend backend =
+                engine_backend_from_string(cfg.inference_backend);
             nlohmann::json body = {
                 {"model_path", effective_model_path},
                 {"vllm_settings", vllm_override ? *vllm_override
                                                 : cfg.vllm_settings},
+                // Always explicit so a node never has to guess the engine from
+                // its own default.
+                {"backend",    to_string(backend)},
                 {"agent_id",   cfg.id}
             };
+            // llama.cpp agents also carry the generation/runtime settings the
+            // node launches llama-server with.
+            if (backend == EngineBackend::LlamaCpp) {
+                body["runtime_settings"] = cfg.runtime_settings;
+            }
             if (!transferred_model_id.empty()) {
                 body["model_id"] = transferred_model_id;
                 body["pin"]      = pin_on_node;

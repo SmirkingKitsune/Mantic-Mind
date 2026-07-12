@@ -67,10 +67,17 @@ public:
     void             set_capabilities(const NodeCapabilities& caps);
     VllmRuntimeStatus get_vllm_runtime() const;
     void              set_vllm_runtime(const VllmRuntimeStatus& runtime);
+    LlamaRuntimeStatus get_llama_runtime() const;
+    void               set_llama_runtime(const LlamaRuntimeStatus& runtime);
 
     // Live install/upgrade progress for the node TUI loading bar.
     VllmInstallProgress get_vllm_install_progress() const;
     void                set_vllm_install_progress(const VllmInstallProgress& p);
+    NodeActionProgress  get_action_progress() const;
+    void                set_action_progress(const NodeActionProgress& p);
+    void                clear_action_progress(const std::string& operation_id = {});
+    bool                request_action_cancel();
+    bool                action_cancel_requested(const std::string& operation_id = {}) const;
 
     // ── Diagnostics ───────────────────────────────────────────────────────────
     std::string get_last_error() const;
@@ -115,7 +122,9 @@ private:
     NodeHealthMetrics            metrics_;
     NodeCapabilities             capabilities_;
     VllmRuntimeStatus            vllm_runtime_;
+    LlamaRuntimeStatus           llama_runtime_;
     VllmInstallProgress          vllm_install_progress_;
+    NodeActionProgress           action_progress_;
     std::string                  last_error_;
     std::unordered_set<std::string> api_keys_;
 

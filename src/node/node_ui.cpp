@@ -16,6 +16,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdint>
 #include <ctime>
 #include <deque>
 #include <filesystem>
@@ -101,6 +102,20 @@ std::string clock_hms() {
     return buf;
 }
 
+std::string bytes_label(int64_t bytes) {
+    const double value = static_cast<double>(std::max<int64_t>(0, bytes));
+    char buf[48];
+    if (value >= 1024.0 * 1024.0 * 1024.0)
+        std::snprintf(buf, sizeof(buf), "%.2f GB", value / (1024.0 * 1024.0 * 1024.0));
+    else if (value >= 1024.0 * 1024.0)
+        std::snprintf(buf, sizeof(buf), "%.1f MB", value / (1024.0 * 1024.0));
+    else if (value >= 1024.0)
+        std::snprintf(buf, sizeof(buf), "%.1f KB", value / 1024.0);
+    else
+        std::snprintf(buf, sizeof(buf), "%.0f B", value);
+    return buf;
+}
+
 } // namespace
 
 NodeUI::NodeUI(NodeState& state, uint16_t listen_port,
@@ -153,6 +168,7 @@ void NodeUI::run() {
     using mm::tui::braille_graph;
     using mm::tui::slot_table;
     using mm::tui::mb_str;
+    using mm::tui::spinner_frame;
 
     auto screen = ScreenInteractive::Fullscreen();
 
@@ -186,6 +202,7 @@ void NodeUI::run() {
     // them by reference.
     bool        show_update_modal  = false;
     bool        show_update_button = false;
+    bool        show_action_modal  = false;
     std::string cur_latest;          // latest_version this frame (for button lambdas)
     std::string modal_ack_version;   // latest_version the user has acted on/dismissed
 
@@ -209,6 +226,11 @@ void NodeUI::run() {
     }, ButtonOption::Simple());
     auto modal_btns = Container::Horizontal({modal_update_now, modal_later});
 
+    auto action_cancel = Button("  Cancel  ", [&] {
+        state_.request_action_cancel();
+    }, ButtonOption::Simple());
+    auto action_btns = Container::Horizontal({action_cancel});
+
     auto main_container = Container::Horizontal({btn_forget_pairing, btn_update_maybe});
 
     // ── Renderer ──────────────────────────────────────────────────────────────
@@ -224,15 +246,19 @@ void NodeUI::run() {
         auto last_error   = state_.get_last_error();
         auto vllm_rt      = state_.get_vllm_runtime();
         auto vllm_prog    = state_.get_vllm_install_progress();
+        auto action_prog  = state_.get_action_progress();
         auto api_keys     = state_.get_api_keys();
         auto streaming    = state_.get_streaming_text();
+
+        show_action_modal = action_prog.active;
 
         // Drive the update button/modal from current runtime state.
         cur_latest = vllm_rt.latest_version;
         const bool can_update = vllm_rt.update_available && vllm_rt.managed &&
                                 static_cast<bool>(request_vllm_update_cb_) && !vllm_prog.active;
         show_update_button = can_update;
-        show_update_modal  = can_update && (modal_ack_version != vllm_rt.latest_version);
+        show_update_modal  = !show_action_modal && can_update &&
+                             (modal_ack_version != vllm_rt.latest_version);
 
         int log_scroll_from_bottom = 0;
         std::string log_file_path;
@@ -580,9 +606,64 @@ void NodeUI::run() {
             modal_btns->Render() | hcenter,
         }) | border | size(WIDTH, EQUAL, 46);
     });
-    auto with_modal = Modal(render, update_modal_renderer, &show_update_modal);
+    auto action_modal_renderer = Renderer(action_btns, [&]() -> Element {
+        auto p = state_.get_action_progress();
+        const double derived_fraction =
+            p.bytes_total > 0
+                ? static_cast<double>(p.bytes_done) / static_cast<double>(p.bytes_total)
+                : p.fraction;
+        const bool determinate = derived_fraction >= 0.0;
+        const double clamped_fraction = std::clamp(derived_fraction, 0.0, 1.0);
+        const int pct = static_cast<int>(clamped_fraction * 100.0 + 0.5);
+
+        Elements rows;
+        rows.push_back(text(" " + (p.action.empty() ? std::string{"Working"} : p.action) + " ") |
+                       bold | hcenter);
+        rows.push_back(separator());
+        if (!p.target.empty())
+            rows.push_back(hbox({text(" target : ") | dim, text(shorten_middle(p.target, 42)) | bold}));
+        if (!p.stage.empty())
+            rows.push_back(hbox({text(" stage  : ") | dim, text(shorten_middle(p.stage, 42))}));
+        if (p.total_steps > 0)
+            rows.push_back(hbox({text(" step   : ") | dim,
+                                 text(std::to_string(p.step) + "/" +
+                                      std::to_string(p.total_steps))}));
+        if (determinate) {
+            rows.push_back(hbox({gauge(static_cast<float>(clamped_fraction)) | flex,
+                                 text(" " + std::to_string(pct) + "%")}));
+        } else {
+            rows.push_back(text(std::string(" ") + spinner_frame() + " working") |
+                           color(Color::Yellow));
+        }
+        if (p.bytes_total > 0) {
+            rows.push_back(hbox({text(" data   : ") | dim,
+                                 text(bytes_label(p.bytes_done) + " / " +
+                                      bytes_label(p.bytes_total))}));
+        }
+        if (!p.detail.empty())
+            rows.push_back(paragraph(" " + shorten_middle(p.detail, 80)) | dim);
+        if (!p.last_error.empty())
+            rows.push_back(paragraph(" " + p.last_error) | color(Color::Red));
+        if (p.cancel_requested) {
+            rows.push_back(text(" cancel requested...") | color(Color::Yellow) | hcenter);
+        } else if (p.cancelable) {
+            rows.push_back(separator());
+            rows.push_back(action_btns->Render() | hcenter);
+        }
+
+        return vbox(std::move(rows)) | border | size(WIDTH, EQUAL, 56);
+    });
+    auto with_update = Modal(render, update_modal_renderer, &show_update_modal);
+    auto with_modal = Modal(with_update, action_modal_renderer, &show_action_modal);
 
     auto component = CatchEvent(with_modal, [&](Event ev) {
+        if (show_action_modal) {
+            if (ev == Event::Escape) {
+                state_.request_action_cancel();
+                return true;
+            }
+            return false;
+        }
         if (show_update_modal) {
             // While the prompt is up, its buttons handle input; Esc dismisses it.
             if (ev == Event::Escape) {

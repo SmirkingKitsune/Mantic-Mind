@@ -27,6 +27,27 @@ enum class NodeHealthStatus { Unknown, Healthy, Degraded, Unhealthy };
 
 enum class SlotState { Empty, Loading, Ready, Suspending, Suspended, Error };
 
+// Inference engine family backing an agent or a running slot. llama.cpp is the
+// default runtime on this branch (GGUF models, Windows-native inference, and
+// accelerators without a vLLM build such as the DGX Spark); vLLM remains a
+// peer backend, and runs as the default on the vLLM-runtime branch.
+enum class EngineBackend { Vllm, LlamaCpp };
+
+inline std::string to_string(EngineBackend b) {
+    return b == EngineBackend::Vllm ? "vllm" : "llama-cpp";
+}
+
+// Accepts the canonical "llama-cpp" plus the legacy "llama.cpp"/"llama"
+// spellings so older persisted configs and hand-written payloads keep
+// resolving; an empty string means "unspecified" and resolves to the default
+// runtime (llama.cpp). Only an explicit "vllm" selects the vLLM engine —
+// callers that care about the api backend check the string form before
+// constructing an EngineBackend.
+inline EngineBackend engine_backend_from_string(const std::string& s) {
+    if (s == "vllm") return EngineBackend::Vllm;
+    return EngineBackend::LlamaCpp;
+}
+
 // ── ToolCall ──────────────────────────────────────────────────────────────────
 struct ToolCall {
     std::string id;
@@ -131,13 +152,29 @@ inline bool vllm_launch_compatible(const VllmSettings& a, const VllmSettings& b)
         && a.extra_args             == b.extra_args;
 }
 
+/// True when two llama.cpp configurations describe the same engine launch, i.e.
+/// agents using either can share one llama-server process. Only the launch-time
+/// (engine identity) fields gate sharing; per-request generation parameters
+/// (temperature, top_p, max_tokens) ride each request and are excluded.
+inline bool llama_launch_compatible(const RuntimeSettings& a, const RuntimeSettings& b) {
+    return a.ctx_size        == b.ctx_size
+        && a.n_gpu_layers    == b.n_gpu_layers
+        && a.n_threads       == b.n_threads
+        && a.n_threads_http  == b.n_threads_http
+        && a.parallel        == b.parallel
+        && a.batch_size      == b.batch_size
+        && a.ubatch_size     == b.ubatch_size
+        && a.flash_attn      == b.flash_attn
+        && a.extra_args      == b.extra_args;
+}
+
 // ── AgentConfig ───────────────────────────────────────────────────────────────
 struct AgentConfig {
     AgentId       id;
     std::string   name;
     std::string   model_path;
     std::string   system_prompt;
-    std::string   inference_backend = "vllm"; // vllm | api
+    std::string   inference_backend = "llama-cpp"; // llama-cpp (default) | vllm | api
     RuntimeSettings runtime_settings;
     VllmSettings  vllm_settings;
     ApiSettings   api_settings;
@@ -306,6 +343,7 @@ struct SlotInfo {
     SlotId      id;
     uint16_t    port            = 0;
     std::string model_path;
+    std::string backend         = "llama-cpp"; // "llama-cpp" | "vllm"; slots always report it
     AgentId     assigned_agent;          // first attached agent (legacy display)
     std::vector<AgentId> agent_ids;      // all agents attached to this slot
     SlotState   state           = SlotState::Empty;
@@ -347,6 +385,11 @@ struct NodeCapabilities {
     bool                     supports_ray = false;
     int                      gpu_count = 0;    // GPUs visible to this node
     double                   interconnect_gbps = 0.0; // node-to-node link hint, 0 = unknown
+    // llama.cpp multi-node grouping is orthogonal to vLLM's Ray path: it uses
+    // ggml's own TCP RPC backend (no NCCL/Gloo), so RPC members must share a
+    // compatible llama.cpp build fingerprint rather than a comm backend.
+    std::string              llama_cpp_version; // llama.cpp build fingerprint, "" = unknown
+    bool                     supports_llama_rpc = false; // can host/join a ggml RPC group
 
     bool has_comm_backend(const std::string& b) const {
         return std::find(comm_backends.begin(), comm_backends.end(), b)
@@ -379,6 +422,28 @@ struct VllmRuntimeStatus {
     bool        update_available = false;
 };
 
+// Managed llama.cpp runtime status, the llama-server analog of
+// VllmRuntimeStatus. Kept as a separate struct (not renamed/shared) so a node
+// can advertise both runtimes independently and older clients keep parsing
+// vllm_runtime unchanged.
+struct LlamaRuntimeStatus {
+    std::string status = "disabled"; // resolved|provisioning|ready|failed|disabled
+    std::string platform;
+    std::string method;              // release|source|path
+    std::string source_repo;
+    std::string version;             // llama-server build number / commit
+    bool        managed = false;
+    std::string executable_path;
+    std::string last_error;
+    // Accelerator-correct build this node targets: cuda|rocm|vulkan|metal|cpu.
+    std::string accelerator;
+    // Newest build available upstream; "" when unknown (offline / not checked).
+    std::string latest_version;
+    // True when the installed runtime is older than latest_version. Orthogonal
+    // to `status`: a runtime stays "ready" while advertising an update.
+    bool        update_available = false;
+};
+
 // Live progress of an in-program vLLM runtime install/upgrade, surfaced so the
 // node TUI can render a loading bar instead of running a script blind.
 struct VllmInstallProgress {
@@ -388,6 +453,27 @@ struct VllmInstallProgress {
     double      fraction = -1.0;  // 0..1 within the current step; <0 = indeterminate
     std::string stage;            // human label of the current step
     std::string last_line;        // most recent streamed output line
+};
+
+// Generic long-running node-side action shown by the node TUI modal. This is
+// intentionally transport-neutral: runtime provisioning and model receives both
+// update the same shape, while older clients can keep reading vllm_install_progress.
+struct NodeActionProgress {
+    bool        active = false;
+    std::string operation_id;
+    std::string kind;             // runtime | model_receive | ...
+    std::string action;           // human title, e.g. "Downloading runtime"
+    std::string target;           // model id, runtime name, etc.
+    std::string stage;
+    std::string detail;
+    int         step = 0;
+    int         total_steps = 0;
+    int64_t     bytes_done = 0;
+    int64_t     bytes_total = 0;
+    double      fraction = -1.0;  // 0..1; <0 = indeterminate
+    bool        cancelable = true;
+    bool        cancel_requested = false;
+    std::string last_error;
 };
 
 struct NodeInfo {
@@ -416,6 +502,10 @@ struct NodeInfo {
     int                      slot_error = 0;
     std::string              vllm_server_path;
     VllmRuntimeStatus        vllm_runtime;
+    std::string              llama_server_path;
+    LlamaRuntimeStatus       llama_runtime;
+    VllmInstallProgress      vllm_install_progress;
+    NodeActionProgress       action_progress;
     double                   vllm_gpu_budget = 0.0;         // total GPU fraction vLLM slots may claim
     double                   vllm_gpu_fraction_used = 0.0;  // fraction currently claimed (incl. loads in flight)
 };
@@ -954,6 +1044,7 @@ inline void to_json(nlohmann::json& j, const SlotInfo& s) {
     j = { {"id",              s.id},
           {"port",            s.port},
           {"model_path",      s.model_path},
+          {"backend",         s.backend},
           {"assigned_agent",  s.assigned_agent},
           {"agent_ids",       s.agent_ids},
           {"state",           to_string(s.state)},
@@ -972,6 +1063,7 @@ inline void from_json(const nlohmann::json& j, SlotInfo& s) {
     j.at("id").get_to(s.id);
     if (j.contains("port"))           j.at("port").get_to(s.port);
     if (j.contains("model_path"))     j.at("model_path").get_to(s.model_path);
+    if (j.contains("backend"))        j.at("backend").get_to(s.backend);
     if (j.contains("assigned_agent")) j.at("assigned_agent").get_to(s.assigned_agent);
     if (j.contains("agent_ids"))      j.at("agent_ids").get_to(s.agent_ids);
     // Older nodes only report assigned_agent.
@@ -1019,7 +1111,9 @@ inline void to_json(nlohmann::json& j, const NodeCapabilities& c) {
           {"vllm_version",  c.vllm_version},
           {"supports_ray",  c.supports_ray},
           {"gpu_count",     c.gpu_count},
-          {"interconnect_gbps", c.interconnect_gbps} };
+          {"interconnect_gbps", c.interconnect_gbps},
+          {"llama_cpp_version",  c.llama_cpp_version},
+          {"supports_llama_rpc", c.supports_llama_rpc} };
 }
 inline void from_json(const nlohmann::json& j, NodeCapabilities& c) {
     if (j.contains("arch"))          j.at("arch").get_to(c.arch);
@@ -1028,6 +1122,8 @@ inline void from_json(const nlohmann::json& j, NodeCapabilities& c) {
     if (j.contains("supports_ray"))  j.at("supports_ray").get_to(c.supports_ray);
     if (j.contains("gpu_count"))     j.at("gpu_count").get_to(c.gpu_count);
     if (j.contains("interconnect_gbps")) j.at("interconnect_gbps").get_to(c.interconnect_gbps);
+    if (j.contains("llama_cpp_version"))  j.at("llama_cpp_version").get_to(c.llama_cpp_version);
+    if (j.contains("supports_llama_rpc")) j.at("supports_llama_rpc").get_to(c.supports_llama_rpc);
 }
 
 // ─── NodeInfo ─────────────────────────────────────────────────────────────────
@@ -1062,6 +1158,33 @@ inline void from_json(const nlohmann::json& j, VllmRuntimeStatus& r) {
     if (j.contains("update_available")) j.at("update_available").get_to(r.update_available);
 }
 
+inline void to_json(nlohmann::json& j, const LlamaRuntimeStatus& r) {
+    j = { {"status",           r.status},
+          {"platform",         r.platform},
+          {"method",           r.method},
+          {"source_repo",      r.source_repo},
+          {"version",          r.version},
+          {"managed",          r.managed},
+          {"executable_path",  r.executable_path},
+          {"last_error",       r.last_error},
+          {"accelerator",      r.accelerator},
+          {"latest_version",   r.latest_version},
+          {"update_available", r.update_available} };
+}
+inline void from_json(const nlohmann::json& j, LlamaRuntimeStatus& r) {
+    if (j.contains("status"))           j.at("status").get_to(r.status);
+    if (j.contains("platform"))         j.at("platform").get_to(r.platform);
+    if (j.contains("method"))           j.at("method").get_to(r.method);
+    if (j.contains("source_repo"))      j.at("source_repo").get_to(r.source_repo);
+    if (j.contains("version"))          j.at("version").get_to(r.version);
+    if (j.contains("managed"))          j.at("managed").get_to(r.managed);
+    if (j.contains("executable_path"))  j.at("executable_path").get_to(r.executable_path);
+    if (j.contains("last_error"))       j.at("last_error").get_to(r.last_error);
+    if (j.contains("accelerator"))      j.at("accelerator").get_to(r.accelerator);
+    if (j.contains("latest_version"))   j.at("latest_version").get_to(r.latest_version);
+    if (j.contains("update_available")) j.at("update_available").get_to(r.update_available);
+}
+
 inline void to_json(nlohmann::json& j, const VllmInstallProgress& p) {
     j = { {"active",      p.active},
           {"step",        p.step},
@@ -1077,6 +1200,41 @@ inline void from_json(const nlohmann::json& j, VllmInstallProgress& p) {
     if (j.contains("fraction"))    j.at("fraction").get_to(p.fraction);
     if (j.contains("stage"))       j.at("stage").get_to(p.stage);
     if (j.contains("last_line"))   j.at("last_line").get_to(p.last_line);
+}
+
+inline void to_json(nlohmann::json& j, const NodeActionProgress& p) {
+    j = { {"active",           p.active},
+          {"operation_id",     p.operation_id},
+          {"kind",             p.kind},
+          {"action",           p.action},
+          {"target",           p.target},
+          {"stage",            p.stage},
+          {"detail",           p.detail},
+          {"step",             p.step},
+          {"total_steps",      p.total_steps},
+          {"bytes_done",       p.bytes_done},
+          {"bytes_total",      p.bytes_total},
+          {"fraction",         p.fraction},
+          {"cancelable",       p.cancelable},
+          {"cancel_requested", p.cancel_requested},
+          {"last_error",       p.last_error} };
+}
+inline void from_json(const nlohmann::json& j, NodeActionProgress& p) {
+    if (j.contains("active"))           j.at("active").get_to(p.active);
+    if (j.contains("operation_id"))     j.at("operation_id").get_to(p.operation_id);
+    if (j.contains("kind"))             j.at("kind").get_to(p.kind);
+    if (j.contains("action"))           j.at("action").get_to(p.action);
+    if (j.contains("target"))           j.at("target").get_to(p.target);
+    if (j.contains("stage"))            j.at("stage").get_to(p.stage);
+    if (j.contains("detail"))           j.at("detail").get_to(p.detail);
+    if (j.contains("step"))             j.at("step").get_to(p.step);
+    if (j.contains("total_steps"))      j.at("total_steps").get_to(p.total_steps);
+    if (j.contains("bytes_done"))       j.at("bytes_done").get_to(p.bytes_done);
+    if (j.contains("bytes_total"))      j.at("bytes_total").get_to(p.bytes_total);
+    if (j.contains("fraction"))         j.at("fraction").get_to(p.fraction);
+    if (j.contains("cancelable"))       j.at("cancelable").get_to(p.cancelable);
+    if (j.contains("cancel_requested")) j.at("cancel_requested").get_to(p.cancel_requested);
+    if (j.contains("last_error"))       j.at("last_error").get_to(p.last_error);
 }
 
 inline void to_json(nlohmann::json& j, const NodeInfo& n) {
@@ -1102,6 +1260,10 @@ inline void to_json(nlohmann::json& j, const NodeInfo& n) {
           {"slot_error",    n.slot_error},
           {"vllm_server_path",         n.vllm_server_path},
           {"vllm_runtime",             n.vllm_runtime},
+          {"llama_server_path",        n.llama_server_path},
+          {"llama_runtime",            n.llama_runtime},
+          {"vllm_install_progress",    n.vllm_install_progress},
+          {"action_progress",          n.action_progress},
           {"vllm_gpu_budget",          n.vllm_gpu_budget},
           {"vllm_gpu_fraction_used",   n.vllm_gpu_fraction_used} };
 }
@@ -1129,6 +1291,10 @@ inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     if (j.contains("slot_error"))    j.at("slot_error").get_to(n.slot_error);
     if (j.contains("vllm_server_path")) j.at("vllm_server_path").get_to(n.vllm_server_path);
     if (j.contains("vllm_runtime")) j.at("vllm_runtime").get_to(n.vllm_runtime);
+    if (j.contains("llama_server_path")) j.at("llama_server_path").get_to(n.llama_server_path);
+    if (j.contains("llama_runtime")) j.at("llama_runtime").get_to(n.llama_runtime);
+    if (j.contains("vllm_install_progress")) j.at("vllm_install_progress").get_to(n.vllm_install_progress);
+    if (j.contains("action_progress")) j.at("action_progress").get_to(n.action_progress);
     if (j.contains("vllm_gpu_budget")) j.at("vllm_gpu_budget").get_to(n.vllm_gpu_budget);
     if (j.contains("vllm_gpu_fraction_used")) j.at("vllm_gpu_fraction_used").get_to(n.vllm_gpu_fraction_used);
 }

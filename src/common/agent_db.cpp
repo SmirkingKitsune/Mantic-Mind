@@ -60,7 +60,12 @@ ApiSettings deserialize_api_settings(const std::string& s) {
 
 std::string normalize_inference_backend(std::string backend) {
     backend = util::to_lower(util::trim(backend));
-    if (backend.empty() || backend == "llama.cpp") return "vllm";
+    // llama.cpp is the default runtime on this branch: unspecified resolves to
+    // it, and the legacy llama spellings canonicalize onto the wire form
+    // ("llama-cpp"). "vllm" and "api" pass through unchanged.
+    if (backend.empty()) return "llama-cpp";
+    if (backend == "llama.cpp" || backend == "llama" || backend == "llama-cpp")
+        return "llama-cpp";
     return backend;
 }
 
@@ -226,7 +231,7 @@ void AgentDB::run_migrations() {
                 name              TEXT    NOT NULL,
                 model_path        TEXT    NOT NULL DEFAULT '',
                 system_prompt     TEXT    NOT NULL DEFAULT '',
-                inference_backend TEXT    NOT NULL DEFAULT 'vllm',
+                inference_backend TEXT    NOT NULL DEFAULT 'llama-cpp',
                 ctx_size          INTEGER NOT NULL DEFAULT 4096,
                 n_gpu_layers      INTEGER NOT NULL DEFAULT -1,
                 n_threads         INTEGER NOT NULL DEFAULT -1,
@@ -462,8 +467,11 @@ void AgentDB::run_migrations() {
 
     if (!has_version(6)) {
         SQLite::Transaction tx(*db_);
+        // DBs that predate this column are from the pre-vLLM llama.cpp era, so
+        // the backfill default matches this branch's default runtime. Agents
+        // created under the vLLM line store 'vllm' explicitly and are untouched.
         if (!has_column("agent_config", "inference_backend")) {
-            db_->exec("ALTER TABLE agent_config ADD COLUMN inference_backend TEXT NOT NULL DEFAULT 'vllm'");
+            db_->exec("ALTER TABLE agent_config ADD COLUMN inference_backend TEXT NOT NULL DEFAULT 'llama-cpp'");
         }
         if (!has_column("agent_config", "vllm_settings_json")) {
             db_->exec("ALTER TABLE agent_config ADD COLUMN vllm_settings_json TEXT NOT NULL DEFAULT '{}'");

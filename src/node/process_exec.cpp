@@ -1,5 +1,6 @@
 #include "node/process_exec.hpp"
 
+#include <chrono>
 #include <mutex>
 #include <thread>
 
@@ -64,6 +65,14 @@ std::string quote_windows_arg(const std::string& arg) {
 int run_streamed_command(const std::vector<std::string>& argv,
                          const std::filesystem::path& cwd,
                          const StreamLineCallback& line_cb,
+                         std::string* error) {
+    return run_streamed_command(argv, cwd, line_cb, CancelCheckCallback{}, error);
+}
+
+int run_streamed_command(const std::vector<std::string>& argv,
+                         const std::filesystem::path& cwd,
+                         const StreamLineCallback& line_cb,
+                         const CancelCheckCallback& cancel_requested,
                          std::string* error) {
     if (argv.empty()) {
         if (error) *error = "empty command";
@@ -153,7 +162,18 @@ int run_streamed_command(const std::vector<std::string>& argv,
     std::thread t_out(pump, out_read, false);
     std::thread t_err(pump, err_read, true);
 
-    WaitForSingleObject(pi.hProcess, INFINITE);
+    bool canceled = false;
+    for (;;) {
+        const DWORD wait = WaitForSingleObject(pi.hProcess, 100);
+        if (wait == WAIT_OBJECT_0) break;
+        if (wait == WAIT_FAILED) break;
+        if (cancel_requested && cancel_requested()) {
+            canceled = true;
+            TerminateProcess(pi.hProcess, 130);
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            break;
+        }
+    }
     DWORD code = 0;
     GetExitCodeProcess(pi.hProcess, &code);
 
@@ -162,6 +182,10 @@ int run_streamed_command(const std::vector<std::string>& argv,
     CloseHandle(out_read);
     CloseHandle(err_read);
     CloseHandle(pi.hProcess);
+    if (canceled) {
+        if (error) *error = "command canceled";
+        return 130;
+    }
     return static_cast<int>(code);
 #else
     int out_pipe[2], err_pipe[2];
@@ -230,13 +254,36 @@ int run_streamed_command(const std::vector<std::string>& argv,
     std::thread t_err(pump, err_pipe[0], true);
 
     int status = 0;
-    while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) { /* retry */ }
+    bool canceled = false;
+    for (;;) {
+        const pid_t got = ::waitpid(pid, &status, WNOHANG);
+        if (got == pid) break;
+        if (got < 0 && errno != EINTR) break;
+        if (cancel_requested && cancel_requested()) {
+            canceled = true;
+            ::kill(pid, SIGTERM);
+            for (int i = 0; i < 20; ++i) {
+                if (::waitpid(pid, &status, WNOHANG) == pid) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            if (::waitpid(pid, &status, WNOHANG) == 0) {
+                ::kill(pid, SIGKILL);
+                while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+            }
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 
     if (t_out.joinable()) t_out.join();
     if (t_err.joinable()) t_err.join();
     ::close(out_pipe[0]);
     ::close(err_pipe[0]);
 
+    if (canceled) {
+        if (error) *error = "command canceled";
+        return 130;
+    }
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
     return -1;

@@ -1,5 +1,6 @@
 #include "control/agent_config_validator.hpp"
 
+#include "common/gguf_metadata.hpp"
 #include "common/util.hpp"
 #include "control/node_registry.hpp"
 
@@ -22,9 +23,18 @@ bool is_blank(const std::string& s) {
     return util::trim(s).empty();
 }
 
+// Case-insensitive ".gguf" suffix test. Local to control so we don't pull in the
+// node-only vllm_runtime header just for the classifier.
+bool looks_like_gguf(const std::string& model_path) {
+    const std::string p = util::to_lower(util::trim(model_path));
+    return p.size() >= 5 && p.compare(p.size() - 5, 5, ".gguf") == 0;
+}
+
 std::string normalized_backend(const AgentConfig& cfg) {
     std::string backend = util::to_lower(util::trim(cfg.inference_backend));
-    if (backend.empty() || backend == "llama.cpp") return "vllm";
+    if (backend.empty()) return "llama-cpp";  // unspecified => default runtime
+    if (backend == "llama.cpp" || backend == "llama" || backend == "llama-cpp")
+        return "llama-cpp";
     return backend;
 }
 
@@ -36,12 +46,6 @@ AgentValidationResult validate_agent_config(const AgentConfig& cfg,
                                             const ModelCapabilityInfo* precomputed_model_info) {
     AgentValidationResult result;
 
-    // models_dir and precomputed_model_info are no longer used now that model
-    // capability inspection (GGUF metadata) has been removed; the config is
-    // always vLLM and model_info is always empty.
-    (void)models_dir;
-    (void)precomputed_model_info;
-
     if (is_blank(cfg.name)) {
         add_issue(result, ValidationSeverity::Error, "name", "Name is required.");
     }
@@ -49,12 +53,13 @@ AgentValidationResult validate_agent_config(const AgentConfig& cfg,
         add_issue(result, ValidationSeverity::Error, "model_path", "Model path is required.");
     }
     const std::string backend = normalized_backend(cfg);
-    if (backend != "vllm" && backend != "api") {
+    if (backend != "vllm" && backend != "api" && backend != "llama-cpp") {
         add_issue(result,
                   ValidationSeverity::Error,
                   "inference_backend",
-                  "inference_backend must be 'vllm' or 'api'.");
+                  "inference_backend must be 'vllm', 'llama-cpp', or 'api'.");
     }
+    const bool is_local_backend = (backend == "vllm" || backend == "llama-cpp");
     if (!cfg.id.empty() && !util::is_valid_agent_id(cfg.id)) {
         add_issue(result,
                   ValidationSeverity::Error,
@@ -121,6 +126,49 @@ AgentValidationResult validate_agent_config(const AgentConfig& cfg,
             !std::isfinite(cfg.vllm_settings.gpu_memory_utilization)) {
             add_issue(result, ValidationSeverity::Error, "vllm_settings.gpu_memory_utilization", "gpu_memory_utilization must be within (0, 1].");
         }
+        // A GGUF served through vLLM is experimental and architecture-limited;
+        // llama.cpp is the reliable backend for it.
+        if (looks_like_gguf(cfg.model_path)) {
+            add_issue(result,
+                      ValidationSeverity::Warning,
+                      "inference_backend",
+                      "model_path is a GGUF file but inference_backend is 'vllm'. "
+                      "vLLM's GGUF support is experimental; consider 'llama-cpp'.");
+        }
+    } else if (backend == "llama-cpp") {
+        // llama.cpp loads a local GGUF file (or a directory of split GGUF
+        // shards). An HF repo id would need an out-of-band pull we do not do yet.
+        if (util::is_hf_repo_id(cfg.model_path)) {
+            add_issue(result,
+                      ValidationSeverity::Warning,
+                      "model_path",
+                      "model_path looks like a Hugging Face repo id. The llama.cpp "
+                      "backend loads a local GGUF file; transfer or point at a "
+                      "node-local .gguf path.");
+        } else if (!looks_like_gguf(cfg.model_path)) {
+            add_issue(result,
+                      ValidationSeverity::Warning,
+                      "model_path",
+                      "model_path does not end in .gguf. The llama.cpp backend "
+                      "expects a GGUF model file.");
+        }
+        // Inspect GGUF metadata (best effort) to sanity-check the requested
+        // context against the model's trained context length.
+        ModelCapabilityInfo model_info =
+            precomputed_model_info ? *precomputed_model_info
+                                   : inspect_model_capabilities(cfg.model_path, models_dir);
+        if (model_info.metadata_found && model_info.n_ctx_train > 0 &&
+            cfg.runtime_settings.ctx_size > model_info.n_ctx_train) {
+            add_issue(result,
+                      ValidationSeverity::Warning,
+                      "runtime_settings.ctx_size",
+                      "ctx_size (" + std::to_string(cfg.runtime_settings.ctx_size) +
+                      ") exceeds the model's trained context length (" +
+                      std::to_string(model_info.n_ctx_train) +
+                      "); the model may degrade or fail to load.");
+        }
+        if (model_info.metadata_found || !model_info.warnings.empty())
+            result.model_info = model_info;
     } else if (backend == "api") {
         if (is_blank(cfg.api_settings.base_url)) {
             add_issue(result, ValidationSeverity::Error, "api_settings.base_url", "API base_url is required.");
@@ -150,7 +198,7 @@ AgentValidationResult validate_agent_config(const AgentConfig& cfg,
                   "Tools are enabled, but no executable tools are currently available unless Memories is also enabled.");
     }
 
-    if (backend == "vllm" && !cfg.preferred_node_id.empty() && registry) {
+    if (is_local_backend && !cfg.preferred_node_id.empty() && registry) {
         const auto nodes = registry->list_nodes();
         auto it = std::find_if(nodes.begin(), nodes.end(), [&](const NodeInfo& node) {
             return node.id == cfg.preferred_node_id;

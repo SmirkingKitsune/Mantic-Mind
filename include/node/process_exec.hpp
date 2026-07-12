@@ -20,10 +20,16 @@ namespace mm {
 // Returns the process exit code, or -1 if the process could not be launched
 // (with *error set when non-null). Blocks until the process exits.
 using StreamLineCallback = std::function<void(const std::string& line, bool is_stderr)>;
+using CancelCheckCallback = std::function<bool()>;
 
 int run_streamed_command(const std::vector<std::string>& argv,
                          const std::filesystem::path& cwd,
                          const StreamLineCallback& line_cb,
+                         std::string* error = nullptr);
+int run_streamed_command(const std::vector<std::string>& argv,
+                         const std::filesystem::path& cwd,
+                         const StreamLineCallback& line_cb,
+                         const CancelCheckCallback& cancel_requested,
                          std::string* error = nullptr);
 
 } // namespace mm

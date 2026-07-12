@@ -441,15 +441,21 @@ bool RuntimeClient::health_check() {
     cli.set_read_timeout(5);
     auto res = cli.Get("/health");
     if (!res || res->status != 200) { model_loaded_ = false; return false; }
+    // Backend-agnostic: vLLM answers 200 with an empty body; llama-server and
+    // some OpenAI-compatible servers answer 200 with {"status":"ok"}. Treat a
+    // 200 as healthy unless the body carries an explicit non-ok status.
+    if (util::trim(res->body).empty()) { model_loaded_ = true; return true; }
     try {
         auto j = nlohmann::json::parse(res->body);
-        bool ok = j.value("status", std::string{}) == "ok";
+        bool ok = j.value("status", std::string{"ok"}) == "ok";
         model_loaded_ = ok;
         return ok;
     } catch (const std::exception& e) {
-        MM_WARN("RuntimeClient::health_check parse error: {}", e.what());
-        model_loaded_ = false;
-        return false;
+        // A 200 with an unparseable/non-JSON body still indicates the server is
+        // up; be lenient rather than reporting a spurious unhealthy state.
+        MM_DEBUG("RuntimeClient::health_check non-JSON 200 body: {}", e.what());
+        model_loaded_ = true;
+        return true;
     }
 }
 
