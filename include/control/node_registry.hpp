@@ -21,6 +21,11 @@ namespace mm {
 std::vector<NodeId> select_vllm_update_peers(const std::vector<NodeInfo>& nodes,
                                              const NodeId& source_id);
 
+NodeConnectionStatus classify_node_reachability(int64_t unreachable_since_ms,
+                                                int64_t now_ms,
+                                                int64_t offline_after_ms);
+
+
 // Tracks all registered nodes and runs background health polling.
 class NodeRegistry {
 public:
@@ -32,7 +37,10 @@ public:
     NodeId add_node(const std::string& url,
                     const std::string& api_key,
                     const std::string& platform = {},
-                    bool remember = false);
+                    bool remember = false,
+                    const std::string& hostname = {});
+
+    void set_offline_after_seconds(int seconds);
 
     void remove_node(const NodeId& id);
     bool forget_node(const NodeId& id);
@@ -103,6 +111,7 @@ private:
     // Last vLLM runtime version seen per node, used to detect an update and nudge
     // same-environment peers to check (cluster version convergence).
     std::unordered_map<NodeId, std::string> last_vllm_version_;
+    std::atomic<int64_t> offline_after_ms_{90000};
 
     std::atomic<bool>       polling_{false};
     std::thread             poll_thread_;

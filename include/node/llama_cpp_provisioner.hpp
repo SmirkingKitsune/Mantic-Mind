@@ -13,10 +13,11 @@ namespace mm {
 
 // Node-managed llama.cpp (llama-server) runtime, the llama analog of
 // VllmProvisioner. It resolves an existing llama-server from PATH / a managed
-// build, or provisions one in-program by building llama.cpp from source (the
-// universal path, and the only one for DGX Spark's aarch64 + sm_121) or by
-// downloading a prebuilt release. Install steps stream their output live and
-// report progress through the shared VllmInstallProgress shape.
+// install, then prefers an environment-matched official GitHub release. A
+// source build is the final fallback for combinations without a published
+// binary (notably Linux CUDA and DGX Spark's aarch64 + sm_121). Install steps
+// stream their output live and report progress through the shared
+// VllmInstallProgress shape.
 struct LlamaProvisionConfig {
     std::string requested_executable = "llama-server";
     std::string provision_dir;
@@ -25,11 +26,18 @@ struct LlamaProvisionConfig {
     std::string version = "latest";      // git ref / release tag, or "latest"
     // Accelerator-correct build: cuda|rocm|vulkan|metal|cpu. Empty => detected.
     std::string accelerator;
+    // True when the accelerator came from config rather than hardware probing.
+    // Explicit config may intentionally supersede a previously selected update
+    // alternative on the next restart.
+    bool accelerator_explicit = false;
     // CUDA compute capability for the source build, e.g. "121" for the DGX Spark
-    // GB10 (sm_121, requires CUDA 13+). "" => let CMake pick the default arch.
+    // GB10 (sm_121, requires CUDA 13+). "" => caller auto-detects when possible.
     std::string cuda_arch;
     // Extra -D flags appended verbatim to the CMake configure step.
     std::vector<std::string> cmake_args;
+    // Concurrent compiler jobs for source builds. 0 selects a conservative
+    // managed default (2 for CUDA/ROCm, 4 otherwise) to avoid WSL OOM failures.
+    int build_jobs = 0;
 
     // Test hooks; empty means use the build host.
     std::string platform; // windows|linux|macos
@@ -55,17 +63,30 @@ struct LlamaCommandRunner {
                                                 const std::filesystem::path&)>;
     // Newest llama.cpp release tag available upstream, or "" when unknown.
     using FetchLatestFn = std::function<std::string(const LlamaProvisionConfig&)>;
+    // Asset names attached to a release tag. Kept separate from fetch_latest so
+    // tests and offline callers can make the update decision deterministically.
+    using FetchReleaseAssetsFn =
+        std::function<std::vector<std::string>(const LlamaProvisionConfig&,
+                                               const std::string& tag)>;
     RunFn run;
     CaptureFn capture_first_line;
     FetchLatestFn fetch_latest;
+    FetchReleaseAssetsFn fetch_release_assets;
 };
 
 std::string normalize_llama_install_method(const std::string& method);
 std::filesystem::path managed_llama_executable_path(const LlamaProvisionConfig& cfg);
-// Build the ordered, in-program build/install plan for this environment. Pure
-// and unit-tested (no process is spawned).
+// Build one ordered install attempt for this environment. auto returns its
+// preferred release attempt; LlamaCppProvisioner runs the source fallback only
+// if that attempt cannot produce a usable executable. Pure and unit-tested (no
+// process is spawned).
 std::vector<LlamaInstallStep> build_llama_install_plan(const LlamaProvisionConfig& cfg,
                                                        bool upgrade = false);
+// Return accelerator variants that have an official release for cfg's OS/arch.
+// The list is ordered for UI display and does not include source-build options.
+std::vector<std::string> llama_release_accelerators(
+    const std::vector<std::string>& asset_names,
+    const LlamaProvisionConfig& cfg);
 std::string resolve_llama_executable(const std::string& executable);
 bool llama_runtime_usable(const LlamaRuntimeStatus& status);
 
@@ -83,7 +104,9 @@ public:
 
     LlamaRuntimeStatus ensure_runtime();
     LlamaRuntimeStatus check_for_update();
-    LlamaRuntimeStatus update_runtime();
+    // Empty override keeps the configured accelerator. A non-empty override is
+    // an explicit user choice from the update prompt and uses a release asset.
+    LlamaRuntimeStatus update_runtime(const std::string& accelerator_override = {});
     LlamaRuntimeStatus status() const;
     LlamaProvisionConfig config() const;
 
@@ -98,7 +121,8 @@ private:
 
     LlamaRuntimeStatus make_base_status() const;
     std::string capture_version(const std::string& executable) const;
-    LlamaRuntimeStatus run_managed_install(bool upgrade);
+    LlamaRuntimeStatus run_managed_install(bool upgrade,
+                                           const std::string& accelerator_override = {});
     void emit_progress(const VllmInstallProgress& p);
     void set_status(const LlamaRuntimeStatus& status);
 };

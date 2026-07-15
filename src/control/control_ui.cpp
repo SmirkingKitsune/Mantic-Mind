@@ -1,5 +1,6 @@
 #include "control/control_ui.hpp"
 #include "control/node_registry.hpp"
+#include "control/audio_player.hpp"
 #include "control/agent_manager.hpp"
 #include "control/agent_config_validator.hpp"
 #include "common/agent.hpp"
@@ -131,8 +132,10 @@ ControlUI::ControlUI(NodeRegistry& registry,
                      AgentManager& agents,
                      std::string models_dir,
                      std::string control_base_url,
+                     std::string control_api_token,
                      LocalChatFallback local_chat_fallback)
     : registry_(registry)
+    , control_api_token_(std::move(control_api_token))
     , agents_(agents)
     , models_dir_(std::move(models_dir))
     , control_base_url_(std::move(control_base_url))
@@ -187,6 +190,9 @@ void ControlUI::run() {
     //
 
     int tab_index = 0;
+    mm::tui::LayoutStore layout("data/control-tui-layout.json");
+    int node_detail_height = layout.get("nodes.detail_height", 20, 12, 40);
+    int node_name_width = layout.get("nodes.name_width", 18, 12, 36);
 
     //
     int  disc_sel      = 0;
@@ -195,6 +201,11 @@ void ControlUI::run() {
     //
     int  node_sel      = 0;
     std::vector<std::string> node_entries;
+    int node_slot_sel = 0;
+    std::vector<std::string> node_slot_entries;
+    std::string node_model_ref;
+    std::string node_ray_head;
+    std::string node_operation_status;
 
     // 1a "Overview" dashboard state. node_rows is the per-frame node snapshot the
     // node-menu transform indexes into (set at the top of nodes_renderer, read
@@ -234,6 +245,16 @@ void ControlUI::run() {
     std::string ed_quant;              // quantization
     std::string ed_toolparser;         // tool_call_parser
     std::string ed_extra_args_text;    // vllm_settings.extra_args (one per line)
+    int ed_backend = 0;
+    std::vector<std::string> ed_backend_labels = {"llama.cpp", "vLLM", "Remote API"};
+    std::string ed_ctx_s{"4096"}, ed_gpu_layers_s{"-1"}, ed_threads_s{"-1"};
+    std::string ed_threads_http_s{"-1"}, ed_parallel_s{"1"};
+    std::string ed_batch_s{"-1"}, ed_ubatch_s{"-1"};
+    std::string ed_llama_extra_args_text;
+    bool ed_flash{true};
+    std::string ed_served_model;
+    std::string ed_api_base{"https://api.openai.com"}, ed_api_path{"/v1/chat/completions"};
+    std::string ed_api_key, ed_api_key_env{"OPENAI_API_KEY"};
     bool ed_reasoning{false}, ed_memories{true}, ed_tools{false};
     bool ed_sleep{true}, ed_prefix{true}, ed_trust{false}, ed_autotool{false};
     ModelCapabilityInfo ed_model_info;
@@ -247,7 +268,28 @@ void ControlUI::run() {
     int log_filter = 0;
     std::vector<std::string> filter_labels = {"All", "Info", "Warn", "Error"};
 
+    nlohmann::json performance_data = nlohmann::json::object();
+    int64_t performance_refreshed_ms = 0;
+    std::string performance_error;
+    bool performance_force_refresh = true;
     // Chat tab
+    int voice_agent_sel = 0;
+    int voice_proposal_sel = 0;
+    std::vector<std::string> voice_agent_entries;
+    std::vector<std::string> voice_proposal_entries;
+    nlohmann::json voice_state = nlohmann::json::object();
+    int64_t voice_refreshed_ms = 0;
+    std::atomic<bool> voice_force_refresh{true};
+    std::atomic<bool> voice_busy{false};
+    std::mutex voice_status_mutex;
+    std::thread voice_thread;
+    std::string voice_description;
+    std::string voice_sample_text;
+    std::string voice_speech_text;
+    std::string voice_status;
+    AudioPlayer audio_player;
+    std::string voice_loaded_agent;
+
     int chat_agent_sel = 0;
     std::vector<std::string> chat_agent_entries;
     std::vector<AgentConfig> chat_agent_rows;   // per-frame snapshot for the rich menu rows
@@ -448,15 +490,28 @@ void ControlUI::run() {
 
     auto build_editor_cfg = [&]() {
         AgentConfig cfg;
+        if (!ed_id_orig.empty()) {
+            if (auto current = agents_.get_agent(ed_id_orig)) cfg = current->get_config();
+        }
+
         cfg.id = ed_id;
         cfg.name = ed_name;
         cfg.model_path = ed_model;
         cfg.system_prompt = ed_sysprompt;
         cfg.preferred_node_id = ed_pref_node;
+        cfg.inference_backend = ed_backend == 1 ? "vllm" : ed_backend == 2 ? "api" : "llama-cpp";
         // Generation (shared request contract → RuntimeSettings)
         try { cfg.runtime_settings.temperature = std::stof(ed_temp_s); } catch (...) {}
         try { cfg.runtime_settings.top_p = std::stof(ed_topp_s); } catch (...) {}
         try { cfg.runtime_settings.max_tokens = std::stoi(ed_max_s); } catch (...) {}
+        try { cfg.runtime_settings.ctx_size = std::stoi(ed_ctx_s); } catch (...) {}
+        try { cfg.runtime_settings.n_gpu_layers = std::stoi(ed_gpu_layers_s); } catch (...) {}
+        try { cfg.runtime_settings.n_threads = std::stoi(ed_threads_s); } catch (...) {}
+        try { cfg.runtime_settings.n_threads_http = std::stoi(ed_threads_http_s); } catch (...) {}
+        try { cfg.runtime_settings.parallel = std::stoi(ed_parallel_s); } catch (...) {}
+        try { cfg.runtime_settings.batch_size = std::stoi(ed_batch_s); } catch (...) {}
+        try { cfg.runtime_settings.ubatch_size = std::stoi(ed_ubatch_s); } catch (...) {}
+        cfg.runtime_settings.flash_attn = ed_flash;
         // Engine · vLLM
         try { cfg.vllm_settings.max_model_len = std::stoi(ed_mml_s); } catch (...) {}
         try { cfg.vllm_settings.max_num_seqs = std::stoi(ed_seqs_s); } catch (...) {}
@@ -466,13 +521,18 @@ void ControlUI::run() {
         try { cfg.vllm_settings.gpu_memory_utilization = std::stod(ed_gpumem_s); } catch (...) {}
         cfg.vllm_settings.dtype = ed_dtype.empty() ? "auto" : ed_dtype;
         cfg.vllm_settings.quantization = ed_quant;
+        cfg.vllm_settings.served_model_name = ed_served_model;
         cfg.vllm_settings.tool_call_parser = ed_toolparser;
         cfg.vllm_settings.enable_sleep_mode = ed_sleep;
         cfg.vllm_settings.enable_prefix_caching = ed_prefix;
         cfg.vllm_settings.trust_remote_code = ed_trust;
         cfg.vllm_settings.enable_auto_tool_choice = ed_autotool;
+        cfg.api_settings.base_url = ed_api_base;
+        cfg.api_settings.chat_completions_path = ed_api_path;
+        cfg.api_settings.api_key_env = ed_api_key_env;
+        if (!ed_api_key.empty()) cfg.api_settings.api_key = ed_api_key;
+
         // Keep ctx_size aligned with max_model_len so the shared contract has a context.
-        cfg.runtime_settings.ctx_size = cfg.vllm_settings.max_model_len;
         cfg.reasoning_enabled = ed_reasoning;
         cfg.memories_enabled = ed_memories;
         cfg.tools_enabled = ed_tools;
@@ -487,6 +547,17 @@ void ControlUI::run() {
             if (!line.empty()) cfg.vllm_settings.extra_args.push_back(line);
             if (end == std::string::npos) break;
             start = end + 1;
+        }
+
+        cfg.runtime_settings.extra_args.clear();
+        size_t llama_start = 0;
+        while (llama_start <= ed_llama_extra_args_text.size()) {
+            const size_t end = ed_llama_extra_args_text.find('\n', llama_start);
+            std::string line = util::trim(ed_llama_extra_args_text.substr(
+                llama_start, end == std::string::npos ? std::string::npos : end - llama_start));
+            if (!line.empty()) cfg.runtime_settings.extra_args.push_back(std::move(line));
+            if (end == std::string::npos) break;
+            llama_start = end + 1;
         }
 
         return cfg;
@@ -506,6 +577,11 @@ void ControlUI::run() {
             ed_mml_s + '\n' + ed_seqs_s + '\n' + ed_batched_s + '\n' + ed_tp_s + '\n' + ed_pp_s +
             '\n' + ed_gpumem_s + '\n' + ed_dtype + '\n' + ed_quant + '\n' + ed_toolparser + '\n' +
             ed_extra_args_text + '\n' +
+            std::to_string(ed_backend) + '\n' + ed_ctx_s + '\n' + ed_gpu_layers_s + '\n' +
+            ed_threads_s + '\n' + ed_threads_http_s + '\n' + ed_parallel_s + '\n' + ed_batch_s + '\n' +
+            ed_ubatch_s + '\n' + ed_llama_extra_args_text + '\n' + ed_served_model + '\n' +
+            ed_api_base + '\n' + ed_api_path + '\n' + ed_api_key + '\n' + ed_api_key_env + '\n' +
+            (ed_flash ? "1" : "0") +
             (ed_reasoning ? "1" : "0") + (ed_memories ? "1" : "0") + (ed_tools ? "1" : "0") +
             (ed_sleep ? "1" : "0") + (ed_prefix ? "1" : "0") + (ed_trust ? "1" : "0") +
             (ed_autotool ? "1" : "0");
@@ -567,14 +643,8 @@ void ControlUI::run() {
         const NodeInfo& n = node_rows[static_cast<size_t>(st.index)];
         auto sep = [] { return text(" │ ") | dim; };
 
-        std::string short_id = n.id;
-        if (short_id.rfind("node-", 0) == 0) short_id = short_id.substr(5);
-
-        Color hc = n.health == NodeHealthStatus::Healthy    ? Color::Green
-                 : n.health == NodeHealthStatus::Degraded   ? Color::Yellow
-                 : n.health == NodeHealthStatus::Unhealthy  ? Color::Red
-                                                            : Color::GrayDark;
-        Element health = text("● " + to_string(n.health)) | color(hc);
+        const std::string display_name = mm::tui::node_display_name(n, node_rows);
+        Element reachability = mm::tui::connection_status_el(n);
 
         const bool gpu = n.metrics.gpu_vram_total_mb > 0 || n.metrics.gpu_backend_available;
         char cpu_pct[8], gpu_pct[8];
@@ -614,8 +684,8 @@ void ControlUI::run() {
         std::string arch = n.capabilities.arch.empty() ? "—" : n.capabilities.arch;
 
         Element row = hbox({
-            mm::tui::col(text(short_id) | bold, 12), sep(),
-            mm::tui::col(std::move(health), 11), sep(),
+            mm::tui::col(text(display_name) | bold, node_name_width), sep(),
+            mm::tui::col(std::move(reachability), 15), sep(),
             mm::tui::col(std::move(cpu_cell), 12), sep(),
             mm::tui::col(std::move(gpu_cell), 12), sep(),
             mm::tui::col(std::move(vram_cell), 15), sep(),
@@ -623,6 +693,7 @@ void ControlUI::run() {
             mm::tui::col(text(arch) | dim, 8),
         });
         if (st.active) row = std::move(row) | inverted;
+        if (n.connection_status != NodeConnectionStatus::Online) row = std::move(row) | dim;
         return row;
     };
     auto node_menu   = Menu(&node_entries, &node_sel, node_menu_opt);
@@ -646,9 +717,85 @@ void ControlUI::run() {
     }, ButtonOption::Simple());
     auto node_menu_m  = Maybe(node_menu, [&]() { return !node_entries.empty(); });
     auto node_btns    = Container::Horizontal({btn_forget_n, btn_rem_n});
+    auto save_node_layout = [&]() {
+        layout.set("nodes.detail_height", node_detail_height);
+        layout.set("nodes.name_width", node_name_width);
+        layout.save();
+    };
+    auto node_rows_divider = mm::tui::resizable_divider(
+        &node_detail_height, 12, 40, mm::tui::SplitAxis::Rows,
+        [&](int) { save_node_layout(); });
+    auto node_name_divider = mm::tui::resizable_divider(
+        &node_name_width, 12, 36, mm::tui::SplitAxis::Columns,
+        [&](int) { save_node_layout(); });
+
     auto nodes_section = Container::Vertical({node_menu_m, node_btns});
 
-    auto nodes_comp  = Container::Vertical({disc_comp, nodes_section});
+    auto selected_control_node = [&]() -> std::optional<NodeInfo> {
+        const auto nodes = registry_.list_nodes();
+        if (node_sel < 0 || node_sel >= static_cast<int>(nodes.size())) return std::nullopt;
+        return nodes[static_cast<std::size_t>(node_sel)];
+    };
+    auto selected_control_slot = [&]() -> std::optional<SlotInfo> {
+        const auto node = selected_control_node();
+        if (!node || node_slot_sel < 0 || node_slot_sel >= static_cast<int>(node->slots.size()))
+            return std::nullopt;
+        return node->slots[static_cast<std::size_t>(node_slot_sel)];
+    };
+    auto post_selected_node = [&](const std::string& path, const nlohmann::json& body) {
+        const auto node = selected_control_node();
+        if (!node || !node->connected) { node_operation_status = "node is not online"; return false; }
+        HttpClient client(node->url);
+        client.set_bearer_token(node->api_key);
+        const auto response = client.post(path, body);
+        node_operation_status = response.ok() ? "ok: " + path
+            : "failed " + std::to_string(response.status) + ": " + parse_api_error(response);
+        return response.ok();
+    };
+    auto node_slot_menu = Menu(&node_slot_entries, &node_slot_sel, MenuOption::Vertical());
+    InputOption node_model_option; node_model_option.multiline = false;
+    node_model_option.placeholder = "model path or Hugging Face repo";
+    auto node_model_input = Input(&node_model_ref, node_model_option);
+    InputOption node_ray_option; node_ray_option.multiline = false;
+    node_ray_option.placeholder = "head-ip:port";
+    auto node_ray_input = Input(&node_ray_head, node_ray_option);
+    auto btn_control_suspend = Button(" Suspend ", [&] {
+        if (auto slot = selected_control_slot()) post_selected_node("/api/node/suspend-slot", {{"slot_id", slot->id}});
+    }, ButtonOption::Simple());
+    auto btn_control_unload = Button(" Unload ", [&] {
+        if (auto slot = selected_control_slot()) post_selected_node("/api/node/unload-model", {{"slot_id", slot->id}});
+    }, ButtonOption::Simple());
+    auto btn_control_restore = Button(" Restore ", [&] {
+        if (auto slot = selected_control_slot()) post_selected_node("/api/node/restore-slot", {
+            {"model_path", slot->model_path}, {"agent_id", slot->assigned_agent},
+            {"backend", slot->backend}, {"kv_cache_path", slot->kv_cache_path}});
+    }, ButtonOption::Simple());
+    auto btn_control_pull = Button(" Pull model ", [&] {
+        if (!util::trim(node_model_ref).empty())
+            post_selected_node("/api/node/models/pull", {{"model_ref", util::trim(node_model_ref)}});
+    }, ButtonOption::Simple());
+    auto btn_control_vllm = Button(" Provision vLLM ", [&] {
+        post_selected_node("/api/node/runtime/vllm/provision", nlohmann::json::object());
+    }, ButtonOption::Simple());
+    auto btn_control_ray_head = Button(" Ray head ", [&] {
+        post_selected_node("/api/node/ray/start", {{"role", "head"}});
+    }, ButtonOption::Simple());
+    auto btn_control_ray_join = Button(" Join Ray ", [&] {
+        post_selected_node("/api/node/ray/start", {{"role", "worker"}, {"head_address", node_ray_head}});
+    }, ButtonOption::Simple());
+    auto btn_control_ray_stop = Button(" Stop Ray ", [&] {
+        post_selected_node("/api/node/ray/stop", nlohmann::json::object());
+    }, ButtonOption::Simple());
+    auto control_slot_buttons = Container::Horizontal({btn_control_suspend, btn_control_restore, btn_control_unload});
+    auto btn_control_cancel = Button(" Cancel action ", [&] {
+        post_selected_node("/api/node/actions/cancel", nlohmann::json::object());
+    }, ButtonOption::Simple());
+    auto control_model_row = Container::Horizontal({node_model_input, btn_control_pull, btn_control_vllm});
+    auto control_ray_row = Container::Horizontal({node_ray_input, btn_control_ray_head, btn_control_ray_join, btn_control_ray_stop, btn_control_cancel});
+    auto node_operations = Container::Vertical({node_slot_menu, control_slot_buttons, control_model_row, control_ray_row});
+
+    auto nodes_comp  = Container::Vertical({disc_comp, nodes_section, node_name_divider,
+        node_rows_divider, node_operations});
 
     //
 
@@ -788,6 +935,13 @@ void ControlUI::run() {
         ed_tp_s = "1"; ed_pp_s = "1"; ed_gpumem_s = "0.90";
         ed_dtype = "auto"; ed_quant.clear(); ed_toolparser.clear();
         ed_extra_args_text.clear();
+        ed_backend = 0;
+        ed_ctx_s = "4096"; ed_gpu_layers_s = "-1"; ed_threads_s = "-1";
+        ed_threads_http_s = "-1"; ed_parallel_s = "1"; ed_batch_s = "-1"; ed_ubatch_s = "-1";
+        ed_llama_extra_args_text.clear(); ed_flash = true;
+        ed_served_model.clear();
+        ed_api_base = "https://api.openai.com"; ed_api_path = "/v1/chat/completions";
+        ed_api_key.clear(); ed_api_key_env = "OPENAI_API_KEY";
         ed_reasoning = false; ed_memories = true; ed_tools = false;
         ed_sleep = true; ed_prefix = true; ed_trust = false; ed_autotool = false;
         ed_model_info = {};
@@ -822,6 +976,23 @@ void ControlUI::run() {
                 if (i > 0) ed_extra_args_text += '\n';
                 ed_extra_args_text += c.vllm_settings.extra_args[i];
             }
+            const std::string backend = util::to_lower(c.inference_backend);
+            ed_backend = backend == "vllm" ? 1 : backend == "api" ? 2 : 0;
+            ed_ctx_s = std::to_string(c.runtime_settings.ctx_size);
+            ed_gpu_layers_s = std::to_string(c.runtime_settings.n_gpu_layers);
+            ed_threads_s = std::to_string(c.runtime_settings.n_threads);
+            ed_threads_http_s = std::to_string(c.runtime_settings.n_threads_http);
+            ed_parallel_s = std::to_string(c.runtime_settings.parallel);
+            ed_batch_s = std::to_string(c.runtime_settings.batch_size);
+            ed_ubatch_s = std::to_string(c.runtime_settings.ubatch_size);
+            ed_flash = c.runtime_settings.flash_attn;
+            ed_llama_extra_args_text = util::join(c.runtime_settings.extra_args, "\n");
+            ed_served_model = c.vllm_settings.served_model_name;
+            ed_api_base = c.api_settings.base_url;
+            ed_api_path = c.api_settings.chat_completions_path;
+            ed_api_key.clear();
+            ed_api_key_env = c.api_settings.api_key_env;
+
             ed_sleep = c.vllm_settings.enable_sleep_mode;
             ed_prefix = c.vllm_settings.enable_prefix_caching;
             ed_trust = c.vllm_settings.trust_remote_code;
@@ -853,7 +1024,7 @@ void ControlUI::run() {
     bool ed_open_sampling = false;   // section expanded?
     bool ed_open_engine   = true;    // vLLM engine is the focus of the re-field → open by default
     bool ed_open_caps     = false;
-    int  ed_split         = 26;      // AGENTS context-list width (columns)
+    int  ed_split         = layout.get("agents.editor_width", 26, 18, 46);
 
     // Editor inputs
     InputOption sl; sl.multiline = false;
@@ -869,6 +1040,17 @@ void ControlUI::run() {
     auto ed_inp_temp  = Input(&ed_temp_s,    sl);
     auto ed_inp_topp  = Input(&ed_topp_s,    sl);
     auto ed_inp_max   = Input(&ed_max_s,     sl);
+    auto ed_backend_toggle = Toggle(&ed_backend_labels, &ed_backend);
+    auto ed_inp_ctx = Input(&ed_ctx_s, sl);
+    auto ed_inp_gpu_layers = Input(&ed_gpu_layers_s, sl);
+    auto ed_inp_threads = Input(&ed_threads_s, sl);
+    auto ed_inp_threads_http = Input(&ed_threads_http_s, sl);
+    auto ed_inp_parallel = Input(&ed_parallel_s, sl);
+    auto ed_inp_batch = Input(&ed_batch_s, sl);
+    auto ed_inp_ubatch = Input(&ed_ubatch_s, sl);
+    auto ed_inp_llama_extra = Input(&ed_llama_extra_args_text, ml);
+    auto ed_cb_flash = Checkbox("flash_attention", &ed_flash);
+
     auto ed_inp_mml       = Input(&ed_mml_s,      sl);
     auto ed_inp_seqs      = Input(&ed_seqs_s,     sl);
     auto ed_inp_batched   = Input(&ed_batched_s,  sl);
@@ -879,6 +1061,13 @@ void ControlUI::run() {
     auto ed_inp_quant     = Input(&ed_quant,      sl);
     auto ed_inp_toolparser = Input(&ed_toolparser, sl);
     auto ed_inp_extra = Input(&ed_extra_args_text, ml);
+    auto ed_inp_served_model = Input(&ed_served_model, sl);
+    auto ed_inp_api_base = Input(&ed_api_base, sl);
+    auto ed_inp_api_path = Input(&ed_api_path, sl);
+    InputOption secret; secret.multiline = false; secret.password = true;
+    secret.placeholder = "leave blank to retain current key";
+    auto ed_inp_api_key = Input(&ed_api_key, secret);
+    auto ed_inp_api_key_env = Input(&ed_api_key_env, sl);
 
     auto ed_cb_sleep     = Checkbox("sleep_mode",   &ed_sleep);
     auto ed_cb_prefix    = Checkbox("prefix_cache", &ed_prefix);
@@ -976,9 +1165,13 @@ void ControlUI::run() {
     auto sampling_fields = Container::Vertical({ed_inp_temp, ed_inp_topp, ed_inp_max});
     auto sampling_m = Maybe(sampling_fields, [&] { return ed_open_sampling; });
     auto engine_fields = Container::Vertical({
+        ed_backend_toggle,
         ed_inp_mml, ed_inp_seqs, ed_inp_batched, ed_inp_tp, ed_inp_pp,
         ed_inp_gpumem, ed_inp_dtype, ed_inp_quant, ed_inp_toolparser,
-        ed_cb_sleep, ed_cb_prefix, ed_cb_trust, ed_cb_autotool});
+        ed_cb_sleep, ed_cb_prefix, ed_cb_trust, ed_cb_autotool,
+        ed_inp_ctx, ed_inp_gpu_layers, ed_inp_threads, ed_inp_threads_http,
+        ed_inp_parallel, ed_inp_batch, ed_inp_ubatch, ed_cb_flash, ed_inp_llama_extra,
+        ed_inp_served_model, ed_inp_api_base, ed_inp_api_path, ed_inp_api_key_env, ed_inp_api_key});
     auto engine_m = Maybe(engine_fields, [&] { return ed_open_engine; });
     auto caps_fields = Container::Vertical({ed_cb_reasoning, ed_cb_memories, ed_cb_tools});
     auto caps_m = Maybe(caps_fields, [&] { return ed_open_caps; });
@@ -989,7 +1182,6 @@ void ControlUI::run() {
         ed_sec_sampling_btn, sampling_m,
         ed_sec_engine_btn, engine_m,
         ed_sec_caps_btn, caps_m,
-        ed_inp_extra,
         ed_form_btns
     });
 
@@ -1062,6 +1254,150 @@ void ControlUI::run() {
 
     auto filter_toggle = Toggle(&filter_labels, &log_filter);
     auto activity_comp = Container::Vertical({filter_toggle});
+    auto refresh_performance = [&]() {
+        performance_force_refresh = true;
+        refresh();
+    };
+    auto btn_perf_refresh = Button(" Refresh ", refresh_performance, ButtonOption::Simple());
+    auto btn_perf_clear = Button(" Clear session ", [&]() {
+        HttpClient cli(control_base_url_);
+        if (!control_api_token_.empty()) cli.set_bearer_token(control_api_token_);
+        auto response = cli.del("/v1/performance");
+        if (!response.ok()) {
+            performance_error = "clear failed: HTTP " + std::to_string(response.status);
+        } else {
+            performance_data = nlohmann::json::object();
+            performance_error.clear();
+        }
+        performance_force_refresh = true;
+        refresh();
+    }, ButtonOption::Simple());
+    auto performance_buttons = Container::Horizontal({btn_perf_refresh, btn_perf_clear});
+    auto performance_comp = Container::Vertical({performance_buttons});
+    auto selected_voice_agent = [&]() -> std::string {
+        const auto configs = agents_.list_agents();
+        if (voice_agent_sel < 0 || voice_agent_sel >= static_cast<int>(configs.size())) return {};
+        return configs[static_cast<std::size_t>(voice_agent_sel)].id;
+    };
+    auto selected_voice_proposal = [&]() -> nlohmann::json {
+        const auto proposals = voice_state.value("proposals", nlohmann::json::array());
+        if (voice_proposal_sel < 0 || voice_proposal_sel >= static_cast<int>(proposals.size()))
+            return nlohmann::json::object();
+        return proposals[static_cast<std::size_t>(voice_proposal_sel)];
+    };
+    auto set_voice_status = [&](const std::string& value) {
+        std::lock_guard<std::mutex> lock(voice_status_mutex);
+        voice_status = value;
+    };
+    auto run_voice_async = [&](const std::string& operation, std::function<std::string()> fn) {
+        if (voice_busy.exchange(true)) return;
+        if (voice_thread.joinable()) voice_thread.join();
+        set_voice_status("running: " + operation);
+        voice_thread = std::thread([&, operation, fn = std::move(fn)]() mutable {
+            const std::string error = fn();
+            set_voice_status(error.empty() ? "done: " + operation : "failed: " + error);
+            voice_force_refresh = true;
+            voice_busy = false;
+            refresh();
+        });
+    };
+    auto voice_client = [&]() {
+        auto client = std::make_unique<HttpClient>(control_base_url_);
+        if (!control_api_token_.empty()) client->set_bearer_token(control_api_token_);
+        return client;
+    };
+
+    InputOption voice_multi; voice_multi.multiline = true;
+    voice_multi.placeholder = "Describe an original synthetic voice";
+    auto voice_description_input = Input(&voice_description, voice_multi);
+    InputOption sample_multi; sample_multi.multiline = true;
+    sample_multi.placeholder = "Text for the voice preview";
+    auto voice_sample_input = Input(&voice_sample_text, sample_multi);
+    InputOption speech_multi; speech_multi.multiline = true;
+    speech_multi.placeholder = "Text to synthesize with the approved voice";
+    auto voice_speech_input = Input(&voice_speech_text, speech_multi);
+    auto voice_agent_menu = Menu(&voice_agent_entries, &voice_agent_sel, MenuOption::Vertical());
+    auto voice_proposal_menu = Menu(&voice_proposal_entries, &voice_proposal_sel, MenuOption::Vertical());
+
+    auto btn_voice_refresh = Button(" Refresh ", [&] { voice_force_refresh = true; }, ButtonOption::Simple());
+    auto btn_voice_propose = Button(" Propose ", [&] {
+        const std::string agent_id = selected_voice_agent();
+        const std::string description = voice_description;
+        const std::string sample_text = voice_sample_text;
+        if (agent_id.empty()) return;
+        run_voice_async("voice proposal", [&, agent_id, description, sample_text]() {
+            auto client = voice_client();
+            nlohmann::json body = nlohmann::json::object();
+            if (!util::trim(description).empty()) body["voice_description"] = description;
+            if (!util::trim(sample_text).empty()) body["sample_text"] = sample_text;
+            auto response = client->post("/v1/agents/" + agent_id + "/voice/proposals", body);
+            return response.ok() ? std::string{} : "HTTP " + std::to_string(response.status) + ": " + parse_api_error(response);
+        });
+    }, ButtonOption::Simple());
+    auto btn_voice_sample = Button(" Generate sample ", [&] {
+        const std::string agent_id = selected_voice_agent();
+        const auto proposal = selected_voice_proposal();
+        const std::string proposal_id = proposal.value("id", std::string{});
+        if (agent_id.empty() || proposal_id.empty()) return;
+        run_voice_async("sample", [&, agent_id, proposal_id]() {
+            auto client = voice_client();
+            auto response = client->post("/v1/agents/" + agent_id + "/voice/proposals/" + proposal_id + "/sample",
+                                         nlohmann::json::object());
+            if (!response.ok()) return "HTTP " + std::to_string(response.status) + ": " + parse_api_error(response);
+            try {
+                const auto json = nlohmann::json::parse(response.body);
+                const std::string path = json.at("proposal").value("preview_audio_path", std::string{});
+                if (!path.empty()) { audio_player.load(path); audio_player.play(); }
+            } catch (...) {}
+            return std::string{};
+        });
+    }, ButtonOption::Simple());
+    auto proposal_decision = [&](const std::string& decision) {
+        const std::string agent_id = selected_voice_agent();
+        const std::string proposal_id = selected_voice_proposal().value("id", std::string{});
+        if (agent_id.empty() || proposal_id.empty()) return;
+        run_voice_async(decision, [&, agent_id, proposal_id, decision]() {
+            auto client = voice_client();
+            auto response = client->post("/v1/agents/" + agent_id + "/voice/proposals/" + proposal_id + "/" + decision,
+                                         nlohmann::json::object());
+            return response.ok() ? std::string{} : "HTTP " + std::to_string(response.status) + ": " + parse_api_error(response);
+        });
+    };
+    auto btn_voice_approve = Button(" Approve ", [&] { proposal_decision("approve"); }, ButtonOption::Simple());
+    auto btn_voice_reject = Button(" Reject ", [&] { proposal_decision("reject"); }, ButtonOption::Simple());
+    auto btn_voice_preview = Button(" Play preview ", [&] {
+        const std::string path = selected_voice_proposal().value("preview_audio_path", std::string{});
+        if (!path.empty()) { audio_player.load(path); audio_player.play(); }
+    }, ButtonOption::Simple());
+    auto btn_voice_speak = Button(" Synthesize speech ", [&] {
+        const std::string agent_id = selected_voice_agent();
+        const std::string text_value = voice_speech_text;
+        if (agent_id.empty() || util::trim(text_value).empty()) return;
+        run_voice_async("speech", [&, agent_id, text_value]() {
+            auto client = voice_client();
+            auto response = client->post("/v1/agents/" + agent_id + "/speech",
+                                         nlohmann::json{{"text", text_value}, {"format", "wav"}});
+            if (!response.ok()) return "HTTP " + std::to_string(response.status) + ": " + parse_api_error(response);
+            try {
+                const auto json = nlohmann::json::parse(response.body);
+                const std::string path = json.at("result").value("audio_path", std::string{});
+                if (!path.empty()) { audio_player.load(path); audio_player.play(); }
+            } catch (...) {}
+            return std::string{};
+        });
+    }, ButtonOption::Simple());
+    auto btn_audio_play = Button(" Play ", [&] { audio_player.play(); }, ButtonOption::Simple());
+    auto btn_audio_pause = Button(" Pause ", [&] { audio_player.pause(); }, ButtonOption::Simple());
+    auto btn_audio_stop = Button(" Stop ", [&] { audio_player.stop(); }, ButtonOption::Simple());
+    auto btn_audio_back = Button(" -5s ", [&] { audio_player.seek_relative(-5.0f); }, ButtonOption::Simple());
+    auto btn_audio_forward = Button(" +5s ", [&] { audio_player.seek_relative(5.0f); }, ButtonOption::Simple());
+    auto voice_buttons = Container::Horizontal({btn_voice_refresh, btn_voice_propose, btn_voice_sample,
+        btn_voice_preview, btn_voice_approve, btn_voice_reject, btn_voice_speak,
+        btn_audio_back, btn_audio_play, btn_audio_pause, btn_audio_stop, btn_audio_forward});
+    auto voice_comp = Container::Vertical({voice_agent_menu, voice_proposal_menu,
+        voice_description_input, voice_sample_input, voice_speech_input, voice_buttons});
+
+
 
     //
 
@@ -1310,7 +1646,23 @@ void ControlUI::run() {
     }, ButtonOption::Simple());
 
     auto chat_btn_row = Container::Horizontal({btn_chat_send, btn_chat_clear});
-    auto chat_comp = Container::Vertical({chat_agent_menu_m, chat_input_comp, chat_btn_row});
+    auto chat_transcript_scroll = mm::tui::wrapped_scroll_view([&]() {
+        std::lock_guard<std::mutex> lk(chat_mutex);
+        std::string transcript;
+        for (const auto& line : chat_transcript) {
+            if (!transcript.empty()) transcript += "\n\n";
+            transcript += line;
+        }
+        if (chat_inflight.load()) {
+            if (!transcript.empty()) transcript += "\n\n";
+            transcript += chat_partial_assistant.empty()
+                ? "Assistant: (streaming...)"
+                : "Assistant (streaming): " + chat_partial_assistant;
+        }
+        return transcript.empty() ? std::string{"(no chat yet)"} : transcript;
+    });
+    auto chat_comp = Container::Vertical(
+        {chat_agent_menu_m, chat_input_comp, chat_btn_row, chat_transcript_scroll});
 
     //
 
@@ -1440,6 +1792,7 @@ void ControlUI::run() {
 
         run_curation_async("force compact", [&, agent_id, conv_id]() -> std::string {
             HttpClient cli(control_base_url_);
+            if (!control_api_token_.empty()) cli.set_bearer_token(control_api_token_);
             auto resp = cli.post("/v1/agents/" + agent_id + "/conversations/" + conv_id + "/compact",
                                  nlohmann::json::object());
             if (!resp.ok()) {
@@ -1508,6 +1861,7 @@ void ControlUI::run() {
 
         run_curation_async("memory extraction", [&, agent_id, conv_id, start_i, end_i, ctx_i]() -> std::string {
             HttpClient cli(control_base_url_);
+            if (!control_api_token_.empty()) cli.set_bearer_token(control_api_token_);
             auto resp = cli.post(
                 "/v1/agents/" + agent_id + "/memories/extract",
                 nlohmann::json{
@@ -1629,11 +1983,7 @@ void ControlUI::run() {
         // Connected nodes — snapshot the rich menu transform indexes into.
         node_rows = registry_.list_nodes();
         node_entries.resize(node_rows.size());
-        for (size_t i = 0; i < node_rows.size(); ++i) {
-            std::string sid = node_rows[i].id;
-            if (sid.rfind("node-", 0) == 0) sid = sid.substr(5);
-            node_entries[i] = sid;  // fallback; the transform renders the real row
-        }
+        for (size_t i = 0; i < node_rows.size(); ++i) node_entries[i] = mm::tui::node_display_name(node_rows[i], node_rows);
         if (!node_rows.empty() && node_sel >= static_cast<int>(node_rows.size()))
             node_sel = static_cast<int>(node_rows.size()) - 1;
         else if (node_rows.empty())
@@ -1716,8 +2066,8 @@ void ControlUI::run() {
         // ── Node table ───────────────────────────────────────────────────
         auto sep = [] { return text(" │ ") | dim; };
         Element head = hbox({
-            col(text("NODE"), 12), sep(),
-            col(text("HEALTH"), 11), sep(),
+            col(text("NODE"), node_name_width), node_name_divider->Render(),
+            col(text("STATUS"), 15), sep(),
             col(text("CPU%"), 12), sep(),
             col(text("GPU%"), 12), sep(),
             col(text("VRAM"), 15), sep(),
@@ -1740,18 +2090,33 @@ void ControlUI::run() {
         std::string detail_cap;
         if (!node_rows.empty() && node_sel >= 0 && node_sel < static_cast<int>(node_rows.size())) {
             const NodeInfo& n = node_rows[static_cast<size_t>(node_sel)];
-            detail_title = "DETAIL · " + n.id;
+            node_slot_entries.clear();
+            for (const auto& slot : n.slots)
+                node_slot_entries.push_back(slot.id + "  " + to_string(slot.state) + "  " + mm::tui::short_model(slot.model_path));
+            if (node_slot_sel >= static_cast<int>(n.slots.size()))
+                node_slot_sel = std::max(0, static_cast<int>(n.slots.size()) - 1);
+
+            detail_title = "DETAIL · " + mm::tui::node_display_name(n, node_rows);
             detail_cap = n.url;
             // Per-node CPU/GPU/VRAM live in the NODES table row (sparklines/gauge)
             // and the CLUSTER tile; matching 1a, the detail shows the slot table +
             // capabilities only — no duplicate gauges here.
             Elements rows = {
+                hbox({mm::tui::connection_status_el(n), text("   resource health ") | dim,
+                      text(to_string(n.health)), text("   "), mm::tui::stale_caption(n)}),
+
                 hbox({text("saved ") | dim, text(n.remembered ? "yes" : "no"),
                       text("   platform ") | dim, text(n.platform.empty() ? "—" : n.platform),
                       text("   model ") | dim,
                       text(n.loaded_model.empty() ? "(engine-managed)" : n.loaded_model)}),
                 text(""),
                 slot_table(n.slots, true),
+                node_slot_menu->Render() | yframe | size(HEIGHT, LESS_THAN, 4),
+                control_slot_buttons->Render(),
+                control_model_row->Render(),
+                control_ray_row->Render(),
+                node_operation_status.empty() ? text("") : paragraph(node_operation_status),
+
                 text(""),
             };
             char bud[48];
@@ -1771,12 +2136,13 @@ void ControlUI::run() {
             detail_body = text("  No connected nodes.") | dim;
         }
         Element detail_panel = panel(detail_title, detail_cap, std::move(detail_body)) |
-                               size(HEIGHT, EQUAL, 13);
+                               size(HEIGHT, EQUAL, node_detail_height);
 
         return vbox({
             top_strip,
             table_panel,
             detail_panel,
+            node_rows_divider->Render(),
         });
     });
 
@@ -1853,6 +2219,49 @@ void ControlUI::run() {
                 return vbox(std::move(v));
             };
 
+            Element engine_specific;
+            if (ed_backend == 0) {
+                engine_specific = vbox({
+                    hbox({field(" context", ed_inp_ctx->Render() | flex),
+                          field(" gpu_layers", ed_inp_gpu_layers->Render() | flex)}),
+                    hbox({field(" threads", ed_inp_threads->Render() | flex),
+                          field(" http_threads", ed_inp_threads_http->Render() | flex)}),
+                    hbox({field(" parallel", ed_inp_parallel->Render() | flex),
+                          field(" batch", ed_inp_batch->Render() | flex),
+                          field(" ubatch", ed_inp_ubatch->Render() | flex)}),
+                    ed_cb_flash->Render(),
+                    field(" extra args", ed_inp_llama_extra->Render() | border | size(HEIGHT, LESS_THAN, 4)),
+                });
+            } else if (ed_backend == 1) {
+                engine_specific = vbox({
+                    hbox({field(" max_model_len", ed_inp_mml->Render() | flex),
+                          field(" max_num_seqs", ed_inp_seqs->Render() | flex)}),
+                    hbox({field(" gpu_mem_util", ed_inp_gpumem->Render() | flex),
+                          field(" max_batched", ed_inp_batched->Render() | flex)}),
+                    hbox({field(" tensor_par", ed_inp_tp->Render() | flex),
+                          field(" pipeline_par", ed_inp_pp->Render() | flex)}),
+                    hbox({field(" dtype", ed_inp_dtype->Render() | flex),
+                          field(" quantization", ed_inp_quant->Render() | flex)}),
+                    field(" served name", ed_inp_served_model->Render() | flex),
+                    field(" tool parser", ed_inp_toolparser->Render() | flex),
+                    hbox({ed_cb_sleep->Render(), text("  "), ed_cb_prefix->Render(), text("  "),
+                          ed_cb_trust->Render(), text("  "), ed_cb_autotool->Render()}),
+                    field(" extra args", ed_inp_extra->Render() | border | size(HEIGHT, LESS_THAN, 4)),
+                });
+            } else {
+                engine_specific = vbox({
+                    field(" base_url", ed_inp_api_base->Render() | flex),
+                    field(" chat path", ed_inp_api_path->Render() | flex),
+                    field(" key env", ed_inp_api_key_env->Render() | flex),
+                    field(" API key", ed_inp_api_key->Render() | flex),
+                    text("API keys are process-local and never persisted") | dim,
+                });
+            }
+            Element engine_body = vbox({
+                field(" backend", ed_backend_toggle->Render() | flex),
+                separator(),
+                std::move(engine_specific),
+            });
             Element sections = vbox({
                 sec_static("Identity", vbox({
                     field(" id", ed_inp_id->Render() | flex),
@@ -1870,19 +2279,7 @@ void ControlUI::run() {
                     field(" top_p", ed_inp_topp->Render() | flex, 8),
                     field(" max_tokens", ed_inp_max->Render() | flex, 12),
                 })),
-                sec_toggle(ed_sec_engine_btn->Render(), ed_open_engine, vbox({
-                    hbox({field(" max_model_len", ed_inp_mml->Render() | flex),
-                          field(" max_num_seqs", ed_inp_seqs->Render() | flex)}),
-                    hbox({field(" gpu_mem_util", ed_inp_gpumem->Render() | flex),
-                          field(" max_batched", ed_inp_batched->Render() | flex)}),
-                    hbox({field(" tensor_par", ed_inp_tp->Render() | flex),
-                          field(" pipeline_par", ed_inp_pp->Render() | flex)}),
-                    hbox({field(" dtype", ed_inp_dtype->Render() | flex),
-                          field(" quantization", ed_inp_quant->Render() | flex)}),
-                    field(" tool_call_parser", ed_inp_toolparser->Render() | flex),
-                    hbox({ed_cb_sleep->Render(), text("  "), ed_cb_prefix->Render(), text("  "),
-                          ed_cb_trust->Render(), text("  "), ed_cb_autotool->Render()}),
-                })),
+                sec_toggle(ed_sec_engine_btn->Render(), ed_open_engine, std::move(engine_body)),
                 sec_toggle(ed_sec_caps_btn->Render(), ed_open_caps, vbox({
                     hbox({ed_cb_reasoning->Render(), text("   "), ed_cb_memories->Render(), text("   "),
                           ed_cb_tools->Render()}),
@@ -1898,8 +2295,6 @@ void ControlUI::run() {
                                                            ed_model_info.used_filename_heuristics)) | dim,
                     vbox(std::move(tool_lines)) | size(HEIGHT, LESS_THAN, 6) | yframe,
                 })),
-                sec_static("Extra vLLM args (one per line)",
-                           ed_inp_extra->Render() | size(HEIGHT, LESS_THAN, 4) | border),
                 sec_static("Validation", vbox(std::move(validation))),
                 hbox({ed_form_btns->Render(), text("   Esc cancel · click ▸ to expand") | dim}),
             });
@@ -2090,34 +2485,14 @@ void ControlUI::run() {
         const size_t connected_nodes = std::count_if(
             nodes.begin(), nodes.end(), [](const NodeInfo& n) { return n.connected; });
 
-        // Build transcript Elements directly under the lock instead of deep-copying
-        // the whole transcript into an intermediate vector first.
-        Elements transcript_lines;
-        std::string partial_snapshot;
         std::string status_snapshot;
         std::string error_snapshot;
         std::string conv_snapshot;
         {
             std::lock_guard<std::mutex> lk(chat_mutex);
-            transcript_lines.reserve(chat_transcript.size() + 1);
-            for (const auto& line : chat_transcript) {
-                transcript_lines.push_back(text("  " + line));
-            }
-            partial_snapshot = chat_partial_assistant;
             status_snapshot = chat_status;
             error_snapshot = chat_last_error;
             conv_snapshot = chat_last_conv_id;
-        }
-        if (chat_inflight.load()) {
-            if (partial_snapshot.empty()) {
-                transcript_lines.push_back(text("  Assistant: (streaming...)") | color(Color::Cyan));
-            } else {
-                transcript_lines.push_back(
-                    text("  Assistant (streaming): " + partial_snapshot) | color(Color::Cyan));
-            }
-        }
-        if (transcript_lines.empty()) {
-            transcript_lines.push_back(text("  (no chat yet)") | color(Color::GrayDark));
         }
 
         using mm::tui::panel;
@@ -2150,7 +2525,7 @@ void ControlUI::run() {
         })) | size(WIDTH, EQUAL, 42);
 
         Element right = panel("TRANSCRIPT", conv_snapshot,
-                              vbox(std::move(transcript_lines)) | yframe | flex) | flex;
+                              chat_transcript_scroll->Render()) | flex;
 
         return vbox({header, hbox({left, text(" "), right}) | flex});
     });
@@ -2366,13 +2741,180 @@ void ControlUI::run() {
 
     //
 
-    auto main_tabs = Container::Tab(
-        {nodes_renderer, agents_renderer, activity_renderer, chat_renderer, curation_renderer}, &tab_index);
+    auto performance_renderer = Renderer(performance_comp, [&]() -> Element {
+        const int64_t now = util::now_ms();
+        if (performance_force_refresh || now - performance_refreshed_ms >= 1000) {
+            performance_force_refresh = false;
+            performance_refreshed_ms = now;
+            HttpClient cli(control_base_url_);
+            if (!control_api_token_.empty()) cli.set_bearer_token(control_api_token_);
+            auto response = cli.get("/v1/performance?tail=300");
+            if (response.ok()) {
+                try {
+                    performance_data = nlohmann::json::parse(response.body);
+                    performance_error.clear();
+                } catch (const std::exception& e) {
+                    performance_error = e.what();
+                }
+            } else {
+                performance_error = "HTTP " + std::to_string(response.status);
+            }
+        }
+
+        const auto aggregate = performance_data.value("aggregate", nlohmann::json::object());
+        const auto total_stats = aggregate.value("total_ms", nlohmann::json::object());
+        const auto ttft_stats = aggregate.value("time_to_first_token_ms", nlohmann::json::object());
+        const auto rate_stats = aggregate.value("output_tokens_per_second", nlohmann::json::object());
+        auto number = [](double value, const char* suffix) {
+            char buffer[48];
+            std::snprintf(buffer, sizeof(buffer), "%.1f%s", value, suffix);
+            return std::string(buffer);
+        };
+        Element summary = hbox({
+            mm::tui::count_tile("REQUESTS", std::to_string(aggregate.value("requests", 0)), Color::Cyan),
+            mm::tui::count_tile("SUCCESS", std::to_string(aggregate.value("successful", 0)), Color::Green),
+            mm::tui::count_tile("P50 TOTAL", number(total_stats.value("p50", 0.0), " ms"), Color::Green),
+            mm::tui::count_tile("P95 TTFT", number(ttft_stats.value("p95", 0.0), " ms"), Color::Yellow),
+            mm::tui::count_tile("AVG TOK/S", number(rate_stats.value("average", 0.0), ""), Color::Cyan),
+            mm::tui::count_tile("TOKENS", std::to_string(aggregate.value("output_tokens", 0)), Color::Magenta),
+        });
+
+        Elements rows;
+        rows.push_back(hbox({
+            mm::tui::col(text("AGENT") | bold, 15),
+            mm::tui::col(text("BACKEND") | bold, 11),
+            mm::tui::col(text("QUEUE") | bold, 10),
+            mm::tui::col(text("TTFT") | bold, 10),
+            mm::tui::col(text("TOTAL") | bold, 10),
+            mm::tui::col(text("TOK/S") | bold, 10),
+            text("RESULT") | bold,
+        }) | dim);
+        rows.push_back(separator());
+        const auto samples = performance_data.value("samples", nlohmann::json::array());
+        for (auto it = samples.rbegin(); it != samples.rend(); ++it) {
+            const auto& sample = *it;
+            const bool success = sample.value("success", false);
+            const int64_t ttft = sample.value("time_to_first_token_ms", -1LL);
+            rows.push_back(hbox({
+                mm::tui::col(text(sample.value("agent_id", std::string{})), 15),
+                mm::tui::col(text(sample.value("backend", std::string{})), 11),
+                mm::tui::col(text(std::to_string(sample.value("queue_ms", 0LL)) + " ms"), 10),
+                mm::tui::col(text(ttft >= 0 ? std::to_string(ttft) + " ms" : "--"), 10),
+                mm::tui::col(text(std::to_string(sample.value("total_ms", 0LL)) + " ms"), 10),
+                mm::tui::col(text(number(sample.value("output_tokens_per_second", 0.0), "")), 10),
+                text(success ? "ok" : "failed") | color(success ? Color::Green : Color::Red),
+            }));
+            const std::string error = sample.value("error", std::string{});
+            if (!error.empty()) rows.push_back(paragraph("  " + error) | color(Color::Red));
+        }
+        if (samples.empty()) rows.push_back(text("No completed inference samples this session.") | dim);
+
+        Elements page = {summary, separator()};
+        if (!performance_error.empty())
+            page.push_back(paragraph("Performance endpoint: " + performance_error) | color(Color::Red));
+        page.push_back(mm::tui::panel("RECENT REQUESTS", vbox(std::move(rows)) | yframe | flex));
+        page.push_back(performance_buttons->Render());
+        page.push_back(text("Session rolling history; input-token counts are estimated when the backend omits usage.") | dim);
+        return vbox(std::move(page));
+    });
+
+    auto voice_renderer = Renderer(voice_comp, [&]() -> Element {
+        const auto configs = agents_.list_agents();
+        voice_agent_entries.clear();
+        for (const auto& config : configs) voice_agent_entries.push_back(config.name + " [" + config.id + "]");
+        if (voice_agent_sel >= static_cast<int>(configs.size()))
+            voice_agent_sel = std::max(0, static_cast<int>(configs.size()) - 1);
+        const std::string agent_id = selected_voice_agent();
+        const int64_t now = util::now_ms();
+        if (!agent_id.empty() && (voice_force_refresh.exchange(false) ||
+            voice_loaded_agent != agent_id || now - voice_refreshed_ms >= 2000)) {
+            voice_loaded_agent = agent_id;
+            voice_refreshed_ms = now;
+            auto client = voice_client();
+            auto response = client->get("/v1/agents/" + agent_id + "/voice");
+            if (response.ok()) {
+                try { voice_state = nlohmann::json::parse(response.body); }
+                catch (const std::exception& e) { set_voice_status(e.what()); }
+            } else {
+                set_voice_status("voice state HTTP " + std::to_string(response.status));
+            }
+        }
+
+        const auto proposals = voice_state.value("proposals", nlohmann::json::array());
+        voice_proposal_entries.clear();
+        for (const auto& proposal : proposals) {
+            voice_proposal_entries.push_back(
+                proposal.value("display_name", std::string{"proposal"}) + "  [" +
+                proposal.value("status", std::string{"pending"}) + "]");
+        }
+        if (voice_proposal_sel >= static_cast<int>(proposals.size()))
+            voice_proposal_sel = std::max(0, static_cast<int>(proposals.size()) - 1);
+
+        const auto proposal = selected_voice_proposal();
+        Elements detail_rows;
+        if (proposal.empty()) {
+            detail_rows.push_back(text("No proposal selected. Use Propose with blank fields for an agent-generated design.") | dim);
+        } else {
+            detail_rows.push_back(text(proposal.value("display_name", std::string{})) | bold);
+            detail_rows.push_back(text("status: " + proposal.value("status", std::string{})) |
+                color(proposal.value("status", std::string{}) == "approved" ? Color::Green : Color::Yellow));
+            detail_rows.push_back(paragraph("description: " + proposal.value("voice_description", std::string{})));
+            detail_rows.push_back(paragraph("sample: " + proposal.value("sample_text", std::string{})) | dim);
+            const std::string error = proposal.value("error", std::string{});
+            if (!error.empty()) detail_rows.push_back(paragraph(error) | color(Color::Red));
+        }
+
+        const auto player = audio_player.status();
+        const float ratio = player.duration_seconds > 0.0f
+            ? std::clamp(player.position_seconds / player.duration_seconds, 0.0f, 1.0f) : 0.0f;
+        char playback[96];
+        std::snprintf(playback, sizeof(playback), "%s %.1f / %.1f sec  volume %.0f%%",
+                      player.playing ? "playing" : "paused", player.position_seconds,
+                      player.duration_seconds, player.volume * 100.0f);
+        std::string status_snapshot;
+        {
+            std::lock_guard<std::mutex> lock(voice_status_mutex);
+            status_snapshot = voice_status;
+        }
+
+        Element left = mm::tui::panel("AGENTS", voice_agent_menu->Render() | yframe | flex) |
+                       size(WIDTH, EQUAL, 30);
+        Element proposals_panel = mm::tui::panel("PROPOSALS", voice_proposal_menu->Render() | yframe | flex) |
+                                  size(WIDTH, EQUAL, 34);
+        Element editor = mm::tui::panel("VOICE DESIGN", vbox({
+            text("Description (blank = agent proposes)") | dim,
+            voice_description_input->Render() | border | size(HEIGHT, LESS_THAN, 5),
+            text("Sample text") | dim,
+            voice_sample_input->Render() | border | size(HEIGHT, LESS_THAN, 4),
+            text("Speech text") | dim,
+            voice_speech_input->Render() | border | size(HEIGHT, LESS_THAN, 4),
+        })) | flex;
+        Element player_panel = mm::tui::panel("AUDIO PLAYER", vbox({
+            text(playback), gauge(ratio),
+            text(player.path.empty() ? "No audio loaded" : player.path) | dim,
+            player.error.empty() ? text("") : (paragraph(player.error) | color(Color::Yellow)),
+        }));
+
+        Elements page = {
+            hbox({left, proposals_panel, editor}) | flex,
+            mm::tui::panel("SELECTED PROPOSAL", vbox(std::move(detail_rows))),
+            player_panel,
+            voice_buttons->Render(),
+            text(status_snapshot + (voice_busy ? "  " + std::string(mm::tui::spinner_frame()) : "")) |
+                color(voice_busy ? Color::Yellow : Color::GrayDark),
+            text(voice_state.value("tts_enabled", false) ? "TTS enabled" : "TTS disabled") |
+                color(voice_state.value("tts_enabled", false) ? Color::Green : Color::Red),
+        };
+        return vbox(std::move(page));
+    });
+
+    auto main_tabs = Container::Tab({nodes_renderer, agents_renderer, activity_renderer,
+        chat_renderer, curation_renderer, performance_renderer, voice_renderer}, &tab_index);
 
     // Mockup-style header: the tab strip is real Button components (clickable +
     // focusable) rendered as `n Label` chips, the active one inverted.
-    static const std::array<const char*, 5> kTabLabels = {
-        "1 Nodes", "2 Agents", "3 Activity", "4 Chat", "5 Curation"};
+    static const std::array<const char*, 7> kTabLabels = {
+        "1 Nodes", "2 Agents", "3 Activity", "4 Chat", "5 Curation", "6 Performance", "7 Voice"};
     Components tab_buttons;
     for (int i = 0; i < static_cast<int>(kTabLabels.size()); ++i) {
         ButtonOption opt = ButtonOption::Simple();
@@ -2412,7 +2954,7 @@ void ControlUI::run() {
             text(" "),
         });
         auto footer = hbox({
-            text(" 1-5 tabs · ↑/↓ select · click rows · q quit") | dim,
+            text(" 1-7 tabs · ↑/↓ select · click rows · q quit") | dim,
             filler(),
             text("mantic-mind · control ") | dim,
         });
@@ -2436,6 +2978,8 @@ void ControlUI::run() {
             if (ev == Event::Character('2')) { tab_index = 1; return true; }
             if (ev == Event::Character('3')) { tab_index = 2; return true; }
             if (ev == Event::Character('4')) { tab_index = 3; return true; }
+            if (ev == Event::Character('6')) { tab_index = 5; return true; }
+            if (ev == Event::Character('7')) { tab_index = 6; return true; }
             if (ev == Event::Character('5')) { tab_index = 4; return true; }
             if (ev == Event::Character('f') && tab_index == 0) {
                 forget_selected_node();
@@ -2486,6 +3030,10 @@ void ControlUI::run() {
     } catch (...) {
         loop_error = "unknown exception";
     }
+    layout.set("agents.editor_width", ed_split);
+    layout.set("nodes.detail_height", node_detail_height);
+    layout.set("nodes.name_width", node_name_width);
+    layout.save();
 
     // Clear the screen callbacks first so any late refresh()/quit() from a worker
     // thread during the joins is a no-op instead of posting to an exited screen.
@@ -2502,6 +3050,7 @@ void ControlUI::run() {
     if (ticker.joinable())      ticker.join();
     if (chat_thread.joinable()) chat_thread.join();
     if (cur_thread.joinable())  cur_thread.join();
+    if (voice_thread.joinable()) voice_thread.join();
 
     if (!loop_error.empty()) {
         MM_ERROR("Control UI event loop terminated by exception: {}", loop_error);

@@ -66,17 +66,27 @@ max_slots = 4
 # Windows-native inference, and accelerators without a vLLM build (e.g. the
 # NVIDIA DGX Spark GB10).
 # llama_server_path = "llama-server"        # or MM_LLAMA_PATH; "" resolves from PATH
-# If llama_server_path cannot be resolved, the node builds a managed llama.cpp
-# under llama_provision_dir in the background (a source build can take minutes;
-# node startup and vLLM serving never block on it).
+# If llama_server_path cannot be resolved, the node first retrieves the official
+# release matching this OS, architecture, accelerator, and CUDA compatibility.
+# Source is built only when no matching release can be used. Provisioning runs
+# in the background, so node startup and vLLM serving never block on it.
 # llama_auto_provision = true
 # llama_provision_dir = "data/runtimes/llama.cpp"
-# llama_install_method = "auto"   # auto | source | release  (auto builds from source)
+# llama_install_method = "auto"   # auto (release, then source) | release | source
 # llama_version = "latest"        # git ref / release tag, or "latest"
 # llama_accelerator = ""          # cuda | rocm | vulkan | metal | cpu; "" = auto-detect
 # For the DGX Spark GB10 (aarch64, sm_121) a source build with CUDA 13+ is
 # required; set the compute capability so CMake targets it:
 # llama_cuda_arch = "121"
+# llama_build_jobs = 0          # 0 = conservative default (2 for CUDA/ROCm, 4 otherwise)
+#
+# llama.cpp updates have their own policy because an accelerator without an
+# official release (currently Linux CUDA) may require a local CMake build. The
+# prompt identifies download vs compilation before approval and offers any
+# same-platform Vulkan/CPU/other release variants published for that tag.
+# llama_update_policy = "prompt"          # prompt | auto | manual
+# llama_update_check = true
+# llama_update_check_interval_hours = 24
 
 # Total fraction of GPU memory all vLLM slots on this node may claim together.
 # Each vLLM slot reserves an explicit --gpu-memory-utilization slice out of

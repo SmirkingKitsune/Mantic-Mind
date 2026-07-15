@@ -25,6 +25,10 @@ enum class MessageRole { System, User, Assistant, Tool };
 
 enum class NodeHealthStatus { Unknown, Healthy, Degraded, Unhealthy };
 
+// Reachability is intentionally separate from health. A node that cannot be
+// contacted has unknown health; it is not necessarily resource-unhealthy.
+enum class NodeConnectionStatus { Unknown, Online, Unreachable, Offline };
+
 enum class SlotState { Empty, Loading, Ready, Suspending, Suspended, Error };
 
 // Inference engine family backing an agent or a running slot. llama.cpp is the
@@ -442,6 +446,16 @@ struct LlamaRuntimeStatus {
     // True when the installed runtime is older than latest_version. Orthogonal
     // to `status`: a runtime stays "ready" while advertising an update.
     bool        update_available = false;
+    // Planned action for the detected update: release|compile|unavailable.
+    // Empty when no update is pending or release assets could not be assessed.
+    std::string update_action;
+    // True only when an official asset matches this node's current accelerator.
+    bool        update_release_available = false;
+    // Same-platform accelerators that do have official assets (excluding the
+    // current accelerator), e.g. vulkan/cpu when Linux CUDA needs compilation.
+    std::vector<std::string> update_release_alternatives;
+    // Human-readable consequence shown before the user approves the update.
+    std::string update_warning;
 };
 
 // Live progress of an in-program vLLM runtime install/upgrade, surfaced so the
@@ -478,15 +492,21 @@ struct NodeActionProgress {
 
 struct NodeInfo {
     NodeId           id;
+    std::string      hostname;
     std::string      url;
     std::string      api_key;
     std::string      loaded_model;  // deprecated: kept for backwards compat
     NodeHealthStatus health    = NodeHealthStatus::Unknown;
+    NodeConnectionStatus connection_status = NodeConnectionStatus::Unknown;
     bool             connected = false;
     bool             remembered = false;
     std::string      platform;
     NodeCapabilities capabilities;
     NodeHealthMetrics metrics;
+    int64_t          last_seen_ms = 0;
+    int64_t          unreachable_since_ms = 0;
+    int64_t          metrics_sampled_at_ms = 0;
+    int              consecutive_failures = 0;
 
     // Multi-slot fields
     std::vector<SlotInfo>    slots;
@@ -569,6 +589,22 @@ inline NodeHealthStatus node_health_from_string(const std::string& s) {
     if (s == "degraded")  return NodeHealthStatus::Degraded;
     if (s == "unhealthy") return NodeHealthStatus::Unhealthy;
     return NodeHealthStatus::Unknown;
+}
+
+inline std::string to_string(NodeConnectionStatus s) {
+    switch (s) {
+        case NodeConnectionStatus::Online:      return "online";
+        case NodeConnectionStatus::Unreachable: return "unreachable";
+        case NodeConnectionStatus::Offline:     return "offline";
+        default:                                return "unknown";
+    }
+}
+
+inline NodeConnectionStatus node_connection_from_string(const std::string& s) {
+    if (s == "online")      return NodeConnectionStatus::Online;
+    if (s == "unreachable") return NodeConnectionStatus::Unreachable;
+    if (s == "offline")     return NodeConnectionStatus::Offline;
+    return NodeConnectionStatus::Unknown;
 }
 
 inline std::string to_string(SlotState s) {
@@ -1169,7 +1205,11 @@ inline void to_json(nlohmann::json& j, const LlamaRuntimeStatus& r) {
           {"last_error",       r.last_error},
           {"accelerator",      r.accelerator},
           {"latest_version",   r.latest_version},
-          {"update_available", r.update_available} };
+          {"update_available", r.update_available},
+          {"update_action",    r.update_action},
+          {"update_release_available", r.update_release_available},
+          {"update_release_alternatives", r.update_release_alternatives},
+          {"update_warning",   r.update_warning} };
 }
 inline void from_json(const nlohmann::json& j, LlamaRuntimeStatus& r) {
     if (j.contains("status"))           j.at("status").get_to(r.status);
@@ -1183,6 +1223,12 @@ inline void from_json(const nlohmann::json& j, LlamaRuntimeStatus& r) {
     if (j.contains("accelerator"))      j.at("accelerator").get_to(r.accelerator);
     if (j.contains("latest_version"))   j.at("latest_version").get_to(r.latest_version);
     if (j.contains("update_available")) j.at("update_available").get_to(r.update_available);
+    if (j.contains("update_action")) j.at("update_action").get_to(r.update_action);
+    if (j.contains("update_release_available"))
+        j.at("update_release_available").get_to(r.update_release_available);
+    if (j.contains("update_release_alternatives"))
+        j.at("update_release_alternatives").get_to(r.update_release_alternatives);
+    if (j.contains("update_warning")) j.at("update_warning").get_to(r.update_warning);
 }
 
 inline void to_json(nlohmann::json& j, const VllmInstallProgress& p) {
@@ -1239,14 +1285,20 @@ inline void from_json(const nlohmann::json& j, NodeActionProgress& p) {
 
 inline void to_json(nlohmann::json& j, const NodeInfo& n) {
     j = { {"id",            n.id},
+          {"hostname",      n.hostname},
           {"url",           n.url},
           {"loaded_model",  n.loaded_model},
           {"health",        to_string(n.health)},
+          {"connection_status", to_string(n.connection_status)},
           {"connected",     n.connected},
           {"remembered",    n.remembered},
           {"platform",      n.platform},
           {"capabilities",  n.capabilities},
           {"metrics",       n.metrics},
+          {"last_seen_ms",  n.last_seen_ms},
+          {"unreachable_since_ms", n.unreachable_since_ms},
+          {"metrics_sampled_at_ms", n.metrics_sampled_at_ms},
+          {"consecutive_failures", n.consecutive_failures},
           {"slots",         n.slots},
           {"cached_models", n.cached_models},
           {"disk_free_mb",  n.disk_free_mb},
@@ -1270,14 +1322,23 @@ inline void to_json(nlohmann::json& j, const NodeInfo& n) {
 inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     j.at("id").get_to(n.id);
     j.at("url").get_to(n.url);
+    if (j.contains("hostname"))      j.at("hostname").get_to(n.hostname);
     if (j.contains("api_key"))       j.at("api_key").get_to(n.api_key);
     if (j.contains("loaded_model"))  j.at("loaded_model").get_to(n.loaded_model);
     if (j.contains("health"))        n.health = node_health_from_string(j.at("health").get<std::string>());
     if (j.contains("connected"))     j.at("connected").get_to(n.connected);
+    if (j.contains("connection_status"))
+        n.connection_status = node_connection_from_string(j.at("connection_status").get<std::string>());
+    else if (n.connected)
+        n.connection_status = NodeConnectionStatus::Online;
     if (j.contains("remembered"))    j.at("remembered").get_to(n.remembered);
     if (j.contains("platform"))      j.at("platform").get_to(n.platform);
     if (j.contains("capabilities"))  j.at("capabilities").get_to(n.capabilities);
     if (j.contains("metrics"))       j.at("metrics").get_to(n.metrics);
+    if (j.contains("last_seen_ms"))  j.at("last_seen_ms").get_to(n.last_seen_ms);
+    if (j.contains("unreachable_since_ms")) j.at("unreachable_since_ms").get_to(n.unreachable_since_ms);
+    if (j.contains("metrics_sampled_at_ms")) j.at("metrics_sampled_at_ms").get_to(n.metrics_sampled_at_ms);
+    if (j.contains("consecutive_failures")) j.at("consecutive_failures").get_to(n.consecutive_failures);
     if (j.contains("slots"))         j.at("slots").get_to(n.slots);
     if (j.contains("cached_models")) j.at("cached_models").get_to(n.cached_models);
     if (j.contains("disk_free_mb"))  j.at("disk_free_mb").get_to(n.disk_free_mb);

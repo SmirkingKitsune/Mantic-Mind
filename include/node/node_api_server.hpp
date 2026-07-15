@@ -36,11 +36,19 @@ public:
     using VllmUpdateCallback = std::function<VllmRuntimeStatus()>;
     // On-demand online probe for a newer build; never installs.
     using VllmCheckUpdateCallback = std::function<VllmRuntimeStatus()>;
+    using LlamaProvisionCallback = std::function<LlamaRuntimeStatus()>;
+    // accelerator is empty for the current target, or an explicit release
+    // alternative selected from LlamaRuntimeStatus.
+    using LlamaUpdateCallback = std::function<LlamaRuntimeStatus(const std::string& accelerator)>;
+    using LlamaCheckUpdateCallback = std::function<LlamaRuntimeStatus()>;
     void set_runtime_logs_provider(RuntimeLogsProvider provider);
     void set_remember_api_key_callback(RememberApiKeyCallback callback);
     void set_vllm_provision_callback(VllmProvisionCallback callback);
     void set_vllm_update_callback(VllmUpdateCallback callback);
     void set_vllm_check_update_callback(VllmCheckUpdateCallback callback);
+    void set_llama_provision_callback(LlamaProvisionCallback callback);
+    void set_llama_update_callback(LlamaUpdateCallback callback);
+    void set_llama_check_update_callback(LlamaCheckUpdateCallback callback);
     // Ray CLI config for the multi-node engine-group endpoints.
     void set_ray_config(std::string ray_path, uint16_t ray_port);
     // HF model-cache config: the `hf` CLI and the resolved hub cache directory.
@@ -65,6 +73,9 @@ private:
     VllmProvisionCallback vllm_provision_cb_;
     VllmUpdateCallback vllm_update_cb_;
     VllmCheckUpdateCallback vllm_check_update_cb_;
+    LlamaProvisionCallback llama_provision_cb_;
+    LlamaUpdateCallback llama_update_cb_;
+    LlamaCheckUpdateCallback llama_check_update_cb_;
 
     void register_routes();
     bool check_auth(const std::string& auth_header);

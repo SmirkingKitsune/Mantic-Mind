@@ -26,10 +26,14 @@ public:
     // update prompt's "Update now"). Must return promptly — the implementation
     // should run the (slow) install off the UI thread.
     using RequestVllmUpdateCallback = std::function<void()>;
+    // Empty accelerator approves the assessed current-backend action. A value
+    // such as vulkan/cpu selects an official release alternative.
+    using RequestLlamaUpdateCallback = std::function<void(std::string accelerator)>;
 
     NodeUI(NodeState& state, uint16_t listen_port,
            ForgetPairingCallback forget_pairing_cb = {},
-           RequestVllmUpdateCallback request_vllm_update_cb = {});
+           RequestVllmUpdateCallback request_vllm_update_cb = {},
+           RequestLlamaUpdateCallback request_llama_update_cb = {});
     ~NodeUI();
 
     // Append a log line from the runtime engine (thread-safe, posts to UI event loop).
@@ -46,6 +50,7 @@ private:
     uint16_t   listen_port_;
     ForgetPairingCallback forget_pairing_cb_;
     RequestVllmUpdateCallback request_vllm_update_cb_;
+    RequestLlamaUpdateCallback request_llama_update_cb_;
 
     static constexpr size_t kMaxLogLines = 4000;
     static constexpr int    kLogScrollPage = 8;

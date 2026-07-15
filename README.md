@@ -20,7 +20,7 @@ Distributed LLM inference cluster — two executables that turn any collection o
 | MSVC (Windows) | VS 2022 |
 | GCC / Clang (Linux) | GCC 12 / Clang 15 |
 | Apple Clang (macOS) | Xcode 15 command-line tools |
-| llama.cpp (`llama-server`) | on each node — resolved from PATH or auto-built by the node (managed source build; DGX Spark needs CUDA 13+ for `sm_121`) |
+| llama.cpp (`llama-server`) | on each node — resolved from PATH or provisioned from an environment-matched official GitHub release; source builds are the last resort (DGX Spark needs CUDA 13+ for `sm_121`) |
 | Python + vLLM | optional, per node — only for agents with `inference_backend = "vllm"`; an existing `vllm` executable is used, and a managed install is created only when `vllm_auto_provision = true` |
 
 Runtime extras (node side, optional):
@@ -373,12 +373,16 @@ After file loading, matching environment variables override config values.
 | `control_url` | `MM_CONTROL_URL` | *(empty)* | Control base URL (empty = standalone) |
 | `control_api_key` | `MM_CONTROL_API_KEY` | *(empty)* | Bearer token for control |
 | `llama_server_path` | `MM_LLAMA_PATH` | `llama-server` | `llama-server` executable used for llama.cpp engine slots (default runtime) |
-| `llama_auto_provision` | `MM_LLAMA_AUTO_PROVISION` | `true` | Build a managed llama.cpp when `llama_server_path` is unresolved |
+| `llama_auto_provision` | `MM_LLAMA_AUTO_PROVISION` | `true` | Provision a managed llama.cpp when `llama_server_path` is unresolved |
 | `llama_provision_dir` | `MM_LLAMA_PROVISION_DIR` | `data/runtimes/llama.cpp` | Managed llama.cpp runtime root |
-| `llama_install_method` | `MM_LLAMA_INSTALL_METHOD` | `auto` | Provisioning method: `auto` (source), `source`, or `release` |
-| `llama_version` | `MM_LLAMA_VERSION` | `latest` | llama.cpp git ref / release tag used by provisioning |
-| `llama_accelerator` | `MM_LLAMA_ACCELERATOR` | *(auto)* | Build accelerator: `cuda`, `rocm`, `vulkan`, `metal`, `cpu` |
-| `llama_cuda_arch` | `MM_LLAMA_CUDA_ARCH` | *(default)* | CUDA compute capability for source builds (e.g. `121` for DGX Spark GB10) |
+| `llama_install_method` | `MM_LLAMA_INSTALL_METHOD` | `auto` | Provisioning method: `auto` (matched release, then source fallback), `release`, or `source` |
+| `llama_version` | `MM_LLAMA_VERSION` | `latest` | llama.cpp release tag / source ref used by provisioning |
+| `llama_accelerator` | `MM_LLAMA_ACCELERATOR` | *(auto)* | Release/build accelerator: `cuda`, `rocm`, `vulkan`, `metal`, `cpu` |
+| `llama_cuda_arch` | `MM_LLAMA_CUDA_ARCH` | *(auto)* | CUDA compute capability for source builds (e.g. `121` for DGX Spark GB10); detected with `nvidia-smi` when empty |
+| `llama_build_jobs` | `MM_LLAMA_BUILD_JOBS` | `0` | Source-build concurrency; `0` uses 2 jobs for CUDA/ROCm and 4 otherwise |
+| `llama_update_policy` | `MM_LLAMA_UPDATE_POLICY` | `prompt` | llama.cpp update behavior: `prompt`, `auto`, or `manual` |
+| `llama_update_check` | `MM_LLAMA_UPDATE_CHECK` | `true` | Periodically inspect the latest llama.cpp tag and its release assets |
+| `llama_update_check_interval_hours` | `MM_LLAMA_UPDATE_CHECK_INTERVAL_HOURS` | `24` | llama.cpp update-check interval |
 | `vllm_server_path` | `MM_VLLM_PATH` | `vllm` | `vllm` CLI / wrapper used to launch engines (opt-in peer backend) |
 | `vllm_auto_provision` | `MM_VLLM_AUTO_PROVISION` | `false` | Auto-create a managed vLLM runtime when `vllm_server_path` is unresolved |
 | `vllm_provision_dir` | `MM_VLLM_PROVISION_DIR` | `data/runtimes/vllm` | Managed vLLM runtime root |
@@ -404,6 +408,22 @@ After file loading, matching environment variables override config values.
 | `discovery_port` | `MM_DISCOVERY_PORT` | `7072` | UDP discovery port |
 | `log_file` | `MM_LOG_FILE` | `logs/mantic-mind.log` | Log file |
 
+For `llama_install_method = "auto"`, the node matches the release asset to the
+node OS, CPU architecture, accelerator, and supported CUDA version. Windows
+CUDA installs collect the base server archive, CUDA backend, and matching CUDA
+runtime DLL archive as one runnable directory. If upstream does not publish a
+matching accelerated asset (for example, Linux CUDA in the current release
+matrix), the node logs that reason before attempting the source-build fallback.
+Source builds preflight Git, CMake, a C++ compiler, and `nvcc` for CUDA; use a
+separate CMake cache per platform/architecture/accelerator; auto-detect visible
+CUDA compute capabilities; limit parallel compiler jobs; and validate the
+resulting `llama-server` before activation. Under the default `prompt` update
+policy, the node inspects the new tag's asset names before asking for approval.
+The prompt explicitly says when approval will compile locally and provides
+buttons for published alternatives such as Vulkan or CPU. A selected managed
+alternative is recorded in `active-runtime.json` so it remains active after a
+restart unless an explicit accelerator config supersedes it.
+
 ### `mantic-mind-control.toml` — control config
 
 | Key | Env var | Default | Description |
@@ -413,6 +433,7 @@ After file loading, matching environment variables override config values.
 | `data_dir` | `MM_DATA_DIR` | `data` | Agent database root; remembered nodes are stored in `nodes.json` |
 | `models_dir` | `MM_MODELS_DIR` | `models` | Optional local model directory root |
 | `node_health_poll_interval_s` | `MM_POLL_INTERVAL_S` | `30` | Health/metrics poll interval |
+| `node_offline_after_s` | `MM_NODE_OFFLINE_AFTER_S` | `90` | Time without a successful poll before an unreachable node is labeled offline |
 | `external_api_token` | `MM_CONTROL_EXTERNAL_API_TOKEN` | *(empty)* | When set, required as `Authorization: Bearer` on all external `/v1/*` routes |
 | `pairing_key` | `MM_PAIRING_KEY` | *(empty)* | PSK for automatic node/control pairing |
 | `discovery_port` | `MM_DISCOVERY_PORT` | `7072` | UDP discovery port |
@@ -458,6 +479,10 @@ POST   /api/node/infer          { InferenceRequest, slot_id? }  -> SSE
 POST   /api/node/models/pull    { model_ref }           (HF pre-fetch; Linux only, 501 elsewhere)
 GET    /api/node/runtime/vllm   -> { vllm_runtime }
 POST   /api/node/runtime/vllm/provision -> { vllm_runtime }
+POST   /api/node/runtime/vllm/check-update -> { vllm_runtime }
+GET    /api/node/runtime/llama  -> { llama_runtime }
+POST   /api/node/runtime/llama/provision { update?, accelerator? } -> { llama_runtime }
+POST   /api/node/runtime/llama/check-update -> { llama_runtime }
 POST   /api/node/ray/start      { role: "head"|"worker", head_address? }  (Linux only)
 POST   /api/node/ray/stop
 GET    /api/node/health         -> NodeHealthMetrics
@@ -586,15 +611,27 @@ mantic-mind  (:7070)
 
 | Key | Action |
 |---|---|
-| `1` / `2` / `3` / `4` / `5` | Switch tabs (Nodes / Agents / Activity / Chat / Curation) |
+| `1` / `2` / `3` / `4` / `5` / `6` / `7` | Switch control tabs (Nodes / Agents / Activity / Chat / Curation / Performance / Voice) |
 | `q` | Quit |
 | `Esc` | Close modal / editor, or quit |
 
 Node TUI extras:
 
+- `1` / `2` / `3` / `4`: switch Overview / Runtimes / Models & Slots / Logs
 - `j` / `k` or Arrow Down / Arrow Up: scroll engine output
 - `PgUp` / `PgDn`: faster log scrolling
 - `End`: jump back to live tail
+
+Both TUIs expose draggable pane dividers and persist their layout beneath
+`data/`. Long generated text is word-wrapped and keyboard/mouse scrollable.
+The node and control screens expose model-slot, runtime, Ray, and provisioning
+actions where supported. Startup-only settings remain in TOML/environment config.
+
+The control Performance tab displays a bounded, process-session history of
+queue time, time to first token, total latency, estimated input tokens, output
+tokens, and output tokens/second. The same data is available from
+`GET /v1/performance` and can be reset with `DELETE /v1/performance`. The Voice
+tab supports proposal review, preview/speech generation, and local playback.
 
                                                                  ░             ░█                   
                                                            ░█░██  ░ ██       █░█                    
@@ -645,4 +682,4 @@ Node TUI extras:
                                 ████████████▒░░░  ░░░░░▓████████████░                               
                                     ▒██████████████████████████▒░                                   
                                          ░░ ▒██████████▒  ░                                         
-                                                   ░ 
+                                                   ░

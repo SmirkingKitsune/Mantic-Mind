@@ -14,6 +14,7 @@ namespace mm {
 struct DiscoveredNode {
     std::string url;
     std::string node_id;
+    std::string hostname;
     int64_t     last_seen_ms = 0;
 };
 
@@ -24,7 +25,7 @@ public:
     NodeDiscoveryBroadcaster() = default;
     ~NodeDiscoveryBroadcaster() { stop(); }
 
-    void start(const std::string& url, const std::string& node_id,
+    void start(const std::string& url, const std::string& node_id, const std::string& hostname,
                uint16_t port = 7072, int interval_s = 5);
     void stop();
 

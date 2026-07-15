@@ -15,6 +15,7 @@
 #include "control/engine_group_planner.hpp"
 #include "control/control_api_server.hpp"
 #include "control/node_registry.hpp"
+#include "control/performance_tracker.hpp"
 #include "control/tts_service_client.hpp"
 #include "common/gguf_metadata.hpp"
 #include "common/inference_sizing.hpp"
@@ -3278,7 +3279,34 @@ bool test_llama_install_plan_and_method() {
     CHECK(joined.find("clone") != std::string::npos);
     CHECK(joined.find("-DGGML_CUDA=ON") != std::string::npos);
     CHECK(joined.find("-DCMAKE_CUDA_ARCHITECTURES=121") != std::string::npos);
+    CHECK(joined.find("linux-x64-cuda") != std::string::npos); // isolated CMake cache
+    CHECK(joined.find("nvcc") != std::string::npos);            // CUDA preflight
+    CHECK(joined.find("--parallel 2") != std::string::npos);    // conservative default
     CHECK(joined.find("llama-server") != std::string::npos);  // build target
+
+    // Auto starts with an official release lookup, not a source build.
+    cfg.install_method = "auto";
+    const auto auto_plan = mm::build_llama_install_plan(cfg, false);
+    CHECK(auto_plan.size() == 1);
+    CHECK(auto_plan.front().argv.front() == "python3");
+    std::string auto_joined;
+    for (const auto& a : auto_plan.front().argv) auto_joined += a + " ";
+    CHECK(auto_joined.find("api.github.com/repos/ggml-org/llama.cpp") != std::string::npos);
+    CHECK(auto_joined.find("bin-ubuntu-cuda") != std::string::npos);
+    CHECK(auto_joined.find("git clone") == std::string::npos);
+
+    // Current Windows releases need the base/server archive plus the selected
+    // backend, and CUDA needs the matching runtime DLL archive as well.
+    cfg.platform = "windows";
+    const auto windows_plan = mm::build_llama_install_plan(cfg, false);
+    CHECK(windows_plan.size() == 1);
+    CHECK(windows_plan.front().argv.front() == "powershell");
+    std::string windows_joined;
+    for (const auto& a : windows_plan.front().argv) windows_joined += a + " ";
+    CHECK(windows_joined.find("bin-win-cpu") != std::string::npos);
+    CHECK(windows_joined.find("bin-win-cuda") != std::string::npos);
+    CHECK(windows_joined.find("cudart-llama-bin-win-cuda") != std::string::npos);
+    CHECK(windows_joined.find("nvidia-smi") != std::string::npos);
     return true;
 }
 
@@ -3314,6 +3342,142 @@ bool test_llama_provisioner_disabled_and_cancel() {
     CHECK(st2.status == "failed");
     CHECK(st2.last_error.find("canceled") != std::string::npos);
     CHECK(!ran);
+
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_llama_auto_release_then_source_fallback() {
+    auto dir = temp_test_dir("llama-auto-fallback");
+    mm::LlamaProvisionConfig cfg;
+    cfg.requested_executable = "definitely-not-a-real-llama-server-auto";
+    cfg.provision_dir = (dir / "prov").string();
+    cfg.auto_provision = true;
+    cfg.install_method = "auto";
+    cfg.platform = "linux";
+    cfg.arch = "x86_64";
+    cfg.accelerator = "cuda";
+
+    bool saw_release = false;
+    bool saw_source = false;
+    mm::LlamaCommandRunner runner;
+    runner.run = [&](const std::vector<std::string>& argv,
+                     const std::filesystem::path&,
+                     const mm::StreamLineCallback&,
+                     const mm::CancelCheckCallback&,
+                     std::string* error) {
+        if (!argv.empty() && argv.front() == "python3") {
+            saw_release = true;
+            if (error) *error = "no matching Linux CUDA release";
+            return 1;
+        }
+        saw_source = true;
+        const auto build_it = std::find(argv.begin(), argv.end(), "--build");
+        if (build_it != argv.end() && std::next(build_it) != argv.end()) {
+            const auto exe = std::filesystem::path(*std::next(build_it)) / "bin"
+                / "llama-server";
+            std::filesystem::create_directories(exe.parent_path());
+            std::ofstream(exe) << "fake llama-server";
+        }
+        return 0;
+    };
+    runner.capture_first_line = [](const std::vector<std::string>&,
+                                   const std::filesystem::path&) {
+        return std::string{"version b9999"};
+    };
+
+    mm::LlamaCppProvisioner provisioner(cfg, runner);
+    const auto status = provisioner.ensure_runtime();
+    CHECK(saw_release);
+    CHECK(saw_source);
+    CHECK(status.status == "ready");
+    CHECK(status.method == "source");
+    CHECK(status.executable_path.find("llama.cpp-src") != std::string::npos);
+
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_llama_update_release_decision() {
+    auto dir = temp_test_dir("llama-update-decision");
+    mm::LlamaProvisionConfig cfg;
+    cfg.requested_executable = "definitely-not-a-real-llama-server-update";
+    cfg.provision_dir = (dir / "prov").string();
+    cfg.auto_provision = false;
+    cfg.install_method = "auto";
+    cfg.platform = "linux";
+    cfg.arch = "x86_64";
+    cfg.accelerator = "cuda";
+
+    auto source_cfg = cfg;
+    source_cfg.install_method = "source";
+    const auto managed = mm::managed_llama_executable_path(source_cfg);
+    std::filesystem::create_directories(managed.parent_path());
+    std::ofstream(managed) << "fake llama-server";
+
+    const std::vector<std::string> assets{
+        "llama-b1001-bin-ubuntu-x64.tar.gz",
+        "llama-b1001-bin-ubuntu-vulkan-x64.tar.gz",
+    };
+    const auto available = mm::llama_release_accelerators(assets, cfg);
+    CHECK(available == std::vector<std::string>({"vulkan", "cpu"}));
+
+    mm::LlamaCommandRunner runner;
+    runner.run = [&](const std::vector<std::string>& argv,
+                     const std::filesystem::path&,
+                     const mm::StreamLineCallback&,
+                     const mm::CancelCheckCallback&,
+                     std::string*) {
+        if (!argv.empty() && argv.front() == "python3") {
+            const auto executable = dir / "prov" / "release" / "bin" / "llama-server";
+            std::filesystem::create_directories(executable.parent_path());
+            std::ofstream(executable) << "fake Vulkan llama-server";
+        }
+        return 0;
+    };
+    runner.capture_first_line = [](const std::vector<std::string>&,
+                                   const std::filesystem::path&) {
+        return std::string{"llama.cpp version: 1000 (deadbeef)"};
+    };
+    std::string latest = "b1000";
+    runner.fetch_latest = [&](const mm::LlamaProvisionConfig&) {
+        return latest;
+    };
+    runner.fetch_release_assets = [assets](const mm::LlamaProvisionConfig&,
+                                           const std::string&) { return assets; };
+
+    mm::LlamaCppProvisioner provisioner(cfg, runner);
+    CHECK(provisioner.ensure_runtime().status == "ready");
+    CHECK(!provisioner.check_for_update().update_available);
+    latest = "b1001";
+    const auto update = provisioner.check_for_update();
+    CHECK(update.update_available);
+    CHECK(update.update_action == "compile");
+    CHECK(!update.update_release_available);
+    CHECK(update.update_release_alternatives ==
+          std::vector<std::string>({"vulkan", "cpu"}));
+    CHECK(update.update_warning.find("compile llama-server from source") != std::string::npos);
+
+    nlohmann::json encoded = update;
+    const auto decoded = encoded.get<mm::LlamaRuntimeStatus>();
+    CHECK(decoded.update_action == "compile");
+    CHECK(decoded.update_release_alternatives == update.update_release_alternatives);
+
+    const auto switched = provisioner.update_runtime("vulkan");
+    CHECK(switched.status == "ready");
+    CHECK(switched.method == "release");
+    CHECK(switched.accelerator == "vulkan");
+    CHECK(std::filesystem::exists(dir / "prov" / "active-runtime.json"));
+
+    mm::LlamaCppProvisioner restarted(cfg, runner);
+    const auto restored = restarted.ensure_runtime();
+    CHECK(restored.status == "ready");
+    CHECK(restored.method == "release");
+    CHECK(restored.accelerator == "vulkan");
+    const auto restored_update = restarted.check_for_update();
+    CHECK(restored_update.update_action == "release");
+    CHECK(restored_update.update_release_available);
+    CHECK(restarted.update_runtime().accelerator == "vulkan");
 
     CHECK(remove_tree(dir));
     return true;
@@ -3425,6 +3589,94 @@ bool test_llama_default_backend_and_isolation() {
     return true;
 }
 
+bool test_node_reachability_and_json_compatibility() {
+    CHECK(mm::classify_node_reachability(1000, 90999, 90000) ==
+          mm::NodeConnectionStatus::Unreachable);
+    CHECK(mm::classify_node_reachability(1000, 91000, 90000) ==
+          mm::NodeConnectionStatus::Offline);
+    CHECK(mm::classify_node_reachability(1000, 1001, 0) ==
+          mm::NodeConnectionStatus::Offline);
+    CHECK(mm::classify_node_reachability(0, 91000, 90000) ==
+          mm::NodeConnectionStatus::Unreachable);
+
+    mm::NodeInfo source;
+    source.id = "node-1";
+    source.hostname = "workstation";
+    source.url = "http://127.0.0.1:7070";
+    source.health = mm::NodeHealthStatus::Degraded;
+    source.connection_status = mm::NodeConnectionStatus::Offline;
+    source.last_seen_ms = 1000;
+    source.unreachable_since_ms = 2000;
+    source.metrics_sampled_at_ms = 900;
+    source.consecutive_failures = 4;
+
+    const nlohmann::json encoded = source;
+    const auto decoded = encoded.get<mm::NodeInfo>();
+    CHECK(decoded.id == source.id);
+    CHECK(decoded.hostname == source.hostname);
+    CHECK(decoded.connection_status == mm::NodeConnectionStatus::Offline);
+    CHECK(decoded.health == mm::NodeHealthStatus::Degraded);
+    CHECK(decoded.last_seen_ms == 1000);
+    CHECK(decoded.unreachable_since_ms == 2000);
+    CHECK(decoded.metrics_sampled_at_ms == 900);
+    CHECK(decoded.consecutive_failures == 4);
+
+    const nlohmann::json legacy = {
+        {"id", "legacy-node"},
+        {"url", "http://127.0.0.1:7071"},
+        {"connected", true},
+    };
+    const auto legacy_node = legacy.get<mm::NodeInfo>();
+    CHECK(legacy_node.connection_status == mm::NodeConnectionStatus::Online);
+    return true;
+}
+
+bool test_performance_tracker_capacity_aggregation_and_clear() {
+    mm::PerformanceTracker tracker(2);
+
+    mm::PerformanceSample first;
+    first.request_id = "a";
+    first.total_ms = 100;
+    first.time_to_first_token_ms = 20;
+    first.input_tokens = 3;
+    first.output_tokens = 8;
+    first.success = true;
+    tracker.record(first);
+
+    mm::PerformanceSample second;
+    second.request_id = "b";
+    second.total_ms = 300;
+    second.input_tokens = 2;
+    second.success = false;
+    second.error = "failed";
+    tracker.record(second);
+
+    mm::PerformanceSample third;
+    third.request_id = "c";
+    third.total_ms = 500;
+    third.time_to_first_token_ms = 100;
+    third.input_tokens = 7;
+    third.output_tokens = 20;
+    third.success = true;
+    tracker.record(third);
+
+    const auto snapshot = tracker.snapshot(10);
+    CHECK(snapshot.at("session").get<bool>());
+    CHECK(snapshot.at("samples").size() == 2);
+    CHECK(snapshot.at("samples").at(0).at("request_id") == "b");
+    CHECK(snapshot.at("samples").at(1).at("request_id") == "c");
+    CHECK(snapshot.at("aggregate").at("requests") == 2);
+    CHECK(snapshot.at("aggregate").at("successful") == 1);
+    CHECK(snapshot.at("aggregate").at("failed") == 1);
+    CHECK(snapshot.at("aggregate").at("input_tokens") == 9);
+    CHECK(snapshot.at("aggregate").at("total_ms").at("p50") == 400.0);
+    CHECK(snapshot.at("samples").at(1).at("output_tokens_per_second") == 50.0);
+
+    tracker.clear();
+    CHECK(tracker.snapshot(10).at("samples").empty());
+    return true;
+}
+
 bool test_inference_sizing_estimate() {
     // Unknown model path falls back to a positive estimate (never zero), and the
     // effective server context honors ctx_size * parallel.
@@ -3519,12 +3771,20 @@ int main(int argc, char** argv) {
         {"llama_install_plan_and_method", test_llama_install_plan_and_method},
         {"llama_provisioner_disabled_and_cancel",
          test_llama_provisioner_disabled_and_cancel},
+        {"llama_auto_release_then_source_fallback",
+         test_llama_auto_release_then_source_fallback},
+        {"llama_update_release_decision",
+         test_llama_update_release_decision},
         {"llama_slot_info_backend_and_suspend",
          test_llama_slot_info_backend_and_suspend},
         {"runtime_client_health_empty_body_ok",
          test_runtime_client_health_empty_body_ok},
         {"llama_default_backend_and_isolation",
          test_llama_default_backend_and_isolation},
+        {"node_reachability_and_json_compatibility",
+         test_node_reachability_and_json_compatibility},
+        {"performance_tracker_capacity_aggregation_and_clear",
+         test_performance_tracker_capacity_aggregation_and_clear},
         {"inference_sizing_estimate", test_inference_sizing_estimate},
     };
 

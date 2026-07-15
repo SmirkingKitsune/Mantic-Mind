@@ -238,8 +238,10 @@ void NodeState::set_vllm_install_progress(const VllmInstallProgress& p) {
             action_progress_.active && action_progress_.operation_id == action.operation_id
                 ? action_progress_.cancel_requested
                 : false;
-        action_progress_ = std::move(action);
-    } else if (action_progress_.kind == "runtime") {
+        if (!action_progress_.active ||
+            action_progress_.operation_id == action.operation_id)
+            action_progress_ = std::move(action);
+    } else if (action_progress_.operation_id == "vllm-runtime") {
         action_progress_ = {};
     }
 }
@@ -251,6 +253,10 @@ NodeActionProgress NodeState::get_action_progress() const {
 
 void NodeState::set_action_progress(const NodeActionProgress& p) {
     std::lock_guard<std::mutex> g(mutex_);
+    if (p.active && action_progress_.active && !p.operation_id.empty() &&
+        !action_progress_.operation_id.empty() &&
+        action_progress_.operation_id != p.operation_id)
+        return;
     const bool same_operation =
         action_progress_.active && !p.operation_id.empty() &&
         action_progress_.operation_id == p.operation_id;

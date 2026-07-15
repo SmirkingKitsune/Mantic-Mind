@@ -25,6 +25,10 @@
     {
       "name": "openssl",
       "version>=": "3.3.0"
+    },
+    {
+      "name": "miniaudio",
+      "version>=": "0.11.24"
     }
   ],
   "builtin-baseline": "1940ee77e81573713c0d364c42f5990172198be1"

@@ -122,6 +122,18 @@ void NodeApiServer::set_vllm_check_update_callback(VllmCheckUpdateCallback callb
     vllm_check_update_cb_ = std::move(callback);
 }
 
+void NodeApiServer::set_llama_provision_callback(LlamaProvisionCallback callback) {
+    llama_provision_cb_ = std::move(callback);
+}
+
+void NodeApiServer::set_llama_update_callback(LlamaUpdateCallback callback) {
+    llama_update_cb_ = std::move(callback);
+}
+
+void NodeApiServer::set_llama_check_update_callback(LlamaCheckUpdateCallback callback) {
+    llama_check_update_cb_ = std::move(callback);
+}
+
 void NodeApiServer::set_ray_config(std::string ray_path, uint16_t ray_port) {
     ray_path_ = std::move(ray_path);
     ray_port_ = ray_port;
@@ -196,6 +208,7 @@ void NodeApiServer::register_routes() {
 
         nlohmann::json j;
         j["node_id"]       = state_.get_node_id();
+        j["hostname"]      = mm::util::hostname();
         j["slots"]         = slots;
         j["cached_models"] = scan_hf_cache_models(hf_hub_cache_dir_);
         if (model_store_) {
@@ -245,6 +258,20 @@ void NodeApiServer::register_routes() {
     });
 
     // ── GET /api/node/logs ───────────────────────────────────────────────────
+    server_->Post("/api/node/actions/cancel", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401;
+            return;
+        }
+        const bool accepted = state_.request_action_cancel();
+        if (!accepted) {
+            res.status = 409;
+            res.set_content(R"({"error":"no cancelable action is active"})", "application/json");
+            return;
+        }
+        res.set_content(R"({"cancel_requested":true})", "application/json");
+    });
+
     server_->Get("/api/node/logs", [this](const Request& req, Response& res) {
         if (!check_auth(req.get_header_value("Authorization"))) {
             res.status = 401; return;
@@ -327,6 +354,73 @@ void NodeApiServer::register_routes() {
     });
 
     // ── POST /api/node/load-model ─────────────────────────────────────────────
+    server_->Get("/api/node/runtime/llama", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401; return;
+        }
+        res.set_content(nlohmann::json{{"llama_runtime", state_.get_llama_runtime()}}.dump(),
+                        "application/json");
+    });
+
+    server_->Post("/api/node/runtime/llama/provision", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401; return;
+        }
+        bool want_update = false;
+        std::string accelerator;
+        if (!req.body.empty()) {
+            try {
+                const auto j = nlohmann::json::parse(req.body);
+                want_update = j.value("update", false);
+                accelerator = j.value("accelerator", std::string{});
+                if (!accelerator.empty() && !want_update) {
+                    res.status = 400;
+                    res.set_content(
+                        R"({"error":"accelerator is only valid with update=true"})",
+                        "application/json");
+                    return;
+                }
+            } catch (...) {
+                res.status = 400;
+                res.set_content(R"({"error":"invalid JSON body"})", "application/json");
+                return;
+            }
+        }
+        if ((want_update && !llama_update_cb_) || (!want_update && !llama_provision_cb_)) {
+            res.status = 501;
+            res.set_content(want_update
+                                ? R"({"error":"llama.cpp update is not configured"})"
+                                : R"({"error":"llama.cpp provisioning is not configured"})",
+                            "application/json");
+            return;
+        }
+        auto runtime = want_update ? llama_update_cb_(accelerator)
+                                   : llama_provision_cb_();
+        state_.set_llama_runtime(runtime);
+        if (!runtime.last_error.empty()) state_.set_last_error(runtime.last_error);
+        if (runtime.status == "failed" || runtime.status == "disabled") res.status = 500;
+        else if (want_update && !runtime.last_error.empty()) res.status = 409;
+        else res.status = 200;
+        res.set_content(nlohmann::json{{"llama_runtime", runtime}}.dump(),
+                        "application/json");
+    });
+
+    server_->Post("/api/node/runtime/llama/check-update", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401; return;
+        }
+        if (!llama_check_update_cb_) {
+            res.status = 501;
+            res.set_content(R"({"error":"llama.cpp update checking is not configured"})",
+                            "application/json");
+            return;
+        }
+        auto runtime = llama_check_update_cb_();
+        state_.set_llama_runtime(runtime);
+        res.set_content(nlohmann::json{{"llama_runtime", runtime}}.dump(),
+                        "application/json");
+    });
+
     server_->Post("/api/node/load-model", [this](const Request& req, Response& res) {
         if (!check_auth(req.get_header_value("Authorization"))) {
             res.status = 401; return;
@@ -1063,7 +1157,8 @@ void NodeApiServer::register_routes() {
             MM_INFO("NodeApiServer: pair-complete accepted — new key issued");
 
             res.set_content(
-                nlohmann::json{{"accepted", true}, {"api_key", new_key}}.dump(),
+                nlohmann::json{{"accepted", true}, {"api_key", new_key},
+                               {"hostname", mm::util::hostname()}}.dump(),
                 "application/json");
         } catch (const std::exception& e) {
             res.status = 400;

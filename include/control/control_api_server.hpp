@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/models.hpp"
+#include "control/performance_tracker.hpp"
 #include "control/tts_service_client.hpp"
 #include <deque>
 #include <functional>
@@ -67,6 +68,7 @@ private:
     std::string     external_api_token_;
     TtsServiceClient tts_;
     std::unique_ptr<HttpServer> server_;
+    PerformanceTracker performance_;
     std::unique_ptr<HttpServer> openai_server_;
     LogCallback     log_cb_;
     mutable std::mutex activity_mutex_;

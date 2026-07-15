@@ -14,13 +14,15 @@ class AgentManager;
 
 // FTXUI-based terminal UI for mantic-mind-control.
 //
-// Five tabs (keyboard 1/2/3/4/5):
+// Seven tabs (keyboard 1/2/3/4/5/6/7):
 //   Tab 1 — Nodes:    list + health metrics + add/remove actions
 //   Tab 2 — Agents:   list + full config editor + memories + conversations
 //   Tab 3 — Activity: scrollable system event log with level filter
 //   Tab 4 — Chat:     in-app agent chat for troubleshooting model behavior
 //   Tab 5 — Curation: conversation trees and memory management actions
 //
+//   Tab 6 - Performance: rolling request latency and throughput metrics
+//   Tab 7 - Voice: proposal review, synthesis, and local playback
 // All state mutations come from a thread-safe event queue drained on the
 // FTXUI loop tick to avoid locking inside the renderer.
 class ControlUI {
@@ -36,6 +38,7 @@ public:
               AgentManager& agents,
               std::string models_dir,
               std::string control_base_url,
+              std::string control_api_token,
               LocalChatFallback local_chat_fallback = {});
     ~ControlUI();
 
@@ -56,6 +59,7 @@ public:
 
 private:
     NodeRegistry& registry_;
+    std::string   control_api_token_;
     AgentManager& agents_;
     std::string   models_dir_;
     std::string   control_base_url_;

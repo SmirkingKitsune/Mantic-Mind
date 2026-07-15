@@ -1203,6 +1203,7 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
                                     DoneCb done_cb,
                                     int max_tokens_override) {
     // 1. Look up agent
+    const int64_t request_started_ms = util::now_ms();
     auto agent = agents_.get_agent(agent_id);
     if (!agent) {
         MM_WARN("handle_chat: agent '{}' not found", agent_id);
@@ -1211,6 +1212,13 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     }
 
     AgentConfig cfg = agent->get_config();
+    PerformanceSample perf;
+    perf.request_id = util::generate_uuid();
+    perf.agent_id = agent_id;
+    perf.backend = agent_backend(cfg);
+    perf.model = cfg.model_path;
+    perf.started_at_ms = request_started_ms;
+
     AgentDB& db = agent->db();
 
     const bool api_backend = agent_uses_api_backend(cfg);
@@ -1378,12 +1386,22 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     int         final_total_tokens = 0;
     const int64_t infer_start_ms = util::now_ms();
     bool        force_prefill_safe = false;
+    perf.queue_ms = infer_start_ms - request_started_ms;
+    int64_t first_token_at_ms = 0;
+
 
     for (int tool_round = 0; tool_round < kMaxToolRounds; ++tool_round) {
         // Build context fresh each round (local memories may have changed)
         std::vector<TraceEvent> context_trace_events =
             build_context_trace_events(db, conv_id, memories);
         std::vector<Message> context_msgs = conv_mgr.build_context(conv_id, cfg, memories);
+
+        if (tool_round == 0) {
+            for (const auto& context_message : context_msgs) {
+                const auto chars = context_message.content.size() + context_message.thinking_text.size();
+                perf.input_tokens += static_cast<int>((chars + 3) / 4);
+            }
+        }
 
         // Build inference request
         InferenceRequest infer_req;
@@ -1459,6 +1477,10 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
                         finish_reason = j.value("finish_reason", "");
                         return true;
                     }
+                    if (first_token_at_ms == 0 &&
+                        (!chunk.delta_content.empty() || !chunk.thinking_delta.empty() || chunk.tool_call_delta)) {
+                        first_token_at_ms = util::now_ms();
+                    }
                     chunk_cb(chunk);
                 } catch (const std::exception& e) {
                     MM_WARN("handle_chat: SSE parse error: {}", e.what());
@@ -1478,6 +1500,10 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
                     real_runtime.stream_complete(
                         req_to_send,
                         [&](const InferenceChunk& chunk) {
+                            if (!chunk.is_done && first_token_at_ms == 0 &&
+                                (!chunk.delta_content.empty() || !chunk.thinking_delta.empty() || chunk.tool_call_delta)) {
+                                first_token_at_ms = util::now_ms();
+                            }
                             if (chunk.is_done) {
                                 infer_done_seen = true;
                                 total_tokens = chunk.tokens_used;
@@ -1511,6 +1537,9 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
                     infer_http_body = stream_error_message;
                     return false;
                 }
+                if (first_token_at_ms == 0 &&
+                    (!response.content.empty() || !response.thinking_text.empty() || !response.tool_calls.empty()))
+                    first_token_at_ms = util::now_ms();
                 thinking_content = response.thinking_text;
                 assistant_content = response.content;
                 total_tokens = response.token_count;
@@ -1717,6 +1746,16 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
 
     // 11. Signal completion to the SSE client.
     done_cb(conv_id, ok, failure_reason);
+    const int64_t completed_at_ms = util::now_ms();
+    perf.node_id = schedule_result ? schedule_result->node_id : std::string{};
+    perf.time_to_first_token_ms = first_token_at_ms > 0
+        ? first_token_at_ms - infer_start_ms : -1;
+    perf.total_ms = completed_at_ms - infer_start_ms;
+    perf.output_tokens = final_total_tokens;
+    perf.success = ok;
+    perf.error = failure_reason;
+    performance_.record(std::move(perf));
+
 }
 
 // ── queue_global_recall ───────────────────────────────────────────────────────
@@ -1939,6 +1978,7 @@ void ControlApiServer::register_routes() {
             std::string node_url = j.value("node_url", "");
             std::string api_key  = j.value("api_key", "");
             std::string platform = j.value("platform", "");
+            std::string hostname = j.value("hostname", "");
 
             if (node_url.empty() || api_key.empty()) {
                 res.status = 400;
@@ -1964,7 +2004,7 @@ void ControlApiServer::register_routes() {
                 return;
             }
 
-            NodeId node_id = registry_.add_node(node_url, api_key, platform);
+            NodeId node_id = registry_.add_node(node_url, api_key, platform, false, hostname);
             MM_INFO("Node registered: {} @ {}", node_id, node_url);
 
             res.set_content(
@@ -1985,6 +2025,7 @@ void ControlApiServer::register_routes() {
             arr.push_back(nlohmann::json{
                 {"url", d.url},
                 {"node_id", d.node_id},
+                {"hostname", d.hostname},
                 {"last_seen_ms", d.last_seen_ms}
             });
         }
@@ -1998,12 +2039,13 @@ void ControlApiServer::register_routes() {
             const std::string api_key = util::trim(j.value("api_key", std::string{}));
             const std::string platform = util::trim(j.value("platform", std::string{}));
             const bool remember = j.value("remember", false);
+            const std::string hostname = util::trim(j.value("hostname", std::string{}));
             if (url.empty() || api_key.empty()) {
                 res.status = 400;
                 res.set_content(R"({"error":"url and api_key required"})", "application/json");
                 return;
             }
-            const NodeId node_id = registry_.add_node(url, api_key, platform, remember);
+            const NodeId node_id = registry_.add_node(url, api_key, platform, remember, hostname);
             publish_activity(0, "Node added via API: " + node_id + " @ " + url +
                                 (remember ? " (remembered)" : ""));
             res.status = 201;
@@ -2221,6 +2263,26 @@ void ControlApiServer::register_routes() {
         nlohmann::json out = nlohmann::json::array();
         for (int i = start; i < total; ++i) out.push_back(filtered[static_cast<std::size_t>(i)]);
         res.set_content(nlohmann::json{{"entries", out}}.dump(), "application/json");
+    });
+
+    server_->Get("/v1/performance", [this](const Request& req, Response& res) {
+        int tail = 200;
+        if (req.has_param("tail")) {
+            try { tail = std::stoi(req.get_param_value("tail")); }
+            catch (...) {
+                res.status = 400;
+                res.set_content(R"({"error":"tail must be an integer"})", "application/json");
+                return;
+            }
+        }
+        tail = std::clamp(tail, 1, 2000);
+        res.set_content(performance_.snapshot(static_cast<std::size_t>(tail)).dump(),
+                        "application/json");
+    });
+
+    server_->Delete("/v1/performance", [this](const Request&, Response& res) {
+        performance_.clear();
+        res.set_content(R"({"cleared":true})", "application/json");
     });
 
     // ── GET /v1/agents ────────────────────────────────────────────────────────
