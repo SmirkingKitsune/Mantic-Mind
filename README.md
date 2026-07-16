@@ -422,7 +422,11 @@ architecture-specific CUDA/ptxas smoke test; pin CMake's early CUDA compiler-ID
 probe to the detected GPU instead of its legacy default; clear CMake's cached
 CUDA compiler selection so toolkit upgrades honor the current `CUDACXX`/`PATH`;
 limit parallel compiler jobs; and validate the resulting `llama-server` before activation.
-`sm_120` requires CUDA Toolkit 12.8 or newer. The CUDA version displayed by
+For Blackwell 12.x devices, the provisioner maps the detected capability to an
+architecture-specific real target (`120a-real` for an RTX 50-series GPU or
+`121a-real` for GB10). llama.cpp's FP4/block-scaled tensor-core kernels require
+the `a` feature target; a global baseline `-arch=sm_120` flag will fail even
+with CUDA 13.2. `sm_120a` requires CUDA Toolkit 12.8 or newer. The CUDA version displayed by
 `nvidia-smi` describes driver compatibility and may differ from the installed
 compiler toolkit. Under the default `prompt` update
 policy, the node inspects the new tag's asset names before asking for approval.
@@ -462,7 +466,17 @@ Windows/Linux/macOS architecture, while distinguishing a complete runnable
 server release from a backend-only artifact. Recovery actions can retry the
 normal plan, select any assessed complete official release, or skip the
 Mantic-Mind preflight for one source-build attempt. The override is never
-persisted and does not suppress CMake or compiler failures.
+persisted and does not suppress CMake or compiler failures. **Copy report**
+places the complete, untruncated report on the host clipboard (using the native
+clipboard on Windows, `clip.exe` under WSL, or an available desktop clipboard
+helper on Linux/macOS).
+
+Every managed llama.cpp install or update also writes a dedicated transcript to
+`<llama_provision_dir>/logs/llama-build-*.log`. It records the selected backend
+and variant, each command and working directory, streamed stdout/stderr, exit
+codes, and the final troubleshooting report. The newest 20 transcripts are
+retained, and the latest path is shown in the wizard and exposed as
+`llama_runtime.build_log_path` by the node status APIs.
 
 ### `mantic-mind-control.toml` — control config
 

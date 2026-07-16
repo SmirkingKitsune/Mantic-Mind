@@ -483,6 +483,9 @@ struct LlamaRuntimeStatus {
     bool        managed = false;
     std::string executable_path;
     std::string last_error;
+    // Dedicated stdout/stderr/command transcript for the most recent managed
+    // install or update attempt. Separate from the rotating application log.
+    std::string build_log_path;
     // Accelerator-correct build this node targets: cuda|rocm|vulkan|metal|cpu.
     std::string accelerator;
     // Concrete selected engine variant when known (for example cuda-12,
@@ -1319,6 +1322,7 @@ inline void to_json(nlohmann::json& j, const LlamaRuntimeStatus& r) {
           {"managed",          r.managed},
           {"executable_path",  r.executable_path},
           {"last_error",       r.last_error},
+          {"build_log_path",   r.build_log_path},
           {"accelerator",      r.accelerator},
           {"variant",          r.variant},
           {"available_variants", r.available_variants},
@@ -1339,6 +1343,7 @@ inline void from_json(const nlohmann::json& j, LlamaRuntimeStatus& r) {
     if (j.contains("managed"))          j.at("managed").get_to(r.managed);
     if (j.contains("executable_path"))  j.at("executable_path").get_to(r.executable_path);
     if (j.contains("last_error"))       j.at("last_error").get_to(r.last_error);
+    if (j.contains("build_log_path"))   j.at("build_log_path").get_to(r.build_log_path);
     if (j.contains("accelerator"))      j.at("accelerator").get_to(r.accelerator);
     if (j.contains("variant"))          j.at("variant").get_to(r.variant);
     if (j.contains("available_variants"))

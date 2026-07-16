@@ -104,6 +104,11 @@ std::vector<LlamaRuntimeVariant> llama_runtime_variants(
     const LlamaProvisionConfig& cfg);
 std::string resolve_llama_executable(const std::string& executable);
 bool llama_runtime_usable(const LlamaRuntimeStatus& status);
+// Complete plain-text representation used by the troubleshooting scroll view,
+// clipboard action, build-attempt log, and headless consumers.
+std::string format_llama_troubleshooting_report(
+    const LlamaTroubleshootingReport& report,
+    const std::string& build_log_path = {});
 
 class LlamaCppProvisioner {
 public:

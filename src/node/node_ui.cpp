@@ -1,5 +1,6 @@
 #include "node/node_ui.hpp"
 #include "node/node_state.hpp"
+#include "node/llama_cpp_provisioner.hpp"
 #include "common/util.hpp"
 #include "common/http_client.hpp"
 #include "common/logger.hpp"
@@ -17,9 +18,11 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <ctime>
 #include <deque>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -28,6 +31,10 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#include <Windows.h>
+#endif
 
 namespace mm {
 
@@ -89,6 +96,108 @@ std::string tail_text(const std::string& s, size_t max_chars) {
     size_t start = s.size() - (max_chars - 1);
     while (start < s.size() && (static_cast<unsigned char>(s[start]) & 0xC0) == 0x80) ++start;
     return "…" + s.substr(start);
+}
+
+#ifndef _WIN32
+bool executable_on_path(const std::string& name) {
+    const char* raw_path = std::getenv("PATH");
+    if (!raw_path || !*raw_path) return false;
+    for (const auto& directory : util::split(raw_path, ':')) {
+        if (directory.empty()) continue;
+        std::error_code ec;
+        const auto candidate = std::filesystem::path(directory) / name;
+        if (std::filesystem::is_regular_file(candidate, ec) && !ec) return true;
+    }
+    return false;
+}
+#endif
+
+bool copy_text_to_clipboard(const std::string& text, std::string* error) {
+#ifdef _WIN32
+    const int wide_size = MultiByteToWideChar(
+        CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()),
+        nullptr, 0);
+    if (wide_size <= 0) {
+        if (error) *error = "the report is not valid UTF-8";
+        return false;
+    }
+    std::wstring wide(static_cast<size_t>(wide_size), L'\0');
+    if (MultiByteToWideChar(
+            CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()),
+            wide.data(), wide_size) != wide_size) {
+        if (error) *error = "could not convert the report to Unicode";
+        return false;
+    }
+
+    bool opened = false;
+    for (int attempt = 0; attempt < 5 && !opened; ++attempt) {
+        opened = OpenClipboard(nullptr) != FALSE;
+        if (!opened) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (!opened) {
+        if (error) *error = "Windows clipboard is busy";
+        return false;
+    }
+    if (!EmptyClipboard()) {
+        CloseClipboard();
+        if (error) *error = "could not clear the Windows clipboard";
+        return false;
+    }
+
+    const size_t bytes = (wide.size() + 1) * sizeof(wchar_t);
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!memory) {
+        CloseClipboard();
+        if (error) *error = "could not allocate clipboard memory";
+        return false;
+    }
+    void* destination = GlobalLock(memory);
+    if (!destination) {
+        GlobalFree(memory);
+        CloseClipboard();
+        if (error) *error = "could not lock clipboard memory";
+        return false;
+    }
+    std::memcpy(destination, wide.c_str(), bytes);
+    GlobalUnlock(memory);
+    if (!SetClipboardData(CF_UNICODETEXT, memory)) {
+        GlobalFree(memory);
+        CloseClipboard();
+        if (error) *error = "could not publish the report to the clipboard";
+        return false;
+    }
+    CloseClipboard();
+    return true;
+#else
+    const char* command = nullptr;
+#ifdef __APPLE__
+    if (executable_on_path("pbcopy")) command = "pbcopy";
+#else
+    // clip.exe is the most reliable bridge from a WSL node to the Windows host.
+    if (executable_on_path("clip.exe")) command = "clip.exe";
+    else if (executable_on_path("wl-copy")) command = "wl-copy";
+    else if (executable_on_path("xclip")) command = "xclip -selection clipboard";
+    else if (executable_on_path("xsel")) command = "xsel --clipboard --input";
+#endif
+    if (!command) {
+        if (error) {
+            *error = "no clipboard helper found (install wl-clipboard, xclip, or xsel)";
+        }
+        return false;
+    }
+    FILE* pipe = ::popen(command, "w");
+    if (!pipe) {
+        if (error) *error = "could not start the clipboard helper";
+        return false;
+    }
+    const size_t written = std::fwrite(text.data(), 1, text.size(), pipe);
+    const int rc = ::pclose(pipe);
+    if (written != text.size() || rc != 0) {
+        if (error) *error = "clipboard helper failed";
+        return false;
+    }
+    return true;
+#endif
 }
 
 std::string clock_hms() {
@@ -270,6 +379,9 @@ void NodeUI::run() {
     std::string llama_cur_latest;
     std::string llama_modal_ack_version;
     std::string llama_troubleshoot_ack_fingerprint;
+    std::string llama_clipboard_status;
+    std::string llama_clipboard_report_key;
+    bool llama_clipboard_status_ok = false;
     std::vector<std::string> llama_release_entries;
     std::vector<std::string> llama_release_ids;
     std::vector<std::string> llama_release_assets;
@@ -405,6 +517,18 @@ void NodeUI::run() {
     auto modal_llama_diagnose = Button("[ Re-run diagnostics ]", [&] {
         request_llama_recovery("diagnose");
     }, high_contrast_button_option());
+    auto modal_llama_copy_report = Button("[ Copy report ]", [&] {
+        const auto rt = state_.get_llama_runtime();
+        const std::string report = format_llama_troubleshooting_report(
+            rt.troubleshooting, rt.build_log_path);
+        std::string error;
+        llama_clipboard_status_ok = copy_text_to_clipboard(report, &error);
+        llama_clipboard_status = llama_clipboard_status_ok
+            ? "Troubleshooting report copied to the clipboard."
+            : "Copy failed: " + error;
+        llama_clipboard_report_key = rt.troubleshooting.fingerprint + "|" +
+            rt.build_log_path;
+    }, high_contrast_button_option());
     auto modal_llama_retry = Button("[ Retry normal provisioning ]", [&] {
         request_llama_recovery("retry");
     }, high_contrast_button_option());
@@ -456,33 +580,9 @@ void NodeUI::run() {
         return out.empty() ? std::string{"(idle -- waiting for inference)"} : out;
     });
     auto llama_troubleshoot_details = mm::tui::wrapped_scroll_view([&]() {
-        const auto report = state_.get_llama_runtime().troubleshooting;
-        std::ostringstream out;
-        out << "Failure stage: " << report.failure_stage << "\n"
-            << report.failure_detail << "\n\n"
-            << report.summary << "\n\nEnvironment checks:\n";
-        for (const auto& check : report.checks) {
-            std::string marker = check.status == "pass" ? "PASS"
-                : (check.status == "fail" ? "FAIL"
-                    : (check.status == "warn" ? "WARN" : "INFO"));
-            out << "[" << marker << "] " << check.label;
-            if (!check.detected.empty()) out << ": " << check.detected;
-            out << "\n";
-            if (!check.required.empty()) out << "  Required: " << check.required << "\n";
-            if (!check.remediation.empty()) out << "  Fix: " << check.remediation << "\n";
-        }
-        out << "\nRuntime variants (" << report.platform << "/"
-            << report.architecture << "):\n";
-        for (const auto& variant : report.variants) {
-            const char* availability = variant.release_available ? "RELEASE"
-                : (variant.source_supported ? "COMPILE" : "UNSUPPORTED");
-            out << "[" << availability << "] " << variant.label;
-            if (variant.recommended) out << " (recommended)";
-            out << ": " << variant.reason;
-            if (!variant.release_asset.empty()) out << " [" << variant.release_asset << "]";
-            out << "\n";
-        }
-        return out.str();
+        const auto rt = state_.get_llama_runtime();
+        return format_llama_troubleshooting_report(
+            rt.troubleshooting, rt.build_log_path);
     });
     auto llama_troubleshoot_primary_actions = Container::Horizontal({
         modal_llama_use_release_maybe,
@@ -490,6 +590,7 @@ void NodeUI::run() {
     });
     auto llama_troubleshoot_secondary_actions = Container::Horizontal({
         modal_llama_diagnose,
+        modal_llama_copy_report,
         modal_llama_troubleshoot_dismiss,
     });
     auto llama_troubleshoot_btns = Container::Vertical({
@@ -1181,7 +1282,14 @@ void NodeUI::run() {
         });
     auto llama_troubleshoot_modal_renderer =
         Renderer(llama_troubleshoot_btns, [&]() -> Element {
-            const auto report = state_.get_llama_runtime().troubleshooting;
+            const auto rt = state_.get_llama_runtime();
+            const auto& report = rt.troubleshooting;
+            const std::string report_key = report.fingerprint + "|" + rt.build_log_path;
+            if (!llama_clipboard_report_key.empty() &&
+                llama_clipboard_report_key != report_key) {
+                llama_clipboard_report_key.clear();
+                llama_clipboard_status.clear();
+            }
             Elements rows{
                 text(" llama.cpp troubleshooting wizard ") | bold | hcenter |
                     color(Color::Yellow),
@@ -1194,11 +1302,18 @@ void NodeUI::run() {
                 hbox({text(" stage  : ") | dim,
                       text(shorten_middle(report.failure_stage, 58)) |
                           color(Color::Red)}),
-                paragraph(" " + report.summary),
-                separator(),
-                llama_troubleshoot_details->Render() | frame | vscroll_indicator |
-                    size(HEIGHT, EQUAL, 12),
             };
+            if (!rt.build_log_path.empty()) {
+                rows.push_back(hbox({
+                    text(" log    : ") | dim,
+                    text(shorten_middle(rt.build_log_path, 58)) |
+                        color(Color::GrayLight),
+                }));
+            }
+            rows.push_back(paragraph(" " + report.summary));
+            rows.push_back(separator());
+            rows.push_back(llama_troubleshoot_details->Render() | frame |
+                           vscroll_indicator | size(HEIGHT, EQUAL, 12));
             if (show_llama_release_choice) {
                 rows.push_back(separator());
                 rows.push_back(text(" Complete official release fallbacks ") | bold);
@@ -1223,8 +1338,15 @@ void NodeUI::run() {
             rows.push_back(hbox({
                 modal_llama_diagnose->Render(),
                 text("  "),
+                modal_llama_copy_report->Render(),
+                text("  "),
                 modal_llama_troubleshoot_dismiss->Render(),
             }) | hcenter);
+            if (!llama_clipboard_status.empty()) {
+                rows.push_back(paragraph(" " + llama_clipboard_status) |
+                    color(llama_clipboard_status_ok ? Color::GreenLight
+                                                    : Color::RedLight));
+            }
             if (show_llama_compile_anyway) {
                 rows.push_back(paragraph(
                     " One-attempt override skips only the environment preflight; CMake and compiler errors still stop the build.") |

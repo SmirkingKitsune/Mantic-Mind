@@ -88,7 +88,7 @@ find_package(OpenSSL REQUIRED)
 
 # ── Platform libraries ────────────────────────────────────────────────────────
 if(WIN32)
-    set(MM_PLATFORM_LIBS ws2_32 crypt32)
+    set(MM_PLATFORM_LIBS ws2_32 crypt32 user32)
 else()
     set(MM_PLATFORM_LIBS "")
 endif()

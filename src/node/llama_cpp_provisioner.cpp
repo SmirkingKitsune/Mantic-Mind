@@ -137,19 +137,42 @@ std::vector<std::string> cuda_arch_targets(const std::string& value) {
     return targets;
 }
 
+bool cuda_arch_needs_architecture_specific_target(const std::string& target) {
+    return target.size() == 3 && target[0] == '1' && target[1] == '2' &&
+        std::isdigit(static_cast<unsigned char>(target[2])) != 0;
+}
+
+std::string cuda_feature_target(const std::string& target) {
+    return cuda_arch_needs_architecture_specific_target(target)
+        ? target + "a"
+        : target;
+}
+
+// llama.cpp's Blackwell MXFP4 kernels use architecture-specific tensor-core
+// instructions. Plain 12X is a baseline/forward-compatible target and cannot
+// assemble those instructions, so detected 12X devices must be compiled as
+// 12Xa. Use a real-only target for detected hardware to avoid an unnecessary,
+// non-forward-compatible PTX payload and to work with CMake 3.28 in WSL.
+std::string cuda_cmake_architectures(const std::string& value) {
+    std::vector<std::string> mapped;
+    for (const auto& target : cuda_arch_targets(value)) {
+        mapped.push_back(cuda_arch_needs_architecture_specific_target(target)
+            ? target + "a-real"
+            : target);
+    }
+    return util::join(mapped, ";");
+}
+
 std::string cuda_arch_requirement(const std::vector<std::string>& targets) {
     std::vector<std::string> labels;
     labels.reserve(targets.size());
-    for (const auto& target : targets) labels.push_back("compute_" + target);
+    for (const auto& target : targets)
+        labels.push_back("compute_" + cuda_feature_target(target));
     std::string requirement = "NVCC support for " + util::join(labels, ", ");
     if (std::find(targets.begin(), targets.end(), "120") != targets.end())
-        requirement += " (CUDA Toolkit 12.8 or newer for sm_120)";
+        requirement +=
+            " (CUDA Toolkit 12.8 or newer; llama.cpp FP4 kernels require sm_120a)";
     return requirement;
-}
-
-std::string cuda_compiler_id_arch(const LlamaProvisionConfig& cfg) {
-    const auto targets = cuda_arch_targets(cfg.cuda_arch);
-    return targets.empty() ? std::string{} : targets.front();
 }
 
 bool cuda_removed_default_arch_failure(const std::string& failure_detail) {
@@ -163,6 +186,20 @@ bool cuda_removed_default_arch_failure(const std::string& failure_detail) {
             std::string::npos ||
         lower.find("cmakedeterminecudacompiler") != std::string::npos;
     return removed_arch && rejected && compiler_id;
+}
+
+bool cuda_blackwell_baseline_target_failure(const std::string& failure_detail) {
+    const std::string lower = util::to_lower(failure_detail);
+    const bool baseline_target =
+        lower.find("target 'sm_120'") != std::string::npos ||
+        lower.find("target 'sm_121'") != std::string::npos ||
+        lower.find("-arch=sm_120 ") != std::string::npos ||
+        lower.find("-arch=sm_121 ") != std::string::npos;
+    const bool architecture_specific_feature =
+        lower.find(".kind::mxf4") != std::string::npos ||
+        lower.find(".block_scale") != std::string::npos ||
+        lower.find("mma with block scale") != std::string::npos;
+    return baseline_target && architecture_specific_feature;
 }
 
 bool nvcc_supports_arch(const std::string& output, const std::string& target) {
@@ -197,6 +234,49 @@ std::string backend_for_variant(std::string variant) {
     if (variant == "cuda-12" || variant == "cuda-13") return "cuda";
     if (variant == "hip") return "rocm";
     return variant;
+}
+
+fs::path create_llama_build_log_path(const LlamaProvisionConfig& cfg) {
+    const fs::path log_dir = fs::path(cfg.provision_dir) / "logs";
+    std::error_code ec;
+    fs::create_directories(log_dir, ec);
+    if (ec) return {};
+
+    struct ExistingLog {
+        fs::path path;
+        fs::file_time_type modified;
+    };
+    std::vector<ExistingLog> existing;
+    for (const auto& entry : fs::directory_iterator(log_dir, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file(ec) || ec) {
+            ec.clear();
+            continue;
+        }
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("llama-build-", 0) != 0 || entry.path().extension() != ".log")
+            continue;
+        const auto modified = entry.last_write_time(ec);
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+        existing.push_back({entry.path(), modified});
+    }
+    std::sort(existing.begin(), existing.end(), [](const auto& a, const auto& b) {
+        return a.modified < b.modified;
+    });
+    constexpr size_t kRetainedBuildLogs = 20;
+    while (existing.size() >= kRetainedBuildLogs) {
+        fs::remove(existing.front().path, ec);
+        ec.clear();
+        existing.erase(existing.begin());
+    }
+
+    std::string id = util::generate_uuid();
+    if (id.size() > 8) id.resize(8);
+    return log_dir / ("llama-build-" + std::to_string(util::now_ms()) + "-" +
+                      id + ".log");
 }
 
 fs::path source_build_dir(const LlamaProvisionConfig& cfg) {
@@ -253,15 +333,13 @@ std::vector<std::string> accelerator_cmake_flags(const LlamaProvisionConfig& cfg
     if (cfg.accelerator == "cuda") {
         flags.push_back("-DGGML_CUDA=ON");
         if (!cfg.cuda_arch.empty()) {
-            flags.push_back("-DCMAKE_CUDA_ARCHITECTURES=" + cfg.cuda_arch);
-            // CMake's NVIDIA compiler-identification invocation runs before
-            // target CUDA_ARCHITECTURES are applied. Older CMake/NVCC pairs
-            // can therefore fall back to sm_52, which CUDA 13 removed. Seed
-            // the compiler-id invocation with one detected, validated target.
-            const std::string compiler_id_arch = cuda_compiler_id_arch(cfg);
-            if (!compiler_id_arch.empty())
-                flags.push_back("-DCMAKE_CUDA_FLAGS=-arch=sm_" +
-                                compiler_id_arch);
+            // This cache variable is visible before enable_language(CUDA), so
+            // it fixes CUDA 13's removed sm_52 compiler-id default without a
+            // global -arch flag. A global CMAKE_CUDA_FLAGS=-arch=sm_120 would
+            // also leak into every target and break llama.cpp's sm_120a MXFP4
+            // compilation even after upstream selects the correct target.
+            flags.push_back("-DCMAKE_CUDA_ARCHITECTURES=" +
+                            cuda_cmake_architectures(cfg.cuda_arch));
         }
     } else if (cfg.accelerator == "rocm" || cfg.accelerator == "hip") {
         flags.push_back("-DGGML_HIP=ON");
@@ -345,6 +423,7 @@ std::optional<LlamaRuntimeStatus> read_active_runtime(const LlamaProvisionConfig
         status.executable_path = normalized.string();
         status.accelerator = accelerator;
         status.variant = json.value("variant", accelerator);
+        status.build_log_path = json.value("build_log_path", std::string{});
         return status;
     } catch (...) {
         return std::nullopt;
@@ -364,6 +443,7 @@ void write_active_runtime(const LlamaProvisionConfig& cfg,
             {"version", status.version},
             {"executable_path", status.executable_path},
             {"variant", status.variant.empty() ? status.accelerator : status.variant},
+            {"build_log_path", status.build_log_path},
         }.dump(2);
         out.close();
         std::error_code ec;
@@ -702,7 +782,14 @@ std::vector<LlamaInstallStep> build_source_plan(const LlamaProvisionConfig& cfg,
         ? cfg.build_jobs
         : ((cfg.accelerator == "cuda" || cfg.accelerator == "rocm") ? 2 : 4);
     const auto cuda_targets = cuda_arch_targets(cfg.cuda_arch);
-    const std::string cuda_target_arg = util::join(cuda_targets, ",");
+    std::vector<std::string> cuda_feature_targets;
+    cuda_feature_targets.reserve(cuda_targets.size());
+    for (const auto& target : cuda_targets)
+        cuda_feature_targets.push_back(cuda_feature_target(target));
+    const std::string cuda_target_arg = util::join(cuda_feature_targets, ",");
+    const std::string cuda_probe_arch = cuda_feature_targets.empty()
+        ? std::string{}
+        : cuda_feature_targets.front();
 
     std::vector<LlamaInstallStep> plan;
     if (cfg.platform == "windows" && !cfg.bypass_environment_checks) {
@@ -741,13 +828,13 @@ std::vector<LlamaInstallStep> build_source_plan(const LlamaProvisionConfig& cfg,
                       "$requested='" << cuda_target_arg << "' -split ','; "
                       "foreach($arch in $requested){$target='compute_'+$arch; "
                       "if($supported -notmatch ('(^|\\s)'+[regex]::Escape($target)+'(\\s|$)')){"
-                      "$hint=if($arch -eq '120'){' CUDA Toolkit 12.8 or newer is required for sm_120.'}else{''}; "
+                      "$hint=if($arch -eq '120a'){' CUDA Toolkit 12.8 or newer is required for sm_120a.'}else{''}; "
                       "throw ('Selected NVCC '+$nvcc+' does not support compute_'+$arch+'.'+$hint+"
                       "' The CUDA version shown by nvidia-smi is driver compatibility, not the installed compiler version.')}}; ";
                 ps << "$probe=Join-Path $env:TEMP ('mantic-mind-cuda-'+[guid]::NewGuid().ToString('N')+'.cu'); "
                       "$object=$probe+'.obj'; try { "
                       "Set-Content -LiteralPath $probe -Encoding Ascii -Value 'extern \"C\" __global__ void mm_cuda_probe() {}'; "
-                      "$probeArch=($requested | Select-Object -First 1); "
+                      "$probeArch='" << cuda_probe_arch << "'; "
                       "& $nvcc ('-arch=sm_'+$probeArch) -c $probe -o $object; "
                       "if($LASTEXITCODE -ne 0){throw ('CUDA compiler/assembler smoke test failed for sm_'+$probeArch+'. Ensure nvcc and ptxas come from the same CUDA Toolkit.')} "
                       "} finally {Remove-Item -LiteralPath $probe,$object -Force -ErrorAction SilentlyContinue}; ";
@@ -760,6 +847,7 @@ std::vector<LlamaInstallStep> build_source_plan(const LlamaProvisionConfig& cfg,
         const std::string preflight = R"SH(set -eu
 backend="$1"
 cuda_arches="$2"
+cuda_probe_arch="$3"
 missing=""
 for tool in git cmake; do
   command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
@@ -800,19 +888,18 @@ if [ "$backend" = "cuda" ]; then
     for arch in $(printf '%s' "$cuda_arches" | tr ',' ' '); do
       if ! printf '%s\n' "$supported" | tr '[:space:]' '\n' | grep -Fqx "compute_$arch"; then
         echo "Selected NVCC $nvcc_path does not support compute_$arch." >&2
-        if [ "$arch" = "120" ]; then
-          echo "CUDA Toolkit 12.8 or newer is required to compile for sm_120." >&2
+        if [ "$arch" = "120a" ]; then
+          echo "CUDA Toolkit 12.8 or newer is required to compile for sm_120a." >&2
         fi
         echo "The CUDA version shown by nvidia-smi is driver compatibility, not the installed compiler version." >&2
         exit 3
       fi
     done
-    probe_arch=$(printf '%s' "$cuda_arches" | cut -d, -f1)
     probe_dir=$(mktemp -d "${TMPDIR:-/tmp}/mantic-mind-cuda-probe.XXXXXX")
     trap 'rm -rf "$probe_dir"' EXIT HUP INT TERM
     printf '%s\n' 'extern "C" __global__ void mm_cuda_probe() {}' > "$probe_dir/probe.cu"
-    if ! "$nvcc_path" "-arch=sm_$probe_arch" -c "$probe_dir/probe.cu" -o "$probe_dir/probe.o"; then
-      echo "CUDA compiler/assembler smoke test failed for sm_$probe_arch." >&2
+    if ! "$nvcc_path" "-arch=sm_$cuda_probe_arch" -c "$probe_dir/probe.cu" -o "$probe_dir/probe.o"; then
+      echo "CUDA compiler/assembler smoke test failed for sm_$cuda_probe_arch." >&2
       echo "Ensure nvcc and ptxas come from the same CUDA Toolkit installation." >&2
       exit 4
     fi
@@ -831,7 +918,7 @@ fi
 )SH";
         plan.push_back({"Checking source-build prerequisites",
                         {"sh", "-c", preflight, "mantic-mind-llama-preflight",
-                         cfg.accelerator, cuda_target_arg}, root, false});
+                         cfg.accelerator, cuda_target_arg, cuda_probe_arch}, root, false});
     }
     if (!fs::exists(src / ".git"))
         plan.push_back({"Cloning llama.cpp source",
@@ -1122,6 +1209,44 @@ bool llama_runtime_usable(const LlamaRuntimeStatus& status) {
         && !status.executable_path.empty();
 }
 
+std::string format_llama_troubleshooting_report(
+    const LlamaTroubleshootingReport& report,
+    const std::string& build_log_path) {
+    std::ostringstream out;
+    out << "llama.cpp troubleshooting report\n"
+        << "Host: " << report.platform << "/" << report.architecture << "\n"
+        << "Target: " << (report.target_backend.empty() ? "?" : report.target_backend)
+        << "\n"
+        << "Release: " << (report.release_tag.empty() ? "?" : report.release_tag)
+        << "\n"
+        << "Failure stage: " << report.failure_stage << "\n";
+    if (!build_log_path.empty()) out << "Full build log: " << build_log_path << "\n";
+    out << "\n" << report.failure_detail << "\n\n"
+        << report.summary << "\n\nEnvironment checks:\n";
+    for (const auto& check : report.checks) {
+        const char* marker = check.status == "pass" ? "PASS"
+            : (check.status == "fail" ? "FAIL"
+                : (check.status == "warn" ? "WARN" : "INFO"));
+        out << "[" << marker << "] " << check.label;
+        if (!check.detected.empty()) out << ": " << check.detected;
+        out << "\n";
+        if (!check.required.empty()) out << "  Required: " << check.required << "\n";
+        if (!check.remediation.empty()) out << "  Fix: " << check.remediation << "\n";
+    }
+    out << "\nRuntime variants (" << report.platform << "/"
+        << report.architecture << "):\n";
+    for (const auto& variant : report.variants) {
+        const char* availability = variant.release_available ? "RELEASE"
+            : (variant.source_supported ? "COMPILE" : "UNSUPPORTED");
+        out << "[" << availability << "] " << variant.label;
+        if (variant.recommended) out << " (recommended)";
+        out << ": " << variant.reason;
+        if (!variant.release_asset.empty()) out << " [" << variant.release_asset << "]";
+        out << "\n";
+    }
+    return out.str();
+}
+
 LlamaCppProvisioner::LlamaCppProvisioner(LlamaProvisionConfig cfg,
                                          LlamaCommandRunner runner)
     : cfg_(normalized_config(std::move(cfg)))
@@ -1306,6 +1431,41 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
         return status;
     }
 
+    std::ofstream build_log;
+    const fs::path build_log_path = create_llama_build_log_path(install_cfg);
+    if (!build_log_path.empty()) {
+        build_log.open(build_log_path, std::ios::out | std::ios::trunc);
+        if (build_log) {
+            status.build_log_path = build_log_path.string();
+            MM_INFO("llama.cpp build attempt log: {}", status.build_log_path);
+        } else {
+            MM_WARN("Could not open llama.cpp build attempt log: {}",
+                    build_log_path.string());
+        }
+    }
+    auto write_build_log = [&](const std::string& line) {
+        if (!build_log) return;
+        build_log << line << '\n';
+        build_log.flush();
+    };
+    write_build_log("# Mantic-Mind llama.cpp managed runtime attempt");
+    write_build_log("started_ms: " + std::to_string(util::now_ms()));
+    write_build_log(std::string{"operation: "} + (upgrade ? "update" : "install"));
+    write_build_log("platform: " + install_cfg.platform + "/" +
+                    release_arch(install_cfg.arch));
+    write_build_log("backend: " + install_cfg.accelerator);
+    write_build_log("variant: " + (install_cfg.release_variant.empty()
+        ? install_cfg.accelerator : install_cfg.release_variant));
+    write_build_log("method: " + install_cfg.install_method);
+    write_build_log("version: " + install_cfg.version);
+    if (!install_cfg.cuda_arch.empty()) {
+        write_build_log("cuda_architectures: " + install_cfg.cuda_arch);
+        write_build_log("cuda_cmake_architectures: " +
+                        cuda_cmake_architectures(install_cfg.cuda_arch));
+    }
+    write_build_log("provision_dir: " + install_cfg.provision_dir);
+    write_build_log("");
+
     status.status = "provisioning";
     status.managed = true;
     set_status(status);
@@ -1319,6 +1479,7 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
         status.managed = true;
         status.last_error =
             std::string("llama.cpp ") + (upgrade ? "update" : "install") + " canceled";
+        write_build_log("result: canceled");
         set_status(status);
         finish_progress();
         return status;
@@ -1359,9 +1520,15 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
         const int total = static_cast<int>(plan.size());
         MM_INFO("llama.cpp {} {} plan: {} step(s)",
                 upgrade ? "update" : "install", attempt.label, total);
+        write_build_log("## attempt " + std::to_string(attempt_index + 1) + "/" +
+                        std::to_string(attempts.size()) + ": " + attempt.label);
+        write_build_log("planned_steps: " + std::to_string(total));
 
         std::string attempt_error;
-        if (plan.empty()) attempt_error = "install plan is empty";
+        if (plan.empty()) {
+            attempt_error = "install plan is empty";
+            write_build_log("error: " + attempt_error);
+        }
         for (int i = 0; i < total && attempt_error.empty(); ++i) {
             const LlamaInstallStep& step = plan[static_cast<size_t>(i)];
             if (cancel_check_ && cancel_check_()) return canceled_status();
@@ -1374,6 +1541,12 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
             prog.stage = step.label;
             emit_progress(prog);
             if (log_sink_) log_sink_("[llama-install] " + step.label, false);
+            const fs::path cwd = step.cwd.empty() ? root : step.cwd;
+            write_build_log("");
+            write_build_log("### step " + std::to_string(i + 1) + "/" +
+                            std::to_string(total) + ": " + step.label);
+            write_build_log("cwd: " + cwd.string());
+            write_build_log("command: " + join_shell_command(step.argv));
 
             // Preserve enough context for CMake compiler-identification and
             // nested call stacks. Twelve lines routinely discarded the actual
@@ -1381,6 +1554,8 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
             std::deque<std::string> output_tail;
             auto on_line = [&](const std::string& line, bool is_stderr) {
                 if (log_sink_) log_sink_(line, is_stderr);
+                write_build_log(std::string{is_stderr ? "[stderr] " : "[stdout] "} +
+                                line);
                 const double f = parse_vllm_install_fraction(line);
                 if (f >= 0.0) prog.fraction = f;
                 prog.last_line = line;
@@ -1393,8 +1568,9 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
             };
 
             std::string step_err;
-            const fs::path cwd = step.cwd.empty() ? root : step.cwd;
             const int rc = runner_.run(step.argv, cwd, on_line, cancel_check_, &step_err);
+            write_build_log("exit_code: " + std::to_string(rc));
+            if (!step_err.empty()) write_build_log("runner_error: " + step_err);
             if (cancel_check_ && cancel_check_()) return canceled_status();
             if (rc != 0 && !step.allow_failure) {
                 std::string detail = step_err;
@@ -1405,6 +1581,7 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
                 attempt_error = "step '" + step.label + "' failed"
                     + (detail.empty() ? (" (exit " + std::to_string(rc) + ")")
                                       : (": " + detail));
+                write_build_log("step_failure: " + attempt_error);
             }
         }
 
@@ -1416,6 +1593,7 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
             if (found.empty()) {
                 attempt_error = "install completed but no llama-server executable was found under "
                     + root.string();
+                write_build_log("attempt_failure: " + attempt_error);
             }
         }
 
@@ -1435,6 +1613,11 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
             status.update_warning.clear();
             status.troubleshooting = {};
             status.last_error.clear();
+            write_build_log("");
+            write_build_log("result: success");
+            write_build_log("method: " + status.method);
+            write_build_log("executable: " + status.executable_path);
+            write_build_log("reported_version: " + status.version);
             write_active_runtime(attempt.config, status);
             set_status(status);
             finish_progress();
@@ -1445,6 +1628,8 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
         }
 
         attempt_errors.push_back(attempt.label + ": " + attempt_error);
+        write_build_log("attempt_result: failed");
+        write_build_log("attempt_error: " + attempt_error);
         if (attempt_index + 1 < attempts.size()) {
             const std::string message =
                 "[llama-install] " + attempt.label + " unavailable (" + attempt_error
@@ -1458,6 +1643,10 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
     status.last_error = "llama.cpp install failed";
     for (const auto& error : attempt_errors) status.last_error += "; " + error;
     status.troubleshooting = build_troubleshooting_report(status.last_error, install_cfg);
+    write_build_log("");
+    write_build_log("result: failed");
+    write_build_log(format_llama_troubleshooting_report(
+        status.troubleshooting, status.build_log_path));
     set_status(status);
     finish_progress();
     return status;
@@ -1628,7 +1817,7 @@ LlamaTroubleshootingReport LlamaCppProvisioner::build_troubleshooting_report(
         if (cuda_removed_default_arch_failure(failure_detail)) {
             const std::string target = requested_arches.empty()
                 ? std::string{"the detected GPU architecture"}
-                : "sm_" + requested_arches.front();
+                : "sm_" + cuda_feature_target(requested_arches.front());
             add("cuda-cmake-compiler-id", "CUDA CMake compiler identification",
                 "fail",
                 "CMake invoked ptxas for removed legacy target sm_52 instead of " +
@@ -1637,6 +1826,20 @@ LlamaTroubleshootingReport LlamaCppProvisioner::build_troubleshooting_report(
                 "Retry with Mantic-Mind's architecture-pinned configure command. "
                 "If it still fails, ensure nvcc and ptxas resolve from the same "
                 "CUDA Toolkit and upgrade CMake to a release with CUDA 13 support.",
+                true);
+        }
+        if (cuda_blackwell_baseline_target_failure(failure_detail)) {
+            const std::string target = requested_arches.empty()
+                ? std::string{"sm_12Xa"}
+                : "sm_" + cuda_feature_target(requested_arches.front());
+            add("cuda-blackwell-feature-target",
+                "Blackwell architecture-specific CUDA target", "fail",
+                "llama.cpp's MXFP4/block-scaled MMA kernel was assembled for a "
+                "baseline sm_12X target",
+                target + " for Blackwell FP4 tensor-core instructions",
+                "Retry with the architecture-specific CMake target. Remove any "
+                "CMAKE_CUDA_FLAGS=-arch=sm_120 override; use "
+                "CMAKE_CUDA_ARCHITECTURES=120a-real for an RTX 50-series GPU.",
                 true);
         }
         if (toolkit) {
@@ -1665,11 +1868,12 @@ LlamaTroubleshootingReport LlamaCppProvisioner::build_troubleshooting_report(
             const std::string supported = capture({nvcc_path, "--list-gpu-arch"});
             std::vector<std::string> unsupported;
             for (const auto& arch : requested_arches) {
-                if (!nvcc_supports_arch(supported, arch)) unsupported.push_back(arch);
+                if (!nvcc_supports_arch(supported, cuda_feature_target(arch)))
+                    unsupported.push_back(arch);
             }
             std::vector<std::string> unsupported_labels;
             for (const auto& arch : unsupported)
-                unsupported_labels.push_back("compute_" + arch);
+                unsupported_labels.push_back("compute_" + cuda_feature_target(arch));
             const bool compatible = unsupported.empty();
             add("cuda-architecture", "CUDA compiler architecture support",
                 compatible ? "pass" : "fail",
@@ -1679,7 +1883,7 @@ LlamaTroubleshootingReport LlamaCppProvisioner::build_troubleshooting_report(
                       + (nvcc_version.empty() ? std::string{} : " | " + nvcc_version),
                 cuda_arch_requirement(requested_arches),
                 compatible ? std::string{}
-                    : "Install a compatible CUDA Toolkit inside the active environment and ensure CUDACXX or PATH selects it. For sm_120 use CUDA Toolkit 12.8 or newer; nvidia-smi's CUDA Version reports driver compatibility, not the selected NVCC.",
+                    : "Install a compatible CUDA Toolkit inside the active environment and ensure CUDACXX or PATH selects it. For sm_120a use CUDA Toolkit 12.8 or newer; nvidia-smi's CUDA Version reports driver compatibility, not the selected NVCC.",
                 !compatible);
         }
         if (driver && !toolkit) {
