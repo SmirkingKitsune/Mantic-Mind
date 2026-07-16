@@ -372,12 +372,12 @@ After file loading, matching environment variables override config values.
 | `listen_port` | `MM_LISTEN_PORT` | `7070` | Node API port |
 | `control_url` | `MM_CONTROL_URL` | *(empty)* | Control base URL (empty = standalone) |
 | `control_api_key` | `MM_CONTROL_API_KEY` | *(empty)* | Bearer token for control |
-| `llama_server_path` | `MM_LLAMA_PATH` | `llama-server` | `llama-server` executable used for llama.cpp engine slots (default runtime) |
-| `llama_auto_provision` | `MM_LLAMA_AUTO_PROVISION` | `true` | Provision a managed llama.cpp when `llama_server_path` is unresolved |
+| `llama_server_path` | `MM_LLAMA_PATH` | `llama-server` | Explicit path/wrapper for llama.cpp engine slots; a bare PATH name is not trusted as GPU-capable |
+| `llama_auto_provision` | `MM_LLAMA_AUTO_PROVISION` | `true` | Provision an accelerator-matched managed llama.cpp when no compatible explicit runtime is selected |
 | `llama_provision_dir` | `MM_LLAMA_PROVISION_DIR` | `data/runtimes/llama.cpp` | Managed llama.cpp runtime root |
 | `llama_install_method` | `MM_LLAMA_INSTALL_METHOD` | `auto` | Provisioning method: `auto` (matched release, then source fallback), `release`, or `source` |
 | `llama_version` | `MM_LLAMA_VERSION` | `latest` | llama.cpp release tag / source ref used by provisioning |
-| `llama_accelerator` | `MM_LLAMA_ACCELERATOR` | *(auto)* | Release/build accelerator: `cuda`, `rocm`, `vulkan`, `metal`, `cpu` |
+| `llama_accelerator` | `MM_LLAMA_ACCELERATOR` | *(auto)* | Release/build backend: `cuda`, `rocm`/`hip`, `vulkan`, `openvino`, `sycl-fp32`, `sycl-fp16`, `metal`, or `cpu` (availability depends on OS/architecture/toolchain) |
 | `llama_cuda_arch` | `MM_LLAMA_CUDA_ARCH` | *(auto)* | CUDA compute capability for source builds (e.g. `121` for DGX Spark GB10); detected with `nvidia-smi` when empty |
 | `llama_build_jobs` | `MM_LLAMA_BUILD_JOBS` | `0` | Source-build concurrency; `0` uses 2 jobs for CUDA/ROCm and 4 otherwise |
 | `llama_update_policy` | `MM_LLAMA_UPDATE_POLICY` | `prompt` | llama.cpp update behavior: `prompt`, `auto`, or `manual` |
@@ -416,13 +416,53 @@ matching accelerated asset (for example, Linux CUDA in the current release
 matrix), the node logs that reason before attempting the source-build fallback.
 Source builds preflight Git, CMake, a C++ compiler, and `nvcc` for CUDA; use a
 separate CMake cache per platform/architecture/accelerator; auto-detect visible
-CUDA compute capabilities; limit parallel compiler jobs; and validate the
-resulting `llama-server` before activation. Under the default `prompt` update
+CUDA compute capabilities; verify that the `nvcc` selected by `CUDACXX` or
+`PATH` lists every detected target via `--list-gpu-arch`; compile a small
+architecture-specific CUDA/ptxas smoke test; pin CMake's early CUDA compiler-ID
+probe to the detected GPU instead of its legacy default; clear CMake's cached
+CUDA compiler selection so toolkit upgrades honor the current `CUDACXX`/`PATH`;
+limit parallel compiler jobs; and validate the resulting `llama-server` before activation.
+`sm_120` requires CUDA Toolkit 12.8 or newer. The CUDA version displayed by
+`nvidia-smi` describes driver compatibility and may differ from the installed
+compiler toolkit. Under the default `prompt` update
 policy, the node inspects the new tag's asset names before asking for approval.
 The prompt explicitly says when approval will compile locally and provides
 buttons for published alternatives such as Vulkan or CPU. A selected managed
 alternative is recorded in `active-runtime.json` so it remains active after a
 restart unless an explicit accelerator config supersedes it.
+
+A bare `llama-server` discovered on `PATH` is accepted for CPU nodes, for the
+normal Metal-enabled macOS build, or when auto-provisioning is disabled. It is
+not assumed to match CUDA, Vulkan, or ROCm merely because it launches. This
+prevents generic packages such as the Windows Winget CPU build from shadowing
+an accelerator-matched managed runtime. Set `llama_server_path`/`MM_LLAMA_PATH`
+to an explicit executable path or custom wrapper name to intentionally override
+managed selection.
+
+The node Runtime tab identifies the active engine family, accelerator backend,
+concrete variant when known, managed/external install source, version, and
+executable path. **Change llama.cpp engine** opens the platform-aware variant
+matrix at any time; choices backed by an official release are downloaded, while
+source-only choices clearly indicate that local compilation is required. The
+same operation is available headlessly through
+`POST /api/node/runtime/llama/switch {"variant":"vulkan"}`. Running slots keep
+their current subprocess until unloaded; new or restarted slots use the newly
+selected engine. If an external executable rejects `--version`, its version is
+shown as `not reported` instead of displaying the command-line error as version
+text.
+
+If managed provisioning or compilation fails, the node TUI force-opens a
+scrollable llama.cpp troubleshooting wizard. Long diagnostic lines are wrapped
+and the captured failure tail retains enough context for CMake call stacks and
+CUDA assembler errors. It probes the host, free disk and
+memory, Git/CMake/compiler toolchain, and the selected backend's driver, SDK,
+device, and environment requirements. The report assesses CUDA 12/13, Vulkan,
+ROCm, OpenVINO, SYCL FP32/FP16, Metal, HIP, and CPU across the detected
+Windows/Linux/macOS architecture, while distinguishing a complete runnable
+server release from a backend-only artifact. Recovery actions can retry the
+normal plan, select any assessed complete official release, or skip the
+Mantic-Mind preflight for one source-build attempt. The override is never
+persisted and does not suppress CMake or compiler failures.
 
 ### `mantic-mind-control.toml` — control config
 
@@ -482,7 +522,10 @@ POST   /api/node/runtime/vllm/provision -> { vllm_runtime }
 POST   /api/node/runtime/vllm/check-update -> { vllm_runtime }
 GET    /api/node/runtime/llama  -> { llama_runtime }
 POST   /api/node/runtime/llama/provision { update?, accelerator? } -> { llama_runtime }
+POST   /api/node/runtime/llama/switch    { variant } -> { llama_runtime }
 POST   /api/node/runtime/llama/check-update -> { llama_runtime }
+POST   /api/node/runtime/llama/diagnose -> { llama_runtime.troubleshooting }
+POST   /api/node/runtime/llama/recover { action: "retry"|"compile-anyway"|"release", variant? } -> { llama_runtime }
 POST   /api/node/ray/start      { role: "head"|"worker", head_address? }  (Linux only)
 POST   /api/node/ray/stop
 GET    /api/node/health         -> NodeHealthMetrics

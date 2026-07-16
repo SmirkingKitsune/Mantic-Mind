@@ -22,6 +22,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -117,17 +118,45 @@ std::string bytes_label(int64_t bytes) {
     return buf;
 }
 
+// Let focused controls handle input before global shortcuts. FTXUI's standard
+// CatchEvent does the reverse, which lets shortcuts steal navigation keys.
+class CatchEventAfter : public ftxui::ComponentBase {
+public:
+    explicit CatchEventAfter(std::function<bool(ftxui::Event)> on_event)
+        : on_event_(std::move(on_event)) {}
+
+    bool OnEvent(ftxui::Event event) override {
+        if (ftxui::ComponentBase::OnEvent(event)) return true;
+        return on_event_(std::move(event));
+    }
+
+private:
+    std::function<bool(ftxui::Event)> on_event_;
+};
+
+ftxui::Component make_catch_event_after(
+    ftxui::Component child,
+    std::function<bool(ftxui::Event)> on_event) {
+    auto component = std::make_shared<CatchEventAfter>(std::move(on_event));
+    component->Add(std::move(child));
+    return component;
+}
+
 } // namespace
 
 NodeUI::NodeUI(NodeState& state, uint16_t listen_port,
                ForgetPairingCallback forget_pairing_cb,
                RequestVllmUpdateCallback request_vllm_update_cb,
-               RequestLlamaUpdateCallback request_llama_update_cb)
+               RequestLlamaUpdateCallback request_llama_update_cb,
+               RequestLlamaSwitchCallback request_llama_switch_cb,
+               RequestLlamaRecoveryCallback request_llama_recovery_cb)
     : state_(state)
     , listen_port_(listen_port)
     , forget_pairing_cb_(std::move(forget_pairing_cb))
     , request_vllm_update_cb_(std::move(request_vllm_update_cb))
-    , request_llama_update_cb_(std::move(request_llama_update_cb)) {
+    , request_llama_update_cb_(std::move(request_llama_update_cb))
+    , request_llama_switch_cb_(std::move(request_llama_switch_cb))
+    , request_llama_recovery_cb_(std::move(request_llama_recovery_cb)) {
     started_ms_ = mm::util::now_ms();
     log_file_path_ = make_temp_runtime_log_path();
     if (!log_file_path_.empty()) {
@@ -190,6 +219,7 @@ void NodeUI::run() {
     mm::tui::LayoutStore layout("data/node-tui-layout.json");
     int node_tab = 0;
     std::vector<std::string> node_tab_labels = {"1 Overview", "2 Runtimes", "3 Models & Slots", "4 Logs"};
+    bool show_node_tabs = false;
     int left_width = layout.get("overview.left_width", 48, 32, 78);
     int top_height = layout.get("overview.top_height", 22, 12, 38);
     int slot_sel = 0;
@@ -222,10 +252,16 @@ void NodeUI::run() {
     bool        show_update_button = false;
     bool        show_llama_update_modal  = false;
     bool        show_llama_update_button = false;
+    bool        show_llama_engine_modal = false;
+    bool        show_llama_engine_button = false;
+    bool        show_llama_troubleshoot_modal = false;
+    bool        show_llama_release_choice = false;
+    bool        show_llama_compile_anyway = false;
     bool        show_llama_current_action = false;
     bool        show_llama_alt_cuda = false;
     bool        show_llama_alt_rocm = false;
     bool        show_llama_alt_vulkan = false;
+    bool        show_llama_alt_openvino = false;
     bool        show_llama_alt_metal = false;
     bool        show_llama_alt_cpu = false;
     bool        show_action_modal  = false;
@@ -233,6 +269,25 @@ void NodeUI::run() {
     std::string modal_ack_version;   // latest_version the user has acted on/dismissed
     std::string llama_cur_latest;
     std::string llama_modal_ack_version;
+    std::string llama_troubleshoot_ack_fingerprint;
+    std::vector<std::string> llama_release_entries;
+    std::vector<std::string> llama_release_ids;
+    std::vector<std::string> llama_release_assets;
+    int llama_release_selection = 0;
+    std::vector<std::string> llama_engine_entries;
+    std::vector<std::string> llama_engine_ids;
+    std::vector<std::string> llama_engine_details;
+    int llama_engine_selection = 0;
+
+    auto high_contrast_button_option = [] {
+        ButtonOption option = ButtonOption::Simple();
+        option.transform = [](const EntryState& state) -> Element {
+            Element label = text(state.label) | color(Color::White);
+            if (state.focused) label = std::move(label) | inverted | bold;
+            return label;
+        };
+        return option;
+    };
 
     auto request_update = [&] {
         if (request_vllm_update_cb_) request_vllm_update_cb_();
@@ -282,11 +337,15 @@ void NodeUI::run() {
     auto modal_llama_cuda = llama_alternative_button(" Use CUDA release ", "cuda");
     auto modal_llama_rocm = llama_alternative_button(" Use ROCm release ", "rocm");
     auto modal_llama_vulkan = llama_alternative_button(" Use Vulkan release ", "vulkan");
+    auto modal_llama_openvino =
+        llama_alternative_button(" Use OpenVINO release ", "openvino");
     auto modal_llama_metal = llama_alternative_button(" Use Metal release ", "metal");
     auto modal_llama_cpu = llama_alternative_button(" Use CPU release ", "cpu");
     auto modal_llama_cuda_maybe = Maybe(modal_llama_cuda, &show_llama_alt_cuda);
     auto modal_llama_rocm_maybe = Maybe(modal_llama_rocm, &show_llama_alt_rocm);
     auto modal_llama_vulkan_maybe = Maybe(modal_llama_vulkan, &show_llama_alt_vulkan);
+    auto modal_llama_openvino_maybe =
+        Maybe(modal_llama_openvino, &show_llama_alt_openvino);
     auto modal_llama_metal_maybe = Maybe(modal_llama_metal, &show_llama_alt_metal);
     auto modal_llama_cpu_maybe = Maybe(modal_llama_cpu, &show_llama_alt_cpu);
     auto modal_llama_later = Button(" Later ", [&] {
@@ -298,17 +357,93 @@ void NodeUI::run() {
         modal_llama_cuda_maybe,
         modal_llama_rocm_maybe,
         modal_llama_vulkan_maybe,
+        modal_llama_openvino_maybe,
         modal_llama_metal_maybe,
         modal_llama_cpu_maybe,
         modal_llama_later,
     });
+
+    auto btn_llama_engine = Button("[ Change llama.cpp engine ]", [&] {
+        show_llama_engine_modal = true;
+    }, high_contrast_button_option());
+    auto btn_llama_engine_maybe = Maybe(btn_llama_engine, &show_llama_engine_button);
+    MenuOption llama_engine_menu_option = MenuOption::Vertical();
+    llama_engine_menu_option.entries_option.transform =
+        [](const EntryState& state) -> Element {
+            Element row = text(state.label) | color(Color::White);
+            if (state.active) row = std::move(row) | inverted | bold;
+            else if (state.focused) row = std::move(row) | underlined;
+            return row;
+        };
+    auto llama_engine_menu = Menu(&llama_engine_entries, &llama_engine_selection,
+                                  llama_engine_menu_option);
+    auto modal_llama_engine_apply = Button("[ Use selected engine ]", [&] {
+        if (request_llama_switch_cb_ && llama_engine_selection >= 0 &&
+            llama_engine_selection < static_cast<int>(llama_engine_ids.size())) {
+            request_llama_switch_cb_(
+                llama_engine_ids[static_cast<size_t>(llama_engine_selection)]);
+        }
+        show_llama_engine_modal = false;
+    }, high_contrast_button_option());
+    auto modal_llama_engine_cancel = Button("[ Cancel ]", [&] {
+        show_llama_engine_modal = false;
+    }, high_contrast_button_option());
+    auto llama_engine_actions = Container::Horizontal({
+        modal_llama_engine_apply, modal_llama_engine_cancel,
+    });
+    auto llama_engine_controls = Container::Vertical({
+        llama_engine_menu, llama_engine_actions,
+    });
+
+    auto request_llama_recovery = [&](const std::string& action,
+                                      const std::string& variant = std::string{}) {
+        if (request_llama_recovery_cb_) request_llama_recovery_cb_(action, variant);
+        const auto rt = state_.get_llama_runtime();
+        llama_troubleshoot_ack_fingerprint = rt.troubleshooting.fingerprint;
+        show_llama_troubleshoot_modal = false;
+    };
+    auto modal_llama_diagnose = Button("[ Re-run diagnostics ]", [&] {
+        request_llama_recovery("diagnose");
+    }, high_contrast_button_option());
+    auto modal_llama_retry = Button("[ Retry normal provisioning ]", [&] {
+        request_llama_recovery("retry");
+    }, high_contrast_button_option());
+    auto modal_llama_compile_anyway = Button("[ Compile anyway - one attempt ]", [&] {
+        request_llama_recovery("compile-anyway");
+    }, high_contrast_button_option());
+    auto modal_llama_compile_anyway_maybe =
+        Maybe(modal_llama_compile_anyway, &show_llama_compile_anyway);
+    MenuOption llama_release_menu_option = MenuOption::Vertical();
+    llama_release_menu_option.entries_option.transform =
+        [](const EntryState& state) -> Element {
+            Element row = text(state.label) | color(Color::White);
+            if (state.active) row = std::move(row) | inverted | bold;
+            else if (state.focused) row = std::move(row) | underlined;
+            return row;
+        };
+    auto llama_release_menu = Menu(&llama_release_entries, &llama_release_selection,
+                                   llama_release_menu_option);
+    auto llama_release_menu_maybe = Maybe(llama_release_menu, &show_llama_release_choice);
+    auto modal_llama_use_release = Button("[ Use selected release ]", [&] {
+        if (llama_release_selection >= 0 &&
+            llama_release_selection < static_cast<int>(llama_release_ids.size())) {
+            request_llama_recovery(
+                "release", llama_release_ids[static_cast<size_t>(llama_release_selection)]);
+        }
+    }, high_contrast_button_option());
+    auto modal_llama_use_release_maybe =
+        Maybe(modal_llama_use_release, &show_llama_release_choice);
+    auto modal_llama_troubleshoot_dismiss = Button("[ Dismiss ]", [&] {
+        const auto rt = state_.get_llama_runtime();
+        llama_troubleshoot_ack_fingerprint = rt.troubleshooting.fingerprint;
+        show_llama_troubleshoot_modal = false;
+    }, high_contrast_button_option());
 
     auto action_cancel = Button("  Cancel  ", [&] {
         state_.request_action_cancel();
     }, ButtonOption::Simple());
     auto action_btns = Container::Horizontal({action_cancel});
 
-    auto tab_toggle = Toggle(&node_tab_labels, &node_tab);
     auto left_divider = mm::tui::resizable_divider(
         &left_width, 32, 78, mm::tui::SplitAxis::Columns, [&](int) { save_layout(); });
     auto row_divider = mm::tui::resizable_divider(
@@ -319,6 +454,50 @@ void NodeUI::run() {
         if (!stream.thinking.empty()) out += "[thinking]\n" + stream.thinking + "\n\n";
         out += stream.content;
         return out.empty() ? std::string{"(idle -- waiting for inference)"} : out;
+    });
+    auto llama_troubleshoot_details = mm::tui::wrapped_scroll_view([&]() {
+        const auto report = state_.get_llama_runtime().troubleshooting;
+        std::ostringstream out;
+        out << "Failure stage: " << report.failure_stage << "\n"
+            << report.failure_detail << "\n\n"
+            << report.summary << "\n\nEnvironment checks:\n";
+        for (const auto& check : report.checks) {
+            std::string marker = check.status == "pass" ? "PASS"
+                : (check.status == "fail" ? "FAIL"
+                    : (check.status == "warn" ? "WARN" : "INFO"));
+            out << "[" << marker << "] " << check.label;
+            if (!check.detected.empty()) out << ": " << check.detected;
+            out << "\n";
+            if (!check.required.empty()) out << "  Required: " << check.required << "\n";
+            if (!check.remediation.empty()) out << "  Fix: " << check.remediation << "\n";
+        }
+        out << "\nRuntime variants (" << report.platform << "/"
+            << report.architecture << "):\n";
+        for (const auto& variant : report.variants) {
+            const char* availability = variant.release_available ? "RELEASE"
+                : (variant.source_supported ? "COMPILE" : "UNSUPPORTED");
+            out << "[" << availability << "] " << variant.label;
+            if (variant.recommended) out << " (recommended)";
+            out << ": " << variant.reason;
+            if (!variant.release_asset.empty()) out << " [" << variant.release_asset << "]";
+            out << "\n";
+        }
+        return out.str();
+    });
+    auto llama_troubleshoot_primary_actions = Container::Horizontal({
+        modal_llama_use_release_maybe,
+        modal_llama_retry,
+    });
+    auto llama_troubleshoot_secondary_actions = Container::Horizontal({
+        modal_llama_diagnose,
+        modal_llama_troubleshoot_dismiss,
+    });
+    auto llama_troubleshoot_btns = Container::Vertical({
+        llama_troubleshoot_details,
+        llama_release_menu_maybe,
+        llama_troubleshoot_primary_actions,
+        llama_troubleshoot_secondary_actions,
+        modal_llama_compile_anyway_maybe,
     });
     auto slot_menu = Menu(&slot_entries, &slot_sel, MenuOption::Vertical());
     InputOption node_line; node_line.multiline = false;
@@ -369,16 +548,52 @@ void NodeUI::run() {
     auto slot_buttons = Container::Horizontal({btn_slot_suspend, btn_slot_restore, btn_slot_unload});
     auto ray_buttons = Container::Horizontal({btn_ray_head, btn_ray_worker, btn_ray_stop});
     auto model_row = Container::Horizontal({model_input, btn_model_pull});
-    auto main_container = Container::Vertical({tab_toggle, btn_forget_pairing,
+
+    // Keep the selected page and the focus tree in lockstep. Previously all
+    // controls from all pages shared one container, so hidden controls could
+    // retain focus. Explicit button tabs also provide consistent mouse and
+    // keyboard behavior across Windows terminal hosts.
+    Components node_tab_buttons;
+    for (int i = 0; i < static_cast<int>(node_tab_labels.size()); ++i) {
+        ButtonOption option = ButtonOption::Simple();
+        option.transform = [&, i](const EntryState& state) -> Element {
+            Element label = text(" " + node_tab_labels[static_cast<size_t>(i)] + " ");
+            if (node_tab == i) label = std::move(label) | inverted | bold;
+            else if (state.focused) label = std::move(label) | underlined;
+            else label = std::move(label) | dim;
+            return label;
+        };
+        node_tab_buttons.push_back(Button(
+            node_tab_labels[static_cast<size_t>(i)],
+            [&, i] { node_tab = i; }, option));
+    }
+    auto tab_button_row = Container::Horizontal(std::move(node_tab_buttons));
+    auto overview_controls = Container::Vertical({
+        left_divider, row_divider, generated_scroll,
+    });
+    auto runtime_controls = Container::Vertical({
+        ray_input, ray_buttons, btn_llama_engine_maybe,
         btn_llama_update_maybe, btn_update_maybe,
-        left_divider, row_divider, generated_scroll, slot_menu, slot_buttons,
-        model_row, ray_input, ray_buttons});
+    });
+    auto model_controls = Container::Vertical({
+        model_row, slot_menu, slot_buttons,
+    });
+    auto log_controls = Container::Vertical({});
+    auto page_controls = Container::Tab({
+        overview_controls, runtime_controls, model_controls, log_controls,
+    }, &node_tab);
+    auto tab_button_row_maybe = Maybe(tab_button_row, &show_node_tabs);
+    auto page_controls_maybe = Maybe(page_controls, &show_node_tabs);
+    auto main_container = Container::Vertical({
+        tab_button_row_maybe, page_controls_maybe, btn_forget_pairing,
+    });
 
     // ── Renderer ──────────────────────────────────────────────────────────────
     auto render = Renderer(main_container, [&]() -> Element {
 
         // Snapshot mutable state
         bool registered   = state_.is_registered();
+        show_node_tabs    = registered;
         auto metrics      = state_.get_metrics();
         auto loaded_model = state_.get_loaded_model();
         auto active_agent = state_.get_active_agent();
@@ -411,6 +626,11 @@ void NodeUI::run() {
         llama_cur_latest = llama_rt.latest_version;
         const bool llama_busy = action_prog.active &&
                                 action_prog.operation_id == "llama-runtime";
+        const bool llama_ready =
+            (llama_rt.status == "ready" || llama_rt.status == "resolved") &&
+            !llama_rt.executable_path.empty();
+        show_llama_engine_button = static_cast<bool>(request_llama_switch_cb_) &&
+                                   llama_ready && !llama_busy;
         const bool can_update_llama = llama_rt.update_available && llama_rt.managed &&
                                       static_cast<bool>(request_llama_update_cb_) &&
                                       !llama_busy;
@@ -424,11 +644,69 @@ void NodeUI::run() {
         show_llama_alt_cuda = has_llama_alternative("cuda");
         show_llama_alt_rocm = has_llama_alternative("rocm");
         show_llama_alt_vulkan = has_llama_alternative("vulkan");
+        show_llama_alt_openvino = has_llama_alternative("openvino");
         show_llama_alt_metal = has_llama_alternative("metal");
         show_llama_alt_cpu = has_llama_alternative("cpu");
         show_llama_update_modal = !show_action_modal && can_update_llama &&
             (show_llama_update_modal ||
              llama_modal_ack_version != llama_rt.latest_version);
+
+        llama_release_entries.clear();
+        llama_release_ids.clear();
+        llama_release_assets.clear();
+        for (const auto& variant : llama_rt.troubleshooting.variants) {
+            if (!variant.release_available) continue;
+            llama_release_ids.push_back(variant.id);
+            llama_release_assets.push_back(variant.release_asset);
+            llama_release_entries.push_back((variant.recommended ? "* " : "  ") +
+                                            variant.label +
+                                            (variant.recommended ? " (recommended)" : ""));
+        }
+        if (llama_release_selection >= static_cast<int>(llama_release_entries.size()))
+            llama_release_selection = std::max(
+                0, static_cast<int>(llama_release_entries.size()) - 1);
+        show_llama_release_choice = !llama_release_entries.empty();
+        show_llama_compile_anyway =
+            llama_rt.troubleshooting.can_override_checks;
+        const bool can_troubleshoot = llama_rt.troubleshooting.required &&
+            static_cast<bool>(request_llama_recovery_cb_);
+        show_llama_troubleshoot_modal = !show_action_modal && can_troubleshoot &&
+            (show_llama_troubleshoot_modal ||
+             llama_troubleshoot_ack_fingerprint !=
+                 llama_rt.troubleshooting.fingerprint);
+        if (show_llama_troubleshoot_modal) show_llama_update_modal = false;
+
+        llama_engine_entries.clear();
+        llama_engine_ids.clear();
+        llama_engine_details.clear();
+        for (const auto& variant : llama_rt.available_variants) {
+            if (!variant.platform_supported ||
+                (!variant.release_available && !variant.source_supported))
+                continue;
+            const bool current = (!llama_rt.variant.empty() &&
+                                  llama_rt.variant == variant.id) ||
+                ((llama_rt.variant.empty() ||
+                  llama_rt.variant == llama_rt.accelerator) &&
+                 llama_rt.accelerator == variant.backend);
+            const std::string action = variant.release_available
+                ? "official release" : "compile locally";
+            llama_engine_ids.push_back(variant.id);
+            llama_engine_entries.push_back(
+                (current ? "* " : "  ") + variant.label + " - " + action);
+            llama_engine_details.push_back(
+                variant.reason + (variant.release_asset.empty()
+                    ? std::string{} : " [" + variant.release_asset + "]"));
+        }
+        if (llama_engine_selection >= static_cast<int>(llama_engine_entries.size()))
+            llama_engine_selection = std::max(
+                0, static_cast<int>(llama_engine_entries.size()) - 1);
+        show_llama_engine_modal = !show_action_modal && show_llama_engine_button &&
+                                  show_llama_engine_modal &&
+                                  !llama_engine_entries.empty();
+        if (show_llama_engine_modal) {
+            show_llama_update_modal = false;
+            show_llama_troubleshoot_modal = false;
+        }
 
         int log_scroll_from_bottom = 0;
         std::string log_file_path;
@@ -735,25 +1013,44 @@ void NodeUI::run() {
                       static_cast<int>((up_s / 60) % 60),
                       static_cast<int>(up_s % 60));
 
-        auto runtime_status = [](const std::string& name, const auto& runtime) {
+        auto runtime_status = [](const std::string& name, const auto& runtime,
+                                 const std::string& variant) {
+            const std::string install = runtime.managed
+                ? "managed " + (runtime.method.empty() ? std::string{"runtime"}
+                                                        : runtime.method)
+                : (runtime.method == "path" ? std::string{"external PATH"}
+                                             : runtime.method);
             Elements rows = {
-                hbox({text(name + " status  ") | dim, text(runtime.status) | bold}),
-                hbox({text("version       ") | dim, text(runtime.version.empty() ? "unknown" : runtime.version)}),
-                hbox({text("accelerator   ") | dim, text(runtime.accelerator.empty() ? "unknown" : runtime.accelerator)}),
+                hbox({text("engine        ") | dim, text(name) | bold}),
+                hbox({text("status        ") | dim, text(runtime.status) | bold}),
+                hbox({text("version       ") | dim,
+                      text(runtime.version.empty() ? "not reported" : runtime.version)}),
+                hbox({text("backend       ") | dim,
+                      text(runtime.accelerator.empty() ? "unknown" : runtime.accelerator)}),
+                hbox({text("variant       ") | dim,
+                      text(variant.empty()
+                          ? (runtime.accelerator.empty() ? "unknown" : runtime.accelerator)
+                          : variant)}),
+                hbox({text("install       ") | dim,
+                      text(install.empty() ? "unknown" : install)}),
                 paragraph("path          " + (runtime.executable_path.empty() ? std::string{"not resolved"} : runtime.executable_path)) | dim,
             };
             if (!runtime.last_error.empty()) rows.push_back(paragraph(runtime.last_error) | color(Color::Red));
             return vbox(std::move(rows));
         };
         Element runtimes_page = vbox({
-            hbox({panel("llama.cpp", runtime_status("llama.cpp", llama_rt)) | flex,
-                  panel("vLLM", runtime_status("vLLM", vllm_rt)) | flex}),
+            hbox({panel("llama.cpp", runtime_status("llama.cpp", llama_rt,
+                                                     llama_rt.variant)) | flex,
+                  panel("vLLM", runtime_status("vLLM", vllm_rt,
+                                                vllm_rt.accelerator)) | flex}),
             panel("RAY", vbox({
                 text("Ray controls are enabled only when the node advertises Ray support.") | dim,
                 ray_input->Render() | border,
                 ray_buttons->Render(),
             })),
-            hbox({btn_llama_update_maybe->Render(), text(" "), btn_update_maybe->Render()}),
+            hbox({btn_llama_engine_maybe->Render(), text(" "),
+                  btn_llama_update_maybe->Render(), text(" "),
+                  btn_update_maybe->Render()}),
             operation_status.empty() ? text("") : paragraph(operation_status),
         });
         Element models_page = vbox({
@@ -783,14 +1080,16 @@ void NodeUI::run() {
 
         Element footer = hbox({
             btn_forget_pairing->Render(),
-            text("  f forget · j/k scroll · PgUp/PgDn · Home/End · q quit") | dim,
+            text(node_tab == 3
+                ? "  1-4 tabs · arrows focus/scroll · Enter select · f forget · q quit"
+                : "  1-4 tabs · arrows focus · Enter select · f forget · q quit") | dim,
             filler(),
             text("mantic-mind · node ") | dim,
         });
 
         return vbox({
             header,
-            tab_toggle->Render(),
+            tab_button_row->Render(),
             separator(),
             std::move(page) | flex,
             footer,
@@ -844,6 +1143,96 @@ void NodeUI::run() {
         rows.push_back(modal_llama_btns->Render() | hcenter);
         return vbox(std::move(rows)) | border | size(WIDTH, EQUAL, 68);
     });
+    auto llama_engine_modal_renderer =
+        Renderer(llama_engine_controls, [&]() -> Element {
+            const auto rt = state_.get_llama_runtime();
+            Elements rows{
+                text(" Change llama.cpp engine ") | bold | hcenter |
+                    color(Color::Cyan),
+                separator(),
+                hbox({text(" engine  : ") | dim, text("llama.cpp") | bold}),
+                hbox({text(" backend : ") | dim,
+                      text(rt.accelerator.empty() ? std::string{"unknown"}
+                                                  : rt.accelerator) | bold}),
+                hbox({text(" variant : ") | dim,
+                      text(rt.variant.empty()
+                          ? (rt.accelerator.empty() ? std::string{"unknown"}
+                                                    : rt.accelerator)
+                          : rt.variant)}),
+                hbox({text(" install : ") | dim,
+                      text(rt.managed ? "managed " + rt.method
+                                      : (rt.method == "path" ? "external PATH"
+                                                             : rt.method))}),
+                separator(),
+                llama_engine_menu->Render() | size(HEIGHT, LESS_THAN, 9),
+            };
+            if (llama_engine_selection >= 0 &&
+                llama_engine_selection < static_cast<int>(llama_engine_details.size())) {
+                rows.push_back(paragraph(
+                    " " + llama_engine_details[static_cast<size_t>(
+                              llama_engine_selection)]) | dim);
+            }
+            rows.push_back(paragraph(
+                " Switching changes the managed runtime used by new or restarted llama.cpp slots. Existing running slots keep their current process until unloaded.") |
+                color(Color::Yellow));
+            rows.push_back(separator());
+            rows.push_back(llama_engine_actions->Render() | hcenter);
+            return vbox(std::move(rows)) | border | size(WIDTH, EQUAL, 76);
+        });
+    auto llama_troubleshoot_modal_renderer =
+        Renderer(llama_troubleshoot_btns, [&]() -> Element {
+            const auto report = state_.get_llama_runtime().troubleshooting;
+            Elements rows{
+                text(" llama.cpp troubleshooting wizard ") | bold | hcenter |
+                    color(Color::Yellow),
+                separator(),
+                hbox({text(" host   : ") | dim,
+                      text(report.platform + "/" + report.architecture)}),
+                hbox({text(" target : ") | dim,
+                      text(report.target_backend.empty() ? std::string{"?"}
+                                                         : report.target_backend) | bold}),
+                hbox({text(" stage  : ") | dim,
+                      text(shorten_middle(report.failure_stage, 58)) |
+                          color(Color::Red)}),
+                paragraph(" " + report.summary),
+                separator(),
+                llama_troubleshoot_details->Render() | frame | vscroll_indicator |
+                    size(HEIGHT, EQUAL, 12),
+            };
+            if (show_llama_release_choice) {
+                rows.push_back(separator());
+                rows.push_back(text(" Complete official release fallbacks ") | bold);
+                rows.push_back(llama_release_menu_maybe->Render() |
+                               size(HEIGHT, LESS_THAN, 5));
+                if (llama_release_selection >= 0 &&
+                    llama_release_selection < static_cast<int>(llama_release_assets.size())) {
+                    rows.push_back(hbox({
+                        text(" asset : ") | dim,
+                        text(shorten_middle(
+                            llama_release_assets[static_cast<size_t>(llama_release_selection)],
+                            62)) | color(Color::GrayLight),
+                    }));
+                }
+            }
+            rows.push_back(separator());
+            rows.push_back(hbox({
+                modal_llama_use_release_maybe->Render(),
+                text("  "),
+                modal_llama_retry->Render(),
+            }) | hcenter);
+            rows.push_back(hbox({
+                modal_llama_diagnose->Render(),
+                text("  "),
+                modal_llama_troubleshoot_dismiss->Render(),
+            }) | hcenter);
+            if (show_llama_compile_anyway) {
+                rows.push_back(paragraph(
+                    " One-attempt override skips only the environment preflight; CMake and compiler errors still stop the build.") |
+                    color(Color::Yellow));
+                rows.push_back(modal_llama_compile_anyway_maybe->Render() | hcenter);
+            }
+            return vbox(std::move(rows)) | border | size(WIDTH, EQUAL, 78);
+        });
     auto action_modal_renderer = Renderer(action_btns, [&]() -> Element {
         auto p = state_.get_action_progress();
         const double derived_fraction =
@@ -894,12 +1283,36 @@ void NodeUI::run() {
     auto with_update = Modal(render, update_modal_renderer, &show_update_modal);
     auto with_llama_update =
         Modal(with_update, llama_update_modal_renderer, &show_llama_update_modal);
-    auto with_modal = Modal(with_llama_update, action_modal_renderer, &show_action_modal);
+    auto with_llama_engine =
+        Modal(with_llama_update, llama_engine_modal_renderer,
+              &show_llama_engine_modal);
+    auto with_llama_troubleshooting = Modal(
+        with_llama_engine, llama_troubleshoot_modal_renderer,
+        &show_llama_troubleshoot_modal);
+    auto with_modal =
+        Modal(with_llama_troubleshooting, action_modal_renderer, &show_action_modal);
 
-    auto component = CatchEvent(with_modal, [&](Event ev) {
+    auto component = make_catch_event_after(with_modal, [&](Event ev) {
         if (show_action_modal) {
             if (ev == Event::Escape) {
                 state_.request_action_cancel();
+                return true;
+            }
+            return false;
+        }
+        if (show_llama_troubleshoot_modal) {
+            if (ev == Event::Escape) {
+                const auto rt = state_.get_llama_runtime();
+                llama_troubleshoot_ack_fingerprint =
+                    rt.troubleshooting.fingerprint;
+                show_llama_troubleshoot_modal = false;
+                return true;
+            }
+            return false;
+        }
+        if (show_llama_engine_modal) {
+            if (ev == Event::Escape) {
+                show_llama_engine_modal = false;
                 return true;
             }
             return false;
@@ -921,6 +1334,11 @@ void NodeUI::run() {
             }
             return false;
         }
+        if (ev == Event::Character('1')) { node_tab = 0; return true; }
+        if (ev == Event::Character('2')) { node_tab = 1; return true; }
+        if (ev == Event::Character('3')) { node_tab = 2; return true; }
+        if (ev == Event::Character('4')) { node_tab = 3; return true; }
+
         const int viewport = log_viewport;
         auto scroll_logs = [&](int delta) {
             std::lock_guard<std::mutex> lk(log_mutex_);
@@ -939,29 +1357,33 @@ void NodeUI::run() {
             log_scroll_from_bottom_ = max_scroll;
         };
 
-        if (ev == Event::Character('k') || ev == Event::ArrowUp) {
-            scroll_logs(+1);
-            return true;
-        }
-        if (ev == Event::Character('j') || ev == Event::ArrowDown) {
-            scroll_logs(-1);
-            return true;
-        }
-        if (ev == Event::PageUp) {
-            scroll_logs(+kLogScrollPage);
-            return true;
-        }
-        if (ev == Event::PageDown) {
-            scroll_logs(-kLogScrollPage);
-            return true;
-        }
-        if (ev == Event::Home) {
-            scroll_to_oldest();
-            return true;
-        }
-        if (ev == Event::End || ev == Event::Character('G')) {
-            scroll_to_end();
-            return true;
+        // Log navigation belongs to the Logs page. On other pages these keys
+        // remain available to the focused controls and their containers.
+        if (node_tab == 3) {
+            if (ev == Event::Character('k') || ev == Event::ArrowUp) {
+                scroll_logs(+1);
+                return true;
+            }
+            if (ev == Event::Character('j') || ev == Event::ArrowDown) {
+                scroll_logs(-1);
+                return true;
+            }
+            if (ev == Event::PageUp) {
+                scroll_logs(+kLogScrollPage);
+                return true;
+            }
+            if (ev == Event::PageDown) {
+                scroll_logs(-kLogScrollPage);
+                return true;
+            }
+            if (ev == Event::Home) {
+                scroll_to_oldest();
+                return true;
+            }
+            if (ev == Event::End || ev == Event::Character('G')) {
+                scroll_to_end();
+                return true;
+            }
         }
         if (ev == Event::Character('f')) {
             return forget_pairing();

@@ -453,7 +453,15 @@ public:
 
     ftxui::Element OnRender() override {
         using namespace ftxui;
-        Element body = paragraph(content_()) |
+        // paragraph() does not reliably wrap each embedded newline-delimited
+        // diagnostic line in all FTXUI/terminal combinations. Render logical
+        // lines separately so long compiler paths and CMake call stacks wrap
+        // instead of disappearing beyond the modal's right edge.
+        Elements wrapped_lines;
+        for (const auto& line : util::split(content_(), '\n'))
+            wrapped_lines.push_back(paragraph(line.empty() ? " " : line));
+        if (wrapped_lines.empty()) wrapped_lines.push_back(text(""));
+        Element body = vbox(std::move(wrapped_lines)) |
                        focusPositionRelative(0.0f, scroll_position_) |
                        frame | vscroll_indicator | flex;
         if (Focused()) body = std::move(body) | color(Color::Cyan);

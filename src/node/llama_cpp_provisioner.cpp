@@ -51,6 +51,24 @@ bool is_path_like(const std::string& s) {
         || s.find(':') != std::string::npos;
 }
 
+bool is_generic_llama_server_request(const std::string& raw) {
+    const std::string request = util::to_lower(strip_wrapping_quotes(raw));
+    return request == "llama-server" || request == "llama-server.exe";
+}
+
+// A bare `llama-server` on PATH has no accelerator identity. In particular,
+// the Windows Winget package is a generic CPU build and must not shadow a
+// managed CUDA/Vulkan/ROCm runtime. Explicit paths/wrapper names remain trusted,
+// and disabling auto-provision preserves the traditional PATH-only behavior.
+bool use_unmanaged_path_runtime(const LlamaProvisionConfig& cfg) {
+    if (!is_generic_llama_server_request(cfg.requested_executable)) return true;
+    if (!cfg.auto_provision) return true;
+    if (cfg.accelerator == "cpu") return true;
+    // llama.cpp's normal macOS build enables Metal, so the conventional PATH
+    // binary is accelerator-correct there rather than analogous to Winget CPU.
+    return cfg.platform == "macos" && cfg.accelerator == "metal";
+}
+
 bool file_exists(const fs::path& p) {
     std::error_code ec;
     return fs::exists(p, ec) && fs::is_regular_file(p, ec);
@@ -64,7 +82,11 @@ std::string release_arch(const std::string& arch) {
     const std::string normalized = util::to_lower(util::trim(arch));
     if (normalized == "x86_64" || normalized == "amd64" || normalized == "x64")
         return "x64";
-    if (normalized == "aarch64" || normalized == "arm64") return "arm64";
+    if (normalized == "x86" || normalized == "i386" || normalized == "i686")
+        return "x86";
+    if (normalized == "aarch64" || normalized == "arm64" ||
+        normalized == "apple-silicon" || normalized == "apple silicon")
+        return "arm64";
     return normalized;
 }
 
@@ -75,6 +97,106 @@ std::string safe_path_component(std::string value) {
             ch = '-';
     }
     return value.empty() ? std::string{"unknown"} : value;
+}
+
+// CMAKE_CUDA_ARCHITECTURES accepts a semicolon-separated list and optional
+// "-real"/"-virtual" suffixes. Reduce those values to the architecture names
+// reported by `nvcc --list-gpu-arch` so the source-build preflight can verify
+// that the compiler selected by CUDACXX/PATH actually supports the detected GPU.
+std::vector<std::string> cuda_arch_targets(const std::string& value) {
+    std::vector<std::string> targets;
+    std::string token;
+    auto flush = [&] {
+        token = util::to_lower(util::trim(token));
+        if (token.rfind("compute_", 0) == 0) token.erase(0, 8);
+        if (token.rfind("sm_", 0) == 0) token.erase(0, 3);
+        for (const std::string& suffix : {std::string{"-real"},
+                                          std::string{"-virtual"}}) {
+            if (token.size() > suffix.size() &&
+                token.compare(token.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                token.erase(token.size() - suffix.size());
+                break;
+            }
+        }
+        const bool valid = !token.empty() &&
+            std::isdigit(static_cast<unsigned char>(token.front())) != 0 &&
+            std::all_of(token.begin(), token.end(), [](unsigned char ch) {
+                return std::isdigit(ch) != 0 || (ch >= 'a' && ch <= 'z');
+            });
+        if (valid && std::find(targets.begin(), targets.end(), token) == targets.end())
+            targets.push_back(token);
+        token.clear();
+    };
+    for (const char ch : value) {
+        if (ch == ';' || ch == ',' || std::isspace(static_cast<unsigned char>(ch)))
+            flush();
+        else
+            token.push_back(ch);
+    }
+    flush();
+    return targets;
+}
+
+std::string cuda_arch_requirement(const std::vector<std::string>& targets) {
+    std::vector<std::string> labels;
+    labels.reserve(targets.size());
+    for (const auto& target : targets) labels.push_back("compute_" + target);
+    std::string requirement = "NVCC support for " + util::join(labels, ", ");
+    if (std::find(targets.begin(), targets.end(), "120") != targets.end())
+        requirement += " (CUDA Toolkit 12.8 or newer for sm_120)";
+    return requirement;
+}
+
+std::string cuda_compiler_id_arch(const LlamaProvisionConfig& cfg) {
+    const auto targets = cuda_arch_targets(cfg.cuda_arch);
+    return targets.empty() ? std::string{} : targets.front();
+}
+
+bool cuda_removed_default_arch_failure(const std::string& failure_detail) {
+    const std::string lower = util::to_lower(failure_detail);
+    const bool removed_arch = lower.find("sm_52") != std::string::npos ||
+        lower.find("compute_52") != std::string::npos;
+    const bool rejected = lower.find("not defined for option 'gpu-name'") !=
+            std::string::npos ||
+        lower.find("unsupported gpu architecture") != std::string::npos;
+    const bool compiler_id = lower.find("cmakecudacompilerid") !=
+            std::string::npos ||
+        lower.find("cmakedeterminecudacompiler") != std::string::npos;
+    return removed_arch && rejected && compiler_id;
+}
+
+bool nvcc_supports_arch(const std::string& output, const std::string& target) {
+    const std::regex token("(^|[\\s,])compute_" + target + "([\\s,]|$)",
+                           std::regex::icase);
+    return std::regex_search(output, token);
+}
+
+std::string validated_llama_version(std::string output) {
+    output = util::trim(output);
+    if (output.empty()) return {};
+    const std::string lower = util::to_lower(output);
+    for (const std::string& error : {
+             std::string{"not recognized"}, std::string{"unrecognized option"},
+             std::string{"unknown option"}, std::string{"unknown argument"},
+             std::string{"invalid option"}, std::string{"invalid argument"}}) {
+        if (lower.find(error) != std::string::npos) return {};
+    }
+    if (std::regex_match(lower, std::regex("b[0-9]+"))) return output;
+    // Known llama.cpp forms include "version: 6389 (commit)",
+    // "llama.cpp version: 6389", and release tags such as "version b6389".
+    // Requiring a version marker plus a numeric build avoids presenting stderr
+    // or shell diagnostics as the installed version.
+    if (lower.find("version") == std::string::npos) return {};
+    if (!std::regex_search(lower, std::regex("(^|[^0-9])b?[0-9]+([^0-9]|$)")))
+        return {};
+    return output;
+}
+
+std::string backend_for_variant(std::string variant) {
+    variant = util::to_lower(util::trim(variant));
+    if (variant == "cuda-12" || variant == "cuda-13") return "cuda";
+    if (variant == "hip") return "rocm";
+    return variant;
 }
 
 fs::path source_build_dir(const LlamaProvisionConfig& cfg) {
@@ -113,6 +235,7 @@ LlamaProvisionConfig normalized_config(LlamaProvisionConfig cfg) {
                                                    /*has_rocm=*/false);
     }
     cfg.cuda_arch = util::trim(cfg.cuda_arch);
+    cfg.release_variant = util::to_lower(util::trim(cfg.release_variant));
     if (cfg.build_jobs < 0) cfg.build_jobs = 0;
     if (cfg.provision_dir.empty()) {
         cfg.provision_dir = (fs::path("data") / "runtimes" / "llama.cpp").string();
@@ -129,14 +252,30 @@ std::vector<std::string> accelerator_cmake_flags(const LlamaProvisionConfig& cfg
     std::vector<std::string> flags;
     if (cfg.accelerator == "cuda") {
         flags.push_back("-DGGML_CUDA=ON");
-        if (!cfg.cuda_arch.empty())
+        if (!cfg.cuda_arch.empty()) {
             flags.push_back("-DCMAKE_CUDA_ARCHITECTURES=" + cfg.cuda_arch);
-    } else if (cfg.accelerator == "rocm") {
+            // CMake's NVIDIA compiler-identification invocation runs before
+            // target CUDA_ARCHITECTURES are applied. Older CMake/NVCC pairs
+            // can therefore fall back to sm_52, which CUDA 13 removed. Seed
+            // the compiler-id invocation with one detected, validated target.
+            const std::string compiler_id_arch = cuda_compiler_id_arch(cfg);
+            if (!compiler_id_arch.empty())
+                flags.push_back("-DCMAKE_CUDA_FLAGS=-arch=sm_" +
+                                compiler_id_arch);
+        }
+    } else if (cfg.accelerator == "rocm" || cfg.accelerator == "hip") {
         flags.push_back("-DGGML_HIP=ON");
     } else if (cfg.accelerator == "vulkan") {
         flags.push_back("-DGGML_VULKAN=ON");
     } else if (cfg.accelerator == "metal") {
         flags.push_back("-DGGML_METAL=ON");
+    } else if (cfg.accelerator == "openvino") {
+        flags.push_back("-DGGML_OPENVINO=ON");
+    } else if (cfg.accelerator == "sycl-fp32" || cfg.accelerator == "sycl-fp16") {
+        // llama.cpp currently exposes one SYCL build toggle. Precision remains
+        // a runtime/device capability; the wizard keeps FP32/FP16 as distinct
+        // compatibility choices without inventing a nonexistent CMake flag.
+        flags.push_back("-DGGML_SYCL=ON");
     }
     // cpu: no accelerator flag (default CPU backend).
     return flags;
@@ -200,10 +339,12 @@ std::optional<LlamaRuntimeStatus> read_active_runtime(const LlamaProvisionConfig
         status.platform = cfg.platform;
         status.method = method;
         status.source_repo = kLlamaCppRepoUrl;
-        status.version = json.value("version", cfg.version);
+        status.version = validated_llama_version(
+            json.value("version", std::string{}));
         status.managed = true;
         status.executable_path = normalized.string();
         status.accelerator = accelerator;
+        status.variant = json.value("variant", accelerator);
         return status;
     } catch (...) {
         return std::nullopt;
@@ -222,6 +363,7 @@ void write_active_runtime(const LlamaProvisionConfig& cfg,
             {"accelerator", status.accelerator},
             {"version", status.version},
             {"executable_path", status.executable_path},
+            {"variant", status.variant.empty() ? status.accelerator : status.variant},
         }.dump(2);
         out.close();
         std::error_code ec;
@@ -306,7 +448,7 @@ std::string default_fetch_latest(const LlamaProvisionConfig& cfg,
     if (!capture) return {};
     const std::string url =
         "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest";
-    if (cfg.platform == "windows") {
+    if (!cfg.bypass_environment_checks && cfg.platform == "windows") {
         const std::string ps =
             "try { (Invoke-RestMethod -Uri '" + url +
             "' -Headers @{ 'User-Agent' = 'mantic-mind' }).tag_name } catch { '' }";
@@ -394,10 +536,7 @@ std::vector<LlamaInstallStep> build_release_plan(const LlamaProvisionConfig& cfg
     const fs::path stage = rel / "staging";
     const fs::path next_bin = rel / "bin.next";
     const fs::path bin = rel / "bin";
-    const std::string release_arch =
-        (cfg.arch == "x86_64" || cfg.arch == "amd64" || cfg.arch == "x64")
-            ? "x64"
-            : (cfg.arch == "aarch64" ? "arm64" : cfg.arch);
+    const std::string asset_arch = release_arch(cfg.arch);
     const std::string tag_filter =
         cfg.version == "latest" ? std::string("releases/latest")
                                 : "releases/tags/" + cfg.version;
@@ -407,24 +546,27 @@ std::vector<LlamaInstallStep> build_release_plan(const LlamaProvisionConfig& cfg
     if (cfg.platform == "windows") {
         std::ostringstream ps;
         ps << "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; ";
-        ps << "$api='" << api << "'; $arch='" << release_arch
-           << "'; $backend='" << cfg.accelerator << "'; ";
+        ps << "$api='" << api << "'; $arch='" << asset_arch
+           << "'; $backend='" << cfg.accelerator << "'; $variant='"
+           << cfg.release_variant << "'; ";
         ps << "$rel='" << rel.string() << "'; $stage='" << stage.string()
            << "'; $next='" << next_bin.string() << "'; $bin='" << bin.string() << "'; ";
         ps << "New-Item -ItemType Directory -Force -Path $rel | Out-Null; ";
         ps << "$r=Invoke-RestMethod -Uri $api -Headers @{'User-Agent'='mantic-mind'}; $assets=@($r.assets); ";
         ps << "$archRx=[regex]::Escape($arch); ";
         ps << "$base=@($assets | Where-Object {$_.name -match ('^llama-.*-bin-win-cpu-'+$archRx+'\\.zip$')})[0]; ";
+        ps << "if ($backend -eq 'openvino') {$full=$assets | Where-Object {$_.name -match ('^llama-.*-bin-win-openvino-.*-'+$archRx+'\\.zip$')} | Select-Object -First 1; if($null -eq $full){throw 'No matching llama.cpp Windows OpenVINO release'}; $selected=@($full)} else { ";
         ps << "if ($null -eq $base) { throw ('No llama.cpp Windows base release for '+$arch) }; $selected=@($base); ";
         ps << "if ($backend -eq 'cuda') { ";
         ps << "$gpu=@(); foreach($a in $assets) { if($a.name -match ('^llama-.*-bin-win-cuda-([0-9.]+)-'+$archRx+'\\.zip$')) {$gpu += [pscustomobject]@{Asset=$a; Version=[version]$Matches[1]}} }; ";
+        ps << "if($variant -eq 'cuda-12'){$gpu=@($gpu | Where-Object {$_.Version.Major -eq 12})} elseif($variant -eq 'cuda-13'){$gpu=@($gpu | Where-Object {$_.Version.Major -eq 13})}; ";
         ps << "$supported=$null; try {$txt=(& nvidia-smi 2>$null) -join \"`n\"; $m=[regex]::Match($txt,'CUDA Version:\\s*([0-9.]+)'); if($m.Success){$supported=[version]$m.Groups[1].Value}} catch {}; ";
         ps << "if($null -ne $supported){$choice=$gpu | Where-Object {$_.Version -le $supported} | Sort-Object Version -Descending | Select-Object -First 1} else {$choice=$gpu | Sort-Object Version | Select-Object -First 1}; ";
         ps << "if($null -eq $choice){throw ('No compatible llama.cpp Windows CUDA release for '+$arch)}; $selected += $choice.Asset; ";
         ps << "$cudartName=('cudart-llama-bin-win-cuda-'+$choice.Version+'-'+$arch+'.zip'); $cudart=$assets | Where-Object {$_.name -eq $cudartName} | Select-Object -First 1; if($null -ne $cudart){$selected += $cudart}; ";
         ps << "} elseif ($backend -eq 'vulkan') {$addon=$assets | Where-Object {$_.name -match ('^llama-.*-bin-win-vulkan-'+$archRx+'\\.zip$')} | Select-Object -First 1; if($null -eq $addon){throw 'No matching llama.cpp Windows Vulkan release'}; $selected += $addon; ";
         ps << "} elseif ($backend -eq 'rocm') {$addon=$assets | Where-Object {$_.name -match ('^llama-.*-bin-win-(hip|rocm).*-'+$archRx+'\\.zip$')} | Select-Object -First 1; if($null -eq $addon){throw 'No matching llama.cpp Windows ROCm/HIP release'}; $selected += $addon; ";
-        ps << "} elseif ($backend -ne 'cpu') {throw ('No matching llama.cpp Windows release backend: '+$backend)}; ";
+        ps << "} elseif ($backend -ne 'cpu') {throw ('No matching llama.cpp Windows release backend: '+$backend)} }; ";
         ps << "Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $next -Recurse -Force -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Force -Path $stage,$next | Out-Null; ";
         ps << "$n=0; foreach($a in $selected){$n++; $archive=Join-Path $rel ('asset-'+$n+'.zip'); Write-Host ('Downloading '+$a.name); Invoke-WebRequest -Uri $a.browser_download_url -OutFile $archive; Expand-Archive -LiteralPath $archive -DestinationPath $stage -Force}; ";
         ps << "$exe=Get-ChildItem -LiteralPath $stage -Recurse -File -Filter 'llama-server.exe' | Select-Object -First 1; if($null -eq $exe){throw 'llama-server.exe not found in selected release assets'}; ";
@@ -445,7 +587,7 @@ import tarfile
 import urllib.request
 import zipfile
 
-api, platform, arch, backend, rel_arg = sys.argv[1:]
+api, platform, arch, backend, variant, rel_arg = sys.argv[1:]
 rel = pathlib.Path(rel_arg)
 stage = rel / "staging"
 next_bin = rel / "bin.next"
@@ -489,8 +631,13 @@ if platform == "linux":
         candidates = matches(r"^llama-.*-bin-ubuntu-rocm-.*-" + arch_rx + r"\.tar\.gz$")
     elif backend == "cuda":
         candidates = matches(r"^llama-.*-bin-ubuntu-cuda-[0-9.]+-" + arch_rx + r"\.tar\.gz$")
+        if variant in ("cuda-12", "cuda-13"):
+            major = variant.split("-")[1]
+            candidates = [a for a in candidates if re.search(r"-cuda-" + major + r"\.", a["name"])]
         choice = choose_cuda(candidates)
         candidates = [choice] if choice else []
+    elif backend == "openvino":
+        candidates = matches(r"^llama-.*-bin-ubuntu-openvino-.*-" + arch_rx + r"\.tar\.gz$")
     else:
         candidates = []
 elif platform == "macos" and backend in ("metal", "cpu"):
@@ -537,8 +684,8 @@ shutil.rmtree(bin_dir, ignore_errors=True)
 next_bin.replace(bin_dir)
 )PY";
         plan.push_back({"Downloading matched llama.cpp release asset",
-                        {"python3", "-c", py, api, cfg.platform, release_arch,
-                         cfg.accelerator, rel.string()}, root, false});
+                        {"python3", "-c", py, api, cfg.platform, asset_arch,
+                         cfg.accelerator, cfg.release_variant, rel.string()}, root, false});
     }
     return plan;
 }
@@ -554,40 +701,88 @@ std::vector<LlamaInstallStep> build_source_plan(const LlamaProvisionConfig& cfg,
     const int build_jobs = cfg.build_jobs > 0
         ? cfg.build_jobs
         : ((cfg.accelerator == "cuda" || cfg.accelerator == "rocm") ? 2 : 4);
+    const auto cuda_targets = cuda_arch_targets(cfg.cuda_arch);
+    const std::string cuda_target_arg = util::join(cuda_targets, ",");
 
     std::vector<LlamaInstallStep> plan;
-    if (cfg.platform == "windows") {
+    if (cfg.platform == "windows" && !cfg.bypass_environment_checks) {
         std::ostringstream ps;
         ps << "$ErrorActionPreference='Stop'; $required=@('git','cmake'); ";
         ps << "$missing=@($required | Where-Object {-not (Get-Command $_ -ErrorAction SilentlyContinue)}); ";
         // CMake can discover Visual Studio through the registry even when cl.exe
         // is not on this PowerShell process's PATH, so let configure validate it.
         if (cfg.accelerator == "cuda") {
-            ps << "if(-not (Get-Command nvcc -ErrorAction SilentlyContinue)){ "
+            ps << "$configuredNvcc=if($env:CUDACXX){Get-Command $env:CUDACXX -ErrorAction SilentlyContinue}"
+                  "else{Get-Command nvcc -ErrorAction SilentlyContinue}; "
+                  "if(-not $configuredNvcc){ "
                   "$missing += 'nvcc (CUDA Toolkit; the display driver alone is insufficient)' }; ";
-        } else if (cfg.accelerator == "rocm") {
+        } else if (cfg.accelerator == "rocm" || cfg.accelerator == "hip") {
             ps << "if(-not (Get-Command hipcc -ErrorAction SilentlyContinue)){ "
                   "$missing += 'hipcc (ROCm/HIP SDK)' }; ";
+        } else if (cfg.accelerator == "vulkan") {
+            ps << "if(-not (Get-Command glslc -ErrorAction SilentlyContinue)){ "
+                  "$missing += 'glslc (Vulkan SDK)' }; ";
+        } else if (cfg.accelerator == "sycl-fp32" ||
+                   cfg.accelerator == "sycl-fp16") {
+            ps << "if(-not (Get-Command icx -ErrorAction SilentlyContinue)){ "
+                  "$missing += 'icx (Intel oneAPI DPC++ compiler)' }; ";
+        } else if (cfg.accelerator == "openvino") {
+            ps << "if(-not $env:OpenVINO_DIR -and -not $env:INTEL_OPENVINO_DIR){ "
+                  "$missing += 'OpenVINO toolkit environment' }; ";
         }
         ps << "if($missing.Count){throw ('Missing llama.cpp source-build prerequisites: '+"
               "($missing -join ', '))}; cmake --version | Select-Object -First 1; ";
-        if (cfg.accelerator == "cuda") ps << "nvcc --version | Select-Object -Last 1; ";
+        if (cfg.accelerator == "cuda") {
+            ps << "$nvcc=if($env:CUDACXX){(Get-Command $env:CUDACXX -ErrorAction Stop).Source}"
+                  "else{(Get-Command nvcc -ErrorAction Stop).Source}; ";
+            ps << "& $nvcc --version | Select-Object -Last 1; ";
+            if (!cuda_targets.empty()) {
+                ps << "$supported=((& $nvcc --list-gpu-arch 2>$null) -join ' '); "
+                      "$requested='" << cuda_target_arg << "' -split ','; "
+                      "foreach($arch in $requested){$target='compute_'+$arch; "
+                      "if($supported -notmatch ('(^|\\s)'+[regex]::Escape($target)+'(\\s|$)')){"
+                      "$hint=if($arch -eq '120'){' CUDA Toolkit 12.8 or newer is required for sm_120.'}else{''}; "
+                      "throw ('Selected NVCC '+$nvcc+' does not support compute_'+$arch+'.'+$hint+"
+                      "' The CUDA version shown by nvidia-smi is driver compatibility, not the installed compiler version.')}}; ";
+                ps << "$probe=Join-Path $env:TEMP ('mantic-mind-cuda-'+[guid]::NewGuid().ToString('N')+'.cu'); "
+                      "$object=$probe+'.obj'; try { "
+                      "Set-Content -LiteralPath $probe -Encoding Ascii -Value 'extern \"C\" __global__ void mm_cuda_probe() {}'; "
+                      "$probeArch=($requested | Select-Object -First 1); "
+                      "& $nvcc ('-arch=sm_'+$probeArch) -c $probe -o $object; "
+                      "if($LASTEXITCODE -ne 0){throw ('CUDA compiler/assembler smoke test failed for sm_'+$probeArch+'. Ensure nvcc and ptxas come from the same CUDA Toolkit.')} "
+                      "} finally {Remove-Item -LiteralPath $probe,$object -Force -ErrorAction SilentlyContinue}; ";
+            }
+        }
         plan.push_back({"Checking source-build prerequisites",
                         {"powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
                          "-Command", ps.str()}, root, false});
-    } else {
+    } else if (!cfg.bypass_environment_checks) {
         const std::string preflight = R"SH(set -eu
 backend="$1"
+cuda_arches="$2"
 missing=""
 for tool in git cmake; do
   command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
 done
 cxx="${CXX:-c++}"
 command -v "$cxx" >/dev/null 2>&1 || missing="$missing C++-compiler"
+nvcc_path=""
 if [ "$backend" = "cuda" ]; then
-  command -v nvcc >/dev/null 2>&1 || missing="$missing nvcc-CUDA-Toolkit"
-elif [ "$backend" = "rocm" ]; then
+  if [ -n "${CUDACXX:-}" ]; then
+    nvcc_path=$(command -v "$CUDACXX" 2>/dev/null || true)
+    if [ -z "$nvcc_path" ] && [ -x "$CUDACXX" ]; then nvcc_path="$CUDACXX"; fi
+  else
+    nvcc_path=$(command -v nvcc 2>/dev/null || true)
+  fi
+  [ -n "$nvcc_path" ] || missing="$missing nvcc-CUDA-Toolkit"
+elif [ "$backend" = "rocm" ] || [ "$backend" = "hip" ]; then
   command -v hipcc >/dev/null 2>&1 || missing="$missing hipcc-ROCm-SDK"
+elif [ "$backend" = "vulkan" ]; then
+  command -v glslc >/dev/null 2>&1 || missing="$missing glslc-Vulkan-SDK"
+elif [ "$backend" = "openvino" ]; then
+  [ -n "${OpenVINO_DIR:-}${INTEL_OPENVINO_DIR:-}" ] || missing="$missing OpenVINO-toolkit-environment"
+elif [ "$backend" = "sycl-fp32" ] || [ "$backend" = "sycl-fp16" ]; then
+  command -v icpx >/dev/null 2>&1 || missing="$missing icpx-oneAPI-DPC++-compiler"
 fi
 if [ -n "$missing" ]; then
   echo "Missing llama.cpp source-build prerequisites:$missing" >&2
@@ -599,7 +794,31 @@ fi
 cmake --version | head -n 1
 "$cxx" --version | head -n 1
 if [ "$backend" = "cuda" ]; then
-  nvcc --version | tail -n 1
+  "$nvcc_path" --version | tail -n 1
+  if [ -n "$cuda_arches" ]; then
+    supported=$("$nvcc_path" --list-gpu-arch 2>/dev/null || true)
+    for arch in $(printf '%s' "$cuda_arches" | tr ',' ' '); do
+      if ! printf '%s\n' "$supported" | tr '[:space:]' '\n' | grep -Fqx "compute_$arch"; then
+        echo "Selected NVCC $nvcc_path does not support compute_$arch." >&2
+        if [ "$arch" = "120" ]; then
+          echo "CUDA Toolkit 12.8 or newer is required to compile for sm_120." >&2
+        fi
+        echo "The CUDA version shown by nvidia-smi is driver compatibility, not the installed compiler version." >&2
+        exit 3
+      fi
+    done
+    probe_arch=$(printf '%s' "$cuda_arches" | cut -d, -f1)
+    probe_dir=$(mktemp -d "${TMPDIR:-/tmp}/mantic-mind-cuda-probe.XXXXXX")
+    trap 'rm -rf "$probe_dir"' EXIT HUP INT TERM
+    printf '%s\n' 'extern "C" __global__ void mm_cuda_probe() {}' > "$probe_dir/probe.cu"
+    if ! "$nvcc_path" "-arch=sm_$probe_arch" -c "$probe_dir/probe.cu" -o "$probe_dir/probe.o"; then
+      echo "CUDA compiler/assembler smoke test failed for sm_$probe_arch." >&2
+      echo "Ensure nvcc and ptxas come from the same CUDA Toolkit installation." >&2
+      exit 4
+    fi
+    rm -rf "$probe_dir"
+    trap - EXIT HUP INT TERM
+  fi
   if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
     echo "WSL detected: using the Linux CUDA toolkit and a conservative parallel build."
     command -v nvidia-smi >/dev/null 2>&1 || echo "Warning: nvidia-smi is not visible inside WSL; the build can finish, but CUDA runtime validation may fail." >&2
@@ -612,7 +831,7 @@ fi
 )SH";
         plan.push_back({"Checking source-build prerequisites",
                         {"sh", "-c", preflight, "mantic-mind-llama-preflight",
-                         cfg.accelerator}, root, false});
+                         cfg.accelerator, cuda_target_arg}, root, false});
     }
     if (!fs::exists(src / ".git"))
         plan.push_back({"Cloning llama.cpp source",
@@ -621,6 +840,21 @@ fi
     plan.push_back({"Checking out " + ref, {"git", "checkout", ref}, src, false});
     if (cfg.version == "latest")
         plan.push_back({"Updating source", {"git", "pull", "--ff-only"}, src, true});
+
+    if (cfg.accelerator == "cuda") {
+        // CMake persists CMAKE_CUDA_COMPILER across attempts. This is especially
+        // hazardous in WSL after upgrading from distro /usr/bin/nvcc to a newer
+        // toolkit selected through CUDACXX/PATH: the old compiler keeps winning
+        // even though all live preflight probes see the new one. Clear only the
+        // generated configure state; the source checkout remains intact and
+        // the next configure/build selects the active toolkit afresh.
+        plan.push_back({"Clearing cached CUDA compiler selection",
+                        {"cmake", "-E", "remove_directory",
+                         (build / "CMakeFiles").string()}, src, true});
+        plan.push_back({"Clearing cached CUDA configure state",
+                        {"cmake", "-E", "remove",
+                         (build / "CMakeCache.txt").string()}, src, true});
+    }
 
     std::vector<std::string> configure = {
         "cmake", "-S", src.string(), "-B", build.string(),
@@ -684,7 +918,9 @@ std::vector<std::string> llama_release_accelerators(
             asset_names, "^llama-.*-bin-win-cpu-" + arch_rx + "\\.zip$");
         if (base) available.insert("cpu");
         if (base && any_asset_matches(
-                asset_names, "^llama-.*-bin-win-cuda-[0-9.]+-" + arch_rx + "\\.zip$"))
+                asset_names, "^llama-.*-bin-win-cuda-[0-9.]+-" + arch_rx + "\\.zip$") &&
+            any_asset_matches(
+                asset_names, "^cudart-llama-bin-win-cuda-[0-9.]+-" + arch_rx + "\\.zip$"))
             available.insert("cuda");
         if (base && any_asset_matches(
                 asset_names, "^llama-.*-bin-win-vulkan-" + arch_rx + "\\.zip$"))
@@ -692,6 +928,9 @@ std::vector<std::string> llama_release_accelerators(
         if (base && any_asset_matches(
                 asset_names, "^llama-.*-bin-win-(hip|rocm).*-" + arch_rx + "\\.zip$"))
             available.insert("rocm");
+        if (any_asset_matches(
+                asset_names, "^llama-.*-bin-win-openvino-.*-" + arch_rx + "\\.zip$"))
+            available.insert("openvino");
     } else if (cfg.platform == "linux") {
         const std::string suffix = "-" + arch_rx + "(\\.tar\\.gz|\\.zip)$";
         if (any_asset_matches(asset_names, "^llama-.*-bin-ubuntu" + suffix))
@@ -702,6 +941,8 @@ std::vector<std::string> llama_release_accelerators(
             available.insert("rocm");
         if (any_asset_matches(asset_names, "^llama-.*-bin-ubuntu-cuda-[0-9.]+" + suffix))
             available.insert("cuda");
+        if (any_asset_matches(asset_names, "^llama-.*-bin-ubuntu-openvino-.*" + suffix))
+            available.insert("openvino");
     } else if (cfg.platform == "macos") {
         if (any_asset_matches(asset_names,
                               "^llama-.*-bin-macos-" + arch_rx +
@@ -712,13 +953,125 @@ std::vector<std::string> llama_release_accelerators(
     }
 
     const std::vector<std::string> preference = cfg.platform == "linux"
-        ? std::vector<std::string>{"vulkan", "cpu", "rocm", "cuda"}
+        ? std::vector<std::string>{"vulkan", "openvino", "cpu", "rocm", "cuda"}
         : (cfg.platform == "windows"
-            ? std::vector<std::string>{"cuda", "vulkan", "cpu", "rocm"}
+            ? std::vector<std::string>{"cuda", "vulkan", "openvino", "cpu", "rocm"}
             : std::vector<std::string>{"metal", "cpu"});
     std::vector<std::string> out;
     for (const auto& accelerator : preference)
         if (available.count(accelerator)) out.push_back(accelerator);
+    return out;
+}
+
+std::vector<LlamaRuntimeVariant> llama_runtime_variants(
+    const std::vector<std::string>& asset_names,
+    const LlamaProvisionConfig& raw_cfg) {
+    const LlamaProvisionConfig cfg = normalized_config(raw_cfg);
+    const std::string arch = release_arch(cfg.arch);
+    std::string arch_rx;
+    for (const char ch : arch) {
+        if (std::string{".^$|()[]{}*+?\\"}.find(ch) != std::string::npos)
+            arch_rx.push_back('\\');
+        arch_rx.push_back(ch);
+    }
+    auto asset = [&](const std::string& pattern) -> std::string {
+        const std::regex rx(pattern, std::regex::icase);
+        for (const auto& name : asset_names)
+            if (std::regex_match(name, rx)) return name;
+        return {};
+    };
+
+    const bool win = cfg.platform == "windows";
+    const bool linux = cfg.platform == "linux";
+    const bool mac = cfg.platform == "macos";
+    const bool x64 = arch == "x64";
+    const bool arm64 = arch == "arm64";
+    const bool cpu_arch = arch == "x86" || x64 || arm64 || arch == "s390x";
+    const std::string win_base = win
+        ? asset("^llama-.*-bin-win-cpu-" + arch_rx + "\\.zip$") : std::string{};
+
+    std::vector<LlamaRuntimeVariant> out;
+    auto add = [&](std::string id, std::string label, std::string backend,
+                   bool supported, bool source, std::string release_asset) {
+        LlamaRuntimeVariant v;
+        v.id = std::move(id);
+        v.label = std::move(label);
+        v.backend = std::move(backend);
+        v.platform_supported = supported;
+        v.source_supported = supported && source;
+        v.release_asset = std::move(release_asset);
+        v.release_available = supported && !v.release_asset.empty();
+        if (!supported) {
+            v.reason = "not supported for " + cfg.platform + "/" + arch;
+        } else if (v.release_available) {
+            v.reason = "complete compatible release is available";
+        } else if (v.source_supported) {
+            v.reason = "no complete server release; source compilation is available";
+        } else {
+            v.reason = "no complete server release or supported source build";
+        }
+        out.push_back(std::move(v));
+    };
+
+    auto windows_modular = [&](const std::string& addon_pattern) {
+        const std::string addon = asset(addon_pattern);
+        return !win_base.empty() && !addon.empty() ? addon : std::string{};
+    };
+    auto windows_cuda = [&](const std::string& major) {
+        const std::string addon = windows_modular(
+            "^llama-.*-bin-win-cuda-" + major + "[.][0-9.]*-" + arch_rx + "\\.zip$");
+        const std::string runtime = asset(
+            "^cudart-llama-bin-win-cuda-" + major + "[.][0-9.]*-" + arch_rx + "\\.zip$");
+        return !addon.empty() && !runtime.empty() ? addon : std::string{};
+    };
+    const std::string archive_suffix = "-" + arch_rx + "(\\.tar\\.gz|\\.zip)$";
+
+    add("cuda-12", "CUDA 12", "cuda", (win || linux) && x64, true,
+        win ? windows_cuda("12")
+            : asset("^llama-.*-bin-ubuntu-cuda-12[.][0-9.]*" + archive_suffix));
+    add("cuda-13", "CUDA 13", "cuda", (win || linux) && x64, true,
+        win ? windows_cuda("13")
+            : asset("^llama-.*-bin-ubuntu-cuda-13[.][0-9.]*" + archive_suffix));
+    add("vulkan", "Vulkan", "vulkan", (win || linux) && (x64 || arm64), true,
+        win ? windows_modular("^llama-.*-bin-win-vulkan-" + arch_rx + "\\.zip$")
+            : asset("^llama-.*-bin-ubuntu-vulkan" + archive_suffix));
+    add("rocm", "ROCm", "rocm", linux && x64, true,
+        linux ? asset("^llama-.*-bin-ubuntu-rocm-.*" + archive_suffix) : std::string{});
+    add("openvino", "OpenVINO", "openvino", (win || linux) && x64, true,
+        win ? asset("^llama-.*-bin-win-openvino-.*-" + arch_rx + "\\.zip$")
+            : asset("^llama-.*-bin-ubuntu-openvino-.*" + archive_suffix));
+    add("sycl-fp32", "SYCL FP32", "sycl-fp32", (win || linux) && x64, true, {});
+    add("sycl-fp16", "SYCL FP16", "sycl-fp16", (win || linux) && x64, true, {});
+    add("metal", "Metal", "metal", mac && arm64, true,
+        mac && arm64 ? asset("^llama-.*-bin-macos-" + arch_rx + "(\\.tar\\.gz|\\.zip)$")
+                     : std::string{});
+    add("hip", "HIP", "rocm", win && x64, true,
+        win ? windows_modular("^llama-.*-bin-win-(hip|rocm).*-" + arch_rx + "\\.zip$")
+            : std::string{});
+    std::string cpu_release;
+    if (win) cpu_release = win_base;
+    else if (linux) cpu_release = asset("^llama-.*-bin-ubuntu" + archive_suffix);
+    else if (mac) cpu_release = asset("^llama-.*-bin-macos-" + arch_rx + "(\\.tar\\.gz|\\.zip)$");
+    add("cpu", "CPU", "cpu", (win || linux || mac) && cpu_arch, true, cpu_release);
+
+    auto preferred = std::find_if(out.begin(), out.end(), [&](const auto& v) {
+        return v.release_available &&
+            (v.backend == cfg.accelerator || v.id == cfg.release_variant);
+    });
+    if (preferred == out.end()) {
+        for (const std::string& id : {std::string{"vulkan"}, std::string{"openvino"},
+                                      std::string{"cpu"}}) {
+            preferred = std::find_if(out.begin(), out.end(), [&](const auto& v) {
+                return v.id == id && v.release_available;
+            });
+            if (preferred != out.end()) break;
+        }
+    }
+    if (preferred == out.end())
+        preferred = std::find_if(out.begin(), out.end(), [](const auto& v) {
+            return v.release_available;
+        });
+    if (preferred != out.end()) preferred->recommended = true;
     return out;
 }
 
@@ -783,7 +1136,9 @@ LlamaCppProvisioner::LlamaCppProvisioner(LlamaProvisionConfig cfg,
             return run_streamed_command(argv, cwd, on_line, cancel_requested, error);
         };
     }
+    if (!runner_.capture_output) runner_.capture_output = default_capture_output;
     if (!runner_.capture_first_line) runner_.capture_first_line = default_capture_first_line;
+    if (!runner_.resolve_executable) runner_.resolve_executable = resolve_llama_executable;
     if (!runner_.fetch_latest) {
         runner_.fetch_latest =
             [capture = runner_.capture_first_line](const LlamaProvisionConfig& c) {
@@ -811,6 +1166,9 @@ LlamaRuntimeStatus LlamaCppProvisioner::make_base_status() const {
     status.source_repo = kLlamaCppRepoUrl;
     status.version = cfg_.version;
     status.accelerator = cfg_.accelerator;
+    status.variant = cfg_.release_variant.empty() ? cfg_.accelerator
+                                                  : cfg_.release_variant;
+    status.available_variants = llama_runtime_variants({}, cfg_);
     return status;
 }
 
@@ -827,22 +1185,31 @@ LlamaRuntimeStatus LlamaCppProvisioner::status() const {
 LlamaProvisionConfig LlamaCppProvisioner::config() const { return cfg_; }
 
 std::string LlamaCppProvisioner::capture_version(const std::string& executable) const {
-    return runner_.capture_first_line({executable, "--version"}, {});
+    return validated_llama_version(
+        runner_.capture_first_line({executable, "--version"}, {}));
 }
 
 LlamaRuntimeStatus LlamaCppProvisioner::ensure_runtime() {
     LlamaRuntimeStatus status = make_base_status();
 
-    if (const std::string resolved = resolve_llama_executable(cfg_.requested_executable);
-        !resolved.empty()) {
+    const std::string resolved = runner_.resolve_executable(cfg_.requested_executable);
+    if (!resolved.empty() && use_unmanaged_path_runtime(cfg_)) {
         status.status = "resolved";
         status.method = "path";
         status.managed = false;
         status.executable_path = resolved;
         const std::string version = capture_version(resolved);
-        if (!version.empty()) status.version = version;
+        // cfg_.version describes a managed target (often "latest"), not an
+        // arbitrary PATH executable. Unknown is more honest than echoing a
+        // rejected CLI error or the desired managed version.
+        status.version = version;
         set_status(status);
         return status;
+    }
+    if (!resolved.empty()) {
+        MM_INFO("Ignoring generic PATH llama-server '{}' for requested {} backend; "
+                "selecting an environment-matched managed runtime instead",
+                resolved, cfg_.accelerator);
     }
 
     // Honor the last successful managed selection before scanning generic
@@ -852,6 +1219,7 @@ LlamaRuntimeStatus LlamaCppProvisioner::ensure_runtime() {
     if (active) {
         const std::string version = capture_version(active->executable_path);
         auto restored = *active;
+        restored.available_variants = status.available_variants;
         if (!version.empty()) restored.version = version;
         set_status(restored);
         return restored;
@@ -875,7 +1243,8 @@ LlamaRuntimeStatus LlamaCppProvisioner::ensure_runtime() {
         status.status = "ready";
         status.managed = true;
         status.executable_path = cand.string();
-        if (!version.empty()) status.version = version;
+        status.version = version.empty() ? validated_llama_version(cfg_.version)
+                                         : version;
         set_status(status);
         return status;
     }
@@ -894,7 +1263,10 @@ LlamaRuntimeStatus LlamaCppProvisioner::ensure_runtime() {
 
 LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
     bool upgrade,
-    const std::string& accelerator_override) {
+    const std::string& accelerator_override,
+    bool force_source,
+    bool bypass_environment_checks,
+    bool release_only_override) {
     LlamaProvisionConfig install_cfg = cfg_;
     const LlamaRuntimeStatus prior = this->status();
     if (upgrade && !prior.latest_version.empty())
@@ -903,9 +1275,13 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
         !prior.accelerator.empty())
         install_cfg.accelerator = prior.accelerator;
     if (!accelerator_override.empty()) {
-        install_cfg.accelerator = util::to_lower(util::trim(accelerator_override));
-        install_cfg.install_method = "release"; // alternative buttons only represent published assets
+        install_cfg.release_variant = util::to_lower(util::trim(accelerator_override));
+        install_cfg.accelerator = backend_for_variant(install_cfg.release_variant);
+        if (release_only_override)
+            install_cfg.install_method = "release"; // update alternatives represent published assets
     }
+    if (force_source) install_cfg.install_method = "source";
+    install_cfg.bypass_environment_checks = bypass_environment_checks;
     if (install_cfg.install_method == "auto" && install_cfg.version == "latest" &&
         runner_.fetch_latest) {
         const std::string release_tag = util::trim(runner_.fetch_latest(install_cfg));
@@ -913,7 +1289,11 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
     }
     LlamaRuntimeStatus status = make_base_status();
     status.accelerator = install_cfg.accelerator;
+    status.variant = install_cfg.release_variant.empty()
+        ? install_cfg.accelerator : install_cfg.release_variant;
     status.version = install_cfg.version;
+    if (!prior.available_variants.empty())
+        status.available_variants = prior.available_variants;
 
     const fs::path root(install_cfg.provision_dir);
     std::error_code ec;
@@ -921,6 +1301,7 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
     if (ec) {
         status.status = "failed";
         status.last_error = "failed to create llama.cpp provision directory: " + ec.message();
+        status.troubleshooting = build_troubleshooting_report(status.last_error, install_cfg);
         set_status(status);
         return status;
     }
@@ -994,6 +1375,9 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
             emit_progress(prog);
             if (log_sink_) log_sink_("[llama-install] " + step.label, false);
 
+            // Preserve enough context for CMake compiler-identification and
+            // nested call stacks. Twelve lines routinely discarded the actual
+            // CUDA/ptxas error before the troubleshooting wizard opened.
             std::deque<std::string> output_tail;
             auto on_line = [&](const std::string& line, bool is_stderr) {
                 if (log_sink_) log_sink_(line, is_stderr);
@@ -1002,7 +1386,7 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
                 prog.last_line = line;
                 const std::string trimmed = util::trim(line);
                 if (!trimmed.empty()) {
-                    if (output_tail.size() >= 12) output_tail.pop_front();
+                    if (output_tail.size() >= 80) output_tail.pop_front();
                     output_tail.push_back(trimmed);
                 }
                 emit_progress(prog);
@@ -1041,13 +1425,15 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
             status.managed = true;
             status.method = attempt.config.install_method;
             status.executable_path = found;
-            if (!version.empty()) status.version = version;
+            status.version = version.empty()
+                ? validated_llama_version(attempt.config.version) : version;
             status.latest_version.clear();
             status.update_available = false;
             status.update_action.clear();
             status.update_release_available = false;
             status.update_release_alternatives.clear();
             status.update_warning.clear();
+            status.troubleshooting = {};
             status.last_error.clear();
             write_active_runtime(attempt.config, status);
             set_status(status);
@@ -1071,9 +1457,353 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
     status.status = "failed";
     status.last_error = "llama.cpp install failed";
     for (const auto& error : attempt_errors) status.last_error += "; " + error;
+    status.troubleshooting = build_troubleshooting_report(status.last_error, install_cfg);
     set_status(status);
     finish_progress();
     return status;
+}
+
+LlamaTroubleshootingReport LlamaCppProvisioner::build_troubleshooting_report(
+    const std::string& failure_detail,
+    const LlamaProvisionConfig& raw_install_cfg) const {
+    const LlamaProvisionConfig install_cfg = normalized_config(raw_install_cfg);
+    LlamaTroubleshootingReport report;
+    report.required = true;
+    report.failure_detail = failure_detail;
+    report.platform = install_cfg.platform;
+    report.architecture = release_arch(install_cfg.arch);
+    report.target_backend = install_cfg.accelerator;
+    report.release_tag = install_cfg.version;
+
+    std::smatch stage_match;
+    if (std::regex_search(failure_detail, stage_match,
+                          std::regex("step '([^']+)' failed")))
+        report.failure_stage = stage_match[1].str();
+    if (report.failure_stage.empty()) report.failure_stage = "Managed provisioning";
+
+    if (report.release_tag == "latest" && runner_.fetch_latest) {
+        const std::string latest = util::trim(runner_.fetch_latest(install_cfg));
+        if (!latest.empty()) report.release_tag = latest;
+    }
+    const auto assets = runner_.fetch_release_assets && !report.release_tag.empty()
+        ? runner_.fetch_release_assets(install_cfg, report.release_tag)
+        : std::vector<std::string>{};
+    report.variants = llama_runtime_variants(assets, install_cfg);
+
+    auto add = [&](std::string id, std::string label, std::string status,
+                   std::string detected, std::string required,
+                   std::string remediation, bool blocking) {
+        report.checks.push_back({std::move(id), std::move(label), std::move(status),
+                                 std::move(detected), std::move(required),
+                                 std::move(remediation), blocking});
+    };
+    auto capture = [&](const std::vector<std::string>& argv) {
+        return runner_.capture_output
+            ? util::trim(runner_.capture_output(argv, install_cfg.provision_dir))
+            : std::string{};
+    };
+    auto locate = [&](const std::string& tool) {
+        if (install_cfg.platform == "windows") {
+            const std::string script =
+                "$c=Get-Command '" + tool +
+                "' -ErrorAction SilentlyContinue; if($c){$c.Source}";
+            return capture({"powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                            "-Command", script});
+        }
+        return capture({"sh", "-c", "command -v \"$1\" 2>/dev/null || true",
+                        "mantic-mind-diagnostic", tool});
+    };
+    auto tool_check = [&](const std::string& id, const std::string& label,
+                          const std::string& tool, const std::string& required,
+                          const std::string& remediation, bool blocking) {
+        const std::string found = locate(tool);
+        add(id, label, found.empty() ? (blocking ? "fail" : "warn") : "pass",
+            found.empty() ? "not found on PATH" : found, required, remediation,
+            blocking && found.empty());
+        return !found.empty();
+    };
+
+    add("host", "Host platform", "pass",
+        install_cfg.platform + "/" + report.architecture,
+        "Windows, Linux, or macOS on a supported architecture", {}, false);
+    if (install_cfg.platform == "linux") {
+        const std::string wsl = capture(
+            {"sh", "-c", "grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null && echo WSL || true"});
+        add("wsl", "Linux environment", "info", wsl.empty() ? "native Linux" : "WSL",
+            "GPU toolkits must be installed inside this Linux environment",
+            wsl.empty() ? std::string{}
+                        : "Install Linux build packages and GPU toolkits inside the WSL distribution, not only on Windows.",
+            false);
+    }
+
+    std::error_code space_ec;
+    const auto space = fs::space(install_cfg.provision_dir, space_ec);
+    if (space_ec) {
+        add("disk", "Build disk space", "warn", "could not measure: " + space_ec.message(),
+            "at least 4 GiB free", "Free space in the runtime provision directory.", false);
+    } else {
+        const uint64_t gib = space.available / (1024ULL * 1024ULL * 1024ULL);
+        add("disk", "Build disk space", gib >= 4 ? "pass" : "warn",
+            std::to_string(gib) + " GiB free", "at least 4 GiB free",
+            gib >= 4 ? std::string{} : "Free at least 4 GiB before compiling llama.cpp.",
+            false);
+    }
+    const std::string memory = install_cfg.platform == "windows"
+        ? capture({"powershell", "-NoProfile", "-Command",
+                   "[math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory/1MB,2).ToString()+' GiB free'"})
+        : (install_cfg.platform == "macos"
+            ? capture({"sh", "-c", "vm_stat 2>/dev/null | head -n 2 | tail -n 1 || true"})
+            : capture({"sh", "-c", "awk '/MemAvailable/{printf \"%.2f GiB free\",$2/1048576}' /proc/meminfo 2>/dev/null || true"}));
+    add("memory", "Available memory", memory.empty() ? "warn" : "info",
+        memory.empty() ? "could not measure" : memory,
+        "enough RAM for the selected parallel build",
+        "Reduce llama_build_jobs if the compiler is killed by the OOM manager.", false);
+
+    const std::string package_hint = install_cfg.platform == "windows"
+        ? "Install the tool and reopen the node so its executable is on PATH."
+        : "Install the package with the distribution package manager and reopen the node.";
+    tool_check("git", "Git", "git", "git client", package_hint, true);
+    const bool cmake_found = tool_check(
+        "cmake", "CMake", "cmake", "CMake 3.14 or newer", package_hint, true);
+    std::string cmake_version;
+    if (cmake_found) {
+        const std::string cmake_output = capture({"cmake", "--version"});
+        for (const auto& line : util::split(cmake_output, '\n')) {
+            const std::string trimmed = util::trim(line);
+            if (!trimmed.empty()) {
+                cmake_version = trimmed;
+                break;
+            }
+        }
+        add("cmake-version", "CMake version",
+            cmake_version.empty() ? "warn" : "info",
+            cmake_version.empty() ? "version could not be queried" : cmake_version,
+            "a CMake release compatible with the selected CUDA Toolkit",
+            cmake_version.empty()
+                ? "Run cmake --version in the node environment. CUDA 13 support "
+                  "requires either Mantic-Mind's architecture pin or a current CMake."
+                : std::string{},
+            false);
+    }
+    if (install_cfg.platform == "windows") {
+        tool_check("compiler", "C/C++ compiler", "cl", "Visual Studio C++ build tools",
+                   "Install Visual Studio Build Tools with Desktop development with C++; CMake may also discover an installed compiler outside PATH.",
+                   false);
+    } else {
+        tool_check("compiler", "C++ compiler", "c++", "a C++17 compiler (GCC or Clang)",
+                   "Install build-essential/g++ or clang with the distribution package manager.", true);
+    }
+
+    const std::string backend = install_cfg.accelerator;
+    if (backend == "cuda") {
+        const bool driver = tool_check(
+            "nvidia-driver", "NVIDIA driver visibility", "nvidia-smi",
+            "NVIDIA driver with GPU visibility",
+            install_cfg.platform == "linux"
+                ? "Enable NVIDIA GPU passthrough for this Linux/WSL environment."
+                : "Install or repair the NVIDIA display driver.", false);
+        const std::string nvcc_path = install_cfg.platform == "windows"
+            ? capture({"powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                       "$c=if($env:CUDACXX){Get-Command $env:CUDACXX -ErrorAction SilentlyContinue}else{Get-Command nvcc -ErrorAction SilentlyContinue}; if($c){$c.Source}"})
+            : capture({"sh", "-c",
+                       "if [ -n \"${CUDACXX:-}\" ]; then command -v \"$CUDACXX\" 2>/dev/null || { [ -x \"$CUDACXX\" ] && printf '%s' \"$CUDACXX\"; }; else command -v nvcc 2>/dev/null || true; fi"});
+        const bool toolkit = !nvcc_path.empty();
+        std::string nvcc_version;
+        if (toolkit) {
+            const std::string version_output = capture({nvcc_path, "--version"});
+            for (const auto& line : util::split(version_output, '\n')) {
+                const std::string trimmed = util::trim(line);
+                if (!trimmed.empty()) nvcc_version = trimmed;
+            }
+        }
+        add("cuda-toolkit", "CUDA compiler toolkit", toolkit ? "pass" : "fail",
+            toolkit ? nvcc_path + (nvcc_version.empty() ? std::string{} : " | " + nvcc_version)
+                    : "not found via CUDACXX or PATH",
+            install_cfg.release_variant == "cuda-13" ? "CUDA 13 toolkit" : "CUDA toolkit",
+            install_cfg.platform == "linux"
+                ? "Install the CUDA Toolkit inside this Linux/WSL distribution and ensure CUDACXX or PATH selects its nvcc."
+                : "Install the NVIDIA CUDA Toolkit and ensure CUDACXX or PATH selects its nvcc.",
+            !toolkit);
+        const auto requested_arches = cuda_arch_targets(install_cfg.cuda_arch);
+        if (cuda_removed_default_arch_failure(failure_detail)) {
+            const std::string target = requested_arches.empty()
+                ? std::string{"the detected GPU architecture"}
+                : "sm_" + requested_arches.front();
+            add("cuda-cmake-compiler-id", "CUDA CMake compiler identification",
+                "fail",
+                "CMake invoked ptxas for removed legacy target sm_52 instead of " +
+                    target,
+                "compiler identification targeting " + target,
+                "Retry with Mantic-Mind's architecture-pinned configure command. "
+                "If it still fails, ensure nvcc and ptxas resolve from the same "
+                "CUDA Toolkit and upgrade CMake to a release with CUDA 13 support.",
+                true);
+        }
+        if (toolkit) {
+            const std::string ptxas_path = locate("ptxas");
+            if (!ptxas_path.empty()) {
+                const std::string ptxas_output = capture({ptxas_path, "--version"});
+                std::string ptxas_version;
+                for (const auto& line : util::split(ptxas_output, '\n')) {
+                    const std::string trimmed = util::trim(line);
+                    if (!trimmed.empty()) ptxas_version = trimmed;
+                }
+                const bool same_bin = fs::path(ptxas_path).parent_path() ==
+                    fs::path(nvcc_path).parent_path();
+                add("cuda-assembler", "CUDA assembler", same_bin ? "pass" : "warn",
+                    ptxas_path + (ptxas_version.empty() ? std::string{}
+                                                       : " | " + ptxas_version),
+                    "ptxas from the same CUDA Toolkit bin directory as nvcc",
+                    same_bin ? std::string{}
+                        : "Resolve PATH/CUDACXX so nvcc and ptxas come from one "
+                          "CUDA Toolkit; mixed toolkit components can advertise "
+                          "sm_120 but fail during assembly.",
+                    false);
+            }
+        }
+        if (toolkit && !requested_arches.empty()) {
+            const std::string supported = capture({nvcc_path, "--list-gpu-arch"});
+            std::vector<std::string> unsupported;
+            for (const auto& arch : requested_arches) {
+                if (!nvcc_supports_arch(supported, arch)) unsupported.push_back(arch);
+            }
+            std::vector<std::string> unsupported_labels;
+            for (const auto& arch : unsupported)
+                unsupported_labels.push_back("compute_" + arch);
+            const bool compatible = unsupported.empty();
+            add("cuda-architecture", "CUDA compiler architecture support",
+                compatible ? "pass" : "fail",
+                compatible
+                    ? nvcc_path + " meets " + cuda_arch_requirement(requested_arches)
+                    : nvcc_path + " does not list " + util::join(unsupported_labels, ", ")
+                      + (nvcc_version.empty() ? std::string{} : " | " + nvcc_version),
+                cuda_arch_requirement(requested_arches),
+                compatible ? std::string{}
+                    : "Install a compatible CUDA Toolkit inside the active environment and ensure CUDACXX or PATH selects it. For sm_120 use CUDA Toolkit 12.8 or newer; nvidia-smi's CUDA Version reports driver compatibility, not the selected NVCC.",
+                !compatible);
+        }
+        if (driver && !toolkit) {
+            add("cuda-driver-toolkit-mismatch", "CUDA driver/toolkit mismatch", "fail",
+                "GPU driver is visible but nvcc is missing",
+                "both nvidia-smi and nvcc for source compilation",
+                "The display driver alone cannot compile llama.cpp; install the CUDA Toolkit in the active OS environment.",
+                true);
+        }
+    } else if (backend == "rocm" || backend == "hip") {
+        tool_check("hipcc", "HIP compiler", "hipcc", "ROCm/HIP SDK",
+                   "Install the ROCm/HIP development SDK and ensure hipcc is on PATH.", true);
+        tool_check("rocminfo", "ROCm device visibility", "rocminfo", "ROCm device runtime",
+                   "Install the ROCm runtime and grant this user access to the GPU device.", false);
+        if (install_cfg.platform == "linux") {
+            const std::string kfd = capture({"sh", "-c", "test -e /dev/kfd && echo /dev/kfd || true"});
+            add("kfd", "ROCm kernel device", kfd.empty() ? "warn" : "pass",
+                kfd.empty() ? "/dev/kfd is missing" : kfd, "/dev/kfd device access",
+                "Load the amdgpu driver and grant the user video/render group access.", false);
+        }
+    } else if (backend == "vulkan") {
+        tool_check("glslc", "Vulkan shader compiler", "glslc", "Vulkan SDK shader tools",
+                   "Install the Vulkan SDK (including glslc) and make it available on PATH.", true);
+        tool_check("vulkaninfo", "Vulkan device visibility", "vulkaninfo", "Vulkan loader and driver",
+                   "Install a Vulkan-capable GPU driver and Vulkan loader tools.", false);
+    } else if (backend == "openvino") {
+        const std::string ov = install_cfg.platform == "windows"
+            ? capture({"powershell", "-NoProfile", "-Command",
+                       "if($env:OpenVINO_DIR){$env:OpenVINO_DIR}elseif($env:INTEL_OPENVINO_DIR){$env:INTEL_OPENVINO_DIR}"})
+            : capture({"sh", "-c", "printf '%s' \"${OpenVINO_DIR:-${INTEL_OPENVINO_DIR:-}}\""});
+        add("openvino", "OpenVINO toolkit", ov.empty() ? "fail" : "pass",
+            ov.empty() ? "environment is not initialized" : ov,
+            "OpenVINO development toolkit",
+            "Install OpenVINO and run its setupvars script before starting the node.", ov.empty());
+    } else if (backend == "sycl-fp32" || backend == "sycl-fp16") {
+        const std::string compiler = install_cfg.platform == "windows" ? "icx" : "icpx";
+        tool_check("sycl-compiler", "oneAPI DPC++ compiler", compiler,
+                   "Intel oneAPI DPC++ compiler",
+                   "Install Intel oneAPI Base Toolkit and initialize setvars before starting the node.", true);
+        tool_check("sycl-ls", "SYCL device visibility", "sycl-ls", "a SYCL-capable device/runtime",
+                   "Install the matching Level Zero/OpenCL device runtime.", false);
+    } else if (backend == "metal") {
+        tool_check("xcrun", "Apple developer toolchain", "xcrun",
+                   "Xcode command-line tools and Metal framework",
+                   "Run xcode-select --install and accept the Xcode license.", true);
+    }
+
+    const int release_count = static_cast<int>(std::count_if(
+        report.variants.begin(), report.variants.end(),
+        [](const auto& v) { return v.release_available; }));
+    add("release-assets", "Compatible server releases",
+        assets.empty() ? "warn" : (release_count > 0 ? "pass" : "warn"),
+        assets.empty() ? "release assets could not be retrieved"
+                       : std::to_string(release_count) + " compatible option(s)",
+        "a complete llama-server bundle for a one-click fallback",
+        assets.empty() ? "Check network access to api.github.com or retry diagnostics."
+                       : (release_count > 0 ? std::string{}
+                                            : "Use source compilation after fixing the failed checks."),
+        false);
+
+    report.can_override_checks = std::any_of(
+        report.variants.begin(), report.variants.end(), [&](const auto& v) {
+            return v.source_supported && v.backend == backend;
+        });
+    const int blocking = static_cast<int>(std::count_if(
+        report.checks.begin(), report.checks.end(),
+        [](const auto& c) { return c.blocking && c.status == "fail"; }));
+    report.summary = blocking > 0
+        ? std::to_string(blocking) + " blocking prerequisite issue(s) detected; "
+          + std::to_string(release_count) + " compatible release fallback(s) available."
+        : "No blocking prerequisite was detected by the static probes; inspect the failed build stage and retry with full logs.";
+
+    const std::string fingerprint_input = report.platform + "|" + report.architecture + "|"
+        + report.target_backend + "|" + report.failure_stage + "|" + failure_detail + "|"
+        + std::to_string(util::now_ms());
+    std::ostringstream fingerprint;
+    fingerprint << std::hex << std::hash<std::string>{}(fingerprint_input);
+    report.fingerprint = fingerprint.str();
+    return report;
+}
+
+LlamaRuntimeStatus LlamaCppProvisioner::diagnose_environment() {
+    LlamaRuntimeStatus current = status();
+    LlamaProvisionConfig install_cfg = cfg_;
+    if (!current.accelerator.empty()) install_cfg.accelerator = current.accelerator;
+    if (!current.latest_version.empty()) install_cfg.version = current.latest_version;
+    const std::string failure = current.last_error.empty()
+        ? std::string{"Manual llama.cpp environment diagnostic"}
+        : current.last_error;
+    current.troubleshooting = build_troubleshooting_report(failure, install_cfg);
+    set_status(current);
+    return current;
+}
+
+LlamaRuntimeStatus LlamaCppProvisioner::recover_runtime(
+    const std::string& raw_action,
+    const std::string& raw_variant) {
+    const std::string action = util::to_lower(util::trim(raw_action));
+    const std::string variant = util::to_lower(util::trim(raw_variant));
+    if (action == "retry")
+        return run_managed_install(/*upgrade=*/false);
+    if (action == "compile-anyway")
+        return run_managed_install(/*upgrade=*/false, {}, /*force_source=*/true,
+                                   /*bypass_environment_checks=*/true);
+    if (action == "release") {
+        LlamaRuntimeStatus current = status();
+        if (!current.troubleshooting.required) current = diagnose_environment();
+        const auto found = std::find_if(
+            current.troubleshooting.variants.begin(),
+            current.troubleshooting.variants.end(),
+            [&](const auto& item) { return item.id == variant; });
+        if (found == current.troubleshooting.variants.end() ||
+            !found->release_available) {
+            current.last_error = "no assessed complete llama.cpp release for variant: "
+                + (variant.empty() ? std::string{"(none)"} : variant);
+            set_status(current);
+            return current;
+        }
+        return run_managed_install(/*upgrade=*/false, variant);
+    }
+    LlamaRuntimeStatus current = status();
+    current.last_error = "unsupported llama.cpp recovery action: " + raw_action;
+    set_status(current);
+    return current;
 }
 
 LlamaRuntimeStatus LlamaCppProvisioner::check_for_update() {
@@ -1086,15 +1816,16 @@ LlamaRuntimeStatus LlamaCppProvisioner::check_for_update() {
     status.update_release_available = false;
     status.update_release_alternatives.clear();
     status.update_warning.clear();
+    const auto assets = runner_.fetch_release_assets && !latest.empty()
+        ? runner_.fetch_release_assets(cfg_, latest)
+        : std::vector<std::string>{};
+    status.available_variants = llama_runtime_variants(assets, cfg_);
     // `llama-server --version` commonly returns a sentence containing the tag,
     // so treat a contained tag as current instead of comparing whole strings.
     status.update_available = !latest.empty() && !installed.empty()
         && !installed_version_matches_tag(installed, latest);
     if (status.update_available) {
         MM_INFO("llama.cpp update available: {} -> {}", installed, latest);
-        const auto assets = runner_.fetch_release_assets
-            ? runner_.fetch_release_assets(cfg_, latest)
-            : std::vector<std::string>{};
         const auto available = llama_release_accelerators(assets, cfg_);
         const std::string target = status.accelerator.empty()
             ? cfg_.accelerator
@@ -1145,8 +1876,8 @@ LlamaRuntimeStatus LlamaCppProvisioner::check_for_update() {
 
 LlamaRuntimeStatus LlamaCppProvisioner::update_runtime(
     const std::string& accelerator_override) {
-    if (const std::string resolved = resolve_llama_executable(cfg_.requested_executable);
-        !resolved.empty()) {
+    const std::string resolved = runner_.resolve_executable(cfg_.requested_executable);
+    if (!resolved.empty() && use_unmanaged_path_runtime(cfg_)) {
         LlamaRuntimeStatus status = this->status();
         status.last_error =
             "llama-server is resolved from PATH (" + resolved +
@@ -1163,7 +1894,8 @@ LlamaRuntimeStatus LlamaCppProvisioner::update_runtime(
     }
     const std::string requested = util::to_lower(util::trim(accelerator_override));
     if (!requested.empty()) {
-        const std::set<std::string> allowed{"cuda", "rocm", "vulkan", "metal", "cpu"};
+        const std::set<std::string> allowed{
+            "cuda", "rocm", "vulkan", "openvino", "metal", "cpu"};
         if (!allowed.count(requested)) {
             current.last_error = "unsupported llama.cpp update accelerator: " + requested;
             set_status(current);
@@ -1181,6 +1913,33 @@ LlamaRuntimeStatus LlamaCppProvisioner::update_runtime(
         }
     }
     return run_managed_install(/*upgrade=*/true, requested);
+}
+
+LlamaRuntimeStatus LlamaCppProvisioner::switch_runtime(
+    const std::string& raw_variant) {
+    const std::string variant = util::to_lower(util::trim(raw_variant));
+    LlamaRuntimeStatus current = status();
+    auto variants = current.available_variants;
+    if (variants.empty()) variants = llama_runtime_variants({}, cfg_);
+    const auto selected = std::find_if(
+        variants.begin(), variants.end(),
+        [&](const auto& candidate) { return candidate.id == variant; });
+    if (selected == variants.end() || !selected->platform_supported ||
+        (!selected->release_available && !selected->source_supported)) {
+        current.last_error = "unsupported llama.cpp engine variant for "
+            + cfg_.platform + "/" + release_arch(cfg_.arch) + ": "
+            + (variant.empty() ? std::string{"(none)"} : variant);
+        set_status(current);
+        return current;
+    }
+
+    // A backend switch is not contingent on an update. Respect the configured
+    // install method: auto prefers a matching release and falls back to source,
+    // release remains release-only, and source compiles directly.
+    return run_managed_install(/*upgrade=*/true, variant,
+                               /*force_source=*/false,
+                               /*bypass_environment_checks=*/false,
+                               /*release_only_override=*/false);
 }
 
 } // namespace mm

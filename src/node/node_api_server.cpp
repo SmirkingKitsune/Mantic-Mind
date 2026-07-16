@@ -130,8 +130,20 @@ void NodeApiServer::set_llama_update_callback(LlamaUpdateCallback callback) {
     llama_update_cb_ = std::move(callback);
 }
 
+void NodeApiServer::set_llama_switch_callback(LlamaSwitchCallback callback) {
+    llama_switch_cb_ = std::move(callback);
+}
+
 void NodeApiServer::set_llama_check_update_callback(LlamaCheckUpdateCallback callback) {
     llama_check_update_cb_ = std::move(callback);
+}
+
+void NodeApiServer::set_llama_diagnose_callback(LlamaDiagnoseCallback callback) {
+    llama_diagnose_cb_ = std::move(callback);
+}
+
+void NodeApiServer::set_llama_recovery_callback(LlamaRecoveryCallback callback) {
+    llama_recovery_cb_ = std::move(callback);
 }
 
 void NodeApiServer::set_ray_config(std::string ray_path, uint16_t ray_port) {
@@ -417,6 +429,93 @@ void NodeApiServer::register_routes() {
         }
         auto runtime = llama_check_update_cb_();
         state_.set_llama_runtime(runtime);
+        res.set_content(nlohmann::json{{"llama_runtime", runtime}}.dump(),
+                        "application/json");
+    });
+
+    server_->Post("/api/node/runtime/llama/switch", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401; return;
+        }
+        if (!llama_switch_cb_) {
+            res.status = 501;
+            res.set_content(R"({"error":"llama.cpp engine switching is not configured"})",
+                            "application/json");
+            return;
+        }
+        std::string variant;
+        try {
+            const auto j = nlohmann::json::parse(req.body);
+            variant = j.value("variant", std::string{});
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid JSON body"})", "application/json");
+            return;
+        }
+        if (variant.empty()) {
+            res.status = 400;
+            res.set_content(R"({"error":"variant is required"})", "application/json");
+            return;
+        }
+        auto runtime = llama_switch_cb_(variant);
+        state_.set_llama_runtime(runtime);
+        if (!runtime.last_error.empty()) state_.set_last_error(runtime.last_error);
+        if (runtime.status == "failed" || runtime.status == "disabled") res.status = 500;
+        else if (!runtime.last_error.empty()) res.status = 409;
+        else res.status = 200;
+        res.set_content(nlohmann::json{{"llama_runtime", runtime}}.dump(),
+                        "application/json");
+    });
+
+    server_->Post("/api/node/runtime/llama/diagnose", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401; return;
+        }
+        if (!llama_diagnose_cb_) {
+            res.status = 501;
+            res.set_content(R"({"error":"llama.cpp diagnostics are not configured"})",
+                            "application/json");
+            return;
+        }
+        auto runtime = llama_diagnose_cb_();
+        state_.set_llama_runtime(runtime);
+        res.set_content(nlohmann::json{{"llama_runtime", runtime}}.dump(),
+                        "application/json");
+    });
+
+    server_->Post("/api/node/runtime/llama/recover", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401; return;
+        }
+        if (!llama_recovery_cb_) {
+            res.status = 501;
+            res.set_content(R"({"error":"llama.cpp recovery is not configured"})",
+                            "application/json");
+            return;
+        }
+        std::string action;
+        std::string variant;
+        try {
+            const auto j = nlohmann::json::parse(req.body);
+            action = j.value("action", std::string{});
+            variant = j.value("variant", std::string{});
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid JSON body"})", "application/json");
+            return;
+        }
+        const std::set<std::string> allowed{"retry", "compile-anyway", "release"};
+        if (!allowed.count(action) || (action == "release" && variant.empty())) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":"action must be retry, compile-anyway, or release; release requires variant"})",
+                "application/json");
+            return;
+        }
+        auto runtime = llama_recovery_cb_(action, variant);
+        state_.set_llama_runtime(runtime);
+        if (!runtime.last_error.empty()) state_.set_last_error(runtime.last_error);
+        res.status = runtime.status == "failed" ? 500 : 200;
         res.set_content(nlohmann::json{{"llama_runtime", runtime}}.dump(),
                         "application/json");
     });

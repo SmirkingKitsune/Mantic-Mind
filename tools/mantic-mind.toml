@@ -65,8 +65,9 @@ max_slots = 4
 # slots, its own runtime). llama.cpp is the reliable path for GGUF models,
 # Windows-native inference, and accelerators without a vLLM build (e.g. the
 # NVIDIA DGX Spark GB10).
-# llama_server_path = "llama-server"        # or MM_LLAMA_PATH; "" resolves from PATH
-# If llama_server_path cannot be resolved, the node first retrieves the official
+# llama_server_path = "llama-server"        # or MM_LLAMA_PATH; use an explicit path to override managed GPU selection
+# A bare PATH llama-server is accepted for CPU (or when auto-provision is off),
+# otherwise the node first retrieves the accelerator-matched official
 # release matching this OS, architecture, accelerator, and CUDA compatibility.
 # Source is built only when no matching release can be used. Provisioning runs
 # in the background, so node startup and vLLM serving never block on it.

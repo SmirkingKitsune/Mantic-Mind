@@ -426,6 +426,50 @@ struct VllmRuntimeStatus {
     bool        update_available = false;
 };
 
+// One environment check performed after a llama.cpp provisioning failure.
+// `status` is pass|warn|fail|info; blocking means the normal source-build
+// preflight will reject the environment until the issue is resolved.
+struct LlamaDiagnosticCheck {
+    std::string id;
+    std::string label;
+    std::string status = "info";
+    std::string detected;
+    std::string required;
+    std::string remediation;
+    bool        blocking = false;
+};
+
+// A known llama.cpp backend/precision variant assessed against this OS,
+// architecture, and the assets attached to the selected upstream release.
+struct LlamaRuntimeVariant {
+    std::string id;                 // cuda-12|cuda-13|vulkan|...|cpu
+    std::string label;
+    std::string backend;            // normalized build backend
+    bool        platform_supported = false;
+    bool        source_supported = false;
+    bool        release_available = false;
+    std::string release_asset;
+    std::string reason;
+    bool        recommended = false;
+};
+
+// Comprehensive, serializable failure report consumed by the forced node-TUI
+// troubleshooting popup and by the REST API.
+struct LlamaTroubleshootingReport {
+    bool        required = false;
+    std::string fingerprint;
+    std::string failure_stage;
+    std::string failure_detail;
+    std::string platform;
+    std::string architecture;
+    std::string target_backend;
+    std::string release_tag;
+    std::string summary;
+    bool        can_override_checks = false;
+    std::vector<LlamaDiagnosticCheck> checks;
+    std::vector<LlamaRuntimeVariant> variants;
+};
+
 // Managed llama.cpp runtime status, the llama-server analog of
 // VllmRuntimeStatus. Kept as a separate struct (not renamed/shared) so a node
 // can advertise both runtimes independently and older clients keep parsing
@@ -441,6 +485,13 @@ struct LlamaRuntimeStatus {
     std::string last_error;
     // Accelerator-correct build this node targets: cuda|rocm|vulkan|metal|cpu.
     std::string accelerator;
+    // Concrete selected engine variant when known (for example cuda-12,
+    // cuda-13, vulkan, or cpu). Older markers may report only accelerator.
+    std::string variant;
+    // Platform-aware engine/backend choices. Populated immediately with source
+    // support and enriched with official release availability after an online
+    // update/variant assessment.
+    std::vector<LlamaRuntimeVariant> available_variants;
     // Newest build available upstream; "" when unknown (offline / not checked).
     std::string latest_version;
     // True when the installed runtime is older than latest_version. Orthogonal
@@ -456,6 +507,9 @@ struct LlamaRuntimeStatus {
     std::vector<std::string> update_release_alternatives;
     // Human-readable consequence shown before the user approves the update.
     std::string update_warning;
+    // Populated after a managed provisioning/compilation failure or an explicit
+    // diagnostic refresh. Empty/default while no troubleshooting is required.
+    LlamaTroubleshootingReport troubleshooting;
 };
 
 // Live progress of an in-program vLLM runtime install/upgrade, surfaced so the
@@ -1194,6 +1248,68 @@ inline void from_json(const nlohmann::json& j, VllmRuntimeStatus& r) {
     if (j.contains("update_available")) j.at("update_available").get_to(r.update_available);
 }
 
+inline void to_json(nlohmann::json& j, const LlamaDiagnosticCheck& c) {
+    j = {{"id", c.id}, {"label", c.label}, {"status", c.status},
+         {"detected", c.detected}, {"required", c.required},
+         {"remediation", c.remediation}, {"blocking", c.blocking}};
+}
+inline void from_json(const nlohmann::json& j, LlamaDiagnosticCheck& c) {
+    if (j.contains("id")) j.at("id").get_to(c.id);
+    if (j.contains("label")) j.at("label").get_to(c.label);
+    if (j.contains("status")) j.at("status").get_to(c.status);
+    if (j.contains("detected")) j.at("detected").get_to(c.detected);
+    if (j.contains("required")) j.at("required").get_to(c.required);
+    if (j.contains("remediation")) j.at("remediation").get_to(c.remediation);
+    if (j.contains("blocking")) j.at("blocking").get_to(c.blocking);
+}
+
+inline void to_json(nlohmann::json& j, const LlamaRuntimeVariant& v) {
+    j = {{"id", v.id}, {"label", v.label}, {"backend", v.backend},
+         {"platform_supported", v.platform_supported},
+         {"source_supported", v.source_supported},
+         {"release_available", v.release_available},
+         {"release_asset", v.release_asset}, {"reason", v.reason},
+         {"recommended", v.recommended}};
+}
+inline void from_json(const nlohmann::json& j, LlamaRuntimeVariant& v) {
+    if (j.contains("id")) j.at("id").get_to(v.id);
+    if (j.contains("label")) j.at("label").get_to(v.label);
+    if (j.contains("backend")) j.at("backend").get_to(v.backend);
+    if (j.contains("platform_supported"))
+        j.at("platform_supported").get_to(v.platform_supported);
+    if (j.contains("source_supported"))
+        j.at("source_supported").get_to(v.source_supported);
+    if (j.contains("release_available"))
+        j.at("release_available").get_to(v.release_available);
+    if (j.contains("release_asset")) j.at("release_asset").get_to(v.release_asset);
+    if (j.contains("reason")) j.at("reason").get_to(v.reason);
+    if (j.contains("recommended")) j.at("recommended").get_to(v.recommended);
+}
+
+inline void to_json(nlohmann::json& j, const LlamaTroubleshootingReport& r) {
+    j = {{"required", r.required}, {"fingerprint", r.fingerprint},
+         {"failure_stage", r.failure_stage}, {"failure_detail", r.failure_detail},
+         {"platform", r.platform}, {"architecture", r.architecture},
+         {"target_backend", r.target_backend}, {"release_tag", r.release_tag},
+         {"summary", r.summary}, {"can_override_checks", r.can_override_checks},
+         {"checks", r.checks}, {"variants", r.variants}};
+}
+inline void from_json(const nlohmann::json& j, LlamaTroubleshootingReport& r) {
+    if (j.contains("required")) j.at("required").get_to(r.required);
+    if (j.contains("fingerprint")) j.at("fingerprint").get_to(r.fingerprint);
+    if (j.contains("failure_stage")) j.at("failure_stage").get_to(r.failure_stage);
+    if (j.contains("failure_detail")) j.at("failure_detail").get_to(r.failure_detail);
+    if (j.contains("platform")) j.at("platform").get_to(r.platform);
+    if (j.contains("architecture")) j.at("architecture").get_to(r.architecture);
+    if (j.contains("target_backend")) j.at("target_backend").get_to(r.target_backend);
+    if (j.contains("release_tag")) j.at("release_tag").get_to(r.release_tag);
+    if (j.contains("summary")) j.at("summary").get_to(r.summary);
+    if (j.contains("can_override_checks"))
+        j.at("can_override_checks").get_to(r.can_override_checks);
+    if (j.contains("checks")) j.at("checks").get_to(r.checks);
+    if (j.contains("variants")) j.at("variants").get_to(r.variants);
+}
+
 inline void to_json(nlohmann::json& j, const LlamaRuntimeStatus& r) {
     j = { {"status",           r.status},
           {"platform",         r.platform},
@@ -1204,12 +1320,15 @@ inline void to_json(nlohmann::json& j, const LlamaRuntimeStatus& r) {
           {"executable_path",  r.executable_path},
           {"last_error",       r.last_error},
           {"accelerator",      r.accelerator},
+          {"variant",          r.variant},
+          {"available_variants", r.available_variants},
           {"latest_version",   r.latest_version},
           {"update_available", r.update_available},
           {"update_action",    r.update_action},
           {"update_release_available", r.update_release_available},
           {"update_release_alternatives", r.update_release_alternatives},
-          {"update_warning",   r.update_warning} };
+          {"update_warning",   r.update_warning},
+          {"troubleshooting",  r.troubleshooting} };
 }
 inline void from_json(const nlohmann::json& j, LlamaRuntimeStatus& r) {
     if (j.contains("status"))           j.at("status").get_to(r.status);
@@ -1221,6 +1340,9 @@ inline void from_json(const nlohmann::json& j, LlamaRuntimeStatus& r) {
     if (j.contains("executable_path"))  j.at("executable_path").get_to(r.executable_path);
     if (j.contains("last_error"))       j.at("last_error").get_to(r.last_error);
     if (j.contains("accelerator"))      j.at("accelerator").get_to(r.accelerator);
+    if (j.contains("variant"))          j.at("variant").get_to(r.variant);
+    if (j.contains("available_variants"))
+        j.at("available_variants").get_to(r.available_variants);
     if (j.contains("latest_version"))   j.at("latest_version").get_to(r.latest_version);
     if (j.contains("update_available")) j.at("update_available").get_to(r.update_available);
     if (j.contains("update_action")) j.at("update_action").get_to(r.update_action);
@@ -1229,6 +1351,8 @@ inline void from_json(const nlohmann::json& j, LlamaRuntimeStatus& r) {
     if (j.contains("update_release_alternatives"))
         j.at("update_release_alternatives").get_to(r.update_release_alternatives);
     if (j.contains("update_warning")) j.at("update_warning").get_to(r.update_warning);
+    if (j.contains("troubleshooting"))
+        j.at("troubleshooting").get_to(r.troubleshooting);
 }
 
 inline void to_json(nlohmann::json& j, const VllmInstallProgress& p) {

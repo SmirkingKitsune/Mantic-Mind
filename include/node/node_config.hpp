@@ -32,7 +32,7 @@ struct NodeConfig {
     std::string llama_provision_dir;
     std::string llama_install_method = "auto"; // auto|release|source
     std::string llama_version = "latest";
-    std::string llama_accelerator;             // cuda|rocm|vulkan|metal|cpu; "" = auto
+    std::string llama_accelerator;             // cuda|rocm|hip|vulkan|openvino|sycl-*|metal|cpu; "" = auto
     std::string llama_cuda_arch;               // e.g. "121" for DGX Spark GB10; "" = auto
     std::vector<std::string> llama_cmake_args; // extra -D flags for the source build
     int         llama_build_jobs = 0;          // 0 = conservative accelerator-aware default

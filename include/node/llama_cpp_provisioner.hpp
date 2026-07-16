@@ -39,6 +39,11 @@ struct LlamaProvisionConfig {
     // managed default (2 for CUDA/ROCm, 4 otherwise) to avoid WSL OOM failures.
     int build_jobs = 0;
 
+    // Transient recovery controls. They are deliberately not loaded from node
+    // configuration: the troubleshooting wizard may set them for one attempt.
+    bool        bypass_environment_checks = false;
+    std::string release_variant; // cuda-12|cuda-13|openvino|...; empty => auto
+
     // Test hooks; empty means use the build host.
     std::string platform; // windows|linux|macos
     std::string arch;      // x86_64|aarch64|arm64
@@ -68,10 +73,15 @@ struct LlamaCommandRunner {
     using FetchReleaseAssetsFn =
         std::function<std::vector<std::string>(const LlamaProvisionConfig&,
                                                const std::string& tag)>;
+    using ResolveExecutableFn = std::function<std::string(const std::string&)>;
     RunFn run;
+    CaptureFn capture_output;
     CaptureFn capture_first_line;
     FetchLatestFn fetch_latest;
     FetchReleaseAssetsFn fetch_release_assets;
+    // Test hook and policy seam for distinguishing an explicitly configured
+    // executable from an incidental generic PATH installation.
+    ResolveExecutableFn resolve_executable;
 };
 
 std::string normalize_llama_install_method(const std::string& method);
@@ -85,6 +95,11 @@ std::vector<LlamaInstallStep> build_llama_install_plan(const LlamaProvisionConfi
 // Return accelerator variants that have an official release for cfg's OS/arch.
 // The list is ordered for UI display and does not include source-build options.
 std::vector<std::string> llama_release_accelerators(
+    const std::vector<std::string>& asset_names,
+    const LlamaProvisionConfig& cfg);
+// Full matrix used by the troubleshooting wizard. Every known variant is
+// returned, including unsupported/unavailable entries with a reason.
+std::vector<LlamaRuntimeVariant> llama_runtime_variants(
     const std::vector<std::string>& asset_names,
     const LlamaProvisionConfig& cfg);
 std::string resolve_llama_executable(const std::string& executable);
@@ -107,6 +122,15 @@ public:
     // Empty override keeps the configured accelerator. A non-empty override is
     // an explicit user choice from the update prompt and uses a release asset.
     LlamaRuntimeStatus update_runtime(const std::string& accelerator_override = {});
+    // Change the managed llama.cpp execution backend independently of whether
+    // an update is pending. `variant` is one of status().variants[].id.
+    LlamaRuntimeStatus switch_runtime(const std::string& variant);
+    // Re-run all non-mutating probes and attach a fresh report to status().
+    LlamaRuntimeStatus diagnose_environment();
+    // action: retry | compile-anyway | release. `variant` is required for a
+    // release action and is one of troubleshooting.variants[].id.
+    LlamaRuntimeStatus recover_runtime(const std::string& action,
+                                       const std::string& variant = {});
     LlamaRuntimeStatus status() const;
     LlamaProvisionConfig config() const;
 
@@ -122,7 +146,13 @@ private:
     LlamaRuntimeStatus make_base_status() const;
     std::string capture_version(const std::string& executable) const;
     LlamaRuntimeStatus run_managed_install(bool upgrade,
-                                           const std::string& accelerator_override = {});
+                                           const std::string& accelerator_override = {},
+                                           bool force_source = false,
+                                           bool bypass_environment_checks = false,
+                                           bool release_only_override = true);
+    LlamaTroubleshootingReport build_troubleshooting_report(
+        const std::string& failure_detail,
+        const LlamaProvisionConfig& install_cfg) const;
     void emit_progress(const VllmInstallProgress& p);
     void set_status(const LlamaRuntimeStatus& status);
 };

@@ -1157,11 +1157,40 @@ int main(int argc, char** argv) {
             auto fallback = llama_provisioner.ensure_runtime();
             if (mm::llama_runtime_usable(fallback)) {
                 fallback.last_error = "llama.cpp update failed: " + update_error;
+                fallback.troubleshooting = updated.troubleshooting;
                 MM_WARN("llama.cpp update failed, kept existing runtime: {}", update_error);
                 return apply_llama_result(fallback);
             }
         }
         return apply_llama_result(updated);
+    };
+
+    auto do_llama_switch = [&](const std::string& variant) -> mm::LlamaRuntimeStatus {
+        std::lock_guard<std::mutex> op_lk(llama_operation_mutex);
+        auto switched = llama_provisioner.switch_runtime(variant);
+        if (switched.status == "failed") {
+            const std::string switch_error = switched.last_error;
+            auto fallback = llama_provisioner.ensure_runtime();
+            if (mm::llama_runtime_usable(fallback)) {
+                fallback.last_error = "llama.cpp engine switch failed: " + switch_error;
+                fallback.troubleshooting = switched.troubleshooting;
+                MM_WARN("llama.cpp engine switch failed, kept existing runtime: {}",
+                        switch_error);
+                return apply_llama_result(fallback);
+            }
+        }
+        return apply_llama_result(switched);
+    };
+
+    auto do_llama_recovery = [&](const std::string& action,
+                                 const std::string& variant) -> mm::LlamaRuntimeStatus {
+        std::lock_guard<std::mutex> op_lk(llama_operation_mutex);
+        MM_INFO("llama.cpp troubleshooting action requested: {}{}", action,
+                variant.empty() ? std::string{} : " (" + variant + ")");
+        auto runtime = action == "diagnose"
+            ? llama_provisioner.diagnose_environment()
+            : llama_provisioner.recover_runtime(action, variant);
+        return apply_llama_result(runtime);
     };
 
     auto check_llama_update = [&]() -> mm::LlamaRuntimeStatus {
@@ -1286,6 +1315,30 @@ int main(int argc, char** argv) {
                 manual_llama_update_running = false;
             });
     };
+    auto request_manual_llama_switch = [&](std::string variant) {
+        bool expected = false;
+        if (!manual_llama_update_running.compare_exchange_strong(expected, true)) return;
+        if (manual_llama_update_thread.joinable()) manual_llama_update_thread.join();
+        manual_llama_update_thread = std::thread(
+            [&, variant = std::move(variant)]() {
+                do_llama_switch(variant);
+                manual_llama_update_running = false;
+            });
+    };
+    std::atomic<bool> manual_llama_recovery_running{false};
+    std::thread manual_llama_recovery_thread;
+    auto request_manual_llama_recovery = [&](std::string action,
+                                             std::string variant) {
+        bool expected = false;
+        if (!manual_llama_recovery_running.compare_exchange_strong(expected, true)) return;
+        if (manual_llama_recovery_thread.joinable())
+            manual_llama_recovery_thread.join();
+        manual_llama_recovery_thread = std::thread(
+            [&, action = std::move(action), variant = std::move(variant)]() {
+                do_llama_recovery(action, variant);
+                manual_llama_recovery_running = false;
+            });
+    };
 
     std::mutex runtime_log_mutex;
     std::deque<std::string> runtime_logs;
@@ -1378,9 +1431,20 @@ int main(int argc, char** argv) {
                 accelerator.empty() ? "current" : accelerator);
         return do_llama_update(accelerator);
     });
+    api_server.set_llama_switch_callback([&](const std::string& variant) {
+        MM_INFO("llama.cpp engine switch requested by user (variant={})", variant);
+        return do_llama_switch(variant);
+    });
     api_server.set_llama_check_update_callback([&]() {
         return check_llama_update();
     });
+    api_server.set_llama_diagnose_callback([&]() {
+        return do_llama_recovery("diagnose", {});
+    });
+    api_server.set_llama_recovery_callback(
+        [&](const std::string& action, const std::string& variant) {
+            return do_llama_recovery(action, variant);
+        });
     api_server.set_remember_api_key_callback([&](const std::string& key) {
         remembered_api_keys.push_back(key);
         if (save_remembered_api_keys(remembered_keys_path, remembered_api_keys)) {
@@ -1530,7 +1594,9 @@ int main(int argc, char** argv) {
             cfg.listen_port,
             forget_remembered_pairings,
             request_manual_update,
-            request_manual_llama_update);
+            request_manual_llama_update,
+            request_manual_llama_switch,
+            request_manual_llama_recovery);
         ui_ptr = &ui;
         ui.run();
         ui_ptr = nullptr;
@@ -1582,6 +1648,10 @@ int main(int argc, char** argv) {
     if (manual_llama_update_thread.joinable()) {
         state.request_action_cancel();
         manual_llama_update_thread.join();
+    }
+    if (manual_llama_recovery_thread.joinable()) {
+        state.request_action_cancel();
+        manual_llama_recovery_thread.join();
     }
 
     state.stop_metrics_poll();
