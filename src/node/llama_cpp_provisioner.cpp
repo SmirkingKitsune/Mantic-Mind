@@ -394,11 +394,6 @@ std::optional<LlamaRuntimeStatus> read_active_runtime(const LlamaProvisionConfig
         if ((method != "release" && method != "source") || accelerator.empty()
             || executable.empty() || !file_exists(executable))
             return std::nullopt;
-        if (cfg.install_method != "auto" && cfg.install_method != method)
-            return std::nullopt;
-        if (cfg.accelerator_explicit && cfg.accelerator != accelerator)
-            return std::nullopt;
-
         LlamaProvisionConfig active_cfg = cfg;
         active_cfg.install_method = method;
         active_cfg.accelerator = accelerator;
@@ -423,6 +418,8 @@ std::optional<LlamaRuntimeStatus> read_active_runtime(const LlamaProvisionConfig
         status.executable_path = normalized.string();
         status.accelerator = accelerator;
         status.variant = json.value("variant", accelerator);
+        status.cuda_architecture =
+            json.value("cuda_architecture", std::string{});
         status.build_log_path = json.value("build_log_path", std::string{});
         return status;
     } catch (...) {
@@ -443,6 +440,7 @@ void write_active_runtime(const LlamaProvisionConfig& cfg,
             {"version", status.version},
             {"executable_path", status.executable_path},
             {"variant", status.variant.empty() ? status.accelerator : status.variant},
+            {"cuda_architecture", status.cuda_architecture},
             {"build_log_path", status.build_log_path},
         }.dump(2);
         out.close();
@@ -1209,6 +1207,54 @@ bool llama_runtime_usable(const LlamaRuntimeStatus& status) {
         && !status.executable_path.empty();
 }
 
+std::string llama_runtime_target_mismatch_reason(
+    const LlamaRuntimeStatus& status) {
+    if (!llama_runtime_usable(status)) return {};
+
+    const std::string actual_backend = util::to_lower(util::trim(status.accelerator));
+    const std::string target_backend = util::to_lower(util::trim(
+        status.target_accelerator.empty() ? status.accelerator
+                                          : status.target_accelerator));
+    if (!target_backend.empty() && actual_backend != target_backend) {
+        return "Active llama.cpp backend is " +
+            (actual_backend.empty() ? std::string{"unknown"} : actual_backend) +
+            "; this node targets " + target_backend + ".";
+    }
+
+    const std::string target_variant = util::to_lower(util::trim(
+        status.target_variant.empty() ? target_backend : status.target_variant));
+    const bool concrete_target_variant = !target_variant.empty() &&
+        target_variant != target_backend &&
+        backend_for_variant(target_variant) == target_backend;
+    const std::string actual_variant = util::to_lower(util::trim(
+        status.variant.empty() ? actual_backend : status.variant));
+    if (concrete_target_variant && actual_variant != target_variant) {
+        return "Active llama.cpp variant is " +
+            (actual_variant.empty() ? std::string{"unknown"} : actual_variant) +
+            "; this node targets " + target_variant + ".";
+    }
+
+    const std::string target_method = normalize_llama_install_method(
+        status.target_method.empty() ? "auto" : status.target_method);
+    const std::string actual_method = normalize_llama_install_method(status.method);
+    if (status.managed && target_method != "auto" &&
+        actual_method != target_method) {
+        return "Active llama.cpp install is " +
+            (actual_method.empty() ? std::string{"unknown"} : actual_method) +
+            "; this node targets a " + target_method + " build.";
+    }
+
+    if (target_backend == "cuda" && actual_method == "source" &&
+        !status.target_cuda_architecture.empty() &&
+        !status.cuda_architecture.empty() &&
+        status.cuda_architecture != status.target_cuda_architecture) {
+        return "Active llama.cpp CUDA architecture is " +
+            status.cuda_architecture + "; this node targets " +
+            status.target_cuda_architecture + ".";
+    }
+    return {};
+}
+
 std::string format_llama_troubleshooting_report(
     const LlamaTroubleshootingReport& report,
     const std::string& build_log_path) {
@@ -1293,11 +1339,31 @@ LlamaRuntimeStatus LlamaCppProvisioner::make_base_status() const {
     status.accelerator = cfg_.accelerator;
     status.variant = cfg_.release_variant.empty() ? cfg_.accelerator
                                                   : cfg_.release_variant;
+    status.target_method = cfg_.install_method;
+    status.target_accelerator = cfg_.accelerator;
+    status.target_variant = cfg_.release_variant.empty() ? cfg_.accelerator
+                                                         : cfg_.release_variant;
+    if (cfg_.accelerator == "cuda" && !cfg_.cuda_arch.empty())
+        status.target_cuda_architecture = cuda_cmake_architectures(cfg_.cuda_arch);
     status.available_variants = llama_runtime_variants({}, cfg_);
     return status;
 }
 
-void LlamaCppProvisioner::set_status(const LlamaRuntimeStatus& status) {
+void LlamaCppProvisioner::set_status(LlamaRuntimeStatus& status) {
+    if (status.target_method.empty()) status.target_method = cfg_.install_method;
+    if (status.target_accelerator.empty())
+        status.target_accelerator = cfg_.accelerator;
+    if (status.target_variant.empty()) {
+        status.target_variant = cfg_.release_variant.empty()
+            ? cfg_.accelerator : cfg_.release_variant;
+    }
+    if (status.target_cuda_architecture.empty() &&
+        status.target_accelerator == "cuda" && !cfg_.cuda_arch.empty()) {
+        status.target_cuda_architecture = cuda_cmake_architectures(cfg_.cuda_arch);
+    }
+    status.target_mismatch_reason =
+        llama_runtime_target_mismatch_reason(status);
+    status.target_mismatch = !status.target_mismatch_reason.empty();
     std::lock_guard<std::mutex> lock(status_mutex_);
     status_ = status;
 }
@@ -1354,8 +1420,8 @@ LlamaRuntimeStatus LlamaCppProvisioner::ensure_runtime() {
 
     // An already-built managed runtime is usable regardless of auto-provision.
     for (const auto& cand : managed_executable_candidates(cfg_)) {
-        // A marker rejected because explicit config superseded its method or
-        // accelerator must not be rediscovered as an unlabeled generic release.
+        // A malformed/stale marker must not cause a generic release artifact
+        // to be rediscovered with the configured target's identity.
         if (ignored_active_marker) {
             const fs::path release_root =
                 (fs::path(cfg_.provision_dir) / "release").lexically_normal();
@@ -1396,8 +1462,7 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
     const LlamaRuntimeStatus prior = this->status();
     if (upgrade && !prior.latest_version.empty())
         install_cfg.version = prior.latest_version; // build/download the assessed release, not moving master
-    if (upgrade && accelerator_override.empty() && !cfg_.accelerator_explicit &&
-        !prior.accelerator.empty())
+    if (upgrade && accelerator_override.empty() && !prior.accelerator.empty())
         install_cfg.accelerator = prior.accelerator;
     if (!accelerator_override.empty()) {
         install_cfg.release_variant = util::to_lower(util::trim(accelerator_override));
@@ -1602,6 +1667,10 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
             status.status = "ready";
             status.managed = true;
             status.method = attempt.config.install_method;
+            status.cuda_architecture =
+                attempt.config.accelerator == "cuda" && status.method == "source"
+                ? cuda_cmake_architectures(attempt.config.cuda_arch)
+                : std::string{};
             status.executable_path = found;
             status.version = version.empty()
                 ? validated_llama_version(attempt.config.version) : version;
@@ -1968,7 +2037,10 @@ LlamaTroubleshootingReport LlamaCppProvisioner::build_troubleshooting_report(
 LlamaRuntimeStatus LlamaCppProvisioner::diagnose_environment() {
     LlamaRuntimeStatus current = status();
     LlamaProvisionConfig install_cfg = cfg_;
-    if (!current.accelerator.empty()) install_cfg.accelerator = current.accelerator;
+    if (!current.target_accelerator.empty())
+        install_cfg.accelerator = current.target_accelerator;
+    else if (!current.accelerator.empty())
+        install_cfg.accelerator = current.accelerator;
     if (!current.latest_version.empty()) install_cfg.version = current.latest_version;
     const std::string failure = current.last_error.empty()
         ? std::string{"Manual llama.cpp environment diagnostic"}
@@ -1984,6 +2056,8 @@ LlamaRuntimeStatus LlamaCppProvisioner::recover_runtime(
     const std::string action = util::to_lower(util::trim(raw_action));
     const std::string variant = util::to_lower(util::trim(raw_variant));
     if (action == "retry")
+        return run_managed_install(/*upgrade=*/false);
+    if (action == "target")
         return run_managed_install(/*upgrade=*/false);
     if (action == "compile-anyway")
         return run_managed_install(/*upgrade=*/false, {}, /*force_source=*/true,

@@ -433,7 +433,11 @@ policy, the node inspects the new tag's asset names before asking for approval.
 The prompt explicitly says when approval will compile locally and provides
 buttons for published alternatives such as Vulkan or CPU. A selected managed
 alternative is recorded in `active-runtime.json` so it remains active after a
-restart unless an explicit accelerator config supersedes it.
+restart. The configured/detected target remains separate from that active
+fallback. When they differ, the node prompts before reinstalling the target;
+declining keeps the working fallback and the prompt can be reopened from the
+Runtime tab with **Review target build**. A failed target install also restores
+the prior active runtime while retaining the target build log and diagnostics.
 
 A bare `llama-server` discovered on `PATH` is accepted for CPU nodes, for the
 normal Metal-enabled macOS build, or when auto-provisioning is disabled. It is
@@ -445,7 +449,9 @@ managed selection.
 
 The node Runtime tab identifies the active engine family, accelerator backend,
 concrete variant when known, managed/external install source, version, and
-executable path. **Change llama.cpp engine** opens the platform-aware variant
+executable path. A target mismatch is shown with both the active and intended
+backend/variant (and CUDA architecture for source builds).
+**Change llama.cpp engine** opens the platform-aware variant
 matrix at any time; choices backed by an official release are downloaded, while
 source-only choices clearly indicate that local compilation is required. The
 same operation is available headlessly through
@@ -454,6 +460,11 @@ their current subprocess until unloaded; new or restarted slots use the newly
 selected engine. If an external executable rejects `--version`, its version is
 shown as `not reported` instead of displaying the command-line error as version
 text.
+
+**Troubleshoot llama.cpp** on the Runtime tab opens the same comprehensive
+diagnostic wizard on demand, including when the current runtime is healthy or a
+fallback is active. In that case diagnostics assess the configured/detected
+target so users can fix its environment before choosing **Install target build**.
 
 If managed provisioning or compilation fails, the node TUI force-opens a
 scrollable llama.cpp troubleshooting wizard. Long diagnostic lines are wrapped
@@ -539,7 +550,7 @@ POST   /api/node/runtime/llama/provision { update?, accelerator? } -> { llama_ru
 POST   /api/node/runtime/llama/switch    { variant } -> { llama_runtime }
 POST   /api/node/runtime/llama/check-update -> { llama_runtime }
 POST   /api/node/runtime/llama/diagnose -> { llama_runtime.troubleshooting }
-POST   /api/node/runtime/llama/recover { action: "retry"|"compile-anyway"|"release", variant? } -> { llama_runtime }
+POST   /api/node/runtime/llama/recover { action: "retry"|"target"|"compile-anyway"|"release", variant? } -> { llama_runtime }
 POST   /api/node/ray/start      { role: "head"|"worker", head_address? }  (Linux only)
 POST   /api/node/ray/stop
 GET    /api/node/health         -> NodeHealthMetrics

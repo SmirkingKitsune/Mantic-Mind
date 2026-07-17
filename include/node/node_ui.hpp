@@ -32,7 +32,7 @@ public:
     // Change the active managed llama.cpp execution variant independently of
     // update availability (for example cuda-12, vulkan, or cpu).
     using RequestLlamaSwitchCallback = std::function<void(std::string variant)>;
-    // Failure-wizard action: diagnose | retry | compile-anyway | release.
+    // Runtime/wizard action: diagnose | retry | target | compile-anyway | release.
     // `variant` is populated only for release and is a report variant id.
     using RequestLlamaRecoveryCallback =
         std::function<void(std::string action, std::string variant)>;

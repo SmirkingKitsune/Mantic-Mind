@@ -27,8 +27,8 @@ struct LlamaProvisionConfig {
     // Accelerator-correct build: cuda|rocm|vulkan|metal|cpu. Empty => detected.
     std::string accelerator;
     // True when the accelerator came from config rather than hardware probing.
-    // Explicit config may intentionally supersede a previously selected update
-    // alternative on the next restart.
+    // It remains the target while a previously selected fallback stays active
+    // until the user approves reinstalling the target build.
     bool accelerator_explicit = false;
     // CUDA compute capability for the source build, e.g. "121" for the DGX Spark
     // GB10 (sm_121, requires CUDA 13+). "" => caller auto-detects when possible.
@@ -104,6 +104,10 @@ std::vector<LlamaRuntimeVariant> llama_runtime_variants(
     const LlamaProvisionConfig& cfg);
 std::string resolve_llama_executable(const std::string& executable);
 bool llama_runtime_usable(const LlamaRuntimeStatus& status);
+// Empty means the usable active runtime satisfies its configured/detected
+// target. Otherwise this explains the backend/variant/build mismatch.
+std::string llama_runtime_target_mismatch_reason(
+    const LlamaRuntimeStatus& status);
 // Complete plain-text representation used by the troubleshooting scroll view,
 // clipboard action, build-attempt log, and headless consumers.
 std::string format_llama_troubleshooting_report(
@@ -132,8 +136,9 @@ public:
     LlamaRuntimeStatus switch_runtime(const std::string& variant);
     // Re-run all non-mutating probes and attach a fresh report to status().
     LlamaRuntimeStatus diagnose_environment();
-    // action: retry | compile-anyway | release. `variant` is required for a
-    // release action and is one of troubleshooting.variants[].id.
+    // action: retry | target | compile-anyway | release. `target` reinstalls
+    // the configured/detected build. `variant` is required for a release
+    // action and is one of troubleshooting.variants[].id.
     LlamaRuntimeStatus recover_runtime(const std::string& action,
                                        const std::string& variant = {});
     LlamaRuntimeStatus status() const;
@@ -159,7 +164,7 @@ private:
         const std::string& failure_detail,
         const LlamaProvisionConfig& install_cfg) const;
     void emit_progress(const VllmInstallProgress& p);
-    void set_status(const LlamaRuntimeStatus& status);
+    void set_status(LlamaRuntimeStatus& status);
 };
 
 } // namespace mm

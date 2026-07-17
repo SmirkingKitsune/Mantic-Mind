@@ -301,6 +301,10 @@ bool test_agent_api_settings_round_trip_without_key_persistence() {
         cfg.api_settings.chat_completions_path = "/v1/chat/completions";
         cfg.api_settings.api_key = "secret-not-persisted";
         cfg.api_settings.api_key_env = "MANTIC_TEST_API_KEY";
+        cfg.runtime_settings.top_k = 20;
+        cfg.runtime_settings.min_p = 0.0f;
+        cfg.runtime_settings.presence_penalty = 1.5f;
+        cfg.runtime_settings.repeat_penalty = 1.0f;
 
         CHECK(manager.create_agent(cfg) == "api-agent");
         auto agent = manager.get_agent("api-agent");
@@ -324,6 +328,10 @@ bool test_agent_api_settings_round_trip_without_key_persistence() {
         CHECK(loaded.api_settings.chat_completions_path == "/v1/chat/completions");
         CHECK(loaded.api_settings.api_key.empty());
         CHECK(loaded.api_settings.api_key_env == "MANTIC_TEST_API_KEY");
+        CHECK(loaded.runtime_settings.top_k == 20);
+        CHECK(loaded.runtime_settings.min_p == 0.0f);
+        CHECK(loaded.runtime_settings.presence_penalty == 1.5f);
+        CHECK(loaded.runtime_settings.repeat_penalty == 1.0f);
 
         nlohmann::json loaded_json = loaded;
         CHECK(loaded_json.dump().find("secret-not-persisted") == std::string::npos);
@@ -1961,6 +1969,12 @@ bool test_control_api_agent_api_mode_chat() {
                     {"model_path", "frontier-test-model"},
                     {"memories_enabled", false},
                     {"tools_enabled", false},
+                    {"runtime_settings", {
+                        {"top_k", 20},
+                        {"min_p", 0.0},
+                        {"presence_penalty", 1.5},
+                        {"repeat_penalty", 1.0}
+                    }},
                     {"api_settings", {
                         {"base_url", backend_url},
                         {"chat_completions_path", "/v1/chat/completions"},
@@ -2047,6 +2061,10 @@ bool test_control_api_agent_api_mode_chat() {
         RECORD(auth == "Bearer test-secret");
         RECORD(sent["model"] == "frontier-test-model");
         RECORD(sent["stream"] == true);
+        RECORD(sent["top_k"] == 20);
+        RECORD(sent["min_p"] == 0.0);
+        RECORD(sent["presence_penalty"] == 1.5);
+        RECORD(sent["repeat_penalty"] == 1.0);
         RECORD(sent.dump().find("hello from test") != std::string::npos);
 
         api.stop();
@@ -3363,18 +3381,24 @@ bool test_llama_path_resolution_respects_accelerator() {
     cfg.platform = "windows";
     cfg.arch = "x86_64";
     cfg.accelerator = "cuda";
+    cfg.accelerator_explicit = true;
 
     const std::string winget =
         "C:/Users/test/AppData/Local/Microsoft/WinGet/Packages/ggml.llamacpp/llama-server.exe";
     bool ran_managed_install = false;
+    bool fail_managed_install = false;
     mm::LlamaCommandRunner runner;
     runner.resolve_executable = [winget](const std::string&) { return winget; };
     runner.run = [&](const std::vector<std::string>&,
                      const std::filesystem::path&,
                      const mm::StreamLineCallback&,
                      const mm::CancelCheckCallback&,
-                     std::string*) {
+                     std::string* error) {
         ran_managed_install = true;
+        if (fail_managed_install) {
+            if (error) *error = "simulated target install failure";
+            return 1;
+        }
         const auto executable = std::filesystem::path(cfg.provision_dir) /
             "release" / "bin" / "llama-server.exe";
         std::filesystem::create_directories(executable.parent_path());
@@ -3403,6 +3427,10 @@ bool test_llama_path_resolution_respects_accelerator() {
     CHECK(managed.method == "release");
     CHECK(managed.accelerator == "cuda");
     CHECK(managed.variant == "cuda");
+    CHECK(managed.target_method == "release");
+    CHECK(managed.target_accelerator == "cuda");
+    CHECK(managed.target_variant == "cuda");
+    CHECK(!managed.target_mismatch);
     CHECK(!managed.available_variants.empty());
     CHECK(managed.executable_path.find("WinGet") == std::string::npos);
 
@@ -3465,9 +3493,15 @@ bool test_llama_path_resolution_respects_accelerator() {
     CHECK(switched.managed);
     CHECK(switched.accelerator == "vulkan");
     CHECK(switched.variant == "vulkan");
+    CHECK(switched.target_accelerator == "cuda");
+    CHECK(switched.target_variant == "cuda");
+    CHECK(switched.target_mismatch);
+    CHECK(switched.target_mismatch_reason.find("targets cuda") != std::string::npos);
     nlohmann::json switched_json = switched;
     const auto switched_round_trip = switched_json.get<mm::LlamaRuntimeStatus>();
     CHECK(switched_round_trip.variant == "vulkan");
+    CHECK(switched_round_trip.target_accelerator == "cuda");
+    CHECK(switched_round_trip.target_mismatch);
     CHECK(switched_round_trip.available_variants.size() ==
           switched.available_variants.size());
 
@@ -3477,6 +3511,29 @@ bool test_llama_path_resolution_respects_accelerator() {
     CHECK(!ran_managed_install);
     CHECK(switched_restored.accelerator == "vulkan");
     CHECK(switched_restored.variant == "vulkan");
+    CHECK(switched_restored.target_accelerator == "cuda");
+    CHECK(switched_restored.target_mismatch);
+
+    // A failed target attempt does not replace the persisted fallback marker.
+    fail_managed_install = true;
+    const auto failed_target = switched_restart.recover_runtime("target");
+    CHECK(failed_target.status == "failed");
+    CHECK(failed_target.last_error.find("simulated target install failure") !=
+          std::string::npos);
+    fail_managed_install = false;
+    const auto after_failed_target = switched_restart.ensure_runtime();
+    CHECK(after_failed_target.accelerator == "vulkan");
+    CHECK(after_failed_target.target_mismatch);
+
+    // The explicit configured target no longer silently displaces a working
+    // fallback at startup. A deliberate target recovery installs it instead.
+    ran_managed_install = false;
+    const auto target = switched_restart.recover_runtime("target");
+    CHECK(ran_managed_install);
+    CHECK(target.status == "ready");
+    CHECK(target.accelerator == "cuda");
+    CHECK(target.target_accelerator == "cuda");
+    CHECK(!target.target_mismatch);
 
     CHECK(remove_tree(dir));
     return true;
@@ -3492,6 +3549,7 @@ bool test_llama_auto_release_then_source_fallback() {
     cfg.platform = "linux";
     cfg.arch = "x86_64";
     cfg.accelerator = "cuda";
+    cfg.cuda_arch = "120";
 
     // Seed more than the retention limit; the new attempt should prune the
     // oldest managed-runtime transcripts before creating its own.
@@ -3536,6 +3594,13 @@ bool test_llama_auto_release_then_source_fallback() {
     CHECK(saw_source);
     CHECK(status.status == "ready");
     CHECK(status.method == "source");
+    CHECK(status.cuda_architecture == "120a-real");
+    CHECK(status.target_cuda_architecture == "120a-real");
+    CHECK(!status.target_mismatch);
+    auto stale_architecture = status;
+    stale_architecture.cuda_architecture = "120";
+    CHECK(mm::llama_runtime_target_mismatch_reason(stale_architecture).find(
+              "targets 120a-real") != std::string::npos);
     CHECK(status.executable_path.find("llama.cpp-src") != std::string::npos);
     CHECK(!status.build_log_path.empty());
     CHECK(std::filesystem::exists(status.build_log_path));
@@ -3557,6 +3622,12 @@ bool test_llama_auto_release_then_source_fallback() {
         }
     }
     CHECK(retained_logs == 20);
+
+    mm::LlamaCppProvisioner restarted(cfg, runner);
+    const auto restored = restarted.ensure_runtime();
+    CHECK(restored.cuda_architecture == "120a-real");
+    CHECK(restored.target_cuda_architecture == "120a-real");
+    CHECK(!restored.target_mismatch);
 
     CHECK(remove_tree(dir));
     return true;

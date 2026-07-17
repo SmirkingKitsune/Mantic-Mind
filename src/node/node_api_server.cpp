@@ -504,18 +504,21 @@ void NodeApiServer::register_routes() {
             res.set_content(R"({"error":"invalid JSON body"})", "application/json");
             return;
         }
-        const std::set<std::string> allowed{"retry", "compile-anyway", "release"};
+        const std::set<std::string> allowed{
+            "retry", "target", "compile-anyway", "release"};
         if (!allowed.count(action) || (action == "release" && variant.empty())) {
             res.status = 400;
             res.set_content(
-                R"({"error":"action must be retry, compile-anyway, or release; release requires variant"})",
+                R"({"error":"action must be retry, target, compile-anyway, or release; release requires variant"})",
                 "application/json");
             return;
         }
         auto runtime = llama_recovery_cb_(action, variant);
         state_.set_llama_runtime(runtime);
         if (!runtime.last_error.empty()) state_.set_last_error(runtime.last_error);
-        res.status = runtime.status == "failed" ? 500 : 200;
+        if (runtime.status == "failed") res.status = 500;
+        else if (!runtime.last_error.empty()) res.status = 409;
+        else res.status = 200;
         res.set_content(nlohmann::json{{"llama_runtime", runtime}}.dump(),
                         "application/json");
     });

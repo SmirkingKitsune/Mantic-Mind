@@ -363,6 +363,9 @@ void NodeUI::run() {
     bool        show_llama_update_button = false;
     bool        show_llama_engine_modal = false;
     bool        show_llama_engine_button = false;
+    bool        show_llama_target_modal = false;
+    bool        show_llama_target_button = false;
+    bool        show_llama_troubleshoot_button = false;
     bool        show_llama_troubleshoot_modal = false;
     bool        show_llama_release_choice = false;
     bool        show_llama_compile_anyway = false;
@@ -378,6 +381,7 @@ void NodeUI::run() {
     std::string modal_ack_version;   // latest_version the user has acted on/dismissed
     std::string llama_cur_latest;
     std::string llama_modal_ack_version;
+    std::string llama_target_ack_key;
     std::string llama_troubleshoot_ack_fingerprint;
     std::string llama_clipboard_status;
     std::string llama_clipboard_report_key;
@@ -399,6 +403,13 @@ void NodeUI::run() {
             return label;
         };
         return option;
+    };
+    auto llama_target_key = [](const LlamaRuntimeStatus& runtime) {
+        return runtime.accelerator + "|" + runtime.variant + "|" +
+            runtime.method + "|" + runtime.cuda_architecture + "|" +
+            runtime.target_accelerator + "|" + runtime.target_variant + "|" +
+            runtime.target_method + "|" + runtime.target_cuda_architecture + "|" +
+            runtime.executable_path;
     };
 
     auto request_update = [&] {
@@ -514,6 +525,31 @@ void NodeUI::run() {
         llama_troubleshoot_ack_fingerprint = rt.troubleshooting.fingerprint;
         show_llama_troubleshoot_modal = false;
     };
+    auto btn_llama_target = Button("[ Review target build ]", [&] {
+        show_llama_target_modal = true;
+    }, high_contrast_button_option());
+    auto btn_llama_target_maybe = Maybe(btn_llama_target, &show_llama_target_button);
+    auto modal_llama_target_install = Button("[ Install target build ]", [&] {
+        const auto rt = state_.get_llama_runtime();
+        llama_target_ack_key = llama_target_key(rt);
+        if (request_llama_recovery_cb_)
+            request_llama_recovery_cb_("target", {});
+        show_llama_target_modal = false;
+    }, high_contrast_button_option());
+    auto modal_llama_target_later = Button("[ Keep current for now ]", [&] {
+        llama_target_ack_key = llama_target_key(state_.get_llama_runtime());
+        show_llama_target_modal = false;
+    }, high_contrast_button_option());
+    auto llama_target_actions = Container::Horizontal({
+        modal_llama_target_install, modal_llama_target_later,
+    });
+    auto btn_llama_troubleshoot = Button("[ Troubleshoot llama.cpp ]", [&] {
+        llama_troubleshoot_ack_fingerprint.clear();
+        if (request_llama_recovery_cb_)
+            request_llama_recovery_cb_("diagnose", {});
+    }, high_contrast_button_option());
+    auto btn_llama_troubleshoot_maybe =
+        Maybe(btn_llama_troubleshoot, &show_llama_troubleshoot_button);
     auto modal_llama_diagnose = Button("[ Re-run diagnostics ]", [&] {
         request_llama_recovery("diagnose");
     }, high_contrast_button_option());
@@ -674,6 +710,7 @@ void NodeUI::run() {
     });
     auto runtime_controls = Container::Vertical({
         ray_input, ray_buttons, btn_llama_engine_maybe,
+        btn_llama_target_maybe, btn_llama_troubleshoot_maybe,
         btn_llama_update_maybe, btn_update_maybe,
     });
     auto model_controls = Container::Vertical({
@@ -732,6 +769,11 @@ void NodeUI::run() {
             !llama_rt.executable_path.empty();
         show_llama_engine_button = static_cast<bool>(request_llama_switch_cb_) &&
                                    llama_ready && !llama_busy;
+        show_llama_target_button = llama_rt.target_mismatch && llama_ready &&
+                                   static_cast<bool>(request_llama_recovery_cb_) &&
+                                   !llama_busy;
+        show_llama_troubleshoot_button =
+            static_cast<bool>(request_llama_recovery_cb_) && !llama_busy;
         const bool can_update_llama = llama_rt.update_available && llama_rt.managed &&
                                       static_cast<bool>(request_llama_update_cb_) &&
                                       !llama_busy;
@@ -808,6 +850,14 @@ void NodeUI::run() {
             show_llama_update_modal = false;
             show_llama_troubleshoot_modal = false;
         }
+        const bool can_install_target = llama_rt.target_mismatch && llama_ready &&
+            static_cast<bool>(request_llama_recovery_cb_) && !llama_busy;
+        show_llama_target_modal = !show_action_modal &&
+            !show_llama_troubleshoot_modal && !show_llama_engine_modal &&
+            can_install_target &&
+            (show_llama_target_modal ||
+             llama_target_ack_key != llama_target_key(llama_rt));
+        if (show_llama_target_modal) show_llama_update_modal = false;
 
         int log_scroll_from_bottom = 0;
         std::string log_file_path;
@@ -1139,19 +1189,44 @@ void NodeUI::run() {
             if (!runtime.last_error.empty()) rows.push_back(paragraph(runtime.last_error) | color(Color::Red));
             return vbox(std::move(rows));
         };
+        Element llama_target_notice = text("");
+        if (llama_rt.target_mismatch) {
+            const std::string actual =
+                (llama_rt.variant.empty() ? llama_rt.accelerator : llama_rt.variant) +
+                (llama_rt.cuda_architecture.empty()
+                    ? std::string{} : " / " + llama_rt.cuda_architecture);
+            const std::string target =
+                (llama_rt.target_variant.empty() ? llama_rt.target_accelerator
+                                                  : llama_rt.target_variant) +
+                (llama_rt.target_cuda_architecture.empty()
+                    ? std::string{} : " / " + llama_rt.target_cuda_architecture);
+            llama_target_notice = panel("LLAMA.CPP TARGET", vbox({
+                hbox({text("active        ") | dim,
+                      text(actual.empty() ? std::string{"unknown"} : actual) | bold}),
+                hbox({text("target        ") | dim,
+                      text(target.empty() ? std::string{"unknown"} : target) |
+                          color(Color::Yellow) | bold}),
+                paragraph(llama_rt.target_mismatch_reason) | color(Color::Yellow),
+            }));
+        }
         Element runtimes_page = vbox({
             hbox({panel("llama.cpp", runtime_status("llama.cpp", llama_rt,
                                                      llama_rt.variant)) | flex,
                   panel("vLLM", runtime_status("vLLM", vllm_rt,
                                                 vllm_rt.accelerator)) | flex}),
+            std::move(llama_target_notice),
             panel("RAY", vbox({
                 text("Ray controls are enabled only when the node advertises Ray support.") | dim,
                 ray_input->Render() | border,
                 ray_buttons->Render(),
             })),
-            hbox({btn_llama_engine_maybe->Render(), text(" "),
-                  btn_llama_update_maybe->Render(), text(" "),
-                  btn_update_maybe->Render()}),
+            vbox({
+                hbox({btn_llama_engine_maybe->Render(), text(" "),
+                      btn_llama_target_maybe->Render()}),
+                hbox({btn_llama_troubleshoot_maybe->Render(), text(" "),
+                      btn_llama_update_maybe->Render(), text(" "),
+                      btn_update_maybe->Render()}),
+            }),
             operation_status.empty() ? text("") : paragraph(operation_status),
         });
         Element models_page = vbox({
@@ -1279,6 +1354,76 @@ void NodeUI::run() {
             rows.push_back(separator());
             rows.push_back(llama_engine_actions->Render() | hcenter);
             return vbox(std::move(rows)) | border | size(WIDTH, EQUAL, 76);
+        });
+    auto llama_target_modal_renderer =
+        Renderer(llama_target_actions, [&]() -> Element {
+            const auto rt = state_.get_llama_runtime();
+            const std::string actual_variant = rt.variant.empty()
+                ? rt.accelerator : rt.variant;
+            const std::string target_variant = rt.target_variant.empty()
+                ? rt.target_accelerator : rt.target_variant;
+            const std::string actual = actual_variant +
+                (rt.cuda_architecture.empty()
+                    ? std::string{} : " / " + rt.cuda_architecture);
+            const std::string target = target_variant +
+                (rt.target_cuda_architecture.empty()
+                    ? std::string{} : " / " + rt.target_cuda_architecture);
+
+            bool target_release_assessed = false;
+            for (const auto& variant : rt.available_variants) {
+                const bool matches = variant.id == target_variant ||
+                    (target_variant == rt.target_accelerator &&
+                     variant.backend == rt.target_accelerator);
+                if (matches && variant.release_available) {
+                    target_release_assessed = true;
+                    break;
+                }
+            }
+
+            std::string consequence;
+            Color consequence_color = Color::Yellow;
+            if (rt.target_method == "source") {
+                consequence =
+                    "Installing the target will compile llama-server locally.";
+            } else if (rt.target_method == "release") {
+                consequence = target_release_assessed
+                    ? "Installing the target will download its assessed official release."
+                    : "No complete official target release is currently assessed; "
+                      "release-only installation may fail.";
+                if (target_release_assessed) consequence_color = Color::Cyan;
+            } else if (target_release_assessed) {
+                consequence =
+                    "Installing the target will prefer its official release and use "
+                    "source compilation only if the release cannot be used.";
+                consequence_color = Color::Cyan;
+            } else {
+                consequence =
+                    "No complete official target release is currently assessed. "
+                    "Installation will compile locally if the release lookup confirms none.";
+            }
+
+            Elements rows{
+                text(" llama.cpp target build differs ") | bold | hcenter |
+                    color(Color::Yellow),
+                separator(),
+                hbox({text(" active : ") | dim,
+                      text(actual.empty() ? std::string{"unknown"} : actual) | bold}),
+                hbox({text(" target : ") | dim,
+                      text(target.empty() ? std::string{"unknown"} : target) |
+                          color(Color::Yellow) | bold}),
+                hbox({text(" policy : ") | dim,
+                      text(rt.target_method.empty() ? std::string{"auto"}
+                                                    : rt.target_method)}),
+                separator(),
+                paragraph(" " + rt.target_mismatch_reason) | color(Color::Yellow),
+                paragraph(" " + consequence) | color(consequence_color),
+                paragraph(
+                    " Keeping the current build leaves the active engine unchanged. "
+                    "You can reopen this prompt from the Runtime tab.") | dim,
+                separator(),
+                llama_target_actions->Render() | hcenter,
+            };
+            return vbox(std::move(rows)) | border | size(WIDTH, EQUAL, 74);
         });
     auto llama_troubleshoot_modal_renderer =
         Renderer(llama_troubleshoot_btns, [&]() -> Element {
@@ -1408,8 +1553,11 @@ void NodeUI::run() {
     auto with_llama_engine =
         Modal(with_llama_update, llama_engine_modal_renderer,
               &show_llama_engine_modal);
+    auto with_llama_target =
+        Modal(with_llama_engine, llama_target_modal_renderer,
+              &show_llama_target_modal);
     auto with_llama_troubleshooting = Modal(
-        with_llama_engine, llama_troubleshoot_modal_renderer,
+        with_llama_target, llama_troubleshoot_modal_renderer,
         &show_llama_troubleshoot_modal);
     auto with_modal =
         Modal(with_llama_troubleshooting, action_modal_renderer, &show_action_modal);
@@ -1428,6 +1576,15 @@ void NodeUI::run() {
                 llama_troubleshoot_ack_fingerprint =
                     rt.troubleshooting.fingerprint;
                 show_llama_troubleshoot_modal = false;
+                return true;
+            }
+            return false;
+        }
+        if (show_llama_target_modal) {
+            if (ev == Event::Escape) {
+                llama_target_ack_key =
+                    llama_target_key(state_.get_llama_runtime());
+                show_llama_target_modal = false;
                 return true;
             }
             return false;

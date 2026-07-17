@@ -156,6 +156,16 @@ nlohmann::json build_request(const InferenceRequest& req, bool stream) {
     const auto& s = req.settings;
     body["temperature"] = static_cast<double>(s.temperature);
     body["top_p"]       = static_cast<double>(s.top_p);
+    if (s.top_k >= 0) body["top_k"] = s.top_k;
+    if (s.min_p >= 0.0f) body["min_p"] = static_cast<double>(s.min_p);
+    if (s.presence_penalty != 0.0f) {
+        body["presence_penalty"] = static_cast<double>(s.presence_penalty);
+    }
+    // llama.cpp names this sampler repeat_penalty. It remains optional so
+    // OpenAI-compatible providers that do not expose the extension never see it.
+    if (s.repeat_penalty > 0.0f) {
+        body["repeat_penalty"] = static_cast<double>(s.repeat_penalty);
+    }
     body["max_tokens"]  = s.max_tokens;
     body["stream"]      = stream;
     if (stream) body["stream_options"] = { {"include_usage", true} };

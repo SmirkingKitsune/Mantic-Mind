@@ -70,7 +70,15 @@ ConvId ConversationManager::maybe_compact(const ConvId& conv_id,
                                            const AgentConfig& cfg) {
     int total   = db_.get_total_tokens(conv_id);
     int ctx_sz  = cfg.runtime_settings.ctx_size;
-    double ratio = ctx_sz > 0 ? static_cast<double>(total) / ctx_sz : 0.0;
+    // Reserve the configured completion allowance before deciding how much
+    // history can remain. Long-reasoning profiles commonly allow 16K-32K
+    // output tokens; comparing history against the whole context window can
+    // otherwise admit a prompt that leaves no room for the response.
+    const int completion_reserve = cfg.runtime_settings.max_tokens > 0 && ctx_sz > 1
+        ? std::min(cfg.runtime_settings.max_tokens, ctx_sz - 1)
+        : 0;
+    const int prompt_budget = std::max(1, ctx_sz - completion_reserve);
+    double ratio = static_cast<double>(total) / prompt_budget;
 
     if (ratio >= kCompactionThreshold) {
         MM_INFO("Conversation {} at {:.0f}% context — compacting", conv_id, ratio * 100);

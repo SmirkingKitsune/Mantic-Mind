@@ -98,6 +98,10 @@ struct RuntimeSettings {
     int   ubatch_size  = -1;   // -1 = runtime default
     float temperature  = 0.7f;
     float top_p        = 0.9f;
+    int   top_k        = -1;   // -1 = omit and use provider/runtime default
+    float min_p        = -1.0f; // -1 = omit; 0 explicitly disables min-p
+    float presence_penalty = 0.0f;
+    float repeat_penalty   = -1.0f; // -1 = omit; llama.cpp request field
     int   max_tokens   = 1024;
     bool  flash_attn   = true;
     std::vector<std::string> extra_args;  // additional runtime CLI flags
@@ -159,7 +163,7 @@ inline bool vllm_launch_compatible(const VllmSettings& a, const VllmSettings& b)
 /// True when two llama.cpp configurations describe the same engine launch, i.e.
 /// agents using either can share one llama-server process. Only the launch-time
 /// (engine identity) fields gate sharing; per-request generation parameters
-/// (temperature, top_p, max_tokens) ride each request and are excluded.
+/// (sampling controls and max_tokens) ride each request and are excluded.
 inline bool llama_launch_compatible(const RuntimeSettings& a, const RuntimeSettings& b) {
     return a.ctx_size        == b.ctx_size
         && a.n_gpu_layers    == b.n_gpu_layers
@@ -491,6 +495,22 @@ struct LlamaRuntimeStatus {
     // Concrete selected engine variant when known (for example cuda-12,
     // cuda-13, vulkan, or cpu). Older markers may report only accelerator.
     std::string variant;
+    // The configured/detected build the node ultimately wants. These remain
+    // stable when a user selects a temporary Vulkan/CPU fallback, allowing the
+    // UI to distinguish the active runtime from the intended target.
+    std::string target_method;       // auto|release|source
+    std::string target_accelerator;  // cuda|rocm|vulkan|metal|cpu|...
+    std::string target_variant;      // concrete variant, or target_accelerator
+    // Effective CMAKE_CUDA_ARCHITECTURES value for source builds. The active
+    // value is persisted in the managed-runtime marker; target is derived from
+    // current environment/configuration (for example 120a-real on Blackwell).
+    std::string cuda_architecture;
+    std::string target_cuda_architecture;
+    // Computed whenever provisioner status changes. A usable fallback can be
+    // ready while this is true; callers should offer, not silently force, the
+    // target installation.
+    bool        target_mismatch = false;
+    std::string target_mismatch_reason;
     // Platform-aware engine/backend choices. Populated immediately with source
     // support and enriched with official release availability after an online
     // update/variant assessment.
@@ -761,6 +781,10 @@ inline void to_json(nlohmann::json& j, const RuntimeSettings& s) {
           {"ubatch_size",  s.ubatch_size},
           {"temperature",  s.temperature},
           {"top_p",        s.top_p},
+          {"top_k",        s.top_k},
+          {"min_p",        s.min_p},
+          {"presence_penalty", s.presence_penalty},
+          {"repeat_penalty", s.repeat_penalty},
           {"max_tokens",   s.max_tokens},
           {"flash_attn",   s.flash_attn},
           {"extra_args",   s.extra_args} };
@@ -775,6 +799,10 @@ inline void from_json(const nlohmann::json& j, RuntimeSettings& s) {
     if (j.contains("ubatch_size"))  j.at("ubatch_size").get_to(s.ubatch_size);
     if (j.contains("temperature"))  j.at("temperature").get_to(s.temperature);
     if (j.contains("top_p"))        j.at("top_p").get_to(s.top_p);
+    if (j.contains("top_k"))        j.at("top_k").get_to(s.top_k);
+    if (j.contains("min_p"))        j.at("min_p").get_to(s.min_p);
+    if (j.contains("presence_penalty")) j.at("presence_penalty").get_to(s.presence_penalty);
+    if (j.contains("repeat_penalty")) j.at("repeat_penalty").get_to(s.repeat_penalty);
     if (j.contains("max_tokens"))   j.at("max_tokens").get_to(s.max_tokens);
     if (j.contains("flash_attn"))   j.at("flash_attn").get_to(s.flash_attn);
     if (j.contains("extra_args"))   j.at("extra_args").get_to(s.extra_args);
@@ -1325,6 +1353,13 @@ inline void to_json(nlohmann::json& j, const LlamaRuntimeStatus& r) {
           {"build_log_path",   r.build_log_path},
           {"accelerator",      r.accelerator},
           {"variant",          r.variant},
+          {"target_method",    r.target_method},
+          {"target_accelerator", r.target_accelerator},
+          {"target_variant",   r.target_variant},
+          {"cuda_architecture", r.cuda_architecture},
+          {"target_cuda_architecture", r.target_cuda_architecture},
+          {"target_mismatch", r.target_mismatch},
+          {"target_mismatch_reason", r.target_mismatch_reason},
           {"available_variants", r.available_variants},
           {"latest_version",   r.latest_version},
           {"update_available", r.update_available},
@@ -1346,6 +1381,20 @@ inline void from_json(const nlohmann::json& j, LlamaRuntimeStatus& r) {
     if (j.contains("build_log_path"))   j.at("build_log_path").get_to(r.build_log_path);
     if (j.contains("accelerator"))      j.at("accelerator").get_to(r.accelerator);
     if (j.contains("variant"))          j.at("variant").get_to(r.variant);
+    if (j.contains("target_method"))
+        j.at("target_method").get_to(r.target_method);
+    if (j.contains("target_accelerator"))
+        j.at("target_accelerator").get_to(r.target_accelerator);
+    if (j.contains("target_variant"))
+        j.at("target_variant").get_to(r.target_variant);
+    if (j.contains("cuda_architecture"))
+        j.at("cuda_architecture").get_to(r.cuda_architecture);
+    if (j.contains("target_cuda_architecture"))
+        j.at("target_cuda_architecture").get_to(r.target_cuda_architecture);
+    if (j.contains("target_mismatch"))
+        j.at("target_mismatch").get_to(r.target_mismatch);
+    if (j.contains("target_mismatch_reason"))
+        j.at("target_mismatch_reason").get_to(r.target_mismatch_reason);
     if (j.contains("available_variants"))
         j.at("available_variants").get_to(r.available_variants);
     if (j.contains("latest_version"))   j.at("latest_version").get_to(r.latest_version);

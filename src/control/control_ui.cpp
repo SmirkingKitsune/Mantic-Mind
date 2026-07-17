@@ -233,7 +233,9 @@ void ControlUI::run() {
     std::vector<AgentConfig> agent_rows;   // per-frame snapshot the menu transform indexes
     std::string ed_id, ed_id_orig, ed_name, ed_model, ed_sysprompt, ed_pref_node;
     // Sampling (generation settings still flow through RuntimeSettings in the request contract)
-    std::string ed_temp_s{"0.70"}, ed_topp_s{"0.90"}, ed_max_s{"1024"};
+    std::string ed_temp_s{"0.70"}, ed_topp_s{"0.90"}, ed_topk_s{"-1"};
+    std::string ed_minp_s{"-1.00"}, ed_presence_s{"0.00"}, ed_repeat_s{"-1.00"};
+    std::string ed_max_s{"1024"};
     // Engine · vLLM
     std::string ed_mml_s{"4096"};      // max_model_len
     std::string ed_seqs_s{"16"};       // max_num_seqs
@@ -503,6 +505,10 @@ void ControlUI::run() {
         // Generation (shared request contract → RuntimeSettings)
         try { cfg.runtime_settings.temperature = std::stof(ed_temp_s); } catch (...) {}
         try { cfg.runtime_settings.top_p = std::stof(ed_topp_s); } catch (...) {}
+        try { cfg.runtime_settings.top_k = std::stoi(ed_topk_s); } catch (...) {}
+        try { cfg.runtime_settings.min_p = std::stof(ed_minp_s); } catch (...) {}
+        try { cfg.runtime_settings.presence_penalty = std::stof(ed_presence_s); } catch (...) {}
+        try { cfg.runtime_settings.repeat_penalty = std::stof(ed_repeat_s); } catch (...) {}
         try { cfg.runtime_settings.max_tokens = std::stoi(ed_max_s); } catch (...) {}
         try { cfg.runtime_settings.ctx_size = std::stoi(ed_ctx_s); } catch (...) {}
         try { cfg.runtime_settings.n_gpu_layers = std::stoi(ed_gpu_layers_s); } catch (...) {}
@@ -573,7 +579,8 @@ void ControlUI::run() {
     auto refresh_editor_validation = [&]() {
         const std::string signature =
             ed_id + '\n' + ed_name + '\n' + ed_model + '\n' + ed_sysprompt + '\n' + ed_pref_node +
-            '\n' + ed_temp_s + '\n' + ed_topp_s + '\n' + ed_max_s + '\n' +
+            '\n' + ed_temp_s + '\n' + ed_topp_s + '\n' + ed_topk_s + '\n' +
+            ed_minp_s + '\n' + ed_presence_s + '\n' + ed_repeat_s + '\n' + ed_max_s + '\n' +
             ed_mml_s + '\n' + ed_seqs_s + '\n' + ed_batched_s + '\n' + ed_tp_s + '\n' + ed_pp_s +
             '\n' + ed_gpumem_s + '\n' + ed_dtype + '\n' + ed_quant + '\n' + ed_toolparser + '\n' +
             ed_extra_args_text + '\n' +
@@ -930,7 +937,9 @@ void ControlUI::run() {
     auto btn_new_a    = Button("[+] New", [&] {
         ed_id.clear(); ed_id_orig.clear(); ed_name = "New Agent"; ed_model.clear();
         ed_sysprompt.clear(); ed_pref_node.clear();
-        ed_temp_s = "0.70"; ed_topp_s = "0.90"; ed_max_s = "1024";
+        ed_temp_s = "0.70"; ed_topp_s = "0.90"; ed_topk_s = "-1";
+        ed_minp_s = "-1.00"; ed_presence_s = "0.00"; ed_repeat_s = "-1.00";
+        ed_max_s = "1024";
         ed_mml_s = "4096"; ed_seqs_s = "16"; ed_batched_s = "-1";
         ed_tp_s = "1"; ed_pp_s = "1"; ed_gpumem_s = "0.90";
         ed_dtype = "auto"; ed_quant.clear(); ed_toolparser.clear();
@@ -960,6 +969,13 @@ void ControlUI::run() {
             ed_temp_s = tmp;
             snprintf(tmp, sizeof(tmp), "%.2f", static_cast<double>(c.runtime_settings.top_p));
             ed_topp_s = tmp;
+            ed_topk_s = std::to_string(c.runtime_settings.top_k);
+            snprintf(tmp, sizeof(tmp), "%.2f", static_cast<double>(c.runtime_settings.min_p));
+            ed_minp_s = tmp;
+            snprintf(tmp, sizeof(tmp), "%.2f", static_cast<double>(c.runtime_settings.presence_penalty));
+            ed_presence_s = tmp;
+            snprintf(tmp, sizeof(tmp), "%.2f", static_cast<double>(c.runtime_settings.repeat_penalty));
+            ed_repeat_s = tmp;
             ed_max_s = std::to_string(c.runtime_settings.max_tokens);
             ed_mml_s = std::to_string(c.vllm_settings.max_model_len);
             ed_seqs_s = std::to_string(c.vllm_settings.max_num_seqs);
@@ -1039,6 +1055,10 @@ void ControlUI::run() {
     auto ed_inp_pnode = Input(&ed_pref_node, sl);
     auto ed_inp_temp  = Input(&ed_temp_s,    sl);
     auto ed_inp_topp  = Input(&ed_topp_s,    sl);
+    auto ed_inp_topk  = Input(&ed_topk_s,    sl);
+    auto ed_inp_minp  = Input(&ed_minp_s,    sl);
+    auto ed_inp_presence = Input(&ed_presence_s, sl);
+    auto ed_inp_repeat = Input(&ed_repeat_s, sl);
     auto ed_inp_max   = Input(&ed_max_s,     sl);
     auto ed_backend_toggle = Toggle(&ed_backend_labels, &ed_backend);
     auto ed_inp_ctx = Input(&ed_ctx_s, sl);
@@ -1151,7 +1171,8 @@ void ControlUI::run() {
     };
     auto ed_sec_sampling_btn = Button("Sampling", [&] { ed_open_sampling = !ed_open_sampling; },
         section_header(&ed_open_sampling, "Sampling",
-            [&] { return "temp " + ed_temp_s + " · top_p " + ed_topp_s + " · " + ed_max_s + " tok"; }));
+            [&] { return "temp " + ed_temp_s + " · top_p " + ed_topp_s +
+                         " · top_k " + ed_topk_s + " · " + ed_max_s + " tok"; }));
     auto ed_sec_engine_btn = Button("Engine", [&] { ed_open_engine = !ed_open_engine; },
         section_header(&ed_open_engine, "Engine · vLLM",
             [&] { return "mml " + ed_mml_s + " · seqs " + ed_seqs_s + " · gpu " + ed_gpumem_s +
@@ -1162,7 +1183,9 @@ void ControlUI::run() {
                          (ed_reasoning ? "y" : "n") + " · mem " + (ed_memories ? "y" : "n"); }));
 
     // Section field groups, Maybe-gated so collapsed sections leave the focus tree.
-    auto sampling_fields = Container::Vertical({ed_inp_temp, ed_inp_topp, ed_inp_max});
+    auto sampling_fields = Container::Vertical({
+        ed_inp_temp, ed_inp_topp, ed_inp_topk, ed_inp_minp,
+        ed_inp_presence, ed_inp_repeat, ed_inp_max});
     auto sampling_m = Maybe(sampling_fields, [&] { return ed_open_sampling; });
     auto engine_fields = Container::Vertical({
         ed_backend_toggle,
@@ -2274,10 +2297,18 @@ void ControlUI::run() {
                 })),
                 sec_static("System prompt",
                            ed_inp_sys->Render() | size(HEIGHT, LESS_THAN, 5) | border),
-                sec_toggle(ed_sec_sampling_btn->Render(), ed_open_sampling, hbox({
-                    field(" temperature", ed_inp_temp->Render() | flex, 13),
-                    field(" top_p", ed_inp_topp->Render() | flex, 8),
-                    field(" max_tokens", ed_inp_max->Render() | flex, 12),
+                sec_toggle(ed_sec_sampling_btn->Render(), ed_open_sampling, vbox({
+                    hbox({
+                        field(" temperature", ed_inp_temp->Render() | flex, 13),
+                        field(" top_p", ed_inp_topp->Render() | flex, 8),
+                        field(" top_k", ed_inp_topk->Render() | flex, 8),
+                        field(" min_p", ed_inp_minp->Render() | flex, 8),
+                    }),
+                    hbox({
+                        field(" presence", ed_inp_presence->Render() | flex, 11),
+                        field(" repeat", ed_inp_repeat->Render() | flex, 9),
+                        field(" max_tokens", ed_inp_max->Render() | flex, 12),
+                    }),
                 })),
                 sec_toggle(ed_sec_engine_btn->Render(), ed_open_engine, std::move(engine_body)),
                 sec_toggle(ed_sec_caps_btn->Render(), ed_open_caps, vbox({
@@ -2339,7 +2370,9 @@ void ControlUI::run() {
                           color(Color::Cyan) | flex}),
                 hbox({text("sampling ") | dim,
                       text("temp " + fmt2(a.runtime_settings.temperature) + " · top_p " +
-                           fmt2(a.runtime_settings.top_p) + " · " +
+                           fmt2(a.runtime_settings.top_p) + " · top_k " +
+                           std::to_string(a.runtime_settings.top_k) + " · min_p " +
+                           fmt2(a.runtime_settings.min_p) + " · " +
                            std::to_string(a.runtime_settings.max_tokens) + " tok")}),
                 hbox({text("engine   ") | dim,
                       text("mml " + std::to_string(a.vllm_settings.max_model_len) + " · seqs " +

@@ -241,6 +241,10 @@ void AgentDB::run_migrations() {
                 ubatch_size       INTEGER NOT NULL DEFAULT -1,
                 temperature       REAL    NOT NULL DEFAULT 0.7,
                 top_p             REAL    NOT NULL DEFAULT 0.9,
+                top_k             INTEGER NOT NULL DEFAULT -1,
+                min_p             REAL    NOT NULL DEFAULT -1.0,
+                presence_penalty  REAL    NOT NULL DEFAULT 0.0,
+                repeat_penalty    REAL    NOT NULL DEFAULT -1.0,
                 max_tokens        INTEGER NOT NULL DEFAULT 1024,
                 flash_attn        INTEGER NOT NULL DEFAULT 1,
                 extra_args_json   TEXT    NOT NULL DEFAULT '[]',
@@ -488,6 +492,24 @@ void AgentDB::run_migrations() {
         db_->exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (7)");
         tx.commit();
     }
+
+    if (!has_version(8)) {
+        SQLite::Transaction tx(*db_);
+        if (!has_column("agent_config", "top_k")) {
+            db_->exec("ALTER TABLE agent_config ADD COLUMN top_k INTEGER NOT NULL DEFAULT -1");
+        }
+        if (!has_column("agent_config", "min_p")) {
+            db_->exec("ALTER TABLE agent_config ADD COLUMN min_p REAL NOT NULL DEFAULT -1.0");
+        }
+        if (!has_column("agent_config", "presence_penalty")) {
+            db_->exec("ALTER TABLE agent_config ADD COLUMN presence_penalty REAL NOT NULL DEFAULT 0.0");
+        }
+        if (!has_column("agent_config", "repeat_penalty")) {
+            db_->exec("ALTER TABLE agent_config ADD COLUMN repeat_penalty REAL NOT NULL DEFAULT -1.0");
+        }
+        db_->exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (8)");
+        tx.commit();
+    }
 }
 
 //
@@ -506,6 +528,7 @@ void AgentDB::save_config(const AgentConfig& cfg) {
                  inference_backend,
                  ctx_size, n_gpu_layers, n_threads, n_threads_http,
                  parallel, batch_size, ubatch_size, temperature, top_p,
+                 top_k, min_p, presence_penalty, repeat_penalty,
                  max_tokens, flash_attn, extra_args_json, vllm_settings_json,
                  api_settings_json,
                  reasoning_enabled, memories_enabled, tools_enabled,
@@ -515,6 +538,7 @@ void AgentDB::save_config(const AgentConfig& cfg) {
                  :inference_backend,
                  :ctx_size,:n_gpu_layers,:n_threads,:n_threads_http,
                  :parallel,:batch_size,:ubatch_size,:temperature,:top_p,
+                 :top_k,:min_p,:presence_penalty,:repeat_penalty,
                  :max_tokens,:flash_attn,:extra_args_json,:vllm_settings_json,
                  :api_settings_json,
                  :reasoning,:memories,:tools,
@@ -533,6 +557,10 @@ void AgentDB::save_config(const AgentConfig& cfg) {
                 ubatch_size       = excluded.ubatch_size,
                 temperature       = excluded.temperature,
                 top_p             = excluded.top_p,
+                top_k             = excluded.top_k,
+                min_p             = excluded.min_p,
+                presence_penalty  = excluded.presence_penalty,
+                repeat_penalty    = excluded.repeat_penalty,
                 max_tokens        = excluded.max_tokens,
                 flash_attn        = excluded.flash_attn,
                 extra_args_json   = excluded.extra_args_json,
@@ -559,6 +587,10 @@ void AgentDB::save_config(const AgentConfig& cfg) {
         q.bind(":ubatch_size",       s.ubatch_size);
         q.bind(":temperature",       static_cast<double>(s.temperature));
         q.bind(":top_p",             static_cast<double>(s.top_p));
+        q.bind(":top_k",             s.top_k);
+        q.bind(":min_p",             static_cast<double>(s.min_p));
+        q.bind(":presence_penalty",  static_cast<double>(s.presence_penalty));
+        q.bind(":repeat_penalty",    static_cast<double>(s.repeat_penalty));
         q.bind(":max_tokens",        s.max_tokens);
         q.bind(":flash_attn",        s.flash_attn ? 1 : 0);
         q.bind(":extra_args_json",   extra_args_json);
@@ -598,6 +630,10 @@ AgentConfig AgentDB::load_config() const {
     s.ubatch_size   = q.getColumn("ubatch_size").getInt();
     s.temperature   = static_cast<float>(q.getColumn("temperature").getDouble());
     s.top_p         = static_cast<float>(q.getColumn("top_p").getDouble());
+    s.top_k         = q.getColumn("top_k").getInt();
+    s.min_p         = static_cast<float>(q.getColumn("min_p").getDouble());
+    s.presence_penalty = static_cast<float>(q.getColumn("presence_penalty").getDouble());
+    s.repeat_penalty = static_cast<float>(q.getColumn("repeat_penalty").getDouble());
     s.max_tokens    = q.getColumn("max_tokens").getInt();
     s.flash_attn    = q.getColumn("flash_attn").getInt() != 0;
     s.extra_args    = deserialize_strings(q.getColumn("extra_args_json").getText());

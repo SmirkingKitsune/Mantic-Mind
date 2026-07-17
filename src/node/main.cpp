@@ -1190,6 +1190,22 @@ int main(int argc, char** argv) {
         auto runtime = action == "diagnose"
             ? llama_provisioner.diagnose_environment()
             : llama_provisioner.recover_runtime(action, variant);
+        if (action == "target" && runtime.status == "failed") {
+            const auto failed = runtime;
+            auto fallback = llama_provisioner.ensure_runtime();
+            if (mm::llama_runtime_usable(fallback)) {
+                fallback.last_error =
+                    "llama.cpp target install failed; kept active " +
+                    (fallback.variant.empty() ? fallback.accelerator
+                                              : fallback.variant) +
+                    " runtime: " + failed.last_error;
+                fallback.build_log_path = failed.build_log_path;
+                fallback.troubleshooting = failed.troubleshooting;
+                MM_WARN("llama.cpp target install failed, kept active runtime: {}",
+                        failed.last_error);
+                return apply_llama_result(fallback);
+            }
+        }
         return apply_llama_result(runtime);
     };
 

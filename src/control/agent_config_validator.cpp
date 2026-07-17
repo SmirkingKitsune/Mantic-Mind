@@ -86,6 +86,36 @@ AgentValidationResult validate_agent_config(const AgentConfig& cfg,
     if (cfg.runtime_settings.temperature < 0.0f || !std::isfinite(cfg.runtime_settings.temperature)) {
         add_issue(result, ValidationSeverity::Error, "runtime_settings.temperature", "temperature must be a finite value >= 0.");
     }
+    if (cfg.runtime_settings.top_k < -1) {
+        add_issue(result,
+                  ValidationSeverity::Error,
+                  "runtime_settings.top_k",
+                  "top_k must be -1 (runtime default), 0 (disabled), or greater.");
+    }
+    if ((cfg.runtime_settings.min_p < 0.0f && cfg.runtime_settings.min_p != -1.0f) ||
+        cfg.runtime_settings.min_p > 1.0f ||
+        !std::isfinite(cfg.runtime_settings.min_p)) {
+        add_issue(result,
+                  ValidationSeverity::Error,
+                  "runtime_settings.min_p",
+                  "min_p must be -1 (runtime default) or within [0, 1].");
+    }
+    if (cfg.runtime_settings.presence_penalty < -2.0f ||
+        cfg.runtime_settings.presence_penalty > 2.0f ||
+        !std::isfinite(cfg.runtime_settings.presence_penalty)) {
+        add_issue(result,
+                  ValidationSeverity::Error,
+                  "runtime_settings.presence_penalty",
+                  "presence_penalty must be within [-2, 2].");
+    }
+    if ((cfg.runtime_settings.repeat_penalty <= 0.0f &&
+         cfg.runtime_settings.repeat_penalty != -1.0f) ||
+        !std::isfinite(cfg.runtime_settings.repeat_penalty)) {
+        add_issue(result,
+                  ValidationSeverity::Error,
+                  "runtime_settings.repeat_penalty",
+                  "repeat_penalty must be -1 (runtime default) or greater than 0.");
+    }
     if (cfg.runtime_settings.n_gpu_layers < -1) {
         add_issue(result, ValidationSeverity::Error, "runtime_settings.n_gpu_layers", "n_gpu_layers must be -1 or greater.");
     }
