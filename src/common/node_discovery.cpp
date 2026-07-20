@@ -44,11 +44,12 @@ static bool is_loopback_or_unspecified_host(const std::string& host) {
 
 void NodeDiscoveryBroadcaster::start(const std::string& url,
                                       const std::string& node_id,
+                                      const std::string& hostname,
                                       uint16_t port,
                                       int interval_s) {
     if (running_.exchange(true)) return;
 
-    thread_ = std::thread([this, url, node_id, port, interval_s]() {
+    thread_ = std::thread([this, url, node_id, hostname, port, interval_s]() {
 #ifdef _WIN32
         WSADATA wsa{};
         WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -57,7 +58,8 @@ void NodeDiscoveryBroadcaster::start(const std::string& url,
             {"service", "mantic-mind"},
             {"version", 1},
             {"url",     url},
-            {"node_id", node_id}
+            {"node_id", node_id},
+            {"hostname", hostname}
         };
         std::string payload = beacon.dump();
 
@@ -178,6 +180,7 @@ void NodeDiscoveryListener::start(uint16_t port) {
                 dn.url          = j.value("url",     std::string{});
                 dn.node_id      = j.value("node_id", std::string{});
                 dn.last_seen_ms = mm::util::now_ms();
+                dn.hostname     = j.value("hostname", std::string{});
 
                 if (dn.url.empty() || dn.node_id.empty()) continue;
 

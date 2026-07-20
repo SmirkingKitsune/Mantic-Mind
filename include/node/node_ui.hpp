@@ -26,10 +26,23 @@ public:
     // update prompt's "Update now"). Must return promptly — the implementation
     // should run the (slow) install off the UI thread.
     using RequestVllmUpdateCallback = std::function<void()>;
+    // Empty accelerator approves the assessed current-backend action. A value
+    // such as vulkan/cpu selects an official release alternative.
+    using RequestLlamaUpdateCallback = std::function<void(std::string accelerator)>;
+    // Change the active managed llama.cpp execution variant independently of
+    // update availability (for example cuda-12, vulkan, or cpu).
+    using RequestLlamaSwitchCallback = std::function<void(std::string variant)>;
+    // Runtime/wizard action: diagnose | retry | target | compile-anyway | release.
+    // `variant` is populated only for release and is a report variant id.
+    using RequestLlamaRecoveryCallback =
+        std::function<void(std::string action, std::string variant)>;
 
     NodeUI(NodeState& state, uint16_t listen_port,
            ForgetPairingCallback forget_pairing_cb = {},
-           RequestVllmUpdateCallback request_vllm_update_cb = {});
+           RequestVllmUpdateCallback request_vllm_update_cb = {},
+           RequestLlamaUpdateCallback request_llama_update_cb = {},
+           RequestLlamaSwitchCallback request_llama_switch_cb = {},
+           RequestLlamaRecoveryCallback request_llama_recovery_cb = {});
     ~NodeUI();
 
     // Append a log line from the runtime engine (thread-safe, posts to UI event loop).
@@ -46,6 +59,9 @@ private:
     uint16_t   listen_port_;
     ForgetPairingCallback forget_pairing_cb_;
     RequestVllmUpdateCallback request_vllm_update_cb_;
+    RequestLlamaUpdateCallback request_llama_update_cb_;
+    RequestLlamaSwitchCallback request_llama_switch_cb_;
+    RequestLlamaRecoveryCallback request_llama_recovery_cb_;
 
     static constexpr size_t kMaxLogLines = 4000;
     static constexpr int    kLogScrollPage = 8;

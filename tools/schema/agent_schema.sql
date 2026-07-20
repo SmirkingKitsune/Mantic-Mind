@@ -31,6 +31,10 @@ CREATE TABLE IF NOT EXISTS agent_config (
     ubatch_size       INTEGER NOT NULL DEFAULT -1,
     temperature       REAL    NOT NULL DEFAULT 0.7,
     top_p             REAL    NOT NULL DEFAULT 0.9,
+    top_k             INTEGER NOT NULL DEFAULT -1,
+    min_p             REAL    NOT NULL DEFAULT -1.0,
+    presence_penalty  REAL    NOT NULL DEFAULT 0.0,
+    repeat_penalty    REAL    NOT NULL DEFAULT -1.0,
     max_tokens        INTEGER NOT NULL DEFAULT 1024,
     flash_attn        INTEGER NOT NULL DEFAULT 1,   -- stored as bool (0/1)
     extra_args_json   TEXT    NOT NULL DEFAULT '[]', -- JSON array of strings
@@ -165,3 +169,4 @@ CREATE INDEX IF NOT EXISTS idx_tts_cache_expiry
 INSERT OR IGNORE INTO schema_migrations(version) VALUES (1);
 INSERT OR IGNORE INTO schema_migrations(version) VALUES (5);
 INSERT OR IGNORE INTO schema_migrations(version) VALUES (6);
+INSERT OR IGNORE INTO schema_migrations(version) VALUES (8);

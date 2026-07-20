@@ -2,11 +2,14 @@
 
 Distributed LLM inference cluster — two executables that turn any collection of machines into a coordinated AI backend.
 
-- **mantic-mind** — cluster node; spawns and manages `vllm serve` engine subprocesses; FTXUI status TUI
+- **mantic-mind** — cluster node; spawns and manages inference engine subprocesses (`llama-server` by default, `vllm serve` as an opt-in peer); FTXUI status TUI
 - **mantic-mind-control** — cluster head; manages nodes, agents, conversations, memories; FTXUI management TUI
 
-> **Branch note:** this is the `vllm-runtime` line — vLLM is the inference backend.
-> The earlier llama.cpp-based runtime is preserved on the `llama-cpp-runtime` branch.
+> **Branch note:** llama.cpp is the default runtime on this line — agents default to
+> `inference_backend = "llama-cpp"` and serve local GGUF models via `llama-server`.
+> vLLM remains available as an opt-in peer backend per agent; the vLLM-as-default
+> line is preserved on the `vLLM-runtime` branch, and the original llama.cpp-only
+> line on the `llama-cpp-runtime` branch.
 
 ## Prerequisites
 
@@ -17,7 +20,8 @@ Distributed LLM inference cluster — two executables that turn any collection o
 | MSVC (Windows) | VS 2022 |
 | GCC / Clang (Linux) | GCC 12 / Clang 15 |
 | Apple Clang (macOS) | Xcode 15 command-line tools |
-| Python + vLLM | on each node — the node launches `vllm serve`; it can use an existing `vllm` executable or auto-provision a managed runtime |
+| llama.cpp (`llama-server`) | on each node — resolved from PATH or provisioned from an environment-matched official GitHub release; source builds are the last resort (DGX Spark needs CUDA 13+ for `sm_121`) |
+| Python + vLLM | optional, per node — only for agents with `inference_backend = "vllm"`; an existing `vllm` executable is used, and a managed install is created only when `vllm_auto_provision = true` |
 
 Runtime extras (node side, optional):
 
@@ -248,6 +252,56 @@ agents bypass node placement, but they still use the normal Mantic-Mind agent
 harness: conversations, streaming chat, memory extraction, compaction, and tool
 rounds.
 
+## Vision Agents
+
+Image input is opt-in per agent. A llama.cpp profile names both the model GGUF
+and its matching projector explicitly:
+
+```json
+{
+  "name": "local-vision",
+  "inference_backend": "llama-cpp",
+  "model_path": "D:/models/vision-model.gguf",
+  "vision_settings": {
+    "enabled": true,
+    "mmproj_path": "D:/models/mmproj-vision-model.gguf"
+  }
+}
+```
+
+The projector is launched through llama.cpp's authoritative `--mmproj`
+argument. Do not repeat `--mmproj`, `-mm`, or `--mmproj-url` in
+`runtime_settings.extra_args`. For vLLM and API-backed profiles, set
+`vision_settings.enabled` to declare that the configured model accepts images
+and leave `mmproj_path` empty. Image requests sent to a profile without vision
+enabled fail with HTTP 422; Mantic-Mind never drops the images or delegates the
+turn to another agent.
+
+The profile editor exposes a Vision toggle and projector picker. Adjacent
+case-insensitive `mmproj-*.gguf` files are shown as suggestions but are never
+selected automatically. The Chat tab can stage up to eight JPEG/PNG files,
+shows their sizes, uploads them through the same managed attachment API used by
+other clients, and clears the staged list after the request is queued.
+
+Managed images live beneath the owning agent directory. SQLite stores generated
+attachment IDs, relative managed paths, and ordered message parts; neither
+base64 data nor absolute attachment paths appear in persisted messages or API
+responses. Pending uploads expire after 24 hours, and unreferenced managed files
+are reconciled at startup. Limits are 50 MiB per image, eight images per turn or
+hydrated context, and 400 MiB decoded image data per turn or context.
+
+With control and a node running, the opt-in real-model smoke test creates a
+temporary agent, loads a vision GGUF/projector pair, uploads a small PNG, and
+checks a text-only follow-up against the persisted visual turn:
+
+```sh
+python tests/vision_smoke.py \
+  --model /models/vision-model.gguf \
+  --mmproj /models/mmproj-vision-model.gguf \
+  --image tests/data/small.png \
+  --token "$MM_CONTROL_EXTERNAL_API_TOKEN"
+```
+
 ## Quick Start
 
 Local `mantic-mind.toml` and `mantic-mind-control.toml` copies are intentionally gitignored. Keep committed defaults in `tools/`, then copy them into the working directory for local runs.
@@ -368,8 +422,19 @@ After file loading, matching environment variables override config values.
 | `listen_port` | `MM_LISTEN_PORT` | `7070` | Node API port |
 | `control_url` | `MM_CONTROL_URL` | *(empty)* | Control base URL (empty = standalone) |
 | `control_api_key` | `MM_CONTROL_API_KEY` | *(empty)* | Bearer token for control |
-| `vllm_server_path` | `MM_VLLM_PATH` | `vllm` | `vllm` CLI / wrapper used to launch engines |
-| `vllm_auto_provision` | `MM_VLLM_AUTO_PROVISION` | `true` | Auto-create a managed vLLM runtime when `vllm_server_path` is unresolved |
+| `llama_server_path` | `MM_LLAMA_PATH` | `llama-server` | Explicit path/wrapper for llama.cpp engine slots; a bare PATH name is not trusted as GPU-capable |
+| `llama_auto_provision` | `MM_LLAMA_AUTO_PROVISION` | `true` | Provision an accelerator-matched managed llama.cpp when no compatible explicit runtime is selected |
+| `llama_provision_dir` | `MM_LLAMA_PROVISION_DIR` | `data/runtimes/llama.cpp` | Managed llama.cpp runtime root |
+| `llama_install_method` | `MM_LLAMA_INSTALL_METHOD` | `auto` | Provisioning method: `auto` (matched release, then source fallback), `release`, or `source` |
+| `llama_version` | `MM_LLAMA_VERSION` | `latest` | llama.cpp release tag / source ref used by provisioning |
+| `llama_accelerator` | `MM_LLAMA_ACCELERATOR` | *(auto)* | Release/build backend: `cuda`, `rocm`/`hip`, `vulkan`, `openvino`, `sycl-fp32`, `sycl-fp16`, `metal`, or `cpu` (availability depends on OS/architecture/toolchain) |
+| `llama_cuda_arch` | `MM_LLAMA_CUDA_ARCH` | *(auto)* | CUDA compute capability for source builds (e.g. `121` for DGX Spark GB10); detected with `nvidia-smi` when empty |
+| `llama_build_jobs` | `MM_LLAMA_BUILD_JOBS` | `0` | Source-build concurrency; `0` uses 2 jobs for CUDA/ROCm and 4 otherwise |
+| `llama_update_policy` | `MM_LLAMA_UPDATE_POLICY` | `prompt` | llama.cpp update behavior: `prompt`, `auto`, or `manual` |
+| `llama_update_check` | `MM_LLAMA_UPDATE_CHECK` | `true` | Periodically inspect the latest llama.cpp tag and its release assets |
+| `llama_update_check_interval_hours` | `MM_LLAMA_UPDATE_CHECK_INTERVAL_HOURS` | `24` | llama.cpp update-check interval |
+| `vllm_server_path` | `MM_VLLM_PATH` | `vllm` | `vllm` CLI / wrapper used to launch engines (opt-in peer backend) |
+| `vllm_auto_provision` | `MM_VLLM_AUTO_PROVISION` | `false` | Auto-create a managed vLLM runtime when `vllm_server_path` is unresolved |
 | `vllm_provision_dir` | `MM_VLLM_PROVISION_DIR` | `data/runtimes/vllm` | Managed vLLM runtime root |
 | `vllm_install_method` | `MM_VLLM_INSTALL_METHOD` | `auto` | Provisioning method: `auto`, `wheel`, or `source` |
 | `vllm_version` | `MM_VLLM_VERSION` | `latest` | vLLM release tag/version/commit used by provisioning |
@@ -393,6 +458,87 @@ After file loading, matching environment variables override config values.
 | `discovery_port` | `MM_DISCOVERY_PORT` | `7072` | UDP discovery port |
 | `log_file` | `MM_LOG_FILE` | `logs/mantic-mind.log` | Log file |
 
+For `llama_install_method = "auto"`, the node matches the release asset to the
+node OS, CPU architecture, accelerator, and supported CUDA version. Windows
+CUDA installs collect the base server archive, CUDA backend, and matching CUDA
+runtime DLL archive as one runnable directory. If upstream does not publish a
+matching accelerated asset (for example, Linux CUDA in the current release
+matrix), the node logs that reason before attempting the source-build fallback.
+Source builds preflight Git, CMake, a C++ compiler, and `nvcc` for CUDA; use a
+separate CMake cache per platform/architecture/accelerator; auto-detect visible
+CUDA compute capabilities; verify that the `nvcc` selected by `CUDACXX` or
+`PATH` lists every detected target via `--list-gpu-arch`; compile a small
+architecture-specific CUDA/ptxas smoke test; pin CMake's early CUDA compiler-ID
+probe to the detected GPU instead of its legacy default; clear CMake's cached
+CUDA compiler selection so toolkit upgrades honor the current `CUDACXX`/`PATH`;
+limit parallel compiler jobs; and validate the resulting `llama-server` before activation.
+For Blackwell 12.x devices, the provisioner maps the detected capability to an
+architecture-specific real target (`120a-real` for an RTX 50-series GPU or
+`121a-real` for GB10). llama.cpp's FP4/block-scaled tensor-core kernels require
+the `a` feature target; a global baseline `-arch=sm_120` flag will fail even
+with CUDA 13.2. `sm_120a` requires CUDA Toolkit 12.8 or newer. The CUDA version displayed by
+`nvidia-smi` describes driver compatibility and may differ from the installed
+compiler toolkit. Under the default `prompt` update
+policy, the node inspects the new tag's asset names before asking for approval.
+The prompt explicitly says when approval will compile locally and provides
+buttons for published alternatives such as Vulkan or CPU. A selected managed
+alternative is recorded in `active-runtime.json` so it remains active after a
+restart. The configured/detected target remains separate from that active
+fallback. When they differ, the node prompts before reinstalling the target;
+declining keeps the working fallback and the prompt can be reopened from the
+Runtime tab with **Review target build**. A failed target install also restores
+the prior active runtime while retaining the target build log and diagnostics.
+
+A bare `llama-server` discovered on `PATH` is accepted for CPU nodes, for the
+normal Metal-enabled macOS build, or when auto-provisioning is disabled. It is
+not assumed to match CUDA, Vulkan, or ROCm merely because it launches. This
+prevents generic packages such as the Windows Winget CPU build from shadowing
+an accelerator-matched managed runtime. Set `llama_server_path`/`MM_LLAMA_PATH`
+to an explicit executable path or custom wrapper name to intentionally override
+managed selection.
+
+The node Runtime tab identifies the active engine family, accelerator backend,
+concrete variant when known, managed/external install source, version, and
+executable path. A target mismatch is shown with both the active and intended
+backend/variant (and CUDA architecture for source builds).
+**Change llama.cpp engine** opens the platform-aware variant
+matrix at any time; choices backed by an official release are downloaded, while
+source-only choices clearly indicate that local compilation is required. The
+same operation is available headlessly through
+`POST /api/node/runtime/llama/switch {"variant":"vulkan"}`. Running slots keep
+their current subprocess until unloaded; new or restarted slots use the newly
+selected engine. If an external executable rejects `--version`, its version is
+shown as `not reported` instead of displaying the command-line error as version
+text.
+
+**Troubleshoot llama.cpp** on the Runtime tab opens the same comprehensive
+diagnostic wizard on demand, including when the current runtime is healthy or a
+fallback is active. In that case diagnostics assess the configured/detected
+target so users can fix its environment before choosing **Install target build**.
+
+If managed provisioning or compilation fails, the node TUI force-opens a
+scrollable llama.cpp troubleshooting wizard. Long diagnostic lines are wrapped
+and the captured failure tail retains enough context for CMake call stacks and
+CUDA assembler errors. It probes the host, free disk and
+memory, Git/CMake/compiler toolchain, and the selected backend's driver, SDK,
+device, and environment requirements. The report assesses CUDA 12/13, Vulkan,
+ROCm, OpenVINO, SYCL FP32/FP16, Metal, HIP, and CPU across the detected
+Windows/Linux/macOS architecture, while distinguishing a complete runnable
+server release from a backend-only artifact. Recovery actions can retry the
+normal plan, select any assessed complete official release, or skip the
+Mantic-Mind preflight for one source-build attempt. The override is never
+persisted and does not suppress CMake or compiler failures. **Copy report**
+places the complete, untruncated report on the host clipboard (using the native
+clipboard on Windows, `clip.exe` under WSL, or an available desktop clipboard
+helper on Linux/macOS).
+
+Every managed llama.cpp install or update also writes a dedicated transcript to
+`<llama_provision_dir>/logs/llama-build-*.log`. It records the selected backend
+and variant, each command and working directory, streamed stdout/stderr, exit
+codes, and the final troubleshooting report. The newest 20 transcripts are
+retained, and the latest path is shown in the wizard and exposed as
+`llama_runtime.build_log_path` by the node status APIs.
+
 ### `mantic-mind-control.toml` — control config
 
 | Key | Env var | Default | Description |
@@ -402,6 +548,7 @@ After file loading, matching environment variables override config values.
 | `data_dir` | `MM_DATA_DIR` | `data` | Agent database root; remembered nodes are stored in `nodes.json` |
 | `models_dir` | `MM_MODELS_DIR` | `models` | Optional local model directory root |
 | `node_health_poll_interval_s` | `MM_POLL_INTERVAL_S` | `30` | Health/metrics poll interval |
+| `node_offline_after_s` | `MM_NODE_OFFLINE_AFTER_S` | `90` | Time without a successful poll before an unreachable node is labeled offline |
 | `external_api_token` | `MM_CONTROL_EXTERNAL_API_TOKEN` | *(empty)* | When set, required as `Authorization: Bearer` on all external `/v1/*` routes |
 | `pairing_key` | `MM_PAIRING_KEY` | *(empty)* | PSK for automatic node/control pairing |
 | `discovery_port` | `MM_DISCOVERY_PORT` | `7072` | UDP discovery port |
@@ -438,15 +585,22 @@ happen inside the engine's load timeout window.
 ### Node API (`Authorization: Bearer <node-api-key>`)
 
 ```
-POST   /api/node/load-model     { model_path, vllm_settings?, agent_id? }
+POST   /api/node/load-model     { model_path, mmproj_path?, vision_enabled?, vllm_settings?, agent_id? }
 POST   /api/node/unload-model   { slot_id? }            (omit slot_id to unload all)
 POST   /api/node/detach-agent   { slot_id, agent_id }   (unloads engine when its last agent leaves)
 POST   /api/node/suspend-slot   { slot_id }             (vLLM sleep, or stop)
-POST   /api/node/restore-slot   { model_path, vllm_settings?, agent_id? }
+POST   /api/node/restore-slot   { model_path, mmproj_path?, vision_enabled?, vllm_settings?, agent_id? }
 POST   /api/node/infer          { InferenceRequest, slot_id? }  -> SSE
 POST   /api/node/models/pull    { model_ref }           (HF pre-fetch; Linux only, 501 elsewhere)
 GET    /api/node/runtime/vllm   -> { vllm_runtime }
 POST   /api/node/runtime/vllm/provision -> { vllm_runtime }
+POST   /api/node/runtime/vllm/check-update -> { vllm_runtime }
+GET    /api/node/runtime/llama  -> { llama_runtime }
+POST   /api/node/runtime/llama/provision { update?, accelerator? } -> { llama_runtime }
+POST   /api/node/runtime/llama/switch    { variant } -> { llama_runtime }
+POST   /api/node/runtime/llama/check-update -> { llama_runtime }
+POST   /api/node/runtime/llama/diagnose -> { llama_runtime.troubleshooting }
+POST   /api/node/runtime/llama/recover { action: "retry"|"target"|"compile-anyway"|"release", variant? } -> { llama_runtime }
 POST   /api/node/ray/start      { role: "head"|"worker", head_address? }  (Linux only)
 POST   /api/node/ray/stop
 GET    /api/node/health         -> NodeHealthMetrics
@@ -478,7 +632,9 @@ clients.
 ```
 GET/POST       /v1/agents
 GET/PUT/DELETE /v1/agents/{id}
-POST           /v1/agents/{id}/chat                       { message, conversation_id? } -> SSE
+POST           /v1/agents/{id}/attachments                (stream JPEG/PNG body) -> 201 metadata
+GET/DELETE     /v1/agents/{id}/attachments/{attachment_id}
+POST           /v1/agents/{id}/chat                       { message?, attachment_ids?, conversation_id?, max_tokens? } -> SSE
 GET/POST       /v1/agents/{id}/conversations
 GET/DELETE     /v1/agents/{id}/conversations/{cid}
 PUT            /v1/agents/{id}/conversations/{cid}
@@ -532,6 +688,13 @@ chat-completions route also accepts a bare agent ID, unique agent name, unique
 stable form to configure in external clients. When `external_api_token` is set,
 the compatibility port uses the same `Authorization: Bearer <token>` gate.
 
+Vision-capable agents accept standard ordered user content arrays containing
+`text` and `image_url` parts. Image URLs must be JPEG or PNG base64 `data:` URLs;
+HTTP(S), `file:`, unsupported MIME types, and image parts on non-user roles are
+rejected. The images are converted to managed attachments before the stateful
+Mantic conversation turn is persisted. Both streaming and non-streaming
+completions use the same conversation and hydration pipeline.
+
 ### SSE Chat Events
 
 ```
@@ -575,15 +738,27 @@ mantic-mind  (:7070)
 
 | Key | Action |
 |---|---|
-| `1` / `2` / `3` / `4` / `5` | Switch tabs (Nodes / Agents / Activity / Chat / Curation) |
+| `1` / `2` / `3` / `4` / `5` / `6` / `7` | Switch control tabs (Nodes / Agents / Activity / Chat / Curation / Performance / Voice) |
 | `q` | Quit |
 | `Esc` | Close modal / editor, or quit |
 
 Node TUI extras:
 
+- `1` / `2` / `3` / `4`: switch Overview / Runtimes / Models & Slots / Logs
 - `j` / `k` or Arrow Down / Arrow Up: scroll engine output
 - `PgUp` / `PgDn`: faster log scrolling
 - `End`: jump back to live tail
+
+Both TUIs expose draggable pane dividers and persist their layout beneath
+`data/`. Long generated text is word-wrapped and keyboard/mouse scrollable.
+The node and control screens expose model-slot, runtime, Ray, and provisioning
+actions where supported. Startup-only settings remain in TOML/environment config.
+
+The control Performance tab displays a bounded, process-session history of
+queue time, time to first token, total latency, estimated input tokens, output
+tokens, and output tokens/second. The same data is available from
+`GET /v1/performance` and can be reset with `DELETE /v1/performance`. The Voice
+tab supports proposal review, preview/speech generation, and local playback.
 
                                                                  ░             ░█                   
                                                            ░█░██  ░ ██       █░█                    
@@ -634,4 +809,4 @@ Node TUI extras:
                                 ████████████▒░░░  ░░░░░▓████████████░                               
                                     ▒██████████████████████████▒░                                   
                                          ░░ ▒██████████▒  ░                                         
-                                                   ░ 
+                                                   ░

@@ -94,6 +94,9 @@ static mm::ControlConfig load_config(
         cfg.node_health_poll_interval_s = static_cast<uint32_t>(
             file.get_int("node_health_poll_interval_s",
                          static_cast<int>(cfg.node_health_poll_interval_s)));
+        cfg.node_offline_after_s = static_cast<uint32_t>(
+            file.get_int("node_offline_after_s",
+                         static_cast<int>(cfg.node_offline_after_s)));
         cfg.models_dir     = file.get("models_dir",     cfg.models_dir);
         cfg.external_api_token = file.get("external_api_token", cfg.external_api_token);
         cfg.tts.enabled = file.get_bool("tts_enabled", cfg.tts.enabled);
@@ -175,6 +178,9 @@ static mm::ControlConfig load_config(
     cfg.node_health_poll_interval_s = static_cast<uint32_t>(
         env_int("MM_POLL_INTERVAL_S",
                 static_cast<int>(cfg.node_health_poll_interval_s)));
+    cfg.node_offline_after_s = static_cast<uint32_t>(
+        env_int("MM_NODE_OFFLINE_AFTER_S",
+                static_cast<int>(cfg.node_offline_after_s)));
     cfg.discovery_port = static_cast<uint16_t>(
         env_int("MM_DISCOVERY_PORT", static_cast<int>(cfg.discovery_port)));
 
@@ -944,6 +950,7 @@ int main(int argc, char** argv) {
 
     mm::NodeRegistry      registry(cfg.data_dir);
     mm::AgentScheduler    scheduler(registry, cfg.models_dir);
+    registry.set_offline_after_seconds(static_cast<int>(cfg.node_offline_after_s));
     mm::AgentQueue        queue;
     mm::ControlApiServer  api_server(
         agents, queue, registry, scheduler,
@@ -954,6 +961,7 @@ int main(int argc, char** argv) {
         agents,
         cfg.models_dir,
         "http://127.0.0.1:" + std::to_string(cfg.listen_port),
+        cfg.external_api_token,
         [&api_server](const std::string& agent_id,
                       const std::string& message,
                       std::string* out_text,

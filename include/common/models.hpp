@@ -25,7 +25,32 @@ enum class MessageRole { System, User, Assistant, Tool };
 
 enum class NodeHealthStatus { Unknown, Healthy, Degraded, Unhealthy };
 
+// Reachability is intentionally separate from health. A node that cannot be
+// contacted has unknown health; it is not necessarily resource-unhealthy.
+enum class NodeConnectionStatus { Unknown, Online, Unreachable, Offline };
+
 enum class SlotState { Empty, Loading, Ready, Suspending, Suspended, Error };
+
+// Inference engine family backing an agent or a running slot. llama.cpp is the
+// default runtime on this branch (GGUF models, Windows-native inference, and
+// accelerators without a vLLM build such as the DGX Spark); vLLM remains a
+// peer backend, and runs as the default on the vLLM-runtime branch.
+enum class EngineBackend { Vllm, LlamaCpp };
+
+inline std::string to_string(EngineBackend b) {
+    return b == EngineBackend::Vllm ? "vllm" : "llama-cpp";
+}
+
+// Accepts the canonical "llama-cpp" plus the legacy "llama.cpp"/"llama"
+// spellings so older persisted configs and hand-written payloads keep
+// resolving; an empty string means "unspecified" and resolves to the default
+// runtime (llama.cpp). Only an explicit "vllm" selects the vLLM engine —
+// callers that care about the api backend check the string form before
+// constructing an EngineBackend.
+inline EngineBackend engine_backend_from_string(const std::string& s) {
+    if (s == "vllm") return EngineBackend::Vllm;
+    return EngineBackend::LlamaCpp;
+}
 
 // ── ToolCall ──────────────────────────────────────────────────────────────────
 struct ToolCall {
@@ -50,6 +75,30 @@ struct TraceEvent {
     nlohmann::json metadata = nlohmann::json::object();
 };
 
+// Durable metadata for a managed image. relative_path is control-internal and
+// is deliberately omitted from JSON so API responses never expose filesystem
+// layout. Attachments are scoped by the per-agent database that owns them.
+struct ImageAttachment {
+    std::string id;
+    std::string original_filename;
+    std::string mime_type;
+    std::string relative_path;
+    int64_t     size_bytes = 0;
+    int64_t     created_at_ms = 0;
+    int64_t     expires_at_ms = 0; // pending-upload expiry; 0 once referenced
+};
+
+// Ordered message content. Persisted image parts reference a managed
+// attachment_id; hydrated inference-only parts additionally carry image_url as
+// a data URL. Plain legacy messages continue to use Message::content alone.
+struct MessageContentPart {
+    std::string type = "text"; // text | image_attachment | image_url
+    std::string text;
+    std::string attachment_id;
+    std::string image_url;
+    std::string mime_type;
+};
+
 // ── Message ───────────────────────────────────────────────────────────────────
 struct Message {
     MessageRole          role         = MessageRole::User;
@@ -60,6 +109,8 @@ struct Message {
     int                  token_count  = 0;
     int64_t              timestamp_ms = 0;
     std::vector<TraceEvent> trace_events;
+    std::vector<MessageContentPart> content_parts;
+    int64_t              storage_id = 0; // internal SQLite row id; not serialized
 };
 
 // ── RuntimeSettings ─────────────────────────────────────────────────────────────
@@ -73,6 +124,10 @@ struct RuntimeSettings {
     int   ubatch_size  = -1;   // -1 = runtime default
     float temperature  = 0.7f;
     float top_p        = 0.9f;
+    int   top_k        = -1;   // -1 = omit and use provider/runtime default
+    float min_p        = -1.0f; // -1 = omit; 0 explicitly disables min-p
+    float presence_penalty = 0.0f;
+    float repeat_penalty   = -1.0f; // -1 = omit; llama.cpp request field
     int   max_tokens   = 1024;
     bool  flash_attn   = true;
     std::vector<std::string> extra_args;  // additional runtime CLI flags
@@ -110,6 +165,14 @@ struct ApiSettings {
     std::string api_key_env = "OPENAI_API_KEY";
 };
 
+// Image-input capability declared by an agent profile. llama.cpp agents need
+// an explicit local GGUF projector; vLLM/API agents use their model-native
+// multimodal implementation and therefore leave mmproj_path empty.
+struct VisionSettings {
+    bool        enabled = false;
+    std::string mmproj_path;
+};
+
 /// True when two vLLM configurations describe the same engine launch, i.e.
 /// agents using either can share one vllm-serve process. gpu_memory_utilization
 /// is excluded: it sizes the engine on its node, it does not change what the
@@ -131,16 +194,33 @@ inline bool vllm_launch_compatible(const VllmSettings& a, const VllmSettings& b)
         && a.extra_args             == b.extra_args;
 }
 
+/// True when two llama.cpp configurations describe the same engine launch, i.e.
+/// agents using either can share one llama-server process. Only the launch-time
+/// (engine identity) fields gate sharing; per-request generation parameters
+/// (sampling controls and max_tokens) ride each request and are excluded.
+inline bool llama_launch_compatible(const RuntimeSettings& a, const RuntimeSettings& b) {
+    return a.ctx_size        == b.ctx_size
+        && a.n_gpu_layers    == b.n_gpu_layers
+        && a.n_threads       == b.n_threads
+        && a.n_threads_http  == b.n_threads_http
+        && a.parallel        == b.parallel
+        && a.batch_size      == b.batch_size
+        && a.ubatch_size     == b.ubatch_size
+        && a.flash_attn      == b.flash_attn
+        && a.extra_args      == b.extra_args;
+}
+
 // ── AgentConfig ───────────────────────────────────────────────────────────────
 struct AgentConfig {
     AgentId       id;
     std::string   name;
     std::string   model_path;
     std::string   system_prompt;
-    std::string   inference_backend = "vllm"; // vllm | api
+    std::string   inference_backend = "llama-cpp"; // llama-cpp (default) | vllm | api
     RuntimeSettings runtime_settings;
     VllmSettings  vllm_settings;
     ApiSettings   api_settings;
+    VisionSettings vision_settings;
     bool          reasoning_enabled = false;
     bool          memories_enabled  = true;
     bool          tools_enabled     = false;
@@ -306,6 +386,10 @@ struct SlotInfo {
     SlotId      id;
     uint16_t    port            = 0;
     std::string model_path;
+    std::string mmproj_path;             // node-local; only returned by authenticated node/control status
+    bool        vision_enabled  = false;
+    std::string projector_identity;      // stable basename/manifest identity, never a managed attachment path
+    std::string backend         = "llama-cpp"; // "llama-cpp" | "vllm"; slots always report it
     AgentId     assigned_agent;          // first attached agent (legacy display)
     std::vector<AgentId> agent_ids;      // all agents attached to this slot
     SlotState   state           = SlotState::Empty;
@@ -330,6 +414,7 @@ struct AgentPlacement {
     bool        suspended       = false;
     bool        is_active       = false;  // true while inference/memory-extraction is in-flight
     std::string kv_cache_node_path;
+    std::string engine_fingerprint;
     int64_t     placed_at_ms    = 0;
     int64_t     last_active_ms  = 0;
 };
@@ -347,6 +432,11 @@ struct NodeCapabilities {
     bool                     supports_ray = false;
     int                      gpu_count = 0;    // GPUs visible to this node
     double                   interconnect_gbps = 0.0; // node-to-node link hint, 0 = unknown
+    // llama.cpp multi-node grouping is orthogonal to vLLM's Ray path: it uses
+    // ggml's own TCP RPC backend (no NCCL/Gloo), so RPC members must share a
+    // compatible llama.cpp build fingerprint rather than a comm backend.
+    std::string              llama_cpp_version; // llama.cpp build fingerprint, "" = unknown
+    bool                     supports_llama_rpc = false; // can host/join a ggml RPC group
 
     bool has_comm_backend(const std::string& b) const {
         return std::find(comm_backends.begin(), comm_backends.end(), b)
@@ -379,6 +469,111 @@ struct VllmRuntimeStatus {
     bool        update_available = false;
 };
 
+// One environment check performed after a llama.cpp provisioning failure.
+// `status` is pass|warn|fail|info; blocking means the normal source-build
+// preflight will reject the environment until the issue is resolved.
+struct LlamaDiagnosticCheck {
+    std::string id;
+    std::string label;
+    std::string status = "info";
+    std::string detected;
+    std::string required;
+    std::string remediation;
+    bool        blocking = false;
+};
+
+// A known llama.cpp backend/precision variant assessed against this OS,
+// architecture, and the assets attached to the selected upstream release.
+struct LlamaRuntimeVariant {
+    std::string id;                 // cuda-12|cuda-13|vulkan|...|cpu
+    std::string label;
+    std::string backend;            // normalized build backend
+    bool        platform_supported = false;
+    bool        source_supported = false;
+    bool        release_available = false;
+    std::string release_asset;
+    std::string reason;
+    bool        recommended = false;
+};
+
+// Comprehensive, serializable failure report consumed by the forced node-TUI
+// troubleshooting popup and by the REST API.
+struct LlamaTroubleshootingReport {
+    bool        required = false;
+    std::string fingerprint;
+    std::string failure_stage;
+    std::string failure_detail;
+    std::string platform;
+    std::string architecture;
+    std::string target_backend;
+    std::string release_tag;
+    std::string summary;
+    bool        can_override_checks = false;
+    std::vector<LlamaDiagnosticCheck> checks;
+    std::vector<LlamaRuntimeVariant> variants;
+};
+
+// Managed llama.cpp runtime status, the llama-server analog of
+// VllmRuntimeStatus. Kept as a separate struct (not renamed/shared) so a node
+// can advertise both runtimes independently and older clients keep parsing
+// vllm_runtime unchanged.
+struct LlamaRuntimeStatus {
+    std::string status = "disabled"; // resolved|provisioning|ready|failed|disabled
+    std::string platform;
+    std::string method;              // release|source|path
+    std::string source_repo;
+    std::string version;             // llama-server build number / commit
+    bool        managed = false;
+    std::string executable_path;
+    std::string last_error;
+    // Dedicated stdout/stderr/command transcript for the most recent managed
+    // install or update attempt. Separate from the rotating application log.
+    std::string build_log_path;
+    // Accelerator-correct build this node targets: cuda|rocm|vulkan|metal|cpu.
+    std::string accelerator;
+    // Concrete selected engine variant when known (for example cuda-12,
+    // cuda-13, vulkan, or cpu). Older markers may report only accelerator.
+    std::string variant;
+    // The configured/detected build the node ultimately wants. These remain
+    // stable when a user selects a temporary Vulkan/CPU fallback, allowing the
+    // UI to distinguish the active runtime from the intended target.
+    std::string target_method;       // auto|release|source
+    std::string target_accelerator;  // cuda|rocm|vulkan|metal|cpu|...
+    std::string target_variant;      // concrete variant, or target_accelerator
+    // Effective CMAKE_CUDA_ARCHITECTURES value for source builds. The active
+    // value is persisted in the managed-runtime marker; target is derived from
+    // current environment/configuration (for example 120a-real on Blackwell).
+    std::string cuda_architecture;
+    std::string target_cuda_architecture;
+    // Computed whenever provisioner status changes. A usable fallback can be
+    // ready while this is true; callers should offer, not silently force, the
+    // target installation.
+    bool        target_mismatch = false;
+    std::string target_mismatch_reason;
+    // Platform-aware engine/backend choices. Populated immediately with source
+    // support and enriched with official release availability after an online
+    // update/variant assessment.
+    std::vector<LlamaRuntimeVariant> available_variants;
+    // Newest build available upstream; "" when unknown (offline / not checked).
+    std::string latest_version;
+    // True when the installed runtime is older than latest_version. Orthogonal
+    // to `status`: a runtime stays "ready" while advertising an update.
+    bool        update_available = false;
+    // Planned action for the detected update: release|compile|unavailable.
+    // Empty when no update is pending or release assets could not be assessed.
+    std::string update_action;
+    // True only when an official asset matches this node's current accelerator.
+    bool        update_release_available = false;
+    // Same-platform accelerators that do have official assets (excluding the
+    // current accelerator), e.g. vulkan/cpu when Linux CUDA needs compilation.
+    std::vector<std::string> update_release_alternatives;
+    // Human-readable consequence shown before the user approves the update.
+    std::string update_warning;
+    // Populated after a managed provisioning/compilation failure or an explicit
+    // diagnostic refresh. Empty/default while no troubleshooting is required.
+    LlamaTroubleshootingReport troubleshooting;
+};
+
 // Live progress of an in-program vLLM runtime install/upgrade, surfaced so the
 // node TUI can render a loading bar instead of running a script blind.
 struct VllmInstallProgress {
@@ -390,17 +585,44 @@ struct VllmInstallProgress {
     std::string last_line;        // most recent streamed output line
 };
 
+// Generic long-running node-side action shown by the node TUI modal. This is
+// intentionally transport-neutral: runtime provisioning and model receives both
+// update the same shape, while older clients can keep reading vllm_install_progress.
+struct NodeActionProgress {
+    bool        active = false;
+    std::string operation_id;
+    std::string kind;             // runtime | model_receive | ...
+    std::string action;           // human title, e.g. "Downloading runtime"
+    std::string target;           // model id, runtime name, etc.
+    std::string stage;
+    std::string detail;
+    int         step = 0;
+    int         total_steps = 0;
+    int64_t     bytes_done = 0;
+    int64_t     bytes_total = 0;
+    double      fraction = -1.0;  // 0..1; <0 = indeterminate
+    bool        cancelable = true;
+    bool        cancel_requested = false;
+    std::string last_error;
+};
+
 struct NodeInfo {
     NodeId           id;
+    std::string      hostname;
     std::string      url;
     std::string      api_key;
     std::string      loaded_model;  // deprecated: kept for backwards compat
     NodeHealthStatus health    = NodeHealthStatus::Unknown;
+    NodeConnectionStatus connection_status = NodeConnectionStatus::Unknown;
     bool             connected = false;
     bool             remembered = false;
     std::string      platform;
     NodeCapabilities capabilities;
     NodeHealthMetrics metrics;
+    int64_t          last_seen_ms = 0;
+    int64_t          unreachable_since_ms = 0;
+    int64_t          metrics_sampled_at_ms = 0;
+    int              consecutive_failures = 0;
 
     // Multi-slot fields
     std::vector<SlotInfo>    slots;
@@ -416,6 +638,10 @@ struct NodeInfo {
     int                      slot_error = 0;
     std::string              vllm_server_path;
     VllmRuntimeStatus        vllm_runtime;
+    std::string              llama_server_path;
+    LlamaRuntimeStatus       llama_runtime;
+    VllmInstallProgress      vllm_install_progress;
+    NodeActionProgress       action_progress;
     double                   vllm_gpu_budget = 0.0;         // total GPU fraction vLLM slots may claim
     double                   vllm_gpu_fraction_used = 0.0;  // fraction currently claimed (incl. loads in flight)
 };
@@ -479,6 +705,22 @@ inline NodeHealthStatus node_health_from_string(const std::string& s) {
     if (s == "degraded")  return NodeHealthStatus::Degraded;
     if (s == "unhealthy") return NodeHealthStatus::Unhealthy;
     return NodeHealthStatus::Unknown;
+}
+
+inline std::string to_string(NodeConnectionStatus s) {
+    switch (s) {
+        case NodeConnectionStatus::Online:      return "online";
+        case NodeConnectionStatus::Unreachable: return "unreachable";
+        case NodeConnectionStatus::Offline:     return "offline";
+        default:                                return "unknown";
+    }
+}
+
+inline NodeConnectionStatus node_connection_from_string(const std::string& s) {
+    if (s == "online")      return NodeConnectionStatus::Online;
+    if (s == "unreachable") return NodeConnectionStatus::Unreachable;
+    if (s == "offline")     return NodeConnectionStatus::Offline;
+    return NodeConnectionStatus::Unknown;
 }
 
 inline std::string to_string(SlotState s) {
@@ -545,6 +787,43 @@ inline void from_json(const nlohmann::json& j, TraceEvent& t) {
     if (j.contains("metadata"))      t.metadata = j.at("metadata");
 }
 
+inline void to_json(nlohmann::json& j, const ImageAttachment& a) {
+    j = { {"id", a.id},
+          {"original_filename", a.original_filename},
+          {"mime_type", a.mime_type},
+          {"size_bytes", a.size_bytes},
+          {"created_at_ms", a.created_at_ms},
+          {"expires_at_ms", a.expires_at_ms} };
+}
+inline void from_json(const nlohmann::json& j, ImageAttachment& a) {
+    if (j.contains("id"))                j.at("id").get_to(a.id);
+    if (j.contains("original_filename")) j.at("original_filename").get_to(a.original_filename);
+    if (j.contains("mime_type"))         j.at("mime_type").get_to(a.mime_type);
+    if (j.contains("relative_path"))     j.at("relative_path").get_to(a.relative_path);
+    if (j.contains("size_bytes"))        j.at("size_bytes").get_to(a.size_bytes);
+    if (j.contains("created_at_ms"))     j.at("created_at_ms").get_to(a.created_at_ms);
+    if (j.contains("expires_at_ms"))     j.at("expires_at_ms").get_to(a.expires_at_ms);
+}
+
+inline void to_json(nlohmann::json& j, const MessageContentPart& p) {
+    j = {{"type", p.type}};
+    if (!p.text.empty())          j["text"] = p.text;
+    if (!p.attachment_id.empty()) j["attachment_id"] = p.attachment_id;
+    if (!p.image_url.empty())     j["image_url"] = {{"url", p.image_url}};
+    if (!p.mime_type.empty())     j["mime_type"] = p.mime_type;
+}
+inline void from_json(const nlohmann::json& j, MessageContentPart& p) {
+    if (j.contains("type"))          j.at("type").get_to(p.type);
+    if (j.contains("text"))          j.at("text").get_to(p.text);
+    if (j.contains("attachment_id")) j.at("attachment_id").get_to(p.attachment_id);
+    if (j.contains("mime_type"))     j.at("mime_type").get_to(p.mime_type);
+    if (j.contains("image_url")) {
+        const auto& iu = j.at("image_url");
+        if (iu.is_string()) p.image_url = iu.get<std::string>();
+        else if (iu.is_object() && iu.contains("url")) iu.at("url").get_to(p.image_url);
+    }
+}
+
 // ─── Message ─────────────────────────────────────────────────────────────────
 inline void to_json(nlohmann::json& j, const Message& m) {
     j = { {"role",         to_string(m.role)},
@@ -555,6 +834,7 @@ inline void to_json(nlohmann::json& j, const Message& m) {
           {"token_count",  m.token_count},
           {"timestamp_ms", m.timestamp_ms},
           {"trace_events", m.trace_events} };
+    if (!m.content_parts.empty()) j["content_parts"] = m.content_parts;
 }
 inline void from_json(const nlohmann::json& j, Message& m) {
     m.role = message_role_from_string(j.at("role").get<std::string>());
@@ -565,6 +845,7 @@ inline void from_json(const nlohmann::json& j, Message& m) {
     if (j.contains("token_count"))  j.at("token_count").get_to(m.token_count);
     if (j.contains("timestamp_ms")) j.at("timestamp_ms").get_to(m.timestamp_ms);
     if (j.contains("trace_events")) j.at("trace_events").get_to(m.trace_events);
+    if (j.contains("content_parts"))j.at("content_parts").get_to(m.content_parts);
 }
 
 // ─── RuntimeSettings ───────────────────────────────────────────────────────────
@@ -578,6 +859,10 @@ inline void to_json(nlohmann::json& j, const RuntimeSettings& s) {
           {"ubatch_size",  s.ubatch_size},
           {"temperature",  s.temperature},
           {"top_p",        s.top_p},
+          {"top_k",        s.top_k},
+          {"min_p",        s.min_p},
+          {"presence_penalty", s.presence_penalty},
+          {"repeat_penalty", s.repeat_penalty},
           {"max_tokens",   s.max_tokens},
           {"flash_attn",   s.flash_attn},
           {"extra_args",   s.extra_args} };
@@ -592,6 +877,10 @@ inline void from_json(const nlohmann::json& j, RuntimeSettings& s) {
     if (j.contains("ubatch_size"))  j.at("ubatch_size").get_to(s.ubatch_size);
     if (j.contains("temperature"))  j.at("temperature").get_to(s.temperature);
     if (j.contains("top_p"))        j.at("top_p").get_to(s.top_p);
+    if (j.contains("top_k"))        j.at("top_k").get_to(s.top_k);
+    if (j.contains("min_p"))        j.at("min_p").get_to(s.min_p);
+    if (j.contains("presence_penalty")) j.at("presence_penalty").get_to(s.presence_penalty);
+    if (j.contains("repeat_penalty")) j.at("repeat_penalty").get_to(s.repeat_penalty);
     if (j.contains("max_tokens"))   j.at("max_tokens").get_to(s.max_tokens);
     if (j.contains("flash_attn"))   j.at("flash_attn").get_to(s.flash_attn);
     if (j.contains("extra_args"))   j.at("extra_args").get_to(s.extra_args);
@@ -645,6 +934,14 @@ inline void from_json(const nlohmann::json& j, ApiSettings& s) {
     if (j.contains("api_key_env"))           j.at("api_key_env").get_to(s.api_key_env);
 }
 
+inline void to_json(nlohmann::json& j, const VisionSettings& s) {
+    j = {{"enabled", s.enabled}, {"mmproj_path", s.mmproj_path}};
+}
+inline void from_json(const nlohmann::json& j, VisionSettings& s) {
+    if (j.contains("enabled"))     j.at("enabled").get_to(s.enabled);
+    if (j.contains("mmproj_path")) j.at("mmproj_path").get_to(s.mmproj_path);
+}
+
 // ─── AgentConfig ─────────────────────────────────────────────────────────────
 inline void to_json(nlohmann::json& j, const AgentConfig& a) {
     j = { {"id",                a.id},
@@ -655,6 +952,7 @@ inline void to_json(nlohmann::json& j, const AgentConfig& a) {
           {"runtime_settings",    a.runtime_settings},
           {"vllm_settings",     a.vllm_settings},
           {"api_settings",      a.api_settings},
+          {"vision_settings",   a.vision_settings},
           {"reasoning_enabled", a.reasoning_enabled},
           {"memories_enabled",  a.memories_enabled},
           {"tools_enabled",     a.tools_enabled},
@@ -669,6 +967,7 @@ inline void from_json(const nlohmann::json& j, AgentConfig& a) {
     if (j.contains("runtime_settings"))    j.at("runtime_settings").get_to(a.runtime_settings);
     if (j.contains("vllm_settings"))     j.at("vllm_settings").get_to(a.vllm_settings);
     if (j.contains("api_settings"))      j.at("api_settings").get_to(a.api_settings);
+    if (j.contains("vision_settings"))   j.at("vision_settings").get_to(a.vision_settings);
     if (j.contains("reasoning_enabled")) j.at("reasoning_enabled").get_to(a.reasoning_enabled);
     if (j.contains("memories_enabled"))  j.at("memories_enabled").get_to(a.memories_enabled);
     if (j.contains("tools_enabled"))     j.at("tools_enabled").get_to(a.tools_enabled);
@@ -954,6 +1253,10 @@ inline void to_json(nlohmann::json& j, const SlotInfo& s) {
     j = { {"id",              s.id},
           {"port",            s.port},
           {"model_path",      s.model_path},
+          {"mmproj_path",     s.mmproj_path},
+          {"vision_enabled",  s.vision_enabled},
+          {"projector_identity", s.projector_identity},
+          {"backend",         s.backend},
           {"assigned_agent",  s.assigned_agent},
           {"agent_ids",       s.agent_ids},
           {"state",           to_string(s.state)},
@@ -972,6 +1275,10 @@ inline void from_json(const nlohmann::json& j, SlotInfo& s) {
     j.at("id").get_to(s.id);
     if (j.contains("port"))           j.at("port").get_to(s.port);
     if (j.contains("model_path"))     j.at("model_path").get_to(s.model_path);
+    if (j.contains("mmproj_path"))    j.at("mmproj_path").get_to(s.mmproj_path);
+    if (j.contains("vision_enabled")) j.at("vision_enabled").get_to(s.vision_enabled);
+    if (j.contains("projector_identity")) j.at("projector_identity").get_to(s.projector_identity);
+    if (j.contains("backend"))        j.at("backend").get_to(s.backend);
     if (j.contains("assigned_agent")) j.at("assigned_agent").get_to(s.assigned_agent);
     if (j.contains("agent_ids"))      j.at("agent_ids").get_to(s.agent_ids);
     // Older nodes only report assigned_agent.
@@ -998,6 +1305,7 @@ inline void to_json(nlohmann::json& j, const AgentPlacement& p) {
           {"suspended",          p.suspended},
           {"is_active",          p.is_active},
           {"kv_cache_node_path", p.kv_cache_node_path},
+          {"engine_fingerprint", p.engine_fingerprint},
           {"placed_at_ms",       p.placed_at_ms},
           {"last_active_ms",     p.last_active_ms} };
 }
@@ -1008,6 +1316,7 @@ inline void from_json(const nlohmann::json& j, AgentPlacement& p) {
     if (j.contains("suspended"))          j.at("suspended").get_to(p.suspended);
     if (j.contains("is_active"))          j.at("is_active").get_to(p.is_active);
     if (j.contains("kv_cache_node_path")) j.at("kv_cache_node_path").get_to(p.kv_cache_node_path);
+    if (j.contains("engine_fingerprint")) j.at("engine_fingerprint").get_to(p.engine_fingerprint);
     if (j.contains("placed_at_ms"))       j.at("placed_at_ms").get_to(p.placed_at_ms);
     if (j.contains("last_active_ms"))     j.at("last_active_ms").get_to(p.last_active_ms);
 }
@@ -1019,7 +1328,9 @@ inline void to_json(nlohmann::json& j, const NodeCapabilities& c) {
           {"vllm_version",  c.vllm_version},
           {"supports_ray",  c.supports_ray},
           {"gpu_count",     c.gpu_count},
-          {"interconnect_gbps", c.interconnect_gbps} };
+          {"interconnect_gbps", c.interconnect_gbps},
+          {"llama_cpp_version",  c.llama_cpp_version},
+          {"supports_llama_rpc", c.supports_llama_rpc} };
 }
 inline void from_json(const nlohmann::json& j, NodeCapabilities& c) {
     if (j.contains("arch"))          j.at("arch").get_to(c.arch);
@@ -1028,6 +1339,8 @@ inline void from_json(const nlohmann::json& j, NodeCapabilities& c) {
     if (j.contains("supports_ray"))  j.at("supports_ray").get_to(c.supports_ray);
     if (j.contains("gpu_count"))     j.at("gpu_count").get_to(c.gpu_count);
     if (j.contains("interconnect_gbps")) j.at("interconnect_gbps").get_to(c.interconnect_gbps);
+    if (j.contains("llama_cpp_version"))  j.at("llama_cpp_version").get_to(c.llama_cpp_version);
+    if (j.contains("supports_llama_rpc")) j.at("supports_llama_rpc").get_to(c.supports_llama_rpc);
 }
 
 // ─── NodeInfo ─────────────────────────────────────────────────────────────────
@@ -1062,6 +1375,136 @@ inline void from_json(const nlohmann::json& j, VllmRuntimeStatus& r) {
     if (j.contains("update_available")) j.at("update_available").get_to(r.update_available);
 }
 
+inline void to_json(nlohmann::json& j, const LlamaDiagnosticCheck& c) {
+    j = {{"id", c.id}, {"label", c.label}, {"status", c.status},
+         {"detected", c.detected}, {"required", c.required},
+         {"remediation", c.remediation}, {"blocking", c.blocking}};
+}
+inline void from_json(const nlohmann::json& j, LlamaDiagnosticCheck& c) {
+    if (j.contains("id")) j.at("id").get_to(c.id);
+    if (j.contains("label")) j.at("label").get_to(c.label);
+    if (j.contains("status")) j.at("status").get_to(c.status);
+    if (j.contains("detected")) j.at("detected").get_to(c.detected);
+    if (j.contains("required")) j.at("required").get_to(c.required);
+    if (j.contains("remediation")) j.at("remediation").get_to(c.remediation);
+    if (j.contains("blocking")) j.at("blocking").get_to(c.blocking);
+}
+
+inline void to_json(nlohmann::json& j, const LlamaRuntimeVariant& v) {
+    j = {{"id", v.id}, {"label", v.label}, {"backend", v.backend},
+         {"platform_supported", v.platform_supported},
+         {"source_supported", v.source_supported},
+         {"release_available", v.release_available},
+         {"release_asset", v.release_asset}, {"reason", v.reason},
+         {"recommended", v.recommended}};
+}
+inline void from_json(const nlohmann::json& j, LlamaRuntimeVariant& v) {
+    if (j.contains("id")) j.at("id").get_to(v.id);
+    if (j.contains("label")) j.at("label").get_to(v.label);
+    if (j.contains("backend")) j.at("backend").get_to(v.backend);
+    if (j.contains("platform_supported"))
+        j.at("platform_supported").get_to(v.platform_supported);
+    if (j.contains("source_supported"))
+        j.at("source_supported").get_to(v.source_supported);
+    if (j.contains("release_available"))
+        j.at("release_available").get_to(v.release_available);
+    if (j.contains("release_asset")) j.at("release_asset").get_to(v.release_asset);
+    if (j.contains("reason")) j.at("reason").get_to(v.reason);
+    if (j.contains("recommended")) j.at("recommended").get_to(v.recommended);
+}
+
+inline void to_json(nlohmann::json& j, const LlamaTroubleshootingReport& r) {
+    j = {{"required", r.required}, {"fingerprint", r.fingerprint},
+         {"failure_stage", r.failure_stage}, {"failure_detail", r.failure_detail},
+         {"platform", r.platform}, {"architecture", r.architecture},
+         {"target_backend", r.target_backend}, {"release_tag", r.release_tag},
+         {"summary", r.summary}, {"can_override_checks", r.can_override_checks},
+         {"checks", r.checks}, {"variants", r.variants}};
+}
+inline void from_json(const nlohmann::json& j, LlamaTroubleshootingReport& r) {
+    if (j.contains("required")) j.at("required").get_to(r.required);
+    if (j.contains("fingerprint")) j.at("fingerprint").get_to(r.fingerprint);
+    if (j.contains("failure_stage")) j.at("failure_stage").get_to(r.failure_stage);
+    if (j.contains("failure_detail")) j.at("failure_detail").get_to(r.failure_detail);
+    if (j.contains("platform")) j.at("platform").get_to(r.platform);
+    if (j.contains("architecture")) j.at("architecture").get_to(r.architecture);
+    if (j.contains("target_backend")) j.at("target_backend").get_to(r.target_backend);
+    if (j.contains("release_tag")) j.at("release_tag").get_to(r.release_tag);
+    if (j.contains("summary")) j.at("summary").get_to(r.summary);
+    if (j.contains("can_override_checks"))
+        j.at("can_override_checks").get_to(r.can_override_checks);
+    if (j.contains("checks")) j.at("checks").get_to(r.checks);
+    if (j.contains("variants")) j.at("variants").get_to(r.variants);
+}
+
+inline void to_json(nlohmann::json& j, const LlamaRuntimeStatus& r) {
+    j = { {"status",           r.status},
+          {"platform",         r.platform},
+          {"method",           r.method},
+          {"source_repo",      r.source_repo},
+          {"version",          r.version},
+          {"managed",          r.managed},
+          {"executable_path",  r.executable_path},
+          {"last_error",       r.last_error},
+          {"build_log_path",   r.build_log_path},
+          {"accelerator",      r.accelerator},
+          {"variant",          r.variant},
+          {"target_method",    r.target_method},
+          {"target_accelerator", r.target_accelerator},
+          {"target_variant",   r.target_variant},
+          {"cuda_architecture", r.cuda_architecture},
+          {"target_cuda_architecture", r.target_cuda_architecture},
+          {"target_mismatch", r.target_mismatch},
+          {"target_mismatch_reason", r.target_mismatch_reason},
+          {"available_variants", r.available_variants},
+          {"latest_version",   r.latest_version},
+          {"update_available", r.update_available},
+          {"update_action",    r.update_action},
+          {"update_release_available", r.update_release_available},
+          {"update_release_alternatives", r.update_release_alternatives},
+          {"update_warning",   r.update_warning},
+          {"troubleshooting",  r.troubleshooting} };
+}
+inline void from_json(const nlohmann::json& j, LlamaRuntimeStatus& r) {
+    if (j.contains("status"))           j.at("status").get_to(r.status);
+    if (j.contains("platform"))         j.at("platform").get_to(r.platform);
+    if (j.contains("method"))           j.at("method").get_to(r.method);
+    if (j.contains("source_repo"))      j.at("source_repo").get_to(r.source_repo);
+    if (j.contains("version"))          j.at("version").get_to(r.version);
+    if (j.contains("managed"))          j.at("managed").get_to(r.managed);
+    if (j.contains("executable_path"))  j.at("executable_path").get_to(r.executable_path);
+    if (j.contains("last_error"))       j.at("last_error").get_to(r.last_error);
+    if (j.contains("build_log_path"))   j.at("build_log_path").get_to(r.build_log_path);
+    if (j.contains("accelerator"))      j.at("accelerator").get_to(r.accelerator);
+    if (j.contains("variant"))          j.at("variant").get_to(r.variant);
+    if (j.contains("target_method"))
+        j.at("target_method").get_to(r.target_method);
+    if (j.contains("target_accelerator"))
+        j.at("target_accelerator").get_to(r.target_accelerator);
+    if (j.contains("target_variant"))
+        j.at("target_variant").get_to(r.target_variant);
+    if (j.contains("cuda_architecture"))
+        j.at("cuda_architecture").get_to(r.cuda_architecture);
+    if (j.contains("target_cuda_architecture"))
+        j.at("target_cuda_architecture").get_to(r.target_cuda_architecture);
+    if (j.contains("target_mismatch"))
+        j.at("target_mismatch").get_to(r.target_mismatch);
+    if (j.contains("target_mismatch_reason"))
+        j.at("target_mismatch_reason").get_to(r.target_mismatch_reason);
+    if (j.contains("available_variants"))
+        j.at("available_variants").get_to(r.available_variants);
+    if (j.contains("latest_version"))   j.at("latest_version").get_to(r.latest_version);
+    if (j.contains("update_available")) j.at("update_available").get_to(r.update_available);
+    if (j.contains("update_action")) j.at("update_action").get_to(r.update_action);
+    if (j.contains("update_release_available"))
+        j.at("update_release_available").get_to(r.update_release_available);
+    if (j.contains("update_release_alternatives"))
+        j.at("update_release_alternatives").get_to(r.update_release_alternatives);
+    if (j.contains("update_warning")) j.at("update_warning").get_to(r.update_warning);
+    if (j.contains("troubleshooting"))
+        j.at("troubleshooting").get_to(r.troubleshooting);
+}
+
 inline void to_json(nlohmann::json& j, const VllmInstallProgress& p) {
     j = { {"active",      p.active},
           {"step",        p.step},
@@ -1079,16 +1522,57 @@ inline void from_json(const nlohmann::json& j, VllmInstallProgress& p) {
     if (j.contains("last_line"))   j.at("last_line").get_to(p.last_line);
 }
 
+inline void to_json(nlohmann::json& j, const NodeActionProgress& p) {
+    j = { {"active",           p.active},
+          {"operation_id",     p.operation_id},
+          {"kind",             p.kind},
+          {"action",           p.action},
+          {"target",           p.target},
+          {"stage",            p.stage},
+          {"detail",           p.detail},
+          {"step",             p.step},
+          {"total_steps",      p.total_steps},
+          {"bytes_done",       p.bytes_done},
+          {"bytes_total",      p.bytes_total},
+          {"fraction",         p.fraction},
+          {"cancelable",       p.cancelable},
+          {"cancel_requested", p.cancel_requested},
+          {"last_error",       p.last_error} };
+}
+inline void from_json(const nlohmann::json& j, NodeActionProgress& p) {
+    if (j.contains("active"))           j.at("active").get_to(p.active);
+    if (j.contains("operation_id"))     j.at("operation_id").get_to(p.operation_id);
+    if (j.contains("kind"))             j.at("kind").get_to(p.kind);
+    if (j.contains("action"))           j.at("action").get_to(p.action);
+    if (j.contains("target"))           j.at("target").get_to(p.target);
+    if (j.contains("stage"))            j.at("stage").get_to(p.stage);
+    if (j.contains("detail"))           j.at("detail").get_to(p.detail);
+    if (j.contains("step"))             j.at("step").get_to(p.step);
+    if (j.contains("total_steps"))      j.at("total_steps").get_to(p.total_steps);
+    if (j.contains("bytes_done"))       j.at("bytes_done").get_to(p.bytes_done);
+    if (j.contains("bytes_total"))      j.at("bytes_total").get_to(p.bytes_total);
+    if (j.contains("fraction"))         j.at("fraction").get_to(p.fraction);
+    if (j.contains("cancelable"))       j.at("cancelable").get_to(p.cancelable);
+    if (j.contains("cancel_requested")) j.at("cancel_requested").get_to(p.cancel_requested);
+    if (j.contains("last_error"))       j.at("last_error").get_to(p.last_error);
+}
+
 inline void to_json(nlohmann::json& j, const NodeInfo& n) {
     j = { {"id",            n.id},
+          {"hostname",      n.hostname},
           {"url",           n.url},
           {"loaded_model",  n.loaded_model},
           {"health",        to_string(n.health)},
+          {"connection_status", to_string(n.connection_status)},
           {"connected",     n.connected},
           {"remembered",    n.remembered},
           {"platform",      n.platform},
           {"capabilities",  n.capabilities},
           {"metrics",       n.metrics},
+          {"last_seen_ms",  n.last_seen_ms},
+          {"unreachable_since_ms", n.unreachable_since_ms},
+          {"metrics_sampled_at_ms", n.metrics_sampled_at_ms},
+          {"consecutive_failures", n.consecutive_failures},
           {"slots",         n.slots},
           {"cached_models", n.cached_models},
           {"disk_free_mb",  n.disk_free_mb},
@@ -1102,20 +1586,33 @@ inline void to_json(nlohmann::json& j, const NodeInfo& n) {
           {"slot_error",    n.slot_error},
           {"vllm_server_path",         n.vllm_server_path},
           {"vllm_runtime",             n.vllm_runtime},
+          {"llama_server_path",        n.llama_server_path},
+          {"llama_runtime",            n.llama_runtime},
+          {"vllm_install_progress",    n.vllm_install_progress},
+          {"action_progress",          n.action_progress},
           {"vllm_gpu_budget",          n.vllm_gpu_budget},
           {"vllm_gpu_fraction_used",   n.vllm_gpu_fraction_used} };
 }
 inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     j.at("id").get_to(n.id);
     j.at("url").get_to(n.url);
+    if (j.contains("hostname"))      j.at("hostname").get_to(n.hostname);
     if (j.contains("api_key"))       j.at("api_key").get_to(n.api_key);
     if (j.contains("loaded_model"))  j.at("loaded_model").get_to(n.loaded_model);
     if (j.contains("health"))        n.health = node_health_from_string(j.at("health").get<std::string>());
     if (j.contains("connected"))     j.at("connected").get_to(n.connected);
+    if (j.contains("connection_status"))
+        n.connection_status = node_connection_from_string(j.at("connection_status").get<std::string>());
+    else if (n.connected)
+        n.connection_status = NodeConnectionStatus::Online;
     if (j.contains("remembered"))    j.at("remembered").get_to(n.remembered);
     if (j.contains("platform"))      j.at("platform").get_to(n.platform);
     if (j.contains("capabilities"))  j.at("capabilities").get_to(n.capabilities);
     if (j.contains("metrics"))       j.at("metrics").get_to(n.metrics);
+    if (j.contains("last_seen_ms"))  j.at("last_seen_ms").get_to(n.last_seen_ms);
+    if (j.contains("unreachable_since_ms")) j.at("unreachable_since_ms").get_to(n.unreachable_since_ms);
+    if (j.contains("metrics_sampled_at_ms")) j.at("metrics_sampled_at_ms").get_to(n.metrics_sampled_at_ms);
+    if (j.contains("consecutive_failures")) j.at("consecutive_failures").get_to(n.consecutive_failures);
     if (j.contains("slots"))         j.at("slots").get_to(n.slots);
     if (j.contains("cached_models")) j.at("cached_models").get_to(n.cached_models);
     if (j.contains("disk_free_mb"))  j.at("disk_free_mb").get_to(n.disk_free_mb);
@@ -1129,6 +1626,10 @@ inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     if (j.contains("slot_error"))    j.at("slot_error").get_to(n.slot_error);
     if (j.contains("vllm_server_path")) j.at("vllm_server_path").get_to(n.vllm_server_path);
     if (j.contains("vllm_runtime")) j.at("vllm_runtime").get_to(n.vllm_runtime);
+    if (j.contains("llama_server_path")) j.at("llama_server_path").get_to(n.llama_server_path);
+    if (j.contains("llama_runtime")) j.at("llama_runtime").get_to(n.llama_runtime);
+    if (j.contains("vllm_install_progress")) j.at("vllm_install_progress").get_to(n.vllm_install_progress);
+    if (j.contains("action_progress")) j.at("action_progress").get_to(n.action_progress);
     if (j.contains("vllm_gpu_budget")) j.at("vllm_gpu_budget").get_to(n.vllm_gpu_budget);
     if (j.contains("vllm_gpu_fraction_used")) j.at("vllm_gpu_fraction_used").get_to(n.vllm_gpu_fraction_used);
 }

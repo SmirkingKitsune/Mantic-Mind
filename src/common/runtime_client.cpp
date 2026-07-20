@@ -20,7 +20,19 @@ namespace {
 nlohmann::json message_to_openai(const Message& m) {
     nlohmann::json j;
     j["role"]    = to_string(m.role);
-    j["content"] = m.content;
+    if (m.content_parts.empty()) {
+        j["content"] = m.content;
+    } else {
+        auto& content = j["content"] = nlohmann::json::array();
+        for (const auto& part : m.content_parts) {
+            if (part.type == "text") {
+                content.push_back({{"type", "text"}, {"text", part.text}});
+            } else if (part.type == "image_url" && !part.image_url.empty()) {
+                content.push_back({{"type", "image_url"},
+                                   {"image_url", {{"url", part.image_url}}}});
+            }
+        }
+    }
     if (!m.tool_calls.empty()) {
         auto& arr = j["tool_calls"] = nlohmann::json::array();
         for (auto& tc : m.tool_calls)
@@ -149,13 +161,32 @@ nlohmann::json build_request(const InferenceRequest& req, bool stream) {
     nlohmann::json body;
     if (!req.model.empty()) body["model"] = req.model;
 
-    auto normalized_messages = normalize_for_strict_chat_template(req.messages);
+    const bool has_multimodal = std::any_of(
+        req.messages.begin(), req.messages.end(), [](const Message& message) {
+            return std::any_of(message.content_parts.begin(), message.content_parts.end(),
+                               [](const MessageContentPart& part) {
+                                   return part.type == "image_url" ||
+                                          part.type == "image_attachment";
+                               });
+        });
+    auto normalized_messages = has_multimodal
+        ? req.messages : normalize_for_strict_chat_template(req.messages);
     auto& msgs = body["messages"] = nlohmann::json::array();
     for (auto& m : normalized_messages) msgs.push_back(message_to_openai(m));
 
     const auto& s = req.settings;
     body["temperature"] = static_cast<double>(s.temperature);
     body["top_p"]       = static_cast<double>(s.top_p);
+    if (s.top_k >= 0) body["top_k"] = s.top_k;
+    if (s.min_p >= 0.0f) body["min_p"] = static_cast<double>(s.min_p);
+    if (s.presence_penalty != 0.0f) {
+        body["presence_penalty"] = static_cast<double>(s.presence_penalty);
+    }
+    // llama.cpp names this sampler repeat_penalty. It remains optional so
+    // OpenAI-compatible providers that do not expose the extension never see it.
+    if (s.repeat_penalty > 0.0f) {
+        body["repeat_penalty"] = static_cast<double>(s.repeat_penalty);
+    }
     body["max_tokens"]  = s.max_tokens;
     body["stream"]      = stream;
     if (stream) body["stream_options"] = { {"include_usage", true} };
@@ -441,15 +472,21 @@ bool RuntimeClient::health_check() {
     cli.set_read_timeout(5);
     auto res = cli.Get("/health");
     if (!res || res->status != 200) { model_loaded_ = false; return false; }
+    // Backend-agnostic: vLLM answers 200 with an empty body; llama-server and
+    // some OpenAI-compatible servers answer 200 with {"status":"ok"}. Treat a
+    // 200 as healthy unless the body carries an explicit non-ok status.
+    if (util::trim(res->body).empty()) { model_loaded_ = true; return true; }
     try {
         auto j = nlohmann::json::parse(res->body);
-        bool ok = j.value("status", std::string{}) == "ok";
+        bool ok = j.value("status", std::string{"ok"}) == "ok";
         model_loaded_ = ok;
         return ok;
     } catch (const std::exception& e) {
-        MM_WARN("RuntimeClient::health_check parse error: {}", e.what());
-        model_loaded_ = false;
-        return false;
+        // A 200 with an unparseable/non-JSON body still indicates the server is
+        // up; be lenient rather than reporting a spurious unhealthy state.
+        MM_DEBUG("RuntimeClient::health_check non-JSON 200 body: {}", e.what());
+        model_loaded_ = true;
+        return true;
     }
 }
 

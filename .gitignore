@@ -27,6 +27,8 @@
 # IDE / editor
 /.vscode/
 /.idea/
+/.docs/*
+/docs/plans/llama-cpp-redeployment.md
 *.user
 *.suo
 *.sln.docstates

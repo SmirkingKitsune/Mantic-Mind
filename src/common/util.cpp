@@ -10,7 +10,26 @@
 #include <cctype>
 #include <stdexcept>
 
+#ifdef _WIN32
+#  include <Windows.h>
+#else
+#  include <unistd.h>
+#endif
+
+
 namespace mm::util {
+
+std::string hostname() {
+    char name[256] = {};
+#ifdef _WIN32
+    DWORD size = static_cast<DWORD>(sizeof(name));
+    if (GetComputerNameA(name, &size) && size > 0) return std::string(name, size);
+#else
+    if (::gethostname(name, sizeof(name) - 1) == 0 && name[0] != '\0') return name;
+#endif
+    return "unknown-host";
+}
+
 
 // ── UUID v4 ───────────────────────────────────────────────────────────────────
 std::string generate_uuid() {

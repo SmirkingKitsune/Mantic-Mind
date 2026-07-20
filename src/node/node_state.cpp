@@ -203,6 +203,16 @@ void NodeState::set_vllm_runtime(const VllmRuntimeStatus& runtime) {
     vllm_runtime_ = runtime;
 }
 
+LlamaRuntimeStatus NodeState::get_llama_runtime() const {
+    std::lock_guard<std::mutex> g(mutex_);
+    return llama_runtime_;
+}
+
+void NodeState::set_llama_runtime(const LlamaRuntimeStatus& runtime) {
+    std::lock_guard<std::mutex> g(mutex_);
+    llama_runtime_ = runtime;
+}
+
 VllmInstallProgress NodeState::get_vllm_install_progress() const {
     std::lock_guard<std::mutex> g(mutex_);
     return vllm_install_progress_;
@@ -211,6 +221,67 @@ VllmInstallProgress NodeState::get_vllm_install_progress() const {
 void NodeState::set_vllm_install_progress(const VllmInstallProgress& p) {
     std::lock_guard<std::mutex> g(mutex_);
     vllm_install_progress_ = p;
+    if (p.active) {
+        NodeActionProgress action;
+        action.active = true;
+        action.operation_id = "vllm-runtime";
+        action.kind = "runtime";
+        action.action = "Downloading runtime";
+        action.target = "vLLM";
+        action.stage = p.stage;
+        action.detail = p.last_line;
+        action.step = p.step;
+        action.total_steps = p.total_steps;
+        action.fraction = p.fraction;
+        action.cancelable = true;
+        action.cancel_requested =
+            action_progress_.active && action_progress_.operation_id == action.operation_id
+                ? action_progress_.cancel_requested
+                : false;
+        if (!action_progress_.active ||
+            action_progress_.operation_id == action.operation_id)
+            action_progress_ = std::move(action);
+    } else if (action_progress_.operation_id == "vllm-runtime") {
+        action_progress_ = {};
+    }
+}
+
+NodeActionProgress NodeState::get_action_progress() const {
+    std::lock_guard<std::mutex> g(mutex_);
+    return action_progress_;
+}
+
+void NodeState::set_action_progress(const NodeActionProgress& p) {
+    std::lock_guard<std::mutex> g(mutex_);
+    if (p.active && action_progress_.active && !p.operation_id.empty() &&
+        !action_progress_.operation_id.empty() &&
+        action_progress_.operation_id != p.operation_id)
+        return;
+    const bool same_operation =
+        action_progress_.active && !p.operation_id.empty() &&
+        action_progress_.operation_id == p.operation_id;
+    const bool keep_cancel = same_operation && action_progress_.cancel_requested;
+    action_progress_ = p;
+    if (keep_cancel) action_progress_.cancel_requested = true;
+}
+
+void NodeState::clear_action_progress(const std::string& operation_id) {
+    std::lock_guard<std::mutex> g(mutex_);
+    if (!operation_id.empty() && action_progress_.operation_id != operation_id) return;
+    action_progress_ = {};
+}
+
+bool NodeState::request_action_cancel() {
+    std::lock_guard<std::mutex> g(mutex_);
+    if (!action_progress_.active || !action_progress_.cancelable) return false;
+    action_progress_.cancel_requested = true;
+    return true;
+}
+
+bool NodeState::action_cancel_requested(const std::string& operation_id) const {
+    std::lock_guard<std::mutex> g(mutex_);
+    if (!action_progress_.active || !action_progress_.cancel_requested) return false;
+    return operation_id.empty() || action_progress_.operation_id == operation_id;
 }
 
 // ── Platform metrics sampling ──────────────────────────────────────────────────

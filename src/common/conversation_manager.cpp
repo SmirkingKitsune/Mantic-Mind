@@ -11,6 +11,27 @@ namespace mm {
 
 static constexpr double kCompactionThreshold  = 0.80;
 static constexpr int    kCompactionKeepRecent = 4;
+static constexpr int    kImageTokenEstimate   = 2048;
+static constexpr int    kMaxContextImages     = 8;
+static constexpr int64_t kMaxContextImageBytes = 400LL * 1024 * 1024;
+
+struct ImageUsage {
+    int count = 0;
+    int64_t bytes = 0;
+};
+
+ImageUsage image_usage(AgentDB& db, const std::vector<Message>& messages) {
+    ImageUsage usage;
+    for (const auto& message : messages) {
+        for (const auto& part : message.content_parts) {
+            if (part.type != "image_attachment") continue;
+            ++usage.count;
+            if (auto attachment = db.get_attachment(part.attachment_id))
+                usage.bytes += attachment->size_bytes;
+        }
+    }
+    return usage;
+}
 
 ConversationManager::ConversationManager(AgentDB& db, RuntimeClient& runtime)
     : db_(db), runtime_(runtime) {}
@@ -70,9 +91,21 @@ ConvId ConversationManager::maybe_compact(const ConvId& conv_id,
                                            const AgentConfig& cfg) {
     int total   = db_.get_total_tokens(conv_id);
     int ctx_sz  = cfg.runtime_settings.ctx_size;
-    double ratio = ctx_sz > 0 ? static_cast<double>(total) / ctx_sz : 0.0;
+    // Reserve the configured completion allowance before deciding how much
+    // history can remain. Long-reasoning profiles commonly allow 16K-32K
+    // output tokens; comparing history against the whole context window can
+    // otherwise admit a prompt that leaves no room for the response.
+    const int completion_reserve = cfg.runtime_settings.max_tokens > 0 && ctx_sz > 1
+        ? std::min(cfg.runtime_settings.max_tokens, ctx_sz - 1)
+        : 0;
+    const int prompt_budget = std::max(1, ctx_sz - completion_reserve);
+    double ratio = static_cast<double>(total) / prompt_budget;
+    const auto images = image_usage(db_, db_.load_messages(conv_id));
+    const bool image_pressure =
+        images.count >= static_cast<int>(kMaxContextImages * kCompactionThreshold) ||
+        images.bytes >= static_cast<int64_t>(kMaxContextImageBytes * kCompactionThreshold);
 
-    if (ratio >= kCompactionThreshold) {
+    if (ratio >= kCompactionThreshold || image_pressure) {
         MM_INFO("Conversation {} at {:.0f}% context — compacting", conv_id, ratio * 100);
         return compact_conversation(conv_id, cfg);
     }
@@ -90,15 +123,55 @@ ConvId ConversationManager::compact_conversation(const ConvId& conv_id,
     if (!conv) return conv_id;
 
     auto& msgs = conv->messages;
-    const int keep_recent = kCompactionKeepRecent;
+    int keep_start = std::max(0, static_cast<int>(msgs.size()) - kCompactionKeepRecent);
+    const auto all_images = image_usage(db_, msgs);
 
-    // Nothing to compact if fewer messages than the keep threshold.
-    if (static_cast<int>(msgs.size()) <= keep_recent)
-        return conv_id;
+    if (all_images.count > 0) {
+        std::vector<int> user_starts;
+        for (int i = 0; i < static_cast<int>(msgs.size()); ++i)
+            if (msgs[i].role == MessageRole::User) user_starts.push_back(i);
 
-    auto old_msgs = std::vector<Message>(msgs.begin(),
-                                         msgs.end() - keep_recent);
-    auto recent   = std::vector<Message>(msgs.end() - keep_recent, msgs.end());
+        if (!user_starts.empty()) {
+            keep_start = user_starts.back();
+            int retained_images = 0;
+            int64_t retained_bytes = 0;
+            int retained_tokens = 0;
+            const int completion_reserve =
+                cfg.runtime_settings.max_tokens > 0 &&
+                cfg.runtime_settings.ctx_size > 1
+                    ? std::min(cfg.runtime_settings.max_tokens,
+                               cfg.runtime_settings.ctx_size - 1)
+                    : 0;
+            const int prompt_budget = std::max(
+                1, cfg.runtime_settings.ctx_size - completion_reserve);
+            const int token_budget = std::max(1, static_cast<int>(
+                prompt_budget * kCompactionThreshold));
+            for (int turn = static_cast<int>(user_starts.size()) - 1; turn >= 0; --turn) {
+                const int begin = user_starts[turn];
+                const int end = turn + 1 < static_cast<int>(user_starts.size())
+                    ? user_starts[turn + 1] : static_cast<int>(msgs.size());
+                std::vector<Message> turn_messages(msgs.begin() + begin, msgs.begin() + end);
+                const auto turn_images = image_usage(db_, turn_messages);
+                int turn_tokens = 0;
+                for (const auto& message : turn_messages)
+                    turn_tokens += std::max(0, message.token_count);
+                turn_tokens = std::max(turn_tokens, turn_images.count * kImageTokenEstimate);
+                const bool fits = retained_images + turn_images.count <= kMaxContextImages &&
+                    retained_bytes + turn_images.bytes <= kMaxContextImageBytes &&
+                    retained_tokens + turn_tokens <= token_budget;
+                if (!fits && turn != static_cast<int>(user_starts.size()) - 1) break;
+                keep_start = begin;
+                retained_images += turn_images.count;
+                retained_bytes += turn_images.bytes;
+                retained_tokens += turn_tokens;
+            }
+        }
+    }
+
+    if (keep_start <= 0) return conv_id;
+
+    auto old_msgs = std::vector<Message>(msgs.begin(), msgs.begin() + keep_start);
+    auto recent   = std::vector<Message>(msgs.begin() + keep_start, msgs.end());
 
     // ── Summarise old messages ────────────────────────────────────────────────
     std::ostringstream prompt;
@@ -109,6 +182,9 @@ ConvId ConversationManager::compact_conversation(const ConvId& conv_id,
         if (m.role == MessageRole::System) continue;
         prompt << (m.role == MessageRole::User ? "User" : "Assistant")
                << ": " << m.content << "\n";
+        const auto omitted = image_usage(db_, std::vector<Message>{m}).count;
+        if (omitted > 0)
+            prompt << "[" << omitted << " image attachment(s) omitted from summary input]\n";
     }
 
     InferenceRequest req;

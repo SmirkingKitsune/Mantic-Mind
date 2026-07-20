@@ -1,6 +1,8 @@
 #include "node/slot_manager.hpp"
+#include "node/llama_runtime.hpp"
 #include "node/vllm_runtime.hpp"
 #include "common/http_client.hpp"
+#include "common/inference_sizing.hpp"
 #include "common/logger.hpp"
 #include "common/util.hpp"
 
@@ -8,6 +10,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <utility>
 
 #ifdef _WIN32
@@ -20,6 +23,53 @@
 #endif
 
 namespace mm {
+
+namespace {
+
+int64_t projector_file_mb(const std::string& path) {
+    if (path.empty()) return 0;
+    std::error_code ec;
+    const auto bytes = std::filesystem::file_size(path, ec);
+    if (ec) return 0;
+    return static_cast<int64_t>((bytes + (1024 * 1024 - 1)) / (1024 * 1024));
+}
+
+std::string projector_identity(const std::string& path) {
+    if (path.empty()) return {};
+    namespace fs = std::filesystem;
+    std::error_code size_ec;
+    std::error_code time_ec;
+    const auto size = fs::file_size(path, size_ec);
+    const auto modified = fs::last_write_time(path, time_ec);
+    std::string identity = util::to_lower(fs::path(path).filename().string());
+    if (!size_ec) identity += ":" + std::to_string(size);
+    if (!time_ec) identity += ":" + std::to_string(modified.time_since_epoch().count());
+    return identity;
+}
+
+bool llama_reports_vision(uint16_t port, std::string& detail) {
+    try {
+        HttpClient client("http://127.0.0.1:" + std::to_string(port));
+        client.set_timeouts(5, 15, 15);
+        const auto response = client.get("/props");
+        if (!response.ok()) {
+            detail = "GET /props returned HTTP " + std::to_string(response.status);
+            return false;
+        }
+        const auto props = nlohmann::json::parse(response.body);
+        if (!props.contains("modalities") || !props["modalities"].is_object() ||
+            !props["modalities"].value("vision", false)) {
+            detail = "GET /props did not report modalities.vision=true";
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        detail = e.what();
+        return false;
+    }
+}
+
+} // namespace
 
 SlotManager::SlotLease::SlotLease(SlotManager* manager, SlotId slot_id, RuntimeClient* client)
     : manager_(manager)
@@ -85,10 +135,12 @@ void SlotManager::set_log_callback(LogCallback cb) {
 
 SlotId SlotManager::load_model(const std::string& model_path,
                                VllmSettings vllm_settings,
-                               const AgentId& agent_id) {
+                               const AgentId& agent_id,
+                               bool vision_enabled) {
     // A compatible engine already running (or sleeping) serves this agent too —
     // attach or wake instead of spawning a second process.
-    if (auto shared = try_attach_or_wake(model_path, vllm_settings, agent_id)) {
+    if (auto shared = try_attach_or_wake(model_path, vllm_settings, agent_id,
+                                         vision_enabled)) {
         return *shared;
     }
 
@@ -138,6 +190,8 @@ SlotId SlotManager::load_model(const std::string& model_path,
     slot->id             = util::generate_uuid();
     slot->port           = port;
     slot->model_path     = model_path;
+    slot->vision_enabled = vision_enabled;
+    slot->backend        = EngineBackend::Vllm;
     if (!agent_id.empty()) slot->agents.push_back(agent_id);
     slot->launch_settings = vllm_settings;
     slot->state          = SlotState::Loading;
@@ -210,6 +264,114 @@ SlotId SlotManager::load_model(const std::string& model_path,
     return id;
 }
 
+SlotId SlotManager::load_model_llama(const std::string& model_path,
+                                     const std::string& mmproj_path,
+                                     RuntimeSettings settings,
+                                     const AgentId& agent_id) {
+    // Share a compatible live llama-server if one is already up.
+    if (auto shared = try_attach_llama(model_path, mmproj_path, settings, agent_id)) {
+        return *shared;
+    }
+
+    // Phase 1 (locked): capacity + port. llama slots do not draw on the vLLM
+    // GPU-fraction budget, so there is no fraction to reserve here.
+    uint16_t port = 0;
+    LogCallback log_cb;
+    std::string llama_path;
+    std::string kv_dir;
+    std::string models_dir;
+    {
+        std::lock_guard lock(mutex_);
+        last_error_.clear();
+
+        int active_count = pending_loads_;
+        for (const auto& s : slots_) {
+            if (s->state != SlotState::Suspended) ++active_count;
+        }
+        if (active_count >= max_slots_) {
+            MM_WARN("SlotManager: max active slots ({}) reached", max_slots_);
+            last_error_ = "max slots reached";
+            return {};
+        }
+
+        auto port_opt = allocate_port();
+        if (!port_opt) {
+            MM_ERROR("SlotManager: no available ports in range {}-{}",
+                     port_range_start_, port_range_end_);
+            last_error_ = "no available ports";
+            return {};
+        }
+        port = *port_opt;
+        ++pending_loads_;
+        log_cb     = log_cb_;
+        llama_path = llama_server_path_;
+        kv_dir     = kv_cache_dir_;
+        models_dir = models_dir_;
+    }
+
+    auto slot = std::make_unique<Slot>();
+    slot->id             = util::generate_uuid();
+    slot->port           = port;
+    slot->model_path     = model_path;
+    slot->mmproj_path    = mmproj_path;
+    slot->vision_enabled = !mmproj_path.empty();
+    slot->backend        = EngineBackend::LlamaCpp;
+    if (!agent_id.empty()) slot->agents.push_back(agent_id);
+    slot->llama_launch_settings = settings;
+    slot->state          = SlotState::Loading;
+    slot->last_active_ms = util::now_ms();
+    slot->vram_usage_mb  = estimate_inference_vram_mb(model_path, settings, models_dir)
+                         + projector_file_mb(mmproj_path);
+
+    slot->process = std::make_unique<RuntimeProcess>(llama_path);
+    if (log_cb) slot->process->set_log_callback(log_cb);
+
+    MM_INFO("SlotManager: loading llama.cpp model {} on port {} (slot {})",
+            model_path, port, slot->id);
+
+    // Enable KV slot persistence so this slot can suspend/restore its context.
+    bool started = slot->process->start_llama_server(model_path, mmproj_path, settings, port, kv_dir);
+
+    if (started && !mmproj_path.empty()) {
+        std::string capability_error;
+        if (!llama_reports_vision(port, capability_error)) {
+            slot->process->stop();
+            started = false;
+            std::lock_guard lock(mutex_);
+            last_error_ = "llama-server started with --mmproj but cannot verify multimodal support: "
+                        + capability_error
+                        + ". Upgrade the configured llama-server runtime.";
+        }
+    }
+
+    std::lock_guard lock(mutex_);
+    --pending_loads_;
+
+    if (!started) {
+        MM_ERROR("SlotManager: failed to start llama-server for slot {}", slot->id);
+        auto proc_err = slot->process->last_error();
+        if (last_error_.empty()) {
+            last_error_ = "failed to start llama-server (path=" + llama_path + ")"
+                        + (proc_err.empty() ? "" : ": " + proc_err);
+        }
+        release_port(port);
+        return {};
+    }
+
+    slot->effective_ctx_size =
+        effective_llama_server_ctx_tokens(settings);
+    slot->client = std::make_unique<RuntimeClient>(
+        "http://127.0.0.1:" + std::to_string(port));
+    slot->state = SlotState::Ready;
+
+    SlotId id = slot->id;
+    slots_.push_back(std::move(slot));
+
+    MM_INFO("SlotManager: slot {} ready (llama.cpp, model={}, agent={}, port={}, ctx={})",
+            id, model_path, agent_id, port, slots_.back()->effective_ctx_size);
+    return id;
+}
+
 SlotOperationResult SlotManager::unload_slot(const SlotId& slot_id) {
     std::lock_guard lock(mutex_);
 
@@ -228,6 +390,7 @@ SlotOperationResult SlotManager::unload_slot(const SlotId& slot_id) {
 
     if (slot->process) slot->process->stop();
     release_port(slot->port);
+    remove_kv_cache_file_locked(*slot);
 
     slots_.erase(it);
     return {SlotOperationStatus::Ok, "unloaded", {}};
@@ -267,6 +430,7 @@ DetachResult SlotManager::detach_agent(const SlotId& slot_id,
             agent_id, slot_id);
     if (slot->process) slot->process->stop();
     if (slot->port != 0) release_port(slot->port);
+    remove_kv_cache_file_locked(*slot);
     slots_.erase(it);
     return {SlotOperationStatus::Ok, "detached; slot unloaded", 0, true};
 }
@@ -292,6 +456,50 @@ SlotOperationResult SlotManager::suspend_slot(const SlotId& slot_id) {
     MM_INFO("SlotManager: suspending slot {} ({} agent(s), first={})",
             slot->id, slot->agents.size(),
             slot->agents.empty() ? std::string{"-"} : slot->agents.front());
+
+    // llama.cpp has no sleep mode; suspend saves the KV cache to disk and stops
+    // the engine. A later restore replays the cache on a fresh engine.
+    if (slot->backend == EngineBackend::LlamaCpp) {
+        namespace fs = std::filesystem;
+        const std::string cache_file = slot->id + ".kvbin";
+        std::string cache_path = (fs::path(kv_cache_dir_) / cache_file).string();
+
+        if (slot->client && slot->port != 0) {
+            // With --slot-save-path set at launch, the save filename is resolved
+            // relative to that directory; pass a bare filename (no separators).
+            bool saved = false;
+            try {
+                HttpClient cli("http://127.0.0.1:" + std::to_string(slot->port));
+                cli.set_timeouts(5, 120, 30);
+                saved = cli.post("/slots/0?action=save",
+                                 nlohmann::json{{"filename", cache_file}}).ok();
+            } catch (const std::exception& e) {
+                MM_WARN("SlotManager: KV cache save failed for slot {}: {}",
+                        slot->id, e.what());
+            }
+            if (!saved) {
+                MM_WARN("SlotManager: KV cache save failed for slot {}; "
+                        "suspending without cached context", slot->id);
+                cache_path.clear();
+            }
+        } else {
+            cache_path.clear();
+        }
+
+        if (slot->process) slot->process->stop();
+        release_port(slot->port);
+
+        slot->kv_cache_path = cache_path;
+        slot->state = SlotState::Suspended;
+        slot->sleeping = false;
+        slot->port = 0;
+        slot->process.reset();
+        slot->client.reset();
+
+        MM_INFO("SlotManager: llama.cpp slot {} suspended (cache={})",
+                slot->id, cache_path.empty() ? std::string{"none"} : cache_path);
+        return {SlotOperationStatus::Ok, "suspended", cache_path};
+    }
 
     // Sleep mode: offload weights to host RAM, free the GPU, and keep the
     // process alive for a fast wake instead of a full engine restart.
@@ -332,11 +540,13 @@ SlotOperationResult SlotManager::suspend_slot(const SlotId& slot_id) {
 
 SlotId SlotManager::restore_slot(const std::string& model_path,
                                  const VllmSettings& vllm_settings,
-                                 const AgentId& agent_id) {
+                                 const AgentId& agent_id,
+                                 bool vision_enabled) {
     // Restoring starts a fresh engine anyway (no KV cache to recover), so a
     // compatible running engine serves the restored agent directly — and a
     // compatible sleeping engine wakes far faster than a cold start.
-    if (auto shared = try_attach_or_wake(model_path, vllm_settings, agent_id)) {
+    if (auto shared = try_attach_or_wake(model_path, vllm_settings, agent_id,
+                                         vision_enabled)) {
         return *shared;
     }
 
@@ -382,6 +592,8 @@ SlotId SlotManager::restore_slot(const std::string& model_path,
     slot->id             = util::generate_uuid();
     slot->port           = port;
     slot->model_path     = model_path;
+    slot->vision_enabled = vision_enabled;
+    slot->backend        = EngineBackend::Vllm;
     if (!agent_id.empty()) slot->agents.push_back(agent_id);
     slot->launch_settings = vllm_cfg;
     slot->state          = SlotState::Loading;
@@ -428,6 +640,135 @@ SlotId SlotManager::restore_slot(const std::string& model_path,
     return id;
 }
 
+SlotId SlotManager::restore_slot_llama(const std::string& model_path,
+                                       const std::string& mmproj_path,
+                                       const RuntimeSettings& settings,
+                                       const std::string& kv_cache_path,
+                                       const AgentId& agent_id) {
+    // A compatible live llama engine serves the restored agent directly.
+    if (auto shared = try_attach_llama(model_path, mmproj_path, settings, agent_id)) {
+        return *shared;
+    }
+
+    uint16_t port = 0;
+    LogCallback log_cb;
+    std::string llama_path;
+    std::string kv_dir;
+    std::string models_dir;
+    {
+        std::lock_guard lock(mutex_);
+        last_error_.clear();
+
+        int active_count = pending_loads_;
+        for (const auto& s : slots_) {
+            if (s->state != SlotState::Suspended) ++active_count;
+        }
+        if (active_count >= max_slots_) {
+            MM_WARN("SlotManager: max active slots ({}) reached for restore", max_slots_);
+            last_error_ = "max active slots reached";
+            return {};
+        }
+
+        auto port_opt = allocate_port();
+        if (!port_opt) {
+            MM_ERROR("SlotManager: no available ports for restore");
+            last_error_ = "no available ports for restore";
+            return {};
+        }
+        port = *port_opt;
+        ++pending_loads_;
+        log_cb     = log_cb_;
+        llama_path = llama_server_path_;
+        kv_dir     = kv_cache_dir_;
+        models_dir = models_dir_;
+    }
+
+    auto slot = std::make_unique<Slot>();
+    slot->id             = util::generate_uuid();
+    slot->port           = port;
+    slot->model_path     = model_path;
+    slot->mmproj_path    = mmproj_path;
+    slot->vision_enabled = !mmproj_path.empty();
+    slot->backend        = EngineBackend::LlamaCpp;
+    if (!agent_id.empty()) slot->agents.push_back(agent_id);
+    slot->llama_launch_settings = settings;
+    slot->state          = SlotState::Loading;
+    slot->last_active_ms = util::now_ms();
+    slot->kv_cache_path  = kv_cache_path;
+    slot->vram_usage_mb  = estimate_inference_vram_mb(model_path, settings, models_dir)
+                         + projector_file_mb(mmproj_path);
+    slot->process = std::make_unique<RuntimeProcess>(llama_path);
+    if (log_cb) slot->process->set_log_callback(log_cb);
+
+    MM_INFO("SlotManager: restoring llama.cpp model {} on port {} (slot {}, cache={})",
+            model_path, port, slot->id, kv_cache_path);
+
+    bool started = slot->process->start_llama_server(model_path, mmproj_path, settings, port, kv_dir);
+    if (started && !mmproj_path.empty()) {
+        std::string capability_error;
+        if (!llama_reports_vision(port, capability_error)) {
+            slot->process->stop();
+            started = false;
+            std::lock_guard lock(mutex_);
+            last_error_ = "llama-server restore cannot verify multimodal support: "
+                        + capability_error
+                        + ". Upgrade the configured llama-server runtime.";
+        }
+    }
+    if (!started) {
+        MM_ERROR("SlotManager: failed to start llama-server for restore");
+        auto proc_err = slot->process->last_error();
+        std::lock_guard lock(mutex_);
+        --pending_loads_;
+        if (last_error_.empty()) {
+            last_error_ = "failed to start llama-server for restore (path=" + llama_path + ")"
+                        + (proc_err.empty() ? "" : ": " + proc_err);
+        }
+        release_port(port);
+        return {};
+    }
+
+    // Replay the saved KV cache when present; a miss/failure is a cold start.
+    if (!kv_cache_path.empty()) {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        if (fs::exists(kv_cache_path, ec)) {
+            const std::string cache_file = fs::path(kv_cache_path).filename().string();
+            try {
+                HttpClient cli("http://127.0.0.1:" + std::to_string(port));
+                cli.set_timeouts(5, 120, 30);
+                auto resp = cli.post("/slots/0?action=restore",
+                                     nlohmann::json{{"filename", cache_file}});
+                if (resp.ok()) {
+                    MM_INFO("SlotManager: KV cache restored for slot {}", slot->id);
+                } else {
+                    MM_WARN("SlotManager: KV cache restore failed (HTTP {}), "
+                            "proceeding without cached context", resp.status);
+                }
+            } catch (const std::exception& e) {
+                MM_WARN("SlotManager: KV cache restore request failed: {}", e.what());
+            }
+        } else {
+            MM_WARN("SlotManager: KV cache file not found: {}", kv_cache_path);
+        }
+    }
+
+    slot->client = std::make_unique<RuntimeClient>(
+        "http://127.0.0.1:" + std::to_string(port));
+    slot->state = SlotState::Ready;
+    slot->effective_ctx_size = effective_llama_server_ctx_tokens(settings);
+    SlotId id = slot->id;
+
+    std::lock_guard lock(mutex_);
+    --pending_loads_;
+    if (!agent_id.empty())
+        remove_agent_from_suspended_locked(agent_id);
+    slots_.push_back(std::move(slot));
+
+    MM_INFO("SlotManager: llama.cpp slot {} restored (agent={})", id, agent_id);
+    return id;
+}
+
 SlotOperationResult SlotManager::unload_all(bool force) {
     std::lock_guard lock(mutex_);
     if (!force) {
@@ -444,6 +785,7 @@ SlotOperationResult SlotManager::unload_all(bool force) {
             slot->process->stop();
         if (slot->port != 0)
             release_port(slot->port);
+        remove_kv_cache_file_locked(*slot);
     }
     slots_.clear();
     used_ports_.clear();
@@ -546,6 +888,9 @@ void SlotManager::refresh_vllm_metrics() {
         std::lock_guard lock(mutex_);
         for (const auto& s : slots_) {
             if (s->state != SlotState::Ready || s->port == 0) continue;
+            // Prometheus /metrics scraping here parses vLLM's exposition format;
+            // llama-server load signals are not collected this way.
+            if (s->backend != EngineBackend::Vllm) continue;
             targets.push_back({s->id, s->port});
         }
     }
@@ -587,8 +932,32 @@ SlotId SlotManager::add_ready_test_slot(std::string model_path,
     auto slot = std::make_unique<Slot>();
     slot->id = util::generate_uuid();
     slot->model_path = std::move(model_path);
+    slot->backend = EngineBackend::Vllm;
     if (!agent_id.empty()) slot->agents.push_back(std::move(agent_id));
     slot->gpu_mem_fraction = gpu_mem_fraction;
+    slot->client = std::make_unique<RuntimeClient>("http://127.0.0.1:0");
+    slot->state = SlotState::Ready;
+    slot->last_active_ms = util::now_ms();
+
+    SlotId id = slot->id;
+    slots_.push_back(std::move(slot));
+    return id;
+}
+
+SlotId SlotManager::add_ready_test_slot_llama(std::string model_path,
+                                              AgentId agent_id,
+                                              RuntimeSettings settings,
+                                              std::string mmproj_path) {
+    std::lock_guard lock(mutex_);
+
+    auto slot = std::make_unique<Slot>();
+    slot->id = util::generate_uuid();
+    slot->model_path = std::move(model_path);
+    slot->mmproj_path = std::move(mmproj_path);
+    slot->vision_enabled = !slot->mmproj_path.empty();
+    slot->backend = EngineBackend::LlamaCpp;
+    if (!agent_id.empty()) slot->agents.push_back(std::move(agent_id));
+    slot->llama_launch_settings = std::move(settings);
     slot->client = std::make_unique<RuntimeClient>("http://127.0.0.1:0");
     slot->state = SlotState::Ready;
     slot->last_active_ms = util::now_ms();
@@ -619,6 +988,26 @@ void SlotManager::set_vllm_server_path(const std::string& path) {
 std::string SlotManager::vllm_server_path() const {
     std::lock_guard lock(mutex_);
     return vllm_server_path_;
+}
+
+void SlotManager::set_llama_server_path(const std::string& path) {
+    std::lock_guard lock(mutex_);
+    if (!path.empty()) llama_server_path_ = path;
+}
+
+std::string SlotManager::llama_server_path() const {
+    std::lock_guard lock(mutex_);
+    return llama_server_path_;
+}
+
+void SlotManager::set_kv_cache_dir(const std::string& dir) {
+    std::lock_guard lock(mutex_);
+    if (!dir.empty()) kv_cache_dir_ = dir;
+}
+
+void SlotManager::set_models_dir(const std::string& dir) {
+    std::lock_guard lock(mutex_);
+    models_dir_ = dir;
 }
 
 void SlotManager::release_slot_request(const SlotId& slot_id) {
@@ -677,6 +1066,10 @@ SlotManager::Slot* SlotManager::find_compatible_vllm_slot_locked(
 {
     for (auto& s : slots_) {
         if (s->state != SlotState::Ready) continue;
+        // A llama slot for the same model must never satisfy a vLLM lookup: its
+        // launch_settings is a default-constructed VllmSettings, which would
+        // spuriously pass vllm_launch_compatible against default vLLM settings.
+        if (s->backend != EngineBackend::Vllm) continue;
         if (s->model_path != model_path) continue;
         if (!vllm_launch_compatible(s->launch_settings, settings)) continue;
         return s.get();
@@ -686,7 +1079,8 @@ SlotManager::Slot* SlotManager::find_compatible_vllm_slot_locked(
 
 std::optional<SlotId> SlotManager::try_attach_or_wake(const std::string& model_path,
                                                       const VllmSettings& settings,
-                                                      const AgentId& agent_id) {
+                                                      const AgentId& agent_id,
+                                                      bool vision_enabled) {
     SlotId   wake_id;
     uint16_t wake_port = 0;
     {
@@ -694,6 +1088,7 @@ std::optional<SlotId> SlotManager::try_attach_or_wake(const std::string& model_p
 
         if (Slot* shared = find_compatible_vllm_slot_locked(model_path, settings)) {
             attach_agent_locked(*shared, agent_id);
+            shared->vision_enabled = shared->vision_enabled || vision_enabled;
             remove_agent_from_suspended_locked(agent_id);
             MM_INFO("SlotManager: attached agent {} to shared vLLM slot {} "
                     "(model={}, {} agent(s) attached)",
@@ -703,6 +1098,7 @@ std::optional<SlotId> SlotManager::try_attach_or_wake(const std::string& model_p
 
         for (auto& s : slots_) {
             if (s->state != SlotState::Suspended || !s->sleeping) continue;
+            if (s->backend != EngineBackend::Vllm) continue;
             if (s->model_path != model_path) continue;
             if (!vllm_launch_compatible(s->launch_settings, settings)) continue;
             // Waking re-claims the engine's original GPU slice.
@@ -751,10 +1147,40 @@ std::optional<SlotId> SlotManager::try_attach_or_wake(const std::string& model_p
     slot->state    = SlotState::Ready;
     slot->sleeping = false;
     attach_agent_locked(*slot, agent_id);
+    slot->vision_enabled = slot->vision_enabled || vision_enabled;
     remove_agent_from_suspended_locked(agent_id);
     MM_INFO("SlotManager: woke vLLM slot {} (model={}, {} agent(s) attached)",
             wake_id, model_path, slot->agents.size());
     return slot->id;
+}
+
+std::optional<SlotId> SlotManager::try_attach_llama(const std::string& model_path,
+                                                    const std::string& mmproj_path,
+                                                    const RuntimeSettings& settings,
+                                                    const AgentId& agent_id) {
+    std::lock_guard lock(mutex_);
+    for (auto& s : slots_) {
+        if (s->state != SlotState::Ready) continue;
+        if (s->backend != EngineBackend::LlamaCpp) continue;
+        if (normalize_llama_model_path(s->model_path) !=
+            normalize_llama_model_path(model_path)) continue;
+        if (normalize_llama_model_path(s->mmproj_path) !=
+            normalize_llama_model_path(mmproj_path)) continue;
+        if (!llama_launch_compatible(s->llama_launch_settings, settings)) continue;
+        attach_agent_locked(*s, agent_id);
+        remove_agent_from_suspended_locked(agent_id);
+        MM_INFO("SlotManager: attached agent {} to shared llama.cpp slot {} "
+                "(model={}, {} agent(s) attached)",
+                agent_id, s->id, model_path, s->agents.size());
+        return s->id;
+    }
+    return std::nullopt;
+}
+
+void SlotManager::remove_kv_cache_file_locked(const Slot& slot) const {
+    if (slot.kv_cache_path.empty()) return;
+    std::error_code ec;
+    std::filesystem::remove(slot.kv_cache_path, ec);
 }
 
 void SlotManager::attach_agent_locked(Slot& slot, const AgentId& agent_id) {
@@ -775,9 +1201,11 @@ void SlotManager::remove_agent_from_suspended_locked(const AgentId& agent_id) {
         agents.erase(std::remove(agents.begin(), agents.end(), agent_id),
                      agents.end());
         if (agents.empty()) {
-            // A sleeping record still owns a live process and port.
+            // A sleeping record still owns a live process and port; a suspended
+            // llama record owns a saved KV-cache file on disk.
             if (slot->process) slot->process->stop();
             if (slot->port != 0) release_port(slot->port);
+            remove_kv_cache_file_locked(*slot);
             it = slots_.erase(it);
         } else {
             ++it;
@@ -835,6 +1263,10 @@ SlotInfo SlotManager::make_slot_info(const Slot& s) const {
     info.id              = s.id;
     info.port            = s.port;
     info.model_path      = s.model_path;
+    info.mmproj_path     = s.mmproj_path;
+    info.vision_enabled  = s.vision_enabled;
+    info.projector_identity = projector_identity(s.mmproj_path);
+    info.backend         = to_string(s.backend);
     info.assigned_agent  = s.agents.empty() ? AgentId{} : s.agents.front();
     info.agent_ids       = s.agents;
     info.state           = s.state;

@@ -9,6 +9,7 @@ namespace mm::util {
 // ── Identity / randomness ────────────────────────────────────────────────────
 std::string generate_uuid();          // UUID v4
 std::string generate_api_key(size_t length = 32);
+std::string hostname();
 
 // Returns true iff id is a valid agent/resource identifier:
 //   - 1–128 characters

@@ -15,6 +15,15 @@
 
 namespace mm {
 
+NodeConnectionStatus classify_node_reachability(int64_t unreachable_since_ms,
+                                                int64_t now_ms,
+                                                int64_t offline_after_ms) {
+    if (unreachable_since_ms <= 0) return NodeConnectionStatus::Unreachable;
+    if (offline_after_ms <= 0 || now_ms - unreachable_since_ms >= offline_after_ms)
+        return NodeConnectionStatus::Offline;
+    return NodeConnectionStatus::Unreachable;
+}
+
 NodeRegistry::NodeRegistry() = default;
 
 NodeRegistry::NodeRegistry(std::string data_dir) {
@@ -24,6 +33,11 @@ NodeRegistry::NodeRegistry(std::string data_dir) {
     remembered_nodes_path_ = (fs::path(data_dir) / "nodes.json").string();
     load_remembered_nodes();
 }
+void NodeRegistry::set_offline_after_seconds(int seconds) {
+    const int clamped = std::max(1, seconds);
+    offline_after_ms_.store(static_cast<int64_t>(clamped) * 1000);
+}
+
 
 NodeRegistry::~NodeRegistry() { stop_health_poll(); }
 
@@ -31,7 +45,8 @@ NodeRegistry::~NodeRegistry() { stop_health_poll(); }
 NodeId NodeRegistry::add_node(const std::string& url,
                                const std::string& api_key,
                                const std::string& platform,
-                               bool remember) {
+                               bool remember,
+                               const std::string& hostname) {
     std::lock_guard<std::mutex> g(mutex_);
 
     for (auto& [id, n] : nodes_) {
@@ -43,6 +58,7 @@ NodeId NodeRegistry::add_node(const std::string& url,
         if (!api_key.empty()) n.api_key = api_key;
         if (!platform.empty()) n.platform = platform;
         if (remember) remembered_nodes_.insert(id);
+        if (!hostname.empty()) n.hostname = hostname;
         n.remembered = remembered_nodes_.count(id) > 0;
         if (n.remembered) save_remembered_nodes_unlocked();
         MM_INFO("NodeRegistry: updated node {} @ {}", id, url);
@@ -55,8 +71,10 @@ NodeId NodeRegistry::add_node(const std::string& url,
     info.api_key  = api_key;
     info.platform = platform;
     info.connected = false;
+    info.hostname = hostname;
     info.health    = NodeHealthStatus::Unknown;
     info.remembered = remember;
+    info.connection_status = NodeConnectionStatus::Unknown;
     nodes_[info.id] = info;
     if (remember) {
         remembered_nodes_.insert(info.id);
@@ -332,8 +350,9 @@ std::string NodeRegistry::complete_pair(const std::string& url,
             return {};
         }
         std::string api_key = j.value("api_key", std::string{});
+        const std::string hostname = j.value("hostname", std::string{});
         if (api_key.empty()) return {};
-        add_node(url, api_key, {}, remember);
+        add_node(url, api_key, {}, remember, hostname);
         MM_INFO("NodeRegistry: paired with {} — node added{}", url, remember ? " and remembered" : "");
         return api_key;
     } catch (const std::exception& e) {
@@ -372,8 +391,10 @@ void NodeRegistry::load_remembered_nodes() {
             info.api_key = api_key;
             info.platform = item.value("platform", std::string{});
             info.connected = false;
+            info.hostname = item.value("hostname", std::string{});
             info.health = NodeHealthStatus::Unknown;
             info.remembered = true;
+            info.connection_status = NodeConnectionStatus::Unknown;
 
             nodes_[info.id] = info;
             remembered_nodes_.insert(info.id);
@@ -399,13 +420,14 @@ void NodeRegistry::save_remembered_nodes_unlocked() const {
         nodes_json.push_back(nlohmann::json{
             {"id", n.id},
             {"url", n.url},
+            {"hostname", n.hostname},
             {"api_key", n.api_key},
             {"platform", n.platform}
         });
     }
 
     const nlohmann::json root{
-        {"version", 1},
+        {"version", 2},
         {"nodes", nodes_json}
     };
 
@@ -449,10 +471,21 @@ bool NodeRegistry::ping_node(NodeInfo& info) {
     cli.set_bearer_token(info.api_key);
 
     // GET /api/node/health → metrics
+
+    auto mark_unreachable = [&]() {
+        const int64_t now = mm::util::now_ms();
+        if (info.unreachable_since_ms <= 0) info.unreachable_since_ms = now;
+        ++info.consecutive_failures;
+        info.connected = false;
+        info.connection_status = classify_node_reachability(
+            info.unreachable_since_ms, now, offline_after_ms_.load());
+        // Retain the last metrics sample for display, but make it explicit that
+        // current health cannot be known while the node is unreachable.
+        info.health = NodeHealthStatus::Unknown;
+    };
     auto health_res = cli.get("/api/node/health");
     if (!health_res.ok()) {
-        info.connected = false;
-        info.health    = NodeHealthStatus::Unhealthy;
+        mark_unreachable();
         return false;
     }
 
@@ -463,13 +496,18 @@ bool NodeRegistry::ping_node(NodeInfo& info) {
 
         // Determine health status from resource usage
         float max_pct = std::max(info.metrics.cpu_percent, info.metrics.ram_percent);
-        if (max_pct < 80.0f) info.health = NodeHealthStatus::Healthy;
+        if (max_pct < 80.0f)      info.health = NodeHealthStatus::Healthy;
         else if (max_pct < 95.0f) info.health = NodeHealthStatus::Degraded;
         else                      info.health = NodeHealthStatus::Unhealthy;
+        const int64_t now = mm::util::now_ms();
+        info.connection_status = NodeConnectionStatus::Online;
+        info.last_seen_ms = now;
+        info.metrics_sampled_at_ms = now;
+        info.unreachable_since_ms = 0;
+        info.consecutive_failures = 0;
     } catch (const std::exception& e) {
         MM_WARN("NodeRegistry: health parse error for {}: {}", info.id, e.what());
-        info.connected = false;
-        info.health    = NodeHealthStatus::Unhealthy;
+        mark_unreachable();
         return false;
     }
 
@@ -485,6 +523,8 @@ bool NodeRegistry::ping_node(NodeInfo& info) {
                 info.slots = sj["slots"].get<std::vector<SlotInfo>>();
             if (sj.contains("cached_models"))
                 info.cached_models = sj["cached_models"].get<std::vector<std::string>>();
+            if (sj.contains("hostname"))
+                info.hostname = sj["hostname"].get<std::string>();
             if (sj.contains("disk_free_mb"))
                 info.disk_free_mb = sj["disk_free_mb"].get<int64_t>();
             if (sj.contains("max_slots"))
@@ -507,6 +547,14 @@ bool NodeRegistry::ping_node(NodeInfo& info) {
                 info.vllm_server_path = sj["vllm_server_path"].get<std::string>();
             if (sj.contains("vllm_runtime"))
                 info.vllm_runtime = sj["vllm_runtime"].get<VllmRuntimeStatus>();
+            if (sj.contains("llama_server_path"))
+                info.llama_server_path = sj["llama_server_path"].get<std::string>();
+            if (sj.contains("llama_runtime"))
+                info.llama_runtime = sj["llama_runtime"].get<LlamaRuntimeStatus>();
+            if (sj.contains("vllm_install_progress"))
+                info.vllm_install_progress = sj["vllm_install_progress"].get<VllmInstallProgress>();
+            if (sj.contains("action_progress"))
+                info.action_progress = sj["action_progress"].get<NodeActionProgress>();
             if (sj.contains("capabilities"))
                 info.capabilities = sj["capabilities"].get<NodeCapabilities>();
             if (sj.contains("vllm_gpu_budget"))
@@ -564,7 +612,7 @@ void NodeRegistry::poll_all_nodes() {
             info = it->second;
         }
 
-        bool was_connected = info.connected;
+        const auto previous_connection = info.connection_status;
         ping_node(info); // modifies info in place
 
         // Write updated info back; grab callback outside the lock
@@ -583,6 +631,12 @@ void NodeRegistry::poll_all_nodes() {
                 it->second.disk_free_mb  = info.disk_free_mb;
                 it->second.max_slots     = info.max_slots;
                 it->second.slot_in_use   = info.slot_in_use;
+                it->second.connection_status = info.connection_status;
+                it->second.last_seen_ms = info.last_seen_ms;
+                it->second.unreachable_since_ms = info.unreachable_since_ms;
+                it->second.metrics_sampled_at_ms = info.metrics_sampled_at_ms;
+                it->second.consecutive_failures = info.consecutive_failures;
+                it->second.hostname = info.hostname;
                 it->second.slot_available = info.slot_available;
                 it->second.slot_ready    = info.slot_ready;
                 it->second.slot_loading  = info.slot_loading;
@@ -591,6 +645,10 @@ void NodeRegistry::poll_all_nodes() {
                 it->second.slot_error    = info.slot_error;
                 it->second.vllm_server_path = info.vllm_server_path;
                 it->second.vllm_runtime = info.vllm_runtime;
+                it->second.llama_server_path = info.llama_server_path;
+                it->second.llama_runtime = info.llama_runtime;
+                it->second.vllm_install_progress = info.vllm_install_progress;
+                it->second.action_progress = info.action_progress;
                 it->second.vllm_gpu_budget = info.vllm_gpu_budget;
                 it->second.vllm_gpu_fraction_used = info.vllm_gpu_fraction_used;
                 it->second.capabilities = info.capabilities;
@@ -607,8 +665,9 @@ void NodeRegistry::poll_all_nodes() {
             }
         }
 
-        if (info.connected != was_connected)
-            MM_INFO("Node {} is now {}", id, info.connected ? "connected" : "disconnected");
+        if (info.connection_status != previous_connection) {
+            MM_INFO("Node {} is now {}", id, to_string(info.connection_status));
+        }
 
         if (version_bumped) {
             MM_INFO("Node {} vLLM updated to {}; nudging same-environment peers",

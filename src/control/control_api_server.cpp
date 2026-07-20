@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -438,7 +439,9 @@ std::string openai_agent_model_id(const AgentConfig& cfg) {
 
 std::string agent_backend(const AgentConfig& cfg) {
     std::string backend = util::to_lower(util::trim(cfg.inference_backend));
-    if (backend.empty() || backend == "llama.cpp") return "vllm";
+    if (backend.empty()) return "llama-cpp";  // unspecified => default runtime
+    if (backend == "llama.cpp" || backend == "llama" || backend == "llama-cpp")
+        return "llama-cpp";
     return backend;
 }
 
@@ -472,6 +475,7 @@ nlohmann::json openai_model_entry(const AgentConfig& cfg) {
             {"agent_name", cfg.name},
             {"inference_backend", agent_backend(cfg)},
             {"model_path", cfg.model_path},
+            {"vision_enabled", cfg.vision_settings.enabled},
             {"served_model_name", cfg.vllm_settings.served_model_name},
             {"api_base_url", agent_uses_api_backend(cfg) ? cfg.api_settings.base_url : ""}
         }}
@@ -485,6 +489,7 @@ nlohmann::json mantic_model_entry(const AgentConfig& cfg) {
         {"agent_name", cfg.name},
         {"inference_backend", agent_backend(cfg)},
         {"model_path", cfg.model_path},
+        {"vision_enabled", cfg.vision_settings.enabled},
         {"served_model_name", cfg.vllm_settings.served_model_name},
         {"api_base_url", agent_uses_api_backend(cfg) ? cfg.api_settings.base_url : ""}
     };
@@ -747,9 +752,354 @@ bool set_file_response(httplib::Response& res,
             file->read(buf, static_cast<std::streamsize>(sizeof(buf)));
             const std::streamsize n = file->gcount();
             if (n > 0) return sink.write(buf, static_cast<size_t>(n));
-            return false;
+            sink.done();
+            return true;
         });
     return true;
+}
+
+constexpr int64_t kMaxImageBytes = 50LL * 1024 * 1024;
+constexpr int     kMaxImagesPerContext = 8;
+constexpr int64_t kMaxDecodedImageBytes = 400LL * 1024 * 1024;
+constexpr int64_t kPendingAttachmentTtlMs = 24LL * 60 * 60 * 1000;
+constexpr std::size_t kOpenAiJsonCeiling =
+    static_cast<std::size_t>((kMaxDecodedImageBytes * 4 + 2) / 3) +
+    (16ULL * 1024 * 1024);
+
+std::string normalized_image_mime(std::string mime) {
+    const auto semicolon = mime.find(';');
+    if (semicolon != std::string::npos) mime.resize(semicolon);
+    mime = util::to_lower(util::trim(mime));
+    if (mime == "image/jpg") mime = "image/jpeg";
+    return mime;
+}
+
+std::string detected_image_mime(const std::vector<unsigned char>& bytes) {
+    static constexpr unsigned char png[] =
+        {0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
+    if (bytes.size() >= sizeof(png) &&
+        std::equal(std::begin(png), std::end(png), bytes.begin())) {
+        return "image/png";
+    }
+    if (bytes.size() >= 3 && bytes[0] == 0xff && bytes[1] == 0xd8 &&
+        bytes[2] == 0xff) {
+        return "image/jpeg";
+    }
+    return {};
+}
+
+std::string safe_attachment_filename(std::string name,
+                                     const std::string& mime_type) {
+    name = std::filesystem::path(name).filename().string();
+    name.erase(std::remove_if(name.begin(), name.end(), [](unsigned char ch) {
+        return ch < 0x20 || ch == 0x7f;
+    }), name.end());
+    if (name.empty()) name = mime_type == "image/png" ? "image.png" : "image.jpg";
+    if (name.size() > 255) name.resize(255);
+    return name;
+}
+
+std::string base64_encode(const std::vector<unsigned char>& bytes) {
+    if (bytes.empty()) return {};
+    std::string encoded(4 * ((bytes.size() + 2) / 3), '\0');
+    const int length = EVP_EncodeBlock(
+        reinterpret_cast<unsigned char*>(encoded.data()),
+        bytes.data(), static_cast<int>(bytes.size()));
+    if (length < 0) throw std::runtime_error("base64 encoding failed");
+    encoded.resize(static_cast<std::size_t>(length));
+    return encoded;
+}
+
+std::vector<unsigned char> base64_decode_image(const std::string& encoded) {
+    if (encoded.empty() || encoded.size() % 4 != 0) {
+        throw std::invalid_argument("image data URL contains invalid base64");
+    }
+    const std::size_t upper_bound = (encoded.size() / 4) * 3;
+    if (upper_bound > static_cast<std::size_t>(kMaxImageBytes + 2)) {
+        throw std::invalid_argument("image exceeds the 50 MiB decoded limit");
+    }
+    std::vector<unsigned char> decoded(upper_bound);
+    const int length = EVP_DecodeBlock(decoded.data(),
+        reinterpret_cast<const unsigned char*>(encoded.data()),
+        static_cast<int>(encoded.size()));
+    if (length < 0) throw std::invalid_argument("image data URL contains invalid base64");
+    std::size_t actual = static_cast<std::size_t>(length);
+    if (!encoded.empty() && encoded.back() == '=') --actual;
+    if (encoded.size() >= 2 && encoded[encoded.size() - 2] == '=') --actual;
+    decoded.resize(actual);
+    if (decoded.size() > static_cast<std::size_t>(kMaxImageBytes)) {
+        throw std::invalid_argument("image exceeds the 50 MiB decoded limit");
+    }
+    return decoded;
+}
+
+std::vector<unsigned char> read_attachment_bytes(const std::string& path,
+                                                 int64_t expected_size) {
+    if (expected_size < 0 || expected_size > kMaxImageBytes) {
+        throw std::runtime_error("stored attachment exceeds the image size limit");
+    }
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw std::runtime_error("stored attachment file is unavailable");
+    std::vector<unsigned char> bytes;
+    bytes.resize(static_cast<std::size_t>(expected_size));
+    if (!bytes.empty()) {
+        input.read(reinterpret_cast<char*>(bytes.data()),
+                   static_cast<std::streamsize>(bytes.size()));
+        if (input.gcount() != static_cast<std::streamsize>(bytes.size())) {
+            throw std::runtime_error("stored attachment size does not match metadata");
+        }
+    }
+    char extra = 0;
+    if (input.read(&extra, 1)) {
+        throw std::runtime_error("stored attachment size does not match metadata");
+    }
+    return bytes;
+}
+
+ImageAttachment store_image_bytes(AgentDB& db,
+                                  const std::vector<unsigned char>& bytes,
+                                  const std::string& declared_mime,
+                                  const std::string& original_filename) {
+    const std::string detected = detected_image_mime(bytes);
+    const std::string mime = normalized_image_mime(declared_mime);
+    if (mime != "image/jpeg" && mime != "image/png") {
+        throw std::invalid_argument("only JPEG and PNG images are supported");
+    }
+    if (detected.empty() || detected != mime) {
+        throw std::invalid_argument("image signature does not match the declared MIME type");
+    }
+    if (bytes.empty() || bytes.size() > static_cast<std::size_t>(kMaxImageBytes)) {
+        throw std::invalid_argument("image must be between 1 byte and 50 MiB");
+    }
+
+    ImageAttachment attachment;
+    attachment.id = util::generate_uuid();
+    attachment.original_filename = safe_attachment_filename(original_filename, mime);
+    attachment.mime_type = mime;
+    attachment.relative_path = "attachments/" + attachment.id +
+        (mime == "image/png" ? ".png" : ".jpg");
+    attachment.size_bytes = static_cast<int64_t>(bytes.size());
+    attachment.created_at_ms = util::now_ms();
+    attachment.expires_at_ms = attachment.created_at_ms + kPendingAttachmentTtlMs;
+
+    const std::filesystem::path destination(db.attachment_file_path(attachment));
+    std::filesystem::create_directories(destination.parent_path());
+    const std::filesystem::path temporary = destination.string() + ".part";
+    {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        if (!output) throw std::runtime_error("cannot create managed attachment file");
+        output.write(reinterpret_cast<const char*>(bytes.data()),
+                     static_cast<std::streamsize>(bytes.size()));
+        if (!output) {
+            std::error_code remove_ec;
+            std::filesystem::remove(temporary, remove_ec);
+            throw std::runtime_error("failed to write managed attachment file");
+        }
+    }
+    std::error_code rename_ec;
+    std::filesystem::rename(temporary, destination, rename_ec);
+    if (rename_ec) {
+        std::error_code remove_ec;
+        std::filesystem::remove(temporary, remove_ec);
+        throw std::runtime_error("failed to commit managed attachment file");
+    }
+    try {
+        db.save_attachment(attachment);
+    } catch (...) {
+        std::error_code remove_ec;
+        std::filesystem::remove(destination, remove_ec);
+        throw;
+    }
+    return attachment;
+}
+
+struct PreparedChatTurn {
+    std::string message;
+    std::vector<MessageContentPart> parts;
+    int image_count = 0;
+    int64_t decoded_bytes = 0;
+};
+
+PreparedChatTurn prepare_attachment_turn(AgentDB& db,
+                                         const std::string& message,
+                                         const std::vector<std::string>& attachment_ids) {
+    PreparedChatTurn turn;
+    turn.message = message;
+    if (!message.empty()) {
+        MessageContentPart text_part;
+        text_part.type = "text";
+        text_part.text = message;
+        turn.parts.push_back(std::move(text_part));
+    }
+    if (attachment_ids.size() > static_cast<std::size_t>(kMaxImagesPerContext)) {
+        throw std::invalid_argument("a turn may contain at most 8 images");
+    }
+    for (const auto& id : attachment_ids) {
+        auto attachment = db.get_attachment(id);
+        if (!attachment) throw std::invalid_argument("attachment not found for this agent: " + id);
+        turn.decoded_bytes += attachment->size_bytes;
+        if (turn.decoded_bytes > kMaxDecodedImageBytes) {
+            throw std::invalid_argument("decoded images exceed the 400 MiB turn limit");
+        }
+        MessageContentPart part;
+        part.type = "image_attachment";
+        part.attachment_id = id;
+        part.mime_type = attachment->mime_type;
+        turn.parts.push_back(std::move(part));
+        ++turn.image_count;
+    }
+    return turn;
+}
+
+void hydrate_attachment_parts(AgentDB& db,
+                              std::vector<Message>& messages,
+                              int* image_count,
+                              int64_t* decoded_bytes) {
+    int count = 0;
+    int64_t total = 0;
+    for (auto& message : messages) {
+        for (auto& part : message.content_parts) {
+            if (part.type != "image_attachment") continue;
+            auto attachment = db.get_attachment(part.attachment_id);
+            if (!attachment) {
+                throw std::runtime_error("conversation references a missing attachment");
+            }
+            ++count;
+            total += attachment->size_bytes;
+            if (count > kMaxImagesPerContext) {
+                throw std::runtime_error("hydrated context exceeds the 8-image limit");
+            }
+            if (total > kMaxDecodedImageBytes) {
+                throw std::runtime_error("hydrated context exceeds the 400 MiB decoded-image limit");
+            }
+            auto bytes = read_attachment_bytes(db.attachment_file_path(*attachment),
+                                               attachment->size_bytes);
+            if (detected_image_mime(bytes) != attachment->mime_type) {
+                throw std::runtime_error("stored attachment failed signature validation");
+            }
+            part.type = "image_url";
+            part.image_url = "data:" + attachment->mime_type + ";base64," +
+                             base64_encode(bytes);
+            part.attachment_id.clear();
+        }
+    }
+    if (image_count) *image_count = count;
+    if (decoded_bytes) *decoded_bytes = total;
+}
+
+void append_ordered_text(PreparedChatTurn& turn, const std::string& text) {
+    if (text.empty()) return;
+    turn.message += text;
+    if (!turn.parts.empty() && turn.parts.back().type == "text") {
+        turn.parts.back().text += text;
+    } else {
+        MessageContentPart part;
+        part.type = "text";
+        part.text = text;
+        turn.parts.push_back(std::move(part));
+    }
+}
+
+PreparedChatTurn ingest_openai_messages(AgentDB& db,
+                                        const nlohmann::json& messages) {
+    if (!messages.is_array()) throw std::invalid_argument("messages must be an array");
+    if (messages.empty()) throw std::invalid_argument("messages must not be empty");
+    PreparedChatTurn turn;
+    const bool simple_user = messages.size() == 1 && messages.front().is_object() &&
+        util::to_lower(messages.front().value("role", "user")) == "user";
+
+    for (const auto& message : messages) {
+        if (!message.is_object()) {
+            throw std::invalid_argument("each message must be an object");
+        }
+        std::string role = util::to_lower(util::trim(message.value("role", "user")));
+        if (role.empty()) role = "user";
+        if (!simple_user) append_ordered_text(turn, role + ": ");
+
+        const auto content_it = message.find("content");
+        if (content_it != message.end() && content_it->is_string()) {
+            append_ordered_text(turn, content_it->get<std::string>());
+        } else if (content_it != message.end() && content_it->is_array()) {
+            for (const auto& item : *content_it) {
+                if (!item.is_object()) {
+                    throw std::invalid_argument("message content parts must be objects");
+                }
+                const std::string type = util::to_lower(item.value("type", std::string{}));
+                if (type == "text") {
+                    if (!item.contains("text") || !item.at("text").is_string()) {
+                        throw std::invalid_argument("text content parts require string text");
+                    }
+                    append_ordered_text(turn, item.at("text").get<std::string>());
+                    continue;
+                }
+                if (type != "image_url") {
+                    throw std::invalid_argument("unsupported message content part type: " + type);
+                }
+                if (role != "user") {
+                    throw std::invalid_argument("image_url content parts are allowed only on user messages");
+                }
+                if (++turn.image_count > kMaxImagesPerContext) {
+                    throw std::invalid_argument("a request may contain at most 8 images");
+                }
+                if (!item.contains("image_url")) {
+                    throw std::invalid_argument("image_url content part is missing image_url");
+                }
+                std::string url;
+                const auto& image_url = item.at("image_url");
+                if (image_url.is_string()) url = image_url.get<std::string>();
+                else if (image_url.is_object() && image_url.contains("url") &&
+                         image_url.at("url").is_string()) {
+                    url = image_url.at("url").get<std::string>();
+                } else {
+                    throw std::invalid_argument("image_url must be a string or an object with a string url");
+                }
+                const std::string lower = util::to_lower(url);
+                if (lower.rfind("http://", 0) == 0 || lower.rfind("https://", 0) == 0 ||
+                    lower.rfind("file:", 0) == 0) {
+                    throw std::invalid_argument("remote and file image URLs are not supported");
+                }
+                if (lower.rfind("data:", 0) != 0) {
+                    throw std::invalid_argument("image_url must use a JPEG or PNG base64 data URL");
+                }
+                const auto comma = url.find(',');
+                if (comma == std::string::npos) {
+                    throw std::invalid_argument("malformed image data URL");
+                }
+                const std::string metadata = util::to_lower(url.substr(5, comma - 5));
+                const auto semicolon = metadata.find(';');
+                if (semicolon == std::string::npos ||
+                    metadata.substr(semicolon + 1) != "base64") {
+                    throw std::invalid_argument("image data URL must use base64 encoding");
+                }
+                const std::string mime = normalized_image_mime(metadata.substr(0, semicolon));
+                auto bytes = base64_decode_image(url.substr(comma + 1));
+                turn.decoded_bytes += static_cast<int64_t>(bytes.size());
+                if (turn.decoded_bytes > kMaxDecodedImageBytes) {
+                    throw std::invalid_argument("decoded images exceed the 400 MiB request limit");
+                }
+                const std::string filename = "openai-image-" +
+                    std::to_string(turn.image_count) +
+                    (mime == "image/png" ? ".png" : ".jpg");
+                const auto attachment = store_image_bytes(db, bytes, mime, filename);
+                MessageContentPart part;
+                part.type = "image_attachment";
+                part.attachment_id = attachment.id;
+                part.mime_type = attachment.mime_type;
+                turn.parts.push_back(std::move(part));
+            }
+        } else if (content_it != message.end() && !content_it->is_null()) {
+            throw std::invalid_argument("message content must be a string or array");
+        }
+        if (message.contains("tool_calls") && !message.at("tool_calls").is_null()) {
+            append_ordered_text(turn, "\ntool_calls: " + message.at("tool_calls").dump());
+        }
+        if (!simple_user) append_ordered_text(turn, "\n\n");
+    }
+    turn.message = util::trim(turn.message);
+    if (turn.parts.empty()) {
+        throw std::invalid_argument("messages must include text or image content");
+    }
+    return turn;
 }
 
 } // namespace
@@ -779,6 +1129,8 @@ ControlApiServer::ControlApiServer(AgentManager& agents,
 ControlApiServer::~ControlApiServer() { stop(); }
 
 bool ControlApiServer::listen(uint16_t port) {
+    server_->set_payload_max_length(static_cast<std::size_t>(kMaxImageBytes) +
+                                    (2ULL * 1024 * 1024));
     server_->SetPreRoutingHandler([this](const httplib::Request& req,
                                          httplib::Response& res) {
         return authorize_external_request(req, res);
@@ -789,6 +1141,7 @@ bool ControlApiServer::listen(uint16_t port) {
 }
 
 bool ControlApiServer::listen_openai_compat(uint16_t port) {
+    openai_server_->set_payload_max_length(kOpenAiJsonCeiling);
     openai_server_->SetPreRoutingHandler([this](const httplib::Request& req,
                                                 httplib::Response& res) {
         return authorize_openai_compat_request(req, res);
@@ -816,9 +1169,11 @@ void ControlApiServer::cleanup_expired_tts_cache() {
             remove_file_quietly(entry.audio_path);
             ++removed;
         }
+        removed += static_cast<int>(
+            agent->db().delete_expired_unreferenced_attachments(now).size());
     }
     if (removed > 0) {
-        activity_log(0, "Expired TTS cache entries cleaned: " + std::to_string(removed));
+        activity_log(0, "Expired managed cache entries cleaned: " + std::to_string(removed));
     }
 }
 
@@ -901,7 +1256,6 @@ void ControlApiServer::register_openai_compat_routes() {
     openai_server_->Post("/v1/chat/completions", [this](const Request& req, Response& res) {
         nlohmann::json body;
         std::string requested_model;
-        std::string prompt;
         ConvId conv_id_hint;
         int max_tokens_override = 0;
         bool stream = false;
@@ -912,7 +1266,6 @@ void ControlApiServer::register_openai_compat_routes() {
             if (!body.contains("messages")) {
                 throw std::invalid_argument("messages is required");
             }
-            prompt = openai_messages_to_prompt(body.at("messages"));
             conv_id_hint = util::trim(body.value("conversation_id", std::string{}));
             if (conv_id_hint.empty()) {
                 conv_id_hint = util::trim(body.value("mantic_conversation_id", std::string{}));
@@ -943,11 +1296,41 @@ void ControlApiServer::register_openai_compat_routes() {
             return;
         }
 
+        auto agent = agents_.get_agent(cfg->id);
+        if (!agent) {
+            set_openai_error(res, 404, "agent not found");
+            return;
+        }
+        PreparedChatTurn prepared;
+        try {
+            prepared = ingest_openai_messages(agent->db(), body.at("messages"));
+        } catch (const std::exception& e) {
+            set_openai_error(res, 400, e.what());
+            return;
+        }
+        if (prepared.image_count > 0 && !cfg->vision_settings.enabled) {
+            set_openai_error(res, 422, "this agent profile does not accept images",
+                             "invalid_request_error");
+            return;
+        }
+
         const std::string response_id = "chatcmpl-" + util::generate_uuid();
         const int64_t created = util::now_ms() / 1000;
 
         if (!stream) {
-            auto result = chat_local(cfg->id, prompt, conv_id_hint, max_tokens_override);
+            LocalChatResult result;
+            auto chunk_cb = [&result](const InferenceChunk& chunk) {
+                result.chunks.push_back(chunk);
+            };
+            auto done_cb = [&result](const ConvId& conv_id, bool success,
+                                     const std::string& error) {
+                result.conv_id = conv_id;
+                result.success = success;
+                result.error = error;
+            };
+            handle_chat(cfg->id, prepared.message, conv_id_hint,
+                        std::move(chunk_cb), std::move(done_cb),
+                        max_tokens_override, prepared.parts);
             if (!result.success) {
                 set_openai_error(res,
                                  500,
@@ -1030,7 +1413,7 @@ void ControlApiServer::register_openai_compat_routes() {
         };
         job.process_fn = [this,
                           agent_id = cfg->id,
-                          prompt,
+                          prepared,
                           conv_id_hint,
                           max_tokens_override,
                           chunk_fn,
@@ -1038,11 +1421,12 @@ void ControlApiServer::register_openai_compat_routes() {
                           done_for_catch = done_fn]() mutable {
             try {
                 handle_chat(agent_id,
-                            prompt,
+                            prepared.message,
                             conv_id_hint,
                             std::move(chunk_fn),
                             std::move(done_for_handle),
-                            max_tokens_override);
+                            max_tokens_override,
+                            std::move(prepared.parts));
             } catch (const std::exception& e) {
                 MM_ERROR("OpenAI-compatible chat job for agent '{}' failed: {}",
                          agent_id,
@@ -1087,8 +1471,28 @@ ControlApiServer::LocalChatResult ControlApiServer::chat_local(
     const AgentId& agent_id,
     const std::string& message,
     const ConvId& conv_id_hint,
-    int max_tokens_override) {
+    int max_tokens_override,
+    const std::vector<std::string>& attachment_ids) {
     LocalChatResult result;
+
+    std::vector<MessageContentPart> content_parts;
+    if (!attachment_ids.empty()) {
+        auto agent = agents_.get_agent(agent_id);
+        if (!agent) {
+            result.error = "agent not found";
+            return result;
+        }
+        if (!agent->get_config().vision_settings.enabled) {
+            result.error = "this agent profile does not accept images";
+            return result;
+        }
+        try {
+            content_parts = prepare_attachment_turn(agent->db(), message, attachment_ids).parts;
+        } catch (const std::exception& e) {
+            result.error = e.what();
+            return result;
+        }
+    }
 
     auto chunk_cb = [&result](const InferenceChunk& chunk) {
         result.chunks.push_back(chunk);
@@ -1100,7 +1504,8 @@ ControlApiServer::LocalChatResult ControlApiServer::chat_local(
     };
 
     handle_chat(agent_id, message, conv_id_hint,
-                std::move(chunk_cb), std::move(done_cb), max_tokens_override);
+                std::move(chunk_cb), std::move(done_cb), max_tokens_override,
+                std::move(content_parts));
     return result;
 }
 
@@ -1199,8 +1604,10 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
                                     const ConvId& conv_id_hint,
                                     ChunkCb chunk_cb,
                                     DoneCb done_cb,
-                                    int max_tokens_override) {
+                                    int max_tokens_override,
+                                    std::vector<MessageContentPart> content_parts) {
     // 1. Look up agent
+    const int64_t request_started_ms = util::now_ms();
     auto agent = agents_.get_agent(agent_id);
     if (!agent) {
         MM_WARN("handle_chat: agent '{}' not found", agent_id);
@@ -1209,6 +1616,26 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     }
 
     AgentConfig cfg = agent->get_config();
+    const bool has_images = std::any_of(
+        content_parts.begin(), content_parts.end(), [](const MessageContentPart& part) {
+            return part.type == "image_attachment" || part.type == "image_url";
+        });
+    if (has_images && !cfg.vision_settings.enabled) {
+        done_cb({}, false, "this agent profile does not accept images");
+        return;
+    }
+    PerformanceSample perf;
+    perf.request_id = util::generate_uuid();
+    perf.agent_id = agent_id;
+    perf.backend = agent_backend(cfg);
+    perf.model = cfg.model_path;
+    perf.vision_routing = has_images;
+    if (!cfg.vision_settings.mmproj_path.empty()) {
+        perf.projector_basename =
+            std::filesystem::path(cfg.vision_settings.mmproj_path).filename().string();
+    }
+    perf.started_at_ms = request_started_ms;
+
     AgentDB& db = agent->db();
 
     const bool api_backend = agent_uses_api_backend(cfg);
@@ -1238,6 +1665,21 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     Message user_msg;
     user_msg.role         = MessageRole::User;
     user_msg.content      = message;
+    if (content_parts.empty() && !message.empty()) {
+        MessageContentPart text_part;
+        text_part.type = "text";
+        text_part.text = message;
+        content_parts.push_back(std::move(text_part));
+    }
+    user_msg.content_parts = std::move(content_parts);
+    user_msg.token_count = static_cast<int>((message.size() + 3) / 4);
+    if (has_images) {
+        user_msg.token_count += 2048 * static_cast<int>(std::count_if(
+            user_msg.content_parts.begin(), user_msg.content_parts.end(),
+            [](const MessageContentPart& part) {
+                return part.type == "image_attachment" || part.type == "image_url";
+            }));
+    }
     user_msg.timestamp_ms = util::now_ms();
     db.append_message(conv_id, user_msg, seq);
 
@@ -1376,12 +1818,38 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     int         final_total_tokens = 0;
     const int64_t infer_start_ms = util::now_ms();
     bool        force_prefill_safe = false;
+    perf.queue_ms = infer_start_ms - request_started_ms;
+    int64_t first_token_at_ms = 0;
+
 
     for (int tool_round = 0; tool_round < kMaxToolRounds; ++tool_round) {
         // Build context fresh each round (local memories may have changed)
         std::vector<TraceEvent> context_trace_events =
             build_context_trace_events(db, conv_id, memories);
         std::vector<Message> context_msgs = conv_mgr.build_context(conv_id, cfg, memories);
+
+        try {
+            int context_images = 0;
+            int64_t context_image_bytes = 0;
+            hydrate_attachment_parts(db, context_msgs,
+                                     &context_images, &context_image_bytes);
+            if (tool_round == 0) {
+                perf.image_count = context_images;
+                perf.decoded_image_bytes = context_image_bytes;
+                perf.vision_routing = context_images > 0;
+            }
+        } catch (const std::exception& e) {
+            ok = false;
+            failure_reason = e.what();
+            break;
+        }
+
+        if (tool_round == 0) {
+            for (const auto& context_message : context_msgs) {
+                const auto chars = context_message.content.size() + context_message.thinking_text.size();
+                perf.input_tokens += static_cast<int>((chars + 3) / 4);
+            }
+        }
 
         // Build inference request
         InferenceRequest infer_req;
@@ -1457,6 +1925,10 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
                         finish_reason = j.value("finish_reason", "");
                         return true;
                     }
+                    if (first_token_at_ms == 0 &&
+                        (!chunk.delta_content.empty() || !chunk.thinking_delta.empty() || chunk.tool_call_delta)) {
+                        first_token_at_ms = util::now_ms();
+                    }
                     chunk_cb(chunk);
                 } catch (const std::exception& e) {
                     MM_WARN("handle_chat: SSE parse error: {}", e.what());
@@ -1476,6 +1948,10 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
                     real_runtime.stream_complete(
                         req_to_send,
                         [&](const InferenceChunk& chunk) {
+                            if (!chunk.is_done && first_token_at_ms == 0 &&
+                                (!chunk.delta_content.empty() || !chunk.thinking_delta.empty() || chunk.tool_call_delta)) {
+                                first_token_at_ms = util::now_ms();
+                            }
                             if (chunk.is_done) {
                                 infer_done_seen = true;
                                 total_tokens = chunk.tokens_used;
@@ -1509,6 +1985,9 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
                     infer_http_body = stream_error_message;
                     return false;
                 }
+                if (first_token_at_ms == 0 &&
+                    (!response.content.empty() || !response.thinking_text.empty() || !response.tool_calls.empty()))
+                    first_token_at_ms = util::now_ms();
                 thinking_content = response.thinking_text;
                 assistant_content = response.content;
                 total_tokens = response.token_count;
@@ -1676,28 +2155,43 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     {
         int64_t duration_ms = util::now_ms() - infer_start_ms;
         if (ok) {
-            char buf[256];
+            char buf[384];
             snprintf(buf, sizeof(buf),
-                     "Chat complete: agent='%s' tokens=%d content=%zuB duration=%lldms",
+                     "Chat complete: agent='%s' tokens=%d content=%zuB duration=%lldms "
+                     "images=%d image_bytes=%lld vision=%s projector='%s'",
                      agent_id.c_str(), final_total_tokens,
-                     final_assistant_content.size(), static_cast<long long>(duration_ms));
+                     final_assistant_content.size(), static_cast<long long>(duration_ms),
+                     perf.image_count,
+                     static_cast<long long>(perf.decoded_image_bytes),
+                     perf.vision_routing ? "true" : "false",
+                     perf.projector_basename.c_str());
             activity_log(0, buf);
         } else {
-            char buf[256];
+            char buf[384];
             if (api_backend) {
                 snprintf(buf, sizeof(buf),
-                         "Chat error: agent='%s' backend=api reason='%s' duration=%lldms",
+                         "Chat error: agent='%s' backend=api reason='%s' duration=%lldms "
+                         "images=%d image_bytes=%lld vision=%s projector='%s'",
                          agent_id.c_str(),
                          failure_reason.substr(0, 80).c_str(),
-                         static_cast<long long>(duration_ms));
+                         static_cast<long long>(duration_ms),
+                         perf.image_count,
+                         static_cast<long long>(perf.decoded_image_bytes),
+                         perf.vision_routing ? "true" : "false",
+                         perf.projector_basename.c_str());
             } else {
                 snprintf(buf, sizeof(buf),
-                         "Chat error: agent='%s' node=%s slot=%s reason='%s' duration=%lldms",
+                         "Chat error: agent='%s' node=%s slot=%s reason='%s' duration=%lldms "
+                         "images=%d image_bytes=%lld vision=%s projector='%s'",
                          agent_id.c_str(),
                          schedule_result ? schedule_result->node_id.substr(0, 8).c_str() : "",
                          active_slot_id.substr(0, 8).c_str(),
                          failure_reason.substr(0, 80).c_str(),
-                         static_cast<long long>(duration_ms));
+                         static_cast<long long>(duration_ms),
+                         perf.image_count,
+                         static_cast<long long>(perf.decoded_image_bytes),
+                         perf.vision_routing ? "true" : "false",
+                         perf.projector_basename.c_str());
             }
             activity_log(2, buf);
         }
@@ -1715,6 +2209,16 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
 
     // 11. Signal completion to the SSE client.
     done_cb(conv_id, ok, failure_reason);
+    const int64_t completed_at_ms = util::now_ms();
+    perf.node_id = schedule_result ? schedule_result->node_id : std::string{};
+    perf.time_to_first_token_ms = first_token_at_ms > 0
+        ? first_token_at_ms - infer_start_ms : -1;
+    perf.total_ms = completed_at_ms - infer_start_ms;
+    perf.output_tokens = final_total_tokens;
+    perf.success = ok;
+    perf.error = failure_reason;
+    performance_.record(std::move(perf));
+
 }
 
 // ── queue_global_recall ───────────────────────────────────────────────────────
@@ -1937,6 +2441,7 @@ void ControlApiServer::register_routes() {
             std::string node_url = j.value("node_url", "");
             std::string api_key  = j.value("api_key", "");
             std::string platform = j.value("platform", "");
+            std::string hostname = j.value("hostname", "");
 
             if (node_url.empty() || api_key.empty()) {
                 res.status = 400;
@@ -1962,7 +2467,7 @@ void ControlApiServer::register_routes() {
                 return;
             }
 
-            NodeId node_id = registry_.add_node(node_url, api_key, platform);
+            NodeId node_id = registry_.add_node(node_url, api_key, platform, false, hostname);
             MM_INFO("Node registered: {} @ {}", node_id, node_url);
 
             res.set_content(
@@ -1983,6 +2488,7 @@ void ControlApiServer::register_routes() {
             arr.push_back(nlohmann::json{
                 {"url", d.url},
                 {"node_id", d.node_id},
+                {"hostname", d.hostname},
                 {"last_seen_ms", d.last_seen_ms}
             });
         }
@@ -1996,12 +2502,13 @@ void ControlApiServer::register_routes() {
             const std::string api_key = util::trim(j.value("api_key", std::string{}));
             const std::string platform = util::trim(j.value("platform", std::string{}));
             const bool remember = j.value("remember", false);
+            const std::string hostname = util::trim(j.value("hostname", std::string{}));
             if (url.empty() || api_key.empty()) {
                 res.status = 400;
                 res.set_content(R"({"error":"url and api_key required"})", "application/json");
                 return;
             }
-            const NodeId node_id = registry_.add_node(url, api_key, platform, remember);
+            const NodeId node_id = registry_.add_node(url, api_key, platform, remember, hostname);
             publish_activity(0, "Node added via API: " + node_id + " @ " + url +
                                 (remember ? " (remembered)" : ""));
             res.status = 201;
@@ -2219,6 +2726,26 @@ void ControlApiServer::register_routes() {
         nlohmann::json out = nlohmann::json::array();
         for (int i = start; i < total; ++i) out.push_back(filtered[static_cast<std::size_t>(i)]);
         res.set_content(nlohmann::json{{"entries", out}}.dump(), "application/json");
+    });
+
+    server_->Get("/v1/performance", [this](const Request& req, Response& res) {
+        int tail = 200;
+        if (req.has_param("tail")) {
+            try { tail = std::stoi(req.get_param_value("tail")); }
+            catch (...) {
+                res.status = 400;
+                res.set_content(R"({"error":"tail must be an integer"})", "application/json");
+                return;
+            }
+        }
+        tail = std::clamp(tail, 1, 2000);
+        res.set_content(performance_.snapshot(static_cast<std::size_t>(tail)).dump(),
+                        "application/json");
+    });
+
+    server_->Delete("/v1/performance", [this](const Request&, Response& res) {
+        performance_.clear();
+        res.set_content(R"({"cleared":true})", "application/json");
     });
 
     // ── GET /v1/agents ────────────────────────────────────────────────────────
@@ -2858,27 +3385,174 @@ void ControlApiServer::register_routes() {
     });
 
     // ── POST /v1/agents/:id/chat  (SSE streaming) ─────────────────────────────
+    // Managed image attachments. Uploads stream directly to the agent-owned
+    // directory; SQLite stores metadata and relative paths only.
+    server_->PostUpload("/v1/agents/:id/attachments",
+        [this](const httplib::Request& req, httplib::Response& res,
+               const HttpServer::UploadPump& pump) {
+        const std::string agent_id = req.path_params.at("id");
+        auto agent = agents_.get_agent(agent_id);
+        if (!agent) { set_json_error(res, 404, "agent not found"); return; }
+
+        const std::string mime = normalized_image_mime(
+            req.get_header_value("Content-Type"));
+        if (mime != "image/jpeg" && mime != "image/png") {
+            set_json_error(res, 415, "only image/jpeg and image/png uploads are supported");
+            return;
+        }
+        if (req.has_header("Content-Length")) {
+            try {
+                if (std::stoll(req.get_header_value("Content-Length")) > kMaxImageBytes) {
+                    set_json_error(res, 413, "image exceeds the 50 MiB limit");
+                    return;
+                }
+            } catch (...) {
+                set_json_error(res, 400, "invalid Content-Length");
+                return;
+            }
+        }
+
+        AgentDB& db = agent->db();
+        ImageAttachment attachment;
+        attachment.id = util::generate_uuid();
+        attachment.original_filename = safe_attachment_filename(
+            req.get_header_value("X-Filename"), mime);
+        attachment.mime_type = mime;
+        attachment.relative_path = "attachments/" + attachment.id +
+            (mime == "image/png" ? ".png" : ".jpg");
+        attachment.created_at_ms = util::now_ms();
+        attachment.expires_at_ms = attachment.created_at_ms + kPendingAttachmentTtlMs;
+
+        const std::filesystem::path destination(db.attachment_file_path(attachment));
+        const std::filesystem::path temporary = destination.string() + ".part";
+        std::filesystem::create_directories(destination.parent_path());
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        if (!output) {
+            set_json_error(res, 500, "cannot create managed attachment");
+            return;
+        }
+        std::vector<unsigned char> signature;
+        signature.reserve(8);
+        int64_t received = 0;
+        bool too_large = false;
+        bool write_failed = false;
+        const bool pumped = pump([&](const char* data, std::size_t length) {
+            if (received + static_cast<int64_t>(length) > kMaxImageBytes) {
+                too_large = true;
+                return false;
+            }
+            for (std::size_t i = 0; i < length && signature.size() < 8; ++i)
+                signature.push_back(static_cast<unsigned char>(data[i]));
+            output.write(data, static_cast<std::streamsize>(length));
+            if (!output) { write_failed = true; return false; }
+            received += static_cast<int64_t>(length);
+            return true;
+        });
+        output.close();
+
+        auto remove_temp = [&]() {
+            std::error_code ec;
+            std::filesystem::remove(temporary, ec);
+        };
+        if (too_large) {
+            remove_temp();
+            set_json_error(res, 413, "image exceeds the 50 MiB limit");
+            return;
+        }
+        if (!pumped || write_failed || !output || received == 0) {
+            remove_temp();
+            set_json_error(res, 400, "image upload was interrupted or empty");
+            return;
+        }
+        if (detected_image_mime(signature) != mime) {
+            remove_temp();
+            set_json_error(res, 415,
+                           "image signature does not match the declared MIME type");
+            return;
+        }
+        attachment.size_bytes = received;
+        std::error_code rename_ec;
+        std::filesystem::rename(temporary, destination, rename_ec);
+        if (rename_ec) {
+            remove_temp();
+            set_json_error(res, 500, "failed to commit managed attachment");
+            return;
+        }
+        try {
+            db.save_attachment(attachment);
+        } catch (const std::exception& e) {
+            std::error_code remove_ec;
+            std::filesystem::remove(destination, remove_ec);
+            set_json_error(res, 500, "failed to persist attachment metadata", e.what());
+            return;
+        }
+        res.status = 201;
+        res.set_content(nlohmann::json(attachment).dump(), "application/json");
+    });
+
+    server_->Get("/v1/agents/:id/attachments/:attachment_id",
+        [this](const Request& req, Response& res) {
+        auto agent = agents_.get_agent(req.path_params.at("id"));
+        if (!agent) { set_json_error(res, 404, "agent not found"); return; }
+        auto attachment = agent->db().get_attachment(req.path_params.at("attachment_id"));
+        if (!attachment) { set_json_error(res, 404, "attachment not found"); return; }
+        if (!set_file_response(res, agent->db().attachment_file_path(*attachment),
+                               attachment->mime_type)) {
+            set_json_error(res, 404, "attachment file not found");
+        }
+    });
+
+    server_->Delete("/v1/agents/:id/attachments/:attachment_id",
+        [this](const Request& req, Response& res) {
+        auto agent = agents_.get_agent(req.path_params.at("id"));
+        if (!agent) { set_json_error(res, 404, "agent not found"); return; }
+        bool referenced = false;
+        if (!agent->db().delete_attachment(req.path_params.at("attachment_id"), &referenced)) {
+            if (referenced) set_json_error(res, 409, "attachment is referenced by a message");
+            else set_json_error(res, 404, "attachment not found");
+            return;
+        }
+        res.status = 204;
+    });
+
     server_->Post("/v1/agents/:id/chat", [this](const Request& req, Response& res) {
         std::string agent_id = req.path_params.at("id");
-        if (!agents_.get_agent(agent_id)) { res.status = 404; return; }
+        auto agent = agents_.get_agent(agent_id);
+        if (!agent) { res.status = 404; return; }
 
         std::string message;
+        std::vector<std::string> attachment_ids;
+        PreparedChatTurn prepared;
         ConvId      conv_id_hint;
         int         max_tokens_override = 0;
         try {
             auto j      = nlohmann::json::parse(req.body);
             message     = j.value("message", "");
+            if (j.contains("attachment_ids")) {
+                if (!j.at("attachment_ids").is_array()) {
+                    throw std::invalid_argument("attachment_ids must be an array");
+                }
+                attachment_ids = j.at("attachment_ids").get<std::vector<std::string>>();
+            }
             conv_id_hint = j.value("conversation_id", "");
             max_tokens_override = j.value("max_tokens", 0);
+            prepared = prepare_attachment_turn(agent->db(), message, attachment_ids);
         } catch (const std::exception& e) {
-            MM_WARN("POST /v1/agents/:id/chat: invalid JSON: {}", e.what());
+            MM_WARN("POST /v1/agents/:id/chat: invalid request: {}", e.what());
             res.status = 400;
-            res.set_content(R"({"error":"invalid JSON"})", "application/json");
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(),
+                            "application/json");
             return;
         }
-        if (message.empty()) {
+        if (message.empty() && attachment_ids.empty()) {
             res.status = 400;
-            res.set_content(R"({"error":"message required"})", "application/json");
+            res.set_content(R"({"error":"message required unless attachment_ids are supplied"})", "application/json");
+            return;
+        }
+        if (!attachment_ids.empty() && !agent->get_config().vision_settings.enabled) {
+            res.status = 422;
+            res.set_content(R"({"error":"this agent profile does not accept images"})",
+                            "application/json");
             return;
         }
 
@@ -2945,6 +3619,7 @@ void ControlApiServer::register_routes() {
         job.process_fn = [this,
                           agent_id,
                           message,
+                          content_parts = prepared.parts,
                           conv_id_hint,
                           max_tokens_override,
                           chunk_fn,
@@ -2953,7 +3628,7 @@ void ControlApiServer::register_routes() {
             try {
                 handle_chat(agent_id, message, conv_id_hint,
                             std::move(chunk_fn), std::move(done_for_handle),
-                            max_tokens_override);
+                            max_tokens_override, std::move(content_parts));
             } catch (const std::exception& e) {
                 MM_ERROR("queued chat job for agent '{}' failed: {}", agent_id, e.what());
                 done_for_catch(conv_id_hint, false, e.what());

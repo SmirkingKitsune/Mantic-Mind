@@ -1,6 +1,7 @@
 #include "node/runtime_process.hpp"
 #include "common/logger.hpp"
 #include "common/util.hpp"
+#include "node/llama_runtime.hpp"
 #include "node/vllm_runtime.hpp"
 
 #include <httplib.h>
@@ -217,6 +218,27 @@ bool RuntimeProcess::start_vllm(const std::string& model_ref,
     }
     auto args = build_vllm_server_args(model_ref, settings, port);
     return start_with_args("vLLM", strip_wrapping_quotes(runtime_path_),
+                           std::move(args), port, load_health_timeout_seconds());
+}
+
+bool RuntimeProcess::start_llama_server(const std::string& model_path,
+                                        const std::string& mmproj_path,
+                                        const RuntimeSettings& settings,
+                                        uint16_t port,
+                                        const std::string& slot_save_path) {
+    const std::string runtime_model_path = normalize_llama_model_path(model_path);
+    if (runtime_model_path != strip_wrapping_quotes(model_path)) {
+        MM_INFO("Normalized model path for llama.cpp runtime: '{}' -> '{}'",
+                strip_wrapping_quotes(model_path), runtime_model_path);
+    }
+    const std::string runtime_mmproj_path = normalize_llama_model_path(mmproj_path);
+    if (!mmproj_path.empty() && runtime_mmproj_path != strip_wrapping_quotes(mmproj_path)) {
+        MM_INFO("Normalized projector path for llama.cpp runtime: '{}' -> '{}'",
+                strip_wrapping_quotes(mmproj_path), runtime_mmproj_path);
+    }
+    auto args = build_llama_server_args(runtime_model_path, runtime_mmproj_path, settings, port,
+                                        slot_save_path);
+    return start_with_args("llama.cpp", strip_wrapping_quotes(runtime_path_),
                            std::move(args), port, load_health_timeout_seconds());
 }
 

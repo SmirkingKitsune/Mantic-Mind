@@ -4,5 +4,6 @@ listen_port = 9090
 data_dir = "data"
 models_dir = "models"
 node_health_poll_interval_s = 5
+node_offline_after_s = 90
 tts_enabled = false
 log_file = "logs/control.log"

@@ -9,6 +9,9 @@
 // so the redesign works on any UTF-8 terminal.
 
 #include "common/models.hpp"
+#include <ftxui/component/component.hpp>
+#include <ftxui/component/event.hpp>
+#include <ftxui/component/mouse.hpp>
 #include "common/util.hpp"
 
 #include <ftxui/dom/elements.hpp>
@@ -18,6 +21,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -321,5 +328,203 @@ inline ftxui::Element slot_table(const std::vector<SlotInfo>& slots, bool wide) 
     }
     return vbox(std::move(rows));
 }
+
+inline std::string short_node_id(const NodeId& id, size_t width = 8) {
+    return id.size() <= width ? id : id.substr(0, width);
+}
+
+// Human-first node identity. Hostnames are sufficient until two nodes share
+// one; only then is a short stable identifier appended.
+inline std::string node_display_name(const NodeInfo& node,
+                                     const std::vector<NodeInfo>& all_nodes) {
+    std::string base = node.hostname;
+    if (base.empty()) {
+        const auto parsed = mm::util::parse_url(node.url);
+        base = parsed.first.empty() ? "node" : parsed.first;
+    }
+    const int duplicates = static_cast<int>(std::count_if(
+        all_nodes.begin(), all_nodes.end(), [&](const NodeInfo& other) {
+            std::string other_base = other.hostname;
+            if (other_base.empty()) other_base = mm::util::parse_url(other.url).first;
+            return other_base == base;
+        }));
+    return duplicates > 1 ? base + " [" + short_node_id(node.id) + "]" : base;
+}
+
+inline ftxui::Color connection_color(NodeConnectionStatus status) {
+    switch (status) {
+        case NodeConnectionStatus::Online:      return ftxui::Color::Green;
+        case NodeConnectionStatus::Unreachable: return ftxui::Color::Yellow;
+        case NodeConnectionStatus::Offline:     return ftxui::Color::Red;
+        default:                                return ftxui::Color::GrayDark;
+    }
+}
+
+inline ftxui::Element connection_status_el(const NodeInfo& node) {
+    using namespace ftxui;
+    return text("● " + to_string(node.connection_status)) |
+           color(connection_color(node.connection_status));
+}
+
+inline std::string sample_age(int64_t sampled_at_ms, int64_t now = mm::util::now_ms()) {
+    if (sampled_at_ms <= 0) return "no sample";
+    const int64_t age_s = std::max<int64_t>(0, (now - sampled_at_ms) / 1000);
+    if (age_s < 60) return std::to_string(age_s) + "s ago";
+    if (age_s < 3600) return std::to_string(age_s / 60) + "m ago";
+    return std::to_string(age_s / 3600) + "h ago";
+}
+
+inline ftxui::Element stale_caption(const NodeInfo& node) {
+    using namespace ftxui;
+    if (node.connection_status == NodeConnectionStatus::Online) return text("");
+    return text("last metrics " + sample_age(node.metrics_sampled_at_ms)) | dim;
+}
+
+}  // namespace mm::tui
+
+namespace mm::tui {
+enum class SplitAxis { Columns, Rows };
+
+class ResizableDivider : public ftxui::ComponentBase {
+public:
+    ResizableDivider(int* value, int minimum, int maximum, SplitAxis axis,
+                     std::function<void(int)> changed = {})
+        : value_(value), minimum_(minimum), maximum_(maximum), axis_(axis),
+          changed_(std::move(changed)) {}
+
+    ftxui::Element OnRender() override {
+        using namespace ftxui;
+        Element divider = axis_ == SplitAxis::Columns ? separator() : separator();
+        if (dragging_) divider = std::move(divider) | color(Color::Cyan);
+        return divider | reflect(box_);
+    }
+
+    bool OnEvent(ftxui::Event event) override {
+        using namespace ftxui;
+        if (!event.is_mouse()) return false;
+        auto& mouse = event.mouse();
+        if (mouse.button == Mouse::Left && mouse.motion == Mouse::Pressed &&
+            box_.Contain(mouse.x, mouse.y)) {
+            captured_ = CaptureMouse(event);
+            if (!captured_) return false;
+            dragging_ = true;
+            start_position_ = axis_ == SplitAxis::Columns ? mouse.x : mouse.y;
+            start_value_ = *value_;
+            return true;
+        }
+        if (dragging_ && mouse.motion == Mouse::Moved) {
+            const int position = axis_ == SplitAxis::Columns ? mouse.x : mouse.y;
+            *value_ = std::clamp(start_value_ + position - start_position_, minimum_, maximum_);
+            return true;
+        }
+        if (dragging_ && mouse.motion == Mouse::Released) {
+            dragging_ = false;
+            captured_.reset();
+            if (changed_) changed_(*value_);
+            return true;
+        }
+        return false;
+    }
+
+private:
+    int* value_;
+    int minimum_;
+    int maximum_;
+    SplitAxis axis_;
+    std::function<void(int)> changed_;
+    ftxui::Box box_{};
+    bool dragging_ = false;
+    int start_position_ = 0;
+    int start_value_ = 0;
+    ftxui::CapturedMouse captured_;
+};
+
+inline ftxui::Component resizable_divider(int* value, int minimum, int maximum,
+                                          SplitAxis axis,
+                                          std::function<void(int)> changed = {}) {
+    return std::make_shared<ResizableDivider>(value, minimum, maximum, axis,
+                                              std::move(changed));
+}
+
+class WrappedScrollView : public ftxui::ComponentBase {
+public:
+    explicit WrappedScrollView(std::function<std::string()> content)
+        : content_(std::move(content)) {}
+
+    ftxui::Element OnRender() override {
+        using namespace ftxui;
+        // paragraph() does not reliably wrap each embedded newline-delimited
+        // diagnostic line in all FTXUI/terminal combinations. Render logical
+        // lines separately so long compiler paths and CMake call stacks wrap
+        // instead of disappearing beyond the modal's right edge.
+        Elements wrapped_lines;
+        for (const auto& line : util::split(content_(), '\n'))
+            wrapped_lines.push_back(paragraph(line.empty() ? " " : line));
+        if (wrapped_lines.empty()) wrapped_lines.push_back(text(""));
+        Element body = vbox(std::move(wrapped_lines)) |
+                       focusPositionRelative(0.0f, scroll_position_) |
+                       frame | vscroll_indicator | flex;
+        if (Focused()) body = std::move(body) | color(Color::Cyan);
+        return body | reflect(box_);
+    }
+
+    bool OnEvent(ftxui::Event event) override {
+        using namespace ftxui;
+        float delta = 0.0f;
+        if (event == Event::ArrowUp) delta = -0.04f;
+        else if (event == Event::ArrowDown) delta = 0.04f;
+        else if (event == Event::PageUp) delta = -0.25f;
+        else if (event == Event::PageDown) delta = 0.25f;
+        else if (event == Event::Home) { scroll_position_ = 0.0f; return true; }
+        else if (event == Event::End) { scroll_position_ = 1.0f; return true; }
+        else if (event.is_mouse() && box_.Contain(event.mouse().x, event.mouse().y)) {
+            if (event.mouse().motion == Mouse::Pressed) TakeFocus();
+            if (event.mouse().button == Mouse::WheelUp) delta = -0.08f;
+            else if (event.mouse().button == Mouse::WheelDown) delta = 0.08f;
+            else return event.mouse().motion == Mouse::Pressed;
+        } else {
+            return false;
+        }
+        scroll_position_ = std::clamp(scroll_position_ + delta, 0.0f, 1.0f);
+        return true;
+    }
+
+private:
+    std::function<std::string()> content_;
+    float scroll_position_ = 0.0f;
+    ftxui::Box box_{};
+};
+
+inline ftxui::Component wrapped_scroll_view(std::function<std::string()> content) {
+    return std::make_shared<WrappedScrollView>(std::move(content));
+}
+
+class LayoutStore {
+public:
+    explicit LayoutStore(std::filesystem::path path) : path_(std::move(path)) {
+        std::ifstream input(path_);
+        if (!input) return;
+        try { input >> values_; } catch (...) { values_ = nlohmann::json::object(); }
+    }
+
+    int get(const std::string& key, int fallback, int minimum, int maximum) const {
+        try { return std::clamp(values_.value(key, fallback), minimum, maximum); }
+        catch (...) { return fallback; }
+    }
+
+    void set(const std::string& key, int value) { values_[key] = value; }
+
+    void save() const {
+        std::error_code ec;
+        if (path_.has_parent_path()) std::filesystem::create_directories(path_.parent_path(), ec);
+        std::ofstream output(path_, std::ios::trunc);
+        if (output) output << values_.dump(2) << '\n';
+    }
+
+private:
+    std::filesystem::path path_;
+    nlohmann::json values_ = nlohmann::json::object();
+};
+
 
 }  // namespace mm::tui

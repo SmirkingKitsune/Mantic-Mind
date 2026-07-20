@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include <cstdint>
 
 namespace mm {
@@ -11,19 +12,38 @@ struct NodeConfig {
     std::string control_api_key;    // bearer token for control registration
     uint16_t    listen_port = 7070;
 
-    // Subprocess
+    // Subprocess — vLLM peer backend. llama.cpp is the default runtime on this
+    // branch (vLLM-as-default is preserved on the vLLM-runtime branch), so a
+    // vLLM already on PATH is used but a missing one is NOT auto-installed
+    // unless vllm_auto_provision is enabled.
     std::string vllm_server_path = "vllm";  // vLLM CLI executable or wrapper
     double      vllm_gpu_budget  = 0.90;    // total GPU fraction all vLLM slots may claim
-    bool        vllm_auto_provision = true;
+    bool        vllm_auto_provision = false;
     std::string vllm_provision_dir;
     std::string vllm_install_method = "auto"; // auto|wheel|source
     std::string vllm_version = "latest";
     std::string vllm_python_path;
+
+    // llama.cpp (llama-server) peer backend. Serves GGUF models and accelerators
+    // without a vLLM build (e.g. DGX Spark). Auto provisioning prefers a
+    // matching official release and builds from source only as a fallback.
+    std::string llama_server_path = "llama-server"; // llama-server executable
+    bool        llama_auto_provision = true;
+    std::string llama_provision_dir;
+    std::string llama_install_method = "auto"; // auto|release|source
+    std::string llama_version = "latest";
+    std::string llama_accelerator;             // cuda|rocm|hip|vulkan|openvino|sycl-*|metal|cpu; "" = auto
+    std::string llama_cuda_arch;               // e.g. "121" for DGX Spark GB10; "" = auto
+    std::vector<std::string> llama_cmake_args; // extra -D flags for the source build
+    int         llama_build_jobs = 0;          // 0 = conservative accelerator-aware default
     // Runtime update management. Missing runtimes are always bootstrapped (per
     // vllm_auto_provision); these govern *updating* an existing install.
     std::string vllm_update_policy = "prompt";        // prompt|auto|manual
     bool        vllm_update_check  = true;            // run periodic online checks
     int         vllm_update_check_interval_hours = 24;
+    std::string llama_update_policy = "prompt";       // prompt|auto|manual
+    bool        llama_update_check = true;
+    int         llama_update_check_interval_hours = 24;
 
     // ── Cluster capabilities (multi-node vLLM engine groups) ─────────────────
     // Empty/auto values are filled by runtime detection at startup. Set these

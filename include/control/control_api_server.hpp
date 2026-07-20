@@ -1,12 +1,14 @@
 #pragma once
 
 #include "common/models.hpp"
+#include "control/performance_tracker.hpp"
 #include "control/tts_service_client.hpp"
 #include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <cstdint>
+#include <vector>
 
 namespace httplib { struct Request; struct Response; }
 
@@ -55,7 +57,8 @@ public:
     LocalChatResult chat_local(const AgentId& agent_id,
                                const std::string& message,
                                const ConvId& conv_id_hint = {},
-                               int max_tokens_override = 0);
+                               int max_tokens_override = 0,
+                               const std::vector<std::string>& attachment_ids = {});
 
 private:
     AgentManager&   agents_;
@@ -67,6 +70,7 @@ private:
     std::string     external_api_token_;
     TtsServiceClient tts_;
     std::unique_ptr<HttpServer> server_;
+    PerformanceTracker performance_;
     std::unique_ptr<HttpServer> openai_server_;
     LogCallback     log_cb_;
     mutable std::mutex activity_mutex_;
@@ -90,7 +94,8 @@ private:
                      const ConvId& conv_id_hint,
                      ChunkCb chunk_cb,
                      DoneCb done_cb,
-                     int max_tokens_override = 0);
+                     int max_tokens_override = 0,
+                     std::vector<MessageContentPart> content_parts = {});
 
     // Queue a global recall job for a conversation being deactivated.
     // Runs as an internal inference round where the agent reviews local

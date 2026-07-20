@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <set>
 #include <stdexcept>
 #include <thread>
 
@@ -58,9 +59,22 @@ ApiSettings deserialize_api_settings(const std::string& s) {
     catch (const std::exception& e) { MM_DEBUG("deserialize_api_settings: {}", e.what()); return {}; }
 }
 
+std::string serialize(const VisionSettings& s) {
+    return nlohmann::json(s).dump();
+}
+VisionSettings deserialize_vision_settings(const std::string& s) {
+    try { return nlohmann::json::parse(s).get<VisionSettings>(); }
+    catch (const std::exception& e) { MM_DEBUG("deserialize_vision_settings: {}", e.what()); return {}; }
+}
+
 std::string normalize_inference_backend(std::string backend) {
     backend = util::to_lower(util::trim(backend));
-    if (backend.empty() || backend == "llama.cpp") return "vllm";
+    // llama.cpp is the default runtime on this branch: unspecified resolves to
+    // it, and the legacy llama spellings canonicalize onto the wire form
+    // ("llama-cpp"). "vllm" and "api" pass through unchanged.
+    if (backend.empty()) return "llama-cpp";
+    if (backend == "llama.cpp" || backend == "llama" || backend == "llama-cpp")
+        return "llama-cpp";
     return backend;
 }
 
@@ -92,6 +106,7 @@ void run_with_sqlite_retry(const char* operation, Fn&& fn) {
 
 Message row_to_message(SQLite::Statement& q) {
     Message m;
+    m.storage_id    = q.getColumn("id").getInt64();
     m.role          = message_role_from_string(q.getColumn("role").getText());
     m.content       = q.getColumn("content").getText();
     m.tool_calls    = deserialize_tool_calls(q.getColumn("tool_calls_json").getText());
@@ -101,6 +116,35 @@ Message row_to_message(SQLite::Statement& q) {
     m.timestamp_ms  = q.getColumn("timestamp_ms").getInt64();
     m.trace_events  = deserialize_trace_events(q.getColumn("trace_events_json").getText());
     return m;
+}
+
+ImageAttachment row_to_attachment(SQLite::Statement& q) {
+    ImageAttachment a;
+    a.id = q.getColumn("id").getText();
+    a.original_filename = q.getColumn("original_filename").getText();
+    a.mime_type = q.getColumn("mime_type").getText();
+    a.relative_path = q.getColumn("relative_path").getText();
+    a.size_bytes = q.getColumn("size_bytes").getInt64();
+    a.created_at_ms = q.getColumn("created_at_ms").getInt64();
+    a.expires_at_ms = q.getColumn("expires_at_ms").getInt64();
+    return a;
+}
+
+void load_message_parts(SQLite::Database& db, Message& m) {
+    if (m.storage_id <= 0) return;
+    SQLite::Statement q(db, R"(
+        SELECT type, text, attachment_id
+        FROM message_content_parts
+        WHERE message_id=? ORDER BY ordinal
+    )");
+    q.bind(1, m.storage_id);
+    while (q.executeStep()) {
+        MessageContentPart part;
+        part.type = q.getColumn("type").getText();
+        part.text = q.getColumn("text").getText();
+        part.attachment_id = q.getColumn("attachment_id").getText();
+        m.content_parts.push_back(std::move(part));
+    }
 }
 
 AgentVoiceProfile row_to_voice_profile(SQLite::Statement& q, const AgentId& agent_id) {
@@ -172,6 +216,7 @@ AgentDB::AgentDB(const AgentId& agent_id, const std::string& data_dir)
     namespace fs = std::filesystem;
     fs::path dir = fs::path(data_dir) / "agents" / agent_id;
     fs::create_directories(dir);
+    agent_dir_ = dir.lexically_normal().string();
 
     db_ = std::make_unique<SQLite::Database>(
         (dir / "agent.db").string(),
@@ -189,6 +234,31 @@ AgentDB::AgentDB(const AgentId& agent_id, const std::string& data_dir)
     run_with_sqlite_retry("run_migrations", [&] {
         run_migrations();
     });
+
+    // Startup reconciliation is deliberately scoped to the managed
+    // attachments directory: expire abandoned uploads and remove files that
+    // have no metadata row (including interrupted .part uploads).
+    delete_expired_unreferenced_attachments(util::now_ms());
+    const fs::path attachments_dir = fs::path(agent_dir_) / "attachments";
+    std::error_code dir_ec;
+    fs::create_directories(attachments_dir, dir_ec);
+    std::set<std::string> known_paths;
+    {
+        std::lock_guard g(mutex_);
+        SQLite::Statement q(*db_, "SELECT relative_path FROM attachments");
+        while (q.executeStep()) {
+            known_paths.insert(fs::path(q.getColumn(0).getText())
+                                   .lexically_normal().generic_string());
+        }
+    }
+    for (auto it = fs::recursive_directory_iterator(attachments_dir, dir_ec);
+         !dir_ec && it != fs::recursive_directory_iterator(); it.increment(dir_ec)) {
+        std::error_code file_ec;
+        if (!it->is_regular_file(file_ec)) continue;
+        const auto rel = fs::relative(it->path(), fs::path(agent_dir_), file_ec)
+                             .lexically_normal().generic_string();
+        if (!file_ec && !known_paths.count(rel)) fs::remove(it->path(), file_ec);
+    }
 }
 
 AgentDB::~AgentDB() = default;
@@ -226,7 +296,7 @@ void AgentDB::run_migrations() {
                 name              TEXT    NOT NULL,
                 model_path        TEXT    NOT NULL DEFAULT '',
                 system_prompt     TEXT    NOT NULL DEFAULT '',
-                inference_backend TEXT    NOT NULL DEFAULT 'vllm',
+                inference_backend TEXT    NOT NULL DEFAULT 'llama-cpp',
                 ctx_size          INTEGER NOT NULL DEFAULT 4096,
                 n_gpu_layers      INTEGER NOT NULL DEFAULT -1,
                 n_threads         INTEGER NOT NULL DEFAULT -1,
@@ -236,6 +306,10 @@ void AgentDB::run_migrations() {
                 ubatch_size       INTEGER NOT NULL DEFAULT -1,
                 temperature       REAL    NOT NULL DEFAULT 0.7,
                 top_p             REAL    NOT NULL DEFAULT 0.9,
+                top_k             INTEGER NOT NULL DEFAULT -1,
+                min_p             REAL    NOT NULL DEFAULT -1.0,
+                presence_penalty  REAL    NOT NULL DEFAULT 0.0,
+                repeat_penalty    REAL    NOT NULL DEFAULT -1.0,
                 max_tokens        INTEGER NOT NULL DEFAULT 1024,
                 flash_attn        INTEGER NOT NULL DEFAULT 1,
                 extra_args_json   TEXT    NOT NULL DEFAULT '[]',
@@ -462,8 +536,11 @@ void AgentDB::run_migrations() {
 
     if (!has_version(6)) {
         SQLite::Transaction tx(*db_);
+        // DBs that predate this column are from the pre-vLLM llama.cpp era, so
+        // the backfill default matches this branch's default runtime. Agents
+        // created under the vLLM line store 'vllm' explicitly and are untouched.
         if (!has_column("agent_config", "inference_backend")) {
-            db_->exec("ALTER TABLE agent_config ADD COLUMN inference_backend TEXT NOT NULL DEFAULT 'vllm'");
+            db_->exec("ALTER TABLE agent_config ADD COLUMN inference_backend TEXT NOT NULL DEFAULT 'llama-cpp'");
         }
         if (!has_column("agent_config", "vllm_settings_json")) {
             db_->exec("ALTER TABLE agent_config ADD COLUMN vllm_settings_json TEXT NOT NULL DEFAULT '{}'");
@@ -480,6 +557,62 @@ void AgentDB::run_migrations() {
         db_->exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (7)");
         tx.commit();
     }
+
+    if (!has_version(8)) {
+        SQLite::Transaction tx(*db_);
+        if (!has_column("agent_config", "top_k")) {
+            db_->exec("ALTER TABLE agent_config ADD COLUMN top_k INTEGER NOT NULL DEFAULT -1");
+        }
+        if (!has_column("agent_config", "min_p")) {
+            db_->exec("ALTER TABLE agent_config ADD COLUMN min_p REAL NOT NULL DEFAULT -1.0");
+        }
+        if (!has_column("agent_config", "presence_penalty")) {
+            db_->exec("ALTER TABLE agent_config ADD COLUMN presence_penalty REAL NOT NULL DEFAULT 0.0");
+        }
+        if (!has_column("agent_config", "repeat_penalty")) {
+            db_->exec("ALTER TABLE agent_config ADD COLUMN repeat_penalty REAL NOT NULL DEFAULT -1.0");
+        }
+        db_->exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (8)");
+        tx.commit();
+    }
+
+    if (!has_version(9)) {
+        SQLite::Transaction tx(*db_);
+        if (!has_column("agent_config", "vision_settings_json")) {
+            db_->exec("ALTER TABLE agent_config ADD COLUMN vision_settings_json TEXT NOT NULL DEFAULT '{}'");
+        }
+        db_->exec(R"(
+            CREATE TABLE IF NOT EXISTS attachments (
+                id                TEXT    NOT NULL PRIMARY KEY,
+                original_filename TEXT    NOT NULL DEFAULT '',
+                mime_type         TEXT    NOT NULL,
+                relative_path     TEXT    NOT NULL,
+                size_bytes        INTEGER NOT NULL,
+                created_at_ms     INTEGER NOT NULL,
+                expires_at_ms     INTEGER NOT NULL DEFAULT 0
+            )
+        )");
+        db_->exec(R"(
+            CREATE TABLE IF NOT EXISTS message_content_parts (
+                message_id    INTEGER NOT NULL
+                    REFERENCES messages(id) ON DELETE CASCADE,
+                ordinal       INTEGER NOT NULL,
+                type          TEXT    NOT NULL,
+                text          TEXT    NOT NULL DEFAULT '',
+                attachment_id TEXT
+                    REFERENCES attachments(id) ON DELETE RESTRICT,
+                PRIMARY KEY(message_id, ordinal)
+            )
+        )");
+        db_->exec("CREATE INDEX IF NOT EXISTS idx_parts_attachment ON message_content_parts(attachment_id)");
+        db_->exec("CREATE INDEX IF NOT EXISTS idx_attachments_expiry ON attachments(expires_at_ms)");
+        db_->exec(R"(
+            INSERT OR IGNORE INTO message_content_parts(message_id, ordinal, type, text)
+            SELECT id, 0, 'text', content FROM messages WHERE content <> ''
+        )");
+        db_->exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (9)");
+        tx.commit();
+    }
 }
 
 //
@@ -489,6 +622,7 @@ void AgentDB::save_config(const AgentConfig& cfg) {
     const auto extra_args_json = serialize(s.extra_args);
     const auto vllm_settings_json = serialize(cfg.vllm_settings);
     const auto api_settings_json = serialize(cfg.api_settings);
+    const auto vision_settings_json = serialize(cfg.vision_settings);
     const auto inference_backend = normalize_inference_backend(cfg.inference_backend);
 
     run_with_sqlite_retry("save_config", [&] {
@@ -498,8 +632,9 @@ void AgentDB::save_config(const AgentConfig& cfg) {
                  inference_backend,
                  ctx_size, n_gpu_layers, n_threads, n_threads_http,
                  parallel, batch_size, ubatch_size, temperature, top_p,
+                 top_k, min_p, presence_penalty, repeat_penalty,
                  max_tokens, flash_attn, extra_args_json, vllm_settings_json,
-                 api_settings_json,
+                 api_settings_json, vision_settings_json,
                  reasoning_enabled, memories_enabled, tools_enabled,
                  preferred_node_id, updated_at_ms)
             VALUES
@@ -507,8 +642,9 @@ void AgentDB::save_config(const AgentConfig& cfg) {
                  :inference_backend,
                  :ctx_size,:n_gpu_layers,:n_threads,:n_threads_http,
                  :parallel,:batch_size,:ubatch_size,:temperature,:top_p,
+                 :top_k,:min_p,:presence_penalty,:repeat_penalty,
                  :max_tokens,:flash_attn,:extra_args_json,:vllm_settings_json,
-                 :api_settings_json,
+                 :api_settings_json,:vision_settings_json,
                  :reasoning,:memories,:tools,
                  :preferred_node_id,:now)
             ON CONFLICT(id) DO UPDATE SET
@@ -525,11 +661,16 @@ void AgentDB::save_config(const AgentConfig& cfg) {
                 ubatch_size       = excluded.ubatch_size,
                 temperature       = excluded.temperature,
                 top_p             = excluded.top_p,
+                top_k             = excluded.top_k,
+                min_p             = excluded.min_p,
+                presence_penalty  = excluded.presence_penalty,
+                repeat_penalty    = excluded.repeat_penalty,
                 max_tokens        = excluded.max_tokens,
                 flash_attn        = excluded.flash_attn,
                 extra_args_json   = excluded.extra_args_json,
                 vllm_settings_json = excluded.vllm_settings_json,
                 api_settings_json = excluded.api_settings_json,
+                vision_settings_json = excluded.vision_settings_json,
                 reasoning_enabled = excluded.reasoning_enabled,
                 memories_enabled  = excluded.memories_enabled,
                 tools_enabled     = excluded.tools_enabled,
@@ -551,11 +692,16 @@ void AgentDB::save_config(const AgentConfig& cfg) {
         q.bind(":ubatch_size",       s.ubatch_size);
         q.bind(":temperature",       static_cast<double>(s.temperature));
         q.bind(":top_p",             static_cast<double>(s.top_p));
+        q.bind(":top_k",             s.top_k);
+        q.bind(":min_p",             static_cast<double>(s.min_p));
+        q.bind(":presence_penalty",  static_cast<double>(s.presence_penalty));
+        q.bind(":repeat_penalty",    static_cast<double>(s.repeat_penalty));
         q.bind(":max_tokens",        s.max_tokens);
         q.bind(":flash_attn",        s.flash_attn ? 1 : 0);
         q.bind(":extra_args_json",   extra_args_json);
         q.bind(":vllm_settings_json", vllm_settings_json);
         q.bind(":api_settings_json", api_settings_json);
+        q.bind(":vision_settings_json", vision_settings_json);
         q.bind(":reasoning",         cfg.reasoning_enabled ? 1 : 0);
         q.bind(":memories",          cfg.memories_enabled ? 1 : 0);
         q.bind(":tools",             cfg.tools_enabled ? 1 : 0);
@@ -590,6 +736,10 @@ AgentConfig AgentDB::load_config() const {
     s.ubatch_size   = q.getColumn("ubatch_size").getInt();
     s.temperature   = static_cast<float>(q.getColumn("temperature").getDouble());
     s.top_p         = static_cast<float>(q.getColumn("top_p").getDouble());
+    s.top_k         = q.getColumn("top_k").getInt();
+    s.min_p         = static_cast<float>(q.getColumn("min_p").getDouble());
+    s.presence_penalty = static_cast<float>(q.getColumn("presence_penalty").getDouble());
+    s.repeat_penalty = static_cast<float>(q.getColumn("repeat_penalty").getDouble());
     s.max_tokens    = q.getColumn("max_tokens").getInt();
     s.flash_attn    = q.getColumn("flash_attn").getInt() != 0;
     s.extra_args    = deserialize_strings(q.getColumn("extra_args_json").getText());
@@ -597,6 +747,8 @@ AgentConfig AgentDB::load_config() const {
         deserialize_vllm_settings(q.getColumn("vllm_settings_json").getText());
     cfg.api_settings =
         deserialize_api_settings(q.getColumn("api_settings_json").getText());
+    cfg.vision_settings =
+        deserialize_vision_settings(q.getColumn("vision_settings_json").getText());
 
     cfg.reasoning_enabled  = q.getColumn("reasoning_enabled").getInt() != 0;
     cfg.memories_enabled   = q.getColumn("memories_enabled").getInt()  != 0;
@@ -688,7 +840,11 @@ std::optional<Conversation> AgentDB::load_conversation(const ConvId& id) const {
     SQLite::Statement mq(*db_,
         "SELECT * FROM messages WHERE conversation_id=? ORDER BY sequence_num");
     mq.bind(1, id);
-    while (mq.executeStep()) conv.messages.push_back(row_to_message(mq));
+    while (mq.executeStep()) {
+        auto message = row_to_message(mq);
+        load_message_parts(*db_, message);
+        conv.messages.push_back(std::move(message));
+    }
 
     return conv;
 }
@@ -748,6 +904,26 @@ void AgentDB::delete_conversation(const ConvId& id) {
     SQLite::Statement q(*db_, "DELETE FROM conversations WHERE id=?");
     q.bind(1, id);
     q.exec();
+
+    // Attachments referenced only by this conversation are now orphaned. Keep
+    // still-pending uploads (expires_at_ms > 0) until their normal TTL sweep.
+    std::vector<ImageAttachment> orphans;
+    {
+        SQLite::Statement orphan_q(*db_, R"(
+            SELECT * FROM attachments a
+            WHERE a.expires_at_ms=0 AND NOT EXISTS (
+                SELECT 1 FROM message_content_parts p WHERE p.attachment_id=a.id)
+        )");
+        while (orphan_q.executeStep()) orphans.push_back(row_to_attachment(orphan_q));
+    }
+    for (const auto& attachment : orphans) {
+        SQLite::Statement dq(*db_, "DELETE FROM attachments WHERE id=?");
+        dq.bind(1, attachment.id);
+        dq.exec();
+        const auto path = attachment_file_path(attachment);
+        std::error_code ec;
+        if (!path.empty()) std::filesystem::remove(path, ec);
+    }
 }
 
 void AgentDB::set_active_conversation(const ConvId& id) {
@@ -798,6 +974,35 @@ void AgentDB::append_message(const ConvId& conv_id,
     q.bind(10, ts);
     q.exec();
 
+    const int64_t message_id = db_->getLastInsertRowid();
+    std::vector<MessageContentPart> parts = msg.content_parts;
+    if (parts.empty() && !msg.content.empty()) {
+        MessageContentPart text_part;
+        text_part.type = "text";
+        text_part.text = msg.content;
+        parts.push_back(std::move(text_part));
+    }
+    for (size_t ordinal = 0; ordinal < parts.size(); ++ordinal) {
+        const auto& part = parts[ordinal];
+        SQLite::Statement pq(*db_, R"(
+            INSERT INTO message_content_parts(message_id, ordinal, type, text, attachment_id)
+            VALUES (?,?,?,?,?)
+        )");
+        pq.bind(1, message_id);
+        pq.bind(2, static_cast<int>(ordinal));
+        pq.bind(3, part.type.empty() ? "text" : part.type);
+        pq.bind(4, part.text);
+        if (part.attachment_id.empty()) pq.bind(5);
+        else                            pq.bind(5, part.attachment_id);
+        pq.exec();
+        if (!part.attachment_id.empty()) {
+            SQLite::Statement aq(*db_,
+                "UPDATE attachments SET expires_at_ms=0 WHERE id=?");
+            aq.bind(1, part.attachment_id);
+            aq.exec();
+        }
+    }
+
     // Update running token total on the conversation.
     SQLite::Statement uq(*db_, R"(
         UPDATE conversations
@@ -819,7 +1024,11 @@ std::vector<Message> AgentDB::load_messages(const ConvId& conv_id) const {
         "SELECT * FROM messages WHERE conversation_id=? ORDER BY sequence_num");
     q.bind(1, conv_id);
     std::vector<Message> out;
-    while (q.executeStep()) out.push_back(row_to_message(q));
+    while (q.executeStep()) {
+        auto message = row_to_message(q);
+        load_message_parts(*db_, message);
+        out.push_back(std::move(message));
+    }
     return out;
 }
 
@@ -830,6 +1039,126 @@ int AgentDB::get_total_tokens(const ConvId& conv_id) const {
     q.bind(1, conv_id);
     if (!q.executeStep()) return 0;
     return q.getColumn(0).getInt();
+}
+
+std::string AgentDB::attachment_directory() const {
+    const auto dir = std::filesystem::path(agent_dir_) / "attachments";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir.lexically_normal().string();
+}
+
+std::string AgentDB::attachment_file_path(const ImageAttachment& attachment) const {
+    if (attachment.relative_path.empty()) return {};
+    const auto root = (std::filesystem::path(agent_dir_) / "attachments").lexically_normal();
+    const auto full = (std::filesystem::path(agent_dir_) /
+                       attachment.relative_path).lexically_normal();
+    auto rit = root.begin();
+    auto fit = full.begin();
+    for (; rit != root.end(); ++rit, ++fit) {
+        if (fit == full.end() || *fit != *rit) return {};
+    }
+    return full.string();
+}
+
+void AgentDB::save_attachment(const ImageAttachment& attachment) {
+    if (attachment.id.empty() || attachment.relative_path.empty() ||
+        attachment.mime_type.empty() || attachment.size_bytes < 0 ||
+        attachment_file_path(attachment).empty()) {
+        throw std::invalid_argument("invalid attachment metadata");
+    }
+    std::lock_guard g(mutex_);
+    SQLite::Statement q(*db_, R"(
+        INSERT INTO attachments
+            (id, original_filename, mime_type, relative_path, size_bytes,
+             created_at_ms, expires_at_ms)
+        VALUES (?,?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET
+            original_filename=excluded.original_filename,
+            mime_type=excluded.mime_type,
+            relative_path=excluded.relative_path,
+            size_bytes=excluded.size_bytes,
+            created_at_ms=excluded.created_at_ms,
+            expires_at_ms=excluded.expires_at_ms
+    )");
+    q.bind(1, attachment.id);
+    q.bind(2, attachment.original_filename);
+    q.bind(3, attachment.mime_type);
+    q.bind(4, attachment.relative_path);
+    q.bind(5, attachment.size_bytes);
+    q.bind(6, attachment.created_at_ms);
+    q.bind(7, attachment.expires_at_ms);
+    q.exec();
+}
+
+std::optional<ImageAttachment> AgentDB::get_attachment(const std::string& id) const {
+    std::lock_guard g(mutex_);
+    SQLite::Statement q(*db_, "SELECT * FROM attachments WHERE id=? LIMIT 1");
+    q.bind(1, id);
+    if (!q.executeStep()) return std::nullopt;
+    return row_to_attachment(q);
+}
+
+bool AgentDB::attachment_is_referenced(const std::string& id) const {
+    std::lock_guard g(mutex_);
+    SQLite::Statement q(*db_,
+        "SELECT 1 FROM message_content_parts WHERE attachment_id=? LIMIT 1");
+    q.bind(1, id);
+    return q.executeStep();
+}
+
+bool AgentDB::delete_attachment(const std::string& id, bool* referenced) {
+    std::lock_guard g(mutex_);
+    if (referenced) *referenced = false;
+    ImageAttachment attachment;
+    {
+        SQLite::Statement get_q(*db_, "SELECT * FROM attachments WHERE id=? LIMIT 1");
+        get_q.bind(1, id);
+        if (!get_q.executeStep()) return false;
+        attachment = row_to_attachment(get_q);
+    }
+    SQLite::Statement ref_q(*db_,
+        "SELECT 1 FROM message_content_parts WHERE attachment_id=? LIMIT 1");
+    ref_q.bind(1, id);
+    if (ref_q.executeStep()) {
+        if (referenced) *referenced = true;
+        return false;
+    }
+    SQLite::Statement delete_q(*db_, "DELETE FROM attachments WHERE id=?");
+    delete_q.bind(1, id);
+    delete_q.exec();
+    const auto path = attachment_file_path(attachment);
+    if (!path.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+    return true;
+}
+
+std::vector<ImageAttachment> AgentDB::delete_expired_unreferenced_attachments(
+    int64_t now_ms) {
+    std::lock_guard g(mutex_);
+    std::vector<ImageAttachment> removed;
+    {
+        SQLite::Statement q(*db_, R"(
+            SELECT * FROM attachments a
+            WHERE a.expires_at_ms>0 AND a.expires_at_ms<=? AND NOT EXISTS (
+                SELECT 1 FROM message_content_parts p WHERE p.attachment_id=a.id)
+        )");
+        q.bind(1, now_ms);
+        while (q.executeStep()) removed.push_back(row_to_attachment(q));
+    }
+    for (const auto& attachment : removed) {
+        SQLite::Statement dq(*db_, "DELETE FROM attachments WHERE id=?");
+        dq.bind(1, attachment.id);
+        dq.exec();
+        const auto path = attachment_file_path(attachment);
+        if (!path.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+    }
+    return removed;
 }
 
 //

@@ -16,6 +16,8 @@ set(MM_COMMON_SOURCES
     node_discovery.cpp
     cli_repl.cpp
     inference_response_parser.cpp
+    gguf_metadata.cpp
+    inference_sizing.cpp
 )
 
 add_library(mm_common STATIC ${MM_COMMON_SOURCES})

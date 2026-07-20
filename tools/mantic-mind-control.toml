@@ -26,6 +26,10 @@ data_dir = "data"
 # How often (seconds) to poll registered nodes for health metrics.
 node_health_poll_interval_s = 30
 
+# After this many seconds without a successful poll, label a node offline.
+# Before the threshold it is shown as unreachable. Environment: MM_NODE_OFFLINE_AFTER_S.
+node_offline_after_s = 90
+
 # ── Logging ────────────────────────────────────────────────────────────────────
 # Qwen3-TTS. Disabled by default.
 # Environment variables:

@@ -13,6 +13,7 @@ struct ControlConfig {
     std::string data_dir    = "data";
     std::string log_file    = "logs/mantic-mind-control.log";
     uint32_t    node_health_poll_interval_s = 30;
+    uint32_t    node_offline_after_s = 90;
 
     // Model distribution
     std::string models_dir  = "models";
