@@ -257,6 +257,8 @@ void ControlUI::run() {
     std::string ed_served_model;
     std::string ed_api_base{"https://api.openai.com"}, ed_api_path{"/v1/chat/completions"};
     std::string ed_api_key, ed_api_key_env{"OPENAI_API_KEY"};
+    bool ed_vision{false};
+    std::string ed_mmproj;
     bool ed_reasoning{false}, ed_memories{true}, ed_tools{false};
     bool ed_sleep{true}, ed_prefix{true}, ed_trust{false}, ed_autotool{false};
     ModelCapabilityInfo ed_model_info;
@@ -296,6 +298,7 @@ void ControlUI::run() {
     std::vector<std::string> chat_agent_entries;
     std::vector<AgentConfig> chat_agent_rows;   // per-frame snapshot for the rich menu rows
     std::string chat_input;
+    std::vector<fs::path> chat_staged_paths;
 
     std::mutex              chat_mutex;
     std::deque<std::string> chat_transcript;
@@ -357,6 +360,8 @@ void ControlUI::run() {
     std::vector<fs::path>     fb_entry_paths;
     std::vector<bool>         fb_entry_is_dir;
     int fb_sel = 0;
+    enum class FileBrowserTarget { Model, Projector, ChatImage };
+    FileBrowserTarget fb_target = FileBrowserTarget::Model;
 
     //
 
@@ -474,7 +479,11 @@ void ControlUI::run() {
                      fb_current_path,
                      fs::directory_options::skip_permission_denied)) {
                 bool d = e.is_directory();
-                bool g = e.is_regular_file() && e.path().extension() == ".gguf";
+                const std::string ext = util::to_lower(e.path().extension().string());
+                bool g = e.is_regular_file() &&
+                    (fb_target == FileBrowserTarget::ChatImage
+                        ? (ext == ".jpg" || ext == ".jpeg" || ext == ".png")
+                        : ext == ".gguf");
                 if (d || g) raw.push_back({e.path(), d});
             }
             std::sort(raw.begin(), raw.end(), [](auto& a, auto& b) {
@@ -537,6 +546,8 @@ void ControlUI::run() {
         cfg.api_settings.chat_completions_path = ed_api_path;
         cfg.api_settings.api_key_env = ed_api_key_env;
         if (!ed_api_key.empty()) cfg.api_settings.api_key = ed_api_key;
+        cfg.vision_settings.enabled = ed_vision;
+        cfg.vision_settings.mmproj_path = ed_mmproj;
 
         // Keep ctx_size aligned with max_model_len so the shared contract has a context.
         cfg.reasoning_enabled = ed_reasoning;
@@ -588,6 +599,7 @@ void ControlUI::run() {
             ed_threads_s + '\n' + ed_threads_http_s + '\n' + ed_parallel_s + '\n' + ed_batch_s + '\n' +
             ed_ubatch_s + '\n' + ed_llama_extra_args_text + '\n' + ed_served_model + '\n' +
             ed_api_base + '\n' + ed_api_path + '\n' + ed_api_key + '\n' + ed_api_key_env + '\n' +
+            (ed_vision ? "1" : "0") + '\n' + ed_mmproj + '\n' +
             (ed_flash ? "1" : "0") +
             (ed_reasoning ? "1" : "0") + (ed_memories ? "1" : "0") + (ed_tools ? "1" : "0") +
             (ed_sleep ? "1" : "0") + (ed_prefix ? "1" : "0") + (ed_trust ? "1" : "0") +
@@ -919,7 +931,8 @@ void ControlUI::run() {
         auto flag = [](bool on, const char* ch) -> Element {
             return on ? (text(ch) | bold) : (text(ch) | dim);
         };
-        Element flags = hbox({flag(a.reasoning_enabled, "R"), text(" "),
+        Element flags = hbox({flag(a.vision_settings.enabled, "V"), text(" "),
+                              flag(a.reasoning_enabled, "R"), text(" "),
                               flag(a.memories_enabled, "M"), text(" "),
                               flag(a.tools_enabled, "T")});
         std::string node = a.preferred_node_id.empty() ? "auto" : a.preferred_node_id;
@@ -927,7 +940,7 @@ void ControlUI::run() {
         Element row = hbox({
             mm::tui::col(text(a.name) | bold, 14), sep(),
             mm::tui::col(text(mm::tui::short_model(a.model_path, 26)), 26), sep(),
-            mm::tui::col(std::move(flags), 7), sep(),
+            mm::tui::col(std::move(flags), 9), sep(),
             mm::tui::col(text(node) | (a.preferred_node_id.empty() ? dim : color(Color::Cyan)), 10),
         });
         if (st.active) row = std::move(row) | inverted;
@@ -951,6 +964,7 @@ void ControlUI::run() {
         ed_served_model.clear();
         ed_api_base = "https://api.openai.com"; ed_api_path = "/v1/chat/completions";
         ed_api_key.clear(); ed_api_key_env = "OPENAI_API_KEY";
+        ed_vision = false; ed_mmproj.clear();
         ed_reasoning = false; ed_memories = true; ed_tools = false;
         ed_sleep = true; ed_prefix = true; ed_trust = false; ed_autotool = false;
         ed_model_info = {};
@@ -1008,6 +1022,8 @@ void ControlUI::run() {
             ed_api_path = c.api_settings.chat_completions_path;
             ed_api_key.clear();
             ed_api_key_env = c.api_settings.api_key_env;
+            ed_vision = c.vision_settings.enabled;
+            ed_mmproj = c.vision_settings.mmproj_path;
 
             ed_sleep = c.vllm_settings.enable_sleep_mode;
             ed_prefix = c.vllm_settings.enable_prefix_caching;
@@ -1088,6 +1104,8 @@ void ControlUI::run() {
     secret.placeholder = "leave blank to retain current key";
     auto ed_inp_api_key = Input(&ed_api_key, secret);
     auto ed_inp_api_key_env = Input(&ed_api_key_env, sl);
+    auto ed_inp_mmproj = Input(&ed_mmproj, sl);
+    auto ed_cb_vision = Checkbox("Vision", &ed_vision);
 
     auto ed_cb_sleep     = Checkbox("sleep_mode",   &ed_sleep);
     auto ed_cb_prefix    = Checkbox("prefix_cache", &ed_prefix);
@@ -1098,6 +1116,7 @@ void ControlUI::run() {
     auto ed_cb_tools     = Checkbox("Tools",        &ed_tools);
 
     auto btn_browse_model = Button("[Browse]", [&] {
+        fb_target = FileBrowserTarget::Model;
         fs::path init;
         if (!ed_model.empty()) {
             fs::path mp(ed_model);
@@ -1111,6 +1130,23 @@ void ControlUI::run() {
         show_file_browser = true;
     }, ButtonOption::Simple());
     auto model_row = Container::Horizontal({ed_inp_model, btn_browse_model});
+    auto btn_browse_mmproj = Button("[Browse]", [&] {
+        fb_target = FileBrowserTarget::Projector;
+        fs::path init;
+        if (!ed_mmproj.empty()) {
+            const fs::path projector(ed_mmproj);
+            init = fs::exists(projector.parent_path())
+                ? projector.parent_path() : fs::current_path();
+        } else if (!ed_model.empty() && fs::exists(fs::path(ed_model).parent_path())) {
+            init = fs::path(ed_model).parent_path();
+        } else {
+            init = fs::current_path();
+        }
+        fb_current_path = init;
+        refresh_fb();
+        show_file_browser = true;
+    }, ButtonOption::Simple());
+    auto mmproj_row = Container::Horizontal({ed_inp_mmproj, btn_browse_mmproj});
 
     auto btn_save_a   = Button(" Save ", [&] {
         refresh_editor_validation();
@@ -1194,6 +1230,7 @@ void ControlUI::run() {
         ed_cb_sleep, ed_cb_prefix, ed_cb_trust, ed_cb_autotool,
         ed_inp_ctx, ed_inp_gpu_layers, ed_inp_threads, ed_inp_threads_http,
         ed_inp_parallel, ed_inp_batch, ed_inp_ubatch, ed_cb_flash, ed_inp_llama_extra,
+        ed_cb_vision, mmproj_row,
         ed_inp_served_model, ed_inp_api_base, ed_inp_api_path, ed_inp_api_key_env, ed_inp_api_key});
     auto engine_m = Maybe(engine_fields, [&] { return ed_open_engine; });
     auto caps_fields = Container::Vertical({ed_cb_reasoning, ed_cb_memories, ed_cb_tools});
@@ -1229,8 +1266,30 @@ void ControlUI::run() {
         if (fb_sel < 0 || fb_sel >= static_cast<int>(fb_entry_paths.size())) return;
         if (fb_entry_is_dir[fb_sel]) { fb_navigate(); return; }
         auto chosen = fb_entry_paths[fb_sel];
-        ed_model = chosen.string();
-        refresh_editor_validation();
+        if (fb_target == FileBrowserTarget::Model) {
+            ed_model = chosen.string();
+            refresh_editor_validation();
+        } else if (fb_target == FileBrowserTarget::Projector) {
+            ed_mmproj = chosen.string();
+            refresh_editor_validation();
+        } else {
+            std::error_code ec;
+            const auto size = fs::file_size(chosen, ec);
+            int64_t total = 0;
+            for (const auto& path : chat_staged_paths) {
+                std::error_code size_ec;
+                total += static_cast<int64_t>(fs::file_size(path, size_ec));
+            }
+            if (ec || size > 50ULL * 1024 * 1024 ||
+                chat_staged_paths.size() >= 8 ||
+                total + static_cast<int64_t>(size) > 400LL * 1024 * 1024) {
+                std::lock_guard<std::mutex> lk(chat_mutex);
+                chat_last_error = "Cannot stage image: 8 images, 50 MiB each, 400 MiB total maximum";
+            } else if (std::find(chat_staged_paths.begin(), chat_staged_paths.end(), chosen) ==
+                       chat_staged_paths.end()) {
+                chat_staged_paths.push_back(chosen);
+            }
+        }
         show_file_browser = false;
     };
 
@@ -1258,9 +1317,14 @@ void ControlUI::run() {
                                      : fb_current_path.string();
         std::string empty_msg  = fb_current_path.empty()
                                      ? "  (no drives detected)"
-                                     : "  (no .gguf files or subdirectories here)";
+                                     : (fb_target == FileBrowserTarget::ChatImage
+                                            ? "  (no JPEG/PNG files or subdirectories here)"
+                                            : "  (no .gguf files or subdirectories here)");
         return vbox({
-            text(" Select Model File ") | bold | hcenter,
+            text(fb_target == FileBrowserTarget::ChatImage
+                     ? " Select JPEG/PNG Image "
+                     : fb_target == FileBrowserTarget::Projector
+                         ? " Select GGUF Projector " : " Select Model File ") | bold | hcenter,
             separator(),
             text("  " + path_label) | color(Color::GrayDark),
             separator(),
@@ -1438,16 +1502,35 @@ void ControlUI::run() {
             mm::tui::col(text(a.name) | bold, 12),
             text(" │ ") | dim,
             mm::tui::col(text(mm::tui::short_model(a.model_path, 16)) | dim, 16),
+            a.vision_settings.enabled ? (text(" V") | color(Color::Cyan)) : text(""),
         });
         if (st.active) row = std::move(row) | inverted;
         return row;
     };
     auto chat_agent_menu = Menu(&chat_agent_entries, &chat_agent_sel, chat_menu_opt);
     auto chat_agent_menu_m = Maybe(chat_agent_menu, [&]() { return !chat_agent_entries.empty(); });
+    auto btn_chat_attach = Button(" Attach Images ", [&] {
+        if (chat_inflight.load()) return;
+        fb_target = FileBrowserTarget::ChatImage;
+        fb_current_path = chat_staged_paths.empty()
+            ? fs::current_path() : chat_staged_paths.back().parent_path();
+        refresh_fb();
+        show_file_browser = true;
+    }, ButtonOption::Simple());
+    auto btn_chat_clear_images = Button(" Clear Images ", [&] {
+        if (chat_inflight.load()) return;
+        std::lock_guard<std::mutex> lk(chat_mutex);
+        chat_staged_paths.clear();
+    }, ButtonOption::Simple());
 
     auto btn_chat_send = Button(" Send ", [&] {
         if (chat_inflight.load()) return;
-        if (chat_input.empty()) return;
+        std::vector<fs::path> staged_images;
+        {
+            std::lock_guard<std::mutex> lk(chat_mutex);
+            staged_images = chat_staged_paths;
+        }
+        if (chat_input.empty() && staged_images.empty()) return;
 
         auto chat_agents = agents_.list_agents();
         if (chat_agents.empty()) return;
@@ -1455,6 +1538,12 @@ void ControlUI::run() {
 
         const std::string agent_id = chat_agents[chat_agent_sel].id;
         const std::string agent_name = chat_agents[chat_agent_sel].name;
+        if (!staged_images.empty() && !chat_agents[chat_agent_sel].vision_settings.enabled) {
+            std::lock_guard<std::mutex> lk(chat_mutex);
+            chat_status = "failed";
+            chat_last_error = "Selected agent profile does not accept images";
+            return;
+        }
         const std::string prompt = chat_input;
         chat_input.clear();
 
@@ -1469,12 +1558,18 @@ void ControlUI::run() {
             chat_last_conv_id.clear();
             chat_partial_assistant.clear();
             chat_transcript.push_back("User [" + agent_name + "]: " + prompt);
+            for (const auto& image : staged_images) {
+                std::error_code ec;
+                const auto bytes = fs::file_size(image, ec);
+                chat_transcript.push_back("  image: " + image.filename().string() +
+                    (ec ? std::string{} : " (" + std::to_string(bytes) + " bytes)"));
+            }
             trim_chat_transcript();
         }
         chat_inflight = true;
         refresh();
 
-        chat_thread = std::thread([&, agent_id, prompt]() {
+        chat_thread = std::thread([&, agent_id, prompt, staged_images]() {
             bool done_seen = false;
             bool done_success = true;
             std::string done_error;
@@ -1492,6 +1587,60 @@ void ControlUI::run() {
             // Intentionally single-shot: one user prompt maps to one backend request.
             // Avoids duplicate turns when transient transport issues happen mid-stream.
             const std::string base_url = control_base_url_;
+
+            if (!staged_images.empty()) {
+                if (base_url.empty()) {
+                    std::lock_guard<std::mutex> lk(chat_mutex);
+                    chat_status = "failed";
+                    chat_last_error = "Image upload requires the control HTTP API";
+                    chat_transcript.push_back("Error: " + chat_last_error);
+                    chat_inflight = false;
+                    refresh();
+                    return;
+                }
+                std::vector<std::string> attachment_ids;
+                HttpClient upload_client(base_url);
+                upload_client.set_bearer_token(control_api_token_);
+                for (const auto& image : staged_images) {
+                    const std::string ext = util::to_lower(image.extension().string());
+                    const std::string mime = ext == ".png" ? "image/png" : "image/jpeg";
+                    auto response = upload_client.post_file(
+                        "/v1/agents/" + agent_id + "/attachments",
+                        image.string(), {{"X-Filename", image.filename().string()}}, mime);
+                    if (!response.ok()) {
+                        std::lock_guard<std::mutex> lk(chat_mutex);
+                        chat_status = "failed";
+                        chat_last_error = "Image upload failed: " + parse_api_error(response);
+                        chat_transcript.push_back("Error: " + chat_last_error);
+                        chat_inflight = false;
+                        refresh();
+                        return;
+                    }
+                    try {
+                        attachment_ids.push_back(
+                            nlohmann::json::parse(response.body).at("id").get<std::string>());
+                    } catch (...) {
+                        std::lock_guard<std::mutex> lk(chat_mutex);
+                        chat_status = "failed";
+                        chat_last_error = "Image upload returned invalid attachment metadata";
+                        chat_transcript.push_back("Error: " + chat_last_error);
+                        chat_inflight = false;
+                        refresh();
+                        return;
+                    }
+                }
+                body["attachment_ids"] = attachment_ids;
+                {
+                    std::lock_guard<std::mutex> lk(chat_mutex);
+                    for (const auto& sent : staged_images) {
+                        chat_staged_paths.erase(
+                            std::remove(chat_staged_paths.begin(), chat_staged_paths.end(), sent),
+                            chat_staged_paths.end());
+                    }
+                    chat_status = "sending";
+                }
+                refresh();
+            }
 
             auto stream_cb = [&](const std::string& data) -> bool {
                 // Abort promptly on shutdown: returning false ends the cpp-httplib
@@ -1540,7 +1689,8 @@ void ControlUI::run() {
             // Only use local fallback when there was no transport-level response
             // and no stream payload at all. This prevents duplicate turns when
             // a partial or completed stream already reached the UI.
-            if (!stream_ok && stream_status == 0 && !stream_payload_seen && !done_seen && local_chat_fallback_) {
+            if (staged_images.empty() && !stream_ok && stream_status == 0 &&
+                !stream_payload_seen && !done_seen && local_chat_fallback_) {
                 local_fallback_used = true;
                 std::string local_text;
                 std::string local_conv_id;
@@ -1669,6 +1819,7 @@ void ControlUI::run() {
     }, ButtonOption::Simple());
 
     auto chat_btn_row = Container::Horizontal({btn_chat_send, btn_chat_clear});
+    auto chat_image_btn_row = Container::Horizontal({btn_chat_attach, btn_chat_clear_images});
     auto chat_transcript_scroll = mm::tui::wrapped_scroll_view([&]() {
         std::lock_guard<std::mutex> lk(chat_mutex);
         std::string transcript;
@@ -1685,7 +1836,8 @@ void ControlUI::run() {
         return transcript.empty() ? std::string{"(no chat yet)"} : transcript;
     });
     auto chat_comp = Container::Vertical(
-        {chat_agent_menu_m, chat_input_comp, chat_btn_row, chat_transcript_scroll});
+        {chat_agent_menu_m, chat_input_comp, chat_image_btn_row,
+         chat_btn_row, chat_transcript_scroll});
 
     //
 
@@ -2115,7 +2267,10 @@ void ControlUI::run() {
             const NodeInfo& n = node_rows[static_cast<size_t>(node_sel)];
             node_slot_entries.clear();
             for (const auto& slot : n.slots)
-                node_slot_entries.push_back(slot.id + "  " + to_string(slot.state) + "  " + mm::tui::short_model(slot.model_path));
+                node_slot_entries.push_back(slot.id + "  " + to_string(slot.state) + "  " +
+                    mm::tui::short_model(slot.model_path) +
+                    (slot.vision_enabled ? "  [vision " +
+                        fs::path(slot.mmproj_path).filename().string() + "]" : ""));
             if (node_slot_sel >= static_cast<int>(n.slots.size()))
                 node_slot_sel = std::max(0, static_cast<int>(n.slots.size()) - 1);
 
@@ -2253,6 +2408,19 @@ void ControlUI::run() {
                           field(" batch", ed_inp_batch->Render() | flex),
                           field(" ubatch", ed_inp_ubatch->Render() | flex)}),
                     ed_cb_flash->Render(),
+                    ed_cb_vision->Render(),
+                    hbox({text(" projector") | dim | size(WIDTH, EQUAL, 15),
+                          ed_inp_mmproj->Render() | flex, text(" "), btn_browse_mmproj->Render()}),
+                    [&]() -> Element {
+                        const auto suggestions = suggest_mmproj_files(ed_model);
+                        if (suggestions.empty()) return text("  no adjacent mmproj-*.gguf suggestions") | dim;
+                        std::string line = "  suggestions: ";
+                        for (std::size_t i = 0; i < suggestions.size() && i < 3; ++i) {
+                            if (i > 0) line += " | ";
+                            line += fs::path(suggestions[i]).filename().string();
+                        }
+                        return text(line) | color(Color::Cyan);
+                    }(),
                     field(" extra args", ed_inp_llama_extra->Render() | border | size(HEIGHT, LESS_THAN, 4)),
                 });
             } else if (ed_backend == 1) {
@@ -2269,6 +2437,10 @@ void ControlUI::run() {
                     field(" tool parser", ed_inp_toolparser->Render() | flex),
                     hbox({ed_cb_sleep->Render(), text("  "), ed_cb_prefix->Render(), text("  "),
                           ed_cb_trust->Render(), text("  "), ed_cb_autotool->Render()}),
+                    ed_cb_vision->Render(),
+                    text("Vision uses the model-native vLLM processor; projector must be empty") | dim,
+                    hbox({text(" projector") | dim | size(WIDTH, EQUAL, 15),
+                          ed_inp_mmproj->Render() | flex}),
                     field(" extra args", ed_inp_extra->Render() | border | size(HEIGHT, LESS_THAN, 4)),
                 });
             } else {
@@ -2277,6 +2449,10 @@ void ControlUI::run() {
                     field(" chat path", ed_inp_api_path->Render() | flex),
                     field(" key env", ed_inp_api_key_env->Render() | flex),
                     field(" API key", ed_inp_api_key->Render() | flex),
+                    ed_cb_vision->Render(),
+                    text("Vision declares that the remote model accepts images; projector must be empty") | dim,
+                    hbox({text(" projector") | dim | size(WIDTH, EQUAL, 15),
+                          ed_inp_mmproj->Render() | flex}),
                     text("API keys are process-local and never persisted") | dim,
                 });
             }
@@ -2345,7 +2521,7 @@ void ControlUI::run() {
         Element head = hbox({
             col(text("NAME"), 14), sep(),
             col(text("MODEL"), 26), sep(),
-            col(text("R M T"), 7), sep(),
+            col(text("V R M T"), 9), sep(),
             col(text("NODE"), 10),
         }) | dim | bold;
         Element list_body = cs.empty()
@@ -2383,10 +2559,16 @@ void ControlUI::run() {
                            (a.vllm_settings.enable_sleep_mode ? " · sleep" : ""))}),
                 hbox({text("caps     ") | dim, feat(a.reasoning_enabled, "reasoning"), text("  "),
                       feat(a.memories_enabled, "memories"), text("  "),
-                      feat(a.tools_enabled, "tools")}),
-            })) | size(HEIGHT, EQUAL, 9);
+                      feat(a.tools_enabled, "tools"), text("  "),
+                      feat(a.vision_settings.enabled, "vision")}),
+                a.vision_settings.mmproj_path.empty()
+                    ? text("")
+                    : hbox({text("projector") | dim,
+                            text(" " + fs::path(a.vision_settings.mmproj_path).filename().string()) |
+                                color(Color::Cyan)}),
+            })) | size(HEIGHT, EQUAL, 10);
         } else {
-            detail_panel = panel("AGENT", text("  (no agents)") | dim) | size(HEIGHT, EQUAL, 9);
+            detail_panel = panel("AGENT", text("  (no agents)") | dim) | size(HEIGHT, EQUAL, 10);
         }
 
         return vbox({list_panel, detail_panel});
@@ -2521,11 +2703,13 @@ void ControlUI::run() {
         std::string status_snapshot;
         std::string error_snapshot;
         std::string conv_snapshot;
+        std::vector<fs::path> staged_snapshot;
         {
             std::lock_guard<std::mutex> lk(chat_mutex);
             status_snapshot = chat_status;
             error_snapshot = chat_last_error;
             conv_snapshot = chat_last_conv_id;
+            staged_snapshot = chat_staged_paths;
         }
 
         using mm::tui::panel;
@@ -2545,6 +2729,18 @@ void ControlUI::run() {
         Element chat_head = hbox({
             mm::tui::col(text("NAME"), 12), text(" │ ") | dim, text("MODEL"),
         }) | dim | bold;
+        Elements staged_lines;
+        if (staged_snapshot.empty()) {
+            staged_lines.push_back(text("  (no staged images)") | dim);
+        } else {
+            for (const auto& image : staged_snapshot) {
+                std::error_code ec;
+                const auto bytes = fs::file_size(image, ec);
+                staged_lines.push_back(text("  " + image.filename().string() +
+                    (ec ? std::string{} : " - " + std::to_string(bytes) + " B")) |
+                    color(Color::Cyan));
+            }
+        }
         Element left = panel("AGENT", vbox({
             chat_head,
             separator(),
@@ -2553,6 +2749,10 @@ void ControlUI::run() {
             separator(),
             text(" prompt") | dim,
             chat_input_comp->Render() | border,
+            hbox({text(" images") | dim, filler(),
+                  text(std::to_string(staged_snapshot.size()) + "/8") | dim}),
+            vbox(std::move(staged_lines)) | size(HEIGHT, LESS_THAN, 4) | yframe,
+            chat_image_btn_row->Render(),
             chat_btn_row->Render(),
             text(chat_inflight.load() ? "  send blocked while streaming" : "  streams SSE") | dim,
         })) | size(WIDTH, EQUAL, 42);

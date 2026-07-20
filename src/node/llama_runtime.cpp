@@ -76,6 +76,7 @@ std::string normalize_llama_model_path(const std::string& raw) {
 }
 
 std::vector<std::string> build_llama_server_args(const std::string& model_path,
+                                                 const std::string& mmproj_path,
                                                  const RuntimeSettings& s,
                                                  uint16_t port,
                                                  const std::string& slot_save_path) {
@@ -140,6 +141,10 @@ std::vector<std::string> build_llama_server_args(const std::string& model_path,
         static_cast<long long>(s.ctx_size) * static_cast<long long>(parallel_for_ctx);
 
     args.push_back("--model");       args.push_back(strip_wrapping_quotes(model_path));
+    if (!mmproj_path.empty()) {
+        args.push_back("--mmproj");
+        args.push_back(strip_wrapping_quotes(mmproj_path));
+    }
     args.push_back("--port");        args.push_back(std::to_string(port));
     args.push_back("--host");        args.push_back("127.0.0.1");
     append_value_unless_extra({"--ctx-size", "-c"},

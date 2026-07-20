@@ -1604,6 +1604,47 @@ bool test_control_api_external_token_gate() {
         auto valid_voice = with_retry([&] { return client.get("/v1/agents/agent-a/voice"); });
         RECORD(valid_voice.status == 200);
 
+        const auto png_path = dir / "attachment-test.png";
+        {
+            std::ofstream png(png_path, std::ios::binary);
+            const unsigned char signature[] =
+                {0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
+            png.write(reinterpret_cast<const char*>(signature), sizeof(signature));
+        }
+
+        mm::HttpClient missing_attachment_client(base_url);
+        auto missing_upload = with_retry([&] {
+            return missing_attachment_client.post_file(
+                "/v1/agents/agent-a/attachments", png_path.string(),
+                {{"X-Filename", "test.png"}}, "image/png");
+        });
+        EXPECT_ERROR(missing_upload, 401, "missing bearer token");
+
+        auto mismatched_upload = with_retry([&] {
+            return client.post_file(
+                "/v1/agents/agent-a/attachments", png_path.string(),
+                {{"X-Filename", "test.jpg"}}, "image/jpeg");
+        });
+        EXPECT_ERROR(mismatched_upload, 415, "signature does not match");
+
+        auto upload = with_retry([&] {
+            return client.post_file(
+                "/v1/agents/agent-a/attachments", png_path.string(),
+                {{"X-Filename", "../test.png"}}, "image/png");
+        });
+        RECORD(upload.status == 201);
+        const auto uploaded_attachment = nlohmann::json::parse(upload.body);
+        RECORD(!uploaded_attachment.contains("relative_path"));
+        RECORD(uploaded_attachment["original_filename"] == "test.png");
+        const std::string uploaded_attachment_id =
+            uploaded_attachment["id"].get<std::string>();
+
+        auto download = with_retry([&] {
+            return client.get("/v1/agents/agent-a/attachments/" + uploaded_attachment_id);
+        });
+        RECORD(download.status == 200);
+        RECORD(download.body.size() == 8);
+
         mm::HttpClient missing_voice_client(base_url);
         auto missing_voice = with_retry(
             [&] { return missing_voice_client.get("/v1/agents/agent-a/voice"); });
@@ -1661,6 +1702,21 @@ bool test_control_api_external_token_gate() {
         RECORD(valid_chat_route.status == 400);
         RECORD(valid_chat_route.body.find("message required") != std::string::npos);
 
+        auto disabled_vision_chat = stream_chat(
+            "control-secret",
+            nlohmann::json{{"message", "describe"},
+                           {"attachment_ids", {uploaded_attachment_id}}});
+        RECORD(!disabled_vision_chat.ok);
+        RECORD(disabled_vision_chat.status == 422);
+        RECORD(disabled_vision_chat.body.find("does not accept images") !=
+               std::string::npos);
+
+        auto delete_pending_attachment = with_retry([&] {
+            return client.del("/v1/agents/agent-a/attachments/" +
+                              uploaded_attachment_id);
+        });
+        RECORD(delete_pending_attachment.status == 204);
+
         mm::HttpClient missing_mutator(base_url);
         auto missing_create_conversation = with_retry([&] {
             return missing_mutator.post(
@@ -1687,6 +1743,41 @@ bool test_control_api_external_token_gate() {
         auto conversation_body = nlohmann::json::parse(create_conversation.body);
         const std::string conversation_id =
             conversation_body["conversation"]["id"].get<std::string>();
+
+        auto referenced_upload = with_retry([&] {
+            return client.post_file(
+                "/v1/agents/agent-a/attachments", png_path.string(),
+                {{"X-Filename", "referenced.png"}}, "image/png");
+        });
+        RECORD(referenced_upload.status == 201);
+        const std::string referenced_attachment_id =
+            nlohmann::json::parse(referenced_upload.body)["id"].get<std::string>();
+        auto too_many_images = stream_chat(
+            "control-secret",
+            nlohmann::json{{"message", "too many"},
+                           {"attachment_ids", std::vector<std::string>(
+                               9, referenced_attachment_id)}});
+        RECORD(!too_many_images.ok);
+        RECORD(too_many_images.status == 400);
+        RECORD(too_many_images.body.find("at most 8 images") != std::string::npos);
+        auto agent_for_attachment = agents.get_agent("agent-a");
+        RECORD(agent_for_attachment != nullptr);
+        if (agent_for_attachment) {
+            mm::Message image_message;
+            image_message.role = mm::MessageRole::User;
+            image_message.content = "persist this image";
+            image_message.content_parts = {
+                mm::MessageContentPart{"text", "persist this image", {}, {}, {}},
+                mm::MessageContentPart{"image_attachment", {},
+                                       referenced_attachment_id, {}, "image/png"}
+            };
+            agent_for_attachment->db().append_message(conversation_id, image_message, 0);
+        }
+        auto delete_referenced_attachment = with_retry([&] {
+            return client.del("/v1/agents/agent-a/attachments/" +
+                              referenced_attachment_id);
+        });
+        EXPECT_ERROR(delete_referenced_attachment, 409, "referenced by a message");
 
         mm::HttpClient missing_put(base_url);
         auto missing_rename = with_retry([&] {
@@ -1731,6 +1822,15 @@ bool test_control_api_external_token_gate() {
         auto delete_memory = with_retry(
             [&] { return client.del("/v1/agents/agent-a/memories/" + memory_id); });
         RECORD(delete_memory.status == 200);
+
+        if (agent_for_attachment) {
+            agent_for_attachment->db().delete_conversation(conversation_id);
+        }
+        auto attachment_after_conversation_delete = with_retry([&] {
+            return client.get("/v1/agents/agent-a/attachments/" +
+                              referenced_attachment_id);
+        });
+        EXPECT_ERROR(attachment_after_conversation_delete, 404, "attachment not found");
 
         api.stop();
         if (server_thread.joinable()) server_thread.join();
@@ -1815,6 +1915,7 @@ bool test_openai_compat_api_listener_and_model_catalog() {
         RECORD(models_body["object"] == "list");
         RECORD(models_body["data"].size() == 1);
         RECORD(models_body["data"][0]["id"] == "agent:agent-a");
+        RECORD(models_body["data"][0]["metadata"]["vision_enabled"] == false);
 
         auto model = with_retry([&] { return client.get("/v1/models/served-agent-a"); });
         RECORD(model.status == 200);
@@ -1846,6 +1947,59 @@ bool test_openai_compat_api_listener_and_model_catalog() {
         });
         RECORD(invalid_messages.status == 400);
         RECORD(invalid_messages.body.find("messages must not be empty") != std::string::npos);
+
+        auto remote_image = with_retry([&] {
+            return client.post(
+                "/v1/chat/completions",
+                nlohmann::json{
+                    {"model", "agent:agent-a"},
+                    {"messages", nlohmann::json::array({{
+                        {"role", "user"},
+                        {"content", nlohmann::json::array({
+                            {{"type", "text"}, {"text", "describe"}},
+                            {{"type", "image_url"},
+                             {"image_url", {{"url", "https://example.test/image.png"}}}}
+                        })}
+                    }})}
+                });
+        });
+        RECORD(remote_image.status == 400);
+        RECORD(remote_image.body.find("not supported") != std::string::npos);
+
+        auto non_user_image = with_retry([&] {
+            return client.post(
+                "/v1/chat/completions",
+                nlohmann::json{
+                    {"model", "agent:agent-a"},
+                    {"messages", nlohmann::json::array({{
+                        {"role", "assistant"},
+                        {"content", nlohmann::json::array({
+                            {{"type", "image_url"},
+                             {"image_url", {{"url", "data:image/png;base64,iVBORw0KGgo="}}}}
+                        })}
+                    }})}
+                });
+        });
+        RECORD(non_user_image.status == 400);
+        RECORD(non_user_image.body.find("only on user messages") != std::string::npos);
+
+        auto disabled_image = with_retry([&] {
+            return client.post(
+                "/v1/chat/completions",
+                nlohmann::json{
+                    {"model", "agent:agent-a"},
+                    {"messages", nlohmann::json::array({{
+                        {"role", "user"},
+                        {"content", nlohmann::json::array({
+                            {{"type", "text"}, {"text", "describe"}},
+                            {{"type", "image_url"},
+                             {"image_url", {{"url", "data:image/png;base64,iVBORw0KGgo="}}}}
+                        })}
+                    }})}
+                });
+        });
+        RECORD(disabled_image.status == 422);
+        RECORD(disabled_image.body.find("does not accept images") != std::string::npos);
 
         api.stop_openai_compat();
         if (server_thread.joinable()) server_thread.join();
@@ -1967,6 +2121,7 @@ bool test_control_api_agent_api_mode_chat() {
                     {"name", "API Agent"},
                     {"inference_backend", "api"},
                     {"model_path", "frontier-test-model"},
+                    {"vision_settings", {{"enabled", true}, {"mmproj_path", ""}}},
                     {"memories_enabled", false},
                     {"tools_enabled", false},
                     {"runtime_settings", {
@@ -2010,13 +2165,13 @@ bool test_control_api_agent_api_mode_chat() {
             std::string body;
             std::vector<std::string> events;
         };
-        auto stream_chat = [&] {
+        auto stream_chat = [&](const nlohmann::json& request_body) {
             StreamAttempt attempt;
             for (int retry = 0; retry < 3; ++retry) {
                 attempt = StreamAttempt{};
                 attempt.ok = client.stream_post(
                     "/v1/agents/api-agent/chat",
-                    nlohmann::json{{"message", "hello from test"}},
+                    request_body,
                     [&](const std::string& event) {
                         attempt.events.push_back(event);
                         return true;
@@ -2029,7 +2184,7 @@ bool test_control_api_agent_api_mode_chat() {
             return attempt;
         };
 
-        auto chat = stream_chat();
+        auto chat = stream_chat(nlohmann::json{{"message", "hello from test"}});
         RECORD(chat.ok);
         RECORD(chat.status == 200);
 
@@ -2066,6 +2221,66 @@ bool test_control_api_agent_api_mode_chat() {
         RECORD(sent["presence_penalty"] == 1.5);
         RECORD(sent["repeat_penalty"] == 1.0);
         RECORD(sent.dump().find("hello from test") != std::string::npos);
+
+        const auto image_path = dir / "api-vision.png";
+        {
+            std::ofstream image(image_path, std::ios::binary);
+            const unsigned char signature[] =
+                {0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
+            image.write(reinterpret_cast<const char*>(signature), sizeof(signature));
+        }
+        const auto upload = with_retry([&] {
+            return client.post_file(
+                "/v1/agents/api-agent/attachments", image_path.string(),
+                {{"X-Filename", "api-vision.png"}}, "image/png");
+        });
+        RECORD(upload.status == 201);
+        const std::string attachment_id =
+            nlohmann::json::parse(upload.body)["id"].get<std::string>();
+
+        auto vision_chat = stream_chat(
+            nlohmann::json{{"message", "describe this image"},
+                           {"attachment_ids", {attachment_id}}});
+        RECORD(vision_chat.ok);
+        RECORD(vision_chat.status == 200);
+        {
+            std::lock_guard<std::mutex> lock(captured_mx);
+            sent = captured_body;
+            request_count = captured_requests;
+        }
+        RECORD(request_count == 2);
+        const auto image_parts = sent["messages"].back()["content"];
+        RECORD(image_parts.is_array());
+        RECORD(image_parts.size() == 2);
+        RECORD(image_parts[0]["type"] == "text");
+        RECORD(image_parts[0]["text"] == "describe this image");
+        RECORD(image_parts[1]["type"] == "image_url");
+        RECORD(image_parts[1]["image_url"]["url"] ==
+               "data:image/png;base64,iVBORw0KGgo=");
+
+        auto followup = stream_chat(
+            nlohmann::json{{"message", "what image did I send?"}});
+        RECORD(followup.ok);
+        RECORD(followup.status == 200);
+        {
+            std::lock_guard<std::mutex> lock(captured_mx);
+            sent = captured_body;
+            request_count = captured_requests;
+        }
+        RECORD(request_count == 3);
+        bool retained_image = false;
+        for (const auto& request_message : sent["messages"]) {
+            if (!request_message.contains("content") ||
+                !request_message["content"].is_array()) continue;
+            for (const auto& part : request_message["content"]) {
+                if (part.value("type", std::string{}) == "image_url" &&
+                    part["image_url"].value("url", std::string{}) ==
+                        "data:image/png;base64,iVBORw0KGgo=") {
+                    retained_image = true;
+                }
+            }
+        }
+        RECORD(retained_image);
 
         api.stop();
         if (server_thread.joinable()) server_thread.join();
@@ -3198,6 +3413,242 @@ bool test_llama_server_args() {
     CHECK(val_after(args2, "--ctx-size") == "1234");
     CHECK(count(args2, "--flash-attn") == 0);    // suppressed by -fa
     CHECK(!has(args2, "--slot-save-path"));       // omitted when empty
+
+    const auto vision_args = mm::build_llama_server_args(
+        "m.gguf", "mmproj-vision.gguf", s, 8082, "");
+    CHECK(count(vision_args, "--mmproj") == 1);
+    CHECK(val_after(vision_args, "--mmproj") == "mmproj-vision.gguf");
+    return true;
+}
+
+bool test_vision_config_attachment_and_message_round_trip() {
+    const auto dir = temp_test_dir("vision-db");
+    {
+        mm::AgentDB db("vision-agent", dir.string());
+
+        mm::AgentConfig cfg;
+        cfg.id = "vision-agent";
+        cfg.name = "Vision Agent";
+        cfg.model_path = "model.gguf";
+        cfg.vision_settings.enabled = true;
+        cfg.vision_settings.mmproj_path = "mmproj-model.gguf";
+        db.save_config(cfg);
+        const auto loaded_cfg = db.load_config();
+        CHECK(loaded_cfg.vision_settings.enabled);
+        CHECK(loaded_cfg.vision_settings.mmproj_path == "mmproj-model.gguf");
+
+        mm::ImageAttachment attachment;
+        attachment.id = "image-one";
+        attachment.original_filename = "sample.png";
+        attachment.mime_type = "image/png";
+        attachment.relative_path = "attachments/image-one.png";
+        attachment.size_bytes = 8;
+        attachment.created_at_ms = mm::util::now_ms();
+        attachment.expires_at_ms = attachment.created_at_ms + 60'000;
+        const auto attachment_path = db.attachment_file_path(attachment);
+        CHECK(!attachment_path.empty());
+        {
+            std::ofstream image(attachment_path, std::ios::binary);
+            const unsigned char png_signature[] =
+                {0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
+            image.write(reinterpret_cast<const char*>(png_signature),
+                        sizeof(png_signature));
+        }
+        db.save_attachment(attachment);
+        const auto public_json = nlohmann::json(attachment);
+        CHECK(!public_json.contains("relative_path"));
+
+        mm::ImageAttachment traversal = attachment;
+        traversal.id = "outside";
+        traversal.relative_path = "../outside.png";
+        bool rejected_traversal = false;
+        try {
+            db.save_attachment(traversal);
+        } catch (const std::invalid_argument&) {
+            rejected_traversal = true;
+        }
+        CHECK(rejected_traversal);
+
+        const auto conv_id = db.create_conversation("vision ordering");
+        mm::Message old_user;
+        old_user.role = mm::MessageRole::User;
+        old_user.content = "older context that should be summarized";
+        old_user.token_count = 3000;
+        db.append_message(conv_id, old_user, 0);
+        mm::Message old_assistant;
+        old_assistant.role = mm::MessageRole::Assistant;
+        old_assistant.content = "older response";
+        old_assistant.token_count = 10;
+        db.append_message(conv_id, old_assistant, 1);
+
+        mm::Message message;
+        message.role = mm::MessageRole::User;
+        message.content = "before after";
+        message.token_count = 2 + 2048;
+        message.content_parts = {
+            mm::MessageContentPart{"text", "before", {}, {}, {}},
+            mm::MessageContentPart{"image_attachment", {}, attachment.id, {}, "image/png"},
+            mm::MessageContentPart{"text", "after", {}, {}, {}}
+        };
+        db.append_message(conv_id, message, 2);
+        mm::Message recent_assistant;
+        recent_assistant.role = mm::MessageRole::Assistant;
+        recent_assistant.content = "recent response";
+        recent_assistant.token_count = 10;
+        db.append_message(conv_id, recent_assistant, 3);
+
+        const auto messages = db.load_messages(conv_id);
+        CHECK(messages.size() == 4);
+        CHECK(messages[2].content == "before after");
+        CHECK(messages[2].content_parts.size() == 3);
+        CHECK(messages[2].content_parts[0].text == "before");
+        CHECK(messages[2].content_parts[1].type == "image_attachment");
+        CHECK(messages[2].content_parts[1].attachment_id == attachment.id);
+        CHECK(messages[2].content_parts[2].text == "after");
+        CHECK(db.get_attachment(attachment.id)->expires_at_ms == 0);
+
+        bool referenced = false;
+        CHECK(!db.delete_attachment(attachment.id, &referenced));
+        CHECK(referenced);
+
+        FixedSummaryRuntimeClient summary_runtime;
+        mm::ConversationManager conversation_manager(db, summary_runtime);
+        cfg.runtime_settings.ctx_size = 4096;
+        cfg.runtime_settings.max_tokens = 1024;
+        const auto compacted_id = conversation_manager.force_compact(conv_id, cfg);
+        CHECK(compacted_id != conv_id);
+        const auto compacted_messages = db.load_messages(compacted_id);
+        CHECK(compacted_messages.size() == 2);
+        CHECK(compacted_messages[0].content_parts.size() == 3);
+        CHECK(compacted_messages[0].content_parts[1].attachment_id == attachment.id);
+
+        db.delete_conversation(conv_id);
+        CHECK(db.get_attachment(attachment.id).has_value());
+        CHECK(std::filesystem::exists(attachment_path));
+        db.delete_conversation(compacted_id);
+        CHECK(!db.get_attachment(attachment.id).has_value());
+        CHECK(!std::filesystem::exists(attachment_path));
+
+        mm::ImageAttachment expired;
+        expired.id = "expired";
+        expired.original_filename = "expired.jpg";
+        expired.mime_type = "image/jpeg";
+        expired.relative_path = "attachments/expired.jpg";
+        expired.size_bytes = 3;
+        expired.created_at_ms = mm::util::now_ms() - 1000;
+        expired.expires_at_ms = mm::util::now_ms() - 1;
+        const auto expired_path = db.attachment_file_path(expired);
+        {
+            std::ofstream image(expired_path, std::ios::binary);
+            const unsigned char jpeg_signature[] = {0xff, 0xd8, 0xff};
+            image.write(reinterpret_cast<const char*>(jpeg_signature),
+                        sizeof(jpeg_signature));
+        }
+        db.save_attachment(expired);
+        const auto removed = db.delete_expired_unreferenced_attachments(mm::util::now_ms());
+        CHECK(removed.size() == 1);
+        CHECK(removed[0].id == expired.id);
+        CHECK(!std::filesystem::exists(expired_path));
+    }
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_vision_profile_validation_and_suggestions() {
+    const auto dir = temp_test_dir("vision-validation");
+    std::filesystem::create_directories(dir);
+    const auto model_path = dir / "model.gguf";
+    const auto projector_path = dir / "MMPROJ-Vision.GGUF";
+    {
+        std::ofstream model(model_path, std::ios::binary);
+        model << "model";
+        std::ofstream projector(projector_path, std::ios::binary);
+        projector << "projector";
+    }
+
+    const auto suggestions = mm::suggest_mmproj_files(model_path.string());
+    CHECK(suggestions.size() == 1);
+    CHECK(std::filesystem::path(suggestions[0]).filename() == projector_path.filename());
+
+    mm::AgentConfig cfg;
+    cfg.name = "Vision";
+    cfg.model_path = model_path.string();
+    cfg.inference_backend = "llama-cpp";
+    cfg.vision_settings.enabled = true;
+    CHECK(!mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
+
+    cfg.vision_settings.mmproj_path = projector_path.string();
+    CHECK(mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
+
+    cfg.runtime_settings.extra_args = {"--mmproj-url=https://invalid.example/mmproj"};
+    CHECK(!mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
+    cfg.runtime_settings.extra_args.clear();
+
+    cfg.vision_settings.mmproj_path = (dir / "projector.gguf").string();
+    const auto unconventional = mm::validate_agent_config(cfg, nullptr, "", nullptr);
+    CHECK(unconventional.ok());
+    CHECK(std::any_of(unconventional.issues.begin(), unconventional.issues.end(),
+                      [](const mm::ValidationIssue& issue) {
+                          return issue.field == "vision_settings.mmproj_path" &&
+                                 issue.severity == mm::ValidationSeverity::Warning;
+                      }));
+
+    cfg.inference_backend = "vllm";
+    CHECK(!mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
+    cfg.vision_settings.mmproj_path.clear();
+    CHECK(mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
+
+    cfg.inference_backend = "api";
+    cfg.api_settings.base_url = "https://example.test";
+    cfg.api_settings.chat_completions_path = "/v1/chat/completions";
+    cfg.vision_settings.mmproj_path = projector_path.string();
+    CHECK(!mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
+    cfg.vision_settings.mmproj_path.clear();
+    CHECK(mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
+
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_vision_slot_projector_isolation_and_json() {
+    mm::SlotManager slots(46250, 46253, 4, "missing-vllm");
+    mm::RuntimeSettings settings;
+    const auto first = slots.add_ready_test_slot_llama(
+        "model.gguf", "agent-a", settings, "mmproj-a.gguf");
+    CHECK(!first.empty());
+
+    const auto shared = slots.load_model_llama(
+        "model.gguf", "mmproj-a.gguf", settings, "agent-b");
+    CHECK(shared == first);
+
+    const auto different = slots.load_model_llama(
+        "model.gguf", "mmproj-b.gguf", settings, "agent-c");
+    CHECK(different.empty());
+    const auto info = slots.find_slot(first);
+    CHECK(info.has_value());
+    CHECK(info->vision_enabled);
+    CHECK(info->mmproj_path == "mmproj-a.gguf");
+    CHECK(std::find(info->agent_ids.begin(), info->agent_ids.end(), "agent-b") !=
+          info->agent_ids.end());
+    CHECK(std::find(info->agent_ids.begin(), info->agent_ids.end(), "agent-c") ==
+          info->agent_ids.end());
+
+    const auto slot_json = nlohmann::json(*info);
+    CHECK(slot_json["vision_enabled"] == true);
+    CHECK(slot_json["mmproj_path"] == "mmproj-a.gguf");
+
+    mm::Message ordered;
+    ordered.role = mm::MessageRole::User;
+    ordered.content_parts = {
+        mm::MessageContentPart{"text", "look", {}, {}, {}},
+        mm::MessageContentPart{"image_url", {}, {},
+                               "data:image/png;base64,iVBORw0KGgo=", "image/png"},
+        mm::MessageContentPart{"text", "closely", {}, {}, {}}
+    };
+    const auto round_trip = nlohmann::json(ordered).get<mm::Message>();
+    CHECK(round_trip.content_parts.size() == 3);
+    CHECK(round_trip.content_parts[1].image_url ==
+          "data:image/png;base64,iVBORw0KGgo=");
     return true;
 }
 
@@ -4249,6 +4700,10 @@ bool test_performance_tracker_capacity_aggregation_and_clear() {
     third.time_to_first_token_ms = 100;
     third.input_tokens = 7;
     third.output_tokens = 20;
+    third.image_count = 2;
+    third.decoded_image_bytes = 8192;
+    third.vision_routing = true;
+    third.projector_basename = "mmproj-test.gguf";
     third.success = true;
     tracker.record(third);
 
@@ -4263,6 +4718,11 @@ bool test_performance_tracker_capacity_aggregation_and_clear() {
     CHECK(snapshot.at("aggregate").at("input_tokens") == 9);
     CHECK(snapshot.at("aggregate").at("total_ms").at("p50") == 400.0);
     CHECK(snapshot.at("samples").at(1).at("output_tokens_per_second") == 50.0);
+    CHECK(snapshot.at("samples").at(1).at("image_count") == 2);
+    CHECK(snapshot.at("samples").at(1).at("decoded_image_bytes") == 8192);
+    CHECK(snapshot.at("samples").at(1).at("vision_routing") == true);
+    CHECK(snapshot.at("samples").at(1).at("projector_basename") ==
+          "mmproj-test.gguf");
 
     tracker.clear();
     CHECK(tracker.snapshot(10).at("samples").empty());
@@ -4355,6 +4815,12 @@ int main(int argc, char** argv) {
          test_compaction_followup_trace_provenance_survives},
         {"config_and_url_parsing_edge_cases", test_config_and_url_parsing_edge_cases},
         {"llama_server_args", test_llama_server_args},
+        {"vision_config_attachment_and_message_round_trip",
+         test_vision_config_attachment_and_message_round_trip},
+        {"vision_profile_validation_and_suggestions",
+         test_vision_profile_validation_and_suggestions},
+        {"vision_slot_projector_isolation_and_json",
+         test_vision_slot_projector_isolation_and_json},
         {"llama_model_path_normalization", test_llama_model_path_normalization},
         {"llama_accelerator_detection", test_llama_accelerator_detection},
         {"llama_launch_compatible", test_llama_launch_compatible},

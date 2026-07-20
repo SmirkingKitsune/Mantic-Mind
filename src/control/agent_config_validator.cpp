@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
 
 namespace mm {
 
@@ -30,6 +31,19 @@ bool looks_like_gguf(const std::string& model_path) {
     return p.size() >= 5 && p.compare(p.size() - 5, 5, ".gguf") == 0;
 }
 
+bool has_authoritative_mmproj_flag(const RuntimeSettings& settings) {
+    for (const auto& raw : settings.extra_args) {
+        const std::string arg = util::to_lower(util::trim(raw));
+        for (const std::string flag : {"--mmproj", "-mm", "--mmproj-url"}) {
+            if (arg == flag || arg.rfind(flag + "=", 0) == 0 ||
+                arg.rfind(flag + " ", 0) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 std::string normalized_backend(const AgentConfig& cfg) {
     std::string backend = util::to_lower(util::trim(cfg.inference_backend));
     if (backend.empty()) return "llama-cpp";  // unspecified => default runtime
@@ -39,6 +53,28 @@ std::string normalized_backend(const AgentConfig& cfg) {
 }
 
 } // namespace
+
+std::vector<std::string> suggest_mmproj_files(const std::string& model_path) {
+    namespace fs = std::filesystem;
+    std::vector<std::string> suggestions;
+    const fs::path parent = fs::path(util::trim(model_path)).parent_path();
+    std::error_code ec;
+    if (parent.empty() || !fs::is_directory(parent, ec)) return suggestions;
+    for (const auto& entry : fs::directory_iterator(
+             parent, fs::directory_options::skip_permission_denied, ec)) {
+        std::error_code file_ec;
+        if (!entry.is_regular_file(file_ec)) continue;
+        const std::string basename = util::to_lower(entry.path().filename().string());
+        if (basename.rfind("mmproj-", 0) == 0 &&
+            basename.size() >= 5 && basename.ends_with(".gguf")) {
+            suggestions.push_back(entry.path().lexically_normal().string());
+        }
+    }
+    std::sort(suggestions.begin(), suggestions.end(), [](const auto& a, const auto& b) {
+        return util::to_lower(a) < util::to_lower(b);
+    });
+    return suggestions;
+}
 
 AgentValidationResult validate_agent_config(const AgentConfig& cfg,
                                             const NodeRegistry* registry,
@@ -60,6 +96,43 @@ AgentValidationResult validate_agent_config(const AgentConfig& cfg,
                   "inference_backend must be 'vllm', 'llama-cpp', or 'api'.");
     }
     const bool is_local_backend = (backend == "vllm" || backend == "llama-cpp");
+    const std::string mmproj_path = util::trim(cfg.vision_settings.mmproj_path);
+    if (backend == "llama-cpp") {
+        if (cfg.vision_settings.enabled && mmproj_path.empty()) {
+            add_issue(result,
+                      ValidationSeverity::Error,
+                      "vision_settings.mmproj_path",
+                      "Vision-enabled llama.cpp profiles require an explicit GGUF projector path.");
+        }
+        if (!mmproj_path.empty()) {
+            if (!looks_like_gguf(mmproj_path)) {
+                add_issue(result,
+                          ValidationSeverity::Error,
+                          "vision_settings.mmproj_path",
+                          "The llama.cpp vision projector must end in .gguf.");
+            } else {
+                const std::string basename = util::to_lower(
+                    std::filesystem::path(mmproj_path).filename().string());
+                if (basename.rfind("mmproj-", 0) != 0) {
+                    add_issue(result,
+                              ValidationSeverity::Warning,
+                              "vision_settings.mmproj_path",
+                              "Projector filename does not use the conventional mmproj-*.gguf form; verify it matches the model.");
+                }
+            }
+        }
+        if (has_authoritative_mmproj_flag(cfg.runtime_settings)) {
+            add_issue(result,
+                      ValidationSeverity::Error,
+                      "runtime_settings.extra_args",
+                      "Projector flags (--mmproj, -mm, --mmproj-url) are controlled by vision_settings.mmproj_path and cannot appear in extra_args.");
+        }
+    } else if (!mmproj_path.empty()) {
+        add_issue(result,
+                  ValidationSeverity::Error,
+                  "vision_settings.mmproj_path",
+                  "vLLM and API vision profiles must leave mmproj_path empty; their configured model owns image support.");
+    }
     if (!cfg.id.empty() && !util::is_valid_agent_id(cfg.id)) {
         add_issue(result,
                   ValidationSeverity::Error,

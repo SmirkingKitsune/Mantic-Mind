@@ -89,7 +89,8 @@ public:
     /// slot's ID is returned instead of spawning a new engine.
     SlotId load_model(const std::string& model_path,
                       VllmSettings vllm_settings,
-                      const AgentId& agent_id = {});
+                      const AgentId& agent_id = {},
+                      bool vision_enabled = false);
 
     /// Load a GGUF model into a new llama.cpp engine slot. Mirrors load_model
     /// for the llama-server backend: attaches to a compatible ready llama slot
@@ -97,8 +98,14 @@ public:
     /// not draw on the vLLM GPU-fraction budget; their footprint is estimated
     /// from the on-disk GGUF size for node VRAM accounting.
     SlotId load_model_llama(const std::string& model_path,
+                            const std::string& mmproj_path,
                             RuntimeSettings settings,
                             const AgentId& agent_id = {});
+    SlotId load_model_llama(const std::string& model_path,
+                            RuntimeSettings settings,
+                            const AgentId& agent_id = {}) {
+        return load_model_llama(model_path, {}, std::move(settings), agent_id);
+    }
 
     /// Unload a slot — stops its engine process, frees the port.
     SlotOperationResult unload_slot(const SlotId& slot_id);
@@ -117,16 +124,24 @@ public:
     /// Returns the slot ID, or empty string on failure.
     SlotId restore_slot(const std::string& model_path,
                         const VllmSettings& vllm_settings,
-                        const AgentId& agent_id = {});
+                        const AgentId& agent_id = {},
+                        bool vision_enabled = false);
 
     /// Restore a suspended llama.cpp agent. Starts a fresh llama-server (with
     /// the KV-cache slot endpoints enabled) and, when kv_cache_path names an
     /// existing saved cache, replays it via /slots/0?action=restore so context
     /// survives the suspend. A missing/failed cache degrades to a cold start.
     SlotId restore_slot_llama(const std::string& model_path,
+                              const std::string& mmproj_path,
                               const RuntimeSettings& settings,
                               const std::string& kv_cache_path,
                               const AgentId& agent_id = {});
+    SlotId restore_slot_llama(const std::string& model_path,
+                              const RuntimeSettings& settings,
+                              const std::string& kv_cache_path,
+                              const AgentId& agent_id = {}) {
+        return restore_slot_llama(model_path, {}, settings, kv_cache_path, agent_id);
+    }
 
     /// Gracefully stop all slots. force=true is intended for shutdown cleanup.
     SlotOperationResult unload_all(bool force = true);
@@ -185,7 +200,8 @@ public:
     /// llama-server, for exercising backend-tagged slot info and suspension.
     SlotId add_ready_test_slot_llama(std::string model_path = "model.gguf",
                                      AgentId agent_id = {},
-                                     RuntimeSettings settings = {});
+                                     RuntimeSettings settings = {},
+                                     std::string mmproj_path = {});
 #endif
 
     void        set_vllm_server_path(const std::string& path);
@@ -204,6 +220,8 @@ private:
         SlotId                              id;
         uint16_t                            port       = 0;
         std::string                         model_path;
+        std::string                         mmproj_path;
+        bool                                vision_enabled = false;
         // Every creation path stamps this explicitly; the default matches the
         // branch default runtime.
         EngineBackend                       backend    = EngineBackend::LlamaCpp;
@@ -270,6 +288,7 @@ private:
     /// vLLM there is no sleeping llama process to wake — suspend stops it — so
     /// this only shares live engines. Takes mutex_ internally.
     std::optional<SlotId> try_attach_llama(const std::string& model_path,
+                                           const std::string& mmproj_path,
                                            const RuntimeSettings& settings,
                                            const AgentId& agent_id);
 
@@ -282,7 +301,8 @@ private:
     /// runs unlocked).
     std::optional<SlotId> try_attach_or_wake(const std::string& model_path,
                                              const VllmSettings& settings,
-                                             const AgentId& agent_id);
+                                             const AgentId& agent_id,
+                                             bool vision_enabled);
 
     /// Attach an agent to a slot if not already attached. Caller must hold mutex_.
     static void attach_agent_locked(Slot& slot, const AgentId& agent_id);

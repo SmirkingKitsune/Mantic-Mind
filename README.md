@@ -252,6 +252,56 @@ agents bypass node placement, but they still use the normal Mantic-Mind agent
 harness: conversations, streaming chat, memory extraction, compaction, and tool
 rounds.
 
+## Vision Agents
+
+Image input is opt-in per agent. A llama.cpp profile names both the model GGUF
+and its matching projector explicitly:
+
+```json
+{
+  "name": "local-vision",
+  "inference_backend": "llama-cpp",
+  "model_path": "D:/models/vision-model.gguf",
+  "vision_settings": {
+    "enabled": true,
+    "mmproj_path": "D:/models/mmproj-vision-model.gguf"
+  }
+}
+```
+
+The projector is launched through llama.cpp's authoritative `--mmproj`
+argument. Do not repeat `--mmproj`, `-mm`, or `--mmproj-url` in
+`runtime_settings.extra_args`. For vLLM and API-backed profiles, set
+`vision_settings.enabled` to declare that the configured model accepts images
+and leave `mmproj_path` empty. Image requests sent to a profile without vision
+enabled fail with HTTP 422; Mantic-Mind never drops the images or delegates the
+turn to another agent.
+
+The profile editor exposes a Vision toggle and projector picker. Adjacent
+case-insensitive `mmproj-*.gguf` files are shown as suggestions but are never
+selected automatically. The Chat tab can stage up to eight JPEG/PNG files,
+shows their sizes, uploads them through the same managed attachment API used by
+other clients, and clears the staged list after the request is queued.
+
+Managed images live beneath the owning agent directory. SQLite stores generated
+attachment IDs, relative managed paths, and ordered message parts; neither
+base64 data nor absolute attachment paths appear in persisted messages or API
+responses. Pending uploads expire after 24 hours, and unreferenced managed files
+are reconciled at startup. Limits are 50 MiB per image, eight images per turn or
+hydrated context, and 400 MiB decoded image data per turn or context.
+
+With control and a node running, the opt-in real-model smoke test creates a
+temporary agent, loads a vision GGUF/projector pair, uploads a small PNG, and
+checks a text-only follow-up against the persisted visual turn:
+
+```sh
+python tests/vision_smoke.py \
+  --model /models/vision-model.gguf \
+  --mmproj /models/mmproj-vision-model.gguf \
+  --image tests/data/small.png \
+  --token "$MM_CONTROL_EXTERNAL_API_TOKEN"
+```
+
 ## Quick Start
 
 Local `mantic-mind.toml` and `mantic-mind-control.toml` copies are intentionally gitignored. Keep committed defaults in `tools/`, then copy them into the working directory for local runs.
@@ -535,11 +585,11 @@ happen inside the engine's load timeout window.
 ### Node API (`Authorization: Bearer <node-api-key>`)
 
 ```
-POST   /api/node/load-model     { model_path, vllm_settings?, agent_id? }
+POST   /api/node/load-model     { model_path, mmproj_path?, vision_enabled?, vllm_settings?, agent_id? }
 POST   /api/node/unload-model   { slot_id? }            (omit slot_id to unload all)
 POST   /api/node/detach-agent   { slot_id, agent_id }   (unloads engine when its last agent leaves)
 POST   /api/node/suspend-slot   { slot_id }             (vLLM sleep, or stop)
-POST   /api/node/restore-slot   { model_path, vllm_settings?, agent_id? }
+POST   /api/node/restore-slot   { model_path, mmproj_path?, vision_enabled?, vllm_settings?, agent_id? }
 POST   /api/node/infer          { InferenceRequest, slot_id? }  -> SSE
 POST   /api/node/models/pull    { model_ref }           (HF pre-fetch; Linux only, 501 elsewhere)
 GET    /api/node/runtime/vllm   -> { vllm_runtime }
@@ -582,7 +632,9 @@ clients.
 ```
 GET/POST       /v1/agents
 GET/PUT/DELETE /v1/agents/{id}
-POST           /v1/agents/{id}/chat                       { message, conversation_id? } -> SSE
+POST           /v1/agents/{id}/attachments                (stream JPEG/PNG body) -> 201 metadata
+GET/DELETE     /v1/agents/{id}/attachments/{attachment_id}
+POST           /v1/agents/{id}/chat                       { message?, attachment_ids?, conversation_id?, max_tokens? } -> SSE
 GET/POST       /v1/agents/{id}/conversations
 GET/DELETE     /v1/agents/{id}/conversations/{cid}
 PUT            /v1/agents/{id}/conversations/{cid}
@@ -635,6 +687,13 @@ chat-completions route also accepts a bare agent ID, unique agent name, unique
 `model_path`, or unique `served_model_name`, but `agent:{agent_id}` is the
 stable form to configure in external clients. When `external_api_token` is set,
 the compatibility port uses the same `Authorization: Bearer <token>` gate.
+
+Vision-capable agents accept standard ordered user content arrays containing
+`text` and `image_url` parts. Image URLs must be JPEG or PNG base64 `data:` URLs;
+HTTP(S), `file:`, unsupported MIME types, and image parts on non-user roles are
+rejected. The images are converted to managed attachments before the stateful
+Mantic conversation turn is persisted. Both streaming and non-streaming
+completions use the same conversation and hydration pipeline.
 
 ### SSE Chat Events
 

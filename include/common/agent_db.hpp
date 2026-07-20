@@ -45,6 +45,16 @@ public:
     std::vector<Message> load_messages(const ConvId& conv_id) const;
     int                get_total_tokens(const ConvId& conv_id) const;
 
+    // Managed image attachments. Files live under attachment_directory(); the
+    // database stores only relative paths and message references.
+    std::string                    attachment_directory() const;
+    std::string                    attachment_file_path(const ImageAttachment& attachment) const;
+    void                           save_attachment(const ImageAttachment& attachment);
+    std::optional<ImageAttachment> get_attachment(const std::string& id) const;
+    bool                           attachment_is_referenced(const std::string& id) const;
+    bool                           delete_attachment(const std::string& id, bool* referenced = nullptr);
+    std::vector<ImageAttachment>   delete_expired_unreferenced_attachments(int64_t now_ms);
+
     // ── Global memories ─────────────────────────────────────────────────────
     void                       add_memory(const Memory& mem);
     void                       update_memory(const Memory& mem);
@@ -87,6 +97,7 @@ public:
 
 private:
     AgentId                       agent_id_;
+    std::string                   agent_dir_;
     std::unique_ptr<SQLite::Database> db_;
     mutable std::mutex            mutex_;
 

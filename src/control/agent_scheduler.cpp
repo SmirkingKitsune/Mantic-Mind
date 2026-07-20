@@ -3,6 +3,7 @@
 #include "control/engine_group_planner.hpp"
 #include "common/http_client.hpp"
 #include "common/logger.hpp"
+#include "common/pairing.hpp"
 #include "common/util.hpp"
 
 #include <nlohmann/json.hpp>
@@ -35,9 +36,11 @@ std::optional<std::string> transfer_model_to_node(const NodeInfo& node,
                                                   const std::string& model_ref,
                                                   bool pin,
                                                   bool force,
-                                                  std::string* error) {
+                                                  std::string* error,
+                                                  const std::string& cache_id = {}) {
     namespace fs = std::filesystem;
-    const std::string model_id = util::model_id_from_ref(model_ref);
+    const std::string model_id = cache_id.empty()
+        ? util::model_id_from_ref(model_ref) : cache_id;
 
     struct FileEntry { std::string abs; std::string rel; int64_t size; };
     std::vector<FileEntry> files;
@@ -109,6 +112,8 @@ std::optional<std::string> transfer_model_to_node(const NodeInfo& node,
         try {
             auto j = nlohmann::json::parse(resp.body);
             load_path = j.value("load_path", load_path);
+            if (files.size() == 1)
+                load_path = j.value("stored_path", load_path);
         } catch (...) {}
     }
     if (load_path.empty()) {
@@ -116,6 +121,53 @@ std::optional<std::string> transfer_model_to_node(const NodeInfo& node,
         return std::nullopt;
     }
     return load_path;
+}
+
+std::string file_manifest_identity(const std::string& ref) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path path(ref);
+    std::string out = path.lexically_normal().generic_string();
+    if (fs::is_regular_file(path, ec)) {
+        out += ":" + std::to_string(fs::file_size(path, ec));
+        const auto modified = fs::last_write_time(path, ec);
+        if (!ec) out += ":" + std::to_string(modified.time_since_epoch().count());
+    }
+    return out;
+}
+
+std::string vision_bundle_id(const AgentConfig& cfg) {
+    const std::string manifest = file_manifest_identity(cfg.model_path) + "\n" +
+                                 file_manifest_identity(cfg.vision_settings.mmproj_path);
+    const std::string digest = pairing::hmac_sha256_hex("mantic-vision-bundle-v1", manifest);
+    return util::model_id_from_ref(cfg.model_path) + "-vision-" + digest.substr(0, 20);
+}
+
+std::string engine_fingerprint(const AgentConfig& cfg) {
+    const EngineBackend backend =
+        engine_backend_from_string(cfg.inference_backend);
+    nlohmann::json identity = {
+        {"backend", to_string(backend)},
+        {"model", file_manifest_identity(cfg.model_path)},
+        {"vision", cfg.vision_settings}
+    };
+    if (backend == EngineBackend::LlamaCpp) {
+        const auto& runtime = cfg.runtime_settings;
+        identity["launch"] = {
+            {"ctx_size", runtime.ctx_size},
+            {"n_gpu_layers", runtime.n_gpu_layers},
+            {"n_threads", runtime.n_threads},
+            {"n_threads_http", runtime.n_threads_http},
+            {"parallel", runtime.parallel},
+            {"batch_size", runtime.batch_size},
+            {"ubatch_size", runtime.ubatch_size},
+            {"flash_attn", runtime.flash_attn},
+            {"extra_args", runtime.extra_args}
+        };
+    } else {
+        identity["launch"] = cfg.vllm_settings;
+    }
+    return pairing::hmac_sha256_hex("mantic-engine-placement-v1", identity.dump());
 }
 
 }  // namespace
@@ -131,6 +183,14 @@ AgentScheduler::AgentScheduler(NodeRegistry& registry,
 std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     const AgentConfig& cfg)
 {
+    const std::string desired_fingerprint = engine_fingerprint(cfg);
+    if (auto prior = find_placement_copy(cfg.id);
+        prior && prior->engine_fingerprint != desired_fingerprint) {
+        MM_INFO("AgentScheduler: engine identity changed for agent {}; releasing stale placement",
+                cfg.id);
+        release_agent(cfg.id);
+    }
+
     // Scheduling decisions stay serialized end-to-end (same semantics as the
     // old single mutex), but placements_ is only touched through the
     // state_mutex_ helpers so reads and idle/active marks never block behind
@@ -170,6 +230,7 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
             placement.slot_id        = slot_id;
             placement.suspended      = false;
             placement.last_active_ms = util::now_ms();
+            placement.engine_fingerprint = desired_fingerprint;
             store_placement(placement);
             return ScheduleResult{node_id, slot_id};
         };
@@ -210,6 +271,7 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         p.slot_id        = slot_id;
         p.placed_at_ms   = util::now_ms();
         p.last_active_ms = p.placed_at_ms;
+        p.engine_fingerprint = desired_fingerprint;
         store_placement(p);
         return ScheduleResult{node_id, slot_id};
     };
@@ -257,6 +319,20 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
             for (const auto& s : node.slots) {
                 if (s.state != SlotState::Ready) continue;
                 if (s.model_path != cfg.model_path) continue;
+                if (engine_backend_from_string(s.backend) !=
+                    engine_backend_from_string(cfg.inference_backend)) continue;
+                if (s.vision_enabled != cfg.vision_settings.enabled) continue;
+                if (cfg.vision_settings.enabled &&
+                    engine_backend_from_string(cfg.inference_backend) ==
+                        EngineBackend::LlamaCpp) {
+                    const std::string requested_projector = util::to_lower(
+                        std::filesystem::path(cfg.vision_settings.mmproj_path)
+                            .filename().string());
+                    const std::string slot_projector = util::to_lower(
+                        std::filesystem::path(s.mmproj_path).filename().string());
+                    if (requested_projector.empty() ||
+                        requested_projector != slot_projector) continue;
+                }
                 EngineCandidate c{node.id, s.num_requests_waiting,
                                   s.num_requests_running, s.kv_cache_usage};
                 if (!best || c < *best) best = c;
@@ -333,6 +409,7 @@ std::optional<ScheduleResult> AgentScheduler::ensure_engine_group_running(
         p.slot_id        = slot_id;
         p.placed_at_ms   = util::now_ms();
         p.last_active_ms = p.placed_at_ms;
+        p.engine_fingerprint = engine_fingerprint(cfg);
         store_placement(p);
         return ScheduleResult{node_id, slot_id};
     };
@@ -802,11 +879,49 @@ std::optional<SlotId> AgentScheduler::restore_agent_on_node(
         auto node = registry_.get_node(node_id);
         HttpClient cli(node.url);
         cli.set_bearer_token(node.api_key);
+        std::string effective_model_path = cfg.model_path;
+        std::string effective_mmproj_path = cfg.vision_settings.enabled
+            ? cfg.vision_settings.mmproj_path : std::string{};
+        const bool has_projector = cfg.vision_settings.enabled &&
+            !cfg.vision_settings.mmproj_path.empty();
+        const std::string bundle_id = has_projector ? vision_bundle_id(cfg) : std::string{};
+        const bool pin_on_node = !cfg.preferred_node_id.empty() &&
+                                 cfg.preferred_node_id == node_id;
+        std::error_code ec;
+        if (util::model_ref_is_local_path(cfg.model_path) &&
+            std::filesystem::exists(cfg.model_path, ec)) {
+            std::string transfer_error;
+            auto local = transfer_model_to_node(node, cfg.model_path, pin_on_node,
+                                                false, &transfer_error, bundle_id);
+            if (!local) {
+                set_last_error("failed to transfer model for restore to node " + node_id +
+                               ": " + transfer_error);
+                return std::nullopt;
+            }
+            effective_model_path = *local;
+        }
+        if (has_projector) {
+            ec.clear();
+            if (std::filesystem::exists(cfg.vision_settings.mmproj_path, ec)) {
+                std::string transfer_error;
+                auto local = transfer_model_to_node(node, cfg.vision_settings.mmproj_path,
+                                                    pin_on_node, false,
+                                                    &transfer_error, bundle_id);
+                if (!local) {
+                    set_last_error("failed to transfer projector for restore to node " + node_id +
+                                   ": " + transfer_error);
+                    return std::nullopt;
+                }
+                effective_mmproj_path = *local;
+            }
+        }
         for (int attempt = 0; attempt < 3; ++attempt) {
             const EngineBackend backend =
                 engine_backend_from_string(cfg.inference_backend);
             nlohmann::json body = {
-                {"model_path",    cfg.model_path},
+                {"model_path",    effective_model_path},
+                {"mmproj_path",   effective_mmproj_path},
+                {"vision_enabled", cfg.vision_settings.enabled},
                 {"vllm_settings", cfg.vllm_settings},
                 {"kv_cache_path", placement.kv_cache_node_path},
                 {"backend",       to_string(backend)},
@@ -865,7 +980,12 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
         // Done once, before the retry loop (this runs under schedule_mutex_, so
         // a large transfer serializes scheduling — acceptable for correctness).
         std::string effective_model_path = cfg.model_path;
+        std::string effective_mmproj_path = cfg.vision_settings.enabled
+            ? cfg.vision_settings.mmproj_path : std::string{};
         std::string transferred_model_id;
+        const bool has_projector = cfg.vision_settings.enabled &&
+            !cfg.vision_settings.mmproj_path.empty();
+        const std::string bundle_id = has_projector ? vision_bundle_id(cfg) : std::string{};
         const bool pin_on_node =
             !cfg.preferred_node_id.empty() && cfg.preferred_node_id == node_id;
 
@@ -875,7 +995,7 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
                 std::string xfer_err;
                 auto local = transfer_model_to_node(node, cfg.model_path,
                                                     pin_on_node, /*force=*/false,
-                                                    &xfer_err);
+                                                    &xfer_err, bundle_id);
                 if (!local) {
                     set_last_error("failed to transfer model to node " + node_id +
                                    ": " + xfer_err);
@@ -883,7 +1003,8 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
                             node_id, xfer_err);
                     return std::nullopt;
                 }
-                transferred_model_id = util::model_id_from_ref(cfg.model_path);
+                transferred_model_id = bundle_id.empty()
+                    ? util::model_id_from_ref(cfg.model_path) : bundle_id;
                 effective_model_path = *local;
                 MM_INFO("AgentScheduler: transferred model {} to node {} -> {}",
                         transferred_model_id, node_id, effective_model_path);
@@ -892,12 +1013,36 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
             // original ref and let the node resolve (or fail-fast) it.
         }
 
+        if (has_projector) {
+            std::error_code ec;
+            if (std::filesystem::exists(cfg.vision_settings.mmproj_path, ec)) {
+                std::string xfer_err;
+                auto local = transfer_model_to_node(node,
+                                                    cfg.vision_settings.mmproj_path,
+                                                    pin_on_node, /*force=*/false,
+                                                    &xfer_err, bundle_id);
+                if (!local) {
+                    set_last_error("failed to transfer vision projector to node " + node_id +
+                                   ": " + xfer_err);
+                    return std::nullopt;
+                }
+                effective_mmproj_path = *local;
+                transferred_model_id = bundle_id;
+                MM_INFO("AgentScheduler: transferred model/projector bundle {} to node {}",
+                        bundle_id, node_id);
+            }
+            // An inaccessible path may intentionally be node-local. The node
+            // validates it before launch.
+        }
+
         bool retried_transfer = false;
         for (int attempt = 0; attempt < 3; ++attempt) {
             const EngineBackend backend =
                 engine_backend_from_string(cfg.inference_backend);
             nlohmann::json body = {
                 {"model_path", effective_model_path},
+                {"mmproj_path", effective_mmproj_path},
+                {"vision_enabled", cfg.vision_settings.enabled},
                 {"vllm_settings", vllm_override ? *vllm_override
                                                 : cfg.vllm_settings},
                 // Always explicit so a node never has to guess the engine from
@@ -945,14 +1090,23 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
             // this load (disk pressure). Re-send it once, forcing past the
             // idempotency check, and retry the load.
             if (!transferred_model_id.empty() && !retried_transfer &&
-                util::to_lower(resp.body).find("model not found on node") !=
-                    std::string::npos) {
+                (util::to_lower(resp.body).find("model not found on node") !=
+                     std::string::npos ||
+                 util::to_lower(resp.body).find("projector not found on node") !=
+                     std::string::npos)) {
                 std::string xfer_err;
                 auto local = transfer_model_to_node(node, cfg.model_path,
                                                     pin_on_node, /*force=*/true,
-                                                    &xfer_err);
+                                                    &xfer_err, bundle_id);
                 if (local) {
                     effective_model_path = *local;
+                    if (has_projector) {
+                        auto projector_local = transfer_model_to_node(
+                            node, cfg.vision_settings.mmproj_path,
+                            pin_on_node, /*force=*/true, &xfer_err, bundle_id);
+                        if (!projector_local) continue;
+                        effective_mmproj_path = *projector_local;
+                    }
                     retried_transfer = true;
                     MM_INFO("AgentScheduler: node {} was missing transferred "
                             "model {}; re-sent and retrying load",

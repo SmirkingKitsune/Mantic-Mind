@@ -75,6 +75,30 @@ struct TraceEvent {
     nlohmann::json metadata = nlohmann::json::object();
 };
 
+// Durable metadata for a managed image. relative_path is control-internal and
+// is deliberately omitted from JSON so API responses never expose filesystem
+// layout. Attachments are scoped by the per-agent database that owns them.
+struct ImageAttachment {
+    std::string id;
+    std::string original_filename;
+    std::string mime_type;
+    std::string relative_path;
+    int64_t     size_bytes = 0;
+    int64_t     created_at_ms = 0;
+    int64_t     expires_at_ms = 0; // pending-upload expiry; 0 once referenced
+};
+
+// Ordered message content. Persisted image parts reference a managed
+// attachment_id; hydrated inference-only parts additionally carry image_url as
+// a data URL. Plain legacy messages continue to use Message::content alone.
+struct MessageContentPart {
+    std::string type = "text"; // text | image_attachment | image_url
+    std::string text;
+    std::string attachment_id;
+    std::string image_url;
+    std::string mime_type;
+};
+
 // ── Message ───────────────────────────────────────────────────────────────────
 struct Message {
     MessageRole          role         = MessageRole::User;
@@ -85,6 +109,8 @@ struct Message {
     int                  token_count  = 0;
     int64_t              timestamp_ms = 0;
     std::vector<TraceEvent> trace_events;
+    std::vector<MessageContentPart> content_parts;
+    int64_t              storage_id = 0; // internal SQLite row id; not serialized
 };
 
 // ── RuntimeSettings ─────────────────────────────────────────────────────────────
@@ -139,6 +165,14 @@ struct ApiSettings {
     std::string api_key_env = "OPENAI_API_KEY";
 };
 
+// Image-input capability declared by an agent profile. llama.cpp agents need
+// an explicit local GGUF projector; vLLM/API agents use their model-native
+// multimodal implementation and therefore leave mmproj_path empty.
+struct VisionSettings {
+    bool        enabled = false;
+    std::string mmproj_path;
+};
+
 /// True when two vLLM configurations describe the same engine launch, i.e.
 /// agents using either can share one vllm-serve process. gpu_memory_utilization
 /// is excluded: it sizes the engine on its node, it does not change what the
@@ -186,6 +220,7 @@ struct AgentConfig {
     RuntimeSettings runtime_settings;
     VllmSettings  vllm_settings;
     ApiSettings   api_settings;
+    VisionSettings vision_settings;
     bool          reasoning_enabled = false;
     bool          memories_enabled  = true;
     bool          tools_enabled     = false;
@@ -351,6 +386,9 @@ struct SlotInfo {
     SlotId      id;
     uint16_t    port            = 0;
     std::string model_path;
+    std::string mmproj_path;             // node-local; only returned by authenticated node/control status
+    bool        vision_enabled  = false;
+    std::string projector_identity;      // stable basename/manifest identity, never a managed attachment path
     std::string backend         = "llama-cpp"; // "llama-cpp" | "vllm"; slots always report it
     AgentId     assigned_agent;          // first attached agent (legacy display)
     std::vector<AgentId> agent_ids;      // all agents attached to this slot
@@ -376,6 +414,7 @@ struct AgentPlacement {
     bool        suspended       = false;
     bool        is_active       = false;  // true while inference/memory-extraction is in-flight
     std::string kv_cache_node_path;
+    std::string engine_fingerprint;
     int64_t     placed_at_ms    = 0;
     int64_t     last_active_ms  = 0;
 };
@@ -748,6 +787,43 @@ inline void from_json(const nlohmann::json& j, TraceEvent& t) {
     if (j.contains("metadata"))      t.metadata = j.at("metadata");
 }
 
+inline void to_json(nlohmann::json& j, const ImageAttachment& a) {
+    j = { {"id", a.id},
+          {"original_filename", a.original_filename},
+          {"mime_type", a.mime_type},
+          {"size_bytes", a.size_bytes},
+          {"created_at_ms", a.created_at_ms},
+          {"expires_at_ms", a.expires_at_ms} };
+}
+inline void from_json(const nlohmann::json& j, ImageAttachment& a) {
+    if (j.contains("id"))                j.at("id").get_to(a.id);
+    if (j.contains("original_filename")) j.at("original_filename").get_to(a.original_filename);
+    if (j.contains("mime_type"))         j.at("mime_type").get_to(a.mime_type);
+    if (j.contains("relative_path"))     j.at("relative_path").get_to(a.relative_path);
+    if (j.contains("size_bytes"))        j.at("size_bytes").get_to(a.size_bytes);
+    if (j.contains("created_at_ms"))     j.at("created_at_ms").get_to(a.created_at_ms);
+    if (j.contains("expires_at_ms"))     j.at("expires_at_ms").get_to(a.expires_at_ms);
+}
+
+inline void to_json(nlohmann::json& j, const MessageContentPart& p) {
+    j = {{"type", p.type}};
+    if (!p.text.empty())          j["text"] = p.text;
+    if (!p.attachment_id.empty()) j["attachment_id"] = p.attachment_id;
+    if (!p.image_url.empty())     j["image_url"] = {{"url", p.image_url}};
+    if (!p.mime_type.empty())     j["mime_type"] = p.mime_type;
+}
+inline void from_json(const nlohmann::json& j, MessageContentPart& p) {
+    if (j.contains("type"))          j.at("type").get_to(p.type);
+    if (j.contains("text"))          j.at("text").get_to(p.text);
+    if (j.contains("attachment_id")) j.at("attachment_id").get_to(p.attachment_id);
+    if (j.contains("mime_type"))     j.at("mime_type").get_to(p.mime_type);
+    if (j.contains("image_url")) {
+        const auto& iu = j.at("image_url");
+        if (iu.is_string()) p.image_url = iu.get<std::string>();
+        else if (iu.is_object() && iu.contains("url")) iu.at("url").get_to(p.image_url);
+    }
+}
+
 // ─── Message ─────────────────────────────────────────────────────────────────
 inline void to_json(nlohmann::json& j, const Message& m) {
     j = { {"role",         to_string(m.role)},
@@ -758,6 +834,7 @@ inline void to_json(nlohmann::json& j, const Message& m) {
           {"token_count",  m.token_count},
           {"timestamp_ms", m.timestamp_ms},
           {"trace_events", m.trace_events} };
+    if (!m.content_parts.empty()) j["content_parts"] = m.content_parts;
 }
 inline void from_json(const nlohmann::json& j, Message& m) {
     m.role = message_role_from_string(j.at("role").get<std::string>());
@@ -768,6 +845,7 @@ inline void from_json(const nlohmann::json& j, Message& m) {
     if (j.contains("token_count"))  j.at("token_count").get_to(m.token_count);
     if (j.contains("timestamp_ms")) j.at("timestamp_ms").get_to(m.timestamp_ms);
     if (j.contains("trace_events")) j.at("trace_events").get_to(m.trace_events);
+    if (j.contains("content_parts"))j.at("content_parts").get_to(m.content_parts);
 }
 
 // ─── RuntimeSettings ───────────────────────────────────────────────────────────
@@ -856,6 +934,14 @@ inline void from_json(const nlohmann::json& j, ApiSettings& s) {
     if (j.contains("api_key_env"))           j.at("api_key_env").get_to(s.api_key_env);
 }
 
+inline void to_json(nlohmann::json& j, const VisionSettings& s) {
+    j = {{"enabled", s.enabled}, {"mmproj_path", s.mmproj_path}};
+}
+inline void from_json(const nlohmann::json& j, VisionSettings& s) {
+    if (j.contains("enabled"))     j.at("enabled").get_to(s.enabled);
+    if (j.contains("mmproj_path")) j.at("mmproj_path").get_to(s.mmproj_path);
+}
+
 // ─── AgentConfig ─────────────────────────────────────────────────────────────
 inline void to_json(nlohmann::json& j, const AgentConfig& a) {
     j = { {"id",                a.id},
@@ -866,6 +952,7 @@ inline void to_json(nlohmann::json& j, const AgentConfig& a) {
           {"runtime_settings",    a.runtime_settings},
           {"vllm_settings",     a.vllm_settings},
           {"api_settings",      a.api_settings},
+          {"vision_settings",   a.vision_settings},
           {"reasoning_enabled", a.reasoning_enabled},
           {"memories_enabled",  a.memories_enabled},
           {"tools_enabled",     a.tools_enabled},
@@ -880,6 +967,7 @@ inline void from_json(const nlohmann::json& j, AgentConfig& a) {
     if (j.contains("runtime_settings"))    j.at("runtime_settings").get_to(a.runtime_settings);
     if (j.contains("vllm_settings"))     j.at("vllm_settings").get_to(a.vllm_settings);
     if (j.contains("api_settings"))      j.at("api_settings").get_to(a.api_settings);
+    if (j.contains("vision_settings"))   j.at("vision_settings").get_to(a.vision_settings);
     if (j.contains("reasoning_enabled")) j.at("reasoning_enabled").get_to(a.reasoning_enabled);
     if (j.contains("memories_enabled"))  j.at("memories_enabled").get_to(a.memories_enabled);
     if (j.contains("tools_enabled"))     j.at("tools_enabled").get_to(a.tools_enabled);
@@ -1165,6 +1253,9 @@ inline void to_json(nlohmann::json& j, const SlotInfo& s) {
     j = { {"id",              s.id},
           {"port",            s.port},
           {"model_path",      s.model_path},
+          {"mmproj_path",     s.mmproj_path},
+          {"vision_enabled",  s.vision_enabled},
+          {"projector_identity", s.projector_identity},
           {"backend",         s.backend},
           {"assigned_agent",  s.assigned_agent},
           {"agent_ids",       s.agent_ids},
@@ -1184,6 +1275,9 @@ inline void from_json(const nlohmann::json& j, SlotInfo& s) {
     j.at("id").get_to(s.id);
     if (j.contains("port"))           j.at("port").get_to(s.port);
     if (j.contains("model_path"))     j.at("model_path").get_to(s.model_path);
+    if (j.contains("mmproj_path"))    j.at("mmproj_path").get_to(s.mmproj_path);
+    if (j.contains("vision_enabled")) j.at("vision_enabled").get_to(s.vision_enabled);
+    if (j.contains("projector_identity")) j.at("projector_identity").get_to(s.projector_identity);
     if (j.contains("backend"))        j.at("backend").get_to(s.backend);
     if (j.contains("assigned_agent")) j.at("assigned_agent").get_to(s.assigned_agent);
     if (j.contains("agent_ids"))      j.at("agent_ids").get_to(s.agent_ids);
@@ -1211,6 +1305,7 @@ inline void to_json(nlohmann::json& j, const AgentPlacement& p) {
           {"suspended",          p.suspended},
           {"is_active",          p.is_active},
           {"kv_cache_node_path", p.kv_cache_node_path},
+          {"engine_fingerprint", p.engine_fingerprint},
           {"placed_at_ms",       p.placed_at_ms},
           {"last_active_ms",     p.last_active_ms} };
 }
@@ -1221,6 +1316,7 @@ inline void from_json(const nlohmann::json& j, AgentPlacement& p) {
     if (j.contains("suspended"))          j.at("suspended").get_to(p.suspended);
     if (j.contains("is_active"))          j.at("is_active").get_to(p.is_active);
     if (j.contains("kv_cache_node_path")) j.at("kv_cache_node_path").get_to(p.kv_cache_node_path);
+    if (j.contains("engine_fingerprint")) j.at("engine_fingerprint").get_to(p.engine_fingerprint);
     if (j.contains("placed_at_ms"))       j.at("placed_at_ms").get_to(p.placed_at_ms);
     if (j.contains("last_active_ms"))     j.at("last_active_ms").get_to(p.last_active_ms);
 }

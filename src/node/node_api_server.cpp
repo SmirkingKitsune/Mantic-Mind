@@ -49,8 +49,10 @@ bool node_vllm_runtime_ready(const VllmRuntimeStatus& rt) {
 // evict out from under a running engine.
 std::set<std::string> loaded_model_paths(SlotManager& mgr) {
     std::set<std::string> paths;
-    for (const auto& s : mgr.get_slot_info())
+    for (const auto& s : mgr.get_slot_info()) {
         if (!s.model_path.empty()) paths.insert(s.model_path);
+        if (!s.mmproj_path.empty()) paths.insert(s.mmproj_path);
+    }
     return paths;
 }
 
@@ -530,6 +532,8 @@ void NodeApiServer::register_routes() {
         try {
             auto j = nlohmann::json::parse(req.body);
             std::string model_ref  = j.value("model_path", std::string{});
+            std::string mmproj_ref = j.value("mmproj_path", std::string{});
+            const bool vision_enabled = j.value("vision_enabled", !mmproj_ref.empty());
             std::string agent_id   = j.value("agent_id",   std::string{});
             // Optional: identity + pin flag for a control-transferred model, so
             // the node can refresh the LRU use-queue and pinned state on load.
@@ -555,6 +559,38 @@ void NodeApiServer::register_routes() {
             // vLLM resolves the model from an HF id / cache / local dir; llama.cpp
             // always loads a local GGUF file.
             const std::string model_path = sanitize_path_for_runtime(model_ref);
+            const std::string mmproj_path = sanitize_path_for_runtime(mmproj_ref);
+
+            if (!is_llama && !mmproj_path.empty()) {
+                res.status = 400;
+                res.set_content(R"({"error":"mmproj_path is only valid for llama-cpp"})",
+                                "application/json");
+                return;
+            }
+            if (is_llama && vision_enabled && mmproj_path.empty()) {
+                res.status = 400;
+                res.set_content(R"({"error":"vision-enabled llama-cpp load requires mmproj_path"})",
+                                "application/json");
+                return;
+            }
+            if (is_llama && !vision_enabled && !mmproj_path.empty()) {
+                res.status = 400;
+                res.set_content(R"({"error":"llama.cpp mmproj_path requires vision_enabled=true"})",
+                                "application/json");
+                return;
+            }
+            if (is_llama && !mmproj_path.empty()) {
+                std::error_code ec;
+                if (!fs::is_regular_file(mmproj_path, ec)) {
+                    res.status = 400;
+                    const std::string msg = "projector path not found on this node: " + mmproj_path;
+                    state_.set_last_error(msg);
+                    res.set_content(nlohmann::json{{"error", "projector not found on node"},
+                                                   {"detail", msg}}.dump(),
+                                    "application/json");
+                    return;
+                }
+            }
 
             // Fail fast rather than spawn an engine we know will die: without a
             // usable runtime the launch reports a misleading "did not become
@@ -596,10 +632,9 @@ void NodeApiServer::register_routes() {
                     return;
                 }
             }
-
             auto slot_id = is_llama
-                ? slot_mgr_.load_model_llama(model_path, runtime_settings, agent_id)
-                : slot_mgr_.load_model(model_path, vllm_settings, agent_id);
+                ? slot_mgr_.load_model_llama(model_path, mmproj_path, runtime_settings, agent_id)
+                : slot_mgr_.load_model(model_path, vllm_settings, agent_id, vision_enabled);
             if (slot_id.empty()) {
                 res.status = 500;
                 nlohmann::json err = {{"error", "failed to load model"}};
@@ -956,6 +991,7 @@ void NodeApiServer::register_routes() {
         res.set_content(nlohmann::json{{"status", "stored"},
                                        {"model_id", id},
                                        {"load_path", model_store_->load_path(id)},
+                                       {"stored_path", slot.final_path},
                                        {"evicted", evicted}}.dump(),
                         "application/json");
     });
@@ -1086,6 +1122,9 @@ void NodeApiServer::register_routes() {
             auto j = nlohmann::json::parse(req.body);
             std::string model_path = sanitize_path_for_runtime(
                 j.value("model_path", std::string{}));
+            std::string mmproj_path = sanitize_path_for_runtime(
+                j.value("mmproj_path", std::string{}));
+            const bool vision_enabled = j.value("vision_enabled", !mmproj_path.empty());
             std::string agent_id   = j.value("agent_id", std::string{});
             const std::string backend = j.value("backend", std::string{"llama-cpp"});
             const bool is_llama = (engine_backend_from_string(backend) == EngineBackend::LlamaCpp);
@@ -1102,9 +1141,53 @@ void NodeApiServer::register_routes() {
                 return;
             }
 
+            if (!is_llama && !mmproj_path.empty()) {
+                res.status = 400;
+                res.set_content(R"({"error":"mmproj_path is only valid for llama-cpp"})",
+                                "application/json");
+                return;
+            }
+            if (is_llama && vision_enabled && mmproj_path.empty()) {
+                res.status = 400;
+                res.set_content(R"({"error":"vision-enabled llama-cpp restore requires mmproj_path"})",
+                                "application/json");
+                return;
+            }
+            if (is_llama && !vision_enabled && !mmproj_path.empty()) {
+                res.status = 400;
+                res.set_content(R"({"error":"llama.cpp mmproj_path requires vision_enabled=true"})",
+                                "application/json");
+                return;
+            }
+            if (is_llama && !mmproj_path.empty()) {
+                std::error_code ec;
+                if (!fs::is_regular_file(mmproj_path, ec)) {
+                    res.status = 400;
+                    res.set_content(nlohmann::json{{"error", "projector not found on node"},
+                                                   {"detail", "projector path not found on this node: " + mmproj_path}}.dump(),
+                                    "application/json");
+                    return;
+                }
+            }
+            if (!mm::util::is_hf_repo_id(model_path) &&
+                looks_like_fs_path(model_path)) {
+                std::error_code ec;
+                if (!fs::exists(model_path, ec)) {
+                    res.status = 400;
+                    const std::string detail =
+                        "model path not found on this node during restore: " + model_path;
+                    res.set_content(nlohmann::json{
+                        {"error", "model not found on node"},
+                        {"detail", detail},
+                        {"model_path", model_path}
+                    }.dump(), "application/json");
+                    return;
+                }
+            }
+
             auto slot_id = is_llama
-                ? slot_mgr_.restore_slot_llama(model_path, runtime_settings, kv_cache_path, agent_id)
-                : slot_mgr_.restore_slot(model_path, vllm_settings, agent_id);
+                ? slot_mgr_.restore_slot_llama(model_path, mmproj_path, runtime_settings, kv_cache_path, agent_id)
+                : slot_mgr_.restore_slot(model_path, vllm_settings, agent_id, vision_enabled);
             state_.set_slots(slot_mgr_.get_slot_info());
 
             if (slot_id.empty()) {

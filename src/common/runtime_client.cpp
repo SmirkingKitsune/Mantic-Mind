@@ -20,7 +20,19 @@ namespace {
 nlohmann::json message_to_openai(const Message& m) {
     nlohmann::json j;
     j["role"]    = to_string(m.role);
-    j["content"] = m.content;
+    if (m.content_parts.empty()) {
+        j["content"] = m.content;
+    } else {
+        auto& content = j["content"] = nlohmann::json::array();
+        for (const auto& part : m.content_parts) {
+            if (part.type == "text") {
+                content.push_back({{"type", "text"}, {"text", part.text}});
+            } else if (part.type == "image_url" && !part.image_url.empty()) {
+                content.push_back({{"type", "image_url"},
+                                   {"image_url", {{"url", part.image_url}}}});
+            }
+        }
+    }
     if (!m.tool_calls.empty()) {
         auto& arr = j["tool_calls"] = nlohmann::json::array();
         for (auto& tc : m.tool_calls)
@@ -149,7 +161,16 @@ nlohmann::json build_request(const InferenceRequest& req, bool stream) {
     nlohmann::json body;
     if (!req.model.empty()) body["model"] = req.model;
 
-    auto normalized_messages = normalize_for_strict_chat_template(req.messages);
+    const bool has_multimodal = std::any_of(
+        req.messages.begin(), req.messages.end(), [](const Message& message) {
+            return std::any_of(message.content_parts.begin(), message.content_parts.end(),
+                               [](const MessageContentPart& part) {
+                                   return part.type == "image_url" ||
+                                          part.type == "image_attachment";
+                               });
+        });
+    auto normalized_messages = has_multimodal
+        ? req.messages : normalize_for_strict_chat_template(req.messages);
     auto& msgs = body["messages"] = nlohmann::json::array();
     for (auto& m : normalized_messages) msgs.push_back(message_to_openai(m));
 
