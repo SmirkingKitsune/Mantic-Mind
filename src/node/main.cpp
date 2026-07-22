@@ -203,30 +203,6 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
 
 namespace {
 
-// Run a command, capturing trimmed stdout (first line). Empty on failure.
-std::string capture_command_line(const std::string& cmd) {
-#ifdef _WIN32
-    FILE* f = _popen((cmd + " 2>nul").c_str(), "r");
-#else
-    FILE* f = ::popen((cmd + " 2>/dev/null").c_str(), "r");
-#endif
-    if (!f) return {};
-    std::string out;
-    char buf[512];
-    while (fgets(buf, static_cast<int>(sizeof(buf)), f)) out += buf;
-#ifdef _WIN32
-    _pclose(f);
-#else
-    ::pclose(f);
-#endif
-    // Return the first non-empty line.
-    for (auto& line : mm::util::split(out, '\n')) {
-        const std::string t = mm::util::trim(line);
-        if (!t.empty()) return t;
-    }
-    return {};
-}
-
 // Count GPUs visible via nvidia-smi (one CSV line per GPU).
 int detect_gpu_count() {
     const std::string cmd =
