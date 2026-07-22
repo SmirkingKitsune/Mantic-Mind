@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <filesystem>
 #include <stdexcept>
 
 #ifdef _WIN32
@@ -159,11 +160,71 @@ bool is_hf_repo_id(const std::string& ref) {
 
 bool model_ref_is_local_path(const std::string& ref) {
     if (ref.empty()) return false;
+    const std::string normalized = to_lower(trim(ref));
+    if (ends_with(normalized, ".gguf")) return true;
     if (is_hf_repo_id(ref)) return false;
     if (ref.find('/') != std::string::npos || ref.find('\\') != std::string::npos) return true;
     if (ref.size() >= 2 && std::isalpha(static_cast<unsigned char>(ref[0])) && ref[1] == ':')
         return true;
     return false;
+}
+
+std::optional<std::string> resolve_existing_local_model_path(
+    const std::string& ref,
+    const std::string& models_dir) {
+    namespace fs = std::filesystem;
+
+    std::string cleaned = trim(ref);
+    if (cleaned.size() >= 2 &&
+        ((cleaned.front() == '"' && cleaned.back() == '"') ||
+         (cleaned.front() == '\'' && cleaned.back() == '\''))) {
+        cleaned = trim(cleaned.substr(1, cleaned.size() - 2));
+    }
+    if (cleaned.empty()) return std::nullopt;
+
+    std::vector<fs::path> candidates;
+    const fs::path requested(cleaned);
+    candidates.push_back(requested);
+
+    if (!requested.is_absolute() && !models_dir.empty()) {
+        const fs::path root(models_dir);
+        candidates.push_back(root / requested);
+
+        // When models_dir is absolute, a user-facing reference commonly keeps
+        // its final directory name ("models/foo.gguf"). Avoid producing
+        // <root>/models/foo.gguf in that case.
+        auto requested_it = requested.begin();
+        if (requested_it != requested.end() && !root.filename().empty()) {
+            const std::string first = requested_it->string();
+#ifdef _WIN32
+            const bool same_root_name = to_lower(first) == to_lower(root.filename().string());
+#else
+            const bool same_root_name = first == root.filename().string();
+#endif
+            if (same_root_name) {
+                fs::path beneath_root;
+                for (++requested_it; requested_it != requested.end(); ++requested_it) {
+                    beneath_root /= *requested_it;
+                }
+                if (!beneath_root.empty()) candidates.push_back(root / beneath_root);
+            }
+        }
+    }
+
+    for (const auto& candidate : candidates) {
+        std::error_code ec;
+        if (!fs::is_regular_file(candidate, ec)) continue;
+
+        ec.clear();
+        fs::path resolved = fs::weakly_canonical(candidate, ec);
+        if (ec) {
+            ec.clear();
+            resolved = fs::absolute(candidate, ec);
+        }
+        if (ec) resolved = candidate;
+        return resolved.lexically_normal().string();
+    }
+    return std::nullopt;
 }
 
 std::string model_id_from_ref(const std::string& ref) {

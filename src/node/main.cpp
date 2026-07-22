@@ -6,16 +6,13 @@
 #include "common/util.hpp"
 #include "node/node_api_server.hpp"
 #include "node/node_config.hpp"
-#include "node/hf_cache.hpp"
 #include "node/model_store.hpp"
 #include "node/node_state.hpp"
 #include "node/node_ui.hpp"
 #include "node/singleton_lock.hpp"
 #include "node/slot_manager.hpp"
-#include "node/vllm_provisioner.hpp"
 #include "node/llama_cpp_provisioner.hpp"
 #include "node/llama_runtime.hpp"
-#include "node/vllm_runtime.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -85,12 +82,6 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
     if (!loaded_from.empty()) {
         cfg.control_url       = file.get("control_url",       "");
         cfg.control_api_key   = file.get("control_api_key",   "");
-        cfg.vllm_server_path  = file.get("vllm_server_path",  "vllm");
-        cfg.vllm_auto_provision = file.get_bool("vllm_auto_provision", false);
-        cfg.vllm_provision_dir = file.get("vllm_provision_dir", "");
-        cfg.vllm_install_method = file.get("vllm_install_method", "auto");
-        cfg.vllm_version = file.get("vllm_version", "latest");
-        cfg.vllm_python_path = file.get("vllm_python_path", "");
         cfg.llama_server_path = file.get("llama_server_path", "llama-server");
         cfg.llama_auto_provision = file.get_bool("llama_auto_provision", true);
         cfg.llama_provision_dir = file.get("llama_provision_dir", "");
@@ -99,10 +90,6 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
         cfg.llama_accelerator = file.get("llama_accelerator", "");
         cfg.llama_cuda_arch = file.get("llama_cuda_arch", "");
         cfg.llama_build_jobs = file.get_int("llama_build_jobs", 0);
-        cfg.vllm_update_policy = file.get("vllm_update_policy", "prompt");
-        cfg.vllm_update_check = file.get_bool("vllm_update_check", true);
-        cfg.vllm_update_check_interval_hours =
-            file.get_int("vllm_update_check_interval_hours", 24);
         cfg.llama_update_policy = file.get("llama_update_policy", "prompt");
         cfg.llama_update_check = file.get_bool("llama_update_check", true);
         cfg.llama_update_check_interval_hours =
@@ -117,20 +104,7 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
         cfg.runtime_port_range_end = static_cast<uint16_t>(
             file.get_int("runtime_port_range_end", cfg.runtime_port_range_start + 10));
         cfg.max_slots    = file.get_int("max_slots", 4);
-        cfg.vllm_gpu_budget = static_cast<double>(
-            file.get_float("vllm_gpu_budget", 0.90f));
-        cfg.comm_backends   = file.get("comm_backends", "");
-        if (file.has("supports_ray")) {
-            cfg.supports_ray     = file.get_bool("supports_ray", false);
-            cfg.supports_ray_set = true;
-        }
         cfg.node_gpu_count    = file.get_int("node_gpu_count", 0);
-        cfg.interconnect_gbps = static_cast<double>(
-            file.get_float("interconnect_gbps", 0.0f));
-        cfg.ray_path = file.get("ray_path", "ray");
-        cfg.ray_port = static_cast<uint16_t>(file.get_int("ray_port", 6379));
-        cfg.hf_cli_path = file.get("hf_cli_path", "hf");
-        cfg.hf_cache_dir = file.get("hf_cache_dir", "");
         cfg.kv_cache_dir = file.get("kv_cache_dir", "data/kv_cache");
         cfg.model_cache_min_free_mb = static_cast<int64_t>(
             file.get_int("model_cache_min_free_mb",
@@ -165,12 +139,6 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
 
     cfg.control_url       = env("MM_CONTROL_URL",     cfg.control_url);
     cfg.control_api_key   = env("MM_CONTROL_API_KEY", cfg.control_api_key);
-    cfg.vllm_server_path  = env("MM_VLLM_PATH",       cfg.vllm_server_path);
-    cfg.vllm_auto_provision = env_bool("MM_VLLM_AUTO_PROVISION", cfg.vllm_auto_provision);
-    cfg.vllm_provision_dir = env("MM_VLLM_PROVISION_DIR", cfg.vllm_provision_dir);
-    cfg.vllm_install_method = env("MM_VLLM_INSTALL_METHOD", cfg.vllm_install_method);
-    cfg.vllm_version = env("MM_VLLM_VERSION", cfg.vllm_version);
-    cfg.vllm_python_path = env("MM_VLLM_PYTHON_PATH", cfg.vllm_python_path);
     cfg.llama_server_path = env("MM_LLAMA_PATH", cfg.llama_server_path);
     cfg.llama_auto_provision = env_bool("MM_LLAMA_AUTO_PROVISION", cfg.llama_auto_provision);
     cfg.llama_provision_dir = env("MM_LLAMA_PROVISION_DIR", cfg.llama_provision_dir);
@@ -178,8 +146,6 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
     cfg.llama_version = env("MM_LLAMA_VERSION", cfg.llama_version);
     cfg.llama_accelerator = env("MM_LLAMA_ACCELERATOR", cfg.llama_accelerator);
     cfg.llama_cuda_arch = env("MM_LLAMA_CUDA_ARCH", cfg.llama_cuda_arch);
-    cfg.vllm_update_policy = env("MM_VLLM_UPDATE_POLICY", cfg.vllm_update_policy);
-    cfg.vllm_update_check = env_bool("MM_VLLM_UPDATE_CHECK", cfg.vllm_update_check);
     cfg.models_dir        = env("MM_MODELS_DIR",      cfg.models_dir);
     cfg.data_dir          = env("MM_DATA_DIR",        cfg.data_dir);
     cfg.log_file          = env("MM_LOG_FILE",        cfg.log_file);
@@ -196,8 +162,6 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
     cfg.runtime_port_range_start = env_port("MM_RUNTIME_PORT_RANGE_START", cfg.runtime_port_range_start);
     cfg.runtime_port_range_end   = env_port("MM_RUNTIME_PORT_RANGE_END",   cfg.runtime_port_range_end);
     cfg.max_slots              = env_int("MM_MAX_SLOTS", cfg.max_slots);
-    cfg.vllm_update_check_interval_hours =
-        env_int("MM_VLLM_UPDATE_CHECK_INTERVAL_HOURS", cfg.vllm_update_check_interval_hours);
     cfg.llama_build_jobs = env_int("MM_LLAMA_BUILD_JOBS", cfg.llama_build_jobs);
     cfg.llama_update_policy = env("MM_LLAMA_UPDATE_POLICY", cfg.llama_update_policy);
     cfg.llama_update_check = env_bool("MM_LLAMA_UPDATE_CHECK", cfg.llama_update_check);
@@ -210,36 +174,9 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
     cfg.model_cache_clear_on_shutdown =
         env_bool("MM_MODEL_CACHE_CLEAR_ON_SHUTDOWN", cfg.model_cache_clear_on_shutdown);
 
-    auto env_double = [](const char* name, double cur) -> double {
-        const char* v = std::getenv(name);
-        if (!v) return cur;
-        try { return std::stod(v); } catch (...) { return cur; }
-    };
-    cfg.vllm_gpu_budget = env_double("MM_VLLM_GPU_BUDGET", cfg.vllm_gpu_budget);
-    cfg.comm_backends   = env("MM_COMM_BACKENDS", cfg.comm_backends);
     cfg.node_gpu_count  = env_int("MM_NODE_GPU_COUNT", cfg.node_gpu_count);
-    cfg.interconnect_gbps = env_double("MM_INTERCONNECT_GBPS", cfg.interconnect_gbps);
-    cfg.ray_path = env("MM_RAY_PATH", cfg.ray_path);
-    cfg.ray_port = env_port("MM_RAY_PORT", cfg.ray_port);
-    cfg.hf_cli_path = env("MM_HF_CLI_PATH", cfg.hf_cli_path);
-    cfg.hf_cache_dir = env("MM_HF_CACHE_DIR", cfg.hf_cache_dir);
-    if (const char* sr = std::getenv("MM_SUPPORTS_RAY")) {
-        const std::string v = mm::util::to_lower(sr);
-        cfg.supports_ray     = (v == "1" || v == "true" || v == "yes");
-        cfg.supports_ray_set = true;
-    }
 
     // Keep node startup resilient if env/config accidentally provide empty strings.
-    if (cfg.vllm_server_path.empty()) cfg.vllm_server_path = "vllm";
-    if (cfg.vllm_install_method.empty()) cfg.vllm_install_method = "auto";
-    cfg.vllm_install_method = mm::normalize_vllm_install_method(cfg.vllm_install_method);
-    if (cfg.vllm_version.empty()) cfg.vllm_version = "latest";
-    {
-        const std::string policy = mm::util::to_lower(mm::util::trim(cfg.vllm_update_policy));
-        cfg.vllm_update_policy =
-            (policy == "auto" || policy == "manual") ? policy : "prompt";
-    }
-    if (cfg.vllm_update_check_interval_hours < 1) cfg.vllm_update_check_interval_hours = 24;
     {
         const std::string policy = mm::util::to_lower(mm::util::trim(cfg.llama_update_policy));
         cfg.llama_update_policy =
@@ -251,9 +188,6 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
     if (cfg.models_dir.empty()) cfg.models_dir = "models";
     if (cfg.model_cache_min_free_mb < 0) cfg.model_cache_min_free_mb = 0;
     if (cfg.data_dir.empty()) cfg.data_dir = "data";
-    if (cfg.vllm_provision_dir.empty())
-        cfg.vllm_provision_dir =
-            (std::filesystem::path(cfg.data_dir) / "runtimes" / "vllm").string();
     if (cfg.llama_server_path.empty()) cfg.llama_server_path = "llama-server";
     if (cfg.llama_install_method.empty()) cfg.llama_install_method = "auto";
     cfg.llama_install_method = mm::normalize_llama_install_method(cfg.llama_install_method);
@@ -263,9 +197,6 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
             (std::filesystem::path(cfg.data_dir) / "runtimes" / "llama.cpp").string();
     if (cfg.kv_cache_dir.empty()) cfg.kv_cache_dir = "data/kv_cache";
     if (cfg.log_file.empty()) cfg.log_file = "logs/mantic-mind.log";
-    if (cfg.ray_path.empty()) cfg.ray_path = "ray";
-    if (cfg.hf_cli_path.empty()) cfg.hf_cli_path = "hf";
-    if (cfg.vllm_gpu_budget <= 0.0 || cfg.vllm_gpu_budget > 1.0) cfg.vllm_gpu_budget = 0.90;
 
     return cfg;
 }
@@ -354,7 +285,6 @@ std::string detect_cuda_architectures() {
 // the config left blank. llama_version is the resolved llama.cpp build
 // fingerprint (from the llama provisioner), "" while unknown/provisioning.
 mm::NodeCapabilities detect_node_capabilities(const mm::NodeConfig& cfg,
-                                              bool gpu_backend_available,
                                               const std::string& llama_version = {}) {
     mm::NodeCapabilities caps;
 
@@ -366,50 +296,7 @@ mm::NodeCapabilities detect_node_capabilities(const mm::NodeConfig& cfg,
     caps.arch = "";
 #endif
 
-    const std::string platform = mm::current_vllm_platform();
-    const bool is_linux = platform == "linux";
-
     caps.gpu_count = cfg.node_gpu_count > 0 ? cfg.node_gpu_count : detect_gpu_count();
-    caps.interconnect_gbps = cfg.interconnect_gbps;
-
-    // Ray multi-node membership: Linux/WSL only in practice. Config wins.
-    caps.supports_ray = cfg.supports_ray_set ? cfg.supports_ray : is_linux;
-
-    // Comm backends: explicit CSV, else inferred. NCCL has no Windows build
-    // yet (NVIDIA/nccl#1922 pending), so native Windows gets Gloo only; Linux
-    // with a CUDA GPU gets NCCL + Gloo; CPU-only gets Gloo.
-    if (!cfg.comm_backends.empty()) {
-        for (auto& b : mm::util::split(cfg.comm_backends, ',')) {
-            const std::string t = mm::util::to_lower(mm::util::trim(b));
-            if (!t.empty()) caps.comm_backends.push_back(t);
-        }
-    } else {
-        if (is_linux && gpu_backend_available && caps.gpu_count > 0)
-            caps.comm_backends = {"nccl", "gloo"};
-        else
-            caps.comm_backends = {"gloo"};
-    }
-
-    // vLLM build fingerprint: `vllm --version` (e.g. "0.6.3").
-    const std::string version_cmd =
-        mm::util::trim(cfg.vllm_server_path).empty()
-            ? std::string{}
-            : "\"" + mm::util::trim(cfg.vllm_server_path) + "\" --version";
-    if (!version_cmd.empty()) {
-        const std::string v = capture_command_line(version_cmd);
-        // Keep only a version-looking token if the line has extra words.
-        if (!v.empty()) {
-            for (auto& tok : mm::util::split(v, ' ')) {
-                const std::string t = mm::util::trim(tok);
-                if (!t.empty() && (std::isdigit(static_cast<unsigned char>(t[0])) ||
-                                   t.find('.') != std::string::npos)) {
-                    caps.vllm_version = t;
-                    break;
-                }
-            }
-            if (caps.vllm_version.empty()) caps.vllm_version = v;
-        }
-    }
 
     // llama.cpp build fingerprint (RPC groups need matching builds; advertised
     // for planning even while supports_llama_rpc stays a future capability).
@@ -472,7 +359,7 @@ static bool try_register(const mm::NodeConfig& cfg,
         ? std::string(self_env)
         : "http://127.0.0.1:" + std::to_string(cfg.listen_port);
 
-    const std::string platform = mm::current_vllm_platform();
+    const std::string platform = mm::current_runtime_platform();
 
     mm::HttpClient ctrl(cfg.control_url);
     if (!cfg.control_api_key.empty())
@@ -912,9 +799,7 @@ int main(int argc, char** argv) {
             cfg_path.empty() ? "(defaults/env only; no config file found)" : cfg_path);
     MM_INFO("Node config — control_url='{}', models_dir='{}'",
             cfg.control_url, cfg.models_dir);
-    MM_INFO("Node llama-server path: {} (default runtime)", cfg.llama_server_path);
-    MM_INFO("Node vLLM path: {} (peer backend, auto-provision {})",
-            cfg.vllm_server_path, cfg.vllm_auto_provision ? "on" : "off");
+    MM_INFO("Node llama-server path: {}", cfg.llama_server_path);
 
     // ── NodeState ─────────────────────────────────────────────────────────────
 
@@ -925,24 +810,9 @@ int main(int argc, char** argv) {
 
     // Start metrics polling before provisioning so the GPU-backend probe
     // (nvidia-smi) has populated gpu_backend_available before we pick the
-    // accelerator-correct vLLM build variant.
+    // accelerator-correct llama.cpp build variant.
     state.start_metrics_poll(2000);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-    mm::VllmProvisionConfig vllm_provision_cfg;
-    vllm_provision_cfg.requested_executable = cfg.vllm_server_path;
-    vllm_provision_cfg.provision_dir = cfg.vllm_provision_dir;
-    vllm_provision_cfg.auto_provision = cfg.vllm_auto_provision;
-    vllm_provision_cfg.install_method = cfg.vllm_install_method;
-    vllm_provision_cfg.version = cfg.vllm_version;
-    vllm_provision_cfg.python_path = cfg.vllm_python_path;
-    vllm_provision_cfg.accelerator = mm::detect_vllm_accelerator(
-        mm::current_vllm_platform(), mm::current_vllm_arch(),
-        state.get_metrics().gpu_backend_available, mm::detect_rocm_present());
-    mm::VllmProvisioner vllm_provisioner(vllm_provision_cfg);
-    state.set_vllm_runtime(vllm_provisioner.status());
-    MM_INFO("vLLM update policy: {} (checks {})",
-            cfg.vllm_update_policy, cfg.vllm_update_check ? "enabled" : "disabled");
 
     const auto remembered_keys_path = remembered_api_keys_file(cfg);
     std::vector<std::string> remembered_api_keys =
@@ -967,10 +837,7 @@ int main(int argc, char** argv) {
 
     mm::SlotManager slot_mgr(cfg.runtime_port_range_start,
                              cfg.runtime_port_range_end,
-                             cfg.max_slots,
-                             cfg.vllm_server_path,
-                             cfg.vllm_gpu_budget);
-    slot_mgr.set_gpu_vram_total_mb(state.get_metrics().gpu_vram_total_mb);
+                             cfg.max_slots);
     slot_mgr.set_llama_server_path(cfg.llama_server_path);
     slot_mgr.set_kv_cache_dir(cfg.kv_cache_dir);
     slot_mgr.set_models_dir(cfg.models_dir);
@@ -985,42 +852,38 @@ int main(int argc, char** argv) {
             model_store.root(), cfg.model_cache_min_free_mb,
             cfg.model_cache_clear_on_shutdown);
 
-    // Advertise cluster capabilities (arch, GPUs, comm backends, vLLM build)
-    // for multi-node engine-group planning on control.
+    // Advertise hardware and llama.cpp runtime capabilities to control.
     {
         const auto llama_rt = state.get_llama_runtime();
         auto caps = detect_node_capabilities(
-            cfg, state.get_metrics().gpu_backend_available,
-            mm::llama_runtime_usable(llama_rt) ? llama_rt.version : std::string{});
+            cfg, mm::llama_runtime_usable(llama_rt) ? llama_rt.version : std::string{});
         state.set_capabilities(caps);
-        MM_INFO("Node capabilities: arch={} gpus={} ray={} backends=[{}] vllm={} llama={}",
+        MM_INFO("Node capabilities: arch={} gpus={} llama={}",
                 caps.arch.empty() ? "?" : caps.arch, caps.gpu_count,
-                caps.supports_ray, mm::util::join(caps.comm_backends, ","),
-                caps.vllm_version.empty() ? "?" : caps.vllm_version,
                 caps.llama_cpp_version.empty() ? "?" : caps.llama_cpp_version);
     }
 
-    // Periodically scrape running vLLM engines' /metrics so node status
-    // reports per-engine load (running/waiting requests, KV cache usage).
-    std::atomic<bool> stop_engine_metrics{false};
-    std::thread engine_metrics_thread([&slot_mgr, &model_store, &stop_engine_metrics]() {
-        while (!stop_engine_metrics) {
-            slot_mgr.refresh_vllm_metrics();
+    // Periodically relieve disk pressure without evicting a live model.
+    std::atomic<bool> stop_model_housekeeping{false};
+    std::thread model_housekeeping_thread([&slot_mgr, &model_store, &stop_model_housekeeping]() {
+        while (!stop_model_housekeeping) {
             // Relieve disk pressure: evict LRU unpinned models that are not
             // backing a live slot.
             std::set<std::string> in_use;
-            for (const auto& s : slot_mgr.get_slot_info())
+            for (const auto& s : slot_mgr.get_slot_info()) {
                 if (!s.model_path.empty()) in_use.insert(s.model_path);
+                if (!s.mmproj_path.empty()) in_use.insert(s.mmproj_path);
+            }
             for (const auto& id : model_store.enforce_min_free(in_use))
                 MM_INFO("Model cache: disk pressure evicted {}", id);
-            for (int i = 0; i < 25 && !stop_engine_metrics; ++i)
+            for (int i = 0; i < 25 && !stop_model_housekeeping; ++i)
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     });
 
     // ── llama.cpp runtime management (provision in the background) ─────────────
     // Release retrieval or its source-build fallback runs on a background
-    // thread, so node startup and vLLM serving never block on it. The fast
+    // thread, so node startup never blocks on it. The fast
     // resolve-from-PATH and already-provisioned paths complete near-instantly
     // inside ensure_runtime(). A shutdown flag drives the provisioner's cancel
     // check so a download/build in flight aborts promptly.
@@ -1036,7 +899,7 @@ int main(int argc, char** argv) {
     llama_provision_cfg.accelerator_explicit = !cfg.llama_accelerator.empty();
     llama_provision_cfg.accelerator = !cfg.llama_accelerator.empty()
         ? cfg.llama_accelerator
-        : mm::detect_llama_accelerator(mm::current_vllm_platform(), mm::current_vllm_arch(),
+        : mm::detect_llama_accelerator(mm::current_runtime_platform(), mm::current_runtime_arch(),
                                        state.get_metrics().gpu_backend_available,
                                        mm::detect_rocm_present());
     if (llama_provision_cfg.accelerator == "cuda" &&
@@ -1054,7 +917,7 @@ int main(int argc, char** argv) {
         if (is_stderr) MM_WARN("[llama] {}", line); else MM_INFO("[llama] {}", line);
     });
     std::atomic<bool> llama_provision_stop{false};
-    llama_provisioner.set_progress_sink([&](const mm::VllmInstallProgress& p) {
+    llama_provisioner.set_progress_sink([&](const mm::RuntimeInstallProgress& p) {
         if (!p.active) {
             state.clear_action_progress("llama-runtime");
             return;
@@ -1083,43 +946,18 @@ int main(int argc, char** argv) {
             || state.action_cancel_requested("llama-runtime");
     });
 
-    // ── vLLM runtime management (provision / update) ───────────────────────────
-    // Apply a runtime status produced by the provisioner: on a usable runtime,
-    // rebind the engine executable path and refresh advertised capabilities;
-    // always mirror the status (and any error) into NodeState. Serialized so the
-    // TUI key, the REST endpoints, and the background threads can't race on cfg.
-    std::mutex vllm_apply_mutex;
-    std::mutex vllm_operation_mutex;
+    // ── llama.cpp runtime management (provision / update) ─────────────────────
+    // Apply a runtime status produced by the provisioner and refresh advertised
+    // capabilities. Serialized so UI, API, and background work cannot race.
+    std::mutex runtime_apply_mutex;
     std::mutex llama_operation_mutex;
-    auto apply_runtime_result =
-        [&](mm::VllmRuntimeStatus runtime) -> mm::VllmRuntimeStatus {
-        std::lock_guard<std::mutex> lk(vllm_apply_mutex);
-        if (mm::vllm_runtime_usable(runtime)) {
-            cfg.vllm_server_path = runtime.executable_path;
-            slot_mgr.set_vllm_server_path(cfg.vllm_server_path);
-            const auto llama_rt = state.get_llama_runtime();
-            auto caps = detect_node_capabilities(
-                cfg, state.get_metrics().gpu_backend_available,
-                mm::llama_runtime_usable(llama_rt) ? llama_rt.version : std::string{});
-            state.set_capabilities(caps);
-        }
-        if (!runtime.last_error.empty()) {
-            state.set_last_error(runtime.last_error);
-        } else if (mm::vllm_runtime_usable(runtime)) {
-            state.set_last_error("");
-        }
-        state.set_vllm_runtime(runtime);
-        return runtime;
-    };
-
     auto apply_llama_result =
         [&](mm::LlamaRuntimeStatus runtime) -> mm::LlamaRuntimeStatus {
-        std::lock_guard<std::mutex> lk(vllm_apply_mutex);
+        std::lock_guard<std::mutex> lk(runtime_apply_mutex);
         if (mm::llama_runtime_usable(runtime)) {
             cfg.llama_server_path = runtime.executable_path;
             slot_mgr.set_llama_server_path(cfg.llama_server_path);
-            auto caps = detect_node_capabilities(
-                cfg, state.get_metrics().gpu_backend_available, runtime.version);
+            auto caps = detect_node_capabilities(cfg, runtime.version);
             state.set_capabilities(caps);
         }
         if (!runtime.last_error.empty()) {
@@ -1131,8 +969,6 @@ int main(int argc, char** argv) {
         return runtime;
     };
 
-    // Started after vllm_apply_mutex exists: the capability refresh below reads
-    // cfg (which apply_runtime_result mutates) and must serialize with it.
     std::thread llama_provision_thread([&]() {
         std::lock_guard<std::mutex> op_lk(llama_operation_mutex);
         auto runtime = apply_llama_result(llama_provisioner.ensure_runtime());
@@ -1216,65 +1052,6 @@ int main(int argc, char** argv) {
         return status;
     };
 
-    auto ensure_vllm_runtime = [&]() -> mm::VllmRuntimeStatus {
-        std::lock_guard<std::mutex> op_lk(vllm_operation_mutex);
-        auto runtime = apply_runtime_result(vllm_provisioner.ensure_runtime());
-        if (mm::vllm_runtime_usable(runtime))
-            MM_INFO("Using vLLM executable: {} (accelerator={})",
-                    cfg.vllm_server_path,
-                    runtime.accelerator.empty() ? "?" : runtime.accelerator);
-        else if (!runtime.last_error.empty())
-            MM_WARN("vLLM runtime is not ready: {}", runtime.last_error);
-        return runtime;
-    };
-
-    // Perform the user-approved update. If the upgrade install fails, fall back
-    // to the still-present install so the node keeps serving, while surfacing
-    // the update failure as the node error.
-    auto do_vllm_update = [&]() -> mm::VllmRuntimeStatus {
-        std::lock_guard<std::mutex> op_lk(vllm_operation_mutex);
-        auto updated = vllm_provisioner.update_runtime();
-        if (updated.status == "failed") {
-            const std::string upd_err = updated.last_error;
-            auto fallback = vllm_provisioner.ensure_runtime();
-            if (mm::vllm_runtime_usable(fallback)) {
-                fallback.last_error = "vLLM update failed: " + upd_err;
-                MM_WARN("vLLM update failed, kept existing runtime: {}", upd_err);
-                return apply_runtime_result(fallback);
-            }
-        }
-        return apply_runtime_result(updated);
-    };
-
-    // Background update checker: probes upstream on an interval and, under the
-    // "auto" policy, applies updates without prompting. "manual" skips checks
-    // entirely; "prompt" leaves update_available set for the TUI / REST to act on.
-    std::atomic<bool> stop_update_check{false};
-    std::thread update_check_thread;
-    if (cfg.vllm_update_check && cfg.vllm_update_policy != "manual") {
-        update_check_thread = std::thread([&]() {
-            // Let startup/registration settle before the first network probe.
-            for (int i = 0; i < 50 && !stop_update_check; ++i)
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            while (!stop_update_check) {
-                if (mm::vllm_runtime_usable(state.get_vllm_runtime())) {
-                    auto st = vllm_provisioner.check_for_update();
-                    state.set_vllm_runtime(st);
-                    if (st.update_available && cfg.vllm_update_policy == "auto") {
-                        MM_INFO("vLLM auto-update policy: updating {} -> {}",
-                                st.version, st.latest_version);
-                        do_vllm_update();
-                    }
-                }
-                const int64_t interval_ms =
-                    static_cast<int64_t>(cfg.vllm_update_check_interval_hours) * 3600 * 1000;
-                for (int64_t slept = 0; slept < interval_ms && !stop_update_check;
-                     slept += 200)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            }
-        });
-    }
-
     std::atomic<bool> stop_llama_update_check{false};
     std::thread llama_update_check_thread;
     if (cfg.llama_update_check && cfg.llama_update_policy != "manual") {
@@ -1308,17 +1085,6 @@ int main(int argc, char** argv) {
     // On-demand update worker for the TUI Update button/prompt: runs the (slow)
     // install off the UI thread on a tracked thread that shutdown joins, so the
     // update never outlives the objects it captures. One at a time.
-    std::atomic<bool> manual_update_running{false};
-    std::thread manual_update_thread;
-    auto request_manual_update = [&]() {
-        bool expected = false;
-        if (!manual_update_running.compare_exchange_strong(expected, true)) return;
-        if (manual_update_thread.joinable()) manual_update_thread.join();
-        manual_update_thread = std::thread([&]() {
-            do_vllm_update();
-            manual_update_running = false;
-        });
-    };
     std::atomic<bool> manual_llama_update_running{false};
     std::thread manual_llama_update_thread;
     auto request_manual_llama_update = [&](std::string accelerator) {
@@ -1372,72 +1138,11 @@ int main(int argc, char** argv) {
         if (ui_ptr) ui_ptr->append_log(out);
     });
 
-    // Stream vLLM install/upgrade output into the runtime log and TUI, and mirror
-    // install progress into NodeState so the UI can render a loading bar.
-    vllm_provisioner.set_log_sink([&](const std::string& line, bool is_stderr) {
-        const std::string out = is_stderr ? "[stderr] " + line : line;
-        append_runtime_log(out);
-        if (ui_ptr) ui_ptr->append_log(out);
-    });
-    vllm_provisioner.set_progress_sink([&](const mm::VllmInstallProgress& p) {
-        state.set_vllm_install_progress(p);
-    });
-    vllm_provisioner.set_cancel_check([&]() {
-        return state.action_cancel_requested("vllm-runtime");
-    });
-
     // ── API server ────────────────────────────────────────────────────────────
 
     mm::NodeApiServer api_server(state, slot_mgr,
                                  cfg.control_url, cfg.pairing_key);
-    api_server.set_ray_config(cfg.ray_path, cfg.ray_port);
     api_server.set_model_store(&model_store);
-    // Resolve the HF hub cache dir once (config override → HF_HUB_CACHE →
-    // HF_HOME/hub → ~/.cache/huggingface/hub) and share it with the API server
-    // (status scan + pre-fetch). When configured, also point the vLLM child at
-    // it so a cluster can share one cache (e.g. an NFS export on the NAS).
-    {
-        auto getenv_str = [](const char* k) -> std::string {
-            const char* v = std::getenv(k);
-            return v ? std::string(v) : std::string{};
-        };
-#ifdef _WIN32
-        const std::string home = getenv_str("USERPROFILE");
-#else
-        const std::string home = getenv_str("HOME");
-#endif
-        const std::string hub_dir = mm::resolve_hf_hub_cache_dir(
-            cfg.hf_cache_dir, getenv_str("HF_HUB_CACHE"), getenv_str("HF_HOME"), home);
-        api_server.set_hf_config(cfg.hf_cli_path, hub_dir);
-        if (!cfg.hf_cache_dir.empty()) {
-#ifdef _WIN32
-            _putenv_s("HF_HUB_CACHE", cfg.hf_cache_dir.c_str());
-#else
-            ::setenv("HF_HUB_CACHE", cfg.hf_cache_dir.c_str(), 1);
-#endif
-            MM_INFO("HF hub cache pinned to {} (shared with vLLM child)", cfg.hf_cache_dir);
-        }
-        MM_INFO("HF hub cache dir: {}", hub_dir.empty() ? "(default)" : hub_dir);
-    }
-    api_server.set_vllm_provision_callback([&]() {
-        auto runtime = ensure_vllm_runtime();
-        if (mm::vllm_runtime_usable(runtime))
-            MM_INFO("vLLM runtime reprovisioned: {}", cfg.vllm_server_path);
-        else if (!runtime.last_error.empty())
-            MM_WARN("vLLM runtime reprovision failed: {}", runtime.last_error);
-        return runtime;
-    });
-    // User-approved update (TUI Update button or POST .../provision {"update":true}).
-    api_server.set_vllm_update_callback([&]() {
-        MM_INFO("vLLM update requested by user");
-        return do_vllm_update();
-    });
-    // On-demand online update check (POST .../check-update).
-    api_server.set_vllm_check_update_callback([&]() {
-        auto st = vllm_provisioner.check_for_update();
-        state.set_vllm_runtime(st);
-        return st;
-    });
     api_server.set_llama_provision_callback([&]() {
         MM_INFO("llama.cpp provisioning requested by user");
         return ensure_llama_runtime();
@@ -1485,10 +1190,6 @@ int main(int argc, char** argv) {
     std::thread api_thread([&]() {
         if (!api_server.listen(cfg.listen_port))
             MM_ERROR("NodeApiServer failed to bind on port {}", cfg.listen_port);
-    });
-
-    std::thread startup_runtime_thread([&]() {
-        ensure_vllm_runtime();
     });
 
     // Give the server a moment to bind before we register / broadcast.
@@ -1609,7 +1310,6 @@ int main(int argc, char** argv) {
             state,
             cfg.listen_port,
             forget_remembered_pairings,
-            request_manual_update,
             request_manual_llama_update,
             request_manual_llama_switch,
             request_manual_llama_recovery);
@@ -1643,24 +1343,14 @@ int main(int argc, char** argv) {
     api_server.stop();
     if (api_thread.joinable()) api_thread.join();
 
-    stop_engine_metrics = true;
-    if (engine_metrics_thread.joinable()) engine_metrics_thread.join();
+    stop_model_housekeeping = true;
+    if (model_housekeeping_thread.joinable()) model_housekeeping_thread.join();
 
-    stop_update_check = true;
     stop_llama_update_check = true;
     llama_provision_stop = true;
     state.request_action_cancel();
     if (llama_provision_thread.joinable()) llama_provision_thread.join();
-    if (update_check_thread.joinable()) update_check_thread.join();
     if (llama_update_check_thread.joinable()) llama_update_check_thread.join();
-    if (startup_runtime_thread.joinable()) {
-        state.request_action_cancel();
-        startup_runtime_thread.join();
-    }
-    if (manual_update_thread.joinable()) {
-        state.request_action_cancel();
-        manual_update_thread.join();
-    }
     if (manual_llama_update_thread.joinable()) {
         state.request_action_cancel();
         manual_llama_update_thread.join();

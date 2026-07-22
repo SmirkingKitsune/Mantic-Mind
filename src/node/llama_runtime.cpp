@@ -4,11 +4,49 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <filesystem>
 #include <initializer_list>
 #include <optional>
 
 namespace mm {
+
+std::string current_runtime_platform() {
+#ifdef _WIN32
+    return "windows";
+#elif defined(__APPLE__)
+    return "macos";
+#else
+    return "linux";
+#endif
+}
+
+std::string current_runtime_arch() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return "aarch64";
+#elif defined(__x86_64__) || defined(_M_X64) || defined(__amd64__)
+    return "x86_64";
+#else
+    return {};
+#endif
+}
+
+bool detect_rocm_present() {
+#ifdef _WIN32
+    return false;
+#else
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (fs::exists("/opt/rocm", ec)) return true;
+    if (const char* path_env = std::getenv("PATH")) {
+        for (const auto& dir : mm::util::split(path_env, ':')) {
+            if (dir.empty()) continue;
+            if (fs::exists(fs::path(dir) / "rocminfo", ec)) return true;
+        }
+    }
+    return false;
+#endif
+}
 
 namespace {
 
@@ -191,7 +229,7 @@ std::string detect_llama_accelerator(const std::string& platform,
                                      const std::string& arch,
                                      bool has_cuda,
                                      bool has_rocm) {
-    // current_vllm_platform() reports macOS as "macos"; accept "darwin" too in
+    // current_runtime_platform() reports macOS as "macos"; accept "darwin" too in
     // case a caller passes the raw uname value.
     const bool is_macos = (platform == "macos" || platform == "darwin");
     if (is_macos) return "metal"; // Apple GPUs (and Intel macs) use Metal

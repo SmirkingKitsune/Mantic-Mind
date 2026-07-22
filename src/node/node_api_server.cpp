@@ -1,8 +1,6 @@
 #include "node/node_api_server.hpp"
 #include "node/node_state.hpp"
 #include "node/slot_manager.hpp"
-#include "node/ray_orchestration.hpp"
-#include "node/hf_cache.hpp"
 #include "node/model_store.hpp"
 #include "common/http_server.hpp"
 #include "common/runtime_client.hpp"
@@ -16,7 +14,6 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -30,18 +27,9 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// True when a model reference is a filesystem path (contains a separator or a
-// Windows drive prefix) rather than a bare model name or HF repo id.
-bool looks_like_fs_path(const std::string& s) {
-    if (s.find('/') != std::string::npos || s.find('\\') != std::string::npos) return true;
-    if (s.size() >= 2 &&
-        std::isalpha(static_cast<unsigned char>(s[0])) && s[1] == ':') return true;
-    return false;
-}
-
-// A vLLM runtime is usable for launching engines once it resolves to an
+// A llama.cpp runtime is usable for launching engines once it resolves to an
 // executable (found on PATH or a completed managed install).
-bool node_vllm_runtime_ready(const VllmRuntimeStatus& rt) {
+bool node_llama_runtime_ready(const LlamaRuntimeStatus& rt) {
     return (rt.status == "resolved" || rt.status == "ready") && !rt.executable_path.empty();
 }
 
@@ -112,18 +100,6 @@ void NodeApiServer::set_remember_api_key_callback(RememberApiKeyCallback callbac
     remember_api_key_cb_ = std::move(callback);
 }
 
-void NodeApiServer::set_vllm_provision_callback(VllmProvisionCallback callback) {
-    vllm_provision_cb_ = std::move(callback);
-}
-
-void NodeApiServer::set_vllm_update_callback(VllmUpdateCallback callback) {
-    vllm_update_cb_ = std::move(callback);
-}
-
-void NodeApiServer::set_vllm_check_update_callback(VllmCheckUpdateCallback callback) {
-    vllm_check_update_cb_ = std::move(callback);
-}
-
 void NodeApiServer::set_llama_provision_callback(LlamaProvisionCallback callback) {
     llama_provision_cb_ = std::move(callback);
 }
@@ -146,17 +122,6 @@ void NodeApiServer::set_llama_diagnose_callback(LlamaDiagnoseCallback callback) 
 
 void NodeApiServer::set_llama_recovery_callback(LlamaRecoveryCallback callback) {
     llama_recovery_cb_ = std::move(callback);
-}
-
-void NodeApiServer::set_ray_config(std::string ray_path, uint16_t ray_port) {
-    ray_path_ = std::move(ray_path);
-    ray_port_ = ray_port;
-}
-
-void NodeApiServer::set_hf_config(std::string hf_cli_path,
-                                  std::string hf_hub_cache_dir) {
-    hf_cli_path_ = std::move(hf_cli_path);
-    hf_hub_cache_dir_ = std::move(hf_hub_cache_dir);
 }
 
 void NodeApiServer::set_model_store(ModelStore* store) {
@@ -216,15 +181,10 @@ void NodeApiServer::register_routes() {
         const int available_slots = std::max(0, max_slots - in_use_slots);
 
         const auto metrics = state_.get_metrics();
-        // Keep the slot manager's VRAM total fresh so vLLM utilization
-        // fractions convert to accurate MB estimates.
-        slot_mgr_.set_gpu_vram_total_mb(metrics.gpu_vram_total_mb);
-
         nlohmann::json j;
         j["node_id"]       = state_.get_node_id();
         j["hostname"]      = mm::util::hostname();
         j["slots"]         = slots;
-        j["cached_models"] = scan_hf_cache_models(hf_hub_cache_dir_);
         if (model_store_) {
             nlohmann::json managed = nlohmann::json::array();
             for (const auto& m : model_store_->list())
@@ -246,14 +206,9 @@ void NodeApiServer::register_routes() {
         j["slot_suspending"] = suspending_slots;
         j["slot_suspended"] = suspended_slots;
         j["slot_error"]    = error_slots;
-        j["vllm_server_path"] = slot_mgr_.vllm_server_path();
-        j["vllm_runtime"] = state_.get_vllm_runtime();
         j["llama_server_path"] = slot_mgr_.llama_server_path();
         j["llama_runtime"] = state_.get_llama_runtime();
-        j["vllm_install_progress"] = state_.get_vllm_install_progress();
         j["action_progress"] = state_.get_action_progress();
-        j["vllm_gpu_budget"] = slot_mgr_.vllm_gpu_budget();
-        j["vllm_gpu_fraction_used"] = slot_mgr_.vllm_gpu_fraction_used();
 
         // Backwards compat: set single-model fields from first ready slot.
         std::string first_model;
@@ -307,64 +262,6 @@ void NodeApiServer::register_routes() {
         std::vector<std::string> lines;
         if (runtime_logs_provider_) lines = runtime_logs_provider_(tail);
         res.set_content(nlohmann::json{{"lines", lines}}.dump(), "application/json");
-    });
-
-    server_->Get("/api/node/runtime/vllm", [this](const Request& req, Response& res) {
-        if (!check_auth(req.get_header_value("Authorization"))) {
-            res.status = 401; return;
-        }
-        res.set_content(nlohmann::json{{"vllm_runtime", state_.get_vllm_runtime()}}.dump(),
-                        "application/json");
-    });
-
-    server_->Post("/api/node/runtime/vllm/provision", [this](const Request& req, Response& res) {
-        if (!check_auth(req.get_header_value("Authorization"))) {
-            res.status = 401; return;
-        }
-        // Optional {"update": true} approves a managed upgrade to the target
-        // version; the default (no body / update=false) ensures a runtime exists.
-        bool want_update = false;
-        if (!req.body.empty()) {
-            try {
-                const auto j = nlohmann::json::parse(req.body);
-                want_update = j.value("update", false);
-            } catch (...) {
-                res.status = 400;
-                res.set_content(R"({"error":"invalid JSON body"})", "application/json");
-                return;
-            }
-        }
-        auto* cb = want_update ? &vllm_update_cb_ : &vllm_provision_cb_;
-        if (!*cb) {
-            res.status = 501;
-            res.set_content(want_update
-                                ? R"({"error":"vLLM update is not configured"})"
-                                : R"({"error":"vLLM provisioning is not configured"})",
-                            "application/json");
-            return;
-        }
-        auto runtime = (*cb)();
-        state_.set_vllm_runtime(runtime);
-        if (!runtime.last_error.empty()) state_.set_last_error(runtime.last_error);
-        res.status = (runtime.status == "failed" || runtime.status == "disabled") ? 500 : 200;
-        res.set_content(nlohmann::json{{"vllm_runtime", runtime}}.dump(),
-                        "application/json");
-    });
-
-    server_->Post("/api/node/runtime/vllm/check-update", [this](const Request& req, Response& res) {
-        if (!check_auth(req.get_header_value("Authorization"))) {
-            res.status = 401; return;
-        }
-        if (!vllm_check_update_cb_) {
-            res.status = 501;
-            res.set_content(R"({"error":"vLLM update checking is not configured"})",
-                            "application/json");
-            return;
-        }
-        auto runtime = vllm_check_update_cb_();
-        state_.set_vllm_runtime(runtime);
-        res.set_content(nlohmann::json{{"vllm_runtime", runtime}}.dump(),
-                        "application/json");
     });
 
     // ── POST /api/node/load-model ─────────────────────────────────────────────
@@ -538,16 +435,26 @@ void NodeApiServer::register_routes() {
             // Optional: identity + pin flag for a control-transferred model, so
             // the node can refresh the LRU use-queue and pinned state on load.
             const std::string model_id = j.value("model_id", std::string{});
+            const std::string mmproj_model_id =
+                j.value("mmproj_model_id", std::string{});
             const bool model_pin       = j.value("pin", false);
             // llama.cpp is the default runtime: a payload without an explicit
             // backend loads through llama-server. Control always sends the
             // field, so this default only decides hand-written requests.
-            const std::string backend  = j.value("backend", std::string{"llama-cpp"});
-            const bool is_llama = (engine_backend_from_string(backend) == EngineBackend::LlamaCpp);
-            VllmSettings vllm_settings;
-            if (j.contains("vllm_settings")) vllm_settings = j["vllm_settings"].get<VllmSettings>();
+            const std::string backend = mm::util::to_lower(mm::util::trim(
+                j.value("backend", std::string{"llama-cpp"})));
             RuntimeSettings runtime_settings;
             if (j.contains("runtime_settings")) runtime_settings = j["runtime_settings"].get<RuntimeSettings>();
+
+            if (backend != "llama-cpp") {
+                res.status = 400;
+                const std::string msg = "unsupported node inference backend: " + backend;
+                state_.set_last_error(msg);
+                res.set_content(nlohmann::json{{"error", msg},
+                                               {"supported_backends", {"llama-cpp"}}}.dump(),
+                                "application/json");
+                return;
+            }
 
             if (model_ref.empty()) {
                 res.status = 400;
@@ -556,30 +463,23 @@ void NodeApiServer::register_routes() {
                 return;
             }
 
-            // vLLM resolves the model from an HF id / cache / local dir; llama.cpp
-            // always loads a local GGUF file.
+            // llama.cpp always loads a local GGUF file.
             const std::string model_path = sanitize_path_for_runtime(model_ref);
             const std::string mmproj_path = sanitize_path_for_runtime(mmproj_ref);
 
-            if (!is_llama && !mmproj_path.empty()) {
-                res.status = 400;
-                res.set_content(R"({"error":"mmproj_path is only valid for llama-cpp"})",
-                                "application/json");
-                return;
-            }
-            if (is_llama && vision_enabled && mmproj_path.empty()) {
+            if (vision_enabled && mmproj_path.empty()) {
                 res.status = 400;
                 res.set_content(R"({"error":"vision-enabled llama-cpp load requires mmproj_path"})",
                                 "application/json");
                 return;
             }
-            if (is_llama && !vision_enabled && !mmproj_path.empty()) {
+            if (!vision_enabled && !mmproj_path.empty()) {
                 res.status = 400;
                 res.set_content(R"({"error":"llama.cpp mmproj_path requires vision_enabled=true"})",
                                 "application/json");
                 return;
             }
-            if (is_llama && !mmproj_path.empty()) {
+            if (!mmproj_path.empty()) {
                 std::error_code ec;
                 if (!fs::is_regular_file(mmproj_path, ec)) {
                     res.status = 400;
@@ -592,60 +492,42 @@ void NodeApiServer::register_routes() {
                 }
             }
 
-            // Fail fast rather than spawn an engine we know will die: without a
-            // usable runtime the launch reports a misleading "did not become
-            // healthy within 600s" instead of the real cause. (vLLM only — the
-            // llama.cpp runtime gate is handled by the path-existence check and
-            // the load_model_llama failure path.)
-            if (!is_llama) {
-                if (const auto rt = state_.get_vllm_runtime(); !node_vllm_runtime_ready(rt)) {
-                    res.status = 503;
-                    const std::string msg = rt.last_error.empty()
-                        ? "vLLM runtime is not ready on this node (status=" + rt.status + ")"
-                        : "vLLM runtime is not ready on this node: " + rt.last_error;
-                    state_.set_last_error(msg);
-                    res.set_content(nlohmann::json{{"error", "vllm runtime not ready"},
-                                                   {"detail", msg},
-                                                   {"vllm_runtime", rt}}.dump(),
-                                    "application/json");
-                    return;
-                }
+            // Fail fast rather than spawn an engine without a usable runtime.
+            if (const auto rt = state_.get_llama_runtime(); !node_llama_runtime_ready(rt)) {
+                res.status = 503;
+                const std::string msg = rt.last_error.empty()
+                    ? "llama.cpp runtime is not ready on this node (status=" + rt.status + ")"
+                    : "llama.cpp runtime is not ready on this node: " + rt.last_error;
+                state_.set_last_error(msg);
+                res.set_content(nlohmann::json{{"error", "llama runtime not ready"},
+                                               {"detail", msg},
+                                               {"llama_runtime", rt}}.dump(),
+                                "application/json");
+                return;
             }
 
-            // A path-like ref that is not an HF repo id must exist on this node.
-            // This catches a control-side local/UNC/Windows path (e.g. N:\...)
-            // handed to a node that cannot resolve it, with a clear error
-            // instead of a 10-minute vLLM startup timeout.
-            if (!mm::util::is_hf_repo_id(model_path) && looks_like_fs_path(model_path)) {
-                std::error_code ec;
-                if (!fs::exists(model_path, ec)) {
-                    res.status = 400;
-                    const std::string msg =
-                        "model path not found on this node: " + model_path +
-                        " (control must transfer the model here, or use an HF repo "
-                        "id or a node-local path)";
-                    state_.set_last_error(msg);
-                    res.set_content(nlohmann::json{{"error", "model not found on node"},
-                                                   {"detail", msg},
-                                                   {"model_path", model_path}}.dump(),
-                                    "application/json");
-                    return;
-                }
+            // Model references must resolve to local files on this node.
+            std::error_code model_ec;
+            if (!fs::is_regular_file(model_path, model_ec)) {
+                res.status = 400;
+                const std::string msg = mm::util::is_hf_repo_id(model_path)
+                    ? "llama.cpp requires a node-local GGUF file; Hugging Face repository IDs are not loadable"
+                    : "model file not found on this node: " + model_path;
+                state_.set_last_error(msg);
+                res.set_content(nlohmann::json{{"error", "model not found on node"},
+                                               {"detail", msg},
+                                               {"model_path", model_path}}.dump(),
+                                "application/json");
+                return;
             }
-            auto slot_id = is_llama
-                ? slot_mgr_.load_model_llama(model_path, mmproj_path, runtime_settings, agent_id)
-                : slot_mgr_.load_model(model_path, vllm_settings, agent_id, vision_enabled);
+            auto slot_id = slot_mgr_.load_model(
+                model_path, mmproj_path, runtime_settings, agent_id);
             if (slot_id.empty()) {
                 res.status = 500;
                 nlohmann::json err = {{"error", "failed to load model"}};
                 auto detail = slot_mgr_.last_error();
-                if (is_llama) {
-                    err["llama_server_path"] = slot_mgr_.llama_server_path();
-                    err["llama_runtime"] = state_.get_llama_runtime();
-                } else {
-                    err["vllm_server_path"] = slot_mgr_.vllm_server_path();
-                    err["vllm_runtime"] = state_.get_vllm_runtime();
-                }
+                err["llama_server_path"] = slot_mgr_.llama_server_path();
+                err["llama_runtime"] = state_.get_llama_runtime();
                 err["model_path"] = model_path;
                 state_.set_last_error(detail.empty() ? "failed to load model" : detail);
                 if (!detail.empty()) err["detail"] = detail;
@@ -664,9 +546,13 @@ void NodeApiServer::register_routes() {
                 // agent (pin=false) must not clear a pin another agent set —
                 // otherwise the model would become evictable despite a standing
                 // preference. Unpinning is a separate, explicit lifecycle event.
-                if (model_store_ && !model_id.empty()) {
-                    if (model_pin) model_store_->set_pinned(model_id, true);
-                    model_store_->touch(model_id);
+                if (model_store_) {
+                    for (const auto& id : {model_id, mmproj_model_id}) {
+                        if (id.empty()) continue;
+                        if (model_pin) model_store_->set_pinned(id, true);
+                        model_store_->touch(id);
+                        if (id == model_id && mmproj_model_id == model_id) break;
+                    }
                 }
 
                 // Find the effective_ctx_size for the newly loaded slot.
@@ -726,120 +612,6 @@ void NodeApiServer::register_routes() {
                 }
             }
             res.set_content(R"({"status":"unloaded"})", "application/json");
-        } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
-        }
-    });
-
-    // ── POST /api/node/ray/start ──────────────────────────────────────────────
-    // Join (or head) a Ray cluster for a multi-node vLLM engine group. Body:
-    //   {"role":"head"|"worker", "head_address":"ip:port"}  (worker only)
-    // Gated to Linux nodes — returns 501 on platforms without Ray support.
-    server_->Post("/api/node/ray/start", [this](const Request& req, Response& res) {
-        if (!check_auth(req.get_header_value("Authorization"))) {
-            res.status = 401; return;
-        }
-        if (!ray_supported()) {
-            res.status = 501;
-            res.set_content(
-                R"({"error":"Ray multi-node orchestration is only supported on Linux nodes"})",
-                "application/json");
-            return;
-        }
-        try {
-            auto j = nlohmann::json::parse(req.body);
-            const std::string role = j.value("role", std::string{"head"});
-
-            RayStartConfig rcfg;
-            rcfg.ray_path = ray_path_;
-            rcfg.port     = ray_port_;
-            rcfg.num_gpus = state_.get_capabilities().gpu_count;
-            if (role == "worker") {
-                rcfg.role = RayRole::Worker;
-                rcfg.head_address = j.value("head_address", std::string{});
-                if (rcfg.head_address.empty()) {
-                    res.status = 400;
-                    res.set_content(R"({"error":"head_address required for worker role"})",
-                                    "application/json");
-                    return;
-                }
-            } else {
-                rcfg.role = RayRole::Head;
-            }
-
-            std::string err;
-            if (!ray_start(rcfg, &err)) {
-                res.status = 500;
-                res.set_content(nlohmann::json{{"error", err}}.dump(),
-                                "application/json");
-                return;
-            }
-            res.set_content(nlohmann::json{{"status", "ray-started"},
-                                           {"role", role},
-                                           {"port", ray_port_}}.dump(),
-                            "application/json");
-        } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
-        }
-    });
-
-    // ── POST /api/node/ray/stop ───────────────────────────────────────────────
-    server_->Post("/api/node/ray/stop", [this](const Request& req, Response& res) {
-        if (!check_auth(req.get_header_value("Authorization"))) {
-            res.status = 401; return;
-        }
-        if (!ray_supported()) {
-            res.status = 501;
-            res.set_content(
-                R"({"error":"Ray multi-node orchestration is only supported on Linux nodes"})",
-                "application/json");
-            return;
-        }
-        std::string err;
-        if (!ray_stop(ray_path_, &err)) {
-            res.status = 500;
-            res.set_content(nlohmann::json{{"error", err}}.dump(), "application/json");
-            return;
-        }
-        res.set_content(R"({"status":"ray-stopped"})", "application/json");
-    });
-
-    // ── POST /api/node/models/pull ────────────────────────────────────────────
-    // Pre-fetch an HF model into this node's cache out-of-band, so the multi-GB
-    // download does not happen inside the load-model health-timeout window.
-    // Gated to Linux (hf_prefetch_supported); Windows nodes let vLLM download
-    // lazily at load time instead.
-    server_->Post("/api/node/models/pull", [this](const Request& req, Response& res) {
-        if (!check_auth(req.get_header_value("Authorization"))) {
-            res.status = 401; return;
-        }
-        try {
-            auto j = nlohmann::json::parse(req.body);
-            const std::string model_ref = j.value("model_ref",
-                                                   j.value("model_path", std::string{}));
-            if (model_ref.empty()) {
-                res.status = 400;
-                res.set_content(R"({"error":"model_ref required"})", "application/json");
-                return;
-            }
-            if (!hf_prefetch_supported()) {
-                res.status = 501;
-                res.set_content(
-                    R"({"error":"HF pre-fetch is only supported on Linux nodes; vLLM downloads at load time"})",
-                    "application/json");
-                return;
-            }
-            std::string err;
-            if (!hf_download(hf_cli_path_, model_ref, hf_hub_cache_dir_, &err)) {
-                res.status = 500;
-                res.set_content(nlohmann::json{{"error", err}}.dump(), "application/json");
-                return;
-            }
-            res.set_content(nlohmann::json{{"status", "pulled"},
-                                           {"model_ref", model_ref}}.dump(),
-                            "application/json");
         } catch (const std::exception& e) {
             res.status = 400;
             res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
@@ -1126,13 +898,25 @@ void NodeApiServer::register_routes() {
                 j.value("mmproj_path", std::string{}));
             const bool vision_enabled = j.value("vision_enabled", !mmproj_path.empty());
             std::string agent_id   = j.value("agent_id", std::string{});
-            const std::string backend = j.value("backend", std::string{"llama-cpp"});
-            const bool is_llama = (engine_backend_from_string(backend) == EngineBackend::LlamaCpp);
+            const std::string backend = mm::util::to_lower(mm::util::trim(
+                j.value("backend", std::string{"llama-cpp"})));
             const std::string kv_cache_path = j.value("kv_cache_path", std::string{});
-            VllmSettings vllm_settings;
-            if (j.contains("vllm_settings")) vllm_settings = j["vllm_settings"].get<VllmSettings>();
+            const std::string model_id = j.value("model_id", std::string{});
+            const std::string mmproj_model_id =
+                j.value("mmproj_model_id", std::string{});
+            const bool model_pin = j.value("pin", false);
             RuntimeSettings runtime_settings;
             if (j.contains("runtime_settings")) runtime_settings = j["runtime_settings"].get<RuntimeSettings>();
+
+            if (backend != "llama-cpp") {
+                res.status = 400;
+                const std::string msg = "unsupported node inference backend: " + backend;
+                state_.set_last_error(msg);
+                res.set_content(nlohmann::json{{"error", msg},
+                                               {"supported_backends", {"llama-cpp"}}}.dump(),
+                                "application/json");
+                return;
+            }
 
             if (model_path.empty()) {
                 res.status = 400;
@@ -1141,25 +925,32 @@ void NodeApiServer::register_routes() {
                 return;
             }
 
-            if (!is_llama && !mmproj_path.empty()) {
-                res.status = 400;
-                res.set_content(R"({"error":"mmproj_path is only valid for llama-cpp"})",
+            if (const auto rt = state_.get_llama_runtime(); !node_llama_runtime_ready(rt)) {
+                res.status = 503;
+                const std::string msg = rt.last_error.empty()
+                    ? "llama.cpp runtime is not ready on this node (status=" + rt.status + ")"
+                    : "llama.cpp runtime is not ready on this node: " + rt.last_error;
+                state_.set_last_error(msg);
+                res.set_content(nlohmann::json{{"error", "llama runtime not ready"},
+                                               {"detail", msg},
+                                               {"llama_runtime", rt}}.dump(),
                                 "application/json");
                 return;
             }
-            if (is_llama && vision_enabled && mmproj_path.empty()) {
+
+            if (vision_enabled && mmproj_path.empty()) {
                 res.status = 400;
                 res.set_content(R"({"error":"vision-enabled llama-cpp restore requires mmproj_path"})",
                                 "application/json");
                 return;
             }
-            if (is_llama && !vision_enabled && !mmproj_path.empty()) {
+            if (!vision_enabled && !mmproj_path.empty()) {
                 res.status = 400;
                 res.set_content(R"({"error":"llama.cpp mmproj_path requires vision_enabled=true"})",
                                 "application/json");
                 return;
             }
-            if (is_llama && !mmproj_path.empty()) {
+            if (!mmproj_path.empty()) {
                 std::error_code ec;
                 if (!fs::is_regular_file(mmproj_path, ec)) {
                     res.status = 400;
@@ -1169,38 +960,30 @@ void NodeApiServer::register_routes() {
                     return;
                 }
             }
-            if (!mm::util::is_hf_repo_id(model_path) &&
-                looks_like_fs_path(model_path)) {
-                std::error_code ec;
-                if (!fs::exists(model_path, ec)) {
-                    res.status = 400;
-                    const std::string detail =
-                        "model path not found on this node during restore: " + model_path;
-                    res.set_content(nlohmann::json{
-                        {"error", "model not found on node"},
-                        {"detail", detail},
-                        {"model_path", model_path}
-                    }.dump(), "application/json");
-                    return;
-                }
+            std::error_code model_ec;
+            if (!fs::is_regular_file(model_path, model_ec)) {
+                res.status = 400;
+                const std::string detail = mm::util::is_hf_repo_id(model_path)
+                    ? "llama.cpp requires a node-local GGUF file; Hugging Face repository IDs are not loadable"
+                    : "model file not found on this node during restore: " + model_path;
+                res.set_content(nlohmann::json{
+                    {"error", "model not found on node"},
+                    {"detail", detail},
+                    {"model_path", model_path}
+                }.dump(), "application/json");
+                return;
             }
 
-            auto slot_id = is_llama
-                ? slot_mgr_.restore_slot_llama(model_path, mmproj_path, runtime_settings, kv_cache_path, agent_id)
-                : slot_mgr_.restore_slot(model_path, vllm_settings, agent_id, vision_enabled);
+            auto slot_id = slot_mgr_.restore_slot(
+                model_path, mmproj_path, runtime_settings, kv_cache_path, agent_id);
             state_.set_slots(slot_mgr_.get_slot_info());
 
             if (slot_id.empty()) {
                 res.status = 500;
                 nlohmann::json err = {{"error", "failed to restore slot"}};
                 auto detail = slot_mgr_.last_error();
-                if (is_llama) {
-                    err["llama_server_path"] = slot_mgr_.llama_server_path();
-                    err["llama_runtime"] = state_.get_llama_runtime();
-                } else {
-                    err["vllm_server_path"] = slot_mgr_.vllm_server_path();
-                    err["vllm_runtime"] = state_.get_vllm_runtime();
-                }
+                err["llama_server_path"] = slot_mgr_.llama_server_path();
+                err["llama_runtime"] = state_.get_llama_runtime();
                 state_.set_last_error(detail.empty() ? "failed to restore slot" : detail);
                 if (!detail.empty()) err["detail"] = detail;
                 res.set_content(err.dump(), "application/json");
@@ -1208,6 +991,14 @@ void NodeApiServer::register_routes() {
                 state_.set_loaded_model(model_path);
                 if (!agent_id.empty()) state_.set_active_agent(agent_id);
                 state_.set_last_error("");
+                if (model_store_) {
+                    for (const auto& id : {model_id, mmproj_model_id}) {
+                        if (id.empty()) continue;
+                        if (model_pin) model_store_->set_pinned(id, true);
+                        model_store_->touch(id);
+                        if (id == model_id && mmproj_model_id == model_id) break;
+                    }
+                }
                 res.set_content(
                     nlohmann::json{{"status","restored"},
                                    {"slot_id", slot_id}}.dump(),

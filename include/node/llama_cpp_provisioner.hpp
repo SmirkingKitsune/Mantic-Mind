@@ -11,13 +11,12 @@
 
 namespace mm {
 
-// Node-managed llama.cpp (llama-server) runtime, the llama analog of
-// VllmProvisioner. It resolves an existing llama-server from PATH / a managed
+// Node-managed llama.cpp (llama-server) runtime. It resolves an existing
+// llama-server from PATH / a managed
 // install, then prefers an environment-matched official GitHub release. A
 // source build is the final fallback for combinations without a published
 // binary (notably Linux CUDA and DGX Spark's aarch64 + sm_121). Install steps
-// stream their output live and report progress through the shared
-// VllmInstallProgress shape.
+// stream their output live and report progress through RuntimeInstallProgress.
 struct LlamaProvisionConfig {
     std::string requested_executable = "llama-server";
     std::string provision_dir;
@@ -120,7 +119,7 @@ public:
                                  LlamaCommandRunner runner = {});
 
     using LogSink = std::function<void(const std::string& line, bool is_stderr)>;
-    using ProgressSink = std::function<void(const VllmInstallProgress&)>;
+    using ProgressSink = std::function<void(const RuntimeInstallProgress&)>;
     using CancelCheck = CancelCheckCallback;
     void set_log_sink(LogSink sink);
     void set_progress_sink(ProgressSink sink);
@@ -163,7 +162,7 @@ private:
     LlamaTroubleshootingReport build_troubleshooting_report(
         const std::string& failure_detail,
         const LlamaProvisionConfig& install_cfg) const;
-    void emit_progress(const VllmInstallProgress& p);
+    void emit_progress(const RuntimeInstallProgress& p);
     void set_status(LlamaRuntimeStatus& status);
 };
 

@@ -2,7 +2,6 @@
 #include "common/logger.hpp"
 #include "common/util.hpp"
 #include "node/llama_runtime.hpp"
-#include "node/vllm_runtime.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -202,23 +201,6 @@ RuntimeProcess::~RuntimeProcess() { stop(); }
 void RuntimeProcess::set_log_callback(LogCallback cb) {
     std::lock_guard<std::mutex> lk(impl_->cb_mutex);
     impl_->log_cb = std::move(cb);
-}
-
-bool RuntimeProcess::start_vllm(const std::string& model_ref,
-                                    const VllmSettings& settings,
-                                    uint16_t port) {
-    if (settings.enable_sleep_mode) {
-        // The /sleep and /wake_up endpoints are only exposed in vLLM's dev
-        // mode. Children inherit the parent environment on both platforms.
-#ifdef _WIN32
-        SetEnvironmentVariableA("VLLM_SERVER_DEV_MODE", "1");
-#else
-        ::setenv("VLLM_SERVER_DEV_MODE", "1", 1);
-#endif
-    }
-    auto args = build_vllm_server_args(model_ref, settings, port);
-    return start_with_args("vLLM", strip_wrapping_quotes(runtime_path_),
-                           std::move(args), port, load_health_timeout_seconds());
 }
 
 bool RuntimeProcess::start_llama_server(const std::string& model_path,
@@ -550,10 +532,9 @@ bool RuntimeProcess::start_with_args(const std::string& runtime_name,
         // Reset signal state before exec. execvp resets caught handlers to
         // default, but the *blocked signal mask* and SIG_IGN dispositions are
         // inherited. A multithreaded server's worker thread (the one that
-        // forked) often has signals blocked; a blocked/ignored SIGCHLD breaks
-        // vLLM's asyncio child-watcher that manages its EngineCore subprocess,
-        // hanging engine startup until the load times out. Only async-signal-
-        // safe calls are permitted here between fork() and exec().
+        // forked) can have signals blocked, which can break subprocess handling
+        // in the child. Only async-signal-safe calls are permitted here between
+        // fork() and exec().
         sigset_t empty_mask;
         ::sigemptyset(&empty_mask);
         ::sigprocmask(SIG_SETMASK, &empty_mask, nullptr);

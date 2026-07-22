@@ -2,14 +2,11 @@
 
 Distributed LLM inference cluster — two executables that turn any collection of machines into a coordinated AI backend.
 
-- **mantic-mind** — cluster node; spawns and manages inference engine subprocesses (`llama-server` by default, `vllm serve` as an opt-in peer); FTXUI status TUI
+- **mantic-mind** — cluster node; spawns and manages `llama-server` inference subprocesses; FTXUI status TUI
 - **mantic-mind-control** — cluster head; manages nodes, agents, conversations, memories; FTXUI management TUI
 
-> **Branch note:** llama.cpp is the default runtime on this line — agents default to
-> `inference_backend = "llama-cpp"` and serve local GGUF models via `llama-server`.
-> vLLM remains available as an opt-in peer backend per agent; the vLLM-as-default
-> line is preserved on the `vLLM-runtime` branch, and the original llama.cpp-only
-> line on the `llama-cpp-runtime` branch.
+> **Branch note:** `main` is the llama.cpp runtime line. The alternative runtime
+> implementation is maintained separately on the `vLLM-runtime` branch.
 
 ## Prerequisites
 
@@ -21,12 +18,9 @@ Distributed LLM inference cluster — two executables that turn any collection o
 | GCC / Clang (Linux) | GCC 12 / Clang 15 |
 | Apple Clang (macOS) | Xcode 15 command-line tools |
 | llama.cpp (`llama-server`) | on each node — resolved from PATH or provisioned from an environment-matched official GitHub release; source builds are the last resort (DGX Spark needs CUDA 13+ for `sm_121`) |
-| Python + vLLM | optional, per node — only for agents with `inference_backend = "vllm"`; an existing `vllm` executable is used, and a managed install is created only when `vllm_auto_provision = true` |
 
-Runtime extras (node side, optional):
-
-- **Ray** (Linux) — required only for multi-node engine groups (one large model spanning nodes).
-- **`hf` CLI** (Hugging Face) — used by the optional out-of-band model pre-fetch endpoint.
+Python is optional and used only by the bundled Qwen3-TTS sidecar and smoke-test
+utilities; it is not required for text inference.
 
 Set the `VCPKG_ROOT` environment variable to your bootstrapped vcpkg directory, or put `vcpkg` on `PATH`. If vcpkg is not available, CMake must find all dependencies through the system package manager or another toolchain.
 
@@ -164,64 +158,33 @@ Create GitHub-ready ZIP assets from a Release build with:
 The packager writes `dist/mantic-mind-<version>-<platform>-<arch>.zip`, a
 matching `-symbols.zip` when PDBs are available, and `dist/checksums.txt`.
 The runtime archive includes `bin/`, default root config files, `tools/`,
-`README.md`, `LICENSE`, and a release manifest. It does not bundle vLLM,
-Python environments, model weights, runtime data, logs, or local agent
-databases.
+`README.md`, `LICENSE`, and a release manifest. It does not bundle managed
+llama.cpp runtime installs, Python environments, model weights, runtime data,
+logs, or local agent databases.
 
-## vLLM Runtime
+## llama.cpp Runtime
 
-Each node manages one or more `vllm serve` engine subprocesses. Agent configs
-carry an `inference_backend` of `vllm` plus a `vllm_settings` block that drives
-the engine launch (`--max-model-len`, `--max-num-seqs`, `--gpu-memory-utilization`,
-`--tensor-parallel-size`, `--pipeline-parallel-size`, tool-parser flags, sleep
-mode, etc.).
+Each node manages one or more `llama-server` subprocesses. Agent configs use
+`inference_backend = "llama-cpp"`, a local GGUF `model_path`, and a
+`runtime_settings` block for context size, GPU layers, threads, parallel slots,
+batch sizes, sampling defaults, and additional llama-server arguments.
 
-Engine source policy (for nodes that build vLLM from source):
+The node resolves an explicit `llama_server_path` when configured. Otherwise it
+can install an environment-matched managed runtime: official release assets are
+preferred, with a source build as the fallback when no compatible accelerated
+asset exists. Managed installation and updates run in the background and expose
+live progress and troubleshooting details through the node API and TUI.
 
-- Linux nodes target the upstream vLLM repository: `https://github.com/vllm-project/vllm`
-- Windows nodes target the Windows fork: `https://github.com/SystemPanic/vllm-windows`, branch `vllm-for-windows`
-- Apple Silicon macOS nodes target the Metal plugin: `https://github.com/vllm-project/vllm-metal`
+- **Shared engines.** Agents with the same model and compatible launch settings
+  attach to one llama-server process.
+- **Resource-aware placement.** GGUF metadata and launch settings provide a VRAM
+  estimate used to choose a suitable node and protect active slots from eviction.
+- **Suspend and restore.** A suspended slot saves its llama.cpp KV cache, stops
+  the process to release resources, and restores from that checkpoint later.
+- **Managed model cache.** Control can transfer GGUF/projector files to a node.
+  Nodes keep an LRU cache, while pinned and currently loaded models are protected.
 
-When `vllm_server_path` / `MM_VLLM_PATH` cannot be resolved, nodes can
-auto-provision a managed runtime under `vllm_provision_dir` (default
-`data/runtimes/vllm`). Windows prefers release wheels from
-`SystemPanic/vllm-windows`, Linux uses a managed venv for official vLLM, and
-Apple Silicon macOS uses `vllm-metal` with native arm64 Python 3.12 plus Xcode
-command line tools. Release packages still do not bundle vLLM, Python
-environments, or model weights.
-
-The runtime is designed to use vLLM to its full capability:
-
-- **Per-node GPU budget.** A node hands each engine an explicit
-  `--gpu-memory-utilization` slice out of a configurable `vllm_gpu_budget`, so
-  multiple small models can co-reside on one GPU. Loads are clamped to the
-  remaining budget and rejected when it is exhausted.
-- **Shared engines.** Multiple agents that request the same model with
-  compatible launch settings attach to one running engine (continuous batching)
-  instead of spawning a second process. `max_num_seqs` defaults to 16.
-- **Sleep / wake suspension.** Idle engines are suspended via vLLM sleep mode
-  (`/sleep` offloads weights to host RAM, freeing the GPU) and woken in seconds,
-  falling back to a full stop when sleep is unavailable.
-- **Load-aware routing.** Control scrapes each engine's Prometheus `/metrics`
-  (running/waiting requests, KV-cache usage) and routes new agents to the
-  least-loaded compatible engine; busy engines are protected from eviction.
-- **Multi-node engine groups.** Control plans Ray-backed groups that span nodes
-  for models too large for one machine (tensor parallel within a node, pipeline
-  parallel across nodes), gated on advertised node capabilities (arch, vLLM
-  build fingerprint, comm backend, Ray support). The live multi-node launch is
-  Linux-only and requires a matching-architecture node set.
-- **Hugging Face model cache.** A model reference is resolved by vLLM as an HF
-  repo id (auto-downloaded to the HF cache), a cache hit, or a local directory.
-  Nodes report which repos they have cached; control prefers a node that already
-  holds the model. Point every node's `hf_cache_dir` at one shared location to
-  download a model once for the whole cluster.
-
-Qwen3-TTS can be routed directly to a vLLM-compatible speech endpoint by setting
-`tts_enabled = true` and `tts_backend = "vllm"` in `mantic-mind-control.toml`
-(or `MM_TTS_BACKEND=vllm`). The route, base URL, and served model are
-configurable through `tts_vllm_base_url`, `tts_vllm_speech_path`, and
-`tts_vllm_model_id`; the older Python sidecar remains available as
-`tts_backend = "sidecar"`.
+Optional Qwen3-TTS support uses the bundled `tools/qwen_tts_service.py` sidecar.
 
 ## Agent API Mode
 
@@ -271,9 +234,9 @@ and its matching projector explicitly:
 
 The projector is launched through llama.cpp's authoritative `--mmproj`
 argument. Do not repeat `--mmproj`, `-mm`, or `--mmproj-url` in
-`runtime_settings.extra_args`. For vLLM and API-backed profiles, set
-`vision_settings.enabled` to declare that the configured model accepts images
-and leave `mmproj_path` empty. Image requests sent to a profile without vision
+`runtime_settings.extra_args`. For API-backed profiles, set
+`vision_settings.enabled` to declare that the remote model accepts images and
+leave `mmproj_path` empty. Image requests sent to a profile without vision
 enabled fail with HTTP 422; Mantic-Mind never drops the images or delegates the
 turn to another agent.
 
@@ -318,12 +281,12 @@ cp tools/mantic-mind-control.toml .   # edit locally as needed
 ### 2. Run a node
 
 ```sh
-cp tools/mantic-mind.toml .            # set control_url (and vllm_server_path if needed) locally
+cp tools/mantic-mind.toml .            # set control_url and llama_server_path if needed
 ./mantic-mind
 # or entirely via env vars:
 MM_CONTROL_URL=http://192.168.1.100:9090 \
 MM_SELF_URL=http://192.168.1.5:7070      \
-MM_VLLM_PATH=vllm                        \
+MM_LLAMA_PATH=/opt/llama.cpp/llama-server \
 ./mantic-mind
 ```
 
@@ -332,10 +295,10 @@ The node TUI shows the generated API key. In the control TUI, press **`[+] Add N
 ### 3. Create an agent and chat
 
 ```sh
-# Create (model_path is an HF repo id, a cached model, or a local model dir)
+# Create an agent for a GGUF already visible to control or the selected node.
 curl -X POST http://localhost:9090/v1/agents \
   -H "Content-Type: application/json" \
-  -d '{"name":"assistant","inference_backend":"vllm","model_path":"Qwen/Qwen2.5-0.5B-Instruct"}' | jq
+  -d '{"name":"assistant","inference_backend":"llama-cpp","model_path":"models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"}' | jq
 
 # Chat (streaming SSE)
 curl -N -X POST http://localhost:9090/v1/agents/<id>/chat \
@@ -380,7 +343,7 @@ Example control CLI session:
 mm-control> nodes discovered
 mm-control> nodes pair psk http://127.0.0.1:7070 my-shared-key
 mm-control> models list
-mm-control> agents create {"name":"assistant","inference_backend":"vllm","model_path":"Qwen/Qwen2.5-0.5B-Instruct"}
+mm-control> agents create {"name":"assistant","inference_backend":"llama-cpp","model_path":"models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"}
 mm-control> agents list
 mm-control> chat send <agent_id> "Hello from CLI mode"
 mm-control> activity tail 50
@@ -433,27 +396,15 @@ After file loading, matching environment variables override config values.
 | `llama_update_policy` | `MM_LLAMA_UPDATE_POLICY` | `prompt` | llama.cpp update behavior: `prompt`, `auto`, or `manual` |
 | `llama_update_check` | `MM_LLAMA_UPDATE_CHECK` | `true` | Periodically inspect the latest llama.cpp tag and its release assets |
 | `llama_update_check_interval_hours` | `MM_LLAMA_UPDATE_CHECK_INTERVAL_HOURS` | `24` | llama.cpp update-check interval |
-| `vllm_server_path` | `MM_VLLM_PATH` | `vllm` | `vllm` CLI / wrapper used to launch engines (opt-in peer backend) |
-| `vllm_auto_provision` | `MM_VLLM_AUTO_PROVISION` | `false` | Auto-create a managed vLLM runtime when `vllm_server_path` is unresolved |
-| `vllm_provision_dir` | `MM_VLLM_PROVISION_DIR` | `data/runtimes/vllm` | Managed vLLM runtime root |
-| `vllm_install_method` | `MM_VLLM_INSTALL_METHOD` | `auto` | Provisioning method: `auto`, `wheel`, or `source` |
-| `vllm_version` | `MM_VLLM_VERSION` | `latest` | vLLM release tag/version/commit used by provisioning |
-| `vllm_python_path` | `MM_VLLM_PYTHON_PATH` | *(auto)* | Python executable used for managed venv creation |
-| `vllm_gpu_budget` | `MM_VLLM_GPU_BUDGET` | `0.90` | Total GPU fraction all vLLM engines on this node may claim |
 | `max_slots` | `MM_MAX_SLOTS` | `4` | Maximum concurrent engine slots |
 | `runtime_port_range_start` | `MM_RUNTIME_PORT_RANGE_START` | `8080` | First port in the per-engine port range |
 | `runtime_port_range_end` | `MM_RUNTIME_PORT_RANGE_END` | `8090` | Last port in the per-engine port range |
+| `node_gpu_count` | `MM_NODE_GPU_COUNT` | `0` (auto) | GPUs advertised by the node; `0` auto-detects via `nvidia-smi` |
 | `models_dir` | `MM_MODELS_DIR` | `models` | Optional local model directory root |
+| `model_cache_min_free_mb` | `MM_MODEL_CACHE_MIN_FREE_MB` | `10240` | Evict least-recently-used unpinned models below this free-space threshold; `0` disables it |
+| `model_cache_clear_on_shutdown` | `MM_MODEL_CACHE_CLEAR_ON_SHUTDOWN` | `true` | Remove unpinned cached models when the node shuts down |
 | `data_dir` | `MM_DATA_DIR` | `data` | Node runtime data root; remembered pairing keys live in `api_keys.json` |
 | `kv_cache_dir` | `MM_KV_CACHE_DIR` | `data/kv_cache` | KV-cache checkpoint directory |
-| `comm_backends` | `MM_COMM_BACKENDS` | *(auto)* | CSV of collective backends advertised (`nccl,gloo`); auto-detected when empty |
-| `supports_ray` | `MM_SUPPORTS_RAY` | *(auto)* | Whether this node can join multi-node Ray engine groups (auto = true on Linux) |
-| `node_gpu_count` | `MM_NODE_GPU_COUNT` | `0` (auto) | GPUs advertised; `0` auto-detects via `nvidia-smi` |
-| `interconnect_gbps` | `MM_INTERCONNECT_GBPS` | `0` | Node-to-node link hint for group scoring |
-| `ray_path` | `MM_RAY_PATH` | `ray` | Ray CLI for multi-node engine groups (Linux) |
-| `ray_port` | `MM_RAY_PORT` | `6379` | Ray head GCS port |
-| `hf_cache_dir` | `MM_HF_CACHE_DIR` | *(auto)* | HF hub cache dir override; pins `HF_HUB_CACHE` for the engine (set the same shared path on every node to download once cluster-wide) |
-| `hf_cli_path` | `MM_HF_CLI_PATH` | `hf` | Hugging Face CLI used for out-of-band model pre-fetch (Linux) |
 | `pairing_key` | `MM_PAIRING_KEY` | *(empty)* | PSK for automatic node/control pairing |
 | `discovery_port` | `MM_DISCOVERY_PORT` | `7072` | UDP discovery port |
 | `log_file` | `MM_LOG_FILE` | `logs/mantic-mind.log` | Log file |
@@ -555,10 +506,9 @@ retained, and the latest path is shown in the wizard and exposed as
 | `log_file` | `MM_LOG_FILE` | `logs/mantic-mind-control.log` | Log file |
 
 Text-to-speech is configured through the `tts_*` keys (`tts_enabled`,
-`tts_backend`, `tts_vllm_base_url`, `tts_vllm_speech_path`, `tts_vllm_model_id`,
-`tts_vllm_api_key` / `tts_vllm_api_key_env`, `tts_service_url`,
-`tts_service_command`, `tts_timeout_s`, `tts_cache_dir`, and the voice/clone
-model ids), each overridable with the matching `MM_TTS_*` environment variable.
+`tts_service_url`, `tts_service_command`, `tts_timeout_s`, `tts_cache_dir`, and
+the voice/clone model ids), each overridable with the matching `MM_TTS_*`
+environment variable. TTS runs through the bundled Qwen3-TTS sidecar.
 
 Additional env-only settings:
 
@@ -569,42 +519,34 @@ Additional env-only settings:
 
 ### Model reference contract
 
-`agent.model_path` is passed to vLLM and resolved as one of:
+For `inference_backend = "llama-cpp"`, `agent.model_path` identifies a GGUF
+file. It may be an absolute/local node path or a model transferred into the
+node's managed `models_dir`. A vision agent additionally supplies a matching
+GGUF projector in `vision_settings.mmproj_path`.
 
-- a **Hugging Face repo id** (`org/name`, e.g. `Qwen/Qwen2.5-0.5B-Instruct`) — downloaded to the node's HF cache on first use;
-- a **cached model** already present in the HF cache; or
-- a **local model directory** on the node.
-
-Nodes report their cached HF repo ids to control, which prefers a node that
-already holds the model when placing an agent. Models can be pre-fetched
-out-of-band (see `POST /api/node/models/pull`) so a large download does not
-happen inside the engine's load timeout window.
+For `inference_backend = "api"`, `agent.model_path` is the served model ID sent
+to the configured remote OpenAI-compatible endpoint. API agents are not placed
+on a Mantic-Mind node.
 
 ## REST API
 
 ### Node API (`Authorization: Bearer <node-api-key>`)
 
 ```
-POST   /api/node/load-model     { model_path, mmproj_path?, vision_enabled?, vllm_settings?, agent_id? }
+POST   /api/node/load-model     { model_path, mmproj_path?, vision_enabled?, runtime_settings?, agent_id? }
 POST   /api/node/unload-model   { slot_id? }            (omit slot_id to unload all)
 POST   /api/node/detach-agent   { slot_id, agent_id }   (unloads engine when its last agent leaves)
-POST   /api/node/suspend-slot   { slot_id }             (vLLM sleep, or stop)
-POST   /api/node/restore-slot   { model_path, mmproj_path?, vision_enabled?, vllm_settings?, agent_id? }
+POST   /api/node/suspend-slot   { slot_id }             (save KV cache, then stop)
+POST   /api/node/restore-slot   { model_path, mmproj_path?, vision_enabled?, runtime_settings?, kv_cache_path?, agent_id? }
 POST   /api/node/infer          { InferenceRequest, slot_id? }  -> SSE
-POST   /api/node/models/pull    { model_ref }           (HF pre-fetch; Linux only, 501 elsewhere)
-GET    /api/node/runtime/vllm   -> { vllm_runtime }
-POST   /api/node/runtime/vllm/provision -> { vllm_runtime }
-POST   /api/node/runtime/vllm/check-update -> { vllm_runtime }
 GET    /api/node/runtime/llama  -> { llama_runtime }
 POST   /api/node/runtime/llama/provision { update?, accelerator? } -> { llama_runtime }
 POST   /api/node/runtime/llama/switch    { variant } -> { llama_runtime }
 POST   /api/node/runtime/llama/check-update -> { llama_runtime }
 POST   /api/node/runtime/llama/diagnose -> { llama_runtime.troubleshooting }
 POST   /api/node/runtime/llama/recover { action: "retry"|"target"|"compile-anyway"|"release", variant? } -> { llama_runtime }
-POST   /api/node/ray/start      { role: "head"|"worker", head_address? }  (Linux only)
-POST   /api/node/ray/stop
 GET    /api/node/health         -> NodeHealthMetrics
-GET    /api/node/status         -> { node_id, slots, cached_models, capabilities, vllm_runtime, vllm_gpu_budget, ... }
+GET    /api/node/status         -> { node_id, slots, managed_models, capabilities, llama_runtime, ... }
 GET    /api/node/logs?tail=n    -> { lines: [...] }
 GET    /api/node/api-keys       -> { keys: [...] }
 POST   /api/node/api-keys       { key }
@@ -715,24 +657,23 @@ mantic-mind-control  (:9090)
   ├─ AgentManager      — per-agent SQLite  (data/agents/{uuid}/agent.db)
   ├─ NodeRegistry      — node list + health/metrics polling, capabilities
   ├─ AgentScheduler    — placement: existing/suspended → shared engine →
-  │                       cached-model node → VRAM → sleep/evict + retry;
-  │                       multi-node engine-group planning
+  │                       VRAM-suitable node → suspend/evict + retry
   ├─ AgentQueue        — per-agent FIFO worker threads
   └─ ControlApiServer  — REST endpoints + SSE chat proxy
          │  REST + SSE
          ▼
 mantic-mind  (:7070)
   ├─ NodeState          — API keys, metrics, capabilities
-  ├─ SlotManager        — per-engine slots: GPU budget, shared engines, sleep/wake
+  ├─ SlotManager        — shared engines, VRAM estimates, KV save/restore
   ├─ RuntimeProcess     — engine subprocess supervisor (Windows CreateProcess / POSIX fork+exec)
   ├─ RuntimeClient      — OpenAI-compatible HTTP client → the engine
   └─ NodeApiServer      — node endpoints + SSE infer proxy
          │  HTTP (OpenAI-compatible)
          ▼
-   vllm serve  (engine, :8080+)
+   llama-server  (engine, :8080+)
 ```
 
-(`RuntimeProcess` supervises and `RuntimeClient` talks to `vllm serve`.)
+(`RuntimeProcess` supervises and `RuntimeClient` talks to `llama-server`.)
 
 ## TUI Keyboard Shortcuts
 
@@ -751,7 +692,7 @@ Node TUI extras:
 
 Both TUIs expose draggable pane dividers and persist their layout beneath
 `data/`. Long generated text is word-wrapped and keyboard/mouse scrollable.
-The node and control screens expose model-slot, runtime, Ray, and provisioning
+The node and control screens expose model-slot, runtime, and provisioning
 actions where supported. Startup-only settings remain in TOML/environment config.
 
 The control Performance tab displays a bounded, process-session history of

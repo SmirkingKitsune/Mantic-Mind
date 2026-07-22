@@ -193,16 +193,6 @@ void NodeState::set_capabilities(const NodeCapabilities& caps) {
     capabilities_ = caps;
 }
 
-VllmRuntimeStatus NodeState::get_vllm_runtime() const {
-    std::lock_guard<std::mutex> g(mutex_);
-    return vllm_runtime_;
-}
-
-void NodeState::set_vllm_runtime(const VllmRuntimeStatus& runtime) {
-    std::lock_guard<std::mutex> g(mutex_);
-    vllm_runtime_ = runtime;
-}
-
 LlamaRuntimeStatus NodeState::get_llama_runtime() const {
     std::lock_guard<std::mutex> g(mutex_);
     return llama_runtime_;
@@ -211,39 +201,6 @@ LlamaRuntimeStatus NodeState::get_llama_runtime() const {
 void NodeState::set_llama_runtime(const LlamaRuntimeStatus& runtime) {
     std::lock_guard<std::mutex> g(mutex_);
     llama_runtime_ = runtime;
-}
-
-VllmInstallProgress NodeState::get_vllm_install_progress() const {
-    std::lock_guard<std::mutex> g(mutex_);
-    return vllm_install_progress_;
-}
-
-void NodeState::set_vllm_install_progress(const VllmInstallProgress& p) {
-    std::lock_guard<std::mutex> g(mutex_);
-    vllm_install_progress_ = p;
-    if (p.active) {
-        NodeActionProgress action;
-        action.active = true;
-        action.operation_id = "vllm-runtime";
-        action.kind = "runtime";
-        action.action = "Downloading runtime";
-        action.target = "vLLM";
-        action.stage = p.stage;
-        action.detail = p.last_line;
-        action.step = p.step;
-        action.total_steps = p.total_steps;
-        action.fraction = p.fraction;
-        action.cancelable = true;
-        action.cancel_requested =
-            action_progress_.active && action_progress_.operation_id == action.operation_id
-                ? action_progress_.cancel_requested
-                : false;
-        if (!action_progress_.active ||
-            action_progress_.operation_id == action.operation_id)
-            action_progress_ = std::move(action);
-    } else if (action_progress_.operation_id == "vllm-runtime") {
-        action_progress_ = {};
-    }
 }
 
 NodeActionProgress NodeState::get_action_progress() const {

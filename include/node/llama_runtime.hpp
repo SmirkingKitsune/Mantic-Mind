@@ -11,14 +11,19 @@ namespace mm {
 inline constexpr const char* kLlamaCppRepoUrl =
     "https://github.com/ggml-org/llama.cpp";
 
+// Generic host probes shared by llama.cpp runtime selection and provisioning.
+std::string current_runtime_platform();
+std::string current_runtime_arch();
+bool detect_rocm_present();
+
 // Translate a model path for the node's runtime OS. When the node runs Windows
 // and control handed it a WSL mount path (/mnt/y/foo.gguf), map it to Y:\foo.gguf
 // and vice-versa on POSIX. Also strips wrapping quotes. Pure aside from an
 // existence probe on the POSIX translation.
 std::string normalize_llama_model_path(const std::string& p);
 
-// Build the `llama-server` argument vector (excludes the executable itself,
-// mirroring build_vllm_server_args). Pure and unit-tested. llama-server hosts
+// Build the `llama-server` argument vector (excludes the executable itself).
+// Pure and unit-tested. llama-server hosts
 // one shared context of ctx_size*parallel tokens. User-supplied
 // RuntimeSettings::extra_args always win over the defaults here. When
 // slot_save_path is non-empty, `--slot-save-path <dir>` is added so the engine's
@@ -43,8 +48,8 @@ inline std::vector<std::string> build_llama_server_args(
 //   metal  — Apple Silicon macOS
 //   vulkan — a GPU is present but neither CUDA nor ROCm (cross-vendor fallback)
 //   cpu    — no GPU backend
-// Unlike vLLM, llama.cpp builds natively on Windows with CUDA, so there is no
-// separate "windows" variant. Pure.
+// llama.cpp builds natively on Windows with CUDA, so there is no separate
+// "windows" variant. Pure.
 std::string detect_llama_accelerator(const std::string& platform,
                                      const std::string& arch,
                                      bool has_cuda,

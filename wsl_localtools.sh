@@ -9,8 +9,7 @@ if apt-get download zip unzip 2>/dev/null; then
   echo "downloaded via apt-get download"
 else
   echo "apt-get download failed; trying direct archive URLs"
-  PY="$HOME/vllm-venv/bin/python"
-  $PY - <<'PYEOF'
+  python3 - <<'PYEOF'
 import urllib.request, re, sys
 base="http://archive.ubuntu.com/ubuntu/pool/main/"
 pkgs={"zip":"z/zip/","unzip":"u/unzip/"}

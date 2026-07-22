@@ -2,9 +2,9 @@ name: CMake on multiple platforms
 
 on:
   push:
-    branches: [ "vllm-runtime" ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ "vllm-runtime" ]
+    branches: [ "main" ]
   workflow_dispatch:
 
 permissions:

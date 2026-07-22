@@ -476,7 +476,7 @@ nlohmann::json openai_model_entry(const AgentConfig& cfg) {
             {"inference_backend", agent_backend(cfg)},
             {"model_path", cfg.model_path},
             {"vision_enabled", cfg.vision_settings.enabled},
-            {"served_model_name", cfg.vllm_settings.served_model_name},
+            {"served_model_name", cfg.served_model_name},
             {"api_base_url", agent_uses_api_backend(cfg) ? cfg.api_settings.base_url : ""}
         }}
     };
@@ -490,7 +490,7 @@ nlohmann::json mantic_model_entry(const AgentConfig& cfg) {
         {"inference_backend", agent_backend(cfg)},
         {"model_path", cfg.model_path},
         {"vision_enabled", cfg.vision_settings.enabled},
-        {"served_model_name", cfg.vllm_settings.served_model_name},
+        {"served_model_name", cfg.served_model_name},
         {"api_base_url", agent_uses_api_backend(cfg) ? cfg.api_settings.base_url : ""}
     };
 }
@@ -544,8 +544,8 @@ std::optional<AgentConfig> resolve_openai_agent_model(AgentManager& agents,
     for (const auto& cfg : configs) {
         if (cfg.name == requested) add_match(cfg);
         if (cfg.model_path == requested) add_match(cfg);
-        if (!cfg.vllm_settings.served_model_name.empty() &&
-            cfg.vllm_settings.served_model_name == requested) {
+        if (!cfg.served_model_name.empty() &&
+            cfg.served_model_name == requested) {
             add_match(cfg);
         }
     }
@@ -2548,47 +2548,6 @@ void ControlApiServer::register_routes() {
                         "application/json");
     });
 
-    // Trigger an out-of-band HF pre-fetch on a node. The CLI/UI target this
-    // control route; it forwards to the node's /api/node/models/pull so the
-    // multi-GB download happens outside any load-model health-timeout window.
-    server_->Post("/v1/nodes/:id/models/pull", [this](const Request& req, Response& res) {
-        const std::string node_id = req.path_params.at("id");
-        NodeInfo node;
-        try {
-            node = registry_.get_node(node_id);
-        } catch (...) {
-            res.status = 404;
-            res.set_content(R"({"error":"node not found"})", "application/json");
-            return;
-        }
-        try {
-            auto j = nlohmann::json::parse(req.body);
-            // Accept model_ref, model_path, or the CLI's model_filename spelling.
-            std::string model_ref = util::trim(j.value("model_ref",
-                                    j.value("model_path",
-                                    j.value("model_filename", std::string{}))));
-            if (model_ref.empty()) {
-                res.status = 400;
-                res.set_content(R"({"error":"model_ref required"})", "application/json");
-                return;
-            }
-            nlohmann::json fwd = {{"model_ref", model_ref}};
-            if (j.contains("force")) fwd["force"] = j.value("force", false);
-
-            HttpClient node_cli(node.url);
-            node_cli.set_bearer_token(node.api_key);
-            auto pull = node_cli.post("/api/node/models/pull", fwd);
-            res.status = pull.status ? pull.status : 502;
-            res.set_content(pull.body.empty()
-                                ? R"({"error":"node did not respond"})"
-                                : pull.body,
-                            "application/json");
-        } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
-        }
-    });
-
     server_->Post("/v1/nodes/pair/start", [this](const Request& req, Response& res) {
         try {
             auto j = nlohmann::json::parse(req.body);
@@ -2845,6 +2804,27 @@ void ControlApiServer::register_routes() {
                 res.status = 400;
                 res.set_content(body.dump(), "application/json");
                 return;
+            }
+            auto current = agents_.get_agent(id);
+            if (!current) {
+                res.status = 404;
+                return;
+            }
+            const AgentConfig old_cfg = current->get_config();
+            current.reset();
+            const bool id_changed = cfg.id != id;
+            if (id_changed && agents_.get_agent(cfg.id)) {
+                res.status = 409;
+                res.set_content(
+                    nlohmann::json{{"error", "Agent ID '" + cfg.id +
+                        "' is already in use"}}.dump(),
+                    "application/json");
+                return;
+            }
+            const bool local_to_api =
+                agent_backend(old_cfg) == "llama-cpp" && agent_uses_api_backend(cfg);
+            if (id_changed || local_to_api) {
+                scheduler_.release_agent(id);
             }
             AgentId final_id = agents_.update_agent(id, cfg);
             if (final_id.empty()) { res.status = 404; return; }
@@ -3191,9 +3171,7 @@ void ControlApiServer::register_routes() {
         }
 
         const auto preview_path = (proposal_dir / (proposal_id + ".wav")).string();
-        const auto prompt_ext =
-            tts_.backend() == "vllm" ? ".voice.json" : ".prompt.pkl";
-        const auto prompt_path = (proposal_dir / (proposal_id + prompt_ext)).string();
+        const auto prompt_path = (proposal_dir / (proposal_id + ".prompt.pkl")).string();
         auto svc = tts_.generate_voice_sample(*proposal, preview_path, prompt_path);
         if (!svc.ok) {
             agent->db().update_voice_proposal_status(

@@ -100,7 +100,6 @@ static mm::ControlConfig load_config(
         cfg.models_dir     = file.get("models_dir",     cfg.models_dir);
         cfg.external_api_token = file.get("external_api_token", cfg.external_api_token);
         cfg.tts.enabled = file.get_bool("tts_enabled", cfg.tts.enabled);
-        cfg.tts.backend = file.get("tts_backend", cfg.tts.backend);
         cfg.tts.service_url = file.get("tts_service_url", cfg.tts.service_url);
         cfg.tts.service_command = file.get("tts_service_command", cfg.tts.service_command);
         cfg.tts.cache_dir = file.get("tts_cache_dir", cfg.tts.cache_dir);
@@ -109,13 +108,6 @@ static mm::ControlConfig load_config(
         cfg.tts.clone_model_id = file.get("tts_clone_model_id", cfg.tts.clone_model_id);
         cfg.tts.custom_voice_model_id =
             file.get("tts_custom_voice_model_id", cfg.tts.custom_voice_model_id);
-        cfg.tts.vllm_base_url = file.get("tts_vllm_base_url", cfg.tts.vllm_base_url);
-        cfg.tts.vllm_speech_path =
-            file.get("tts_vllm_speech_path", cfg.tts.vllm_speech_path);
-        cfg.tts.vllm_model_id = file.get("tts_vllm_model_id", cfg.tts.vllm_model_id);
-        cfg.tts.vllm_api_key = file.get("tts_vllm_api_key", cfg.tts.vllm_api_key);
-        cfg.tts.vllm_api_key_env =
-            file.get("tts_vllm_api_key_env", cfg.tts.vllm_api_key_env);
         cfg.tts.cache_ttl_ms = file.get_int(
             "tts_cache_ttl_ms",
             static_cast<int>(cfg.tts.cache_ttl_ms));
@@ -156,7 +148,6 @@ static mm::ControlConfig load_config(
     cfg.external_api_token =
         env("MM_CONTROL_EXTERNAL_API_TOKEN", cfg.external_api_token);
     cfg.tts.enabled = env_bool("MM_TTS_ENABLED", cfg.tts.enabled);
-    cfg.tts.backend = env("MM_TTS_BACKEND", cfg.tts.backend);
     cfg.tts.service_url = env("MM_TTS_SERVICE_URL", cfg.tts.service_url);
     cfg.tts.service_command = env("MM_TTS_SERVICE_COMMAND", cfg.tts.service_command);
     cfg.tts.cache_dir = env("MM_TTS_CACHE_DIR", cfg.tts.cache_dir);
@@ -165,11 +156,6 @@ static mm::ControlConfig load_config(
     cfg.tts.clone_model_id = env("MM_TTS_CLONE_MODEL_ID", cfg.tts.clone_model_id);
     cfg.tts.custom_voice_model_id =
         env("MM_TTS_CUSTOM_VOICE_MODEL_ID", cfg.tts.custom_voice_model_id);
-    cfg.tts.vllm_base_url = env("MM_TTS_VLLM_BASE_URL", cfg.tts.vllm_base_url);
-    cfg.tts.vllm_speech_path = env("MM_TTS_VLLM_SPEECH_PATH", cfg.tts.vllm_speech_path);
-    cfg.tts.vllm_model_id = env("MM_TTS_VLLM_MODEL_ID", cfg.tts.vllm_model_id);
-    cfg.tts.vllm_api_key = env("MM_TTS_VLLM_API_KEY", cfg.tts.vllm_api_key);
-    cfg.tts.vllm_api_key_env = env("MM_TTS_VLLM_API_KEY_ENV", cfg.tts.vllm_api_key_env);
     cfg.tts.cache_ttl_ms = env_int(
         "MM_TTS_CACHE_TTL_MS",
         static_cast<int>(cfg.tts.cache_ttl_ms));
@@ -334,9 +320,6 @@ static void print_control_usage() {
         << "  nodes pair complete <url> <nonce> <pin_or_psk> [remember]\n"
         << "  nodes pair psk <url> [psk] [remember]\n"
         << "  models list\n"
-        << "  node-models list <node_id>\n"
-        << "  node-models pull <node_id> <model_filename> [force(true|false)]\n"
-        << "  node-models delete <node_id> <model_filename>\n"
         << "  agents list|show|create|update|delete ...\n"
         << "  chat send <agent_id> <message> [conversation_id]\n"
         << "  curation conv ...\n"
@@ -408,7 +391,7 @@ static void run_control_cli(uint16_t listen_port,
 
     auto print_help = [&]() {
         printer.line("Use --help for the full command list.");
-        printer.line("Top-level groups: nodes, models, node-models, agents, chat, curation, activity, help, quit");
+        printer.line("Top-level groups: nodes, models, agents, chat, curation, activity, help, quit");
     };
 
     auto pretty_body = [&](const std::string& body) -> std::string {
@@ -579,46 +562,6 @@ static void run_control_cli(uint16_t listen_port,
                 continue;
             }
             emit_http_result("models list", self.get("/v1/models"));
-            continue;
-        }
-
-        if (cmd0 == "node-models") {
-            if (tokens.size() < 3) {
-                printer.line("usage: node-models list|pull|delete|refresh ...");
-                continue;
-            }
-            const std::string sub = mm::util::to_lower(tokens[1]);
-            const std::string node_id = tokens[2];
-            if (sub == "list" || sub == "refresh") {
-                auto r = self.get("/v1/nodes/" + node_id + "/models");
-                emit_http_result("node-models " + sub, r);
-                continue;
-            }
-            if (sub == "pull") {
-                if (tokens.size() < 4) {
-                    printer.line("usage: node-models pull <node_id> <model_filename> [force]");
-                    continue;
-                }
-                bool force = false;
-                if (tokens.size() >= 5 && !mm::cli::parse_bool_token(tokens[4], &force)) {
-                    printer.line("error: force must be true|false");
-                    continue;
-                }
-                auto r = self.post("/v1/nodes/" + node_id + "/models/pull",
-                                   nlohmann::json{{"model_filename", tokens[3]}, {"force", force}});
-                emit_http_result("node-models pull", r);
-                continue;
-            }
-            if (sub == "delete") {
-                if (tokens.size() < 4) {
-                    printer.line("usage: node-models delete <node_id> <model_filename>");
-                    continue;
-                }
-                auto r = self.del("/v1/nodes/" + node_id + "/models/" + tokens[3]);
-                emit_http_result("node-models delete", r);
-                continue;
-            }
-            printer.line("error: unknown node-models subcommand");
             continue;
         }
 
@@ -959,6 +902,7 @@ int main(int argc, char** argv) {
     mm::ControlUI         ui(
         registry,
         agents,
+        scheduler,
         cfg.models_dir,
         "http://127.0.0.1:" + std::to_string(cfg.listen_port),
         cfg.external_api_token,

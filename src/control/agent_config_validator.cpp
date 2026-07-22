@@ -24,8 +24,7 @@ bool is_blank(const std::string& s) {
     return util::trim(s).empty();
 }
 
-// Case-insensitive ".gguf" suffix test. Local to control so we don't pull in the
-// node-only vllm_runtime header just for the classifier.
+// Case-insensitive ".gguf" suffix test kept local to the control process.
 bool looks_like_gguf(const std::string& model_path) {
     const std::string p = util::to_lower(util::trim(model_path));
     return p.size() >= 5 && p.compare(p.size() - 5, 5, ".gguf") == 0;
@@ -89,13 +88,19 @@ AgentValidationResult validate_agent_config(const AgentConfig& cfg,
         add_issue(result, ValidationSeverity::Error, "model_path", "Model path is required.");
     }
     const std::string backend = normalized_backend(cfg);
-    if (backend != "vllm" && backend != "api" && backend != "llama-cpp") {
+    if (backend == "vllm") {
         add_issue(result,
                   ValidationSeverity::Error,
                   "inference_backend",
-                  "inference_backend must be 'vllm', 'llama-cpp', or 'api'.");
+                  "The 'vllm' backend is not available in this runtime. Use 'llama-cpp' "
+                  "for local GGUF models or 'api' for a remote OpenAI-compatible service.");
+    } else if (backend != "api" && backend != "llama-cpp") {
+        add_issue(result,
+                  ValidationSeverity::Error,
+                  "inference_backend",
+                  "inference_backend must be 'llama-cpp' or 'api'.");
     }
-    const bool is_local_backend = (backend == "vllm" || backend == "llama-cpp");
+    const bool is_local_backend = (backend == "llama-cpp");
     const std::string mmproj_path = util::trim(cfg.vision_settings.mmproj_path);
     if (backend == "llama-cpp") {
         if (cfg.vision_settings.enabled && mmproj_path.empty()) {
@@ -131,7 +136,7 @@ AgentValidationResult validate_agent_config(const AgentConfig& cfg,
         add_issue(result,
                   ValidationSeverity::Error,
                   "vision_settings.mmproj_path",
-                  "vLLM and API vision profiles must leave mmproj_path empty; their configured model owns image support.");
+                  "Non-llama.cpp vision profiles must leave mmproj_path empty; their configured model owns image support.");
     }
     if (!cfg.id.empty() && !util::is_valid_agent_id(cfg.id)) {
         add_issue(result,
@@ -207,41 +212,12 @@ AgentValidationResult validate_agent_config(const AgentConfig& cfg,
     if (cfg.runtime_settings.ubatch_size != -1 && cfg.runtime_settings.ubatch_size <= 0) {
         add_issue(result, ValidationSeverity::Error, "runtime_settings.ubatch_size", "ubatch_size must be greater than 0, or -1 for the runtime default.");
     }
-    if (backend == "vllm") {
-        if (cfg.vllm_settings.max_model_len <= 0) {
-            add_issue(result, ValidationSeverity::Error, "vllm_settings.max_model_len", "max_model_len must be greater than 0.");
-        }
-        if (cfg.vllm_settings.max_num_seqs <= 0) {
-            add_issue(result, ValidationSeverity::Error, "vllm_settings.max_num_seqs", "max_num_seqs must be greater than 0.");
-        }
-        if (cfg.vllm_settings.max_num_batched_tokens != -1 &&
-            cfg.vllm_settings.max_num_batched_tokens <= 0) {
-            add_issue(result, ValidationSeverity::Error, "vllm_settings.max_num_batched_tokens", "max_num_batched_tokens must be greater than 0, or -1 for the vLLM default.");
-        }
-        if (cfg.vllm_settings.tensor_parallel_size <= 0) {
-            add_issue(result, ValidationSeverity::Error, "vllm_settings.tensor_parallel_size", "tensor_parallel_size must be greater than 0.");
-        }
-        if (cfg.vllm_settings.pipeline_parallel_size <= 0) {
-            add_issue(result, ValidationSeverity::Error, "vllm_settings.pipeline_parallel_size", "pipeline_parallel_size must be greater than 0.");
-        }
-        if (cfg.vllm_settings.gpu_memory_utilization <= 0.0 ||
-            cfg.vllm_settings.gpu_memory_utilization > 1.0 ||
-            !std::isfinite(cfg.vllm_settings.gpu_memory_utilization)) {
-            add_issue(result, ValidationSeverity::Error, "vllm_settings.gpu_memory_utilization", "gpu_memory_utilization must be within (0, 1].");
-        }
-        // A GGUF served through vLLM is experimental and architecture-limited;
-        // llama.cpp is the reliable backend for it.
-        if (looks_like_gguf(cfg.model_path)) {
-            add_issue(result,
-                      ValidationSeverity::Warning,
-                      "inference_backend",
-                      "model_path is a GGUF file but inference_backend is 'vllm'. "
-                      "vLLM's GGUF support is experimental; consider 'llama-cpp'.");
-        }
-    } else if (backend == "llama-cpp") {
-        // llama.cpp loads a local GGUF file (or a directory of split GGUF
-        // shards). An HF repo id would need an out-of-band pull we do not do yet.
-        if (util::is_hf_repo_id(cfg.model_path)) {
+    if (backend == "llama-cpp") {
+        // This runtime contract loads a node-local GGUF file. An HF repo id
+        // would need an out-of-band download that this branch does not perform.
+        const auto local_model = util::resolve_existing_local_model_path(
+            cfg.model_path, models_dir);
+        if (!local_model && util::is_hf_repo_id(cfg.model_path)) {
             add_issue(result,
                       ValidationSeverity::Warning,
                       "model_path",
@@ -317,18 +293,6 @@ AgentValidationResult validate_agent_config(const AgentConfig& cfg,
                       "preferred_node_id",
                       "Preferred node is currently disconnected.");
         }
-    }
-
-    if (backend == "vllm" && cfg.vllm_settings.max_model_len > 131072) {
-        add_issue(result,
-                  ValidationSeverity::Warning,
-                  "vllm_settings.max_model_len",
-                  "max_model_len is extremely large and may fail to load or perform poorly.");
-    } else if (backend == "vllm" && cfg.vllm_settings.max_model_len > 65536) {
-        add_issue(result,
-                  ValidationSeverity::Warning,
-                  "vllm_settings.max_model_len",
-                  "max_model_len is very large and may be slow or require substantial memory.");
     }
 
     return result;

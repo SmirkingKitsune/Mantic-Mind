@@ -8,7 +8,7 @@
 
 namespace mm {
 
-// OpenAI-compatible HTTP client for a running runtime engine (e.g. vLLM).
+// OpenAI-compatible HTTP client for llama-server and remote API backends.
 // All calls block on the calling thread.
 class RuntimeClient {
 public:

@@ -31,25 +31,12 @@ enum class NodeConnectionStatus { Unknown, Online, Unreachable, Offline };
 
 enum class SlotState { Empty, Loading, Ready, Suspending, Suspended, Error };
 
-// Inference engine family backing an agent or a running slot. llama.cpp is the
-// default runtime on this branch (GGUF models, Windows-native inference, and
-// accelerators without a vLLM build such as the DGX Spark); vLLM remains a
-// peer backend, and runs as the default on the vLLM-runtime branch.
-enum class EngineBackend { Vllm, LlamaCpp };
-
-inline std::string to_string(EngineBackend b) {
-    return b == EngineBackend::Vllm ? "vllm" : "llama-cpp";
-}
-
-// Accepts the canonical "llama-cpp" plus the legacy "llama.cpp"/"llama"
-// spellings so older persisted configs and hand-written payloads keep
-// resolving; an empty string means "unspecified" and resolves to the default
-// runtime (llama.cpp). Only an explicit "vllm" selects the vLLM engine —
-// callers that care about the api backend check the string form before
-// constructing an EngineBackend.
-inline EngineBackend engine_backend_from_string(const std::string& s) {
-    if (s == "vllm") return EngineBackend::Vllm;
-    return EngineBackend::LlamaCpp;
+// Local inference on this branch is always llama.cpp. Keep backend parsing at
+// API/config boundaries so legacy vLLM agents fail explicitly instead of being
+// silently reinterpreted as llama.cpp agents.
+inline bool is_llama_backend(const std::string& backend) {
+    return backend.empty() || backend == "llama-cpp" || backend == "llama.cpp" ||
+           backend == "llama";
 }
 
 // ── ToolCall ──────────────────────────────────────────────────────────────────
@@ -133,29 +120,6 @@ struct RuntimeSettings {
     std::vector<std::string> extra_args;  // additional runtime CLI flags
 };
 
-// vLLM server launch settings. Common generation settings still flow through
-// RuntimeSettings in the current request contract.
-struct VllmSettings {
-    int         max_model_len = 4096;
-    int         max_num_seqs = 16;
-    int         max_num_batched_tokens = -1; // -1 = vLLM default
-    int         tensor_parallel_size = 1;
-    int         pipeline_parallel_size = 1;
-    double      gpu_memory_utilization = 0.90;
-    std::string dtype = "auto";
-    std::string quantization;
-    std::string served_model_name;
-    bool        trust_remote_code = false;
-    bool        enable_prefix_caching = true;
-    bool        enable_auto_tool_choice = false;
-    // Launch with vLLM sleep mode (--enable-sleep-mode + VLLM_SERVER_DEV_MODE).
-    // Suspension then offloads weights to host RAM (/sleep level=1) and wakes
-    // in seconds instead of restarting the engine. Requires CUDA.
-    bool        enable_sleep_mode = true;
-    std::string tool_call_parser;
-    std::vector<std::string> extra_args; // additional vllm serve CLI flags
-};
-
 // OpenAI-compatible remote API settings for agents whose inference_backend is
 // "api". model_path remains the served model id sent in the request body.
 struct ApiSettings {
@@ -166,33 +130,12 @@ struct ApiSettings {
 };
 
 // Image-input capability declared by an agent profile. llama.cpp agents need
-// an explicit local GGUF projector; vLLM/API agents use their model-native
+// an explicit local GGUF projector; API agents use their model-native
 // multimodal implementation and therefore leave mmproj_path empty.
 struct VisionSettings {
     bool        enabled = false;
     std::string mmproj_path;
 };
-
-/// True when two vLLM configurations describe the same engine launch, i.e.
-/// agents using either can share one vllm-serve process. gpu_memory_utilization
-/// is excluded: it sizes the engine on its node, it does not change what the
-/// engine serves.
-inline bool vllm_launch_compatible(const VllmSettings& a, const VllmSettings& b) {
-    return a.max_model_len          == b.max_model_len
-        && a.max_num_seqs           == b.max_num_seqs
-        && a.max_num_batched_tokens == b.max_num_batched_tokens
-        && a.tensor_parallel_size   == b.tensor_parallel_size
-        && a.pipeline_parallel_size == b.pipeline_parallel_size
-        && a.dtype                  == b.dtype
-        && a.quantization           == b.quantization
-        && a.served_model_name      == b.served_model_name
-        && a.trust_remote_code      == b.trust_remote_code
-        && a.enable_prefix_caching  == b.enable_prefix_caching
-        && a.enable_auto_tool_choice == b.enable_auto_tool_choice
-        && a.enable_sleep_mode      == b.enable_sleep_mode
-        && a.tool_call_parser       == b.tool_call_parser
-        && a.extra_args             == b.extra_args;
-}
 
 /// True when two llama.cpp configurations describe the same engine launch, i.e.
 /// agents using either can share one llama-server process. Only the launch-time
@@ -216,9 +159,11 @@ struct AgentConfig {
     std::string   name;
     std::string   model_path;
     std::string   system_prompt;
-    std::string   inference_backend = "llama-cpp"; // llama-cpp (default) | vllm | api
+    std::string   inference_backend = "llama-cpp"; // llama-cpp (default) | api
+    // Public alias advertised by the control server's OpenAI-compatible model
+    // catalog. Older profiles stored this inside their backend-specific block.
+    std::string   served_model_name;
     RuntimeSettings runtime_settings;
-    VllmSettings  vllm_settings;
     ApiSettings   api_settings;
     VisionSettings vision_settings;
     bool          reasoning_enabled = false;
@@ -389,18 +334,11 @@ struct SlotInfo {
     std::string mmproj_path;             // node-local; only returned by authenticated node/control status
     bool        vision_enabled  = false;
     std::string projector_identity;      // stable basename/manifest identity, never a managed attachment path
-    std::string backend         = "llama-cpp"; // "llama-cpp" | "vllm"; slots always report it
+    std::string backend         = "llama-cpp"; // retained on the wire for compatibility
     AgentId     assigned_agent;          // first attached agent (legacy display)
     std::vector<AgentId> agent_ids;      // all agents attached to this slot
     SlotState   state           = SlotState::Empty;
-    bool        sleeping        = false; // vLLM: suspended via sleep mode, engine process alive
-    // vLLM engine load, scraped from the engine's Prometheus /metrics.
-    bool        engine_metrics_valid = false;
-    int         num_requests_running = 0;
-    int         num_requests_waiting = 0;
-    double      kv_cache_usage       = 0.0;  // 0.0–1.0
     int64_t     vram_usage_mb   = 0;
-    double      gpu_mem_fraction = 0.0;  // vLLM only: --gpu-memory-utilization slice held
     int64_t     last_active_ms  = 0;
     std::string kv_cache_path;
     int         effective_ctx_size = 0;
@@ -420,55 +358,17 @@ struct AgentPlacement {
 };
 
 // ── NodeCapabilities ──────────────────────────────────────────────────────────
-// Cluster-formation capabilities a node advertises. Multi-node vLLM engine
-// groups require members to share an arch + vLLM build (fingerprint) and a
-// common collective-comms backend. Empty/false defaults mean "unknown / not
-// cluster-capable", which is exactly how an older node (that doesn't report
-// this block) is treated.
+// Runtime capabilities a llama.cpp node advertises.
 struct NodeCapabilities {
     std::string              arch;            // "x86_64", "aarch64", "" = unknown
-    std::vector<std::string> comm_backends;   // e.g. {"nccl","gloo"} or {"gloo"}
-    std::string              vllm_version;     // engine build fingerprint, "" = unknown
-    bool                     supports_ray = false;
     int                      gpu_count = 0;    // GPUs visible to this node
-    double                   interconnect_gbps = 0.0; // node-to-node link hint, 0 = unknown
-    // llama.cpp multi-node grouping is orthogonal to vLLM's Ray path: it uses
-    // ggml's own TCP RPC backend (no NCCL/Gloo), so RPC members must share a
-    // compatible llama.cpp build fingerprint rather than a comm backend.
+    // RPC members must share a compatible llama.cpp build fingerprint.
     std::string              llama_cpp_version; // llama.cpp build fingerprint, "" = unknown
     bool                     supports_llama_rpc = false; // can host/join a ggml RPC group
 
-    bool has_comm_backend(const std::string& b) const {
-        return std::find(comm_backends.begin(), comm_backends.end(), b)
-            != comm_backends.end();
-    }
-    // The (arch, vllm_version) pair members must match to span one engine.
-    std::string fingerprint() const { return arch + "|" + vllm_version; }
-    bool cluster_capable() const {
-        return supports_ray && !arch.empty() && gpu_count > 0
-            && !comm_backends.empty();
-    }
 };
 
 // ── NodeInfo ──────────────────────────────────────────────────────────────────
-struct VllmRuntimeStatus {
-    std::string status = "disabled"; // resolved|provisioning|ready|failed|disabled
-    std::string platform;
-    std::string method;
-    std::string source_repo;
-    std::string version;
-    bool        managed = false;
-    std::string executable_path;
-    std::string last_error;
-    // Accelerator-correct build variant this node targets: cuda|rocm|cpu|metal|windows.
-    std::string accelerator;
-    // Newest build available upstream; "" when unknown (offline / not yet checked).
-    std::string latest_version;
-    // True when the installed runtime is older than latest_version. Orthogonal to
-    // `status`: a runtime stays "ready" while advertising an available update.
-    bool        update_available = false;
-};
-
 // One environment check performed after a llama.cpp provisioning failure.
 // `status` is pass|warn|fail|info; blocking means the normal source-build
 // preflight will reject the environment until the issue is resolved.
@@ -513,10 +413,7 @@ struct LlamaTroubleshootingReport {
     std::vector<LlamaRuntimeVariant> variants;
 };
 
-// Managed llama.cpp runtime status, the llama-server analog of
-// VllmRuntimeStatus. Kept as a separate struct (not renamed/shared) so a node
-// can advertise both runtimes independently and older clients keep parsing
-// vllm_runtime unchanged.
+// Managed llama.cpp runtime status.
 struct LlamaRuntimeStatus {
     std::string status = "disabled"; // resolved|provisioning|ready|failed|disabled
     std::string platform;
@@ -574,9 +471,8 @@ struct LlamaRuntimeStatus {
     LlamaTroubleshootingReport troubleshooting;
 };
 
-// Live progress of an in-program vLLM runtime install/upgrade, surfaced so the
-// node TUI can render a loading bar instead of running a script blind.
-struct VllmInstallProgress {
+// Live progress of an in-program runtime install/upgrade.
+struct RuntimeInstallProgress {
     bool        active = false;   // true while an install/upgrade is running
     int         step = 0;         // 1-based index of the current step
     int         total_steps = 0;  // number of steps in the plan
@@ -587,7 +483,7 @@ struct VllmInstallProgress {
 
 // Generic long-running node-side action shown by the node TUI modal. This is
 // intentionally transport-neutral: runtime provisioning and model receives both
-// update the same shape, while older clients can keep reading vllm_install_progress.
+// update the same shape.
 struct NodeActionProgress {
     bool        active = false;
     std::string operation_id;
@@ -620,13 +516,13 @@ struct NodeInfo {
     NodeCapabilities capabilities;
     NodeHealthMetrics metrics;
     int64_t          last_seen_ms = 0;
+    int64_t          slot_snapshot_at_ms = 0; // last successfully parsed /api/node/status slots
     int64_t          unreachable_since_ms = 0;
     int64_t          metrics_sampled_at_ms = 0;
     int              consecutive_failures = 0;
 
     // Multi-slot fields
     std::vector<SlotInfo>    slots;
-    std::vector<std::string> cached_models;  // HF repo ids present in this node's HF cache
     int64_t                  disk_free_mb = 0;
     int                      max_slots    = 1;
     int                      slot_in_use = 0;
@@ -636,14 +532,9 @@ struct NodeInfo {
     int                      slot_suspending = 0;
     int                      slot_suspended = 0;
     int                      slot_error = 0;
-    std::string              vllm_server_path;
-    VllmRuntimeStatus        vllm_runtime;
     std::string              llama_server_path;
     LlamaRuntimeStatus       llama_runtime;
-    VllmInstallProgress      vllm_install_progress;
     NodeActionProgress       action_progress;
-    double                   vllm_gpu_budget = 0.0;         // total GPU fraction vLLM slots may claim
-    double                   vllm_gpu_fraction_used = 0.0;  // fraction currently claimed (incl. loads in flight)
 };
 
 // ── ToolDefinition ────────────────────────────────────────────────────────────
@@ -886,41 +777,6 @@ inline void from_json(const nlohmann::json& j, RuntimeSettings& s) {
     if (j.contains("extra_args"))   j.at("extra_args").get_to(s.extra_args);
 }
 
-inline void to_json(nlohmann::json& j, const VllmSettings& s) {
-    j = { {"max_model_len",           s.max_model_len},
-          {"max_num_seqs",            s.max_num_seqs},
-          {"max_num_batched_tokens",  s.max_num_batched_tokens},
-          {"tensor_parallel_size",    s.tensor_parallel_size},
-          {"pipeline_parallel_size",  s.pipeline_parallel_size},
-          {"gpu_memory_utilization",  s.gpu_memory_utilization},
-          {"dtype",                   s.dtype},
-          {"quantization",            s.quantization},
-          {"served_model_name",       s.served_model_name},
-          {"trust_remote_code",       s.trust_remote_code},
-          {"enable_prefix_caching",   s.enable_prefix_caching},
-          {"enable_auto_tool_choice", s.enable_auto_tool_choice},
-          {"enable_sleep_mode",       s.enable_sleep_mode},
-          {"tool_call_parser",        s.tool_call_parser},
-          {"extra_args",              s.extra_args} };
-}
-inline void from_json(const nlohmann::json& j, VllmSettings& s) {
-    if (j.contains("max_model_len"))           j.at("max_model_len").get_to(s.max_model_len);
-    if (j.contains("max_num_seqs"))            j.at("max_num_seqs").get_to(s.max_num_seqs);
-    if (j.contains("max_num_batched_tokens"))  j.at("max_num_batched_tokens").get_to(s.max_num_batched_tokens);
-    if (j.contains("tensor_parallel_size"))    j.at("tensor_parallel_size").get_to(s.tensor_parallel_size);
-    if (j.contains("pipeline_parallel_size"))  j.at("pipeline_parallel_size").get_to(s.pipeline_parallel_size);
-    if (j.contains("gpu_memory_utilization"))  j.at("gpu_memory_utilization").get_to(s.gpu_memory_utilization);
-    if (j.contains("dtype"))                   j.at("dtype").get_to(s.dtype);
-    if (j.contains("quantization"))            j.at("quantization").get_to(s.quantization);
-    if (j.contains("served_model_name"))       j.at("served_model_name").get_to(s.served_model_name);
-    if (j.contains("trust_remote_code"))       j.at("trust_remote_code").get_to(s.trust_remote_code);
-    if (j.contains("enable_prefix_caching"))   j.at("enable_prefix_caching").get_to(s.enable_prefix_caching);
-    if (j.contains("enable_auto_tool_choice")) j.at("enable_auto_tool_choice").get_to(s.enable_auto_tool_choice);
-    if (j.contains("enable_sleep_mode"))       j.at("enable_sleep_mode").get_to(s.enable_sleep_mode);
-    if (j.contains("tool_call_parser"))        j.at("tool_call_parser").get_to(s.tool_call_parser);
-    if (j.contains("extra_args"))              j.at("extra_args").get_to(s.extra_args);
-}
-
 inline void to_json(nlohmann::json& j, const ApiSettings& s) {
     j = { {"base_url",              s.base_url},
           {"chat_completions_path", s.chat_completions_path},
@@ -949,8 +805,8 @@ inline void to_json(nlohmann::json& j, const AgentConfig& a) {
           {"model_path",        a.model_path},
           {"system_prompt",     a.system_prompt},
           {"inference_backend", a.inference_backend},
-          {"runtime_settings",    a.runtime_settings},
-          {"vllm_settings",     a.vllm_settings},
+          {"served_model_name", a.served_model_name},
+          {"runtime_settings",  a.runtime_settings},
           {"api_settings",      a.api_settings},
           {"vision_settings",   a.vision_settings},
           {"reasoning_enabled", a.reasoning_enabled},
@@ -964,8 +820,13 @@ inline void from_json(const nlohmann::json& j, AgentConfig& a) {
     if (j.contains("model_path"))        j.at("model_path").get_to(a.model_path);
     if (j.contains("system_prompt"))     j.at("system_prompt").get_to(a.system_prompt);
     if (j.contains("inference_backend")) j.at("inference_backend").get_to(a.inference_backend);
-    if (j.contains("runtime_settings"))    j.at("runtime_settings").get_to(a.runtime_settings);
-    if (j.contains("vllm_settings"))     j.at("vllm_settings").get_to(a.vllm_settings);
+    if (j.contains("served_model_name")) j.at("served_model_name").get_to(a.served_model_name);
+    if (j.contains("runtime_settings"))  j.at("runtime_settings").get_to(a.runtime_settings);
+    // Compatibility reader for agents serialized before the runtime split.
+    if (a.served_model_name.empty() && j.contains("vllm_settings") &&
+        j.at("vllm_settings").is_object()) {
+        a.served_model_name = j.at("vllm_settings").value("served_model_name", "");
+    }
     if (j.contains("api_settings"))      j.at("api_settings").get_to(a.api_settings);
     if (j.contains("vision_settings"))   j.at("vision_settings").get_to(a.vision_settings);
     if (j.contains("reasoning_enabled")) j.at("reasoning_enabled").get_to(a.reasoning_enabled);
@@ -1260,13 +1121,7 @@ inline void to_json(nlohmann::json& j, const SlotInfo& s) {
           {"assigned_agent",  s.assigned_agent},
           {"agent_ids",       s.agent_ids},
           {"state",           to_string(s.state)},
-          {"sleeping",        s.sleeping},
-          {"engine_metrics_valid", s.engine_metrics_valid},
-          {"num_requests_running", s.num_requests_running},
-          {"num_requests_waiting", s.num_requests_waiting},
-          {"kv_cache_usage",  s.kv_cache_usage},
           {"vram_usage_mb",   s.vram_usage_mb},
-          {"gpu_mem_fraction", s.gpu_mem_fraction},
           {"last_active_ms",  s.last_active_ms},
           {"kv_cache_path",   s.kv_cache_path},
           {"effective_ctx_size", s.effective_ctx_size} };
@@ -1285,13 +1140,7 @@ inline void from_json(const nlohmann::json& j, SlotInfo& s) {
     if (s.agent_ids.empty() && !s.assigned_agent.empty())
         s.agent_ids.push_back(s.assigned_agent);
     if (j.contains("state"))          s.state = slot_state_from_string(j.at("state").get<std::string>());
-    if (j.contains("sleeping"))       j.at("sleeping").get_to(s.sleeping);
-    if (j.contains("engine_metrics_valid")) j.at("engine_metrics_valid").get_to(s.engine_metrics_valid);
-    if (j.contains("num_requests_running")) j.at("num_requests_running").get_to(s.num_requests_running);
-    if (j.contains("num_requests_waiting")) j.at("num_requests_waiting").get_to(s.num_requests_waiting);
-    if (j.contains("kv_cache_usage")) j.at("kv_cache_usage").get_to(s.kv_cache_usage);
     if (j.contains("vram_usage_mb"))  j.at("vram_usage_mb").get_to(s.vram_usage_mb);
-    if (j.contains("gpu_mem_fraction")) j.at("gpu_mem_fraction").get_to(s.gpu_mem_fraction);
     if (j.contains("last_active_ms")) j.at("last_active_ms").get_to(s.last_active_ms);
     if (j.contains("kv_cache_path"))  j.at("kv_cache_path").get_to(s.kv_cache_path);
     if (j.contains("effective_ctx_size")) j.at("effective_ctx_size").get_to(s.effective_ctx_size);
@@ -1324,21 +1173,13 @@ inline void from_json(const nlohmann::json& j, AgentPlacement& p) {
 // ─── NodeCapabilities ────────────────────────────────────────────────────────
 inline void to_json(nlohmann::json& j, const NodeCapabilities& c) {
     j = { {"arch",          c.arch},
-          {"comm_backends", c.comm_backends},
-          {"vllm_version",  c.vllm_version},
-          {"supports_ray",  c.supports_ray},
           {"gpu_count",     c.gpu_count},
-          {"interconnect_gbps", c.interconnect_gbps},
           {"llama_cpp_version",  c.llama_cpp_version},
           {"supports_llama_rpc", c.supports_llama_rpc} };
 }
 inline void from_json(const nlohmann::json& j, NodeCapabilities& c) {
     if (j.contains("arch"))          j.at("arch").get_to(c.arch);
-    if (j.contains("comm_backends")) j.at("comm_backends").get_to(c.comm_backends);
-    if (j.contains("vllm_version"))  j.at("vllm_version").get_to(c.vllm_version);
-    if (j.contains("supports_ray"))  j.at("supports_ray").get_to(c.supports_ray);
     if (j.contains("gpu_count"))     j.at("gpu_count").get_to(c.gpu_count);
-    if (j.contains("interconnect_gbps")) j.at("interconnect_gbps").get_to(c.interconnect_gbps);
     if (j.contains("llama_cpp_version"))  j.at("llama_cpp_version").get_to(c.llama_cpp_version);
     if (j.contains("supports_llama_rpc")) j.at("supports_llama_rpc").get_to(c.supports_llama_rpc);
 }
@@ -1348,33 +1189,6 @@ inline void from_json(const nlohmann::json& j, NodeCapabilities& c) {
 // external clients (/v1/nodes) and must never leak node credentials. The
 // persistence path (NodeRegistry::save_remembered_nodes) writes api_key
 // explicitly.
-inline void to_json(nlohmann::json& j, const VllmRuntimeStatus& r) {
-    j = { {"status",           r.status},
-          {"platform",         r.platform},
-          {"method",           r.method},
-          {"source_repo",      r.source_repo},
-          {"version",          r.version},
-          {"managed",          r.managed},
-          {"executable_path",  r.executable_path},
-          {"last_error",       r.last_error},
-          {"accelerator",      r.accelerator},
-          {"latest_version",   r.latest_version},
-          {"update_available", r.update_available} };
-}
-inline void from_json(const nlohmann::json& j, VllmRuntimeStatus& r) {
-    if (j.contains("status"))           j.at("status").get_to(r.status);
-    if (j.contains("platform"))         j.at("platform").get_to(r.platform);
-    if (j.contains("method"))           j.at("method").get_to(r.method);
-    if (j.contains("source_repo"))      j.at("source_repo").get_to(r.source_repo);
-    if (j.contains("version"))          j.at("version").get_to(r.version);
-    if (j.contains("managed"))          j.at("managed").get_to(r.managed);
-    if (j.contains("executable_path"))  j.at("executable_path").get_to(r.executable_path);
-    if (j.contains("last_error"))       j.at("last_error").get_to(r.last_error);
-    if (j.contains("accelerator"))      j.at("accelerator").get_to(r.accelerator);
-    if (j.contains("latest_version"))   j.at("latest_version").get_to(r.latest_version);
-    if (j.contains("update_available")) j.at("update_available").get_to(r.update_available);
-}
-
 inline void to_json(nlohmann::json& j, const LlamaDiagnosticCheck& c) {
     j = {{"id", c.id}, {"label", c.label}, {"status", c.status},
          {"detected", c.detected}, {"required", c.required},
@@ -1505,7 +1319,7 @@ inline void from_json(const nlohmann::json& j, LlamaRuntimeStatus& r) {
         j.at("troubleshooting").get_to(r.troubleshooting);
 }
 
-inline void to_json(nlohmann::json& j, const VllmInstallProgress& p) {
+inline void to_json(nlohmann::json& j, const RuntimeInstallProgress& p) {
     j = { {"active",      p.active},
           {"step",        p.step},
           {"total_steps", p.total_steps},
@@ -1513,7 +1327,7 @@ inline void to_json(nlohmann::json& j, const VllmInstallProgress& p) {
           {"stage",       p.stage},
           {"last_line",   p.last_line} };
 }
-inline void from_json(const nlohmann::json& j, VllmInstallProgress& p) {
+inline void from_json(const nlohmann::json& j, RuntimeInstallProgress& p) {
     if (j.contains("active"))      j.at("active").get_to(p.active);
     if (j.contains("step"))        j.at("step").get_to(p.step);
     if (j.contains("total_steps")) j.at("total_steps").get_to(p.total_steps);
@@ -1570,11 +1384,11 @@ inline void to_json(nlohmann::json& j, const NodeInfo& n) {
           {"capabilities",  n.capabilities},
           {"metrics",       n.metrics},
           {"last_seen_ms",  n.last_seen_ms},
+          {"slot_snapshot_at_ms", n.slot_snapshot_at_ms},
           {"unreachable_since_ms", n.unreachable_since_ms},
           {"metrics_sampled_at_ms", n.metrics_sampled_at_ms},
           {"consecutive_failures", n.consecutive_failures},
           {"slots",         n.slots},
-          {"cached_models", n.cached_models},
           {"disk_free_mb",  n.disk_free_mb},
           {"max_slots",     n.max_slots},
           {"slot_in_use",   n.slot_in_use},
@@ -1584,14 +1398,9 @@ inline void to_json(nlohmann::json& j, const NodeInfo& n) {
           {"slot_suspending", n.slot_suspending},
           {"slot_suspended", n.slot_suspended},
           {"slot_error",    n.slot_error},
-          {"vllm_server_path",         n.vllm_server_path},
-          {"vllm_runtime",             n.vllm_runtime},
           {"llama_server_path",        n.llama_server_path},
           {"llama_runtime",            n.llama_runtime},
-          {"vllm_install_progress",    n.vllm_install_progress},
-          {"action_progress",          n.action_progress},
-          {"vllm_gpu_budget",          n.vllm_gpu_budget},
-          {"vllm_gpu_fraction_used",   n.vllm_gpu_fraction_used} };
+          {"action_progress",          n.action_progress} };
 }
 inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     j.at("id").get_to(n.id);
@@ -1610,11 +1419,12 @@ inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     if (j.contains("capabilities"))  j.at("capabilities").get_to(n.capabilities);
     if (j.contains("metrics"))       j.at("metrics").get_to(n.metrics);
     if (j.contains("last_seen_ms"))  j.at("last_seen_ms").get_to(n.last_seen_ms);
+    if (j.contains("slot_snapshot_at_ms"))
+        j.at("slot_snapshot_at_ms").get_to(n.slot_snapshot_at_ms);
     if (j.contains("unreachable_since_ms")) j.at("unreachable_since_ms").get_to(n.unreachable_since_ms);
     if (j.contains("metrics_sampled_at_ms")) j.at("metrics_sampled_at_ms").get_to(n.metrics_sampled_at_ms);
     if (j.contains("consecutive_failures")) j.at("consecutive_failures").get_to(n.consecutive_failures);
     if (j.contains("slots"))         j.at("slots").get_to(n.slots);
-    if (j.contains("cached_models")) j.at("cached_models").get_to(n.cached_models);
     if (j.contains("disk_free_mb"))  j.at("disk_free_mb").get_to(n.disk_free_mb);
     if (j.contains("max_slots"))     j.at("max_slots").get_to(n.max_slots);
     if (j.contains("slot_in_use"))   j.at("slot_in_use").get_to(n.slot_in_use);
@@ -1624,14 +1434,9 @@ inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     if (j.contains("slot_suspending")) j.at("slot_suspending").get_to(n.slot_suspending);
     if (j.contains("slot_suspended")) j.at("slot_suspended").get_to(n.slot_suspended);
     if (j.contains("slot_error"))    j.at("slot_error").get_to(n.slot_error);
-    if (j.contains("vllm_server_path")) j.at("vllm_server_path").get_to(n.vllm_server_path);
-    if (j.contains("vllm_runtime")) j.at("vllm_runtime").get_to(n.vllm_runtime);
     if (j.contains("llama_server_path")) j.at("llama_server_path").get_to(n.llama_server_path);
     if (j.contains("llama_runtime")) j.at("llama_runtime").get_to(n.llama_runtime);
-    if (j.contains("vllm_install_progress")) j.at("vllm_install_progress").get_to(n.vllm_install_progress);
     if (j.contains("action_progress")) j.at("action_progress").get_to(n.action_progress);
-    if (j.contains("vllm_gpu_budget")) j.at("vllm_gpu_budget").get_to(n.vllm_gpu_budget);
-    if (j.contains("vllm_gpu_fraction_used")) j.at("vllm_gpu_fraction_used").get_to(n.vllm_gpu_fraction_used);
 }
 
 // ─── ToolDefinition ───────────────────────────────────────────────────────────

@@ -10,8 +10,7 @@ namespace mm {
 // Rough VRAM/host-memory estimate for a llama.cpp (llama-server) load. Anchored
 // to the on-disk GGUF weight size plus a context-scaled KV cache term rather
 // than filename parameter guesses, so it stays backend-honest without parsing
-// architecture tensors. Used by the node to size llama.cpp slots (which do not
-// share vLLM's --gpu-memory-utilization fraction budget).
+// architecture tensors. Used by the node and scheduler to size llama.cpp slots.
 struct InferenceMemoryEstimate {
     int64_t model_weight_mb = 0;
     int64_t context_cache_mb = 0;

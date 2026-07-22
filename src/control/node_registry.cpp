@@ -195,20 +195,6 @@ std::vector<NodeInfo> NodeRegistry::nodes_with_model_loaded(
     return out;
 }
 
-std::vector<NodeInfo> NodeRegistry::nodes_with_model_cached(
-    const std::string& model_ref) const
-{
-    std::lock_guard<std::mutex> g(mutex_);
-    std::vector<NodeInfo> out;
-    for (auto& [_, n] : nodes_) {
-        if (!n.connected) continue;
-        if (std::find(n.cached_models.begin(), n.cached_models.end(), model_ref)
-                != n.cached_models.end())
-            out.push_back(n);
-    }
-    return out;
-}
-
 std::vector<NodeInfo> NodeRegistry::nodes_with_available_vram(
     int64_t min_vram_mb) const
 {
@@ -519,10 +505,10 @@ bool NodeRegistry::ping_node(NodeInfo& info) {
             info.loaded_model = sj.value("loaded_model", std::string{});
 
             // Parse multi-slot fields if present
-            if (sj.contains("slots"))
+            if (sj.contains("slots")) {
                 info.slots = sj["slots"].get<std::vector<SlotInfo>>();
-            if (sj.contains("cached_models"))
-                info.cached_models = sj["cached_models"].get<std::vector<std::string>>();
+                info.slot_snapshot_at_ms = mm::util::now_ms();
+            }
             if (sj.contains("hostname"))
                 info.hostname = sj["hostname"].get<std::string>();
             if (sj.contains("disk_free_mb"))
@@ -543,24 +529,14 @@ bool NodeRegistry::ping_node(NodeInfo& info) {
                 info.slot_suspended = sj["slot_suspended"].get<int>();
             if (sj.contains("slot_error"))
                 info.slot_error = sj["slot_error"].get<int>();
-            if (sj.contains("vllm_server_path"))
-                info.vllm_server_path = sj["vllm_server_path"].get<std::string>();
-            if (sj.contains("vllm_runtime"))
-                info.vllm_runtime = sj["vllm_runtime"].get<VllmRuntimeStatus>();
             if (sj.contains("llama_server_path"))
                 info.llama_server_path = sj["llama_server_path"].get<std::string>();
             if (sj.contains("llama_runtime"))
                 info.llama_runtime = sj["llama_runtime"].get<LlamaRuntimeStatus>();
-            if (sj.contains("vllm_install_progress"))
-                info.vllm_install_progress = sj["vllm_install_progress"].get<VllmInstallProgress>();
             if (sj.contains("action_progress"))
                 info.action_progress = sj["action_progress"].get<NodeActionProgress>();
             if (sj.contains("capabilities"))
                 info.capabilities = sj["capabilities"].get<NodeCapabilities>();
-            if (sj.contains("vllm_gpu_budget"))
-                info.vllm_gpu_budget = sj["vllm_gpu_budget"].get<double>();
-            if (sj.contains("vllm_gpu_fraction_used"))
-                info.vllm_gpu_fraction_used = sj["vllm_gpu_fraction_used"].get<double>();
 
             // Backfill occupancy counts when a node returns only raw slots.
             if (!sj.contains("slot_in_use")) {
@@ -617,7 +593,6 @@ void NodeRegistry::poll_all_nodes() {
 
         // Write updated info back; grab callback outside the lock
         UpdateCallback cb;
-        bool version_bumped = false;
         {
             std::lock_guard<std::mutex> g(mutex_);
             auto it = nodes_.find(id);
@@ -627,12 +602,12 @@ void NodeRegistry::poll_all_nodes() {
                 it->second.metrics       = info.metrics;
                 it->second.loaded_model  = info.loaded_model;
                 it->second.slots         = info.slots;
-                it->second.cached_models = info.cached_models;
                 it->second.disk_free_mb  = info.disk_free_mb;
                 it->second.max_slots     = info.max_slots;
                 it->second.slot_in_use   = info.slot_in_use;
                 it->second.connection_status = info.connection_status;
                 it->second.last_seen_ms = info.last_seen_ms;
+                it->second.slot_snapshot_at_ms = info.slot_snapshot_at_ms;
                 it->second.unreachable_since_ms = info.unreachable_since_ms;
                 it->second.metrics_sampled_at_ms = info.metrics_sampled_at_ms;
                 it->second.consecutive_failures = info.consecutive_failures;
@@ -643,86 +618,19 @@ void NodeRegistry::poll_all_nodes() {
                 it->second.slot_suspending = info.slot_suspending;
                 it->second.slot_suspended = info.slot_suspended;
                 it->second.slot_error    = info.slot_error;
-                it->second.vllm_server_path = info.vllm_server_path;
-                it->second.vllm_runtime = info.vllm_runtime;
                 it->second.llama_server_path = info.llama_server_path;
                 it->second.llama_runtime = info.llama_runtime;
-                it->second.vllm_install_progress = info.vllm_install_progress;
                 it->second.action_progress = info.action_progress;
-                it->second.vllm_gpu_budget = info.vllm_gpu_budget;
-                it->second.vllm_gpu_fraction_used = info.vllm_gpu_fraction_used;
                 it->second.capabilities = info.capabilities;
             }
             cb = update_cb_;
-
-            // Detect a vLLM runtime version bump so we can converge peers. First
-            // observation only seeds the baseline (no nudge on initial connect).
-            const std::string& newv = info.vllm_runtime.version;
-            std::string& prev = last_vllm_version_[id];
-            if (info.connected && !newv.empty() && newv != prev) {
-                version_bumped = !prev.empty();
-                prev = newv;
-            }
         }
 
         if (info.connection_status != previous_connection) {
             MM_INFO("Node {} is now {}", id, to_string(info.connection_status));
         }
 
-        if (version_bumped) {
-            MM_INFO("Node {} vLLM updated to {}; nudging same-environment peers",
-                    id, info.vllm_runtime.version);
-            nudge_environment_peers(id);
-        }
-
         if (cb) cb(info);
-    }
-}
-
-std::vector<NodeId> select_vllm_update_peers(const std::vector<NodeInfo>& nodes,
-                                             const NodeId& source_id) {
-    auto env_key = [](const NodeInfo& n) {
-        return n.vllm_runtime.accelerator + "|" + n.vllm_runtime.platform + "|" +
-               n.capabilities.arch;
-    };
-    const NodeInfo* source = nullptr;
-    for (const auto& n : nodes) {
-        if (n.id == source_id) { source = &n; break; }
-    }
-    std::vector<NodeId> out;
-    if (!source) return out;
-
-    const std::string source_env = env_key(*source);
-    const std::string source_ver = source->vllm_runtime.version;
-    for (const auto& n : nodes) {
-        if (n.id == source_id || !n.connected) continue;
-        if (env_key(n) != source_env) continue;
-        if (n.vllm_runtime.version == source_ver) continue;  // already converged
-        out.push_back(n.id);
-    }
-    return out;
-}
-
-void NodeRegistry::nudge_environment_peers(const NodeId& source_id) {
-    // Snapshot the registry under the lock; select + POST without it.
-    std::vector<NodeInfo> snapshot;
-    {
-        std::lock_guard<std::mutex> g(mutex_);
-        snapshot.reserve(nodes_.size());
-        for (const auto& [id, n] : nodes_) snapshot.push_back(n);
-    }
-
-    const std::vector<NodeId> peer_ids = select_vllm_update_peers(snapshot, source_id);
-    for (const auto& pid : peer_ids) {
-        const NodeInfo* peer = nullptr;
-        for (const auto& n : snapshot) {
-            if (n.id == pid) { peer = &n; break; }
-        }
-        if (!peer) continue;
-        HttpClient cli(peer->url);
-        cli.set_bearer_token(peer->api_key);
-        auto res = cli.post("/api/node/runtime/vllm/check-update", nlohmann::json::object());
-        MM_INFO("  nudged peer {} ({}): HTTP {}", pid, peer->url, res.status);
     }
 }
 

@@ -15,12 +15,6 @@
 
 namespace mm {
 
-// Peers that should be nudged to re-check for a vLLM update when the node
-// `source_id` just updated: connected, same environment (accelerator | platform
-// | arch), and on a different version. Excludes the source. Pure; unit-tested.
-std::vector<NodeId> select_vllm_update_peers(const std::vector<NodeInfo>& nodes,
-                                             const NodeId& source_id);
-
 NodeConnectionStatus classify_node_reachability(int64_t unreachable_since_ms,
                                                 int64_t now_ms,
                                                 int64_t offline_after_ms);
@@ -68,8 +62,6 @@ public:
     /// - preferred: enough free VRAM
     /// - fallback: VRAM + weighted RAM budget (CPU offload)
     std::vector<NodeInfo> nodes_with_available_vram(int64_t min_vram_mb) const;
-    /// Nodes whose HF cache already holds model_ref (avoids a fresh download).
-    std::vector<NodeInfo> nodes_with_model_cached(const std::string& model_ref) const;
 
     // Callback fired whenever node status changes (health poll results).
     using UpdateCallback = std::function<void(const NodeInfo&)>;
@@ -108,9 +100,6 @@ private:
     std::unordered_set<NodeId>            remembered_nodes_;
     std::string                           remembered_nodes_path_;
     UpdateCallback                        update_cb_;
-    // Last vLLM runtime version seen per node, used to detect an update and nudge
-    // same-environment peers to check (cluster version convergence).
-    std::unordered_map<NodeId, std::string> last_vllm_version_;
     std::atomic<int64_t> offline_after_ms_{90000};
 
     std::atomic<bool>       polling_{false};
@@ -122,11 +111,6 @@ private:
 
     void poll_all_nodes();
     bool ping_node(NodeInfo& info);
-    // When node `source_id` just updated its vLLM runtime, POST a check-update to
-    // every same-environment peer (see select_vllm_update_peers). Each peer then
-    // follows its own policy (prompt/auto/manual). Makes HTTP calls; call without
-    // mutex_ held.
-    void nudge_environment_peers(const NodeId& source_id);
     void load_remembered_nodes();
     void save_remembered_nodes_unlocked() const;
 };

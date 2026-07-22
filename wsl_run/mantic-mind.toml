@@ -3,13 +3,11 @@
 listen_port = 7070
 control_url = ""
 
-# vLLM CLI from the venv.
-vllm_server_path = "/home/ryanm/vllm-venv/bin/vllm"
+# Resolve or provision an accelerator-matched llama-server for this WSL node.
+llama_server_path = "llama-server"
+llama_auto_provision = true
 
-# Low GPU budget so the step-1 rejection path is easy to trigger on one GPU.
-vllm_gpu_budget = 0.50
-
-# Allow several concurrent engines.
+# Allow several concurrent llama-server engines.
 max_slots = 6
 runtime_port_range_start = 8100
 runtime_port_range_end   = 8120

@@ -1,10 +1,11 @@
 #include "control/agent_scheduler.hpp"
-#include "control/node_registry.hpp"
-#include "control/engine_group_planner.hpp"
+
 #include "common/http_client.hpp"
+#include "common/inference_sizing.hpp"
 #include "common/logger.hpp"
 #include "common/pairing.hpp"
 #include "common/util.hpp"
+#include "control/node_registry.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -12,7 +13,6 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
-#include <regex>
 #include <string>
 #include <system_error>
 #include <tuple>
@@ -24,14 +24,6 @@ namespace mm {
 
 namespace {
 
-// Stream a control-local model (single file or directory) to a node's local
-// model cache, skipping files it already holds, and return the node-local load
-// path the runtime should open. Returns nullopt on failure (with *error set).
-//
-// The transfer reuses the existing authenticated control→node channel: the
-// node in this topology may have no route back to control, but control always
-// holds the node's url + api_key. Files stream chunk-by-chunk (no multi-GB
-// buffering) via HttpClient::post_file.
 std::optional<std::string> transfer_model_to_node(const NodeInfo& node,
                                                   const std::string& model_ref,
                                                   bool pin,
@@ -40,82 +32,95 @@ std::optional<std::string> transfer_model_to_node(const NodeInfo& node,
                                                   const std::string& cache_id = {}) {
     namespace fs = std::filesystem;
     const std::string model_id = cache_id.empty()
-        ? util::model_id_from_ref(model_ref) : cache_id;
+        ? util::model_id_from_ref(model_ref)
+        : cache_id;
 
-    struct FileEntry { std::string abs; std::string rel; int64_t size; };
+    struct FileEntry {
+        std::string absolute_path;
+        std::string relative_path;
+        int64_t size = 0;
+    };
     std::vector<FileEntry> files;
-    int64_t total = 0;
+    int64_t total_size = 0;
     std::error_code ec;
 
     const fs::path root(model_ref);
     if (fs::is_regular_file(root, ec)) {
-        const int64_t sz = static_cast<int64_t>(fs::file_size(root, ec));
-        files.push_back({root.string(), root.filename().string(), sz});
-        total += sz;
+        const auto size = static_cast<int64_t>(fs::file_size(root, ec));
+        files.push_back({root.string(), root.filename().string(), size});
+        total_size += size;
     } else if (fs::is_directory(root, ec)) {
         for (auto it = fs::recursive_directory_iterator(root, ec);
-             !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
-            std::error_code fec;
-            if (!it->is_regular_file(fec)) continue;
-            const fs::path rel = fs::relative(it->path(), root, fec);
-            const int64_t sz = static_cast<int64_t>(it->file_size(fec));
-            files.push_back({it->path().string(), rel.generic_string(), sz});
-            total += sz;
+             !ec && it != fs::recursive_directory_iterator();
+             it.increment(ec)) {
+            std::error_code file_ec;
+            if (!it->is_regular_file(file_ec)) continue;
+            const fs::path relative = fs::relative(it->path(), root, file_ec);
+            const auto size = static_cast<int64_t>(it->file_size(file_ec));
+            files.push_back({it->path().string(), relative.generic_string(), size});
+            total_size += size;
         }
     } else {
-        if (error) *error = "model path is neither a file nor a directory: " + model_ref;
+        if (error) {
+            *error = "model path is neither a file nor a directory: " + model_ref;
+        }
         return std::nullopt;
     }
+
     if (files.empty()) {
         if (error) *error = "no files found for model: " + model_ref;
         return std::nullopt;
     }
 
-    HttpClient cli(node.url);
-    cli.set_bearer_token(node.api_key);
-    cli.set_timeouts(10, 3600, 3600);  // large transfers can take a while
+    HttpClient client(node.url);
+    client.set_bearer_token(node.api_key);
+    client.set_timeouts(10, 3600, 3600);
 
-    // Skip the transfer when the node already holds this model at the same size
-    // (unless forced — e.g. a retry after the node evicted it mid-flight).
     if (!force) {
-        auto q = cli.get("/api/node/models/local?id=" + model_id);
-        if (q.ok()) {
+        const auto query = client.get("/api/node/models/local?id=" + model_id);
+        if (query.ok()) {
             try {
-                auto j = nlohmann::json::parse(q.body);
-                if (j.value("present", false) &&
-                    j.value("size_bytes", static_cast<int64_t>(-1)) == total) {
-                    const std::string lp = j.value("load_path", std::string{});
-                    if (!lp.empty()) return lp;
+                const auto body = nlohmann::json::parse(query.body);
+                if (body.value("present", false) &&
+                    body.value("size_bytes", static_cast<int64_t>(-1)) == total_size) {
+                    const std::string load_path =
+                        body.value("load_path", std::string{});
+                    if (!load_path.empty()) return load_path;
                 }
-            } catch (...) {}
+            } catch (...) {
+            }
         }
     }
 
     std::string load_path;
-    for (const auto& fe : files) {
+    for (const auto& file : files) {
         const std::vector<std::pair<std::string, std::string>> headers = {
             {"X-MM-Model-Id", model_id},
-            {"X-MM-Rel-Path", fe.rel},
-            {"X-MM-Size",     std::to_string(fe.size)},
-            {"X-MM-Pin",      pin ? "true" : "false"},
+            {"X-MM-Rel-Path", file.relative_path},
+            {"X-MM-Size", std::to_string(file.size)},
+            {"X-MM-Pin", pin ? "true" : "false"},
         };
-        auto resp = cli.post_file("/api/node/models/receive", fe.abs, headers);
-        if (!resp.ok()) {
+        const auto response = client.post_file(
+            "/api/node/models/receive", file.absolute_path, headers);
+        if (!response.ok()) {
             if (error) {
-                std::string body = resp.body.size() > 200 ? resp.body.substr(0, 200)
-                                                          : resp.body;
-                *error = "receive failed for " + fe.rel + " (HTTP " +
-                         std::to_string(resp.status) + "): " + body;
+                std::string preview = response.body;
+                if (preview.size() > 200) preview.resize(200);
+                *error = "receive failed for " + file.relative_path + " (HTTP "
+                       + std::to_string(response.status) + "): " + preview;
             }
             return std::nullopt;
         }
         try {
-            auto j = nlohmann::json::parse(resp.body);
-            load_path = j.value("load_path", load_path);
-            if (files.size() == 1)
-                load_path = j.value("stored_path", load_path);
-        } catch (...) {}
+            const auto body = nlohmann::json::parse(response.body);
+            load_path = body.value("load_path", load_path);
+            if (files.size() == 1) {
+                load_path = body.value("stored_path", load_path);
+            }
+        } catch (...) {
+        }
     }
+
     if (load_path.empty()) {
         if (error) *error = "node did not report a load path after transfer";
         return std::nullopt;
@@ -125,35 +130,85 @@ std::optional<std::string> transfer_model_to_node(const NodeInfo& node,
 
 std::string file_manifest_identity(const std::string& ref) {
     namespace fs = std::filesystem;
+    const fs::path requested(ref);
     std::error_code ec;
-    fs::path path(ref);
-    std::string out = path.lexically_normal().generic_string();
-    if (fs::is_regular_file(path, ec)) {
-        out += ":" + std::to_string(fs::file_size(path, ec));
-        const auto modified = fs::last_write_time(path, ec);
-        if (!ec) out += ":" + std::to_string(modified.time_since_epoch().count());
+    fs::path resolved = fs::weakly_canonical(requested, ec);
+    if (ec) {
+        ec.clear();
+        resolved = fs::absolute(requested, ec);
     }
-    return out;
+    if (ec) resolved = requested;
+    resolved = resolved.lexically_normal();
+
+    ec.clear();
+    if (fs::is_regular_file(resolved, ec)) {
+        std::error_code size_ec;
+        std::error_code time_ec;
+        const auto size = fs::file_size(resolved, size_ec);
+        const auto modified = fs::last_write_time(resolved, time_ec);
+        return "file:" + resolved.generic_string()
+            + "\nsize:" + (size_ec ? std::string{"?"} : std::to_string(size))
+            + "\nmtime:" + (time_ec ? std::string{"?"}
+                                             : std::to_string(modified.time_since_epoch().count()));
+    }
+
+    ec.clear();
+    if (fs::is_directory(resolved, ec)) {
+        std::vector<std::string> entries;
+        for (fs::recursive_directory_iterator it(resolved, ec), end;
+             !ec && it != end; it.increment(ec)) {
+            std::error_code file_ec;
+            if (!it->is_regular_file(file_ec)) continue;
+
+            std::error_code relative_ec;
+            std::error_code size_ec;
+            std::error_code time_ec;
+            const auto relative = fs::relative(it->path(), resolved, relative_ec);
+            const auto size = it->file_size(size_ec);
+            const auto modified = it->last_write_time(time_ec);
+            entries.push_back(
+                (relative_ec ? it->path().filename().generic_string()
+                             : relative.generic_string())
+                + "\t" + (size_ec ? std::string{"?"} : std::to_string(size))
+                + "\t" + (time_ec ? std::string{"?"}
+                                             : std::to_string(modified.time_since_epoch().count())));
+        }
+        std::sort(entries.begin(), entries.end());
+        std::string identity = "directory:" + resolved.generic_string();
+        for (const auto& entry : entries) identity += "\n" + entry;
+        return identity;
+    }
+
+    // A missing reference may intentionally be a path that exists only on the
+    // target node. Keep its spelling stable without pretending it is local.
+    return "reference:" + requested.lexically_normal().generic_string();
 }
 
-std::string vision_bundle_id(const AgentConfig& cfg) {
-    const std::string manifest = file_manifest_identity(cfg.model_path) + "\n" +
-                                 file_manifest_identity(cfg.vision_settings.mmproj_path);
-    const std::string digest = pairing::hmac_sha256_hex("mantic-vision-bundle-v1", manifest);
-    return util::model_id_from_ref(cfg.model_path) + "-vision-" + digest.substr(0, 20);
+std::string manifest_cache_id(const std::string& path) {
+    const std::string digest = pairing::hmac_sha256_hex(
+        "mantic-model-cache-v2", file_manifest_identity(path));
+    return util::model_id_from_ref(path) + "-" + digest.substr(0, 24);
 }
 
-std::string engine_fingerprint(const AgentConfig& cfg) {
-    const EngineBackend backend =
-        engine_backend_from_string(cfg.inference_backend);
-    nlohmann::json identity = {
-        {"backend", to_string(backend)},
-        {"model", file_manifest_identity(cfg.model_path)},
-        {"vision", cfg.vision_settings}
-    };
-    if (backend == EngineBackend::LlamaCpp) {
-        const auto& runtime = cfg.runtime_settings;
-        identity["launch"] = {
+std::string resolved_manifest_identity(const std::string& ref,
+                                       const std::string& models_dir) {
+    if (const auto local = util::resolve_existing_local_model_path(ref, models_dir)) {
+        return file_manifest_identity(*local);
+    }
+    return file_manifest_identity(ref);
+}
+
+std::string engine_fingerprint(const AgentConfig& cfg,
+                               const std::string& models_dir) {
+    const auto& runtime = cfg.runtime_settings;
+    const nlohmann::json identity = {
+        {"backend", "llama-cpp"},
+        {"model", resolved_manifest_identity(cfg.model_path, models_dir)},
+        {"vision_enabled", cfg.vision_settings.enabled},
+        {"projector", cfg.vision_settings.enabled
+            ? resolved_manifest_identity(cfg.vision_settings.mmproj_path, models_dir)
+            : std::string{}},
+        {"launch", {
             {"ctx_size", runtime.ctx_size},
             {"n_gpu_layers", runtime.n_gpu_layers},
             {"n_threads", runtime.n_threads},
@@ -162,235 +217,313 @@ std::string engine_fingerprint(const AgentConfig& cfg) {
             {"batch_size", runtime.batch_size},
             {"ubatch_size", runtime.ubatch_size},
             {"flash_attn", runtime.flash_attn},
-            {"extra_args", runtime.extra_args}
-        };
-    } else {
-        identity["launch"] = cfg.vllm_settings;
-    }
-    return pairing::hmac_sha256_hex("mantic-engine-placement-v1", identity.dump());
+            {"extra_args", runtime.extra_args},
+        }},
+    };
+    return pairing::hmac_sha256_hex(
+        "mantic-engine-placement-v1", identity.dump());
 }
 
-}  // namespace
+int64_t projector_file_mb(const AgentConfig& cfg,
+                          const std::string& models_dir) {
+    if (!cfg.vision_settings.enabled || cfg.vision_settings.mmproj_path.empty()) {
+        return 0;
+    }
+    const auto local = util::resolve_existing_local_model_path(
+        cfg.vision_settings.mmproj_path, models_dir);
+    if (!local) return 0;
+    std::error_code ec;
+    const auto bytes = std::filesystem::file_size(*local, ec);
+    if (ec) return 0;
+    constexpr uint64_t kMib = 1024ULL * 1024ULL;
+    return static_cast<int64_t>((bytes + kMib - 1) / kMib);
+}
 
-AgentScheduler::AgentScheduler(NodeRegistry& registry,
-                               std::string models_dir)
+struct PreparedModel {
+    std::string model_path;
+    std::string mmproj_path;
+    std::string model_id;
+    std::string mmproj_model_id;
+};
+
+std::optional<PreparedModel> prepare_model_for_node(const NodeInfo& node,
+                                                    const AgentConfig& cfg,
+                                                    const std::string& models_dir,
+                                                    bool pin,
+                                                    bool force,
+                                                    std::string* error) {
+    PreparedModel prepared;
+    prepared.model_path = cfg.model_path;
+    prepared.mmproj_path = cfg.vision_settings.enabled
+        ? cfg.vision_settings.mmproj_path
+        : std::string{};
+
+    if (const auto model_path =
+            util::resolve_existing_local_model_path(cfg.model_path, models_dir)) {
+        const std::string cache_id = manifest_cache_id(*model_path);
+        auto local = transfer_model_to_node(
+            node, *model_path, pin, force, error, cache_id);
+        if (!local) return std::nullopt;
+        prepared.model_path = *local;
+        prepared.model_id = cache_id;
+    }
+
+    if (cfg.vision_settings.enabled &&
+        !cfg.vision_settings.mmproj_path.empty()) {
+        if (const auto projector_path = util::resolve_existing_local_model_path(
+                cfg.vision_settings.mmproj_path, models_dir)) {
+            const std::string cache_id = manifest_cache_id(*projector_path);
+            auto local = transfer_model_to_node(
+                node, *projector_path, pin, force, error, cache_id);
+            if (!local) return std::nullopt;
+            prepared.mmproj_path = *local;
+            prepared.mmproj_model_id = cache_id;
+        }
+    }
+
+    return prepared;
+}
+
+bool same_model_reference(const std::string& lhs, const std::string& rhs) {
+    namespace fs = std::filesystem;
+    const auto left = util::to_lower(fs::path(lhs).lexically_normal().generic_string());
+    const auto right = util::to_lower(fs::path(rhs).lexically_normal().generic_string());
+    if (left == right) return true;
+    return util::to_lower(fs::path(lhs).filename().string())
+        == util::to_lower(fs::path(rhs).filename().string());
+}
+
+} // namespace
+
+AgentScheduler::AgentScheduler(NodeRegistry& registry, std::string models_dir)
     : registry_(registry)
-    , models_dir_(std::move(models_dir))
-{}
-
-// ── Main scheduling entry point ──────────────────────────────────────────────
+    , models_dir_(std::move(models_dir)) {}
 
 std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
-    const AgentConfig& cfg)
-{
-    const std::string desired_fingerprint = engine_fingerprint(cfg);
-    if (auto prior = find_placement_copy(cfg.id);
-        prior && prior->engine_fingerprint != desired_fingerprint) {
-        MM_INFO("AgentScheduler: engine identity changed for agent {}; releasing stale placement",
-                cfg.id);
+    const AgentConfig& cfg) {
+    if (!is_llama_backend(cfg.inference_backend)) {
+        // API-backed (and unsupported legacy) agents do not own node slots.
+        // Release a prior local placement before reporting the routing result.
         release_agent(cfg.id);
+        set_last_error("unsupported local inference backend '" + cfg.inference_backend
+                       + "'; this branch supports llama-cpp only");
+        return std::nullopt;
     }
 
-    // Scheduling decisions stay serialized end-to-end (same semantics as the
-    // old single mutex), but placements_ is only touched through the
-    // state_mutex_ helpers so reads and idle/active marks never block behind
-    // a model load or upload happening here.
-    std::lock_guard lock(schedule_mutex_);
+    const std::string desired_fingerprint = engine_fingerprint(cfg, models_dir_);
+    std::lock_guard schedule_lock(schedule_mutex_);
     set_last_error({});
 
-    // 1. Existing active placement?
     auto existing = find_placement_copy(cfg.id);
+    if (existing && existing->engine_fingerprint != desired_fingerprint) {
+        MM_INFO("AgentScheduler: engine identity changed for agent {}; "
+                "releasing stale placement", cfg.id);
+        erase_placement_entry(cfg.id);
+        detach_placement_best_effort(*existing, cfg.id, "engine identity changed");
+        existing.reset();
+    }
+
     if (existing && !existing->suspended) {
-        mutate_placement(cfg.id, [](AgentPlacement& p) {
-            p.last_active_ms = util::now_ms();
-        });
-        return ScheduleResult{existing->node_id, existing->slot_id};
+        const auto nodes = registry_.list_nodes();
+        const auto node_it = std::find_if(
+            nodes.begin(), nodes.end(), [&](const NodeInfo& node) {
+                return node.id == existing->node_id;
+            });
+
+        // A status snapshot taken before this placement cannot disprove it.
+        // Once a newer snapshot exists, require the node to report the same
+        // attached slot so direct lifecycle calls cannot leave stale routing.
+        if (node_it != nodes.end() && node_it->connected
+            && node_it->slot_snapshot_at_ms <= existing->placed_at_ms) {
+            mutate_placement(cfg.id, [](AgentPlacement& placement) {
+                placement.last_active_ms = util::now_ms();
+            });
+            return ScheduleResult{existing->node_id, existing->slot_id};
+        }
+
+        const SlotInfo* reported_slot = nullptr;
+        if (node_it != nodes.end() && node_it->connected) {
+            const auto slot_it = std::find_if(
+                node_it->slots.begin(), node_it->slots.end(),
+                [&](const SlotInfo& slot) { return slot.id == existing->slot_id; });
+            if (slot_it != node_it->slots.end()) reported_slot = &*slot_it;
+        }
+        const bool attached = reported_slot
+            && (reported_slot->assigned_agent == cfg.id
+                || std::find(reported_slot->agent_ids.begin(),
+                             reported_slot->agent_ids.end(), cfg.id)
+                       != reported_slot->agent_ids.end());
+
+        if (attached && reported_slot->state == SlotState::Ready) {
+            mutate_placement(cfg.id, [](AgentPlacement& placement) {
+                placement.last_active_ms = util::now_ms();
+            });
+            return ScheduleResult{existing->node_id, existing->slot_id};
+        }
+        if (attached && reported_slot->state == SlotState::Suspended) {
+            existing->suspended = true;
+            existing->kv_cache_node_path = reported_slot->kv_cache_path;
+            store_placement(*existing);
+        } else {
+            MM_WARN("AgentScheduler: discarding stale placement for agent {} "
+                    "on node {} slot {}", cfg.id, existing->node_id,
+                    existing->slot_id);
+            erase_placement_entry(cfg.id);
+            detach_placement_best_effort(*existing, cfg.id,
+                                         "node no longer reports attached ready slot");
+            existing.reset();
+        }
     }
 
-    // Multi-node engine group: pipeline_parallel_size > 1 means this model is
-    // meant to span nodes. Plan the group from advertised node capabilities
-    // and drive the Ray + engine launch.
-    if (cfg.vllm_settings.pipeline_parallel_size > 1) {
-        return ensure_engine_group_running(cfg);
-    }
+    const int64_t vram_needed = estimate_inference_vram_mb(
+        cfg.model_path, cfg.runtime_settings, models_dir_)
+        + projector_file_mb(cfg, models_dir_);
 
-    // vLLM nodes enforce their own GPU-memory budget at load time and reject
-    // with an out-of-memory style error that response_indicates_max_slots()
-    // detects — that is the real capacity authority. We only use the registry
-    // VRAM filter as a coarse pre-screen, so a conservative zero estimate keeps
-    // every connected node a candidate and lets the node make the final call.
-    const int64_t vram_needed = 0;
-
-    // 2. Suspended placement? Try to restore.
     if (existing && existing->suspended) {
         AgentPlacement placement = *existing;
-
-        auto restored = [&](const NodeId& node_id, const SlotId& slot_id) {
-            placement.node_id        = node_id;
-            placement.slot_id        = slot_id;
-            placement.suspended      = false;
-            placement.last_active_ms = util::now_ms();
+        auto publish_restored = [&](const NodeId& node_id, const SlotId& slot_id) {
+            if (node_id != placement.node_id) {
+                try {
+                    const auto old_node = registry_.get_node(placement.node_id);
+                    HttpClient old_client(old_node.url);
+                    old_client.set_bearer_token(old_node.api_key);
+                    static_cast<void>(old_client.post(
+                        "/api/node/detach-agent",
+                        nlohmann::json{{"slot_id", placement.slot_id},
+                                       {"agent_id", cfg.id}}));
+                } catch (const std::exception& e) {
+                    MM_WARN("AgentScheduler: restored agent {} on node {} but could "
+                            "not remove its suspended record from node {}: {}",
+                            cfg.id, node_id, placement.node_id, e.what());
+                }
+            }
+            placement.node_id = node_id;
+            placement.slot_id = slot_id;
+            placement.suspended = false;
+            placement.placed_at_ms = util::now_ms();
+            placement.last_active_ms = placement.placed_at_ms;
             placement.engine_fingerprint = desired_fingerprint;
+            placement.kv_cache_node_path.clear();
             store_placement(placement);
             return ScheduleResult{node_id, slot_id};
         };
 
-        // Try restore on same node first.
         auto slot_id = restore_agent_on_node(placement, cfg, placement.node_id);
         if (slot_id) {
             MM_INFO("AgentScheduler: restored agent {} on original node {}",
                     cfg.id, placement.node_id);
-            return restored(placement.node_id, *slot_id);
+            return publish_restored(placement.node_id, *slot_id);
         }
 
-        // Same node didn't work — try suspending an idle agent there first.
-        auto lru = find_lru_idle_agent(placement.node_id);
-        if (lru && *lru != cfg.id) {
-            suspend_agent(*lru);
+        for (const auto& candidate_id : lru_idle_agents(placement.node_id)) {
+            if (candidate_id == cfg.id || !suspend_agent(candidate_id)) continue;
             slot_id = restore_agent_on_node(placement, cfg, placement.node_id);
             if (slot_id) {
-                return restored(placement.node_id, *slot_id);
+                return publish_restored(placement.node_id, *slot_id);
             }
         }
 
-        // Try other nodes.
-        for (const auto& node : registry_.available_nodes()) {
+        for (const auto& node : registry_.nodes_with_available_vram(vram_needed)) {
             if (node.id == placement.node_id) continue;
             slot_id = restore_agent_on_node(placement, cfg, node.id);
-            if (slot_id) {
-                return restored(node.id, *slot_id);
-            }
+            if (slot_id) return publish_restored(node.id, *slot_id);
         }
     }
 
-    // 3. No placement — find a node.
-    auto place = [&](const NodeId& node_id, const SlotId& slot_id) {
-        AgentPlacement p;
-        p.agent_id       = cfg.id;
-        p.node_id        = node_id;
-        p.slot_id        = slot_id;
-        p.placed_at_ms   = util::now_ms();
-        p.last_active_ms = p.placed_at_ms;
-        p.engine_fingerprint = desired_fingerprint;
-        store_placement(p);
+    auto publish_new = [&](const NodeId& node_id, const SlotId& slot_id) {
+        AgentPlacement placement;
+        placement.agent_id = cfg.id;
+        placement.node_id = node_id;
+        placement.slot_id = slot_id;
+        placement.placed_at_ms = util::now_ms();
+        placement.last_active_ms = placement.placed_at_ms;
+        placement.engine_fingerprint = desired_fingerprint;
+        store_placement(placement);
         return ScheduleResult{node_id, slot_id};
     };
+
     std::unordered_set<NodeId> attempted_nodes;
-    auto try_load_on_node = [&](const NodeId& node_id) -> std::optional<SlotId> {
-        if (node_id.empty()) return std::nullopt;
-        if (!attempted_nodes.insert(node_id).second) return std::nullopt;
+    auto try_load = [&](const NodeId& node_id) -> std::optional<SlotId> {
+        if (node_id.empty() || !attempted_nodes.insert(node_id).second) {
+            return std::nullopt;
+        }
         auto slot_id = load_agent_on_node(cfg, node_id);
         if (!slot_id) {
-            MM_WARN("AgentScheduler: node {} could not run agent {}; trying another candidate if available",
-                    node_id, cfg.id);
+            MM_WARN("AgentScheduler: node {} could not run agent {}; "
+                    "trying another candidate", node_id, cfg.id);
         }
         return slot_id;
     };
 
-    // 3a. Preferred node has model stored + VRAM?
     if (!cfg.preferred_node_id.empty()) {
-        auto slot_id = try_load_on_node(cfg.preferred_node_id);
-        if (slot_id) {
-            return place(cfg.preferred_node_id, *slot_id);
+        if (const auto slot_id = try_load(cfg.preferred_node_id)) {
+            return publish_new(cfg.preferred_node_id, *slot_id);
         }
     }
 
-    // 3a'. Shared engine: another agent already runs this model on some node —
-    // join its engine instead of loading a fresh copy, preferring the least
-    // loaded engine (vLLM /metrics: waiting, then running, then KV pressure).
-    // The node only attaches when launch settings are actually compatible, so
-    // a mismatch simply falls through to a fresh load there.
-    {
-        struct EngineCandidate {
-            NodeId node_id;
-            int    waiting  = 0;
-            int    running  = 0;
-            double kv_usage = 0.0;
-
-            bool operator<(const EngineCandidate& o) const {
-                return std::tie(waiting, running, kv_usage)
-                     < std::tie(o.waiting, o.running, o.kv_usage);
+    struct SharedCandidate {
+        NodeId node_id;
+        size_t attached_agents = 0;
+        int64_t last_active_ms = 0;
+    };
+    std::vector<SharedCandidate> shared_candidates;
+    for (const auto& node : registry_.available_nodes()) {
+        if (attempted_nodes.count(node.id)) continue;
+        std::optional<SharedCandidate> best;
+        for (const auto& slot : node.slots) {
+            if (slot.state != SlotState::Ready || slot.backend != "llama-cpp") continue;
+            if (!same_model_reference(slot.model_path, cfg.model_path)) continue;
+            if (slot.vision_enabled != cfg.vision_settings.enabled) continue;
+            if (cfg.vision_settings.enabled) {
+                const std::string requested = util::to_lower(
+                    std::filesystem::path(cfg.vision_settings.mmproj_path)
+                        .filename().string());
+                const std::string loaded = util::to_lower(
+                    std::filesystem::path(slot.mmproj_path).filename().string());
+                if (requested.empty() || requested != loaded) continue;
             }
-        };
-        std::vector<EngineCandidate> engine_nodes;
-        for (const auto& node : registry_.available_nodes()) {
-            if (node.id == cfg.preferred_node_id) continue; // already tried
-            std::optional<EngineCandidate> best;
-            for (const auto& s : node.slots) {
-                if (s.state != SlotState::Ready) continue;
-                if (s.model_path != cfg.model_path) continue;
-                if (engine_backend_from_string(s.backend) !=
-                    engine_backend_from_string(cfg.inference_backend)) continue;
-                if (s.vision_enabled != cfg.vision_settings.enabled) continue;
-                if (cfg.vision_settings.enabled &&
-                    engine_backend_from_string(cfg.inference_backend) ==
-                        EngineBackend::LlamaCpp) {
-                    const std::string requested_projector = util::to_lower(
-                        std::filesystem::path(cfg.vision_settings.mmproj_path)
-                            .filename().string());
-                    const std::string slot_projector = util::to_lower(
-                        std::filesystem::path(s.mmproj_path).filename().string());
-                    if (requested_projector.empty() ||
-                        requested_projector != slot_projector) continue;
-                }
-                EngineCandidate c{node.id, s.num_requests_waiting,
-                                  s.num_requests_running, s.kv_cache_usage};
-                if (!best || c < *best) best = c;
+            SharedCandidate candidate{
+                node.id, slot.agent_ids.size(), slot.last_active_ms};
+            if (!best ||
+                std::tie(candidate.attached_agents, candidate.last_active_ms)
+                    < std::tie(best->attached_agents, best->last_active_ms)) {
+                best = candidate;
             }
-            if (best) engine_nodes.push_back(*best);
         }
-        std::sort(engine_nodes.begin(), engine_nodes.end());
-        for (const auto& cand : engine_nodes) {
-            auto slot_id = try_load_on_node(cand.node_id);
-            if (slot_id) {
-                MM_INFO("AgentScheduler: agent {} joining existing vLLM engine "
-                        "for {} on node {} (waiting={}, running={})",
-                        cfg.id, cfg.model_path, cand.node_id,
-                        cand.waiting, cand.running);
-                return place(cand.node_id, *slot_id);
-            }
+        if (best) shared_candidates.push_back(*best);
+    }
+    std::sort(shared_candidates.begin(), shared_candidates.end(),
+              [](const SharedCandidate& lhs, const SharedCandidate& rhs) {
+                  return std::tie(lhs.attached_agents, lhs.last_active_ms)
+                       < std::tie(rhs.attached_agents, rhs.last_active_ms);
+              });
+    for (const auto& candidate : shared_candidates) {
+        if (const auto slot_id = try_load(candidate.node_id)) {
+            MM_INFO("AgentScheduler: agent {} joined a compatible llama.cpp "
+                    "engine for {} on node {}", cfg.id, cfg.model_path,
+                    candidate.node_id);
+            return publish_new(candidate.node_id, *slot_id);
         }
     }
 
-    // 3b. Prefer a node that already has this model in its HF cache — avoids a
-    // fresh multi-GB download. Only meaningful for HF repo ids; local-dir refs
-    // are assumed present wherever they resolve.
-    if (util::is_hf_repo_id(cfg.model_path)) {
-        for (const auto& node : registry_.nodes_with_model_cached(cfg.model_path)) {
-            auto slot_id = try_load_on_node(node.id);
-            if (slot_id) {
-                MM_INFO("AgentScheduler: placed agent {} on node {} which already "
-                        "caches {}", cfg.id, node.id, cfg.model_path);
-                return place(node.id, *slot_id);
-            }
+    for (const auto& node : registry_.nodes_with_available_vram(vram_needed)) {
+        if (const auto slot_id = try_load(node.id)) {
+            return publish_new(node.id, *slot_id);
         }
     }
 
-    // 3c. Any node has VRAM -> try load (the node makes the final budget call).
-    auto vram_nodes = registry_.nodes_with_available_vram(vram_needed);
-    for (const auto& node : vram_nodes) {
-        auto slot_id = try_load_on_node(node.id);
-        if (slot_id) {
-            return place(node.id, *slot_id);
+    for (const auto& candidate_id : lru_idle_agents()) {
+        if (candidate_id == cfg.id) continue;
+        const auto candidate = find_placement_copy(candidate_id);
+        if (!candidate || candidate->suspended || candidate->is_active
+            || !suspend_agent(candidate_id)) {
+            continue;
+        }
+        if (const auto slot_id = load_agent_on_node(cfg, candidate->node_id)) {
+            return publish_new(candidate->node_id, *slot_id);
         }
     }
 
-    // 3d. No VRAM anywhere → suspend LRU idle agent, retry.
-    auto lru = find_lru_idle_agent();
-    if (lru && *lru != cfg.id) {
-        auto lru_placement = find_placement_copy(*lru);
-        if (lru_placement) {
-            suspend_agent(*lru);
-
-            // Retry on the freed node.
-            auto slot_id = load_agent_on_node(cfg, lru_placement->node_id);
-            if (slot_id) {
-                return place(lru_placement->node_id, *slot_id);
-            }
-        }
-    }
-
-    // 3e. All nodes full, no idle agents — return nullopt.
     MM_WARN("AgentScheduler: no capacity for agent {} (model={})",
             cfg.id, cfg.model_path);
     if (last_error().empty()) {
@@ -399,430 +532,181 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     return std::nullopt;
 }
 
-std::optional<ScheduleResult> AgentScheduler::ensure_engine_group_running(
-    const AgentConfig& cfg)
-{
-    auto place = [&](const NodeId& node_id, const SlotId& slot_id) {
-        AgentPlacement p;
-        p.agent_id       = cfg.id;
-        p.node_id        = node_id;
-        p.slot_id        = slot_id;
-        p.placed_at_ms   = util::now_ms();
-        p.last_active_ms = p.placed_at_ms;
-        p.engine_fingerprint = engine_fingerprint(cfg);
-        store_placement(p);
-        return ScheduleResult{node_id, slot_id};
-    };
-    auto preview = [](std::string body) {
-        if (body.size() > 300) body = body.substr(0, 300) + "...";
-        return body;
-    };
-
-    // A suspended placement is meaningless for a group engine (vLLM restores
-    // are fresh starts) — drop it and place from scratch.
-    erase_placement_entry(cfg.id);
-
-    // 1. A live group already serves this model — join it on the head. The
-    // node attaches when the request matches the engine's launch settings, so
-    // we send the group's planned split, not the agent's own tp/pp ask.
-    std::vector<EngineGroupRecord> live_groups;
-    {
-        std::lock_guard g(state_mutex_);
-        for (const auto& [slot, rec] : engine_groups_) {
-            if (rec.model_path == cfg.model_path) live_groups.push_back(rec);
-        }
-    }
-    for (const auto& rec : live_groups) {
-        auto slot_id = load_agent_on_node(cfg, rec.head_node,
-                                          &rec.effective_settings);
-        if (slot_id) {
-            MM_INFO("AgentScheduler: agent {} joined live engine group on head {} "
-                    "(slot={})", cfg.id, rec.head_node, *slot_id);
-            return place(rec.head_node, *slot_id);
-        }
-    }
-
-    // 2. Plan a group from advertised node capabilities.
-    EngineGroupRequest greq;
-    greq.model_path = cfg.model_path;
-    greq.world_size = std::max(1, cfg.vllm_settings.tensor_parallel_size) *
-                      std::max(1, cfg.vllm_settings.pipeline_parallel_size);
-    auto group = best_engine_group(greq, registry_.available_nodes());
-    if (!group) {
-        set_last_error("no feasible multi-node engine group: need world_size " +
-                       std::to_string(greq.world_size) +
-                       " across Ray-capable nodes sharing a vLLM build");
-        return std::nullopt;
-    }
-
-    const VllmSettings effective = apply_group_plan(*group, cfg.vllm_settings);
-    const NodeId head = group->nodes.front();
-
-    MM_INFO("AgentScheduler: agent {} needs engine group for {} — {} node(s), "
-            "tp={}, pp={}, backend={}, nodes=[{}]",
-            cfg.id, cfg.model_path, group->pipeline_parallel_size,
-            group->tensor_parallel_size, group->pipeline_parallel_size,
-            group->comm_backend, util::join(group->nodes, ","));
-
-    // 3. The planned world fits on one node — no Ray, just a plain engine
-    // load with the planned split (tp = all its GPUs, pp = 1).
-    if (!group->spans_nodes()) {
-        auto slot_id = load_agent_on_node(cfg, head, &effective);
-        if (!slot_id) return std::nullopt;  // load_agent_on_node set last_error
-        return place(head, *slot_id);
-    }
-
-    // 4. Start Ray: head first, workers join its GCS address.
-    std::vector<NodeId> ray_started;
-    std::string head_address;
-    try {
-        auto head_node = registry_.get_node(head);
-        HttpClient cli(head_node.url);
-        cli.set_bearer_token(head_node.api_key);
-        cli.set_timeouts(5, 120, 30);
-        auto resp = cli.post("/api/node/ray/start",
-                             nlohmann::json{{"role", "head"}});
-        if (!resp.ok()) {
-            set_last_error("ray head start failed on node " + head + " (HTTP " +
-                           std::to_string(resp.status) + "): " + preview(resp.body));
-            return std::nullopt;
-        }
-        ray_started.push_back(head);
-        int gcs_port = 6379;
-        try {
-            gcs_port = nlohmann::json::parse(resp.body).value("port", 6379);
-        } catch (const std::exception&) {
-            // Older node build without the port field — default GCS port.
-        }
-        head_address = derive_ray_head_address(head_node.url, gcs_port);
-    } catch (const std::exception& e) {
-        set_last_error("ray head start exception on node " + head + ": " + e.what());
-        teardown_ray_members(ray_started);
-        return std::nullopt;
-    }
-    if (head_address.empty()) {
-        set_last_error("could not derive a Ray head address from node URL for " + head);
-        teardown_ray_members(ray_started);
-        return std::nullopt;
-    }
-
-    for (size_t i = 1; i < group->nodes.size(); ++i) {
-        const NodeId& member = group->nodes[i];
-        try {
-            auto node = registry_.get_node(member);
-            HttpClient cli(node.url);
-            cli.set_bearer_token(node.api_key);
-            cli.set_timeouts(5, 120, 30);
-            auto resp = cli.post("/api/node/ray/start",
-                                 nlohmann::json{{"role", "worker"},
-                                                {"head_address", head_address}});
-            if (!resp.ok()) {
-                set_last_error("ray worker start failed on node " + member +
-                               " (HTTP " + std::to_string(resp.status) + "): " +
-                               preview(resp.body));
-                teardown_ray_members(ray_started);
-                return std::nullopt;
-            }
-            ray_started.push_back(member);
-        } catch (const std::exception& e) {
-            set_last_error("ray worker start exception on node " + member + ": " +
-                           e.what());
-            teardown_ray_members(ray_started);
-            return std::nullopt;
-        }
-    }
-
-    // 5. Launch the engine on the head — vLLM discovers the Ray cluster and
-    // spreads pipeline stages across the workers.
-    auto slot_id = load_agent_on_node(cfg, head, &effective);
-    if (!slot_id) {
-        teardown_ray_members(ray_started);
-        return std::nullopt;  // load_agent_on_node set last_error
-    }
-
-    EngineGroupRecord rec;
-    rec.head_node          = head;
-    rec.head_slot          = *slot_id;
-    rec.members            = group->nodes;
-    rec.comm_backend       = group->comm_backend;
-    rec.model_path         = cfg.model_path;
-    rec.effective_settings = effective;
-    {
-        std::lock_guard g(state_mutex_);
-        engine_groups_[*slot_id] = rec;
-    }
-
-    MM_INFO("AgentScheduler: engine group live for {} — head {} slot {} over {} "
-            "node(s) via {}", cfg.model_path, head, *slot_id,
-            group->nodes.size(), group->comm_backend);
-    return place(head, *slot_id);
-}
-
-std::optional<EngineGroupRecord> AgentScheduler::find_group_by_slot(
-    const SlotId& slot_id) const
-{
-    std::lock_guard g(state_mutex_);
-    auto it = engine_groups_.find(slot_id);
-    if (it == engine_groups_.end()) return std::nullopt;
-    return it->second;
-}
-
-void AgentScheduler::teardown_ray_members(const std::vector<NodeId>& members) {
-    for (const auto& member : members) {
-        try {
-            auto node = registry_.get_node(member);
-            HttpClient cli(node.url);
-            cli.set_bearer_token(node.api_key);
-            cli.set_timeouts(5, 60, 30);
-            auto resp = cli.post("/api/node/ray/stop", nlohmann::json::object());
-            if (!resp.ok()) {
-                MM_WARN("AgentScheduler: ray stop failed on node {} (HTTP {})",
-                        member, resp.status);
-            }
-        } catch (const std::exception& e) {
-            MM_WARN("AgentScheduler: ray stop failed on node {}: {}",
-                    member, e.what());
-        }
-    }
-}
-
-void AgentScheduler::teardown_engine_group_for_slot(const SlotId& slot_id) {
-    std::optional<EngineGroupRecord> rec;
-    {
-        std::lock_guard g(state_mutex_);
-        auto it = engine_groups_.find(slot_id);
-        if (it == engine_groups_.end()) return;
-        rec = it->second;
-        engine_groups_.erase(it);
-    }
-    MM_INFO("AgentScheduler: engine group on head {} (slot {}) is gone — "
-            "stopping Ray on {} member(s)",
-            rec->head_node, slot_id, rec->members.size());
-    teardown_ray_members(rec->members);
-}
-
 void AgentScheduler::release_agent(const AgentId& agent_id) {
     std::optional<AgentPlacement> placement;
-
     {
-        // Serialize against scheduling so a release cannot interleave with an
-        // in-flight placement decision for the same agent.
-        std::lock_guard lock(schedule_mutex_);
+        std::lock_guard schedule_lock(schedule_mutex_);
         placement = find_placement_copy(agent_id);
         if (!placement) return;
         erase_placement_entry(agent_id);
     }
 
-    if (placement && !placement->suspended) {
-        // Detach from the slot on the node; the node unloads the engine only
-        // when this was the last attached agent.
-        try {
-            auto node = registry_.get_node(placement->node_id);
-            HttpClient cli(node.url);
-            cli.set_bearer_token(node.api_key);
-            auto resp = cli.post("/api/node/detach-agent",
-                                 nlohmann::json{{"slot_id", placement->slot_id},
-                                                {"agent_id", agent_id}});
-            // Last agent gone and the engine unloaded → if it headed a
-            // multi-node group, stop Ray on the members too.
-            if (resp.ok() &&
-                nlohmann::json::parse(resp.body).value("unloaded", false)) {
-                teardown_engine_group_for_slot(placement->slot_id);
-            }
-        } catch (const std::exception& e) {
-            MM_WARN("AgentScheduler: failed to detach slot for agent {}: {}",
-                    agent_id, e.what());
-        }
-    }
-
+    detach_placement_best_effort(*placement, agent_id, "placement released");
     MM_INFO("AgentScheduler: released agent {}", agent_id);
 }
 
 void AgentScheduler::mark_agent_idle(const AgentId& agent_id) {
-    mutate_placement(agent_id, [](AgentPlacement& p) {
-        p.is_active      = false;
-        p.last_active_ms = util::now_ms();
+    mutate_placement(agent_id, [](AgentPlacement& placement) {
+        placement.is_active = false;
+        placement.last_active_ms = util::now_ms();
     });
 }
 
 void AgentScheduler::mark_agent_active(const AgentId& agent_id) {
-    mutate_placement(agent_id, [](AgentPlacement& p) {
-        p.is_active      = true;
-        p.last_active_ms = util::now_ms();
+    mutate_placement(agent_id, [](AgentPlacement& placement) {
+        placement.is_active = true;
+        placement.last_active_ms = util::now_ms();
     });
 }
 
 std::optional<AgentPlacement> AgentScheduler::get_placement(
-    const AgentId& agent_id) const
-{
+    const AgentId& agent_id) const {
     return find_placement_copy(agent_id);
 }
 
 std::vector<AgentPlacement> AgentScheduler::list_placements() const {
-    std::lock_guard lock(state_mutex_);
-    std::vector<AgentPlacement> out;
-    out.reserve(placements_.size());
-    for (const auto& [_, p] : placements_)
-        out.push_back(p);
-    return out;
+    std::lock_guard state_lock(state_mutex_);
+    std::vector<AgentPlacement> result;
+    result.reserve(placements_.size());
+    for (const auto& [_, placement] : placements_) result.push_back(placement);
+    return result;
 }
 
 std::string AgentScheduler::last_error() const {
-    std::lock_guard lock(state_mutex_);
+    std::lock_guard state_lock(state_mutex_);
     return last_error_;
 }
 
 std::optional<AgentPlacement> AgentScheduler::find_placement_copy(
-    const AgentId& id) const
-{
-    std::lock_guard lock(state_mutex_);
-    auto it = placements_.find(id);
+    const AgentId& id) const {
+    std::lock_guard state_lock(state_mutex_);
+    const auto it = placements_.find(id);
     if (it == placements_.end()) return std::nullopt;
     return it->second;
 }
 
-void AgentScheduler::store_placement(const AgentPlacement& p) {
-    std::lock_guard lock(state_mutex_);
-    placements_[p.agent_id] = p;
+void AgentScheduler::store_placement(const AgentPlacement& placement) {
+    std::lock_guard state_lock(state_mutex_);
+    placements_[placement.agent_id] = placement;
 }
 
 bool AgentScheduler::erase_placement_entry(const AgentId& id) {
-    std::lock_guard lock(state_mutex_);
+    std::lock_guard state_lock(state_mutex_);
     return placements_.erase(id) > 0;
 }
 
-void AgentScheduler::set_last_error(const std::string& err) {
-    std::lock_guard lock(state_mutex_);
-    last_error_ = err;
+void AgentScheduler::set_last_error(const std::string& error) {
+    std::lock_guard state_lock(state_mutex_);
+    last_error_ = error;
+}
+
+void AgentScheduler::detach_placement_best_effort(
+    const AgentPlacement& placement,
+    const AgentId& agent_id,
+    const std::string& reason) {
+    try {
+        const auto node = registry_.get_node(placement.node_id);
+        HttpClient client(node.url);
+        client.set_bearer_token(node.api_key);
+        const auto response = client.post(
+            "/api/node/detach-agent",
+            nlohmann::json{{"slot_id", placement.slot_id},
+                           {"agent_id", agent_id}});
+        if (!response.ok()) {
+            MM_WARN("AgentScheduler: node {} rejected detach for agent {} "
+                    "({}; HTTP {})", placement.node_id, agent_id, reason,
+                    response.status);
+        }
+    } catch (const std::exception& e) {
+        MM_WARN("AgentScheduler: failed to detach slot for agent {} ({}): {}",
+                agent_id, reason, e.what());
+    }
 }
 
 void AgentScheduler::housekeeping(const std::vector<AgentConfig>& active_agents) {
-    struct PendingUnload {
+    struct PendingDetach {
         AgentId agent_id;
         NodeId node_id;
         SlotId slot_id;
     };
-    std::vector<PendingUnload> unloads;
+    std::vector<PendingDetach> detaches;
 
     {
-        // Serialize against scheduling; the map work itself is brief.
-        std::lock_guard sched(schedule_mutex_);
-        std::lock_guard state(state_mutex_);
+        std::lock_guard schedule_lock(schedule_mutex_);
+        std::lock_guard state_lock(state_mutex_);
 
-        // Build set of active agent IDs.
-        std::unordered_map<std::string, bool> active_ids;
-        for (const auto& a : active_agents)
-            active_ids[a.id] = true;
+        std::unordered_set<AgentId> active_ids;
+        active_ids.reserve(active_agents.size());
+        for (const auto& agent : active_agents) active_ids.insert(agent.id);
 
-        // Remove placements for deleted agents.
         for (auto it = placements_.begin(); it != placements_.end();) {
             if (active_ids.count(it->first)) {
                 ++it;
                 continue;
             }
-
-            const auto& id = it->first;
-            const auto& p = it->second;
-            if (!p.suspended) {
-                unloads.push_back(PendingUnload{id, p.node_id, p.slot_id});
-            }
+            detaches.push_back({it->first, it->second.node_id, it->second.slot_id});
             MM_INFO("AgentScheduler: housekeeping removed placement for deleted agent {}",
-                    id);
+                    it->first);
             it = placements_.erase(it);
         }
     }
 
-    for (const auto& unload : unloads) {
+    for (const auto& detach : detaches) {
         try {
-            auto node = registry_.get_node(unload.node_id);
-            HttpClient cli(node.url);
-            cli.set_bearer_token(node.api_key);
-            auto resp = cli.post("/api/node/detach-agent",
-                                 nlohmann::json{{"slot_id", unload.slot_id},
-                                                {"agent_id", unload.agent_id}});
-            if (resp.ok() &&
-                nlohmann::json::parse(resp.body).value("unloaded", false)) {
-                teardown_engine_group_for_slot(unload.slot_id);
+            const auto node = registry_.get_node(detach.node_id);
+            HttpClient client(node.url);
+            client.set_bearer_token(node.api_key);
+            const auto response = client.post(
+                "/api/node/detach-agent",
+                nlohmann::json{{"slot_id", detach.slot_id},
+                               {"agent_id", detach.agent_id}});
+            if (!response.ok()) {
+                MM_WARN("AgentScheduler: housekeeping detach failed for agent {} "
+                        "on node {} (HTTP {})", detach.agent_id, detach.node_id,
+                        response.status);
             }
         } catch (const std::exception& e) {
-            MM_WARN("AgentScheduler: housekeeping failed to detach slot for deleted agent {}: {}",
-                    unload.agent_id, e.what());
+            MM_WARN("AgentScheduler: housekeeping failed to detach deleted agent {}: {}",
+                    detach.agent_id, e.what());
         }
     }
 }
 
-// ── Private helpers ─────────────────────────────────────────────────────────
-
-bool AgentScheduler::is_local_node(const std::string& node_url) {
-    static const std::regex local_re(
-        R"(https?://(127\.0\.0\.1|localhost|::1)(:\d+)?(/.*)?)",
-        std::regex::icase);
-    return std::regex_match(node_url, local_re);
-}
-
-std::optional<NodeInfo> AgentScheduler::find_node_with_vram(
-    int64_t vram_mb, const NodeId& preferred) const
-{
-    auto nodes = registry_.nodes_with_available_vram(vram_mb);
-    if (nodes.empty()) return std::nullopt;
-
-    // Prefer the requested node.
-    if (!preferred.empty()) {
-        for (const auto& n : nodes) {
-            if (n.id == preferred) return n;
-        }
+std::vector<AgentId> AgentScheduler::lru_idle_agents(const NodeId& on_node) const {
+    std::lock_guard state_lock(state_mutex_);
+    std::vector<std::pair<AgentId, int64_t>> candidates;
+    for (const auto& [id, placement] : placements_) {
+        if (placement.suspended || placement.is_active) continue;
+        if (!on_node.empty() && placement.node_id != on_node) continue;
+        candidates.emplace_back(id, placement.last_active_ms);
     }
-    return nodes.front();
-}
+    std::sort(candidates.begin(), candidates.end(), [](const auto& lhs, const auto& rhs) {
+        return std::tie(lhs.second, lhs.first) < std::tie(rhs.second, rhs.first);
+    });
 
-std::optional<AgentId> AgentScheduler::find_lru_idle_agent(
-    const NodeId& on_node) const
-{
-    std::lock_guard lock(state_mutex_);
-    int64_t oldest_ms = INT64_MAX;
-    std::optional<AgentId> oldest_id;
-
-    for (const auto& [id, p] : placements_) {
-        if (p.suspended) continue;
-        if (p.is_active) continue;  // skip agents mid-inference
-        if (!on_node.empty() && p.node_id != on_node) continue;
-        if (p.last_active_ms < oldest_ms) {
-            oldest_ms = p.last_active_ms;
-            oldest_id = id;
-        }
-    }
-    return oldest_id;
+    std::vector<AgentId> result;
+    result.reserve(candidates.size());
+    for (auto& [id, _] : candidates) result.push_back(std::move(id));
+    return result;
 }
 
 bool AgentScheduler::suspend_agent(const AgentId& agent_id) {
-    // Called with schedule_mutex_ held; placement access goes through
-    // state_mutex_ so the node HTTP call below runs without it.
-    auto placement = find_placement_copy(agent_id);
-    if (!placement || placement->suspended)
-        return false;
+    const auto placement = find_placement_copy(agent_id);
+    if (!placement || placement->suspended) return false;
 
-    // Multi-node engines never sleep: vLLM sleep mode does not cover Ray
-    // workers, and a "suspended" group would strand its members. Groups are
-    // released whole, not suspended.
-    if (find_group_by_slot(placement->slot_id)) {
-        MM_INFO("AgentScheduler: not suspending agent {} — slot {} heads a "
-                "multi-node engine group", agent_id, placement->slot_id);
-        return false;
-    }
-
-    // Shared engine: suspending the slot suspends every agent placed on it,
-    // and never while any of them is mid-inference.
     std::vector<AgentId> cohort{agent_id};
     {
-        std::lock_guard lock(state_mutex_);
-        for (const auto& [id, p] : placements_) {
-            if (id == agent_id || p.suspended) continue;
-            if (p.node_id != placement->node_id || p.slot_id != placement->slot_id)
+        std::lock_guard state_lock(state_mutex_);
+        for (const auto& [id, candidate] : placements_) {
+            if (id == agent_id || candidate.suspended) continue;
+            if (candidate.node_id != placement->node_id
+                || candidate.slot_id != placement->slot_id) {
                 continue;
-            if (p.is_active) {
-                MM_INFO("AgentScheduler: not suspending agent {} — slot {} is "
-                        "shared with active agent {}",
-                        agent_id, placement->slot_id, id);
+            }
+            if (candidate.is_active) {
+                MM_INFO("AgentScheduler: not suspending agent {}; slot {} is "
+                        "shared with active agent {}", agent_id,
+                        placement->slot_id, id);
                 return false;
             }
             cohort.push_back(id);
@@ -831,21 +715,22 @@ bool AgentScheduler::suspend_agent(const AgentId& agent_id) {
 
     std::string kv_cache_path;
     try {
-        auto node = registry_.get_node(placement->node_id);
-        HttpClient cli(node.url);
-        cli.set_bearer_token(node.api_key);
-        auto resp = cli.post("/api/node/suspend-slot",
-                             nlohmann::json{{"slot_id", placement->slot_id}});
-        if (resp.ok()) {
-            auto j = nlohmann::json::parse(resp.body);
-            kv_cache_path = j.value("kv_cache_path", std::string{});
-        } else {
-            std::string preview = resp.body;
+        const auto node = registry_.get_node(placement->node_id);
+        HttpClient client(node.url);
+        client.set_bearer_token(node.api_key);
+        const auto response = client.post(
+            "/api/node/suspend-slot",
+            nlohmann::json{{"slot_id", placement->slot_id}});
+        if (!response.ok()) {
+            std::string preview = response.body;
             if (preview.size() > 300) preview = preview.substr(0, 300) + "...";
-            MM_WARN("AgentScheduler: suspend failed for agent {} on node {} (HTTP {}): {}",
-                    agent_id, placement->node_id, resp.status, preview);
+            MM_WARN("AgentScheduler: suspend failed for agent {} on node {} "
+                    "(HTTP {}): {}", agent_id, placement->node_id,
+                    response.status, preview);
             return false;
         }
+        kv_cache_path = nlohmann::json::parse(response.body)
+                            .value("kv_cache_path", std::string{});
     } catch (const std::exception& e) {
         MM_WARN("AgentScheduler: suspend failed for agent {}: {}", agent_id, e.what());
         return false;
@@ -853,18 +738,14 @@ bool AgentScheduler::suspend_agent(const AgentId& agent_id) {
 
     bool updated = false;
     for (const auto& id : cohort) {
-        const bool ok = mutate_placement(id, [&](AgentPlacement& p) {
-            p.suspended = true;
-            p.kv_cache_node_path = kv_cache_path;
+        const bool changed = mutate_placement(id, [&](AgentPlacement& candidate) {
+            candidate.suspended = true;
+            candidate.kv_cache_node_path = kv_cache_path;
         });
-        if (id == agent_id) updated = ok;
+        if (id == agent_id) updated = changed;
     }
-    if (!updated) return false; // released concurrently
+    if (!updated) return false;
 
-    if (cohort.size() > 1) {
-        MM_INFO("AgentScheduler: suspended {} agents sharing slot {} on node {}",
-                cohort.size(), placement->slot_id, placement->node_id);
-    }
     MM_INFO("AgentScheduler: suspended agent {} on node {} (cache={})",
             agent_id, placement->node_id, kv_cache_path);
     return true;
@@ -873,87 +754,59 @@ bool AgentScheduler::suspend_agent(const AgentId& agent_id) {
 std::optional<SlotId> AgentScheduler::restore_agent_on_node(
     const AgentPlacement& placement,
     const AgentConfig& cfg,
-    const NodeId& node_id)
-{
+    const NodeId& node_id) {
     try {
-        auto node = registry_.get_node(node_id);
-        HttpClient cli(node.url);
-        cli.set_bearer_token(node.api_key);
-        std::string effective_model_path = cfg.model_path;
-        std::string effective_mmproj_path = cfg.vision_settings.enabled
-            ? cfg.vision_settings.mmproj_path : std::string{};
-        const bool has_projector = cfg.vision_settings.enabled &&
-            !cfg.vision_settings.mmproj_path.empty();
-        const std::string bundle_id = has_projector ? vision_bundle_id(cfg) : std::string{};
-        const bool pin_on_node = !cfg.preferred_node_id.empty() &&
-                                 cfg.preferred_node_id == node_id;
-        std::error_code ec;
-        if (util::model_ref_is_local_path(cfg.model_path) &&
-            std::filesystem::exists(cfg.model_path, ec)) {
-            std::string transfer_error;
-            auto local = transfer_model_to_node(node, cfg.model_path, pin_on_node,
-                                                false, &transfer_error, bundle_id);
-            if (!local) {
-                set_last_error("failed to transfer model for restore to node " + node_id +
-                               ": " + transfer_error);
+        const auto node = registry_.get_node(node_id);
+        HttpClient client(node.url);
+        client.set_bearer_token(node.api_key);
+        const bool pin = !cfg.preferred_node_id.empty()
+            && cfg.preferred_node_id == node_id;
+        std::string prepare_error;
+        const auto prepared = prepare_model_for_node(
+            node, cfg, models_dir_, pin, false, &prepare_error);
+        if (!prepared) {
+            set_last_error("failed to prepare model for restore on node " + node_id
+                           + ": " + prepare_error);
+            return std::nullopt;
+        }
+
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            nlohmann::json body = {
+                {"model_path", prepared->model_path},
+                {"mmproj_path", prepared->mmproj_path},
+                {"vision_enabled", cfg.vision_settings.enabled},
+                {"runtime_settings", cfg.runtime_settings},
+                {"kv_cache_path", node_id == placement.node_id
+                    ? placement.kv_cache_node_path : std::string{}},
+                {"backend", "llama-cpp"},
+                {"agent_id", cfg.id},
+            };
+            if (!prepared->model_id.empty()) {
+                body["model_id"] = prepared->model_id;
+            }
+            if (!prepared->mmproj_model_id.empty())
+                body["mmproj_model_id"] = prepared->mmproj_model_id;
+            if (!prepared->model_id.empty() || !prepared->mmproj_model_id.empty())
+                body["pin"] = pin;
+
+            const auto response = client.post("/api/node/restore-slot", body);
+            if (response.ok()) {
+                const auto slot_id = nlohmann::json::parse(response.body)
+                                         .value("slot_id", std::string{});
+                if (!slot_id.empty()) return slot_id;
+                set_last_error("restore-slot returned an empty slot_id on node " + node_id);
                 return std::nullopt;
             }
-            effective_model_path = *local;
-        }
-        if (has_projector) {
-            ec.clear();
-            if (std::filesystem::exists(cfg.vision_settings.mmproj_path, ec)) {
-                std::string transfer_error;
-                auto local = transfer_model_to_node(node, cfg.vision_settings.mmproj_path,
-                                                    pin_on_node, false,
-                                                    &transfer_error, bundle_id);
-                if (!local) {
-                    set_last_error("failed to transfer projector for restore to node " + node_id +
-                                   ": " + transfer_error);
-                    return std::nullopt;
-                }
-                effective_mmproj_path = *local;
-            }
-        }
-        for (int attempt = 0; attempt < 3; ++attempt) {
-            const EngineBackend backend =
-                engine_backend_from_string(cfg.inference_backend);
-            nlohmann::json body = {
-                {"model_path",    effective_model_path},
-                {"mmproj_path",   effective_mmproj_path},
-                {"vision_enabled", cfg.vision_settings.enabled},
-                {"vllm_settings", cfg.vllm_settings},
-                {"kv_cache_path", placement.kv_cache_node_path},
-                {"backend",       to_string(backend)},
-                {"agent_id",      cfg.id}
-            };
-            if (backend == EngineBackend::LlamaCpp) {
-                body["runtime_settings"] = cfg.runtime_settings;
+
+            if (response_indicates_capacity_pressure(response.body)) {
+                if (attempt == 0 && evict_slots_on_node(node_id, cfg.id, 1)) continue;
+                if (attempt == 1 && evict_slots_on_node(node_id, cfg.id, -1)) continue;
             }
 
-            auto resp = cli.post("/api/node/restore-slot", body);
-            if (resp.ok()) {
-                auto j = nlohmann::json::parse(resp.body);
-                return j.value("slot_id", std::string{});
-            }
-
-            if (response_indicates_max_slots(resp.body)) {
-                if (attempt == 0 && evict_slots_on_node(node_id, cfg.id, 1)) {
-                    MM_INFO("AgentScheduler: restore-slot hit capacity pressure on node {}; evicted one slot and retrying",
-                            node_id);
-                    continue;
-                }
-                if (attempt == 1 && evict_slots_on_node(node_id, cfg.id, -1)) {
-                    MM_INFO("AgentScheduler: restore-slot still constrained on node {}; evicted remaining slots and retrying",
-                            node_id);
-                    continue;
-                }
-            }
-
-            std::string preview = resp.body;
+            std::string preview = response.body;
             if (preview.size() > 300) preview = preview.substr(0, 300) + "...";
-            set_last_error("restore-slot failed on node " + node_id +
-                           " (HTTP " + std::to_string(resp.status) + "): " + preview);
+            set_last_error("restore-slot failed on node " + node_id + " (HTTP "
+                           + std::to_string(response.status) + "): " + preview);
             return std::nullopt;
         }
     } catch (const std::exception& e) {
@@ -965,160 +818,80 @@ std::optional<SlotId> AgentScheduler::restore_agent_on_node(
 
 std::optional<SlotId> AgentScheduler::load_agent_on_node(
     const AgentConfig& cfg,
-    const NodeId& node_id,
-    const VllmSettings* vllm_override)
-{
+    const NodeId& node_id) {
     try {
-        auto node = registry_.get_node(node_id);
-        HttpClient cli(node.url);
-        cli.set_bearer_token(node.api_key);
+        const auto node = registry_.get_node(node_id);
+        HttpClient client(node.url);
+        client.set_bearer_token(node.api_key);
+        const bool pin = !cfg.preferred_node_id.empty()
+            && cfg.preferred_node_id == node_id;
 
-        // A model given as a control-local path (e.g. a SAMBA share the node
-        // cannot resolve) is transferred to the node's local cache first; the
-        // node then loads from its own copy. Pin it when this node is the
-        // agent's preferred node so the node keeps it across shutdown/eviction.
-        // Done once, before the retry loop (this runs under schedule_mutex_, so
-        // a large transfer serializes scheduling — acceptable for correctness).
-        std::string effective_model_path = cfg.model_path;
-        std::string effective_mmproj_path = cfg.vision_settings.enabled
-            ? cfg.vision_settings.mmproj_path : std::string{};
-        std::string transferred_model_id;
-        const bool has_projector = cfg.vision_settings.enabled &&
-            !cfg.vision_settings.mmproj_path.empty();
-        const std::string bundle_id = has_projector ? vision_bundle_id(cfg) : std::string{};
-        const bool pin_on_node =
-            !cfg.preferred_node_id.empty() && cfg.preferred_node_id == node_id;
-
-        if (util::model_ref_is_local_path(cfg.model_path)) {
-            std::error_code ec;
-            if (std::filesystem::exists(cfg.model_path, ec)) {
-                std::string xfer_err;
-                auto local = transfer_model_to_node(node, cfg.model_path,
-                                                    pin_on_node, /*force=*/false,
-                                                    &xfer_err, bundle_id);
-                if (!local) {
-                    set_last_error("failed to transfer model to node " + node_id +
-                                   ": " + xfer_err);
-                    MM_WARN("AgentScheduler: model transfer to node {} failed: {}",
-                            node_id, xfer_err);
-                    return std::nullopt;
-                }
-                transferred_model_id = bundle_id.empty()
-                    ? util::model_id_from_ref(cfg.model_path) : bundle_id;
-                effective_model_path = *local;
-                MM_INFO("AgentScheduler: transferred model {} to node {} -> {}",
-                        transferred_model_id, node_id, effective_model_path);
-            }
-            // If control cannot see the path either, fall through with the
-            // original ref and let the node resolve (or fail-fast) it.
-        }
-
-        if (has_projector) {
-            std::error_code ec;
-            if (std::filesystem::exists(cfg.vision_settings.mmproj_path, ec)) {
-                std::string xfer_err;
-                auto local = transfer_model_to_node(node,
-                                                    cfg.vision_settings.mmproj_path,
-                                                    pin_on_node, /*force=*/false,
-                                                    &xfer_err, bundle_id);
-                if (!local) {
-                    set_last_error("failed to transfer vision projector to node " + node_id +
-                                   ": " + xfer_err);
-                    return std::nullopt;
-                }
-                effective_mmproj_path = *local;
-                transferred_model_id = bundle_id;
-                MM_INFO("AgentScheduler: transferred model/projector bundle {} to node {}",
-                        bundle_id, node_id);
-            }
-            // An inaccessible path may intentionally be node-local. The node
-            // validates it before launch.
+        std::string prepare_error;
+        auto prepared = prepare_model_for_node(
+            node, cfg, models_dir_, pin, false, &prepare_error);
+        if (!prepared) {
+            set_last_error("failed to prepare model for node " + node_id
+                           + ": " + prepare_error);
+            return std::nullopt;
         }
 
         bool retried_transfer = false;
         for (int attempt = 0; attempt < 3; ++attempt) {
-            const EngineBackend backend =
-                engine_backend_from_string(cfg.inference_backend);
             nlohmann::json body = {
-                {"model_path", effective_model_path},
-                {"mmproj_path", effective_mmproj_path},
+                {"model_path", prepared->model_path},
+                {"mmproj_path", prepared->mmproj_path},
                 {"vision_enabled", cfg.vision_settings.enabled},
-                {"vllm_settings", vllm_override ? *vllm_override
-                                                : cfg.vllm_settings},
-                // Always explicit so a node never has to guess the engine from
-                // its own default.
-                {"backend",    to_string(backend)},
-                {"agent_id",   cfg.id}
+                {"runtime_settings", cfg.runtime_settings},
+                {"backend", "llama-cpp"},
+                {"agent_id", cfg.id},
             };
-            // llama.cpp agents also carry the generation/runtime settings the
-            // node launches llama-server with.
-            if (backend == EngineBackend::LlamaCpp) {
-                body["runtime_settings"] = cfg.runtime_settings;
+            if (!prepared->model_id.empty()) {
+                body["model_id"] = prepared->model_id;
             }
-            if (!transferred_model_id.empty()) {
-                body["model_id"] = transferred_model_id;
-                body["pin"]      = pin_on_node;
-            }
+            if (!prepared->mmproj_model_id.empty())
+                body["mmproj_model_id"] = prepared->mmproj_model_id;
+            if (!prepared->model_id.empty() || !prepared->mmproj_model_id.empty())
+                body["pin"] = pin;
 
-            auto resp = cli.post("/api/node/load-model", body);
-            if (resp.ok()) {
-                auto j = nlohmann::json::parse(resp.body);
-                auto slot_id = j.value("slot_id", std::string{});
+            const auto response = client.post("/api/node/load-model", body);
+            if (response.ok()) {
+                const auto slot_id = nlohmann::json::parse(response.body)
+                                         .value("slot_id", std::string{});
                 if (!slot_id.empty()) {
                     MM_INFO("AgentScheduler: loaded agent {} on node {} (slot={})",
                             cfg.id, node_id, slot_id);
                     return slot_id;
                 }
-                set_last_error("load-model returned success but empty slot_id on node " + node_id);
+                set_last_error("load-model returned an empty slot_id on node " + node_id);
                 return std::nullopt;
             }
 
-            if (response_indicates_max_slots(resp.body)) {
-                if (attempt == 0 && evict_slots_on_node(node_id, cfg.id, 1)) {
-                    MM_INFO("AgentScheduler: load-model hit capacity pressure on node {}; evicted one slot and retrying",
-                            node_id);
-                    continue;
-                }
-                if (attempt == 1 && evict_slots_on_node(node_id, cfg.id, -1)) {
-                    MM_INFO("AgentScheduler: load-model still constrained on node {}; evicted remaining slots and retrying",
-                            node_id);
-                    continue;
-                }
+            if (response_indicates_capacity_pressure(response.body)) {
+                if (attempt == 0 && evict_slots_on_node(node_id, cfg.id, 1)) continue;
+                if (attempt == 1 && evict_slots_on_node(node_id, cfg.id, -1)) continue;
             }
 
-            // The node evicted our transferred model between the transfer and
-            // this load (disk pressure). Re-send it once, forcing past the
-            // idempotency check, and retry the load.
-            if (!transferred_model_id.empty() && !retried_transfer &&
-                (util::to_lower(resp.body).find("model not found on node") !=
-                     std::string::npos ||
-                 util::to_lower(resp.body).find("projector not found on node") !=
-                     std::string::npos)) {
-                std::string xfer_err;
-                auto local = transfer_model_to_node(node, cfg.model_path,
-                                                    pin_on_node, /*force=*/true,
-                                                    &xfer_err, bundle_id);
-                if (local) {
-                    effective_model_path = *local;
-                    if (has_projector) {
-                        auto projector_local = transfer_model_to_node(
-                            node, cfg.vision_settings.mmproj_path,
-                            pin_on_node, /*force=*/true, &xfer_err, bundle_id);
-                        if (!projector_local) continue;
-                        effective_mmproj_path = *projector_local;
-                    }
+            const std::string lower_body = util::to_lower(response.body);
+            const bool model_missing = lower_body.find("model not found on node")
+                    != std::string::npos
+                || lower_body.find("projector not found on node")
+                    != std::string::npos;
+            if ((!prepared->model_id.empty() || !prepared->mmproj_model_id.empty())
+                && !retried_transfer && model_missing) {
+                prepare_error.clear();
+                auto refreshed = prepare_model_for_node(
+                    node, cfg, models_dir_, pin, true, &prepare_error);
+                if (refreshed) {
+                    prepared = std::move(refreshed);
                     retried_transfer = true;
-                    MM_INFO("AgentScheduler: node {} was missing transferred "
-                            "model {}; re-sent and retrying load",
-                            node_id, transferred_model_id);
                     continue;
                 }
             }
 
-            std::string preview = resp.body;
+            std::string preview = response.body;
             if (preview.size() > 300) preview = preview.substr(0, 300) + "...";
-            set_last_error("load-model failed on node " + node_id +
-                           " (HTTP " + std::to_string(resp.status) + "): " + preview);
+            set_last_error("load-model failed on node " + node_id + " (HTTP "
+                           + std::to_string(response.status) + "): " + preview);
             return std::nullopt;
         }
     } catch (const std::exception& e) {
@@ -1128,141 +901,115 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
     return std::nullopt;
 }
 
-bool AgentScheduler::response_indicates_max_slots(const std::string& body) {
-    std::string lower = util::to_lower(body);
+bool AgentScheduler::response_indicates_capacity_pressure(const std::string& body) {
+    const std::string lower = util::to_lower(body);
     return lower.find("max slots reached") != std::string::npos
         || lower.find("max active slots reached") != std::string::npos
         || lower.find("no available ports") != std::string::npos
         || lower.find("out of memory") != std::string::npos
         || lower.find("insufficient memory") != std::string::npos
-        || lower.find("insufficient gpu memory budget") != std::string::npos
-        || lower.find("cuda out of memory") != std::string::npos;
-}
-
-bool AgentScheduler::evict_one_slot_on_node(const NodeId& node_id,
-                                            const AgentId& preserve_agent) {
-    return evict_slots_on_node(node_id, preserve_agent, 1);
+        || lower.find("insufficient vram") != std::string::npos;
 }
 
 bool AgentScheduler::evict_slots_on_node(const NodeId& node_id,
                                          const AgentId& preserve_agent,
                                          int max_to_evict) {
     int evicted = 0;
-    auto can_evict_more = [&]() -> bool {
+    const auto can_evict_more = [&] {
         return max_to_evict < 0 || evicted < max_to_evict;
     };
 
-    // First choice: repeatedly suspend known idle placements on this node.
-    while (can_evict_more()) {
-        auto lru = find_lru_idle_agent(node_id);
-        if (!lru || *lru == preserve_agent) break;
-
-        auto lru_placement = find_placement_copy(*lru);
-        if (!lru_placement) break;
-        if (lru_placement->is_active) break;
-
-        if (!suspend_agent(*lru)) break;
+    for (const auto& candidate_id : lru_idle_agents(node_id)) {
+        if (!can_evict_more()) break;
+        if (candidate_id == preserve_agent) continue;
+        const auto placement = find_placement_copy(candidate_id);
+        if (!placement || placement->suspended || placement->is_active) continue;
+        if (!suspend_agent(candidate_id)) continue;
         ++evicted;
     }
-    if (!can_evict_more()) {
-        return evicted > 0;
-    }
+    if (!can_evict_more()) return evicted > 0;
 
-    // Fallback: unload node-reported slots directly. This handles
-    // orphaned/stale slots that are no longer tracked in placements_.
     try {
-        auto node = registry_.get_node(node_id);
-        HttpClient cli(node.url);
-        cli.set_bearer_token(node.api_key);
+        const auto node = registry_.get_node(node_id);
+        HttpClient client(node.url);
+        client.set_bearer_token(node.api_key);
 
         std::vector<SlotInfo> slots = node.slots;
-        auto status = cli.get("/api/node/status");
+        const auto status = client.get("/api/node/status");
         if (status.ok()) {
             try {
-                auto j = nlohmann::json::parse(status.body);
-                if (j.contains("slots")) {
-                    slots = j["slots"].get<std::vector<SlotInfo>>();
+                const auto body = nlohmann::json::parse(status.body);
+                if (body.contains("slots")) {
+                    slots = body["slots"].get<std::vector<SlotInfo>>();
                 }
             } catch (const std::exception& e) {
-                MM_WARN("AgentScheduler: failed to parse /api/node/status while evicting on {}: {}",
-                        node_id, e.what());
+                MM_WARN("AgentScheduler: failed to parse node status while evicting "
+                        "on {}: {}", node_id, e.what());
             }
         }
 
         std::unordered_set<SlotId> protected_slots;
         {
-            std::lock_guard state(state_mutex_);
-            for (const auto& [agent_id, p] : placements_) {
-                if (p.node_id != node_id) continue;
-                if (p.is_active || (!preserve_agent.empty() && agent_id == preserve_agent)) {
-                    if (!p.slot_id.empty()) protected_slots.insert(p.slot_id);
+            std::lock_guard state_lock(state_mutex_);
+            for (const auto& [agent_id, placement] : placements_) {
+                if (placement.node_id != node_id) continue;
+                if (placement.is_active
+                    || (!preserve_agent.empty() && agent_id == preserve_agent)) {
+                    if (!placement.slot_id.empty()) {
+                        protected_slots.insert(placement.slot_id);
+                    }
                 }
             }
         }
 
         std::vector<SlotInfo> candidates;
-        candidates.reserve(slots.size());
-        for (const auto& s : slots) {
-            if (s.id.empty()) continue;
-            if (s.state == SlotState::Suspended || s.state == SlotState::Empty) continue;
-            if (!preserve_agent.empty()) {
-                if (s.assigned_agent == preserve_agent) continue;
-                if (std::find(s.agent_ids.begin(), s.agent_ids.end(),
-                              preserve_agent) != s.agent_ids.end()) continue;
+        for (const auto& slot : slots) {
+            if (slot.id.empty() || slot.state == SlotState::Suspended
+                || slot.state == SlotState::Empty) {
+                continue;
             }
-            if (protected_slots.find(s.id) != protected_slots.end()) continue;
-            // The engine itself reports in-flight work — never yank it out
-            // from under requests control may not know about.
-            if (s.engine_metrics_valid &&
-                (s.num_requests_running > 0 || s.num_requests_waiting > 0)) continue;
-            // Multi-node engine heads are never evicted to make room for a
-            // single-node load — tearing down an N-node engine to fit one
-            // small model is always a bad trade.
-            if (find_group_by_slot(s.id)) continue;
-            candidates.push_back(s);
+            if (!preserve_agent.empty()
+                && (slot.assigned_agent == preserve_agent
+                    || std::find(slot.agent_ids.begin(), slot.agent_ids.end(),
+                                 preserve_agent) != slot.agent_ids.end())) {
+                continue;
+            }
+            if (protected_slots.count(slot.id)) continue;
+            candidates.push_back(slot);
         }
-
         std::sort(candidates.begin(), candidates.end(),
-                  [](const SlotInfo& a, const SlotInfo& b) {
-                      const int64_t a_ts = a.last_active_ms > 0 ? a.last_active_ms : 0;
-                      const int64_t b_ts = b.last_active_ms > 0 ? b.last_active_ms : 0;
-                      return a_ts < b_ts;
+                  [](const SlotInfo& lhs, const SlotInfo& rhs) {
+                      return lhs.last_active_ms < rhs.last_active_ms;
                   });
 
         for (const auto& candidate : candidates) {
             if (!can_evict_more()) break;
-
-            auto unload = cli.post("/api/node/unload-model",
-                                   nlohmann::json{{"slot_id", candidate.id}});
-            if (!unload.ok()) {
-                MM_WARN("AgentScheduler: failed to unload slot {} on node {} during eviction (HTTP {})",
-                        candidate.id, node_id, unload.status);
+            const auto response = client.post(
+                "/api/node/unload-model",
+                nlohmann::json{{"slot_id", candidate.id}});
+            if (!response.ok()) {
+                MM_WARN("AgentScheduler: failed to unload slot {} on node {} "
+                        "during eviction (HTTP {})", candidate.id, node_id,
+                        response.status);
                 continue;
             }
 
             {
-                std::lock_guard state(state_mutex_);
+                std::lock_guard state_lock(state_mutex_);
                 for (auto it = placements_.begin(); it != placements_.end();) {
-                    const auto& p = it->second;
-                    if (p.node_id == node_id && p.slot_id == candidate.id) {
-                        MM_INFO("AgentScheduler: removed stale placement {} -> {}/{} after direct unload",
-                                it->first, node_id, candidate.id);
+                    if (it->second.node_id == node_id
+                        && it->second.slot_id == candidate.id) {
                         it = placements_.erase(it);
                     } else {
                         ++it;
                     }
                 }
             }
-
-            MM_INFO("AgentScheduler: directly unloaded slot {} on node {} to free capacity",
-                    candidate.id, node_id);
             ++evicted;
+            MM_INFO("AgentScheduler: directly unloaded slot {} on node {} "
+                    "to free capacity", candidate.id, node_id);
         }
 
-        if (evicted > 0) {
-            MM_INFO("AgentScheduler: evicted {} slot(s) on node {} (preserve_agent='{}')",
-                    evicted, node_id, preserve_agent);
-        }
         return evicted > 0;
     } catch (const std::exception& e) {
         MM_WARN("AgentScheduler: eviction fallback failed on node {}: {}",

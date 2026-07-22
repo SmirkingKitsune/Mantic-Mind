@@ -22,10 +22,6 @@ class NodeState;
 class NodeUI {
 public:
     using ForgetPairingCallback = std::function<bool(std::string* out_message)>;
-    // Invoked when the user approves a vLLM update (the Update button or the
-    // update prompt's "Update now"). Must return promptly — the implementation
-    // should run the (slow) install off the UI thread.
-    using RequestVllmUpdateCallback = std::function<void()>;
     // Empty accelerator approves the assessed current-backend action. A value
     // such as vulkan/cpu selects an official release alternative.
     using RequestLlamaUpdateCallback = std::function<void(std::string accelerator)>;
@@ -39,7 +35,6 @@ public:
 
     NodeUI(NodeState& state, uint16_t listen_port,
            ForgetPairingCallback forget_pairing_cb = {},
-           RequestVllmUpdateCallback request_vllm_update_cb = {},
            RequestLlamaUpdateCallback request_llama_update_cb = {},
            RequestLlamaSwitchCallback request_llama_switch_cb = {},
            RequestLlamaRecoveryCallback request_llama_recovery_cb = {});
@@ -58,7 +53,6 @@ private:
     NodeState& state_;
     uint16_t   listen_port_;
     ForgetPairingCallback forget_pairing_cb_;
-    RequestVllmUpdateCallback request_vllm_update_cb_;
     RequestLlamaUpdateCallback request_llama_update_cb_;
     RequestLlamaSwitchCallback request_llama_switch_cb_;
     RequestLlamaRecoveryCallback request_llama_recovery_cb_;

@@ -11,6 +11,7 @@ namespace mm {
 
 class NodeRegistry;
 class AgentManager;
+class AgentScheduler;
 
 // FTXUI-based terminal UI for mantic-mind-control.
 //
@@ -36,6 +37,7 @@ public:
 
     ControlUI(NodeRegistry& registry,
               AgentManager& agents,
+              AgentScheduler& scheduler,
               std::string models_dir,
               std::string control_base_url,
               std::string control_api_token,
@@ -61,6 +63,7 @@ private:
     NodeRegistry& registry_;
     std::string   control_api_token_;
     AgentManager& agents_;
+    AgentScheduler& scheduler_;
     std::string   models_dir_;
     std::string   control_base_url_;
     LocalChatFallback local_chat_fallback_;

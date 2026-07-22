@@ -3,8 +3,6 @@
 #include "common/logger.hpp"
 #include "common/util.hpp"
 #include "node/llama_runtime.hpp"
-#include "node/vllm_provisioner.hpp"  // parse_vllm_install_fraction (shared line parser)
-#include "node/vllm_runtime.hpp"      // current_vllm_platform / current_vllm_arch
 
 #include <nlohmann/json.hpp>
 
@@ -32,6 +30,40 @@ namespace fs = std::filesystem;
 
 namespace mm {
 namespace {
+
+// Best-effort progress extraction from installer output. Prefers an explicit
+// percentage and falls back to an A/B ratio; negative means indeterminate.
+double parse_install_fraction(const std::string& line) {
+    auto is_num = [](char c) { return (c >= '0' && c <= '9') || c == '.'; };
+    auto clamp01 = [](double v) { return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v); };
+
+    if (const size_t p = line.rfind('%'); p != std::string::npos && p > 0) {
+        size_t b = p;
+        while (b > 0 && is_num(line[b - 1])) --b;
+        if (b < p) {
+            try {
+                const double pct = std::stod(line.substr(b, p - b));
+                if (pct >= 0.0 && pct <= 100.0) return clamp01(pct / 100.0);
+            } catch (...) {}
+        }
+    }
+
+    for (size_t slash = line.find('/'); slash != std::string::npos;
+         slash = line.find('/', slash + 1)) {
+        size_t b = slash;
+        while (b > 0 && is_num(line[b - 1])) --b;
+        size_t e = slash + 1;
+        while (e < line.size() && is_num(line[e])) ++e;
+        if (b < slash && slash + 1 < e) {
+            try {
+                const double num = std::stod(line.substr(b, slash - b));
+                const double den = std::stod(line.substr(slash + 1, e - slash - 1));
+                if (den > 0.0 && num >= 0.0 && num <= den) return clamp01(num / den);
+            } catch (...) {}
+        }
+    }
+    return -1.0;
+}
 
 std::string strip_wrapping_quotes(std::string s) {
     s = util::trim(s);
@@ -304,8 +336,8 @@ LlamaProvisionConfig normalized_config(LlamaProvisionConfig cfg) {
     cfg.install_method = normalize_llama_install_method(cfg.install_method);
     cfg.version = util::trim(cfg.version);
     if (cfg.version.empty()) cfg.version = "latest";
-    if (cfg.platform.empty()) cfg.platform = current_vllm_platform();
-    if (cfg.arch.empty()) cfg.arch = current_vllm_arch();
+    if (cfg.platform.empty()) cfg.platform = current_runtime_platform();
+    if (cfg.arch.empty()) cfg.arch = current_runtime_arch();
     cfg.accelerator = util::to_lower(util::trim(cfg.accelerator));
     if (cfg.accelerator.empty()) {
         // Without a live GPU probe, infer only what platform/arch make certain;
@@ -468,7 +500,7 @@ std::string default_capture_output(const std::vector<std::string>& args,
 #endif
     }
     // llama-server historically prints `--version` to stderr, so merge it into
-    // the captured stream instead of discarding it (unlike the vLLM capture).
+    // the captured stream instead of discarding it.
 #ifdef _WIN32
     FILE* f = _popen((cmd + " 2>&1").c_str(), "r");
 #else
@@ -1325,7 +1357,7 @@ void LlamaCppProvisioner::set_log_sink(LogSink sink) { log_sink_ = std::move(sin
 void LlamaCppProvisioner::set_progress_sink(ProgressSink sink) { progress_sink_ = std::move(sink); }
 void LlamaCppProvisioner::set_cancel_check(CancelCheck check) { cancel_check_ = std::move(check); }
 
-void LlamaCppProvisioner::emit_progress(const VllmInstallProgress& p) {
+void LlamaCppProvisioner::emit_progress(const RuntimeInstallProgress& p) {
     if (progress_sink_) progress_sink_(p);
 }
 
@@ -1536,7 +1568,7 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
     set_status(status);
 
     auto finish_progress = [&]() {
-        VllmInstallProgress done;   // active=false
+        RuntimeInstallProgress done;   // active=false
         emit_progress(done);
     };
     auto canceled_status = [&]() {
@@ -1598,7 +1630,7 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
             const LlamaInstallStep& step = plan[static_cast<size_t>(i)];
             if (cancel_check_ && cancel_check_()) return canceled_status();
 
-            VllmInstallProgress prog;
+            RuntimeInstallProgress prog;
             prog.active = true;
             prog.step = i + 1;
             prog.total_steps = total;
@@ -1621,7 +1653,7 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
                 if (log_sink_) log_sink_(line, is_stderr);
                 write_build_log(std::string{is_stderr ? "[stderr] " : "[stdout] "} +
                                 line);
-                const double f = parse_vllm_install_fraction(line);
+                const double f = parse_install_fraction(line);
                 if (f >= 0.0) prog.fraction = f;
                 prog.last_line = line;
                 const std::string trimmed = util::trim(line);

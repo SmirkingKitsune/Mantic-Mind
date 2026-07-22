@@ -12,7 +12,6 @@
 #include "control/agent_manager.hpp"
 #include "control/agent_queue.hpp"
 #include "control/agent_scheduler.hpp"
-#include "control/engine_group_planner.hpp"
 #include "control/control_api_server.hpp"
 #include "control/node_registry.hpp"
 #include "control/performance_tracker.hpp"
@@ -22,12 +21,8 @@
 #include "control/agent_config_validator.hpp"
 #include "node/runtime_process.hpp"
 #include "node/slot_manager.hpp"
-#include "node/vllm_provisioner.hpp"
-#include "node/vllm_runtime.hpp"
 #include "node/llama_runtime.hpp"
 #include "node/llama_cpp_provisioner.hpp"
-#include "node/ray_orchestration.hpp"
-#include "node/hf_cache.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -46,6 +41,7 @@
 
 #include <nlohmann/json.hpp>
 #include <httplib.h>
+#include <SQLiteCpp/SQLiteCpp.h>
 
 namespace {
 
@@ -131,6 +127,65 @@ bool remove_tree(const std::filesystem::path& dir) {
         return false;
     }
     return true;
+}
+
+class ScopedCurrentPath {
+public:
+    explicit ScopedCurrentPath(const std::filesystem::path& path)
+        : original_(std::filesystem::current_path()) {
+        std::filesystem::current_path(path);
+    }
+
+    ScopedCurrentPath(const ScopedCurrentPath&) = delete;
+    ScopedCurrentPath& operator=(const ScopedCurrentPath&) = delete;
+
+    ~ScopedCurrentPath() {
+        std::error_code ec;
+        std::filesystem::current_path(original_, ec);
+    }
+
+private:
+    std::filesystem::path original_;
+};
+
+bool wait_for_test_server(const std::string& url) {
+    mm::HttpClient client(url);
+    for (int i = 0; i < 80; ++i) {
+        if (client.get("/api/node/health").ok()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    }
+    return false;
+}
+
+bool wait_for_registered_node(mm::NodeRegistry& registry,
+                              const mm::NodeId& node_id) {
+    for (int i = 0; i < 80; ++i) {
+        try {
+            if (registry.get_node(node_id).connected) return true;
+        } catch (...) {
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    }
+    return false;
+}
+
+template <typename Predicate>
+bool wait_for_node_snapshot(mm::NodeRegistry& registry,
+                            const mm::NodeId& node_id,
+                            int64_t not_before_ms,
+                            Predicate&& predicate) {
+    for (int i = 0; i < 160; ++i) {
+        try {
+            const auto node = registry.get_node(node_id);
+            if (node.connected && node.last_seen_ms >= not_before_ms &&
+                predicate(node)) {
+                return true;
+            }
+        } catch (...) {
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    return false;
 }
 
 nlohmann::json test_curation_proposal(const std::string& id,
@@ -301,6 +356,7 @@ bool test_agent_api_settings_round_trip_without_key_persistence() {
         cfg.api_settings.chat_completions_path = "/v1/chat/completions";
         cfg.api_settings.api_key = "secret-not-persisted";
         cfg.api_settings.api_key_env = "MANTIC_TEST_API_KEY";
+        cfg.served_model_name = "api-agent-alias";
         cfg.runtime_settings.top_k = 20;
         cfg.runtime_settings.min_p = 0.0f;
         cfg.runtime_settings.presence_penalty = 1.5f;
@@ -324,6 +380,7 @@ bool test_agent_api_settings_round_trip_without_key_persistence() {
         auto loaded = persisted.load_config();
         CHECK(loaded.inference_backend == "api");
         CHECK(loaded.model_path == "frontier-test-model");
+        CHECK(loaded.served_model_name == "api-agent-alias");
         CHECK(loaded.api_settings.base_url == "https://api.openai.com");
         CHECK(loaded.api_settings.chat_completions_path == "/v1/chat/completions");
         CHECK(loaded.api_settings.api_key.empty());
@@ -336,6 +393,48 @@ bool test_agent_api_settings_round_trip_without_key_persistence() {
         nlohmann::json loaded_json = loaded;
         CHECK(loaded_json.dump().find("secret-not-persisted") == std::string::npos);
         CHECK(loaded_json["api_settings"]["api_key_configured"] == false);
+    }
+
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_served_model_name_legacy_compatibility() {
+    nlohmann::json legacy_json = {
+        {"id", "legacy-json-agent"},
+        {"name", "Legacy JSON Agent"},
+        {"model_path", "legacy.gguf"},
+        {"vllm_settings", {{"served_model_name", "legacy-json-alias"}}}
+    };
+    const auto from_legacy_json = legacy_json.get<mm::AgentConfig>();
+    CHECK(from_legacy_json.served_model_name == "legacy-json-alias");
+
+    auto dir = temp_test_dir("legacy-model-alias");
+    std::filesystem::create_directories(dir);
+    {
+        mm::AgentDB db("legacy-db-agent", dir.string());
+        mm::AgentConfig cfg;
+        cfg.id = "legacy-db-agent";
+        cfg.name = "Legacy DB Agent";
+        cfg.model_path = "legacy.gguf";
+        cfg.served_model_name = "modern-alias";
+        db.save_config(cfg);
+    }
+
+    const auto db_path = dir / "agents" / "legacy-db-agent" / "agent.db";
+    {
+        SQLite::Database db(db_path.string(), SQLite::OPEN_READWRITE);
+        db.exec(R"sql(
+            UPDATE agent_config
+               SET served_model_name = '',
+                   vllm_settings_json = '{"served_model_name":"legacy-db-alias"}'
+             WHERE id = 'legacy-db-agent'
+        )sql");
+    }
+    {
+        mm::AgentDB db("legacy-db-agent", dir.string());
+        const auto loaded = db.load_config();
+        CHECK(loaded.served_model_name == "legacy-db-alias");
     }
 
     CHECK(remove_tree(dir));
@@ -379,881 +478,6 @@ bool test_slot_lease_blocks_unload_and_suspend_while_busy() {
     CHECK(unload_after_release.status == mm::SlotOperationStatus::Ok);
 
     CHECK(remove_tree(dir));
-    return true;
-}
-
-bool test_vllm_slot_info_and_suspend_without_kv_cache() {
-    auto dir = temp_test_dir("vllm-slot");
-    mm::SlotManager slots(46120, 46121, 1, "missing-vllm");
-    const auto slot_id = slots.add_ready_test_slot("Qwen/Qwen3-8B",
-                                                   "agent-v");
-
-    auto info = slots.find_slot(slot_id);
-    CHECK(info.has_value());
-
-    nlohmann::json serialized = *info;
-    auto parsed = serialized.get<mm::SlotInfo>();
-    CHECK(parsed.model_path == "Qwen/Qwen3-8B");
-
-    auto suspend = slots.suspend_slot(slot_id);
-    CHECK(suspend.status == mm::SlotOperationStatus::Ok);
-    CHECK(suspend.kv_cache_path.empty());
-
-    auto suspended = slots.find_slot(slot_id);
-    CHECK(suspended.has_value());
-    CHECK(suspended->state == mm::SlotState::Suspended);
-    CHECK(suspended->kv_cache_path.empty());
-
-    CHECK(remove_tree(dir));
-    return true;
-}
-
-bool test_vllm_gpu_budget_accounting() {
-    auto dir = temp_test_dir("vllm-budget");
-    mm::SlotManager slots(46130, 46133, 4, "missing-vllm", 0.80);
-    CHECK(slots.vllm_gpu_budget() == 0.80);
-    CHECK(slots.vllm_gpu_fraction_used() == 0.0);
-
-    // An active vLLM slot holding 0.78 leaves less than the minimum useful
-    // slice (0.05) of the 0.80 budget — the next load must be rejected
-    // before any process spawn is attempted.
-    const auto holder_id = slots.add_ready_test_slot("Qwen/Qwen3-8B",
-                                                     "agent-holder",
-                                                     0.78);
-    CHECK(slots.vllm_gpu_fraction_used() == 0.78);
-
-    auto rejected = slots.load_model("Qwen/Qwen3-4B",
-                                     mm::VllmSettings{},
-                                     "agent-rejected");
-    CHECK(rejected.empty());
-    CHECK(slots.last_error().find("insufficient GPU memory budget")
-          != std::string::npos);
-    CHECK(slots.vllm_gpu_fraction_used() == 0.78);
-
-    // The fraction is informational on the SlotInfo and survives JSON.
-    auto info = slots.find_slot(holder_id);
-    CHECK(info.has_value());
-    nlohmann::json serialized = *info;
-    auto parsed = serialized.get<mm::SlotInfo>();
-    CHECK(parsed.gpu_mem_fraction == 0.78);
-
-    // Suspending the holder releases its claim on the budget.
-    auto suspend = slots.suspend_slot(holder_id);
-    CHECK(suspend.status == mm::SlotOperationStatus::Ok);
-    CHECK(slots.vllm_gpu_fraction_used() == 0.0);
-
-    // A failed load (missing vLLM executable) must release its pending
-    // reservation rather than leak budget.
-    auto failed = slots.load_model("Qwen/Qwen3-4B",
-                                   mm::VllmSettings{},
-                                   "agent-failed");
-    CHECK(failed.empty());
-    CHECK(slots.vllm_gpu_fraction_used() == 0.0);
-
-    CHECK(remove_tree(dir));
-    return true;
-}
-
-bool test_vllm_shared_slot_attach_and_detach() {
-    auto dir = temp_test_dir("vllm-shared");
-    mm::SlotManager slots(46140, 46143, 4, "missing-vllm", 0.90);
-
-    // Agent A's engine is running (test slots carry default launch settings).
-    const auto engine_id = slots.add_ready_test_slot("Qwen/Qwen3-8B",
-                                                     "agent-a",
-                                                     0.45);
-
-    // Agent B requests the same model with compatible launch settings —
-    // attaches to the running engine instead of spawning a second process
-    // (a real spawn of "missing-vllm" would fail).
-    auto shared_id = slots.load_model("Qwen/Qwen3-8B",
-                                      mm::VllmSettings{},
-                                      "agent-b");
-    CHECK(shared_id == engine_id);
-    CHECK(slots.find_slot_by_agent("agent-a").has_value());
-    CHECK(slots.find_slot_by_agent("agent-b").has_value());
-    CHECK(slots.vllm_gpu_fraction_used() == 0.45);  // no new engine
-
-    auto info = slots.find_slot(engine_id);
-    CHECK(info.has_value());
-    CHECK(info->agent_ids.size() == 2);
-    CHECK(info->assigned_agent == "agent-a");
-
-    nlohmann::json serialized = *info;
-    auto parsed = serialized.get<mm::SlotInfo>();
-    CHECK(parsed.agent_ids.size() == 2);
-
-    // Mismatched launch settings must NOT attach — the fresh spawn then
-    // fails on the missing executable, proving no sharing happened.
-    mm::VllmSettings other;
-    other.max_model_len = 8192;
-    auto fresh = slots.load_model("Qwen/Qwen3-8B", other, "agent-c");
-    CHECK(fresh.empty());
-
-    // Detaching one agent keeps the engine up for the other.
-    auto d1 = slots.detach_agent(engine_id, "agent-b");
-    CHECK(d1.ok());
-    CHECK(d1.remaining_agents == 1);
-    CHECK(!d1.unloaded);
-    CHECK(!slots.find_slot_by_agent("agent-b").has_value());
-
-    // Detaching the last agent unloads the engine.
-    auto d2 = slots.detach_agent(engine_id, "agent-a");
-    CHECK(d2.ok());
-    CHECK(d2.remaining_agents == 0);
-    CHECK(d2.unloaded);
-    CHECK(!slots.find_slot(engine_id).has_value());
-
-    CHECK(remove_tree(dir));
-    return true;
-}
-
-bool test_vllm_restore_attaches_and_cleans_suspended_record() {
-    auto dir = temp_test_dir("vllm-restore-attach");
-    mm::SlotManager slots(46150, 46153, 4, "missing-vllm", 0.90);
-
-    // Agent B's old engine was suspended (vLLM: no KV cache survives).
-    const auto old_id = slots.add_ready_test_slot("Qwen/Qwen3-8B",
-                                                  "agent-b",
-                                                  0.45);
-    CHECK(slots.suspend_slot(old_id).ok());
-
-    // Meanwhile agent A's compatible engine is running.
-    const auto engine_id = slots.add_ready_test_slot("Qwen/Qwen3-8B",
-                                                     "agent-a",
-                                                     0.45);
-
-    // Restoring agent B attaches to A's engine and drops B's stale
-    // suspended record.
-    auto restored = slots.restore_slot("Qwen/Qwen3-8B",
-                                       mm::VllmSettings{},
-                                       "agent-b");
-    CHECK(restored == engine_id);
-    CHECK(!slots.find_slot(old_id).has_value());
-
-    auto info = slots.find_slot(engine_id);
-    CHECK(info.has_value());
-    CHECK(info->agent_ids.size() == 2);
-
-    CHECK(remove_tree(dir));
-    return true;
-}
-
-bool has_arg_pair(const std::vector<std::string>& args,
-                  const std::string& flag,
-                  const std::string& value) {
-    for (size_t i = 0; i + 1 < args.size(); ++i) {
-        if (args[i] == flag && args[i + 1] == value) return true;
-    }
-    return false;
-}
-
-bool has_arg(const std::vector<std::string>& args, const std::string& flag) {
-    for (const auto& arg : args) {
-        if (arg == flag) return true;
-    }
-    return false;
-}
-
-bool test_vllm_sleep_fallback_and_dead_wake_cleanup() {
-    auto dir = temp_test_dir("vllm-sleep");
-    mm::SlotManager slots(46160, 46163, 4, "missing-vllm", 0.90);
-
-    // Suspending an unreachable engine falls back to stopping it: state is
-    // Suspended but not sleeping.
-    const auto a = slots.add_ready_test_slot("Qwen/Qwen3-8B", "agent-a", 0.45);
-    auto susp = slots.suspend_slot(a);
-    CHECK(susp.ok());
-    auto info = slots.find_slot(a);
-    CHECK(info.has_value());
-    CHECK(info->state == mm::SlotState::Suspended);
-    CHECK(!info->sleeping);
-
-    // A sleeping engine whose process died: the wake fails, the dead record
-    // is discarded, and the load falls through to a fresh start (which then
-    // fails on the missing executable).
-    const auto b = slots.add_ready_test_slot("Qwen/Qwen3-8B", "agent-b", 0.45);
-    CHECK(slots.mark_test_slot_sleeping(b));
-    auto sleeping_info = slots.find_slot(b);
-    CHECK(sleeping_info.has_value());
-    CHECK(sleeping_info->sleeping);
-    nlohmann::json serialized = *sleeping_info;
-    CHECK(serialized.value("sleeping", false));
-    CHECK(serialized.get<mm::SlotInfo>().sleeping);
-
-    auto loaded = slots.load_model("Qwen/Qwen3-8B", mm::VllmSettings{},
-                                   "agent-c");
-    CHECK(loaded.empty());                   // fresh spawn fails (missing vllm)
-    CHECK(!slots.find_slot(b).has_value());  // dead sleeping record discarded
-    CHECK(slots.vllm_gpu_fraction_used() == 0.0);
-
-    // Sleep mode flag lands in the engine args; disabling removes it.
-    mm::VllmSettings vs;
-    auto args = mm::build_vllm_server_args("Qwen/Qwen3-8B", vs, 8000);
-    CHECK(has_arg(args, "--enable-sleep-mode"));
-    vs.enable_sleep_mode = false;
-    args = mm::build_vllm_server_args("Qwen/Qwen3-8B", vs, 8000);
-    CHECK(!has_arg(args, "--enable-sleep-mode"));
-
-    CHECK(remove_tree(dir));
-    return true;
-}
-
-bool test_vllm_metrics_parse_and_slot_info_round_trip() {
-    const std::string text =
-        "# HELP vllm:num_requests_running Number of requests on GPU.\n"
-        "# TYPE vllm:num_requests_running gauge\n"
-        "vllm:num_requests_running{model_name=\"Qwen/Qwen3-8B\"} 2.0\n"
-        "vllm:num_requests_waiting{model_name=\"Qwen/Qwen3-8B\"} 5.0\n"
-        "vllm:gpu_cache_usage_perc{model_name=\"Qwen/Qwen3-8B\"} 0.42\n"
-        "some_other_metric 7\n";
-    auto m = mm::parse_vllm_metrics_text(text);
-    CHECK(m.valid);
-    CHECK(m.num_requests_running == 2);
-    CHECK(m.num_requests_waiting == 5);
-    CHECK(m.kv_cache_usage > 0.41 && m.kv_cache_usage < 0.43);
-
-    // vLLM v1 renamed the cache metric.
-    auto m_v1 = mm::parse_vllm_metrics_text(
-        "vllm:kv_cache_usage_perc{model_name=\"x\"} 0.9\n");
-    CHECK(m_v1.valid);
-    CHECK(m_v1.kv_cache_usage > 0.89);
-
-    auto m_empty = mm::parse_vllm_metrics_text("# comments only\n");
-    CHECK(!m_empty.valid);
-
-    // Engine load survives the SlotInfo JSON contract node → control.
-    mm::SlotInfo si;
-    si.engine_metrics_valid = true;
-    si.num_requests_running = 3;
-    si.num_requests_waiting = 1;
-    si.kv_cache_usage = 0.5;
-    nlohmann::json j = si;
-    auto parsed = j.get<mm::SlotInfo>();
-    CHECK(parsed.engine_metrics_valid);
-    CHECK(parsed.num_requests_running == 3);
-    CHECK(parsed.num_requests_waiting == 1);
-    CHECK(parsed.kv_cache_usage > 0.49 && parsed.kv_cache_usage < 0.51);
-
-    return true;
-}
-
-namespace {
-mm::NodeInfo make_capable_node(const std::string& id,
-                               const std::string& arch,
-                               const std::string& vllm_version,
-                               int gpu_count,
-                               std::vector<std::string> backends,
-                               bool supports_ray,
-                               double interconnect_gbps = 0.0) {
-    mm::NodeInfo n;
-    n.id = id;
-    n.url = "http://" + id + ":7070";
-    n.connected = true;
-    n.capabilities.arch = arch;
-    n.capabilities.vllm_version = vllm_version;
-    n.capabilities.gpu_count = gpu_count;
-    n.capabilities.comm_backends = std::move(backends);
-    n.capabilities.supports_ray = supports_ray;
-    n.capabilities.interconnect_gbps = interconnect_gbps;
-    return n;
-}
-} // namespace
-
-bool test_engine_group_planner() {
-    using mm::EngineGroupRequest;
-
-    // Two DGX Sparks (aarch64, 1 GPU each, NCCL over 200GbE) form the natural
-    // NCCL pipeline-parallel group for a 2-GPU model.
-    auto spark1 = make_capable_node("spark-1", "aarch64", "0.6.3", 1,
-                                    {"nccl", "gloo"}, true, 200.0);
-    auto spark2 = make_capable_node("spark-2", "aarch64", "0.6.3", 1,
-                                    {"nccl", "gloo"}, true, 200.0);
-    auto nas    = make_capable_node("nas", "x86_64", "0.6.3", 1,
-                                    {"nccl", "gloo"}, true, 10.0);
-
-    {
-        EngineGroupRequest req{"big-model", 2};
-        auto best = mm::best_engine_group(req, {spark1, spark2, nas});
-        CHECK(best.has_value());
-        CHECK(best->comm_backend == "nccl");
-        CHECK(best->pipeline_parallel_size == 2);
-        CHECK(best->tensor_parallel_size == 1);
-        CHECK(best->world_size == 2);
-        // Cross-arch pairing (spark + nas) is never formed: different
-        // fingerprints can't share an engine, so the two Sparks are chosen.
-        CHECK(best->nodes.size() == 2);
-        CHECK((best->nodes[0] == "spark-1" || best->nodes[0] == "spark-2"));
-        CHECK((best->nodes[1] == "spark-1" || best->nodes[1] == "spark-2"));
-    }
-
-    // Spark 2 unavailable: a single remaining Spark can't reach world_size 2.
-    {
-        EngineGroupRequest req{"big-model", 2};
-        auto best = mm::best_engine_group(req, {spark1, nas});
-        CHECK(!best.has_value());
-    }
-
-    // A model that fits on one node yields a single-node (pp=1) plan, so the
-    // caller routes it normally rather than forming a group.
-    {
-        EngineGroupRequest req{"small-model", 1};
-        auto best = mm::best_engine_group(req, {spark1, spark2});
-        CHECK(best.has_value());
-        CHECK(best->pipeline_parallel_size == 1);
-        CHECK(!best->spans_nodes());
-    }
-
-    // Gloo last resort: a pair where one member lacks NCCL forms a Gloo group
-    // only because no all-NCCL pair exists for that fingerprint.
-    {
-        auto win1 = make_capable_node("win-1", "x86_64", "0.6.3", 1,
-                                      {"gloo"}, true, 1.0);
-        auto win2 = make_capable_node("win-2", "x86_64", "0.6.3", 1,
-                                      {"nccl", "gloo"}, true, 1.0);
-        EngineGroupRequest req{"big-model", 2};
-        auto best = mm::best_engine_group(req, {win1, win2});
-        CHECK(best.has_value());
-        CHECK(best->comm_backend == "gloo");
-    }
-
-    // NCCL pair outranks a Gloo pair for the same need.
-    {
-        auto a = make_capable_node("a", "x86_64", "1.0", 1, {"nccl", "gloo"}, true, 100.0);
-        auto b = make_capable_node("b", "x86_64", "1.0", 1, {"nccl", "gloo"}, true, 100.0);
-        auto c = make_capable_node("c", "aarch64", "1.0", 1, {"gloo"}, true, 1.0);
-        auto d = make_capable_node("d", "aarch64", "1.0", 1, {"gloo"}, true, 1.0);
-        EngineGroupRequest req{"big-model", 2};
-        auto ranked = mm::plan_engine_groups(req, {a, b, c, d});
-        CHECK(ranked.size() >= 2);
-        CHECK(ranked.front().valid);
-        CHECK(ranked.front().comm_backend == "nccl");  // NCCL pool wins
-    }
-
-    // A multi-node need where a member lacks Ray is rejected.
-    {
-        auto a = make_capable_node("a", "x86_64", "1.0", 1, {"nccl", "gloo"}, true);
-        auto b = make_capable_node("b", "x86_64", "1.0", 1, {"nccl", "gloo"}, false);
-        EngineGroupRequest req{"big-model", 2};
-        auto best = mm::best_engine_group(req, {a, b});
-        CHECK(!best.has_value());
-    }
-
-    // Nodes with no advertised capabilities (older build) are ignored.
-    {
-        mm::NodeInfo bare;
-        bare.id = "legacy";
-        bare.connected = true;
-        EngineGroupRequest req{"big-model", 1};
-        auto best = mm::best_engine_group(req, {bare});
-        CHECK(!best.has_value());
-    }
-
-    // Capability block survives the node-status JSON round trip.
-    {
-        nlohmann::json j = spark1.capabilities;
-        auto parsed = j.get<mm::NodeCapabilities>();
-        CHECK(parsed.arch == "aarch64");
-        CHECK(parsed.vllm_version == "0.6.3");
-        CHECK(parsed.gpu_count == 1);
-        CHECK(parsed.has_comm_backend("nccl"));
-        CHECK(parsed.supports_ray);
-        CHECK(parsed.interconnect_gbps > 199.0);
-    }
-
-    return true;
-}
-
-bool test_engine_group_launch_helpers() {
-    // Head address derivation: host comes from the node's API URL, port from
-    // the head's advertised GCS port.
-    CHECK(mm::derive_ray_head_address("http://192.168.68.82:7070", 6379)
-          == "192.168.68.82:6379");
-    CHECK(mm::derive_ray_head_address("https://spark1.local:7070/", 6380)
-          == "spark1.local:6380");
-    CHECK(mm::derive_ray_head_address("http://10.0.0.5", 6379)
-          == "10.0.0.5:6379");
-    CHECK(mm::derive_ray_head_address("http://[::1]:7070", 6379)
-          == "[::1]:6379");
-    CHECK(mm::derive_ray_head_address("", 6379).empty());
-    CHECK(mm::derive_ray_head_address("http://", 6379).empty());
-
-    // The planned split overrides the agent's own tp/pp ask; everything else
-    // in the settings is preserved (it keys engine-attach compatibility).
-    mm::EngineGroupCandidate group;
-    group.tensor_parallel_size   = 2;
-    group.pipeline_parallel_size = 3;
-    mm::VllmSettings s;
-    s.tensor_parallel_size   = 1;
-    s.pipeline_parallel_size = 6;
-    s.max_model_len          = 32768;
-    s.dtype                  = "bfloat16";
-    auto effective = mm::apply_group_plan(group, s);
-    CHECK(effective.tensor_parallel_size == 2);
-    CHECK(effective.pipeline_parallel_size == 3);
-    CHECK(effective.max_model_len == 32768);
-    CHECK(effective.dtype == "bfloat16");
-
-    return true;
-}
-
-bool test_hf_cache_helpers() {
-    // Repo-id classification: "org/name" yes, local paths no.
-    CHECK(mm::util::is_hf_repo_id("Qwen/Qwen2.5-0.5B-Instruct"));
-    CHECK(mm::util::is_hf_repo_id("meta-llama/Llama-3.1-8B"));
-    CHECK(!mm::util::is_hf_repo_id("/models/local-dir"));
-    CHECK(!mm::util::is_hf_repo_id("./rel/path"));
-    CHECK(!mm::util::is_hf_repo_id("C:\\models\\x"));
-    CHECK(!mm::util::is_hf_repo_id("bare-name"));
-    CHECK(!mm::util::is_hf_repo_id("a/b/c"));
-
-    // Cache dirname <-> repo id mapping ('/' encoded as '--', literal '-' kept).
-    CHECK(mm::hf_repo_id_from_cache_dirname("models--Qwen--Qwen2.5-0.5B-Instruct")
-          == "Qwen/Qwen2.5-0.5B-Instruct");
-    CHECK(mm::hf_repo_id_from_cache_dirname("models--meta-llama--Llama-3.1-8B")
-          == "meta-llama/Llama-3.1-8B");
-    CHECK(mm::hf_repo_id_from_cache_dirname("datasets--foo--bar").empty());
-
-    // Cache scan over a fake hub directory.
-    auto dir = temp_test_dir("hf-hub");
-    std::filesystem::create_directories(dir / "models--Qwen--Qwen2.5-0.5B-Instruct");
-    std::filesystem::create_directories(dir / "models--meta-llama--Llama-3.1-8B");
-    std::filesystem::create_directories(dir / "datasets--foo--bar");  // ignored
-    {
-        std::ofstream(dir / "version.txt") << "1";  // stray file ignored
-    }
-    auto found = mm::scan_hf_cache_models(dir.string());
-    CHECK(found.size() == 2);
-    CHECK(found[0] == "Qwen/Qwen2.5-0.5B-Instruct");          // sorted
-    CHECK(found[1] == "meta-llama/Llama-3.1-8B");
-    CHECK(mm::scan_hf_cache_models((dir / "does-not-exist").string()).empty());
-
-    // Hub-dir resolution precedence.
-    CHECK(mm::resolve_hf_hub_cache_dir("/cfg", "/env-hub", "/home-hf", "/home") == "/cfg");
-    CHECK(mm::resolve_hf_hub_cache_dir("", "/env-hub", "/home-hf", "/home") == "/env-hub");
-    {
-        auto r = mm::resolve_hf_hub_cache_dir("", "", "/home-hf", "/home");
-        CHECK(r == (std::filesystem::path("/home-hf") / "hub").string());
-    }
-    {
-        auto r = mm::resolve_hf_hub_cache_dir("", "", "", "/home");
-        CHECK(r == (std::filesystem::path("/home") / ".cache" / "huggingface" / "hub").string());
-    }
-
-    // Download args.
-    auto args = mm::build_hf_download_args("Qwen/Qwen2.5-0.5B-Instruct", "/cache");
-    CHECK(args.size() >= 2 && args[0] == "download");
-    CHECK(args[1] == "Qwen/Qwen2.5-0.5B-Instruct");
-    CHECK(has_arg_pair(args, "--cache-dir", "/cache"));
-    auto args_no_cache = mm::build_hf_download_args("Qwen/Qwen2.5-0.5B-Instruct", "");
-    CHECK(!has_arg(args_no_cache, "--cache-dir"));
-
-    // cached_models survives the node-status JSON round trip.
-    mm::NodeInfo n;
-    n.cached_models = {"Qwen/Qwen2.5-0.5B-Instruct", "meta-llama/Llama-3.1-8B"};
-    n.vllm_runtime.status = "ready";
-    n.vllm_runtime.platform = "linux";
-    n.vllm_runtime.method = "auto";
-    n.vllm_runtime.source_repo = mm::kOfficialVllmRepoUrl;
-    n.vllm_runtime.version = "vllm 9.9.9-test";
-    n.vllm_runtime.managed = true;
-    n.vllm_runtime.executable_path = "/tmp/vllm/bin/vllm";
-    n.vllm_runtime.accelerator = "cuda";
-    n.vllm_runtime.latest_version = "9.9.10";
-    n.vllm_runtime.update_available = true;
-    nlohmann::json j = n;
-    auto parsed = j.get<mm::NodeInfo>();
-    CHECK(parsed.cached_models.size() == 2);
-    CHECK(parsed.cached_models[0] == "Qwen/Qwen2.5-0.5B-Instruct");
-    CHECK(parsed.vllm_runtime.status == "ready");
-    CHECK(parsed.vllm_runtime.managed);
-    CHECK(parsed.vllm_runtime.executable_path == "/tmp/vllm/bin/vllm");
-    CHECK(parsed.vllm_runtime.accelerator == "cuda");
-    CHECK(parsed.vllm_runtime.latest_version == "9.9.10");
-    CHECK(parsed.vllm_runtime.update_available);
-
-    // Pre-fetch is Linux-gated; on Windows it refuses cleanly.
-#ifdef _WIN32
-    CHECK(!mm::hf_prefetch_supported());
-    std::string err;
-    CHECK(!mm::hf_download("hf", "Qwen/Qwen2.5-0.5B-Instruct", "", &err));
-    CHECK(!err.empty());
-#else
-    CHECK(mm::hf_prefetch_supported());
-#endif
-
-    CHECK(remove_tree(dir));
-    return true;
-}
-
-bool test_ray_start_args() {
-    // Head node: binds the GCS port and advertises its GPUs.
-    {
-        mm::RayStartConfig cfg;
-        cfg.role = mm::RayRole::Head;
-        cfg.port = 6379;
-        cfg.num_gpus = 2;
-        auto args = mm::build_ray_start_args(cfg);
-        CHECK(!args.empty() && args.front() == "start");
-        CHECK(has_arg(args, "--head"));
-        CHECK(has_arg(args, "--port=6379"));
-        CHECK(has_arg(args, "--num-gpus=2"));
-        CHECK(has_arg(args, "--disable-usage-stats"));
-    }
-
-    // Worker node: connects to the head's address, no --head.
-    {
-        mm::RayStartConfig cfg;
-        cfg.role = mm::RayRole::Worker;
-        cfg.head_address = "10.0.0.1:6379";
-        cfg.num_gpus = 1;
-        auto args = mm::build_ray_start_args(cfg);
-        CHECK(has_arg(args, "--address=10.0.0.1:6379"));
-        CHECK(has_arg(args, "--num-gpus=1"));
-        CHECK(!has_arg(args, "--head"));
-    }
-
-    // num_gpus 0 means "let Ray auto-detect" — flag omitted.
-    {
-        mm::RayStartConfig cfg;
-        cfg.role = mm::RayRole::Head;
-        auto args = mm::build_ray_start_args(cfg);
-        for (const auto& a : args) CHECK(a.rfind("--num-gpus", 0) != 0);
-    }
-
-    // Live orchestration is Linux-only; on Windows it must refuse cleanly.
-#ifdef _WIN32
-    CHECK(!mm::ray_supported());
-    std::string err;
-    mm::RayStartConfig cfg;
-    CHECK(!mm::ray_start(cfg, &err));
-    CHECK(!err.empty());
-#else
-    CHECK(mm::ray_supported());
-#endif
-    return true;
-}
-
-bool test_vllm_runtime_defaults_and_args() {
-    mm::VllmSettings settings;
-    settings.max_model_len = 16384;
-    settings.max_num_seqs = 2;
-    settings.max_num_batched_tokens = 8192;
-    settings.tensor_parallel_size = 2;
-    settings.pipeline_parallel_size = 2;
-    settings.gpu_memory_utilization = 0.8;
-    settings.served_model_name = "agent-qwen";
-    settings.trust_remote_code = true;
-    settings.enable_prefix_caching = true;
-    settings.enable_auto_tool_choice = true;
-    settings.tool_call_parser = "hermes";
-    settings.extra_args = {"--gpu-memory-utilization", "0.7",
-                           "--disable-log-requests"};
-
-    auto args = mm::build_vllm_server_args("Qwen/Qwen3-8B", settings, 8123);
-    CHECK(args.size() >= 2);
-    CHECK(args[0] == "serve");
-    CHECK(args[1] == "Qwen/Qwen3-8B");
-    CHECK(has_arg_pair(args, "--host", "127.0.0.1"));
-    CHECK(has_arg_pair(args, "--port", "8123"));
-    CHECK(has_arg_pair(args, "--max-model-len", "16384"));
-    CHECK(has_arg_pair(args, "--max-num-seqs", "2"));
-    CHECK(has_arg_pair(args, "--max-num-batched-tokens", "8192"));
-    CHECK(has_arg_pair(args, "--tensor-parallel-size", "2"));
-    CHECK(has_arg_pair(args, "--pipeline-parallel-size", "2"));
-    CHECK(!has_arg_pair(args, "--gpu-memory-utilization", "0.8"));
-    CHECK(has_arg_pair(args, "--gpu-memory-utilization", "0.7"));
-    CHECK(has_arg_pair(args, "--served-model-name", "agent-qwen"));
-    CHECK(has_arg(args, "--trust-remote-code"));
-    CHECK(has_arg(args, "--enable-prefix-caching"));
-    CHECK(has_arg(args, "--enable-auto-tool-choice"));
-    CHECK(has_arg_pair(args, "--tool-call-parser", "hermes"));
-    CHECK(has_arg(args, "--disable-log-requests"));
-
-    // GGUF detection (drives the experimental-support advisory at launch).
-    CHECK(mm::model_ref_is_gguf("/models/model.GGUF"));
-    CHECK(!mm::model_ref_is_gguf("/models/model.safetensors"));
-    CHECK(!mm::model_ref_is_gguf(""));
-
-#ifdef _WIN32
-    CHECK(mm::default_vllm_repo_url_for_platform() == mm::kWindowsVllmRepoUrl);
-    CHECK(mm::default_vllm_branch_for_platform() == mm::kWindowsVllmBranch);
-#elif defined(__APPLE__) && defined(__aarch64__)
-    CHECK(mm::default_vllm_repo_url_for_platform() == mm::kMetalVllmRepoUrl);
-    CHECK(mm::default_vllm_branch_for_platform() == "main");
-#else
-    CHECK(mm::default_vllm_repo_url_for_platform() == mm::kOfficialVllmRepoUrl);
-    CHECK(mm::default_vllm_branch_for_platform() == "main");
-#endif
-
-    return true;
-}
-
-bool test_vllm_provisioner_helpers() {
-    CHECK(mm::normalize_vllm_install_method("wheel") == "wheel");
-    CHECK(mm::normalize_vllm_install_method("source") == "source");
-    CHECK(mm::normalize_vllm_install_method("bogus") == "auto");
-
-    CHECK(mm::is_apple_silicon_environment("macos", "aarch64"));
-    CHECK(mm::is_apple_silicon_environment("macos", "arm64"));
-    CHECK(!mm::is_apple_silicon_environment("macos", "x86_64"));
-    CHECK(mm::default_vllm_repo_url_for_environment("windows", "x86_64")
-          == mm::kWindowsVllmRepoUrl);
-    CHECK(mm::default_vllm_repo_url_for_environment("linux", "x86_64")
-          == mm::kOfficialVllmRepoUrl);
-    CHECK(mm::default_vllm_repo_url_for_environment("macos", "aarch64")
-          == mm::kMetalVllmRepoUrl);
-
-    // True when any step's joined argv contains `needle`.
-    auto plan_has = [](const std::vector<mm::VllmInstallStep>& plan,
-                       const std::string& needle) {
-        for (const auto& s : plan) {
-            std::string joined;
-            for (const auto& a : s.argv) { joined += a; joined += ' '; }
-            if (joined.find(needle) != std::string::npos) return true;
-        }
-        return false;
-    };
-
-    auto dir = temp_test_dir("vllm-provisioner");
-    mm::VllmProvisionConfig linux_cfg;
-    linux_cfg.requested_executable = "definitely-missing-vllm-for-test";
-    linux_cfg.provision_dir = dir.string();
-    linux_cfg.platform = "linux";
-    linux_cfg.arch = "x86_64";
-    linux_cfg.install_method = "auto";
-    linux_cfg.package_manager = "uv";  // deterministic plan (don't probe host PATH)
-
-    auto linux_plan = mm::build_vllm_install_plan(linux_cfg);
-    CHECK(plan_has(linux_plan, "uv"));
-    CHECK(plan_has(linux_plan, "pip"));
-    CHECK(plan_has(linux_plan, "install"));
-    CHECK(plan_has(linux_plan, "--torch-backend=auto"));
-    CHECK(plan_has(linux_plan, "vllm"));
-    CHECK(mm::managed_vllm_executable_path(linux_cfg).string().find("bin") !=
-          std::string::npos);
-
-    mm::VllmProvisionConfig mac_cfg = linux_cfg;
-    mac_cfg.platform = "macos";
-    mac_cfg.arch = "aarch64";
-    auto mac_plan = mm::build_vllm_install_plan(mac_cfg);
-    CHECK(plan_has(mac_plan, "vllm-project/vllm-metal"));
-    CHECK(plan_has(mac_plan, "install.sh"));
-
-    bool command_ran = false;
-    mm::VllmCommandRunner runner;
-    runner.run = [&](const std::vector<std::string>&,
-                     const std::filesystem::path&,
-                     const mm::StreamLineCallback&,
-                     const mm::CancelCheckCallback&,
-                     std::string*) {
-        command_ran = true;
-        const auto exe = mm::managed_vllm_executable_path(linux_cfg);
-        std::filesystem::create_directories(exe.parent_path());
-        std::ofstream(exe) << "fake vllm";
-        return 0;
-    };
-    runner.capture_first_line = [&](const std::vector<std::string>& args,
-                                    const std::filesystem::path&) {
-        if (!args.empty() && args.front() == mm::managed_vllm_executable_path(linux_cfg).string())
-            return std::string{"vllm 9.9.9-test"};
-        return std::string{};
-    };
-    mm::VllmProvisioner provisioner(linux_cfg, runner);
-    auto ready = provisioner.ensure_runtime();
-    CHECK(command_ran);
-    CHECK(ready.status == "ready");
-    CHECK(ready.managed);
-    CHECK(ready.executable_path == mm::managed_vllm_executable_path(linux_cfg).string());
-    CHECK(ready.version == "vllm 9.9.9-test");
-    CHECK(mm::vllm_runtime_usable(ready));
-
-    mm::VllmProvisionConfig disabled_cfg = linux_cfg;
-    disabled_cfg.provision_dir = (dir / "disabled").string();
-    disabled_cfg.auto_provision = false;
-    bool disabled_ran = false;
-    mm::VllmCommandRunner disabled_runner;
-    disabled_runner.run = [&](const std::vector<std::string>&,
-                              const std::filesystem::path&,
-                              const mm::StreamLineCallback&,
-                              const mm::CancelCheckCallback&,
-                              std::string*) {
-        disabled_ran = true;
-        return 0;
-    };
-    disabled_runner.capture_first_line = [](const std::vector<std::string>&,
-                                            const std::filesystem::path&) {
-        return std::string{};
-    };
-    mm::VllmProvisioner disabled(disabled_cfg, disabled_runner);
-    auto disabled_status = disabled.ensure_runtime();
-    CHECK(!disabled_ran);
-    CHECK(disabled_status.status == "disabled");
-    CHECK(disabled_status.last_error.find("auto-provisioning is disabled") !=
-          std::string::npos);
-
-    mm::VllmProvisionConfig locked_cfg = linux_cfg;
-    locked_cfg.provision_dir = (dir / "locked").string();
-    std::filesystem::create_directories(
-        std::filesystem::path(locked_cfg.provision_dir) / ".provision.lock");
-    bool locked_ran = false;
-    mm::VllmCommandRunner locked_runner;
-    locked_runner.run = [&](const std::vector<std::string>&,
-                            const std::filesystem::path&,
-                            const mm::StreamLineCallback&,
-                            const mm::CancelCheckCallback&,
-                            std::string*) {
-        locked_ran = true;
-        return 0;
-    };
-    locked_runner.capture_first_line = [](const std::vector<std::string>&,
-                                          const std::filesystem::path&) {
-        return std::string{};
-    };
-    mm::VllmProvisioner locked(locked_cfg, locked_runner);
-    auto locked_status = locked.ensure_runtime();
-    CHECK(!locked_ran);
-    CHECK(locked_status.status == "failed");
-    CHECK(locked_status.last_error.find("already active") != std::string::npos);
-
-    mm::VllmProvisionConfig unsupported_mac = linux_cfg;
-    unsupported_mac.platform = "macos";
-    unsupported_mac.arch = "x86_64";
-    mm::VllmProvisioner mac_provisioner(unsupported_mac, disabled_runner);
-    auto mac_status = mac_provisioner.ensure_runtime();
-    CHECK(mac_status.status == "failed");
-    CHECK(mac_status.last_error.find("Apple Silicon") != std::string::npos);
-
-    CHECK(remove_tree(dir));
-    return true;
-}
-
-bool test_vllm_update_flow() {
-    // Version comparison is numeric, tolerant of tags/suffixes, and never
-    // reports a spurious ordering for unparseable input.
-    CHECK(mm::compare_vllm_versions("0.6.3", "0.6.4") < 0);
-    CHECK(mm::compare_vllm_versions("0.6.4", "0.6.3") > 0);
-    CHECK(mm::compare_vllm_versions("0.6.3", "0.6.3") == 0);
-    CHECK(mm::compare_vllm_versions("v0.6.10", "v0.6.9") > 0);        // numeric, not lexical
-    CHECK(mm::compare_vllm_versions("vllm 0.6.3.dev1+gabc", "0.6.3") == 0);
-    CHECK(mm::compare_vllm_versions("1.0", "0.9.9") > 0);
-    CHECK(mm::compare_vllm_versions("garbage", "0.6.3") == 0);
-
-    // Accelerator-correct build variant per environment.
-    CHECK(mm::detect_vllm_accelerator("macos", "aarch64", false, false) == "metal");
-    CHECK(mm::detect_vllm_accelerator("windows", "x86_64", true, false) == "windows");
-    CHECK(mm::detect_vllm_accelerator("linux", "x86_64", true, false) == "cuda");
-    CHECK(mm::detect_vllm_accelerator("linux", "x86_64", false, true) == "rocm");
-    CHECK(mm::detect_vllm_accelerator("linux", "x86_64", false, false) == "cpu");
-
-    // The Linux plan pins the torch backend from the accelerator.
-    auto plan_has = [](const std::vector<mm::VllmInstallStep>& plan,
-                       const std::string& needle) {
-        for (const auto& s : plan) {
-            std::string joined;
-            for (const auto& a : s.argv) { joined += a; joined += ' '; }
-            if (joined.find(needle) != std::string::npos) return true;
-        }
-        return false;
-    };
-
-    mm::VllmProvisionConfig lc;
-    lc.requested_executable = "definitely-missing-vllm-for-test";
-    lc.provision_dir = temp_test_dir("vllm-update-script").string();
-    lc.platform = "linux";
-    lc.arch = "x86_64";
-    lc.accelerator = "cpu";
-    lc.package_manager = "uv";
-    CHECK(plan_has(mm::build_vllm_install_plan(lc, false), "--torch-backend=cpu"));
-    mm::VllmProvisionConfig lc_cuda = lc;
-    lc_cuda.accelerator = "cuda";
-    CHECK(plan_has(mm::build_vllm_install_plan(lc_cuda, false), "--torch-backend=auto"));
-
-    // An upgrade run forces a wheel reinstall on Windows; a fresh install does not.
-    mm::VllmProvisionConfig wc = lc;
-    wc.platform = "windows";
-    wc.package_manager = "pip";
-    CHECK(plan_has(mm::build_vllm_install_plan(wc, /*upgrade=*/true), "--force-reinstall"));
-    CHECK(!plan_has(mm::build_vllm_install_plan(wc, /*upgrade=*/false), "--force-reinstall"));
-    CHECK(remove_tree(std::filesystem::path(lc.provision_dir)));
-
-    // check_for_update() / update_runtime() with a fully injected runner.
-    auto dir = temp_test_dir("vllm-update-run");
-    mm::VllmProvisionConfig cfg;
-    cfg.requested_executable = "definitely-missing-vllm-for-test";
-    cfg.provision_dir = dir.string();
-    cfg.platform = "linux";
-    cfg.arch = "x86_64";
-    cfg.accelerator = "cuda";
-    cfg.package_manager = "pip";  // deterministic step count
-
-    int run_count = 0;
-    std::string latest = "0.6.4";
-    mm::VllmCommandRunner runner;
-    runner.run = [&](const std::vector<std::string>&,
-                     const std::filesystem::path&,
-                     const mm::StreamLineCallback&,
-                     const mm::CancelCheckCallback&,
-                     std::string*) {
-        ++run_count;
-        const auto exe = mm::managed_vllm_executable_path(cfg);
-        std::filesystem::create_directories(exe.parent_path());
-        std::ofstream(exe) << "fake vllm";
-        return 0;
-    };
-    runner.capture_first_line = [&](const std::vector<std::string>& args,
-                                    const std::filesystem::path&) {
-        if (!args.empty() && args.front() == mm::managed_vllm_executable_path(cfg).string())
-            return std::string{"0.6.3"};
-        return std::string{};
-    };
-    runner.fetch_latest = [&](const mm::VllmProvisionConfig&) { return latest; };
-
-    mm::VllmProvisioner prov(cfg, runner);
-    auto ready = prov.ensure_runtime();
-    CHECK(ready.status == "ready");
-    const int after_ensure = run_count;
-    CHECK(after_ensure >= 1);        // ran the install plan's step(s)
-    CHECK(ready.version == "0.6.3");
-    CHECK(ready.accelerator == "cuda");
-
-    // Newer upstream -> update_available.
-    auto checked = prov.check_for_update();
-    CHECK(checked.latest_version == "0.6.4");
-    CHECK(checked.update_available);
-
-    // Equal upstream -> no update.
-    latest = "0.6.3";
-    CHECK(!prov.check_for_update().update_available);
-
-    // Unknown upstream (offline) -> no spurious update.
-    latest = "";
-    auto offline = prov.check_for_update();
-    CHECK(offline.latest_version.empty());
-    CHECK(!offline.update_available);
-
-    // update_runtime() forces a reinstall even though a managed exe exists.
-    latest = "0.6.4";
-    auto updated = prov.update_runtime();
-    CHECK(updated.status == "ready");
-    CHECK(run_count > after_ensure);   // installer re-ran (forced)
-    CHECK(!updated.update_available);
-
-    CHECK(remove_tree(dir));
-    return true;
-}
-
-bool test_vllm_install_progress_parser() {
-    auto approx = [](double v, double target) { return v > target - 0.02 && v < target + 0.02; };
-
-    CHECK(approx(mm::parse_vllm_install_fraction("Downloading torch (2.1 GB) ... 45%"), 0.45));
-    CHECK(approx(mm::parse_vllm_install_fraction("vllm  12.3/45.6 MB"), 12.3 / 45.6));
-    CHECK(mm::parse_vllm_install_fraction("100%") >= 0.999);
-    // No parseable progress -> indeterminate (<0).
-    CHECK(mm::parse_vllm_install_fraction("Collecting vllm") < 0.0);
-    CHECK(mm::parse_vllm_install_fraction("") < 0.0);
-    // A path with slashes must not be mistaken for a ratio.
-    CHECK(mm::parse_vllm_install_fraction("saving to /root/vllm-windows.whl") < 0.0);
     return true;
 }
 
@@ -1303,71 +527,6 @@ bool test_node_action_progress_json_round_trip() {
     return true;
 }
 
-bool test_vllm_provision_cancel() {
-    auto dir = temp_test_dir("vllm-cancel");
-    mm::VllmProvisionConfig cfg;
-    cfg.requested_executable = "definitely-missing-vllm-for-test";
-    cfg.provision_dir = dir.string();
-    cfg.platform = "linux";
-    cfg.arch = "x86_64";
-    cfg.accelerator = "cpu";
-    cfg.package_manager = "pip";
-
-    bool command_ran = false;
-    mm::VllmCommandRunner runner;
-    runner.run = [&](const std::vector<std::string>&,
-                     const std::filesystem::path&,
-                     const mm::StreamLineCallback&,
-                     const mm::CancelCheckCallback&,
-                     std::string*) {
-        command_ran = true;
-        return 0;
-    };
-    runner.capture_first_line = [](const std::vector<std::string>&,
-                                   const std::filesystem::path&) {
-        return std::string{};
-    };
-
-    mm::VllmProvisioner provisioner(cfg, runner);
-    provisioner.set_cancel_check([] { return true; });
-    auto status = provisioner.ensure_runtime();
-    CHECK(status.status == "failed");
-    CHECK(status.last_error.find("canceled") != std::string::npos);
-    CHECK(!command_ran);
-    CHECK(remove_tree(dir));
-    return true;
-}
-
-bool test_vllm_peer_selection() {
-    auto mk = [](const std::string& id, bool conn, const std::string& accel,
-                 const std::string& plat, const std::string& arch, const std::string& ver) {
-        mm::NodeInfo n;
-        n.id = id;
-        n.connected = conn;
-        n.vllm_runtime.accelerator = accel;
-        n.vllm_runtime.platform = plat;
-        n.vllm_runtime.version = ver;
-        n.capabilities.arch = arch;
-        return n;
-    };
-
-    const std::vector<mm::NodeInfo> nodes = {
-        mk("src",       true,  "cuda", "linux", "x86_64", "0.6.4"),  // just updated
-        mk("same_old",  true,  "cuda", "linux", "x86_64", "0.6.3"),  // same env, behind -> nudge
-        mk("same_cur",  true,  "cuda", "linux", "x86_64", "0.6.4"),  // same env, converged -> skip
-        mk("diff_acc",  true,  "rocm", "linux", "x86_64", "0.6.3"),  // different accelerator -> skip
-        mk("diff_arch", true,  "cuda", "linux", "aarch64","0.6.3"),  // different arch -> skip
-        mk("offline",   false, "cuda", "linux", "x86_64", "0.6.3"),  // disconnected -> skip
-    };
-
-    const auto peers = mm::select_vllm_update_peers(nodes, "src");
-    CHECK(peers.size() == 1);
-    CHECK(!peers.empty() && peers.front() == "same_old");
-    // Unknown source id -> no peers.
-    CHECK(mm::select_vllm_update_peers(nodes, "does-not-exist").empty());
-    return true;
-}
-
 bool test_scheduler_skips_failed_node_current_attempt() {
     bool ok = true;
 #define RECORD(expr) do { if (!(expr)) { std::cerr << "CHECK failed at line " << __LINE__ << ": " << #expr << "\n"; ok = false; } } while (0)
@@ -1396,14 +555,9 @@ bool test_scheduler_skips_failed_node_current_attempt() {
             res.set_content(nlohmann::json(h).dump(), "application/json");
         });
         server.Get("/api/node/status", [](const httplib::Request&, httplib::Response& res) {
-            mm::VllmRuntimeStatus rt;
-            rt.status = "ready";
-            rt.managed = true;
-            rt.executable_path = "fake-vllm";
             nlohmann::json body = {
                 {"loaded_model", ""},
                 {"slots", nlohmann::json::array()},
-                {"cached_models", nlohmann::json::array()},
                 {"max_slots", 1},
                 {"slot_in_use", 0},
                 {"slot_available", 1},
@@ -1411,10 +565,7 @@ bool test_scheduler_skips_failed_node_current_attempt() {
                 {"slot_loading", 0},
                 {"slot_suspending", 0},
                 {"slot_suspended", 0},
-                {"slot_error", 0},
-                {"vllm_runtime", rt},
-                {"vllm_gpu_budget", 0.90},
-                {"vllm_gpu_fraction_used", 0.0}
+                {"slot_error", 0}
             };
             res.set_content(body.dump(), "application/json");
         });
@@ -1424,7 +575,7 @@ bool test_scheduler_skips_failed_node_current_attempt() {
             if (!load_ok) {
                 res.status = 503;
                 res.set_content(nlohmann::json{
-                    {"error", "vllm runtime not ready"},
+                    {"error", "llama.cpp runtime not ready"},
                     {"detail", "synthetic runtime failure"}
                 }.dump(), "application/json");
                 return;
@@ -1482,6 +633,15 @@ bool test_scheduler_skips_failed_node_current_attempt() {
     cfg.model_path = "Qwen/Qwen3-8B";
     cfg.preferred_node_id = bad_id;
 
+    auto retired = cfg;
+    retired.id = "retired-agent";
+    retired.inference_backend = "vllm";
+    RECORD(!scheduler.ensure_agent_running(retired).has_value());
+    RECORD(scheduler.last_error().find("supports llama-cpp only") !=
+           std::string::npos);
+    RECORD(bad_loads.load() == 0);
+    RECORD(good_loads.load() == 0);
+
     auto scheduled = scheduler.ensure_agent_running(cfg);
     RECORD(scheduled.has_value());
     if (scheduled) {
@@ -1498,6 +658,615 @@ bool test_scheduler_skips_failed_node_current_attempt() {
     if (good_thread.joinable()) good_thread.join();
     RECORD(bad_listen_ok);
     RECORD(good_listen_ok);
+    RECORD(remove_tree(dir));
+
+#undef RECORD
+    return ok;
+}
+
+bool test_scheduler_transfers_existing_relative_models_with_unique_cache_ids() {
+    const auto dir = temp_test_dir("scheduler-local-identities");
+    std::filesystem::create_directories(dir / "a");
+    std::filesystem::create_directories(dir / "b");
+    std::filesystem::create_directories(dir / "models");
+    {
+        std::ofstream(dir / "a" / "model.gguf", std::ios::binary) << "AAAA";
+        std::ofstream(dir / "b" / "model.gguf", std::ios::binary) << "BBBB";
+        std::ofstream(dir / "models" / "bare.gguf", std::ios::binary) << "CCCC";
+    }
+    const auto shared_timestamp = std::filesystem::file_time_type::clock::now()
+                                - std::chrono::seconds(5);
+    std::filesystem::last_write_time(dir / "a" / "model.gguf", shared_timestamp);
+    std::filesystem::last_write_time(dir / "b" / "model.gguf", shared_timestamp);
+
+    const uint16_t port = find_free_test_port();
+    CHECK(port != 0);
+    const std::string url = "http://127.0.0.1:" + std::to_string(port);
+
+    httplib::Server server;
+    std::mutex requests_mutex;
+    std::vector<std::string> received_ids;
+    std::map<std::string, nlohmann::json> load_bodies;
+    server.Get("/api/node/health", [](const httplib::Request&,
+                                      httplib::Response& res) {
+        mm::NodeHealthMetrics health;
+        health.gpu_vram_total_mb = 131072;
+        health.gpu_backend_available = true;
+        res.set_content(nlohmann::json(health).dump(), "application/json");
+    });
+    server.Get("/api/node/status", [](const httplib::Request&,
+                                      httplib::Response& res) {
+        res.set_content(nlohmann::json{
+            {"slots", nlohmann::json::array()},
+            {"max_slots", 8},
+            {"slot_available", 8}
+        }.dump(), "application/json");
+    });
+    server.Get("/api/node/models/local", [](const httplib::Request&,
+                                             httplib::Response& res) {
+        res.set_content(nlohmann::json{{"present", false}}.dump(),
+                        "application/json");
+    });
+    server.Post("/api/node/models/receive", [&](const httplib::Request& req,
+                                                 httplib::Response& res) {
+        const std::string model_id = req.get_header_value("X-MM-Model-Id");
+        const std::string relative = req.get_header_value("X-MM-Rel-Path");
+        {
+            std::lock_guard<std::mutex> lock(requests_mutex);
+            received_ids.push_back(model_id);
+        }
+        const std::string stored =
+            "/node/cache/" + model_id + "/" + relative;
+        res.set_content(nlohmann::json{
+            {"stored_path", stored}, {"load_path", stored}
+        }.dump(), "application/json");
+    });
+    server.Post("/api/node/load-model", [&](const httplib::Request& req,
+                                             httplib::Response& res) {
+        const auto body = nlohmann::json::parse(req.body);
+        const std::string agent_id = body.value("agent_id", std::string{});
+        {
+            std::lock_guard<std::mutex> lock(requests_mutex);
+            load_bodies[agent_id] = body;
+        }
+        res.set_content(nlohmann::json{
+            {"status", "loaded"}, {"slot_id", "slot-" + agent_id}
+        }.dump(), "application/json");
+    });
+
+    std::atomic<bool> listen_ok{false};
+    std::thread server_thread([&] {
+        listen_ok = server.listen("127.0.0.1", port);
+    });
+
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    RECORD(wait_for_test_server(url));
+    mm::NodeRegistry registry((dir / "registry").string());
+    const auto node_id = registry.add_node(url, "local-identity-secret", "test");
+    registry.start_health_poll(1);
+    RECORD(wait_for_registered_node(registry, node_id));
+
+    mm::AgentScheduler scheduler(registry, (dir / "models").string());
+    {
+        ScopedCurrentPath current_path(dir);
+        RECORD(mm::util::model_ref_is_local_path("a/model.gguf"));
+        RECORD(mm::util::model_ref_is_local_path("b/model.gguf"));
+        RECORD(mm::util::model_ref_is_local_path("bare.gguf"));
+
+        auto schedule = [&](const std::string& agent_id,
+                            const std::string& model_ref) {
+            mm::AgentConfig cfg;
+            cfg.id = agent_id;
+            cfg.name = agent_id;
+            cfg.model_path = model_ref;
+            cfg.preferred_node_id = node_id;
+            return scheduler.ensure_agent_running(cfg);
+        };
+        RECORD(schedule("relative-a", "a/model.gguf").has_value());
+        RECORD(schedule("relative-b", "b/model.gguf").has_value());
+        RECORD(schedule("bare", "bare.gguf").has_value());
+    }
+
+    std::vector<std::string> ids;
+    std::map<std::string, nlohmann::json> bodies;
+    {
+        std::lock_guard<std::mutex> lock(requests_mutex);
+        ids = received_ids;
+        bodies = load_bodies;
+    }
+    RECORD(ids.size() == 3);
+    if (ids.size() == 3) {
+        RECORD(!ids[0].empty());
+        RECORD(!ids[1].empty());
+        RECORD(ids[0] != ids[1]);
+        if (bodies.count("relative-a") == 1) {
+            RECORD(bodies.at("relative-a").value("model_id", std::string{})
+                   == ids[0]);
+        }
+        if (bodies.count("relative-b") == 1) {
+            RECORD(bodies.at("relative-b").value("model_id", std::string{})
+                   == ids[1]);
+        }
+        if (bodies.count("bare") == 1) {
+            RECORD(bodies.at("bare").value("model_id", std::string{}) == ids[2]);
+        }
+    }
+    for (const std::string agent_id : {"relative-a", "relative-b", "bare"}) {
+        RECORD(bodies.count(agent_id) == 1);
+        if (bodies.count(agent_id) == 1) {
+            const auto& body = bodies.at(agent_id);
+            RECORD(body.contains("model_id"));
+            RECORD(body.value("model_path", std::string{}).rfind("/node/cache/", 0)
+                   == 0);
+        }
+    }
+
+    registry.stop_health_poll();
+    server.stop();
+    if (server_thread.joinable()) server_thread.join();
+    RECORD(listen_ok);
+    RECORD(remove_tree(dir));
+
+#undef RECORD
+    return ok;
+}
+
+bool test_scheduler_eviction_skips_unsuspendable_shared_slot() {
+    const auto dir = temp_test_dir("scheduler-eviction-candidates");
+    std::filesystem::create_directories(dir / "models");
+    const uint16_t port = find_free_test_port();
+    CHECK(port != 0);
+    const std::string url = "http://127.0.0.1:" + std::to_string(port);
+
+    httplib::Server server;
+    std::atomic<bool> standalone_suspended{false};
+    std::atomic<int> standalone_suspend_calls{0};
+    std::atomic<int> shared_suspend_calls{0};
+    std::atomic<int> unload_calls{0};
+    std::atomic<int> new_load_calls{0};
+    server.Get("/api/node/health", [](const httplib::Request&,
+                                      httplib::Response& res) {
+        mm::NodeHealthMetrics health;
+        health.gpu_vram_total_mb = 131072;
+        health.gpu_backend_available = true;
+        res.set_content(nlohmann::json(health).dump(), "application/json");
+    });
+    server.Get("/api/node/status", [](const httplib::Request&,
+                                      httplib::Response& res) {
+        // Placements are intentionally the only eviction candidates. This
+        // makes the test fail if the scheduler gives up on the first idle
+        // placement instead of trying the next one.
+        res.set_content(nlohmann::json{
+            {"slots", nlohmann::json::array()},
+            {"max_slots", 4},
+            {"slot_available", 0}
+        }.dump(), "application/json");
+    });
+    server.Post("/api/node/load-model", [&](const httplib::Request& req,
+                                             httplib::Response& res) {
+        const auto body = nlohmann::json::parse(req.body);
+        const std::string agent_id = body.value("agent_id", std::string{});
+        if (agent_id == "new-agent") {
+            ++new_load_calls;
+            if (!standalone_suspended.load()) {
+                res.status = 503;
+                res.set_content(
+                    nlohmann::json{{"error", "max slots reached"}}.dump(),
+                    "application/json");
+                return;
+            }
+            res.set_content(nlohmann::json{
+                {"status", "loaded"}, {"slot_id", "slot-new"}
+            }.dump(), "application/json");
+            return;
+        }
+
+        const std::string slot_id = agent_id == "standalone-idle"
+            ? "slot-standalone"
+            : "slot-shared";
+        res.set_content(nlohmann::json{
+            {"status", "loaded"}, {"slot_id", slot_id}
+        }.dump(), "application/json");
+    });
+    server.Post("/api/node/suspend-slot", [&](const httplib::Request& req,
+                                               httplib::Response& res) {
+        const auto body = nlohmann::json::parse(req.body);
+        const std::string slot_id = body.value("slot_id", std::string{});
+        if (slot_id == "slot-standalone") {
+            ++standalone_suspend_calls;
+            standalone_suspended = true;
+            res.set_content(nlohmann::json{
+                {"status", "suspended"}, {"kv_cache_path", "standalone.kvbin"}
+            }.dump(), "application/json");
+            return;
+        }
+        ++shared_suspend_calls;
+        res.status = 409;
+        res.set_content(nlohmann::json{{"error", "shared slot is active"}}.dump(),
+                        "application/json");
+    });
+    server.Post("/api/node/unload-model", [&](const httplib::Request&,
+                                               httplib::Response& res) {
+        ++unload_calls;
+        res.status = 409;
+        res.set_content(nlohmann::json{{"error", "unexpected unload"}}.dump(),
+                        "application/json");
+    });
+    server.Post("/api/node/detach-agent", [](const httplib::Request&,
+                                              httplib::Response& res) {
+        res.set_content(nlohmann::json{{"status", "detached"}}.dump(),
+                        "application/json");
+    });
+
+    std::atomic<bool> listen_ok{false};
+    std::thread server_thread([&] {
+        listen_ok = server.listen("127.0.0.1", port);
+    });
+
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    RECORD(wait_for_test_server(url));
+    mm::NodeRegistry registry((dir / "registry").string());
+    const auto node_id = registry.add_node(url, "eviction-secret", "test");
+    registry.start_health_poll(1);
+    RECORD(wait_for_registered_node(registry, node_id));
+    mm::AgentScheduler scheduler(registry, (dir / "models").string());
+
+    auto config = [&](const std::string& id) {
+        mm::AgentConfig cfg;
+        cfg.id = id;
+        cfg.name = id;
+        cfg.model_path = "org/shared-model";
+        cfg.preferred_node_id = node_id;
+        return cfg;
+    };
+
+    RECORD(scheduler.ensure_agent_running(config("shared-idle")).has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    RECORD(scheduler.ensure_agent_running(config("shared-active")).has_value());
+    scheduler.mark_agent_active("shared-active");
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    RECORD(scheduler.ensure_agent_running(config("standalone-idle")).has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+
+    const auto scheduled = scheduler.ensure_agent_running(config("new-agent"));
+    RECORD(scheduled.has_value());
+    if (scheduled) RECORD(scheduled->slot_id == "slot-new");
+    RECORD(new_load_calls.load() >= 2);
+    RECORD(shared_suspend_calls.load() == 0);
+    RECORD(standalone_suspend_calls.load() == 1);
+    RECORD(unload_calls.load() == 0);
+
+    const auto shared_idle = scheduler.get_placement("shared-idle");
+    const auto shared_active = scheduler.get_placement("shared-active");
+    const auto standalone = scheduler.get_placement("standalone-idle");
+    RECORD(shared_idle.has_value() && !shared_idle->suspended);
+    RECORD(shared_active.has_value() && !shared_active->suspended);
+    RECORD(standalone.has_value() && standalone->suspended);
+
+    registry.stop_health_poll();
+    server.stop();
+    if (server_thread.joinable()) server_thread.join();
+    RECORD(listen_ok);
+    RECORD(remove_tree(dir));
+
+#undef RECORD
+    return ok;
+}
+
+bool test_scheduler_backend_change_releases_local_placement() {
+    const auto dir = temp_test_dir("scheduler-backend-change");
+    std::filesystem::create_directories(dir / "models");
+    const uint16_t port = find_free_test_port();
+    CHECK(port != 0);
+    const std::string url = "http://127.0.0.1:" + std::to_string(port);
+
+    httplib::Server server;
+    std::atomic<int> detach_calls{0};
+    std::mutex detach_mutex;
+    nlohmann::json detach_body;
+    server.Get("/api/node/health", [](const httplib::Request&,
+                                      httplib::Response& res) {
+        mm::NodeHealthMetrics health;
+        health.gpu_vram_total_mb = 131072;
+        health.gpu_backend_available = true;
+        res.set_content(nlohmann::json(health).dump(), "application/json");
+    });
+    server.Get("/api/node/status", [](const httplib::Request&,
+                                      httplib::Response& res) {
+        res.set_content(nlohmann::json{
+            {"slots", nlohmann::json::array()},
+            {"max_slots", 2},
+            {"slot_available", 2}
+        }.dump(), "application/json");
+    });
+    server.Post("/api/node/load-model", [](const httplib::Request&,
+                                            httplib::Response& res) {
+        res.set_content(nlohmann::json{
+            {"status", "loaded"}, {"slot_id", "slot-local"}
+        }.dump(), "application/json");
+    });
+    server.Post("/api/node/detach-agent", [&](const httplib::Request& req,
+                                               httplib::Response& res) {
+        ++detach_calls;
+        {
+            std::lock_guard<std::mutex> lock(detach_mutex);
+            detach_body = nlohmann::json::parse(req.body);
+        }
+        res.set_content(nlohmann::json{{"status", "detached"}}.dump(),
+                        "application/json");
+    });
+
+    std::atomic<bool> listen_ok{false};
+    std::thread server_thread([&] {
+        listen_ok = server.listen("127.0.0.1", port);
+    });
+
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    RECORD(wait_for_test_server(url));
+    mm::NodeRegistry registry((dir / "registry").string());
+    const auto node_id = registry.add_node(url, "backend-change-secret", "test");
+    registry.start_health_poll(1);
+    RECORD(wait_for_registered_node(registry, node_id));
+    mm::AgentScheduler scheduler(registry, (dir / "models").string());
+
+    mm::AgentConfig cfg;
+    cfg.id = "backend-agent";
+    cfg.name = "Backend Agent";
+    cfg.model_path = "org/model";
+    cfg.preferred_node_id = node_id;
+    RECORD(scheduler.ensure_agent_running(cfg).has_value());
+    RECORD(scheduler.get_placement(cfg.id).has_value());
+
+    auto api_cfg = cfg;
+    api_cfg.inference_backend = "api";
+    RECORD(!scheduler.ensure_agent_running(api_cfg).has_value());
+    RECORD(!scheduler.get_placement(cfg.id).has_value());
+    RECORD(detach_calls.load() == 1);
+    {
+        std::lock_guard<std::mutex> lock(detach_mutex);
+        RECORD(detach_body.value("slot_id", std::string{}) == "slot-local");
+        RECORD(detach_body.value("agent_id", std::string{}) == cfg.id);
+    }
+    RECORD(scheduler.last_error().find("supports llama-cpp only") !=
+           std::string::npos);
+
+    registry.stop_health_poll();
+    server.stop();
+    if (server_thread.joinable()) server_thread.join();
+    RECORD(listen_ok);
+    RECORD(remove_tree(dir));
+
+#undef RECORD
+    return ok;
+}
+
+bool test_scheduler_reconciles_ready_absent_and_suspended_snapshots() {
+    const auto dir = temp_test_dir("scheduler-placement-reconciliation");
+    std::filesystem::create_directories(dir / "models");
+    const uint16_t port = find_free_test_port();
+    CHECK(port != 0);
+    const std::string url = "http://127.0.0.1:" + std::to_string(port);
+
+    httplib::Server server;
+    // 0: no reported slot, 1: attached Ready, 2: absent again,
+    // 3: attached Suspended with a node-local KV path, 4: status unavailable.
+    std::atomic<int> snapshot_phase{0};
+    std::atomic<int> load_calls{0};
+    std::atomic<int> detach_calls{0};
+    std::atomic<int> restore_calls{0};
+    std::mutex requests_mutex;
+    std::vector<nlohmann::json> detach_bodies;
+    nlohmann::json restore_body;
+
+    server.Get("/api/node/health", [](const httplib::Request&,
+                                      httplib::Response& res) {
+        mm::NodeHealthMetrics health;
+        health.gpu_vram_total_mb = 131072;
+        health.gpu_backend_available = true;
+        res.set_content(nlohmann::json(health).dump(), "application/json");
+    });
+    server.Get("/api/node/status", [&](const httplib::Request&,
+                                       httplib::Response& res) {
+        const int phase = snapshot_phase.load();
+        if (phase == 4) {
+            res.status = 503;
+            return;
+        }
+        nlohmann::json slots = nlohmann::json::array();
+        if (phase == 1 || phase == 3) {
+            mm::SlotInfo slot;
+            slot.id = phase == 1 ? "slot-initial" : "slot-rescheduled";
+            slot.model_path = "org/model";
+            slot.assigned_agent = "reconcile-agent";
+            slot.agent_ids = {"reconcile-agent"};
+            slot.state = phase == 1 ? mm::SlotState::Ready
+                                    : mm::SlotState::Suspended;
+            if (phase == 3) slot.kv_cache_path = "reported-cache.kvbin";
+            slots.push_back(slot);
+        }
+        res.set_content(nlohmann::json{
+            {"slots", std::move(slots)},
+            {"max_slots", 2},
+            {"slot_available", phase == 1 ? 1 : 2}
+        }.dump(), "application/json");
+    });
+    server.Post("/api/node/load-model", [&](const httplib::Request&,
+                                             httplib::Response& res) {
+        const int call = ++load_calls;
+        const std::string slot_id = call == 1 ? "slot-initial"
+                                               : "slot-rescheduled";
+        res.set_content(nlohmann::json{
+            {"status", "loaded"}, {"slot_id", slot_id}
+        }.dump(), "application/json");
+    });
+    server.Post("/api/node/detach-agent", [&](const httplib::Request& req,
+                                               httplib::Response& res) {
+        ++detach_calls;
+        {
+            std::lock_guard<std::mutex> lock(requests_mutex);
+            detach_bodies.push_back(nlohmann::json::parse(req.body));
+        }
+        res.set_content(nlohmann::json{{"status", "detached"}}.dump(),
+                        "application/json");
+    });
+    server.Post("/api/node/restore-slot", [&](const httplib::Request& req,
+                                               httplib::Response& res) {
+        ++restore_calls;
+        {
+            std::lock_guard<std::mutex> lock(requests_mutex);
+            restore_body = nlohmann::json::parse(req.body);
+        }
+        res.set_content(nlohmann::json{
+            {"status", "restored"}, {"slot_id", "slot-restored"}
+        }.dump(), "application/json");
+    });
+
+    std::atomic<bool> listen_ok{false};
+    std::thread server_thread([&] {
+        listen_ok = server.listen("127.0.0.1", port);
+    });
+
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    RECORD(wait_for_test_server(url));
+    mm::NodeRegistry registry((dir / "registry").string());
+    const auto node_id = registry.add_node(url, "reconcile-secret", "test");
+    registry.start_health_poll(1);
+    RECORD(wait_for_registered_node(registry, node_id));
+    mm::AgentScheduler scheduler(registry, (dir / "models").string());
+
+    mm::AgentConfig cfg;
+    cfg.id = "reconcile-agent";
+    cfg.name = "Reconcile Agent";
+    cfg.model_path = "org/model";
+    cfg.preferred_node_id = node_id;
+
+    const auto initial = scheduler.ensure_agent_running(cfg);
+    RECORD(initial.has_value());
+    if (initial) RECORD(initial->slot_id == "slot-initial");
+    RECORD(load_calls.load() == 1);
+    const auto initial_placement = scheduler.get_placement(cfg.id);
+    RECORD(initial_placement.has_value());
+
+    // A newer health sample does not make an older slot snapshot authoritative.
+    // If status polling fails, retain the placement created after that snapshot.
+    const int64_t initial_slot_snapshot =
+        registry.get_node(node_id).slot_snapshot_at_ms;
+    snapshot_phase = 4;
+    const int64_t initial_placed_at = initial_placement
+        ? initial_placement->placed_at_ms : 0;
+    RECORD(wait_for_node_snapshot(
+        registry, node_id, initial_placed_at,
+        [&](const mm::NodeInfo& node) {
+            return node.last_seen_ms > initial_placed_at &&
+                   node.slot_snapshot_at_ms == initial_slot_snapshot;
+        }));
+    const auto health_only = scheduler.ensure_agent_running(cfg);
+    RECORD(health_only.has_value());
+    if (health_only) RECORD(health_only->slot_id == "slot-initial");
+    RECORD(load_calls.load() == 1);
+    RECORD(detach_calls.load() == 0);
+
+    // A newer connected snapshot confirms the same attachment. The scheduler
+    // must return it without issuing another load request.
+    snapshot_phase = 1;
+    const int64_t health_only_seen = registry.get_node(node_id).last_seen_ms;
+    RECORD(wait_for_node_snapshot(
+        registry, node_id, health_only_seen + 1,
+        [](const mm::NodeInfo& node) {
+            return node.slots.size() == 1 &&
+                   node.slots[0].id == "slot-initial" &&
+                   node.slots[0].state == mm::SlotState::Ready;
+        }));
+    const auto ready_snapshot_seen = registry.get_node(node_id).last_seen_ms;
+    const auto still_ready = scheduler.ensure_agent_running(cfg);
+    RECORD(still_ready.has_value());
+    if (still_ready) RECORD(still_ready->slot_id == "slot-initial");
+    RECORD(load_calls.load() == 1);
+    RECORD(detach_calls.load() == 0);
+    RECORD(restore_calls.load() == 0);
+
+    // A still-newer snapshot that no longer contains the attachment disproves
+    // the cached placement. It must be detached and loaded again.
+    snapshot_phase = 2;
+    RECORD(wait_for_node_snapshot(
+        registry, node_id, ready_snapshot_seen + 1,
+        [](const mm::NodeInfo& node) { return node.slots.empty(); }));
+    const auto absent_snapshot_seen = registry.get_node(node_id).last_seen_ms;
+    const auto rescheduled = scheduler.ensure_agent_running(cfg);
+    RECORD(rescheduled.has_value());
+    if (rescheduled) RECORD(rescheduled->slot_id == "slot-rescheduled");
+    RECORD(load_calls.load() == 2);
+    RECORD(detach_calls.load() == 1);
+    const auto rescheduled_placement = scheduler.get_placement(cfg.id);
+    RECORD(rescheduled_placement.has_value());
+    {
+        std::lock_guard<std::mutex> lock(requests_mutex);
+        RECORD(detach_bodies.size() == 1);
+        if (detach_bodies.size() == 1) {
+            RECORD(detach_bodies[0].value("slot_id", std::string{}) ==
+                   "slot-initial");
+            RECORD(detach_bodies[0].value("agent_id", std::string{}) == cfg.id);
+        }
+    }
+
+    // If the node reports that the rescheduled attachment is Suspended, retain
+    // it as a suspended placement and restore with the node-reported KV path.
+    snapshot_phase = 3;
+    const int64_t rescheduled_placed_at = rescheduled_placement
+        ? rescheduled_placement->placed_at_ms : 0;
+    RECORD(wait_for_node_snapshot(
+        registry, node_id,
+        std::max(absent_snapshot_seen + 1, rescheduled_placed_at),
+        [](const mm::NodeInfo& node) {
+            return node.slots.size() == 1 &&
+                   node.slots[0].id == "slot-rescheduled" &&
+                   node.slots[0].state == mm::SlotState::Suspended &&
+                   node.slots[0].kv_cache_path == "reported-cache.kvbin";
+        }));
+    const auto restored = scheduler.ensure_agent_running(cfg);
+    RECORD(restored.has_value());
+    if (restored) RECORD(restored->slot_id == "slot-restored");
+    RECORD(load_calls.load() == 2);
+    RECORD(detach_calls.load() == 1);
+    RECORD(restore_calls.load() == 1);
+    {
+        std::lock_guard<std::mutex> lock(requests_mutex);
+        RECORD(restore_body.value("kv_cache_path", std::string{}) ==
+               "reported-cache.kvbin");
+        RECORD(restore_body.value("agent_id", std::string{}) == cfg.id);
+    }
+    const auto final_placement = scheduler.get_placement(cfg.id);
+    RECORD(final_placement.has_value());
+    if (final_placement) {
+        RECORD(final_placement->slot_id == "slot-restored");
+        RECORD(!final_placement->suspended);
+        RECORD(final_placement->kv_cache_node_path.empty());
+    }
+
+    registry.stop_health_poll();
+    server.stop();
+    if (server_thread.joinable()) server_thread.join();
+    RECORD(listen_ok);
     RECORD(remove_tree(dir));
 
 #undef RECORD
@@ -1861,7 +1630,7 @@ bool test_openai_compat_api_listener_and_model_catalog() {
         cfg.id = "agent-a";
         cfg.name = "agent-a-name";
         cfg.model_path = "model-a.gguf";
-        cfg.vllm_settings.served_model_name = "served-agent-a";
+        cfg.served_model_name = "served-agent-a";
         agents.create_agent(cfg);
 
         mm::AgentQueue queue;
@@ -2477,145 +2246,6 @@ bool test_tts_service_client_fake_sidecar_paths() {
     if (server_thread.joinable()) server_thread.join();
     RECORD(listen_ok);
     RECORD(listen_returned);
-#undef RECORD
-    return ok;
-}
-
-bool test_tts_service_client_vllm_backend_paths() {
-    const uint16_t port = find_free_test_port();
-    CHECK(port != 0);
-    httplib::Server server;
-    std::mutex requests_mutex;
-    std::vector<nlohmann::json> requests;
-
-    server.Get("/health", [](const httplib::Request&, httplib::Response& res) {
-        res.status = 200;
-        res.set_content("", "text/plain");
-    });
-
-    server.Post("/v1/audio/speech", [&](const httplib::Request& req, httplib::Response& res) {
-        auto body = nlohmann::json::parse(req.body);
-        {
-            std::lock_guard<std::mutex> lock(requests_mutex);
-            requests.push_back(body);
-        }
-        if (body.value("input", std::string{}) == "fail") {
-            res.status = 500;
-            res.set_content(
-                nlohmann::json{{"error", {{"message", "vllm failure"}}}}.dump(),
-                "application/json");
-            return;
-        }
-        res.set_content(std::string{"RIFFfake-wav"}, "audio/wav");
-    });
-
-    std::atomic<bool> listen_returned{false};
-    std::atomic<bool> listen_ok{false};
-    std::thread server_thread([&] {
-        listen_ok = server.listen("127.0.0.1", port);
-        listen_returned = true;
-    });
-
-    bool ok = true;
-    auto record = [&](bool condition, const char* expression, int line) {
-        if (!check(condition, expression, line)) ok = false;
-    };
-#define RECORD(expr) record((expr), #expr, __LINE__)
-
-    auto dir = temp_test_dir("tts-vllm");
-    std::filesystem::create_directories(dir);
-
-    mm::TtsServiceConfig config;
-    config.enabled = true;
-    config.backend = "vllm";
-    config.vllm_base_url = "http://127.0.0.1:" + std::to_string(port);
-    config.vllm_model_id = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice";
-    mm::TtsServiceClient client(config);
-
-    bool ready = false;
-    std::string health_error;
-    for (int i = 0; i < 50; ++i) {
-        if (client.health(&health_error)) {
-            ready = true;
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-    RECORD(ready);
-    RECORD(client.provider_name() == "qwen3-tts-vllm");
-    RECORD(client.default_synthesis_model_id() == config.vllm_model_id);
-
-    const auto preview_path = (dir / "preview.wav").string();
-    const auto descriptor_path = (dir / "voice.voice.json").string();
-
-    mm::VoiceDesignProposal proposal;
-    proposal.display_name = "Analyst Voice";
-    proposal.sample_text = "Preview text.";
-    proposal.language = "English";
-    proposal.voice_description = "Original clear voice.";
-    auto sample = client.generate_voice_sample(proposal, preview_path, descriptor_path);
-    RECORD(sample.ok);
-    RECORD(sample.status == 200);
-    RECORD(sample.audio_path == preview_path);
-    RECORD(sample.voice_clone_prompt_path == descriptor_path);
-    RECORD(std::filesystem::is_regular_file(preview_path));
-    RECORD(std::filesystem::is_regular_file(descriptor_path));
-
-    nlohmann::json descriptor;
-    {
-        std::ifstream in(descriptor_path, std::ios::binary);
-        in >> descriptor;
-    }
-    RECORD(descriptor["provider"] == "qwen3-tts-vllm");
-    RECORD(descriptor["model"] == config.vllm_model_id);
-    RECORD(descriptor["voice_description"] == "Original clear voice.");
-
-    mm::AgentVoiceProfile profile;
-    profile.id = "profile-a";
-    profile.display_name = "Analyst Voice";
-    profile.language = "English";
-    profile.voice_description = "Should be overridden by descriptor.";
-    profile.voice_clone_prompt_path = descriptor_path;
-
-    const auto speech_path = (dir / "speech.wav").string();
-    mm::TtsSynthesisRequest request;
-    request.text = "Speak.";
-    request.format = "wav";
-    auto speech = client.synthesize(request, profile, speech_path);
-    RECORD(speech.ok);
-    RECORD(speech.audio_path == speech_path);
-    RECORD(std::filesystem::is_regular_file(speech_path));
-    {
-        std::ifstream in(speech_path, std::ios::binary);
-        const std::string audio((std::istreambuf_iterator<char>(in)),
-                                std::istreambuf_iterator<char>());
-        RECORD(audio == "RIFFfake-wav");
-    }
-
-    request.text = "fail";
-    auto failed = client.synthesize(request, profile, (dir / "failed.wav").string());
-    RECORD(!failed.ok);
-    RECORD(failed.status == 500);
-    RECORD(failed.error.find("vllm failure") != std::string::npos);
-
-    {
-        std::lock_guard<std::mutex> lock(requests_mutex);
-        RECORD(requests.size() == 3);
-        if (requests.size() >= 2) {
-            RECORD(requests[0]["model"] == config.vllm_model_id);
-            RECORD(requests[0]["input"] == "Preview text.");
-            RECORD(requests[0]["voice"] == "Original clear voice.");
-            RECORD(requests[1]["input"] == "Speak.");
-            RECORD(requests[1]["voice"] == "Original clear voice.");
-            RECORD(requests[1]["response_format"] == "wav");
-        }
-    }
-
-    server.stop();
-    if (server_thread.joinable()) server_thread.join();
-    RECORD(listen_ok);
-    RECORD(listen_returned);
-    RECORD(remove_tree(dir));
 #undef RECORD
     return ok;
 }
@@ -3594,9 +3224,13 @@ bool test_vision_profile_validation_and_suggestions() {
                       }));
 
     cfg.inference_backend = "vllm";
-    CHECK(!mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
-    cfg.vision_settings.mmproj_path.clear();
-    CHECK(mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
+    const auto retired_backend = mm::validate_agent_config(cfg, nullptr, "", nullptr);
+    CHECK(!retired_backend.ok());
+    CHECK(std::any_of(retired_backend.issues.begin(), retired_backend.issues.end(),
+                      [](const mm::ValidationIssue& issue) {
+                          return issue.field == "inference_backend" &&
+                                 issue.severity == mm::ValidationSeverity::Error;
+                      }));
 
     cfg.inference_backend = "api";
     cfg.api_settings.base_url = "https://example.test";
@@ -3611,21 +3245,23 @@ bool test_vision_profile_validation_and_suggestions() {
 }
 
 bool test_vision_slot_projector_isolation_and_json() {
-    mm::SlotManager slots(46250, 46253, 4, "missing-vllm");
+    mm::SlotManager slots(46250, 46253, 4);
+    slots.set_llama_server_path("missing-llama-server");
     mm::RuntimeSettings settings;
-    const auto first = slots.add_ready_test_slot_llama(
+    const auto first = slots.add_ready_test_slot(
         "model.gguf", "agent-a", settings, "mmproj-a.gguf");
     CHECK(!first.empty());
 
-    const auto shared = slots.load_model_llama(
+    const auto shared = slots.load_model(
         "model.gguf", "mmproj-a.gguf", settings, "agent-b");
     CHECK(shared == first);
 
-    const auto different = slots.load_model_llama(
+    const auto different = slots.load_model(
         "model.gguf", "mmproj-b.gguf", settings, "agent-c");
     CHECK(different.empty());
     const auto info = slots.find_slot(first);
     CHECK(info.has_value());
+    CHECK(info->backend == "llama-cpp");
     CHECK(info->vision_enabled);
     CHECK(info->mmproj_path == "mmproj-a.gguf");
     CHECK(std::find(info->agent_ids.begin(), info->agent_ids.end(), "agent-b") !=
@@ -3694,15 +3330,19 @@ bool test_llama_backend_validation_and_gguf_routing() {
     auto r = mm::validate_agent_config(cfg, nullptr, "", nullptr);
     CHECK(r.ok());
 
-    // GGUF served through vLLM should warn (routing hint), still valid overall.
-    mm::AgentConfig v = cfg;
-    v.inference_backend = "vllm";
-    auto rv = mm::validate_agent_config(v, nullptr, "", nullptr);
-    bool vllm_gguf_warn = false;
-    for (const auto& i : rv.issues)
-        if (i.field == "inference_backend" && i.severity == mm::ValidationSeverity::Warning)
-            vllm_gguf_warn = true;
-    CHECK(vllm_gguf_warn);
+    // Legacy vLLM profiles must fail explicitly instead of silently routing to
+    // llama.cpp with incompatible model/settings semantics.
+    mm::AgentConfig retired = cfg;
+    retired.inference_backend = "vllm";
+    const auto retired_result =
+        mm::validate_agent_config(retired, nullptr, "", nullptr);
+    CHECK(!retired_result.ok());
+    CHECK(std::any_of(retired_result.issues.begin(), retired_result.issues.end(),
+                      [](const mm::ValidationIssue& issue) {
+                          return issue.field == "inference_backend" &&
+                                 issue.severity == mm::ValidationSeverity::Error &&
+                                 issue.message.find("not available") != std::string::npos;
+                      }));
 
     // llama-cpp with an HF repo id warns (needs a local GGUF).
     mm::AgentConfig h = cfg;
@@ -4528,14 +4168,14 @@ bool test_llama_nvcc_architecture_preflight_and_diagnostics() {
 
 bool test_llama_slot_info_backend_and_suspend() {
     auto dir = temp_test_dir("llama-slot");
-    mm::SlotManager slots(46170, 46173, 2, "missing-vllm");
+    mm::SlotManager slots(46170, 46173, 2);
     slots.set_llama_server_path("missing-llama");
     slots.set_kv_cache_dir((dir / "kv").string());
 
     mm::RuntimeSettings s;
     s.ctx_size = 2048;
     s.parallel = 1;
-    const auto id = slots.add_ready_test_slot_llama("m.gguf", "agent-l", s);
+    const auto id = slots.add_ready_test_slot("m.gguf", "agent-l", s);
 
     auto info = slots.find_slot(id);
     CHECK(info.has_value());
@@ -4558,13 +4198,13 @@ bool test_llama_slot_info_backend_and_suspend() {
 }
 
 bool test_runtime_client_health_empty_body_ok() {
-    // Regression: vLLM answers /health with an empty 200 body; health_check must
-    // treat that (and a {"status":"ok"} body) as healthy.
+    // OpenAI-compatible runtimes may answer /health with an empty 200 body;
+    // health_check must treat that as healthy.
     const uint16_t port = find_free_test_port();
     CHECK(port != 0);
     httplib::Server srv;
     srv.Get("/health", [](const httplib::Request&, httplib::Response& res) {
-        res.status = 200;  // empty body, vLLM-style
+        res.status = 200;
     });
     std::atomic<bool> listen_ok{false};
     std::thread th([&] { listen_ok = srv.listen("127.0.0.1", port); });
@@ -4587,46 +4227,87 @@ bool test_runtime_client_health_empty_body_ok() {
     return true;
 }
 
-bool test_llama_default_backend_and_isolation() {
+bool test_llama_default_backend_and_slot_sharing() {
     // llama.cpp is the default runtime on this branch.
     mm::AgentConfig fresh;
     CHECK(fresh.inference_backend == "llama-cpp");
-    CHECK(mm::engine_backend_from_string("") == mm::EngineBackend::LlamaCpp);
-    CHECK(mm::engine_backend_from_string("vllm") == mm::EngineBackend::Vllm);
-    CHECK(mm::engine_backend_from_string("llama.cpp") == mm::EngineBackend::LlamaCpp);
+    CHECK(mm::is_llama_backend(""));
+    CHECK(mm::is_llama_backend("llama-cpp"));
+    CHECK(mm::is_llama_backend("llama.cpp"));
+    CHECK(mm::is_llama_backend("llama"));
+    CHECK(!mm::is_llama_backend("vllm"));
+    CHECK(!mm::is_llama_backend("api"));
 
     // A slot payload without a backend field parses as the default runtime.
     auto parsed = nlohmann::json{{"id", "s1"}}.get<mm::SlotInfo>();
     CHECK(parsed.backend == "llama-cpp");
 
-    // An unspecified agent backend validates as llama-cpp (no vLLM-side errors).
+    // An unspecified agent backend validates as llama.cpp.
     mm::AgentConfig cfg;
     cfg.name = "d";
     cfg.model_path = "/models/m.gguf";
     cfg.inference_backend = "";
     CHECK(mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
 
-    // Cross-backend isolation: a vLLM load must never attach to a llama slot
-    // serving the same model (default settings on both sides would otherwise
-    // pass vllm_launch_compatible), and vice versa. With no real engines the
-    // load falls through to a spawn that fails fast, returning empty.
-    auto dir = temp_test_dir("backend-isolation");
-    mm::SlotManager slots(46180, 46183, 4, "missing-vllm");
+    // Compatible agents share one ready process. A launch-setting mismatch
+    // cannot attach; the attempted new process then fails on the fake path.
+    auto dir = temp_test_dir("llama-sharing");
+    mm::SlotManager slots(46180, 46183, 4);
     slots.set_llama_server_path("missing-llama");
-    const auto llama_id = slots.add_ready_test_slot_llama("m.gguf", "agent-l");
-    CHECK(slots.load_model("m.gguf", mm::VllmSettings{}, "agent-v").empty());
+    mm::RuntimeSettings settings;
+    settings.ctx_size = 4096;
+    const auto llama_id = slots.add_ready_test_slot("m.gguf", "agent-a", settings);
+    CHECK(slots.load_model("m.gguf", settings, "agent-b") == llama_id);
     auto llama_info = slots.find_slot(llama_id);
     CHECK(llama_info.has_value());
+    CHECK(llama_info->backend == "llama-cpp");
+    CHECK(llama_info->assigned_agent == "agent-a");
+    CHECK(llama_info->agent_ids.size() == 2);
     CHECK(std::find(llama_info->agent_ids.begin(), llama_info->agent_ids.end(),
-                    "agent-v") == llama_info->agent_ids.end());
+                    "agent-b") != llama_info->agent_ids.end());
 
-    const auto vllm_id = slots.add_ready_test_slot("v.gguf", "agent-v2");
-    CHECK(slots.load_model_llama("v.gguf", mm::RuntimeSettings{}, "agent-l2").empty());
-    auto vllm_info = slots.find_slot(vllm_id);
-    CHECK(vllm_info.has_value());
-    CHECK(vllm_info->backend == "vllm");
-    CHECK(std::find(vllm_info->agent_ids.begin(), vllm_info->agent_ids.end(),
-                    "agent-l2") == vllm_info->agent_ids.end());
+    auto incompatible = settings;
+    incompatible.ctx_size = 8192;
+    CHECK(slots.load_model("m.gguf", incompatible, "agent-c").empty());
+    llama_info = slots.find_slot(llama_id);
+    CHECK(llama_info.has_value());
+    CHECK(std::find(llama_info->agent_ids.begin(), llama_info->agent_ids.end(),
+                    "agent-c") == llama_info->agent_ids.end());
+
+    const auto first_detach = slots.detach_agent(llama_id, "agent-b");
+    CHECK(first_detach.ok());
+    CHECK(first_detach.remaining_agents == 1);
+    CHECK(!first_detach.unloaded);
+    const auto last_detach = slots.detach_agent(llama_id, "agent-a");
+    CHECK(last_detach.ok());
+    CHECK(last_detach.unloaded);
+    CHECK(!slots.find_slot(llama_id).has_value());
+
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_llama_restore_attaches_and_cleans_suspended_record() {
+    auto dir = temp_test_dir("llama-restore-attach");
+    mm::SlotManager slots(46190, 46193, 4);
+    mm::RuntimeSettings settings;
+    settings.ctx_size = 4096;
+
+    const auto suspended_id =
+        slots.add_ready_test_slot("m.gguf", "agent-b", settings);
+    CHECK(slots.suspend_slot(suspended_id).ok());
+    CHECK(slots.find_slot(suspended_id)->state == mm::SlotState::Suspended);
+
+    const auto ready_id = slots.add_ready_test_slot("m.gguf", "agent-a", settings);
+    const auto restored = slots.restore_slot("m.gguf", settings, "", "agent-b");
+    CHECK(restored == ready_id);
+    CHECK(!slots.find_slot(suspended_id).has_value());
+    CHECK(slots.find_slot_by_agent("agent-b") == ready_id);
+
+    const auto ready = slots.find_slot(ready_id);
+    CHECK(ready.has_value());
+    CHECK(ready->agent_ids.size() == 2);
+    CHECK(ready->backend == "llama-cpp");
 
     CHECK(remove_tree(dir));
     return true;
@@ -4756,45 +4437,23 @@ int main(int argc, char** argv) {
          test_agent_manager_rejects_duplicates_and_defers_cleanup_until_handles_release},
         {"agent_api_settings_round_trip_without_key_persistence",
          test_agent_api_settings_round_trip_without_key_persistence},
+        {"served_model_name_legacy_compatibility",
+         test_served_model_name_legacy_compatibility},
         {"slot_manager_not_found_statuses", test_slot_manager_not_found_statuses},
         {"slot_lease_blocks_unload_and_suspend_while_busy",
          test_slot_lease_blocks_unload_and_suspend_while_busy},
-        {"vllm_slot_info_and_suspend_without_kv_cache",
-         test_vllm_slot_info_and_suspend_without_kv_cache},
-        {"vllm_gpu_budget_accounting",
-         test_vllm_gpu_budget_accounting},
-        {"vllm_shared_slot_attach_and_detach",
-         test_vllm_shared_slot_attach_and_detach},
-        {"vllm_restore_attaches_and_cleans_suspended_record",
-         test_vllm_restore_attaches_and_cleans_suspended_record},
-        {"vllm_sleep_fallback_and_dead_wake_cleanup",
-         test_vllm_sleep_fallback_and_dead_wake_cleanup},
-        {"vllm_metrics_parse_and_slot_info_round_trip",
-         test_vllm_metrics_parse_and_slot_info_round_trip},
-        {"engine_group_planner",
-         test_engine_group_planner},
-        {"engine_group_launch_helpers",
-         test_engine_group_launch_helpers},
-        {"ray_start_args",
-         test_ray_start_args},
-        {"hf_cache_helpers",
-         test_hf_cache_helpers},
-        {"vllm_runtime_defaults_and_args",
-         test_vllm_runtime_defaults_and_args},
-        {"vllm_provisioner_helpers",
-         test_vllm_provisioner_helpers},
-        {"vllm_update_flow",
-         test_vllm_update_flow},
-        {"vllm_install_progress_parser",
-         test_vllm_install_progress_parser},
         {"node_action_progress_json_round_trip",
          test_node_action_progress_json_round_trip},
-        {"vllm_provision_cancel",
-         test_vllm_provision_cancel},
-        {"vllm_peer_selection",
-         test_vllm_peer_selection},
         {"scheduler_skips_failed_node_current_attempt",
          test_scheduler_skips_failed_node_current_attempt},
+        {"scheduler_transfers_existing_relative_models_with_unique_cache_ids",
+         test_scheduler_transfers_existing_relative_models_with_unique_cache_ids},
+        {"scheduler_eviction_skips_unsuspendable_shared_slot",
+         test_scheduler_eviction_skips_unsuspendable_shared_slot},
+        {"scheduler_backend_change_releases_local_placement",
+         test_scheduler_backend_change_releases_local_placement},
+        {"scheduler_reconciles_ready_absent_and_suspended_snapshots",
+         test_scheduler_reconciles_ready_absent_and_suspended_snapshots},
         {"control_api_external_token_gate", test_control_api_external_token_gate},
         {"openai_compat_api_listener_and_model_catalog",
          test_openai_compat_api_listener_and_model_catalog},
@@ -4804,8 +4463,6 @@ int main(int argc, char** argv) {
          test_agent_voice_db_and_cache_lifecycle},
         {"tts_service_client_fake_sidecar_paths",
          test_tts_service_client_fake_sidecar_paths},
-        {"tts_service_client_vllm_backend_paths",
-         test_tts_service_client_vllm_backend_paths},
         {"control_api_tts_routes_disabled", test_control_api_tts_routes_disabled},
         {"control_api_curation_routes", test_control_api_curation_routes},
         {"global_memory_origin_tool_and_context_metadata",
@@ -4845,8 +4502,10 @@ int main(int argc, char** argv) {
          test_llama_slot_info_backend_and_suspend},
         {"runtime_client_health_empty_body_ok",
          test_runtime_client_health_empty_body_ok},
-        {"llama_default_backend_and_isolation",
-         test_llama_default_backend_and_isolation},
+        {"llama_default_backend_and_slot_sharing",
+         test_llama_default_backend_and_slot_sharing},
+        {"llama_restore_attaches_and_cleans_suspended_record",
+         test_llama_restore_attaches_and_cleans_suspended_record},
         {"node_reachability_and_json_compatibility",
          test_node_reachability_and_json_compatibility},
         {"performance_tracker_capacity_aggregation_and_clear",

@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <optional>
 
 namespace mm::util {
 
@@ -36,15 +37,21 @@ bool ends_with(const std::string& s, const std::string& suffix);
 std::string replace_all(const std::string& s, const std::string& from, const std::string& to);
 
 // True when ref looks like a Hugging Face repo id ("org/name", each segment
-// [A-Za-z0-9._-]) rather than a local filesystem path. Shared by the node (HF
-// cache) and control (placement preference).
+// [A-Za-z0-9._-]) rather than a local filesystem path.
 bool is_hf_repo_id(const std::string& ref);
 
-// True when ref is a local filesystem path (has a separator or a Windows drive
-// prefix) rather than an HF repo id or a bare model name. Handles both '/' and
-// '\\' separators so it is correct regardless of host OS. Used by control to
-// decide whether a model must be transferred to a node.
+// True when ref is syntactically a local filesystem path. GGUF filenames are
+// local model references even when bare or shaped like "models/name.gguf";
+// this check deliberately takes precedence over the legacy org/name heuristic.
 bool model_ref_is_local_path(const std::string& ref);
+
+// Resolve a model reference to an existing local file. The reference itself is
+// checked first, followed by paths beneath models_dir (including the common
+// "models/name.gguf" spelling when models_dir is absolute). Returns a normalized
+// absolute path, or nullopt when the reference is node-local/nonexistent here.
+std::optional<std::string> resolve_existing_local_model_path(
+    const std::string& ref,
+    const std::string& models_dir = {});
 
 // A stable, filesystem-safe identity for a model reference: the final path
 // component (a file name like "Qwen3-8B.gguf" or a directory name), with any

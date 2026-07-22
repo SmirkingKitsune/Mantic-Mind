@@ -1,176 +1,83 @@
 # mantic-mind node configuration
 # Copy this file next to the mantic-mind executable.
-# Environment variables override any value set here.
+# Environment variables override values set here.
 
-# ── Network ────────────────────────────────────────────────────────────────────
-# Port this node listens on for control + infer requests.
+# -- Network ------------------------------------------------------------------
+# Port this node listens on for control and inference requests.
 listen_port = 7070
 
-# URL of the mantic-mind-control process.
-# Leave empty to run the node standalone (no registration).
+# URL of the mantic-mind-control process. Leave empty for standalone mode.
 control_url = ""
 
-# Bearer token to authenticate with the control server.
+# Bearer token used to authenticate with control.
 control_api_key = ""
 
-# URL this node is reachable at from the control server.
-# Defaults to http://127.0.0.1:<listen_port> if not set.
-# self_url = "http://192.168.1.10:7070"
+# The public node URL is configured with MM_SELF_URL and defaults to
+# http://127.0.0.1:<listen_port>.
 
-# ── vLLM engine processes ──────────────────────────────────────────────────────
-# Port range for concurrent vLLM engine processes. Each engine slot binds one
-# port in this range; the range must not conflict with listen_port.
+# -- llama.cpp engine slots ----------------------------------------------------
+# Each llama-server process binds one port in this range. It must not overlap
+# listen_port.
 runtime_port_range_start = 8080
 runtime_port_range_end   = 8090
 
-# Maximum number of concurrent model slots (vLLM engine processes).
+# Maximum number of concurrent llama-server processes.
 max_slots = 4
 
-# ── vLLM (opt-in peer backend) ─────────────────────────────────────────────────
-# llama.cpp is the default runtime on this branch; vLLM-as-default is preserved
-# on the vLLM-runtime branch. A vLLM already on PATH (or previously provisioned)
-# is used for agents with inference_backend = "vllm", but a missing vLLM is NOT
-# installed unless you enable auto-provisioning below.
-# vllm_server_path = "vllm"
+# GPUs advertised by this node. Zero auto-detects with nvidia-smi.
+# node_gpu_count = 0
 
-# If vllm_server_path cannot be resolved, the node can create a managed vLLM
-# runtime under vllm_provision_dir and use that executable for engine slots.
-# Windows uses SystemPanic/vllm-windows, Linux uses vllm-project/vllm, and
-# Apple Silicon macOS uses vllm-project/vllm-metal.
-# vllm_auto_provision = false
-# vllm_provision_dir = "data/runtimes/vllm"
-# vllm_install_method = "auto"  # auto | wheel | source
-# vllm_version = "latest"
-# vllm_python_path = ""
+# -- llama.cpp runtime ---------------------------------------------------------
+# Agents serve local GGUF models through llama-server. An explicit executable
+# path overrides managed runtime selection.
+# llama_server_path = "llama-server"        # or MM_LLAMA_PATH
 
-# Runtime update management. A missing runtime is always bootstrapped (per
-# vllm_auto_provision above); these keys govern *updating* an existing install.
-# The node picks the accelerator-correct build for its hardware automatically
-# (CUDA / ROCm / CPU on Linux, Metal on Apple Silicon, the SystemPanic build on
-# Windows).
-#   prompt (default) — detect newer builds and prompt; update only when you
-#                      approve it (node TUI Update button/popup, or the update
-#                      REST endpoint). A live progress bar shows the install.
-#   auto             — download and apply updates as soon as they are found
-#   manual           — never check for or apply updates automatically
-# When one node updates, control nudges same-environment peers to check too, so
-# the cluster converges on a consistent version (each peer honors its own policy).
-# vllm_update_policy = "prompt"
-# vllm_update_check = true                  # run the periodic online version check
-# vllm_update_check_interval_hours = 24
-
-# ── llama.cpp (default runtime) ────────────────────────────────────────────────
-# Agents default to inference_backend = "llama-cpp" and serve a local GGUF via
-# llama-server. vLLM runs alongside as an opt-in peer on the same node (its own
-# slots, its own runtime). llama.cpp is the reliable path for GGUF models,
-# Windows-native inference, and accelerators without a vLLM build (e.g. the
-# NVIDIA DGX Spark GB10).
-# llama_server_path = "llama-server"        # or MM_LLAMA_PATH; use an explicit path to override managed GPU selection
-# A bare PATH llama-server is accepted for CPU (or when auto-provision is off),
-# otherwise the node first retrieves the accelerator-matched official
-# release matching this OS, architecture, accelerator, and CUDA compatibility.
-# Source is built only when no matching release can be used. Provisioning runs
-# in the background, so node startup and vLLM serving never block on it.
+# A bare PATH llama-server is accepted for CPU, for normal Metal-enabled macOS,
+# or when auto-provisioning is disabled. Otherwise the node first retrieves an
+# accelerator-matched official release and builds from source only when no
+# compatible release exists.
 # llama_auto_provision = true
 # llama_provision_dir = "data/runtimes/llama.cpp"
-# llama_install_method = "auto"   # auto (release, then source) | release | source
-# llama_version = "latest"        # git ref / release tag, or "latest"
-# llama_accelerator = ""          # cuda | rocm | vulkan | metal | cpu; "" = auto-detect
-# For the DGX Spark GB10 (aarch64, sm_121) a source build with CUDA 13+ is
-# required; set the compute capability so CMake targets it:
-# llama_cuda_arch = "121"
-# llama_build_jobs = 0          # 0 = conservative default (2 for CUDA/ROCm, 4 otherwise)
-#
-# llama.cpp updates have their own policy because an accelerator without an
-# official release (currently Linux CUDA) may require a local CMake build. The
-# prompt identifies download vs compilation before approval and offers any
-# same-platform Vulkan/CPU/other release variants published for that tag.
-# llama_update_policy = "prompt"          # prompt | auto | manual
+# llama_install_method = "auto"             # auto | release | source
+# llama_version = "latest"                  # release tag or source ref
+# llama_accelerator = ""
+#   cuda | rocm | vulkan | openvino | sycl-fp32 | sycl-fp16 | metal | cpu
+# llama_cuda_arch = ""                      # e.g. 121 for DGX Spark GB10
+# llama_build_jobs = 0                       # 0 selects a conservative default
+
+# Managed runtime update behavior.
+#   prompt -- report a newer build and wait for approval
+#   auto   -- apply newer builds automatically
+#   manual -- never check or update automatically
+# llama_update_policy = "prompt"
 # llama_update_check = true
 # llama_update_check_interval_hours = 24
 
-# Total fraction of GPU memory all vLLM slots on this node may claim together.
-# Each vLLM slot reserves an explicit --gpu-memory-utilization slice out of
-# this budget; loads are clamped to the remaining budget and rejected when it
-# is exhausted. Range (0, 1].
-# vllm_gpu_budget = 0.90
-
-# ── Cluster / multi-node engine groups ─────────────────────────────────────────
-# Capabilities this node advertises to control. Leave unset to auto-detect.
-# comm_backends = "nccl,gloo"   # CSV; auto-detect picks nccl+gloo on Linux+CUDA, else gloo
-# supports_ray = true            # multi-node Ray membership; auto = true on Linux
-# node_gpu_count = 0             # 0 = auto via nvidia-smi
-# interconnect_gbps = 200        # node-to-node link hint for group scoring
-
-# Ray CLI used to form multi-node vLLM engine groups (Linux nodes only).
-# ray_path = "ray"
-# ray_port = 6379
-
-# ── Hugging Face model cache ────────────────────────────────────────────────────
-# vLLM resolves a model_path as an HF repo id (auto-downloaded to the HF cache),
-# a cache hit, or a local directory. The node reports which repos it has cached
-# so control can prefer a node that already holds the model.
-#
-# hf_cache_dir pins the HF hub cache directory. Point every node at one shared
-# location (e.g. an NFS export on the NAS) so a model downloads once for the
-# whole cluster. Leave unset to use HF_HUB_CACHE / HF_HOME / ~/.cache/huggingface.
-# hf_cache_dir = "/mnt/nas/hf-cache/hub"
-
-# CLI used to pre-fetch models out-of-band (POST /api/node/models/pull), so a
-# large download doesn't run inside the load-model health-timeout. Linux only.
-# hf_cli_path = "hf"
-
-# ── Cluster capabilities (multi-node engine groups) ─────────────────────────────
-# These are auto-detected at startup; set them only to override what this node
-# advertises to control for multi-node vLLM engine-group planning.
-#
-# Collective-comms backends, highest preference first. Auto: Linux+CUDA →
-# "nccl,gloo"; native Windows (no NCCL yet) and CPU-only → "gloo".
-# comm_backends = "nccl,gloo"
-#
-# Whether this node can join a multi-node Ray engine group. Auto: true on
-# Linux/WSL, false on native Windows.
-# supports_ray = true
-#
-# GPUs visible to this node (0 = auto via nvidia-smi).
-# node_gpu_count = 0
-#
-# Node-to-node link bandwidth hint in Gbps (e.g. 200 for ConnectX 200GbE).
-# Used only as a tiebreak when ranking candidate engine groups.
-# interconnect_gbps = 0
-
-# ── Storage ────────────────────────────────────────────────────────────────────
-# Local model cache root. When a node lacks a model given as a local path,
-# control transfers it here; the node then loads from its own copy. The node
-# keeps an LRU use-queue over this directory and evicts unpinned models under
-# disk pressure. Pinned models (control marked this node preferred for the
-# agent) are never auto-evicted.
+# -- Storage ------------------------------------------------------------------
+# Local model cache root. Control transfers GGUF and projector files here when
+# a node does not already have them.
 models_dir = "models"
 
+# llama.cpp KV-cache checkpoints used when suspending slots.
+kv_cache_dir = "data/kv_cache"
+
 # Evict least-recently-used unpinned models once free space on the models_dir
-# filesystem drops below this many MB. 0 disables the proactive threshold (a
-# transfer still evicts just enough to fit the incoming model).
+# filesystem drops below this many MiB. Zero disables the proactive threshold.
 model_cache_min_free_mb = 10240
 
-# On shutdown, delete every model except those pinned to this node. Set false to
-# retain the full local cache across restarts.
+# On shutdown, delete every model except those pinned to this node.
 model_cache_clear_on_shutdown = true
 
-# Node runtime data root. Remembered pairing API keys live in {data_dir}/api_keys.json.
+# Node runtime data root. Remembered pairing API keys live in api_keys.json.
 data_dir = "data"
 
-# ── Logging ────────────────────────────────────────────────────────────────────
+# -- Logging ------------------------------------------------------------------
 log_file = "logs/mantic-mind.log"
 
-# ── Authentication ────────────────────────────────────────────────────────────
-# Pre-set API key for this node.  If empty, one is generated on each startup
-# and printed to the UI.
-# api_key = "change-me"
-
-# ── Discovery & Pairing ────────────────────────────────────────────────────────
+# -- Discovery and pairing ----------------------------------------------------
 # UDP port used for node discovery broadcasts.
 # discovery_port = 7072
 
-# Pre-shared key for automatic PSK pairing.
-# Set the same value on both node and control to skip the PIN dialog.
+# Pre-shared key for automatic pairing. Use the same value on node and control
+# to skip the PIN dialog.
 # pairing_key = ""

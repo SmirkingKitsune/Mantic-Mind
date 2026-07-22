@@ -472,8 +472,8 @@ bool RuntimeClient::health_check() {
     cli.set_read_timeout(5);
     auto res = cli.Get("/health");
     if (!res || res->status != 200) { model_loaded_ = false; return false; }
-    // Backend-agnostic: vLLM answers 200 with an empty body; llama-server and
-    // some OpenAI-compatible servers answer 200 with {"status":"ok"}. Treat a
+    // llama-server and other OpenAI-compatible servers may answer with an empty
+    // body or {"status":"ok"}. Treat a
     // 200 as healthy unless the body carries an explicit non-ok status.
     if (util::trim(res->body).empty()) { model_loaded_ = true; return true; }
     try {

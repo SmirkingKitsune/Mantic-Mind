@@ -12,7 +12,7 @@ namespace mm {
 
 enum class ProcessState { Stopped, Starting, Ready, Error };
 
-// Manages an inference engine child process (`vllm serve`).
+// Manages a llama-server inference child process.
 // Platform specifics are hidden behind a PIMPL.
 // Pipe output is forwarded via LogCallback on background threads.
 class RuntimeProcess {
@@ -22,12 +22,6 @@ public:
 
     using LogCallback = std::function<void(const std::string& line, bool is_stderr)>;
     void set_log_callback(LogCallback cb);
-
-    // Launches `vllm serve` on the given port; blocks until /health is ready
-    // or the startup timeout expires. Returns true on success.
-    bool start_vllm(const std::string& model_ref,
-                    const VllmSettings& settings,
-                    uint16_t port = 8080);
 
     // Launches `llama-server` on the given port; blocks until /health is ready
     // or the startup timeout expires. When slot_save_path is non-empty the

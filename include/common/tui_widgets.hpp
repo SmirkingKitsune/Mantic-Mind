@@ -245,7 +245,7 @@ inline ftxui::Element slot_state_el(SlotState st) {
         case SlotState::Ready:      return text("● ready")      | color(Color::Green);
         case SlotState::Loading:    return text("◐ loading")    | color(Color::Yellow);
         case SlotState::Suspending: return text("◑ suspending") | color(Color::Yellow);
-        case SlotState::Suspended:  return text("◌ sleeping")   | color(Color::GrayDark);
+        case SlotState::Suspended:  return text("◌ suspended")  | color(Color::GrayDark);
         case SlotState::Error:      return text("✗ error")      | color(Color::Red);
         case SlotState::Empty:
         default:                    return text("· empty")      | dim;
@@ -263,17 +263,8 @@ inline std::string short_model(const std::string& path, size_t max = 26) {
 }
 
 // KV-cache usage cell: small gauge + percentage.
-inline ftxui::Element kv_cell(double usage_0_1) {
-    using namespace ftxui;
-    float pct = static_cast<float>(usage_0_1) * 100.0f;
-    pct = std::clamp(pct, 0.0f, 100.0f);
-    char buf[8];
-    std::snprintf(buf, sizeof(buf), "%3d%%", static_cast<int>(pct + 0.5f));
-    return hbox({gauge_bar(pct, 5), text(" "), text(buf) | dim});
-}
-
 // ── Slot table ────────────────────────────────────────────────────────────────
-// SLOT | STATE | MODEL | [AGENTS] | KV | REQ | VRAM. `wide` adds the AGENTS
+// SLOT | STATE | MODEL | [AGENTS] | PORT | CTX | VRAM. `wide` adds the AGENTS
 // column and roomier widths for the control node-detail; the narrow form is for
 // the node console's SLOTS panel.
 inline ftxui::Element slot_table(const std::vector<SlotInfo>& slots, bool wide) {
@@ -284,13 +275,13 @@ inline ftxui::Element slot_table(const std::vector<SlotInfo>& slots, bool wide) 
     const int wState = wide ? 13 : 11;
     const int wModel = wide ? 26 : 15;
     const int wAgents = 14;
-    const int wKv = 11;
-    const int wReq = 7;
+    const int wPort = 6;
+    const int wCtx = 8;
     const int wVram = 6;
     auto sep = [] { return text(" │ ") | dim; };
 
     auto make_row = [&](Element slot, Element state, Element model, Element agents,
-                        Element kv, Element req, Element vram) -> Element {
+                        Element port, Element context, Element vram) -> Element {
         Elements cells = {col(std::move(slot), wSlot), sep(),
                           col(std::move(state), wState), sep(),
                           col(std::move(model), wModel), sep()};
@@ -298,9 +289,9 @@ inline ftxui::Element slot_table(const std::vector<SlotInfo>& slots, bool wide) 
             cells.push_back(col(std::move(agents), wAgents));
             cells.push_back(sep());
         }
-        cells.push_back(col(std::move(kv), wKv));
+        cells.push_back(col_right(std::move(port), wPort));
         cells.push_back(sep());
-        cells.push_back(col(std::move(req), wReq));
+        cells.push_back(col_right(std::move(context), wCtx));
         cells.push_back(sep());
         cells.push_back(col_right(std::move(vram), wVram));
         return hbox(std::move(cells));
@@ -308,23 +299,23 @@ inline ftxui::Element slot_table(const std::vector<SlotInfo>& slots, bool wide) 
 
     Elements rows;
     rows.push_back(make_row(text("SLOT") | dim, text("STATE") | dim, text("MODEL") | dim,
-                            text("AGENTS") | dim, text("KV") | dim, text("REQ") | dim,
+                            text("AGENTS") | dim, text("PORT") | dim, text("CTX") | dim,
                             text("VRAM") | dim));
     rows.push_back(separator());
     for (const auto& s : slots) {
         std::string slot_id = s.id;
         if (slot_id.rfind("slot-", 0) == 0) slot_id = "s" + slot_id.substr(5);
         const std::string agents = s.agent_ids.empty() ? "—" : mm::util::join(s.agent_ids, ",");
-        Element req = text("r" + std::to_string(s.num_requests_running) + " w" +
-                           std::to_string(s.num_requests_waiting));
-        if (s.num_requests_waiting > 0) req = std::move(req) | color(Color::Yellow);
-        else                            req = std::move(req) | dim;
+        Element port = s.port > 0 ? text(std::to_string(s.port)) : (text("-") | dim);
+        Element context = s.effective_ctx_size > 0
+            ? text(std::to_string(s.effective_ctx_size))
+            : (text("-") | dim);
         Element vram = s.vram_usage_mb > 0 ? text(mb_str(s.vram_usage_mb)) : (text("—") | dim);
         Element model = s.state == SlotState::Empty ? (text(short_model(s.model_path)) | dim)
                                                     : text(short_model(s.model_path));
         rows.push_back(make_row(text(slot_id) | dim, slot_state_el(s.state), std::move(model),
-                                text(agents) | color(Color::Cyan), kv_cell(s.kv_cache_usage),
-                                std::move(req), std::move(vram)));
+                                text(agents) | color(Color::Cyan), std::move(port),
+                                std::move(context), std::move(vram)));
     }
     return vbox(std::move(rows));
 }

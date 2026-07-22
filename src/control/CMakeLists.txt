@@ -2,7 +2,6 @@ add_executable(mantic-mind-control
     main.cpp
     node_registry.cpp
     agent_scheduler.cpp
-    engine_group_planner.cpp
     agent_queue.cpp
     agent_manager.cpp
     agent_config_validator.cpp

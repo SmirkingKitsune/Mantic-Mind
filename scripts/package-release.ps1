@@ -321,12 +321,12 @@ $Manifest = @(
     "- bin/mantic-mind-control",
     "- runtime DLLs copied from the build output",
     "- default root config files copied from tools/",
-    "- tools/qwen_tts_service.py and tools/schema/",
+    "- tools/qwen_tts_service.py",
     "- README.md and LICENSE",
     "",
     "Not included:",
-    "- vLLM or Python package environments",
-    "- model weights and Hugging Face caches",
+    "- managed inference runtime installs and Python package environments",
+    "- model weights and model caches",
     "- runtime data, logs, and local agent databases"
 )
 $Manifest | Set-Content -Path (Join-Path $PackageRoot "release-manifest.txt") -Encoding UTF8

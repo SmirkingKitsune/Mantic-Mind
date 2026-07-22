@@ -2,6 +2,7 @@
 #include "control/node_registry.hpp"
 #include "control/audio_player.hpp"
 #include "control/agent_manager.hpp"
+#include "control/agent_scheduler.hpp"
 #include "control/agent_config_validator.hpp"
 #include "common/agent.hpp"
 #include "common/agent_db.hpp"
@@ -30,6 +31,7 @@
 #include <filesystem>
 #include <map>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -130,6 +132,7 @@ ftxui::Component MakeDragDivider(int* split, int lo, int hi) {
 
 ControlUI::ControlUI(NodeRegistry& registry,
                      AgentManager& agents,
+                     AgentScheduler& scheduler,
                      std::string models_dir,
                      std::string control_base_url,
                      std::string control_api_token,
@@ -137,6 +140,7 @@ ControlUI::ControlUI(NodeRegistry& registry,
     : registry_(registry)
     , control_api_token_(std::move(control_api_token))
     , agents_(agents)
+    , scheduler_(scheduler)
     , models_dir_(std::move(models_dir))
     , control_base_url_(std::move(control_base_url))
     , local_chat_fallback_(std::move(local_chat_fallback))
@@ -203,8 +207,6 @@ void ControlUI::run() {
     std::vector<std::string> node_entries;
     int node_slot_sel = 0;
     std::vector<std::string> node_slot_entries;
-    std::string node_model_ref;
-    std::string node_ray_head;
     std::string node_operation_status;
 
     // 1a "Overview" dashboard state. node_rows is the per-frame node snapshot the
@@ -227,7 +229,7 @@ void ControlUI::run() {
     std::string add_url;
     std::string pin_input, pair_url, pair_nonce;
 
-    // Agents tab — the editor is re-fielded to vLLM engine settings (1b).
+    // Agents tab.
     int  agent_sel    = 0;
     bool show_editor  = false;
     std::vector<AgentConfig> agent_rows;   // per-frame snapshot the menu transform indexes
@@ -236,19 +238,10 @@ void ControlUI::run() {
     std::string ed_temp_s{"0.70"}, ed_topp_s{"0.90"}, ed_topk_s{"-1"};
     std::string ed_minp_s{"-1.00"}, ed_presence_s{"0.00"}, ed_repeat_s{"-1.00"};
     std::string ed_max_s{"1024"};
-    // Engine · vLLM
-    std::string ed_mml_s{"4096"};      // max_model_len
-    std::string ed_seqs_s{"16"};       // max_num_seqs
-    std::string ed_batched_s{"-1"};    // max_num_batched_tokens
-    std::string ed_tp_s{"1"};          // tensor_parallel_size
-    std::string ed_pp_s{"1"};          // pipeline_parallel_size
-    std::string ed_gpumem_s{"0.90"};   // gpu_memory_utilization
-    std::string ed_dtype{"auto"};      // dtype
-    std::string ed_quant;              // quantization
-    std::string ed_toolparser;         // tool_call_parser
-    std::string ed_extra_args_text;    // vllm_settings.extra_args (one per line)
+    // Local llama.cpp and remote API runtime settings.
     int ed_backend = 0;
-    std::vector<std::string> ed_backend_labels = {"llama.cpp", "vLLM", "Remote API"};
+    std::vector<std::string> ed_backend_labels = {"llama.cpp", "Remote API"};
+    std::string ed_unsupported_backend;
     std::string ed_ctx_s{"4096"}, ed_gpu_layers_s{"-1"}, ed_threads_s{"-1"};
     std::string ed_threads_http_s{"-1"}, ed_parallel_s{"1"};
     std::string ed_batch_s{"-1"}, ed_ubatch_s{"-1"};
@@ -260,7 +253,6 @@ void ControlUI::run() {
     bool ed_vision{false};
     std::string ed_mmproj;
     bool ed_reasoning{false}, ed_memories{true}, ed_tools{false};
-    bool ed_sleep{true}, ed_prefix{true}, ed_trust{false}, ed_autotool{false};
     ModelCapabilityInfo ed_model_info;
     std::vector<ValidationIssue> ed_validation_issues;
     std::string ed_validation_signature;
@@ -510,7 +502,11 @@ void ControlUI::run() {
         cfg.model_path = ed_model;
         cfg.system_prompt = ed_sysprompt;
         cfg.preferred_node_id = ed_pref_node;
-        cfg.inference_backend = ed_backend == 1 ? "vllm" : ed_backend == 2 ? "api" : "llama-cpp";
+        cfg.inference_backend = ed_backend == 1
+            ? "api"
+            : (ed_backend >= 2 && !ed_unsupported_backend.empty()
+                ? ed_unsupported_backend
+                : "llama-cpp");
         // Generation (shared request contract → RuntimeSettings)
         try { cfg.runtime_settings.temperature = std::stof(ed_temp_s); } catch (...) {}
         try { cfg.runtime_settings.top_p = std::stof(ed_topp_s); } catch (...) {}
@@ -527,21 +523,7 @@ void ControlUI::run() {
         try { cfg.runtime_settings.batch_size = std::stoi(ed_batch_s); } catch (...) {}
         try { cfg.runtime_settings.ubatch_size = std::stoi(ed_ubatch_s); } catch (...) {}
         cfg.runtime_settings.flash_attn = ed_flash;
-        // Engine · vLLM
-        try { cfg.vllm_settings.max_model_len = std::stoi(ed_mml_s); } catch (...) {}
-        try { cfg.vllm_settings.max_num_seqs = std::stoi(ed_seqs_s); } catch (...) {}
-        try { cfg.vllm_settings.max_num_batched_tokens = std::stoi(ed_batched_s); } catch (...) {}
-        try { cfg.vllm_settings.tensor_parallel_size = std::stoi(ed_tp_s); } catch (...) {}
-        try { cfg.vllm_settings.pipeline_parallel_size = std::stoi(ed_pp_s); } catch (...) {}
-        try { cfg.vllm_settings.gpu_memory_utilization = std::stod(ed_gpumem_s); } catch (...) {}
-        cfg.vllm_settings.dtype = ed_dtype.empty() ? "auto" : ed_dtype;
-        cfg.vllm_settings.quantization = ed_quant;
-        cfg.vllm_settings.served_model_name = ed_served_model;
-        cfg.vllm_settings.tool_call_parser = ed_toolparser;
-        cfg.vllm_settings.enable_sleep_mode = ed_sleep;
-        cfg.vllm_settings.enable_prefix_caching = ed_prefix;
-        cfg.vllm_settings.trust_remote_code = ed_trust;
-        cfg.vllm_settings.enable_auto_tool_choice = ed_autotool;
+        cfg.served_model_name = ed_served_model;
         cfg.api_settings.base_url = ed_api_base;
         cfg.api_settings.chat_completions_path = ed_api_path;
         cfg.api_settings.api_key_env = ed_api_key_env;
@@ -549,22 +531,9 @@ void ControlUI::run() {
         cfg.vision_settings.enabled = ed_vision;
         cfg.vision_settings.mmproj_path = ed_mmproj;
 
-        // Keep ctx_size aligned with max_model_len so the shared contract has a context.
         cfg.reasoning_enabled = ed_reasoning;
         cfg.memories_enabled = ed_memories;
         cfg.tools_enabled = ed_tools;
-
-        cfg.vllm_settings.extra_args.clear();
-        size_t start = 0;
-        while (start <= ed_extra_args_text.size()) {
-            size_t end = ed_extra_args_text.find('\n', start);
-            std::string line = ed_extra_args_text.substr(
-                start, end == std::string::npos ? std::string::npos : (end - start));
-            line = util::trim(line);
-            if (!line.empty()) cfg.vllm_settings.extra_args.push_back(line);
-            if (end == std::string::npos) break;
-            start = end + 1;
-        }
 
         cfg.runtime_settings.extra_args.clear();
         size_t llama_start = 0;
@@ -592,18 +561,14 @@ void ControlUI::run() {
             ed_id + '\n' + ed_name + '\n' + ed_model + '\n' + ed_sysprompt + '\n' + ed_pref_node +
             '\n' + ed_temp_s + '\n' + ed_topp_s + '\n' + ed_topk_s + '\n' +
             ed_minp_s + '\n' + ed_presence_s + '\n' + ed_repeat_s + '\n' + ed_max_s + '\n' +
-            ed_mml_s + '\n' + ed_seqs_s + '\n' + ed_batched_s + '\n' + ed_tp_s + '\n' + ed_pp_s +
-            '\n' + ed_gpumem_s + '\n' + ed_dtype + '\n' + ed_quant + '\n' + ed_toolparser + '\n' +
-            ed_extra_args_text + '\n' +
-            std::to_string(ed_backend) + '\n' + ed_ctx_s + '\n' + ed_gpu_layers_s + '\n' +
+            std::to_string(ed_backend) + '\n' + ed_unsupported_backend + '\n' +
+            ed_ctx_s + '\n' + ed_gpu_layers_s + '\n' +
             ed_threads_s + '\n' + ed_threads_http_s + '\n' + ed_parallel_s + '\n' + ed_batch_s + '\n' +
             ed_ubatch_s + '\n' + ed_llama_extra_args_text + '\n' + ed_served_model + '\n' +
             ed_api_base + '\n' + ed_api_path + '\n' + ed_api_key + '\n' + ed_api_key_env + '\n' +
             (ed_vision ? "1" : "0") + '\n' + ed_mmproj + '\n' +
             (ed_flash ? "1" : "0") +
-            (ed_reasoning ? "1" : "0") + (ed_memories ? "1" : "0") + (ed_tools ? "1" : "0") +
-            (ed_sleep ? "1" : "0") + (ed_prefix ? "1" : "0") + (ed_trust ? "1" : "0") +
-            (ed_autotool ? "1" : "0");
+            (ed_reasoning ? "1" : "0") + (ed_memories ? "1" : "0") + (ed_tools ? "1" : "0");
         if (signature == ed_validation_signature) return;
         ed_validation_signature = signature;
         auto validation = validate_agent_config(build_editor_cfg(), &registry_, models_dir_, &ed_model_info);
@@ -755,12 +720,6 @@ void ControlUI::run() {
         if (node_sel < 0 || node_sel >= static_cast<int>(nodes.size())) return std::nullopt;
         return nodes[static_cast<std::size_t>(node_sel)];
     };
-    auto selected_control_slot = [&]() -> std::optional<SlotInfo> {
-        const auto node = selected_control_node();
-        if (!node || node_slot_sel < 0 || node_slot_sel >= static_cast<int>(node->slots.size()))
-            return std::nullopt;
-        return node->slots[static_cast<std::size_t>(node_slot_sel)];
-    };
     auto post_selected_node = [&](const std::string& path, const nlohmann::json& body) {
         const auto node = selected_control_node();
         if (!node || !node->connected) { node_operation_status = "node is not online"; return false; }
@@ -772,46 +731,11 @@ void ControlUI::run() {
         return response.ok();
     };
     auto node_slot_menu = Menu(&node_slot_entries, &node_slot_sel, MenuOption::Vertical());
-    InputOption node_model_option; node_model_option.multiline = false;
-    node_model_option.placeholder = "model path or Hugging Face repo";
-    auto node_model_input = Input(&node_model_ref, node_model_option);
-    InputOption node_ray_option; node_ray_option.multiline = false;
-    node_ray_option.placeholder = "head-ip:port";
-    auto node_ray_input = Input(&node_ray_head, node_ray_option);
-    auto btn_control_suspend = Button(" Suspend ", [&] {
-        if (auto slot = selected_control_slot()) post_selected_node("/api/node/suspend-slot", {{"slot_id", slot->id}});
-    }, ButtonOption::Simple());
-    auto btn_control_unload = Button(" Unload ", [&] {
-        if (auto slot = selected_control_slot()) post_selected_node("/api/node/unload-model", {{"slot_id", slot->id}});
-    }, ButtonOption::Simple());
-    auto btn_control_restore = Button(" Restore ", [&] {
-        if (auto slot = selected_control_slot()) post_selected_node("/api/node/restore-slot", {
-            {"model_path", slot->model_path}, {"agent_id", slot->assigned_agent},
-            {"backend", slot->backend}, {"kv_cache_path", slot->kv_cache_path}});
-    }, ButtonOption::Simple());
-    auto btn_control_pull = Button(" Pull model ", [&] {
-        if (!util::trim(node_model_ref).empty())
-            post_selected_node("/api/node/models/pull", {{"model_ref", util::trim(node_model_ref)}});
-    }, ButtonOption::Simple());
-    auto btn_control_vllm = Button(" Provision vLLM ", [&] {
-        post_selected_node("/api/node/runtime/vllm/provision", nlohmann::json::object());
-    }, ButtonOption::Simple());
-    auto btn_control_ray_head = Button(" Ray head ", [&] {
-        post_selected_node("/api/node/ray/start", {{"role", "head"}});
-    }, ButtonOption::Simple());
-    auto btn_control_ray_join = Button(" Join Ray ", [&] {
-        post_selected_node("/api/node/ray/start", {{"role", "worker"}, {"head_address", node_ray_head}});
-    }, ButtonOption::Simple());
-    auto btn_control_ray_stop = Button(" Stop Ray ", [&] {
-        post_selected_node("/api/node/ray/stop", nlohmann::json::object());
-    }, ButtonOption::Simple());
-    auto control_slot_buttons = Container::Horizontal({btn_control_suspend, btn_control_restore, btn_control_unload});
     auto btn_control_cancel = Button(" Cancel action ", [&] {
         post_selected_node("/api/node/actions/cancel", nlohmann::json::object());
     }, ButtonOption::Simple());
-    auto control_model_row = Container::Horizontal({node_model_input, btn_control_pull, btn_control_vllm});
-    auto control_ray_row = Container::Horizontal({node_ray_input, btn_control_ray_head, btn_control_ray_join, btn_control_ray_stop, btn_control_cancel});
-    auto node_operations = Container::Vertical({node_slot_menu, control_slot_buttons, control_model_row, control_ray_row});
+    auto control_action_buttons = Container::Horizontal({btn_control_cancel});
+    auto node_operations = Container::Vertical({node_slot_menu, control_action_buttons});
 
     auto nodes_comp  = Container::Vertical({disc_comp, nodes_section, node_name_divider,
         node_rows_divider, node_operations});
@@ -953,11 +877,9 @@ void ControlUI::run() {
         ed_temp_s = "0.70"; ed_topp_s = "0.90"; ed_topk_s = "-1";
         ed_minp_s = "-1.00"; ed_presence_s = "0.00"; ed_repeat_s = "-1.00";
         ed_max_s = "1024";
-        ed_mml_s = "4096"; ed_seqs_s = "16"; ed_batched_s = "-1";
-        ed_tp_s = "1"; ed_pp_s = "1"; ed_gpumem_s = "0.90";
-        ed_dtype = "auto"; ed_quant.clear(); ed_toolparser.clear();
-        ed_extra_args_text.clear();
         ed_backend = 0;
+        ed_backend_labels = {"llama.cpp", "Remote API"};
+        ed_unsupported_backend.clear();
         ed_ctx_s = "4096"; ed_gpu_layers_s = "-1"; ed_threads_s = "-1";
         ed_threads_http_s = "-1"; ed_parallel_s = "1"; ed_batch_s = "-1"; ed_ubatch_s = "-1";
         ed_llama_extra_args_text.clear(); ed_flash = true;
@@ -966,7 +888,6 @@ void ControlUI::run() {
         ed_api_key.clear(); ed_api_key_env = "OPENAI_API_KEY";
         ed_vision = false; ed_mmproj.clear();
         ed_reasoning = false; ed_memories = true; ed_tools = false;
-        ed_sleep = true; ed_prefix = true; ed_trust = false; ed_autotool = false;
         ed_model_info = {};
         ed_validation_issues.clear();
         ed_validation_signature.clear();
@@ -991,23 +912,19 @@ void ControlUI::run() {
             snprintf(tmp, sizeof(tmp), "%.2f", static_cast<double>(c.runtime_settings.repeat_penalty));
             ed_repeat_s = tmp;
             ed_max_s = std::to_string(c.runtime_settings.max_tokens);
-            ed_mml_s = std::to_string(c.vllm_settings.max_model_len);
-            ed_seqs_s = std::to_string(c.vllm_settings.max_num_seqs);
-            ed_batched_s = std::to_string(c.vllm_settings.max_num_batched_tokens);
-            ed_tp_s = std::to_string(c.vllm_settings.tensor_parallel_size);
-            ed_pp_s = std::to_string(c.vllm_settings.pipeline_parallel_size);
-            snprintf(tmp, sizeof(tmp), "%.2f", c.vllm_settings.gpu_memory_utilization);
-            ed_gpumem_s = tmp;
-            ed_dtype = c.vllm_settings.dtype.empty() ? "auto" : c.vllm_settings.dtype;
-            ed_quant = c.vllm_settings.quantization;
-            ed_toolparser = c.vllm_settings.tool_call_parser;
-            ed_extra_args_text.clear();
-            for (size_t i = 0; i < c.vllm_settings.extra_args.size(); ++i) {
-                if (i > 0) ed_extra_args_text += '\n';
-                ed_extra_args_text += c.vllm_settings.extra_args[i];
-            }
             const std::string backend = util::to_lower(c.inference_backend);
-            ed_backend = backend == "vllm" ? 1 : backend == "api" ? 2 : 0;
+            ed_backend_labels = {"llama.cpp", "Remote API"};
+            ed_unsupported_backend.clear();
+            if (backend.empty() || backend == "llama-cpp" || backend == "llama.cpp" ||
+                backend == "llama") {
+                ed_backend = 0;
+            } else if (backend == "api") {
+                ed_backend = 1;
+            } else {
+                ed_unsupported_backend = backend;
+                ed_backend_labels.push_back("Unsupported: " + backend);
+                ed_backend = 2;
+            }
             ed_ctx_s = std::to_string(c.runtime_settings.ctx_size);
             ed_gpu_layers_s = std::to_string(c.runtime_settings.n_gpu_layers);
             ed_threads_s = std::to_string(c.runtime_settings.n_threads);
@@ -1017,7 +934,7 @@ void ControlUI::run() {
             ed_ubatch_s = std::to_string(c.runtime_settings.ubatch_size);
             ed_flash = c.runtime_settings.flash_attn;
             ed_llama_extra_args_text = util::join(c.runtime_settings.extra_args, "\n");
-            ed_served_model = c.vllm_settings.served_model_name;
+            ed_served_model = c.served_model_name;
             ed_api_base = c.api_settings.base_url;
             ed_api_path = c.api_settings.chat_completions_path;
             ed_api_key.clear();
@@ -1025,10 +942,6 @@ void ControlUI::run() {
             ed_vision = c.vision_settings.enabled;
             ed_mmproj = c.vision_settings.mmproj_path;
 
-            ed_sleep = c.vllm_settings.enable_sleep_mode;
-            ed_prefix = c.vllm_settings.enable_prefix_caching;
-            ed_trust = c.vllm_settings.trust_remote_code;
-            ed_autotool = c.vllm_settings.enable_auto_tool_choice;
             ed_reasoning = c.reasoning_enabled;
             ed_memories  = c.memories_enabled;
             ed_tools     = c.tools_enabled;
@@ -1041,6 +954,7 @@ void ControlUI::run() {
     auto btn_del_a    = Button("[-] Delete", [&] {
         auto cs = agents_.list_agents();
         if (agent_sel >= 0 && agent_sel < static_cast<int>(cs.size())) {
+            scheduler_.release_agent(cs[agent_sel].id);
             agents_.delete_agent(cs[agent_sel].id);
             if (agent_sel >= static_cast<int>(cs.size()) - 1)
                 agent_sel = std::max(0, static_cast<int>(cs.size()) - 2);
@@ -1054,7 +968,7 @@ void ControlUI::run() {
 
     // 1b editor: collapsible sections + resizable split.
     bool ed_open_sampling = false;   // section expanded?
-    bool ed_open_engine   = true;    // vLLM engine is the focus of the re-field → open by default
+    bool ed_open_engine   = true;
     bool ed_open_caps     = false;
     int  ed_split         = layout.get("agents.editor_width", 26, 18, 46);
 
@@ -1087,16 +1001,6 @@ void ControlUI::run() {
     auto ed_inp_llama_extra = Input(&ed_llama_extra_args_text, ml);
     auto ed_cb_flash = Checkbox("flash_attention", &ed_flash);
 
-    auto ed_inp_mml       = Input(&ed_mml_s,      sl);
-    auto ed_inp_seqs      = Input(&ed_seqs_s,     sl);
-    auto ed_inp_batched   = Input(&ed_batched_s,  sl);
-    auto ed_inp_tp        = Input(&ed_tp_s,       sl);
-    auto ed_inp_pp        = Input(&ed_pp_s,       sl);
-    auto ed_inp_gpumem    = Input(&ed_gpumem_s,   sl);
-    auto ed_inp_dtype     = Input(&ed_dtype,      sl);
-    auto ed_inp_quant     = Input(&ed_quant,      sl);
-    auto ed_inp_toolparser = Input(&ed_toolparser, sl);
-    auto ed_inp_extra = Input(&ed_extra_args_text, ml);
     auto ed_inp_served_model = Input(&ed_served_model, sl);
     auto ed_inp_api_base = Input(&ed_api_base, sl);
     auto ed_inp_api_path = Input(&ed_api_path, sl);
@@ -1107,10 +1011,6 @@ void ControlUI::run() {
     auto ed_inp_mmproj = Input(&ed_mmproj, sl);
     auto ed_cb_vision = Checkbox("Vision", &ed_vision);
 
-    auto ed_cb_sleep     = Checkbox("sleep_mode",   &ed_sleep);
-    auto ed_cb_prefix    = Checkbox("prefix_cache", &ed_prefix);
-    auto ed_cb_trust     = Checkbox("trust_remote", &ed_trust);
-    auto ed_cb_autotool  = Checkbox("auto_tool",    &ed_autotool);
     auto ed_cb_reasoning = Checkbox("Reasoning",    &ed_reasoning);
     auto ed_cb_memories  = Checkbox("Memories",     &ed_memories);
     auto ed_cb_tools     = Checkbox("Tools",        &ed_tools);
@@ -1164,8 +1064,39 @@ void ControlUI::run() {
 
         AgentConfig cfg = build_editor_cfg();
         try {
-            if (ed_id_orig.empty()) agents_.create_agent(cfg);
-            else                    agents_.update_agent(ed_id_orig, cfg);
+            if (ed_id_orig.empty()) {
+                agents_.create_agent(cfg);
+            } else {
+                auto current = agents_.get_agent(ed_id_orig);
+                if (!current) {
+                    throw std::runtime_error("Agent no longer exists: " + ed_id_orig);
+                }
+                const AgentConfig old_cfg = current->get_config();
+                current.reset();
+                auto normalized_backend = [](const AgentConfig& candidate) {
+                    std::string backend = util::to_lower(
+                        util::trim(candidate.inference_backend));
+                    if (backend.empty() || backend == "llama" ||
+                        backend == "llama.cpp" || backend == "llama-cpp") {
+                        return std::string{"llama-cpp"};
+                    }
+                    return backend;
+                };
+                const bool id_changed = !cfg.id.empty() && cfg.id != ed_id_orig;
+                if (id_changed && agents_.get_agent(cfg.id)) {
+                    throw std::invalid_argument(
+                        "Agent ID '" + cfg.id + "' is already in use");
+                }
+                const bool local_to_api =
+                    normalized_backend(old_cfg) == "llama-cpp" &&
+                    normalized_backend(cfg) == "api";
+                if (id_changed || local_to_api) {
+                    scheduler_.release_agent(ed_id_orig);
+                }
+                if (agents_.update_agent(ed_id_orig, cfg).empty()) {
+                    throw std::runtime_error("Agent no longer exists: " + ed_id_orig);
+                }
+            }
         } catch (const std::exception& e) {
             const std::string err = e.what();
             log(LogLevel::Error, std::string("Agent save failed: ") + err);
@@ -1210,9 +1141,12 @@ void ControlUI::run() {
             [&] { return "temp " + ed_temp_s + " · top_p " + ed_topp_s +
                          " · top_k " + ed_topk_s + " · " + ed_max_s + " tok"; }));
     auto ed_sec_engine_btn = Button("Engine", [&] { ed_open_engine = !ed_open_engine; },
-        section_header(&ed_open_engine, "Engine · vLLM",
-            [&] { return "mml " + ed_mml_s + " · seqs " + ed_seqs_s + " · gpu " + ed_gpumem_s +
-                         " · tp" + ed_tp_s + "/pp" + ed_pp_s; }));
+        section_header(&ed_open_engine, "Runtime",
+            [&] {
+                if (ed_backend == 1) return "remote API · " + ed_api_base;
+                if (ed_backend >= 2) return "unsupported · " + ed_unsupported_backend;
+                return "llama.cpp · ctx " + ed_ctx_s + " · parallel " + ed_parallel_s;
+            }));
     auto ed_sec_caps_btn = Button("Caps", [&] { ed_open_caps = !ed_open_caps; },
         section_header(&ed_open_caps, "Capabilities & options",
             [&] { return std::string("tools ") + (ed_tools ? "y" : "n") + " · reason " +
@@ -1225,9 +1159,6 @@ void ControlUI::run() {
     auto sampling_m = Maybe(sampling_fields, [&] { return ed_open_sampling; });
     auto engine_fields = Container::Vertical({
         ed_backend_toggle,
-        ed_inp_mml, ed_inp_seqs, ed_inp_batched, ed_inp_tp, ed_inp_pp,
-        ed_inp_gpumem, ed_inp_dtype, ed_inp_quant, ed_inp_toolparser,
-        ed_cb_sleep, ed_cb_prefix, ed_cb_trust, ed_cb_autotool,
         ed_inp_ctx, ed_inp_gpu_layers, ed_inp_threads, ed_inp_threads_http,
         ed_inp_parallel, ed_inp_batch, ed_inp_ubatch, ed_cb_flash, ed_inp_llama_extra,
         ed_cb_vision, mmproj_row,
@@ -2290,23 +2221,18 @@ void ControlUI::run() {
                 text(""),
                 slot_table(n.slots, true),
                 node_slot_menu->Render() | yframe | size(HEIGHT, LESS_THAN, 4),
-                control_slot_buttons->Render(),
-                control_model_row->Render(),
-                control_ray_row->Render(),
+                text("Slot suspend, restore, and unload are managed by the agent scheduler.") | dim,
+                control_action_buttons->Render(),
                 node_operation_status.empty() ? text("") : paragraph(node_operation_status),
 
                 text(""),
             };
-            char bud[48];
-            std::snprintf(bud, sizeof(bud), "%.2f/%.2f", n.vllm_gpu_fraction_used, n.vllm_gpu_budget);
             std::vector<std::string> caps = {
                 "arch " + (n.capabilities.arch.empty() ? std::string("—") : n.capabilities.arch),
                 std::to_string(n.capabilities.gpu_count) + " GPU",
-                "vLLM " + (n.capabilities.vllm_version.empty() ? std::string("—") : n.capabilities.vllm_version),
-                std::string("ray ") + (n.capabilities.supports_ray ? "yes" : "no"),
-                n.capabilities.comm_backends.empty() ? std::string("comm —")
-                                                     : util::join(n.capabilities.comm_backends, ","),
-                std::string("budget ") + bud,
+                "llama.cpp " + (n.capabilities.llama_cpp_version.empty()
+                    ? std::string("—") : n.capabilities.llama_cpp_version),
+                std::string("RPC ") + (n.capabilities.supports_llama_rpc ? "yes" : "no"),
             };
             rows.push_back(text("  " + util::join(caps, "  ·  ")) | dim);
             detail_body = vbox(std::move(rows));
@@ -2425,26 +2351,6 @@ void ControlUI::run() {
                 });
             } else if (ed_backend == 1) {
                 engine_specific = vbox({
-                    hbox({field(" max_model_len", ed_inp_mml->Render() | flex),
-                          field(" max_num_seqs", ed_inp_seqs->Render() | flex)}),
-                    hbox({field(" gpu_mem_util", ed_inp_gpumem->Render() | flex),
-                          field(" max_batched", ed_inp_batched->Render() | flex)}),
-                    hbox({field(" tensor_par", ed_inp_tp->Render() | flex),
-                          field(" pipeline_par", ed_inp_pp->Render() | flex)}),
-                    hbox({field(" dtype", ed_inp_dtype->Render() | flex),
-                          field(" quantization", ed_inp_quant->Render() | flex)}),
-                    field(" served name", ed_inp_served_model->Render() | flex),
-                    field(" tool parser", ed_inp_toolparser->Render() | flex),
-                    hbox({ed_cb_sleep->Render(), text("  "), ed_cb_prefix->Render(), text("  "),
-                          ed_cb_trust->Render(), text("  "), ed_cb_autotool->Render()}),
-                    ed_cb_vision->Render(),
-                    text("Vision uses the model-native vLLM processor; projector must be empty") | dim,
-                    hbox({text(" projector") | dim | size(WIDTH, EQUAL, 15),
-                          ed_inp_mmproj->Render() | flex}),
-                    field(" extra args", ed_inp_extra->Render() | border | size(HEIGHT, LESS_THAN, 4)),
-                });
-            } else {
-                engine_specific = vbox({
                     field(" base_url", ed_inp_api_base->Render() | flex),
                     field(" chat path", ed_inp_api_path->Render() | flex),
                     field(" key env", ed_inp_api_key_env->Render() | flex),
@@ -2454,6 +2360,13 @@ void ControlUI::run() {
                     hbox({text(" projector") | dim | size(WIDTH, EQUAL, 15),
                           ed_inp_mmproj->Render() | flex}),
                     text("API keys are process-local and never persisted") | dim,
+                });
+            } else {
+                engine_specific = vbox({
+                    paragraph("This profile uses the unsupported legacy backend '" +
+                              ed_unsupported_backend +
+                              "'. Select llama.cpp or Remote API before saving.") |
+                        color(Color::Red),
                 });
             }
             Element engine_body = vbox({
@@ -2469,6 +2382,7 @@ void ControlUI::run() {
                 sec_static("Model & placement", vbox({
                     hbox({text(" model_path") | dim | size(WIDTH, EQUAL, 15),
                           ed_inp_model->Render() | flex, text(" "), btn_browse_model->Render()}),
+                    field(" served alias", ed_inp_served_model->Render() | flex),
                     field(" preferred_node", ed_inp_pnode->Render() | flex),
                 })),
                 sec_static("System prompt",
@@ -2551,12 +2465,19 @@ void ControlUI::run() {
                            fmt2(a.runtime_settings.min_p) + " · " +
                            std::to_string(a.runtime_settings.max_tokens) + " tok")}),
                 hbox({text("engine   ") | dim,
-                      text("mml " + std::to_string(a.vllm_settings.max_model_len) + " · seqs " +
-                           std::to_string(a.vllm_settings.max_num_seqs) + " · gpu " +
-                           fmt2(a.vllm_settings.gpu_memory_utilization) + " · tp" +
-                           std::to_string(a.vllm_settings.tensor_parallel_size) + "/pp" +
-                           std::to_string(a.vllm_settings.pipeline_parallel_size) +
-                           (a.vllm_settings.enable_sleep_mode ? " · sleep" : ""))}),
+                      text([&]() {
+                          const std::string backend = util::to_lower(util::trim(a.inference_backend));
+                          if (backend == "api") {
+                              return "remote API · " + a.api_settings.base_url;
+                          }
+                          if (!backend.empty() && backend != "llama-cpp" &&
+                              backend != "llama.cpp" && backend != "llama") {
+                              return "unsupported · " + backend;
+                          }
+                          return "llama.cpp · ctx " +
+                              std::to_string(a.runtime_settings.ctx_size) + " · parallel " +
+                              std::to_string(a.runtime_settings.parallel);
+                      }())}),
                 hbox({text("caps     ") | dim, feat(a.reasoning_enabled, "reasoning"), text("  "),
                       feat(a.memories_enabled, "memories"), text("  "),
                       feat(a.tools_enabled, "tools"), text("  "),
