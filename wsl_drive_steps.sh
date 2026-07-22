@@ -51,9 +51,9 @@ echo "  slot_id present? $(echo "$RC" | jq_ "bool(d.get('slot_id'))")  (expect F
 hr; echo "######## STEP 4: engine /metrics scraped into status ########"
 sleep 4
 echo "per-slot engine metrics from NODE status:"
-nstatus | jq_ "chr(10).join('  slot %s port=%s agents=%s metrics_valid=%s running=%s waiting=%s kv=%.3f'%(s['id'][:8],s.get('port'),s.get('agent_ids'),s.get('engine_metrics_valid'),s.get('num_requests_running'),s.get('num_requests_waiting'),s.get('kv_cache_usage',0)) for s in d.get('slots',[]))"
+nstatus | jq_ "chr(10).join('  slot %s port=%s agents=%s metrics_valid=%s running=%s waiting=%s'%(s['id'][:8],s.get('port'),s.get('agent_ids'),s.get('engine_metrics_valid'),s.get('num_requests_running'),s.get('num_requests_waiting')) for s in d.get('slots',[]))"
 echo "same metrics propagated to CONTROL (/v1/nodes):"
-curl -s --max-time 10 "$CTRL/v1/nodes" | jq_ "chr(10).join('  node %s budget=%s used=%s'%(n.get('id','?')[:8],n.get('vllm_gpu_budget'),n.get('vllm_gpu_fraction_used'))+chr(10)+chr(10).join('    slot %s metrics_valid=%s running=%s waiting=%s kv=%.3f'%(s['id'][:8],s.get('engine_metrics_valid'),s.get('num_requests_running'),s.get('num_requests_waiting'),s.get('kv_cache_usage',0)) for s in n.get('slots',[])) for n in (d if isinstance(d,list) else []))"
+curl -s --max-time 10 "$CTRL/v1/nodes" | jq_ "chr(10).join('  node %s budget=%s used=%s'%(n.get('id','?')[:8],n.get('vllm_gpu_budget'),n.get('vllm_gpu_fraction_used'))+chr(10)+chr(10).join('    slot %s metrics_valid=%s running=%s waiting=%s'%(s['id'][:8],s.get('engine_metrics_valid'),s.get('num_requests_running'),s.get('num_requests_waiting')) for s in n.get('slots',[])) for n in (d if isinstance(d,list) else []))"
 
 hr; echo "######## STEP 2: shared engine (attach) ########"
 echo "slots before share: $(nstatus | jq_ "len(d.get('slots',[]))")"
@@ -72,7 +72,7 @@ echo "A slot state after suspend: $(nstatus | jq_ "[(s.get('state'),s.get('sleep
 echo "VRAM after sleep: $(vram) MiB  (expect lower - weights offloaded)"
 echo "restore agent-a (wake):"
 RW=$(curl -s --max-time 320 "${AUTH[@]}" -X POST "$NODE/api/node/restore-slot" -H "Content-Type: application/json" \
-  -d "{\"model_path\":\"$MODEL\",\"inference_backend\":\"vllm\",\"agent_id\":\"agent-a\",\"kv_cache_path\":\"\",
+  -d "{\"model_path\":\"$MODEL\",\"inference_backend\":\"vllm\",\"agent_id\":\"agent-a\",
        \"vllm_settings\":{\"max_model_len\":4096,\"gpu_memory_utilization\":0.24,\"max_num_seqs\":16,\"enable_sleep_mode\":true,\"enable_prefix_caching\":true}}")
 echo "  restore -> slot=$(echo "$RW" | jq_ "d.get('slot_id','')")"
 sleep 3

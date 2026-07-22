@@ -33,8 +33,7 @@ struct EngineGroupRecord {
 /// distribution. Thread-safe — the entire scheduling decision is serialized.
 class AgentScheduler {
 public:
-    AgentScheduler(NodeRegistry& registry,
-                   std::string models_dir);
+    explicit AgentScheduler(NodeRegistry& registry);
 
     /// Ensure an agent has a running slot on some node.
     /// Returns {node_id, slot_id} on success, nullopt if no capacity.
@@ -64,7 +63,6 @@ public:
 
 private:
     NodeRegistry&       registry_;
-    std::string         models_dir_;
 
     // schedule_mutex_ serializes scheduling decisions end-to-end — these can
     // include slow node HTTP calls and multi-GB model uploads. state_mutex_
@@ -98,14 +96,6 @@ private:
     }
 
     void set_last_error(const std::string& err);
-
-    /// Check if a node URL is local (loopback).
-    static bool is_local_node(const std::string& node_url);
-
-    /// Try to find a node that can accommodate a model of the given VRAM.
-    /// Returns node info or nullopt.
-    std::optional<NodeInfo> find_node_with_vram(int64_t vram_mb,
-                                                const NodeId& preferred = {}) const;
 
     /// Find the LRU idle agent placement on any node, or a specific node.
     std::optional<AgentId> find_lru_idle_agent(const NodeId& on_node = {}) const;

@@ -13,8 +13,6 @@
 #include "node/singleton_lock.hpp"
 #include "node/slot_manager.hpp"
 #include "node/vllm_provisioner.hpp"
-#include "node/llama_cpp_provisioner.hpp"
-#include "node/llama_runtime.hpp"
 #include "node/vllm_runtime.hpp"
 
 #include <nlohmann/json.hpp>
@@ -86,27 +84,15 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
         cfg.control_url       = file.get("control_url",       "");
         cfg.control_api_key   = file.get("control_api_key",   "");
         cfg.vllm_server_path  = file.get("vllm_server_path",  "vllm");
-        cfg.vllm_auto_provision = file.get_bool("vllm_auto_provision", false);
+        cfg.vllm_auto_provision = file.get_bool("vllm_auto_provision", true);
         cfg.vllm_provision_dir = file.get("vllm_provision_dir", "");
         cfg.vllm_install_method = file.get("vllm_install_method", "auto");
         cfg.vllm_version = file.get("vllm_version", "latest");
         cfg.vllm_python_path = file.get("vllm_python_path", "");
-        cfg.llama_server_path = file.get("llama_server_path", "llama-server");
-        cfg.llama_auto_provision = file.get_bool("llama_auto_provision", true);
-        cfg.llama_provision_dir = file.get("llama_provision_dir", "");
-        cfg.llama_install_method = file.get("llama_install_method", "auto");
-        cfg.llama_version = file.get("llama_version", "latest");
-        cfg.llama_accelerator = file.get("llama_accelerator", "");
-        cfg.llama_cuda_arch = file.get("llama_cuda_arch", "");
-        cfg.llama_build_jobs = file.get_int("llama_build_jobs", 0);
         cfg.vllm_update_policy = file.get("vllm_update_policy", "prompt");
         cfg.vllm_update_check = file.get_bool("vllm_update_check", true);
         cfg.vllm_update_check_interval_hours =
             file.get_int("vllm_update_check_interval_hours", 24);
-        cfg.llama_update_policy = file.get("llama_update_policy", "prompt");
-        cfg.llama_update_check = file.get_bool("llama_update_check", true);
-        cfg.llama_update_check_interval_hours =
-            file.get_int("llama_update_check_interval_hours", 24);
         cfg.models_dir        = file.get("models_dir",        "models");
         cfg.data_dir          = file.get("data_dir",          "data");
         cfg.log_file          = file.get("log_file", "logs/mantic-mind.log");
@@ -131,7 +117,6 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
         cfg.ray_port = static_cast<uint16_t>(file.get_int("ray_port", 6379));
         cfg.hf_cli_path = file.get("hf_cli_path", "hf");
         cfg.hf_cache_dir = file.get("hf_cache_dir", "");
-        cfg.kv_cache_dir = file.get("kv_cache_dir", "data/kv_cache");
         cfg.model_cache_min_free_mb = static_cast<int64_t>(
             file.get_int("model_cache_min_free_mb",
                          static_cast<int>(cfg.model_cache_min_free_mb)));
@@ -171,19 +156,11 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
     cfg.vllm_install_method = env("MM_VLLM_INSTALL_METHOD", cfg.vllm_install_method);
     cfg.vllm_version = env("MM_VLLM_VERSION", cfg.vllm_version);
     cfg.vllm_python_path = env("MM_VLLM_PYTHON_PATH", cfg.vllm_python_path);
-    cfg.llama_server_path = env("MM_LLAMA_PATH", cfg.llama_server_path);
-    cfg.llama_auto_provision = env_bool("MM_LLAMA_AUTO_PROVISION", cfg.llama_auto_provision);
-    cfg.llama_provision_dir = env("MM_LLAMA_PROVISION_DIR", cfg.llama_provision_dir);
-    cfg.llama_install_method = env("MM_LLAMA_INSTALL_METHOD", cfg.llama_install_method);
-    cfg.llama_version = env("MM_LLAMA_VERSION", cfg.llama_version);
-    cfg.llama_accelerator = env("MM_LLAMA_ACCELERATOR", cfg.llama_accelerator);
-    cfg.llama_cuda_arch = env("MM_LLAMA_CUDA_ARCH", cfg.llama_cuda_arch);
     cfg.vllm_update_policy = env("MM_VLLM_UPDATE_POLICY", cfg.vllm_update_policy);
     cfg.vllm_update_check = env_bool("MM_VLLM_UPDATE_CHECK", cfg.vllm_update_check);
     cfg.models_dir        = env("MM_MODELS_DIR",      cfg.models_dir);
     cfg.data_dir          = env("MM_DATA_DIR",        cfg.data_dir);
     cfg.log_file          = env("MM_LOG_FILE",        cfg.log_file);
-    cfg.kv_cache_dir      = env("MM_KV_CACHE_DIR",   cfg.kv_cache_dir);
     cfg.pairing_key       = env("MM_PAIRING_KEY",     cfg.pairing_key);
     cfg.listen_port       = env_port("MM_LISTEN_PORT",    cfg.listen_port);
     cfg.discovery_port    = env_port("MM_DISCOVERY_PORT", cfg.discovery_port);
@@ -198,12 +175,6 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
     cfg.max_slots              = env_int("MM_MAX_SLOTS", cfg.max_slots);
     cfg.vllm_update_check_interval_hours =
         env_int("MM_VLLM_UPDATE_CHECK_INTERVAL_HOURS", cfg.vllm_update_check_interval_hours);
-    cfg.llama_build_jobs = env_int("MM_LLAMA_BUILD_JOBS", cfg.llama_build_jobs);
-    cfg.llama_update_policy = env("MM_LLAMA_UPDATE_POLICY", cfg.llama_update_policy);
-    cfg.llama_update_check = env_bool("MM_LLAMA_UPDATE_CHECK", cfg.llama_update_check);
-    cfg.llama_update_check_interval_hours =
-        env_int("MM_LLAMA_UPDATE_CHECK_INTERVAL_HOURS",
-                cfg.llama_update_check_interval_hours);
     cfg.model_cache_min_free_mb = static_cast<int64_t>(
         env_int("MM_MODEL_CACHE_MIN_FREE_MB",
                 static_cast<int>(cfg.model_cache_min_free_mb)));
@@ -240,28 +211,12 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
             (policy == "auto" || policy == "manual") ? policy : "prompt";
     }
     if (cfg.vllm_update_check_interval_hours < 1) cfg.vllm_update_check_interval_hours = 24;
-    {
-        const std::string policy = mm::util::to_lower(mm::util::trim(cfg.llama_update_policy));
-        cfg.llama_update_policy =
-            (policy == "auto" || policy == "manual") ? policy : "prompt";
-    }
-    if (cfg.llama_update_check_interval_hours < 1)
-        cfg.llama_update_check_interval_hours = 24;
-    if (cfg.llama_build_jobs < 0) cfg.llama_build_jobs = 0;
     if (cfg.models_dir.empty()) cfg.models_dir = "models";
     if (cfg.model_cache_min_free_mb < 0) cfg.model_cache_min_free_mb = 0;
     if (cfg.data_dir.empty()) cfg.data_dir = "data";
     if (cfg.vllm_provision_dir.empty())
         cfg.vllm_provision_dir =
             (std::filesystem::path(cfg.data_dir) / "runtimes" / "vllm").string();
-    if (cfg.llama_server_path.empty()) cfg.llama_server_path = "llama-server";
-    if (cfg.llama_install_method.empty()) cfg.llama_install_method = "auto";
-    cfg.llama_install_method = mm::normalize_llama_install_method(cfg.llama_install_method);
-    if (cfg.llama_version.empty()) cfg.llama_version = "latest";
-    if (cfg.llama_provision_dir.empty())
-        cfg.llama_provision_dir =
-            (std::filesystem::path(cfg.data_dir) / "runtimes" / "llama.cpp").string();
-    if (cfg.kv_cache_dir.empty()) cfg.kv_cache_dir = "data/kv_cache";
     if (cfg.log_file.empty()) cfg.log_file = "logs/mantic-mind.log";
     if (cfg.ray_path.empty()) cfg.ray_path = "ray";
     if (cfg.hf_cli_path.empty()) cfg.hf_cli_path = "hf";
@@ -269,7 +224,6 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
 
     return cfg;
 }
-
 namespace {
 
 // Run a command, capturing trimmed stdout (first line). Empty on failure.
@@ -322,40 +276,9 @@ int detect_gpu_count() {
 // Resolve every visible NVIDIA GPU's compute capability to the CMake form
 // (8.9 -> 89, 12.1 -> 121). Passing an explicit list avoids fragile "native"
 // architecture probing in older CMake versions and WSL toolchains.
-std::string detect_cuda_architectures() {
-    const std::string cmd =
-        "nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits";
-#ifdef _WIN32
-    FILE* f = _popen((cmd + " 2>nul").c_str(), "r");
-#else
-    FILE* f = ::popen((cmd + " 2>/dev/null").c_str(), "r");
-#endif
-    if (!f) return {};
-    std::set<std::string> capabilities;
-    char buf[256];
-    while (fgets(buf, static_cast<int>(sizeof(buf)), f)) {
-        std::string value = mm::util::trim(buf);
-        value.erase(std::remove(value.begin(), value.end(), '.'), value.end());
-        if (!value.empty() && std::all_of(value.begin(), value.end(), [](unsigned char ch) {
-                return std::isdigit(ch) != 0;
-            }))
-            capabilities.insert(value);
-    }
-#ifdef _WIN32
-    _pclose(f);
-#else
-    ::pclose(f);
-#endif
-    std::vector<std::string> ordered(capabilities.begin(), capabilities.end());
-    return mm::util::join(ordered, ";");
-}
-
-// Build the capability block this node advertises. Detection fills the gaps
-// the config left blank. llama_version is the resolved llama.cpp build
-// fingerprint (from the llama provisioner), "" while unknown/provisioning.
+// Build the capability block this node advertises. Detection fills config gaps.
 mm::NodeCapabilities detect_node_capabilities(const mm::NodeConfig& cfg,
-                                              bool gpu_backend_available,
-                                              const std::string& llama_version = {}) {
+                                               bool gpu_backend_available) {
     mm::NodeCapabilities caps;
 
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -410,10 +333,6 @@ mm::NodeCapabilities detect_node_capabilities(const mm::NodeConfig& cfg,
             if (caps.vllm_version.empty()) caps.vllm_version = v;
         }
     }
-
-    // llama.cpp build fingerprint (RPC groups need matching builds; advertised
-    // for planning even while supports_llama_rpc stays a future capability).
-    caps.llama_cpp_version = llama_version;
 
     return caps;
 }
@@ -897,7 +816,6 @@ int main(int argc, char** argv) {
     {
         std::error_code ec;
         fs::create_directories(fs::path(cfg.log_file).parent_path(), ec);
-        fs::create_directories(cfg.kv_cache_dir, ec);
     }
 
     mm::init_logger(
@@ -912,8 +830,7 @@ int main(int argc, char** argv) {
             cfg_path.empty() ? "(defaults/env only; no config file found)" : cfg_path);
     MM_INFO("Node config — control_url='{}', models_dir='{}'",
             cfg.control_url, cfg.models_dir);
-    MM_INFO("Node llama-server path: {} (default runtime)", cfg.llama_server_path);
-    MM_INFO("Node vLLM path: {} (peer backend, auto-provision {})",
+    MM_INFO("Node vLLM path: {} (auto-provision {})",
             cfg.vllm_server_path, cfg.vllm_auto_provision ? "on" : "off");
 
     // ── NodeState ─────────────────────────────────────────────────────────────
@@ -971,9 +888,6 @@ int main(int argc, char** argv) {
                              cfg.vllm_server_path,
                              cfg.vllm_gpu_budget);
     slot_mgr.set_gpu_vram_total_mb(state.get_metrics().gpu_vram_total_mb);
-    slot_mgr.set_llama_server_path(cfg.llama_server_path);
-    slot_mgr.set_kv_cache_dir(cfg.kv_cache_dir);
-    slot_mgr.set_models_dir(cfg.models_dir);
 
     // ── Local model cache ─────────────────────────────────────────────────────
     // Control transfers models into models_dir; the store keeps an LRU
@@ -985,19 +899,15 @@ int main(int argc, char** argv) {
             model_store.root(), cfg.model_cache_min_free_mb,
             cfg.model_cache_clear_on_shutdown);
 
-    // Advertise cluster capabilities (arch, GPUs, comm backends, vLLM build)
-    // for multi-node engine-group planning on control.
+    // Advertise cluster capabilities for multi-node vLLM planning.
     {
-        const auto llama_rt = state.get_llama_runtime();
         auto caps = detect_node_capabilities(
-            cfg, state.get_metrics().gpu_backend_available,
-            mm::llama_runtime_usable(llama_rt) ? llama_rt.version : std::string{});
+            cfg, state.get_metrics().gpu_backend_available);
         state.set_capabilities(caps);
-        MM_INFO("Node capabilities: arch={} gpus={} ray={} backends=[{}] vllm={} llama={}",
+        MM_INFO("Node capabilities: arch={} gpus={} ray={} backends=[{}] vllm={}",
                 caps.arch.empty() ? "?" : caps.arch, caps.gpu_count,
                 caps.supports_ray, mm::util::join(caps.comm_backends, ","),
-                caps.vllm_version.empty() ? "?" : caps.vllm_version,
-                caps.llama_cpp_version.empty() ? "?" : caps.llama_cpp_version);
+                caps.vllm_version.empty() ? "?" : caps.vllm_version);
     }
 
     // Periodically scrape running vLLM engines' /metrics so node status
@@ -1018,71 +928,6 @@ int main(int argc, char** argv) {
         }
     });
 
-    // ── llama.cpp runtime management (provision in the background) ─────────────
-    // Release retrieval or its source-build fallback runs on a background
-    // thread, so node startup and vLLM serving never block on it. The fast
-    // resolve-from-PATH and already-provisioned paths complete near-instantly
-    // inside ensure_runtime(). A shutdown flag drives the provisioner's cancel
-    // check so a download/build in flight aborts promptly.
-    mm::LlamaProvisionConfig llama_provision_cfg;
-    llama_provision_cfg.requested_executable = cfg.llama_server_path;
-    llama_provision_cfg.provision_dir = cfg.llama_provision_dir;
-    llama_provision_cfg.auto_provision = cfg.llama_auto_provision;
-    llama_provision_cfg.install_method = cfg.llama_install_method;
-    llama_provision_cfg.version = cfg.llama_version;
-    llama_provision_cfg.cuda_arch = cfg.llama_cuda_arch;
-    llama_provision_cfg.cmake_args = cfg.llama_cmake_args;
-    llama_provision_cfg.build_jobs = cfg.llama_build_jobs;
-    llama_provision_cfg.accelerator_explicit = !cfg.llama_accelerator.empty();
-    llama_provision_cfg.accelerator = !cfg.llama_accelerator.empty()
-        ? cfg.llama_accelerator
-        : mm::detect_llama_accelerator(mm::current_vllm_platform(), mm::current_vllm_arch(),
-                                       state.get_metrics().gpu_backend_available,
-                                       mm::detect_rocm_present());
-    if (llama_provision_cfg.accelerator == "cuda" &&
-        llama_provision_cfg.cuda_arch.empty()) {
-        llama_provision_cfg.cuda_arch = detect_cuda_architectures();
-        if (!llama_provision_cfg.cuda_arch.empty())
-            MM_INFO("Detected CUDA compute architecture(s) for llama.cpp: {}",
-                    llama_provision_cfg.cuda_arch);
-    }
-    mm::LlamaCppProvisioner llama_provisioner(llama_provision_cfg);
-    state.set_llama_runtime(llama_provisioner.status());
-    MM_INFO("llama.cpp update policy: {} (checks {})",
-            cfg.llama_update_policy, cfg.llama_update_check ? "enabled" : "disabled");
-    llama_provisioner.set_log_sink([](const std::string& line, bool is_stderr) {
-        if (is_stderr) MM_WARN("[llama] {}", line); else MM_INFO("[llama] {}", line);
-    });
-    std::atomic<bool> llama_provision_stop{false};
-    llama_provisioner.set_progress_sink([&](const mm::VllmInstallProgress& p) {
-        if (!p.active) {
-            state.clear_action_progress("llama-runtime");
-            return;
-        }
-        mm::NodeActionProgress action;
-        action.active = true;
-        action.operation_id = "llama-runtime";
-        action.kind = "runtime";
-        action.action = p.stage.find("Building") != std::string::npos
-            ? "Compiling llama.cpp runtime"
-            : "Provisioning llama.cpp runtime";
-        const auto progress_runtime = llama_provisioner.status();
-        action.target = progress_runtime.accelerator.empty()
-            ? std::string{"llama-server"}
-            : "llama-server (" + progress_runtime.accelerator + ")";
-        action.stage = p.stage;
-        action.detail = p.last_line;
-        action.step = p.step;
-        action.total_steps = p.total_steps;
-        action.fraction = p.fraction;
-        action.cancelable = true;
-        state.set_action_progress(action);
-    });
-    llama_provisioner.set_cancel_check([&]() {
-        return llama_provision_stop.load()
-            || state.action_cancel_requested("llama-runtime");
-    });
-
     // ── vLLM runtime management (provision / update) ───────────────────────────
     // Apply a runtime status produced by the provisioner: on a usable runtime,
     // rebind the engine executable path and refresh advertised capabilities;
@@ -1090,17 +935,14 @@ int main(int argc, char** argv) {
     // TUI key, the REST endpoints, and the background threads can't race on cfg.
     std::mutex vllm_apply_mutex;
     std::mutex vllm_operation_mutex;
-    std::mutex llama_operation_mutex;
     auto apply_runtime_result =
         [&](mm::VllmRuntimeStatus runtime) -> mm::VllmRuntimeStatus {
         std::lock_guard<std::mutex> lk(vllm_apply_mutex);
         if (mm::vllm_runtime_usable(runtime)) {
             cfg.vllm_server_path = runtime.executable_path;
             slot_mgr.set_vllm_server_path(cfg.vllm_server_path);
-            const auto llama_rt = state.get_llama_runtime();
             auto caps = detect_node_capabilities(
-                cfg, state.get_metrics().gpu_backend_available,
-                mm::llama_runtime_usable(llama_rt) ? llama_rt.version : std::string{});
+                cfg, state.get_metrics().gpu_backend_available);
             state.set_capabilities(caps);
         }
         if (!runtime.last_error.empty()) {
@@ -1110,110 +952,6 @@ int main(int argc, char** argv) {
         }
         state.set_vllm_runtime(runtime);
         return runtime;
-    };
-
-    auto apply_llama_result =
-        [&](mm::LlamaRuntimeStatus runtime) -> mm::LlamaRuntimeStatus {
-        std::lock_guard<std::mutex> lk(vllm_apply_mutex);
-        if (mm::llama_runtime_usable(runtime)) {
-            cfg.llama_server_path = runtime.executable_path;
-            slot_mgr.set_llama_server_path(cfg.llama_server_path);
-            auto caps = detect_node_capabilities(
-                cfg, state.get_metrics().gpu_backend_available, runtime.version);
-            state.set_capabilities(caps);
-        }
-        if (!runtime.last_error.empty()) {
-            state.set_last_error(runtime.last_error);
-        } else if (mm::llama_runtime_usable(runtime)) {
-            state.set_last_error("");
-        }
-        state.set_llama_runtime(runtime);
-        return runtime;
-    };
-
-    // Started after vllm_apply_mutex exists: the capability refresh below reads
-    // cfg (which apply_runtime_result mutates) and must serialize with it.
-    std::thread llama_provision_thread([&]() {
-        std::lock_guard<std::mutex> op_lk(llama_operation_mutex);
-        auto runtime = apply_llama_result(llama_provisioner.ensure_runtime());
-        if (mm::llama_runtime_usable(runtime)) {
-            MM_INFO("Using llama-server executable: {} (accelerator={})",
-                    runtime.executable_path, runtime.accelerator);
-        } else if (!runtime.last_error.empty()) {
-            MM_WARN("llama.cpp runtime unavailable: {}", runtime.last_error);
-        }
-    });
-
-    auto ensure_llama_runtime = [&]() -> mm::LlamaRuntimeStatus {
-        std::lock_guard<std::mutex> op_lk(llama_operation_mutex);
-        return apply_llama_result(llama_provisioner.ensure_runtime());
-    };
-
-    auto do_llama_update = [&](const std::string& accelerator) -> mm::LlamaRuntimeStatus {
-        std::lock_guard<std::mutex> op_lk(llama_operation_mutex);
-        auto updated = llama_provisioner.update_runtime(accelerator);
-        if (updated.status == "failed") {
-            const std::string update_error = updated.last_error;
-            auto fallback = llama_provisioner.ensure_runtime();
-            if (mm::llama_runtime_usable(fallback)) {
-                fallback.last_error = "llama.cpp update failed: " + update_error;
-                fallback.troubleshooting = updated.troubleshooting;
-                MM_WARN("llama.cpp update failed, kept existing runtime: {}", update_error);
-                return apply_llama_result(fallback);
-            }
-        }
-        return apply_llama_result(updated);
-    };
-
-    auto do_llama_switch = [&](const std::string& variant) -> mm::LlamaRuntimeStatus {
-        std::lock_guard<std::mutex> op_lk(llama_operation_mutex);
-        auto switched = llama_provisioner.switch_runtime(variant);
-        if (switched.status == "failed") {
-            const std::string switch_error = switched.last_error;
-            auto fallback = llama_provisioner.ensure_runtime();
-            if (mm::llama_runtime_usable(fallback)) {
-                fallback.last_error = "llama.cpp engine switch failed: " + switch_error;
-                fallback.troubleshooting = switched.troubleshooting;
-                MM_WARN("llama.cpp engine switch failed, kept existing runtime: {}",
-                        switch_error);
-                return apply_llama_result(fallback);
-            }
-        }
-        return apply_llama_result(switched);
-    };
-
-    auto do_llama_recovery = [&](const std::string& action,
-                                 const std::string& variant) -> mm::LlamaRuntimeStatus {
-        std::lock_guard<std::mutex> op_lk(llama_operation_mutex);
-        MM_INFO("llama.cpp troubleshooting action requested: {}{}", action,
-                variant.empty() ? std::string{} : " (" + variant + ")");
-        auto runtime = action == "diagnose"
-            ? llama_provisioner.diagnose_environment()
-            : llama_provisioner.recover_runtime(action, variant);
-        if (action == "target" && runtime.status == "failed") {
-            const auto failed = runtime;
-            auto fallback = llama_provisioner.ensure_runtime();
-            if (mm::llama_runtime_usable(fallback)) {
-                fallback.last_error =
-                    "llama.cpp target install failed; kept active " +
-                    (fallback.variant.empty() ? fallback.accelerator
-                                              : fallback.variant) +
-                    " runtime: " + failed.last_error;
-                fallback.build_log_path = failed.build_log_path;
-                fallback.troubleshooting = failed.troubleshooting;
-                MM_WARN("llama.cpp target install failed, kept active runtime: {}",
-                        failed.last_error);
-                return apply_llama_result(fallback);
-            }
-        }
-        return apply_llama_result(runtime);
-    };
-
-    auto check_llama_update = [&]() -> mm::LlamaRuntimeStatus {
-        std::lock_guard<std::mutex> op_lk(llama_operation_mutex);
-        auto status = llama_provisioner.check_for_update();
-        state.set_llama_runtime(status);
-        return status;
     };
 
     auto ensure_vllm_runtime = [&]() -> mm::VllmRuntimeStatus {
@@ -1275,36 +1013,6 @@ int main(int argc, char** argv) {
         });
     }
 
-    std::atomic<bool> stop_llama_update_check{false};
-    std::thread llama_update_check_thread;
-    if (cfg.llama_update_check && cfg.llama_update_policy != "manual") {
-        llama_update_check_thread = std::thread([&]() {
-            for (int i = 0; i < 50 && !stop_llama_update_check; ++i)
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            while (!stop_llama_update_check) {
-                if (mm::llama_runtime_usable(state.get_llama_runtime())) {
-                    auto st = check_llama_update();
-                    if (st.update_available && cfg.llama_update_policy == "auto") {
-                        if (st.update_action == "unavailable") {
-                            MM_WARN("llama.cpp auto-update skipped: {}", st.update_warning);
-                        } else {
-                            MM_INFO("llama.cpp auto-update policy: updating {} -> {} ({})",
-                                    st.version, st.latest_version,
-                                    st.update_action.empty() ? "release/fallback" : st.update_action);
-                            do_llama_update({});
-                        }
-                    }
-                }
-                const int64_t interval_ms =
-                    static_cast<int64_t>(cfg.llama_update_check_interval_hours) * 3600 * 1000;
-                for (int64_t slept = 0;
-                     slept < interval_ms && !stop_llama_update_check;
-                     slept += 200)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            }
-        });
-    }
-
     // On-demand update worker for the TUI Update button/prompt: runs the (slow)
     // install off the UI thread on a tracked thread that shutdown joins, so the
     // update never outlives the objects it captures. One at a time.
@@ -1319,43 +1027,6 @@ int main(int argc, char** argv) {
             manual_update_running = false;
         });
     };
-    std::atomic<bool> manual_llama_update_running{false};
-    std::thread manual_llama_update_thread;
-    auto request_manual_llama_update = [&](std::string accelerator) {
-        bool expected = false;
-        if (!manual_llama_update_running.compare_exchange_strong(expected, true)) return;
-        if (manual_llama_update_thread.joinable()) manual_llama_update_thread.join();
-        manual_llama_update_thread = std::thread(
-            [&, accelerator = std::move(accelerator)]() {
-                do_llama_update(accelerator);
-                manual_llama_update_running = false;
-            });
-    };
-    auto request_manual_llama_switch = [&](std::string variant) {
-        bool expected = false;
-        if (!manual_llama_update_running.compare_exchange_strong(expected, true)) return;
-        if (manual_llama_update_thread.joinable()) manual_llama_update_thread.join();
-        manual_llama_update_thread = std::thread(
-            [&, variant = std::move(variant)]() {
-                do_llama_switch(variant);
-                manual_llama_update_running = false;
-            });
-    };
-    std::atomic<bool> manual_llama_recovery_running{false};
-    std::thread manual_llama_recovery_thread;
-    auto request_manual_llama_recovery = [&](std::string action,
-                                             std::string variant) {
-        bool expected = false;
-        if (!manual_llama_recovery_running.compare_exchange_strong(expected, true)) return;
-        if (manual_llama_recovery_thread.joinable())
-            manual_llama_recovery_thread.join();
-        manual_llama_recovery_thread = std::thread(
-            [&, action = std::move(action), variant = std::move(variant)]() {
-                do_llama_recovery(action, variant);
-                manual_llama_recovery_running = false;
-            });
-    };
-
     std::mutex runtime_log_mutex;
     std::deque<std::string> runtime_logs;
     constexpr std::size_t kMaxRuntimeLogLines = 4000;
@@ -1438,29 +1109,6 @@ int main(int argc, char** argv) {
         state.set_vllm_runtime(st);
         return st;
     });
-    api_server.set_llama_provision_callback([&]() {
-        MM_INFO("llama.cpp provisioning requested by user");
-        return ensure_llama_runtime();
-    });
-    api_server.set_llama_update_callback([&](const std::string& accelerator) {
-        MM_INFO("llama.cpp update requested by user (accelerator={})",
-                accelerator.empty() ? "current" : accelerator);
-        return do_llama_update(accelerator);
-    });
-    api_server.set_llama_switch_callback([&](const std::string& variant) {
-        MM_INFO("llama.cpp engine switch requested by user (variant={})", variant);
-        return do_llama_switch(variant);
-    });
-    api_server.set_llama_check_update_callback([&]() {
-        return check_llama_update();
-    });
-    api_server.set_llama_diagnose_callback([&]() {
-        return do_llama_recovery("diagnose", {});
-    });
-    api_server.set_llama_recovery_callback(
-        [&](const std::string& action, const std::string& variant) {
-            return do_llama_recovery(action, variant);
-        });
     api_server.set_remember_api_key_callback([&](const std::string& key) {
         remembered_api_keys.push_back(key);
         if (save_remembered_api_keys(remembered_keys_path, remembered_api_keys)) {
@@ -1609,10 +1257,7 @@ int main(int argc, char** argv) {
             state,
             cfg.listen_port,
             forget_remembered_pairings,
-            request_manual_update,
-            request_manual_llama_update,
-            request_manual_llama_switch,
-            request_manual_llama_recovery);
+            request_manual_update);
         ui_ptr = &ui;
         ui.run();
         ui_ptr = nullptr;
@@ -1647,12 +1292,8 @@ int main(int argc, char** argv) {
     if (engine_metrics_thread.joinable()) engine_metrics_thread.join();
 
     stop_update_check = true;
-    stop_llama_update_check = true;
-    llama_provision_stop = true;
     state.request_action_cancel();
-    if (llama_provision_thread.joinable()) llama_provision_thread.join();
     if (update_check_thread.joinable()) update_check_thread.join();
-    if (llama_update_check_thread.joinable()) llama_update_check_thread.join();
     if (startup_runtime_thread.joinable()) {
         state.request_action_cancel();
         startup_runtime_thread.join();
@@ -1661,15 +1302,6 @@ int main(int argc, char** argv) {
         state.request_action_cancel();
         manual_update_thread.join();
     }
-    if (manual_llama_update_thread.joinable()) {
-        state.request_action_cancel();
-        manual_llama_update_thread.join();
-    }
-    if (manual_llama_recovery_thread.joinable()) {
-        state.request_action_cancel();
-        manual_llama_recovery_thread.join();
-    }
-
     state.stop_metrics_poll();
     slot_mgr.unload_all();
 

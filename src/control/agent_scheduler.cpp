@@ -12,7 +12,6 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
-#include <regex>
 #include <string>
 #include <system_error>
 #include <tuple>
@@ -136,53 +135,31 @@ std::string file_manifest_identity(const std::string& ref) {
     return out;
 }
 
-std::string vision_bundle_id(const AgentConfig& cfg) {
-    const std::string manifest = file_manifest_identity(cfg.model_path) + "\n" +
-                                 file_manifest_identity(cfg.vision_settings.mmproj_path);
-    const std::string digest = pairing::hmac_sha256_hex("mantic-vision-bundle-v1", manifest);
-    return util::model_id_from_ref(cfg.model_path) + "-vision-" + digest.substr(0, 20);
-}
-
 std::string engine_fingerprint(const AgentConfig& cfg) {
-    const EngineBackend backend =
-        engine_backend_from_string(cfg.inference_backend);
     nlohmann::json identity = {
-        {"backend", to_string(backend)},
+        {"backend", "vllm"},
         {"model", file_manifest_identity(cfg.model_path)},
-        {"vision", cfg.vision_settings}
+        {"vision", cfg.vision_settings},
+        {"launch", cfg.vllm_settings}
     };
-    if (backend == EngineBackend::LlamaCpp) {
-        const auto& runtime = cfg.runtime_settings;
-        identity["launch"] = {
-            {"ctx_size", runtime.ctx_size},
-            {"n_gpu_layers", runtime.n_gpu_layers},
-            {"n_threads", runtime.n_threads},
-            {"n_threads_http", runtime.n_threads_http},
-            {"parallel", runtime.parallel},
-            {"batch_size", runtime.batch_size},
-            {"ubatch_size", runtime.ubatch_size},
-            {"flash_attn", runtime.flash_attn},
-            {"extra_args", runtime.extra_args}
-        };
-    } else {
-        identity["launch"] = cfg.vllm_settings;
-    }
     return pairing::hmac_sha256_hex("mantic-engine-placement-v1", identity.dump());
 }
 
 }  // namespace
 
-AgentScheduler::AgentScheduler(NodeRegistry& registry,
-                               std::string models_dir)
-    : registry_(registry)
-    , models_dir_(std::move(models_dir))
-{}
+AgentScheduler::AgentScheduler(NodeRegistry& registry)
+    : registry_(registry) {}
 
 // ── Main scheduling entry point ──────────────────────────────────────────────
 
 std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     const AgentConfig& cfg)
 {
+    if (!is_vllm_backend(cfg.inference_backend)) {
+        set_last_error("unsupported local inference backend '" +
+                       cfg.inference_backend + "'; expected vllm");
+        return std::nullopt;
+    }
     const std::string desired_fingerprint = engine_fingerprint(cfg);
     if (auto prior = find_placement_copy(cfg.id);
         prior && prior->engine_fingerprint != desired_fingerprint) {
@@ -319,20 +296,8 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
             for (const auto& s : node.slots) {
                 if (s.state != SlotState::Ready) continue;
                 if (s.model_path != cfg.model_path) continue;
-                if (engine_backend_from_string(s.backend) !=
-                    engine_backend_from_string(cfg.inference_backend)) continue;
+                if (!is_vllm_backend(s.backend)) continue;
                 if (s.vision_enabled != cfg.vision_settings.enabled) continue;
-                if (cfg.vision_settings.enabled &&
-                    engine_backend_from_string(cfg.inference_backend) ==
-                        EngineBackend::LlamaCpp) {
-                    const std::string requested_projector = util::to_lower(
-                        std::filesystem::path(cfg.vision_settings.mmproj_path)
-                            .filename().string());
-                    const std::string slot_projector = util::to_lower(
-                        std::filesystem::path(s.mmproj_path).filename().string());
-                    if (requested_projector.empty() ||
-                        requested_projector != slot_projector) continue;
-                }
                 EngineCandidate c{node.id, s.num_requests_waiting,
                                   s.num_requests_running, s.kv_cache_usage};
                 if (!best || c < *best) best = c;
@@ -753,28 +718,6 @@ void AgentScheduler::housekeeping(const std::vector<AgentConfig>& active_agents)
 
 // ── Private helpers ─────────────────────────────────────────────────────────
 
-bool AgentScheduler::is_local_node(const std::string& node_url) {
-    static const std::regex local_re(
-        R"(https?://(127\.0\.0\.1|localhost|::1)(:\d+)?(/.*)?)",
-        std::regex::icase);
-    return std::regex_match(node_url, local_re);
-}
-
-std::optional<NodeInfo> AgentScheduler::find_node_with_vram(
-    int64_t vram_mb, const NodeId& preferred) const
-{
-    auto nodes = registry_.nodes_with_available_vram(vram_mb);
-    if (nodes.empty()) return std::nullopt;
-
-    // Prefer the requested node.
-    if (!preferred.empty()) {
-        for (const auto& n : nodes) {
-            if (n.id == preferred) return n;
-        }
-    }
-    return nodes.front();
-}
-
 std::optional<AgentId> AgentScheduler::find_lru_idle_agent(
     const NodeId& on_node) const
 {
@@ -829,17 +772,13 @@ bool AgentScheduler::suspend_agent(const AgentId& agent_id) {
         }
     }
 
-    std::string kv_cache_path;
     try {
         auto node = registry_.get_node(placement->node_id);
         HttpClient cli(node.url);
         cli.set_bearer_token(node.api_key);
         auto resp = cli.post("/api/node/suspend-slot",
                              nlohmann::json{{"slot_id", placement->slot_id}});
-        if (resp.ok()) {
-            auto j = nlohmann::json::parse(resp.body);
-            kv_cache_path = j.value("kv_cache_path", std::string{});
-        } else {
+        if (!resp.ok()) {
             std::string preview = resp.body;
             if (preview.size() > 300) preview = preview.substr(0, 300) + "...";
             MM_WARN("AgentScheduler: suspend failed for agent {} on node {} (HTTP {}): {}",
@@ -855,7 +794,6 @@ bool AgentScheduler::suspend_agent(const AgentId& agent_id) {
     for (const auto& id : cohort) {
         const bool ok = mutate_placement(id, [&](AgentPlacement& p) {
             p.suspended = true;
-            p.kv_cache_node_path = kv_cache_path;
         });
         if (id == agent_id) updated = ok;
     }
@@ -865,13 +803,13 @@ bool AgentScheduler::suspend_agent(const AgentId& agent_id) {
         MM_INFO("AgentScheduler: suspended {} agents sharing slot {} on node {}",
                 cohort.size(), placement->slot_id, placement->node_id);
     }
-    MM_INFO("AgentScheduler: suspended agent {} on node {} (cache={})",
-            agent_id, placement->node_id, kv_cache_path);
+    MM_INFO("AgentScheduler: suspended agent {} on node {}",
+            agent_id, placement->node_id);
     return true;
 }
 
 std::optional<SlotId> AgentScheduler::restore_agent_on_node(
-    const AgentPlacement& placement,
+    const AgentPlacement&,
     const AgentConfig& cfg,
     const NodeId& node_id)
 {
@@ -880,11 +818,6 @@ std::optional<SlotId> AgentScheduler::restore_agent_on_node(
         HttpClient cli(node.url);
         cli.set_bearer_token(node.api_key);
         std::string effective_model_path = cfg.model_path;
-        std::string effective_mmproj_path = cfg.vision_settings.enabled
-            ? cfg.vision_settings.mmproj_path : std::string{};
-        const bool has_projector = cfg.vision_settings.enabled &&
-            !cfg.vision_settings.mmproj_path.empty();
-        const std::string bundle_id = has_projector ? vision_bundle_id(cfg) : std::string{};
         const bool pin_on_node = !cfg.preferred_node_id.empty() &&
                                  cfg.preferred_node_id == node_id;
         std::error_code ec;
@@ -892,7 +825,7 @@ std::optional<SlotId> AgentScheduler::restore_agent_on_node(
             std::filesystem::exists(cfg.model_path, ec)) {
             std::string transfer_error;
             auto local = transfer_model_to_node(node, cfg.model_path, pin_on_node,
-                                                false, &transfer_error, bundle_id);
+                                                false, &transfer_error);
             if (!local) {
                 set_last_error("failed to transfer model for restore to node " + node_id +
                                ": " + transfer_error);
@@ -900,36 +833,14 @@ std::optional<SlotId> AgentScheduler::restore_agent_on_node(
             }
             effective_model_path = *local;
         }
-        if (has_projector) {
-            ec.clear();
-            if (std::filesystem::exists(cfg.vision_settings.mmproj_path, ec)) {
-                std::string transfer_error;
-                auto local = transfer_model_to_node(node, cfg.vision_settings.mmproj_path,
-                                                    pin_on_node, false,
-                                                    &transfer_error, bundle_id);
-                if (!local) {
-                    set_last_error("failed to transfer projector for restore to node " + node_id +
-                                   ": " + transfer_error);
-                    return std::nullopt;
-                }
-                effective_mmproj_path = *local;
-            }
-        }
         for (int attempt = 0; attempt < 3; ++attempt) {
-            const EngineBackend backend =
-                engine_backend_from_string(cfg.inference_backend);
             nlohmann::json body = {
-                {"model_path",    effective_model_path},
-                {"mmproj_path",   effective_mmproj_path},
+                {"model_path", effective_model_path},
                 {"vision_enabled", cfg.vision_settings.enabled},
                 {"vllm_settings", cfg.vllm_settings},
-                {"kv_cache_path", placement.kv_cache_node_path},
-                {"backend",       to_string(backend)},
-                {"agent_id",      cfg.id}
+                {"backend", "vllm"},
+                {"agent_id", cfg.id}
             };
-            if (backend == EngineBackend::LlamaCpp) {
-                body["runtime_settings"] = cfg.runtime_settings;
-            }
 
             auto resp = cli.post("/api/node/restore-slot", body);
             if (resp.ok()) {
@@ -980,12 +891,7 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
         // Done once, before the retry loop (this runs under schedule_mutex_, so
         // a large transfer serializes scheduling — acceptable for correctness).
         std::string effective_model_path = cfg.model_path;
-        std::string effective_mmproj_path = cfg.vision_settings.enabled
-            ? cfg.vision_settings.mmproj_path : std::string{};
         std::string transferred_model_id;
-        const bool has_projector = cfg.vision_settings.enabled &&
-            !cfg.vision_settings.mmproj_path.empty();
-        const std::string bundle_id = has_projector ? vision_bundle_id(cfg) : std::string{};
         const bool pin_on_node =
             !cfg.preferred_node_id.empty() && cfg.preferred_node_id == node_id;
 
@@ -995,7 +901,7 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
                 std::string xfer_err;
                 auto local = transfer_model_to_node(node, cfg.model_path,
                                                     pin_on_node, /*force=*/false,
-                                                    &xfer_err, bundle_id);
+                                                    &xfer_err);
                 if (!local) {
                     set_last_error("failed to transfer model to node " + node_id +
                                    ": " + xfer_err);
@@ -1003,8 +909,7 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
                             node_id, xfer_err);
                     return std::nullopt;
                 }
-                transferred_model_id = bundle_id.empty()
-                    ? util::model_id_from_ref(cfg.model_path) : bundle_id;
+                transferred_model_id = util::model_id_from_ref(cfg.model_path);
                 effective_model_path = *local;
                 MM_INFO("AgentScheduler: transferred model {} to node {} -> {}",
                         transferred_model_id, node_id, effective_model_path);
@@ -1013,48 +918,16 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
             // original ref and let the node resolve (or fail-fast) it.
         }
 
-        if (has_projector) {
-            std::error_code ec;
-            if (std::filesystem::exists(cfg.vision_settings.mmproj_path, ec)) {
-                std::string xfer_err;
-                auto local = transfer_model_to_node(node,
-                                                    cfg.vision_settings.mmproj_path,
-                                                    pin_on_node, /*force=*/false,
-                                                    &xfer_err, bundle_id);
-                if (!local) {
-                    set_last_error("failed to transfer vision projector to node " + node_id +
-                                   ": " + xfer_err);
-                    return std::nullopt;
-                }
-                effective_mmproj_path = *local;
-                transferred_model_id = bundle_id;
-                MM_INFO("AgentScheduler: transferred model/projector bundle {} to node {}",
-                        bundle_id, node_id);
-            }
-            // An inaccessible path may intentionally be node-local. The node
-            // validates it before launch.
-        }
-
         bool retried_transfer = false;
         for (int attempt = 0; attempt < 3; ++attempt) {
-            const EngineBackend backend =
-                engine_backend_from_string(cfg.inference_backend);
             nlohmann::json body = {
                 {"model_path", effective_model_path},
-                {"mmproj_path", effective_mmproj_path},
                 {"vision_enabled", cfg.vision_settings.enabled},
                 {"vllm_settings", vllm_override ? *vllm_override
                                                 : cfg.vllm_settings},
-                // Always explicit so a node never has to guess the engine from
-                // its own default.
-                {"backend",    to_string(backend)},
+                {"backend",    "vllm"},
                 {"agent_id",   cfg.id}
             };
-            // llama.cpp agents also carry the generation/runtime settings the
-            // node launches llama-server with.
-            if (backend == EngineBackend::LlamaCpp) {
-                body["runtime_settings"] = cfg.runtime_settings;
-            }
             if (!transferred_model_id.empty()) {
                 body["model_id"] = transferred_model_id;
                 body["pin"]      = pin_on_node;
@@ -1090,23 +963,14 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
             // this load (disk pressure). Re-send it once, forcing past the
             // idempotency check, and retry the load.
             if (!transferred_model_id.empty() && !retried_transfer &&
-                (util::to_lower(resp.body).find("model not found on node") !=
-                     std::string::npos ||
-                 util::to_lower(resp.body).find("projector not found on node") !=
-                     std::string::npos)) {
+                util::to_lower(resp.body).find("model not found on node") !=
+                    std::string::npos) {
                 std::string xfer_err;
                 auto local = transfer_model_to_node(node, cfg.model_path,
                                                     pin_on_node, /*force=*/true,
-                                                    &xfer_err, bundle_id);
+                                                    &xfer_err);
                 if (local) {
                     effective_model_path = *local;
-                    if (has_projector) {
-                        auto projector_local = transfer_model_to_node(
-                            node, cfg.vision_settings.mmproj_path,
-                            pin_on_node, /*force=*/true, &xfer_err, bundle_id);
-                        if (!projector_local) continue;
-                        effective_mmproj_path = *projector_local;
-                    }
                     retried_transfer = true;
                     MM_INFO("AgentScheduler: node {} was missing transferred "
                             "model {}; re-sent and retrying load",
@@ -1152,17 +1016,29 @@ bool AgentScheduler::evict_slots_on_node(const NodeId& node_id,
         return max_to_evict < 0 || evicted < max_to_evict;
     };
 
-    // First choice: repeatedly suspend known idle placements on this node.
-    while (can_evict_more()) {
-        auto lru = find_lru_idle_agent(node_id);
-        if (!lru || *lru == preserve_agent) break;
-
-        auto lru_placement = find_placement_copy(*lru);
-        if (!lru_placement) break;
-        if (lru_placement->is_active) break;
-
-        if (!suspend_agent(*lru)) break;
-        ++evicted;
+    // First choice: suspend known idle placements in LRU order. A shared or
+    // multi-node slot may be intentionally unsuspendable, so keep looking for
+    // another candidate instead of letting that one block all eviction.
+    std::vector<AgentPlacement> idle_candidates;
+    {
+        std::lock_guard state(state_mutex_);
+        for (const auto& [agent_id, placement] : placements_) {
+            if (placement.node_id != node_id || placement.suspended ||
+                placement.is_active || agent_id == preserve_agent) {
+                continue;
+            }
+            idle_candidates.push_back(placement);
+        }
+    }
+    std::sort(idle_candidates.begin(), idle_candidates.end(),
+              [](const AgentPlacement& a, const AgentPlacement& b) {
+                  return a.last_active_ms < b.last_active_ms;
+              });
+    for (const auto& candidate : idle_candidates) {
+        if (!can_evict_more()) break;
+        auto current = find_placement_copy(candidate.agent_id);
+        if (!current || current->suspended || current->is_active) continue;
+        if (suspend_agent(candidate.agent_id)) ++evicted;
     }
     if (!can_evict_more()) {
         return evicted > 0;

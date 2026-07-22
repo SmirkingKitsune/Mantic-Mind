@@ -21,14 +21,8 @@ CREATE TABLE IF NOT EXISTS agent_config (
     system_prompt     TEXT    NOT NULL DEFAULT '',
     inference_backend TEXT    NOT NULL DEFAULT 'vllm',
 
-    -- RuntimeSettings columns
+    -- Request context and sampling settings shared by vLLM and API agents.
     ctx_size          INTEGER NOT NULL DEFAULT 4096,
-    n_gpu_layers      INTEGER NOT NULL DEFAULT -1,
-    n_threads         INTEGER NOT NULL DEFAULT -1,
-    n_threads_http    INTEGER NOT NULL DEFAULT -1,
-    parallel          INTEGER NOT NULL DEFAULT 1,
-    batch_size        INTEGER NOT NULL DEFAULT -1,
-    ubatch_size       INTEGER NOT NULL DEFAULT -1,
     temperature       REAL    NOT NULL DEFAULT 0.7,
     top_p             REAL    NOT NULL DEFAULT 0.9,
     top_k             INTEGER NOT NULL DEFAULT -1,
@@ -36,10 +30,9 @@ CREATE TABLE IF NOT EXISTS agent_config (
     presence_penalty  REAL    NOT NULL DEFAULT 0.0,
     repeat_penalty    REAL    NOT NULL DEFAULT -1.0,
     max_tokens        INTEGER NOT NULL DEFAULT 1024,
-    flash_attn        INTEGER NOT NULL DEFAULT 1,   -- stored as bool (0/1)
-    extra_args_json   TEXT    NOT NULL DEFAULT '[]', -- JSON array of strings
     vllm_settings_json TEXT   NOT NULL DEFAULT '{}',
     api_settings_json TEXT    NOT NULL DEFAULT '{}',
+    vision_settings_json TEXT NOT NULL DEFAULT '{}',
 
     -- Feature flags
     reasoning_enabled INTEGER NOT NULL DEFAULT 0,

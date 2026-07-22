@@ -97,7 +97,6 @@ static mm::ControlConfig load_config(
         cfg.node_offline_after_s = static_cast<uint32_t>(
             file.get_int("node_offline_after_s",
                          static_cast<int>(cfg.node_offline_after_s)));
-        cfg.models_dir     = file.get("models_dir",     cfg.models_dir);
         cfg.external_api_token = file.get("external_api_token", cfg.external_api_token);
         cfg.tts.enabled = file.get_bool("tts_enabled", cfg.tts.enabled);
         cfg.tts.backend = file.get("tts_backend", cfg.tts.backend);
@@ -152,7 +151,6 @@ static mm::ControlConfig load_config(
         env_int("MM_OPENAI_COMPAT_PORT", static_cast<int>(cfg.openai_compat_port)));
     cfg.data_dir    = env("MM_DATA_DIR",    cfg.data_dir);
     cfg.log_file    = env("MM_LOG_FILE",    cfg.log_file);
-    cfg.models_dir  = env("MM_MODELS_DIR",  cfg.models_dir);
     cfg.external_api_token =
         env("MM_CONTROL_EXTERNAL_API_TOKEN", cfg.external_api_token);
     cfg.tts.enabled = env_bool("MM_TTS_ENABLED", cfg.tts.enabled);
@@ -335,8 +333,8 @@ static void print_control_usage() {
         << "  nodes pair psk <url> [psk] [remember]\n"
         << "  models list\n"
         << "  node-models list <node_id>\n"
-        << "  node-models pull <node_id> <model_filename> [force(true|false)]\n"
-        << "  node-models delete <node_id> <model_filename>\n"
+        << "  node-models pull <node_id> <model_ref> [force(true|false)]\n"
+        << "  node-models delete <node_id> <model_id>\n"
         << "  agents list|show|create|update|delete ...\n"
         << "  chat send <agent_id> <message> [conversation_id]\n"
         << "  curation conv ...\n"
@@ -596,7 +594,7 @@ static void run_control_cli(uint16_t listen_port,
             }
             if (sub == "pull") {
                 if (tokens.size() < 4) {
-                    printer.line("usage: node-models pull <node_id> <model_filename> [force]");
+                    printer.line("usage: node-models pull <node_id> <model_ref> [force]");
                     continue;
                 }
                 bool force = false;
@@ -605,13 +603,13 @@ static void run_control_cli(uint16_t listen_port,
                     continue;
                 }
                 auto r = self.post("/v1/nodes/" + node_id + "/models/pull",
-                                   nlohmann::json{{"model_filename", tokens[3]}, {"force", force}});
+                                   nlohmann::json{{"model_ref", tokens[3]}, {"force", force}});
                 emit_http_result("node-models pull", r);
                 continue;
             }
             if (sub == "delete") {
                 if (tokens.size() < 4) {
-                    printer.line("usage: node-models delete <node_id> <model_filename>");
+                    printer.line("usage: node-models delete <node_id> <model_id>");
                     continue;
                 }
                 auto r = self.del("/v1/nodes/" + node_id + "/models/" + tokens[3]);
@@ -922,13 +920,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Ensure models directory exists.
-    {
-        namespace fs = std::filesystem;
-        std::error_code ec;
-        fs::create_directories(cfg.models_dir, ec);
-    }
-
     // Disable console logging — the TUI owns the terminal.
     mm::init_logger(
         cfg.log_file,
@@ -949,17 +940,16 @@ int main(int argc, char** argv) {
     agents.load_all();
 
     mm::NodeRegistry      registry(cfg.data_dir);
-    mm::AgentScheduler    scheduler(registry, cfg.models_dir);
+    mm::AgentScheduler    scheduler(registry);
     registry.set_offline_after_seconds(static_cast<int>(cfg.node_offline_after_s));
     mm::AgentQueue        queue;
     mm::ControlApiServer  api_server(
         agents, queue, registry, scheduler,
-        cfg.data_dir, cfg.models_dir, cfg.external_api_token, cfg.tts);
+        cfg.data_dir, cfg.external_api_token, cfg.tts);
     api_server.cleanup_expired_tts_cache();
     mm::ControlUI         ui(
         registry,
         agents,
-        cfg.models_dir,
         "http://127.0.0.1:" + std::to_string(cfg.listen_port),
         cfg.external_api_token,
         [&api_server](const std::string& agent_id,

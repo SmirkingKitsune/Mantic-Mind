@@ -4,8 +4,6 @@ add_executable(mantic-mind
     runtime_process.cpp
     vllm_provisioner.cpp
     vllm_runtime.cpp
-    llama_runtime.cpp
-    llama_cpp_provisioner.cpp
     ray_orchestration.cpp
     hf_cache.cpp
     model_store.cpp

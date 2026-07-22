@@ -36,7 +36,6 @@ public:
                      NodeRegistry& registry,
                      AgentScheduler& scheduler,
                      std::string data_dir,
-                     std::string models_dir,
                      std::string external_api_token = {},
                      TtsServiceConfig tts_config = {});
     ~ControlApiServer();
@@ -66,7 +65,6 @@ private:
     NodeRegistry&   registry_;
     AgentScheduler& scheduler_;
     std::string     data_dir_;
-    std::string     models_dir_;
     std::string     external_api_token_;
     TtsServiceClient tts_;
     std::unique_ptr<HttpServer> server_;

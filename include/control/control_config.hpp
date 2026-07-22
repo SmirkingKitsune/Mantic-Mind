@@ -15,9 +15,6 @@ struct ControlConfig {
     uint32_t    node_health_poll_interval_s = 30;
     uint32_t    node_offline_after_s = 90;
 
-    // Model distribution
-    std::string models_dir  = "models";
-
     // Optional bearer token required by external /v1/* client routes.
     std::string external_api_token;
 

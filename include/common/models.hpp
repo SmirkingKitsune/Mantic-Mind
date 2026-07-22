@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cctype>
 #include <string>
 #include <vector>
 #include <optional>
@@ -31,25 +32,23 @@ enum class NodeConnectionStatus { Unknown, Online, Unreachable, Offline };
 
 enum class SlotState { Empty, Loading, Ready, Suspending, Suspended, Error };
 
-// Inference engine family backing an agent or a running slot. llama.cpp is the
-// default runtime on this branch (GGUF models, Windows-native inference, and
-// accelerators without a vLLM build such as the DGX Spark); vLLM remains a
-// peer backend, and runs as the default on the vLLM-runtime branch.
-enum class EngineBackend { Vllm, LlamaCpp };
-
-inline std::string to_string(EngineBackend b) {
-    return b == EngineBackend::Vllm ? "vllm" : "llama-cpp";
-}
-
-// Accepts the canonical "llama-cpp" plus the legacy "llama.cpp"/"llama"
-// spellings so older persisted configs and hand-written payloads keep
-// resolving; an empty string means "unspecified" and resolves to the default
-// runtime (llama.cpp). Only an explicit "vllm" selects the vLLM engine —
-// callers that care about the api backend check the string form before
-// constructing an EngineBackend.
-inline EngineBackend engine_backend_from_string(const std::string& s) {
-    if (s == "vllm") return EngineBackend::Vllm;
-    return EngineBackend::LlamaCpp;
+// Local inference on this branch is always vLLM. Backend validation stays at
+// API/config boundaries so legacy llama.cpp profiles fail explicitly instead
+// of being silently reinterpreted as vLLM agents.
+inline bool is_vllm_backend(const std::string& backend) {
+    const auto first = std::find_if_not(
+        backend.begin(), backend.end(),
+        [](unsigned char ch) { return std::isspace(ch) != 0; });
+    const auto last = std::find_if_not(
+        backend.rbegin(), backend.rend(),
+        [](unsigned char ch) { return std::isspace(ch) != 0; }).base();
+    if (first >= last) return true;
+    static constexpr char expected[] = "vllm";
+    if (std::distance(first, last) != 4) return false;
+    return std::equal(first, last, std::begin(expected),
+                      [](unsigned char a, unsigned char b) {
+                          return std::tolower(a) == std::tolower(b);
+                      });
 }
 
 // ── ToolCall ──────────────────────────────────────────────────────────────────
@@ -116,21 +115,13 @@ struct Message {
 // ── RuntimeSettings ─────────────────────────────────────────────────────────────
 struct RuntimeSettings {
     int   ctx_size     = 4096;
-    int   n_gpu_layers = -1;   // -1 = all layers on GPU
-    int   n_threads    = -1;   // -1 = auto-detect
-    int   n_threads_http = -1; // -1 = runtime default
-    int   parallel     = 1;    // request slots; ctx_size is per slot
-    int   batch_size   = -1;   // -1 = runtime default
-    int   ubatch_size  = -1;   // -1 = runtime default
     float temperature  = 0.7f;
     float top_p        = 0.9f;
     int   top_k        = -1;   // -1 = omit and use provider/runtime default
     float min_p        = -1.0f; // -1 = omit; 0 explicitly disables min-p
     float presence_penalty = 0.0f;
-    float repeat_penalty   = -1.0f; // -1 = omit; llama.cpp request field
+    float repeat_penalty   = -1.0f; // -1 = omit; retained request compatibility
     int   max_tokens   = 1024;
-    bool  flash_attn   = true;
-    std::vector<std::string> extra_args;  // additional runtime CLI flags
 };
 
 // vLLM server launch settings. Common generation settings still flow through
@@ -165,12 +156,10 @@ struct ApiSettings {
     std::string api_key_env = "OPENAI_API_KEY";
 };
 
-// Image-input capability declared by an agent profile. llama.cpp agents need
-// an explicit local GGUF projector; vLLM/API agents use their model-native
-// multimodal implementation and therefore leave mmproj_path empty.
+// Image-input capability declared by an agent profile. vLLM and remote API
+// agents use their model-native multimodal implementation.
 struct VisionSettings {
-    bool        enabled = false;
-    std::string mmproj_path;
+    bool enabled = false;
 };
 
 /// True when two vLLM configurations describe the same engine launch, i.e.
@@ -194,29 +183,13 @@ inline bool vllm_launch_compatible(const VllmSettings& a, const VllmSettings& b)
         && a.extra_args             == b.extra_args;
 }
 
-/// True when two llama.cpp configurations describe the same engine launch, i.e.
-/// agents using either can share one llama-server process. Only the launch-time
-/// (engine identity) fields gate sharing; per-request generation parameters
-/// (sampling controls and max_tokens) ride each request and are excluded.
-inline bool llama_launch_compatible(const RuntimeSettings& a, const RuntimeSettings& b) {
-    return a.ctx_size        == b.ctx_size
-        && a.n_gpu_layers    == b.n_gpu_layers
-        && a.n_threads       == b.n_threads
-        && a.n_threads_http  == b.n_threads_http
-        && a.parallel        == b.parallel
-        && a.batch_size      == b.batch_size
-        && a.ubatch_size     == b.ubatch_size
-        && a.flash_attn      == b.flash_attn
-        && a.extra_args      == b.extra_args;
-}
-
 // ── AgentConfig ───────────────────────────────────────────────────────────────
 struct AgentConfig {
     AgentId       id;
     std::string   name;
     std::string   model_path;
     std::string   system_prompt;
-    std::string   inference_backend = "llama-cpp"; // llama-cpp (default) | vllm | api
+    std::string   inference_backend = "vllm"; // vllm (default) | api
     RuntimeSettings runtime_settings;
     VllmSettings  vllm_settings;
     ApiSettings   api_settings;
@@ -306,16 +279,6 @@ inline ValidationSeverity validation_severity_from_string(const std::string& s) 
     return s == "error" ? ValidationSeverity::Error : ValidationSeverity::Warning;
 }
 
-struct ModelCapabilityInfo {
-    bool                     metadata_found = false;
-    int64_t                  n_ctx_train = 0;
-    bool                     supports_tool_calls = false;
-    bool                     supports_reasoning = false;
-    bool                     used_filename_heuristics = false;
-    std::string              source_path;
-    std::vector<std::string> warnings;
-};
-
 struct ValidationIssue {
     ValidationSeverity severity = ValidationSeverity::Error;
     std::string        field;
@@ -324,7 +287,6 @@ struct ValidationIssue {
 
 struct AgentValidationResult {
     std::vector<ValidationIssue> issues;
-    std::optional<ModelCapabilityInfo> model_info;
 
     bool ok() const {
         for (const auto& issue : issues) {
@@ -386,10 +348,8 @@ struct SlotInfo {
     SlotId      id;
     uint16_t    port            = 0;
     std::string model_path;
-    std::string mmproj_path;             // node-local; only returned by authenticated node/control status
     bool        vision_enabled  = false;
-    std::string projector_identity;      // stable basename/manifest identity, never a managed attachment path
-    std::string backend         = "llama-cpp"; // "llama-cpp" | "vllm"; slots always report it
+    std::string backend         = "vllm"; // retained on the wire for compatibility
     AgentId     assigned_agent;          // first attached agent (legacy display)
     std::vector<AgentId> agent_ids;      // all agents attached to this slot
     SlotState   state           = SlotState::Empty;
@@ -400,9 +360,8 @@ struct SlotInfo {
     int         num_requests_waiting = 0;
     double      kv_cache_usage       = 0.0;  // 0.0–1.0
     int64_t     vram_usage_mb   = 0;
-    double      gpu_mem_fraction = 0.0;  // vLLM only: --gpu-memory-utilization slice held
+    double      gpu_mem_fraction = 0.0;  // --gpu-memory-utilization slice held
     int64_t     last_active_ms  = 0;
-    std::string kv_cache_path;
     int         effective_ctx_size = 0;
 };
 
@@ -413,7 +372,6 @@ struct AgentPlacement {
     SlotId      slot_id;
     bool        suspended       = false;
     bool        is_active       = false;  // true while inference/memory-extraction is in-flight
-    std::string kv_cache_node_path;
     std::string engine_fingerprint;
     int64_t     placed_at_ms    = 0;
     int64_t     last_active_ms  = 0;
@@ -432,12 +390,6 @@ struct NodeCapabilities {
     bool                     supports_ray = false;
     int                      gpu_count = 0;    // GPUs visible to this node
     double                   interconnect_gbps = 0.0; // node-to-node link hint, 0 = unknown
-    // llama.cpp multi-node grouping is orthogonal to vLLM's Ray path: it uses
-    // ggml's own TCP RPC backend (no NCCL/Gloo), so RPC members must share a
-    // compatible llama.cpp build fingerprint rather than a comm backend.
-    std::string              llama_cpp_version; // llama.cpp build fingerprint, "" = unknown
-    bool                     supports_llama_rpc = false; // can host/join a ggml RPC group
-
     bool has_comm_backend(const std::string& b) const {
         return std::find(comm_backends.begin(), comm_backends.end(), b)
             != comm_backends.end();
@@ -467,111 +419,6 @@ struct VllmRuntimeStatus {
     // True when the installed runtime is older than latest_version. Orthogonal to
     // `status`: a runtime stays "ready" while advertising an available update.
     bool        update_available = false;
-};
-
-// One environment check performed after a llama.cpp provisioning failure.
-// `status` is pass|warn|fail|info; blocking means the normal source-build
-// preflight will reject the environment until the issue is resolved.
-struct LlamaDiagnosticCheck {
-    std::string id;
-    std::string label;
-    std::string status = "info";
-    std::string detected;
-    std::string required;
-    std::string remediation;
-    bool        blocking = false;
-};
-
-// A known llama.cpp backend/precision variant assessed against this OS,
-// architecture, and the assets attached to the selected upstream release.
-struct LlamaRuntimeVariant {
-    std::string id;                 // cuda-12|cuda-13|vulkan|...|cpu
-    std::string label;
-    std::string backend;            // normalized build backend
-    bool        platform_supported = false;
-    bool        source_supported = false;
-    bool        release_available = false;
-    std::string release_asset;
-    std::string reason;
-    bool        recommended = false;
-};
-
-// Comprehensive, serializable failure report consumed by the forced node-TUI
-// troubleshooting popup and by the REST API.
-struct LlamaTroubleshootingReport {
-    bool        required = false;
-    std::string fingerprint;
-    std::string failure_stage;
-    std::string failure_detail;
-    std::string platform;
-    std::string architecture;
-    std::string target_backend;
-    std::string release_tag;
-    std::string summary;
-    bool        can_override_checks = false;
-    std::vector<LlamaDiagnosticCheck> checks;
-    std::vector<LlamaRuntimeVariant> variants;
-};
-
-// Managed llama.cpp runtime status, the llama-server analog of
-// VllmRuntimeStatus. Kept as a separate struct (not renamed/shared) so a node
-// can advertise both runtimes independently and older clients keep parsing
-// vllm_runtime unchanged.
-struct LlamaRuntimeStatus {
-    std::string status = "disabled"; // resolved|provisioning|ready|failed|disabled
-    std::string platform;
-    std::string method;              // release|source|path
-    std::string source_repo;
-    std::string version;             // llama-server build number / commit
-    bool        managed = false;
-    std::string executable_path;
-    std::string last_error;
-    // Dedicated stdout/stderr/command transcript for the most recent managed
-    // install or update attempt. Separate from the rotating application log.
-    std::string build_log_path;
-    // Accelerator-correct build this node targets: cuda|rocm|vulkan|metal|cpu.
-    std::string accelerator;
-    // Concrete selected engine variant when known (for example cuda-12,
-    // cuda-13, vulkan, or cpu). Older markers may report only accelerator.
-    std::string variant;
-    // The configured/detected build the node ultimately wants. These remain
-    // stable when a user selects a temporary Vulkan/CPU fallback, allowing the
-    // UI to distinguish the active runtime from the intended target.
-    std::string target_method;       // auto|release|source
-    std::string target_accelerator;  // cuda|rocm|vulkan|metal|cpu|...
-    std::string target_variant;      // concrete variant, or target_accelerator
-    // Effective CMAKE_CUDA_ARCHITECTURES value for source builds. The active
-    // value is persisted in the managed-runtime marker; target is derived from
-    // current environment/configuration (for example 120a-real on Blackwell).
-    std::string cuda_architecture;
-    std::string target_cuda_architecture;
-    // Computed whenever provisioner status changes. A usable fallback can be
-    // ready while this is true; callers should offer, not silently force, the
-    // target installation.
-    bool        target_mismatch = false;
-    std::string target_mismatch_reason;
-    // Platform-aware engine/backend choices. Populated immediately with source
-    // support and enriched with official release availability after an online
-    // update/variant assessment.
-    std::vector<LlamaRuntimeVariant> available_variants;
-    // Newest build available upstream; "" when unknown (offline / not checked).
-    std::string latest_version;
-    // True when the installed runtime is older than latest_version. Orthogonal
-    // to `status`: a runtime stays "ready" while advertising an update.
-    bool        update_available = false;
-    // Planned action for the detected update: release|compile|unavailable.
-    // Empty when no update is pending or release assets could not be assessed.
-    std::string update_action;
-    // True only when an official asset matches this node's current accelerator.
-    bool        update_release_available = false;
-    // Same-platform accelerators that do have official assets (excluding the
-    // current accelerator), e.g. vulkan/cpu when Linux CUDA needs compilation.
-    std::vector<std::string> update_release_alternatives;
-    // Human-readable consequence shown before the user approves the update.
-    std::string update_warning;
-    // Populated after a managed provisioning/compilation failure or an explicit
-    // diagnostic refresh. Empty/default while no troubleshooting is required.
-    LlamaTroubleshootingReport troubleshooting;
 };
 
 // Live progress of an in-program vLLM runtime install/upgrade, surfaced so the
@@ -638,8 +485,6 @@ struct NodeInfo {
     int                      slot_error = 0;
     std::string              vllm_server_path;
     VllmRuntimeStatus        vllm_runtime;
-    std::string              llama_server_path;
-    LlamaRuntimeStatus       llama_runtime;
     VllmInstallProgress      vllm_install_progress;
     NodeActionProgress       action_progress;
     double                   vllm_gpu_budget = 0.0;         // total GPU fraction vLLM slots may claim
@@ -851,30 +696,16 @@ inline void from_json(const nlohmann::json& j, Message& m) {
 // ─── RuntimeSettings ───────────────────────────────────────────────────────────
 inline void to_json(nlohmann::json& j, const RuntimeSettings& s) {
     j = { {"ctx_size",     s.ctx_size},
-          {"n_gpu_layers", s.n_gpu_layers},
-          {"n_threads",    s.n_threads},
-          {"n_threads_http", s.n_threads_http},
-          {"parallel",     s.parallel},
-          {"batch_size",   s.batch_size},
-          {"ubatch_size",  s.ubatch_size},
           {"temperature",  s.temperature},
           {"top_p",        s.top_p},
           {"top_k",        s.top_k},
           {"min_p",        s.min_p},
           {"presence_penalty", s.presence_penalty},
           {"repeat_penalty", s.repeat_penalty},
-          {"max_tokens",   s.max_tokens},
-          {"flash_attn",   s.flash_attn},
-          {"extra_args",   s.extra_args} };
+          {"max_tokens",   s.max_tokens} };
 }
 inline void from_json(const nlohmann::json& j, RuntimeSettings& s) {
     if (j.contains("ctx_size"))     j.at("ctx_size").get_to(s.ctx_size);
-    if (j.contains("n_gpu_layers")) j.at("n_gpu_layers").get_to(s.n_gpu_layers);
-    if (j.contains("n_threads"))    j.at("n_threads").get_to(s.n_threads);
-    if (j.contains("n_threads_http")) j.at("n_threads_http").get_to(s.n_threads_http);
-    if (j.contains("parallel"))     j.at("parallel").get_to(s.parallel);
-    if (j.contains("batch_size"))   j.at("batch_size").get_to(s.batch_size);
-    if (j.contains("ubatch_size"))  j.at("ubatch_size").get_to(s.ubatch_size);
     if (j.contains("temperature"))  j.at("temperature").get_to(s.temperature);
     if (j.contains("top_p"))        j.at("top_p").get_to(s.top_p);
     if (j.contains("top_k"))        j.at("top_k").get_to(s.top_k);
@@ -882,8 +713,6 @@ inline void from_json(const nlohmann::json& j, RuntimeSettings& s) {
     if (j.contains("presence_penalty")) j.at("presence_penalty").get_to(s.presence_penalty);
     if (j.contains("repeat_penalty")) j.at("repeat_penalty").get_to(s.repeat_penalty);
     if (j.contains("max_tokens"))   j.at("max_tokens").get_to(s.max_tokens);
-    if (j.contains("flash_attn"))   j.at("flash_attn").get_to(s.flash_attn);
-    if (j.contains("extra_args"))   j.at("extra_args").get_to(s.extra_args);
 }
 
 inline void to_json(nlohmann::json& j, const VllmSettings& s) {
@@ -935,11 +764,10 @@ inline void from_json(const nlohmann::json& j, ApiSettings& s) {
 }
 
 inline void to_json(nlohmann::json& j, const VisionSettings& s) {
-    j = {{"enabled", s.enabled}, {"mmproj_path", s.mmproj_path}};
+    j = {{"enabled", s.enabled}};
 }
 inline void from_json(const nlohmann::json& j, VisionSettings& s) {
-    if (j.contains("enabled"))     j.at("enabled").get_to(s.enabled);
-    if (j.contains("mmproj_path")) j.at("mmproj_path").get_to(s.mmproj_path);
+    if (j.contains("enabled")) j.at("enabled").get_to(s.enabled);
 }
 
 // ─── AgentConfig ─────────────────────────────────────────────────────────────
@@ -1116,28 +944,6 @@ inline void from_json(const nlohmann::json& j, ValidationSeverity& severity) {
     severity = validation_severity_from_string(j.get<std::string>());
 }
 
-// ─── ModelCapabilityInfo ────────────────────────────────────────────────────
-inline void to_json(nlohmann::json& j, const ModelCapabilityInfo& info) {
-    j = {
-        {"metadata_found", info.metadata_found},
-        {"n_ctx_train", info.n_ctx_train},
-        {"supports_tool_calls", info.supports_tool_calls},
-        {"supports_reasoning", info.supports_reasoning},
-        {"used_filename_heuristics", info.used_filename_heuristics},
-        {"source_path", info.source_path},
-        {"warnings", info.warnings}
-    };
-}
-inline void from_json(const nlohmann::json& j, ModelCapabilityInfo& info) {
-    if (j.contains("metadata_found")) j.at("metadata_found").get_to(info.metadata_found);
-    if (j.contains("n_ctx_train")) j.at("n_ctx_train").get_to(info.n_ctx_train);
-    if (j.contains("supports_tool_calls")) j.at("supports_tool_calls").get_to(info.supports_tool_calls);
-    if (j.contains("supports_reasoning")) j.at("supports_reasoning").get_to(info.supports_reasoning);
-    if (j.contains("used_filename_heuristics")) j.at("used_filename_heuristics").get_to(info.used_filename_heuristics);
-    if (j.contains("source_path")) j.at("source_path").get_to(info.source_path);
-    if (j.contains("warnings")) j.at("warnings").get_to(info.warnings);
-}
-
 // ─── ValidationIssue ────────────────────────────────────────────────────────
 inline void to_json(nlohmann::json& j, const ValidationIssue& issue) {
     j = {
@@ -1155,11 +961,9 @@ inline void from_json(const nlohmann::json& j, ValidationIssue& issue) {
 // ─── AgentValidationResult ──────────────────────────────────────────────────
 inline void to_json(nlohmann::json& j, const AgentValidationResult& result) {
     j = {{"issues", result.issues}};
-    if (result.model_info) j["model_info"] = *result.model_info;
 }
 inline void from_json(const nlohmann::json& j, AgentValidationResult& result) {
     if (j.contains("issues")) j.at("issues").get_to(result.issues);
-    if (j.contains("model_info")) result.model_info = j.at("model_info").get<ModelCapabilityInfo>();
 }
 
 // ─── Conversation ─────────────────────────────────────────────────────────────
@@ -1253,9 +1057,7 @@ inline void to_json(nlohmann::json& j, const SlotInfo& s) {
     j = { {"id",              s.id},
           {"port",            s.port},
           {"model_path",      s.model_path},
-          {"mmproj_path",     s.mmproj_path},
           {"vision_enabled",  s.vision_enabled},
-          {"projector_identity", s.projector_identity},
           {"backend",         s.backend},
           {"assigned_agent",  s.assigned_agent},
           {"agent_ids",       s.agent_ids},
@@ -1268,16 +1070,13 @@ inline void to_json(nlohmann::json& j, const SlotInfo& s) {
           {"vram_usage_mb",   s.vram_usage_mb},
           {"gpu_mem_fraction", s.gpu_mem_fraction},
           {"last_active_ms",  s.last_active_ms},
-          {"kv_cache_path",   s.kv_cache_path},
           {"effective_ctx_size", s.effective_ctx_size} };
 }
 inline void from_json(const nlohmann::json& j, SlotInfo& s) {
     j.at("id").get_to(s.id);
     if (j.contains("port"))           j.at("port").get_to(s.port);
     if (j.contains("model_path"))     j.at("model_path").get_to(s.model_path);
-    if (j.contains("mmproj_path"))    j.at("mmproj_path").get_to(s.mmproj_path);
     if (j.contains("vision_enabled")) j.at("vision_enabled").get_to(s.vision_enabled);
-    if (j.contains("projector_identity")) j.at("projector_identity").get_to(s.projector_identity);
     if (j.contains("backend"))        j.at("backend").get_to(s.backend);
     if (j.contains("assigned_agent")) j.at("assigned_agent").get_to(s.assigned_agent);
     if (j.contains("agent_ids"))      j.at("agent_ids").get_to(s.agent_ids);
@@ -1293,7 +1092,6 @@ inline void from_json(const nlohmann::json& j, SlotInfo& s) {
     if (j.contains("vram_usage_mb"))  j.at("vram_usage_mb").get_to(s.vram_usage_mb);
     if (j.contains("gpu_mem_fraction")) j.at("gpu_mem_fraction").get_to(s.gpu_mem_fraction);
     if (j.contains("last_active_ms")) j.at("last_active_ms").get_to(s.last_active_ms);
-    if (j.contains("kv_cache_path"))  j.at("kv_cache_path").get_to(s.kv_cache_path);
     if (j.contains("effective_ctx_size")) j.at("effective_ctx_size").get_to(s.effective_ctx_size);
 }
 
@@ -1304,7 +1102,6 @@ inline void to_json(nlohmann::json& j, const AgentPlacement& p) {
           {"slot_id",            p.slot_id},
           {"suspended",          p.suspended},
           {"is_active",          p.is_active},
-          {"kv_cache_node_path", p.kv_cache_node_path},
           {"engine_fingerprint", p.engine_fingerprint},
           {"placed_at_ms",       p.placed_at_ms},
           {"last_active_ms",     p.last_active_ms} };
@@ -1315,7 +1112,6 @@ inline void from_json(const nlohmann::json& j, AgentPlacement& p) {
     if (j.contains("slot_id"))            j.at("slot_id").get_to(p.slot_id);
     if (j.contains("suspended"))          j.at("suspended").get_to(p.suspended);
     if (j.contains("is_active"))          j.at("is_active").get_to(p.is_active);
-    if (j.contains("kv_cache_node_path")) j.at("kv_cache_node_path").get_to(p.kv_cache_node_path);
     if (j.contains("engine_fingerprint")) j.at("engine_fingerprint").get_to(p.engine_fingerprint);
     if (j.contains("placed_at_ms"))       j.at("placed_at_ms").get_to(p.placed_at_ms);
     if (j.contains("last_active_ms"))     j.at("last_active_ms").get_to(p.last_active_ms);
@@ -1328,9 +1124,7 @@ inline void to_json(nlohmann::json& j, const NodeCapabilities& c) {
           {"vllm_version",  c.vllm_version},
           {"supports_ray",  c.supports_ray},
           {"gpu_count",     c.gpu_count},
-          {"interconnect_gbps", c.interconnect_gbps},
-          {"llama_cpp_version",  c.llama_cpp_version},
-          {"supports_llama_rpc", c.supports_llama_rpc} };
+          {"interconnect_gbps", c.interconnect_gbps} };
 }
 inline void from_json(const nlohmann::json& j, NodeCapabilities& c) {
     if (j.contains("arch"))          j.at("arch").get_to(c.arch);
@@ -1339,8 +1133,6 @@ inline void from_json(const nlohmann::json& j, NodeCapabilities& c) {
     if (j.contains("supports_ray"))  j.at("supports_ray").get_to(c.supports_ray);
     if (j.contains("gpu_count"))     j.at("gpu_count").get_to(c.gpu_count);
     if (j.contains("interconnect_gbps")) j.at("interconnect_gbps").get_to(c.interconnect_gbps);
-    if (j.contains("llama_cpp_version"))  j.at("llama_cpp_version").get_to(c.llama_cpp_version);
-    if (j.contains("supports_llama_rpc")) j.at("supports_llama_rpc").get_to(c.supports_llama_rpc);
 }
 
 // ─── NodeInfo ─────────────────────────────────────────────────────────────────
@@ -1373,136 +1165,6 @@ inline void from_json(const nlohmann::json& j, VllmRuntimeStatus& r) {
     if (j.contains("accelerator"))      j.at("accelerator").get_to(r.accelerator);
     if (j.contains("latest_version"))   j.at("latest_version").get_to(r.latest_version);
     if (j.contains("update_available")) j.at("update_available").get_to(r.update_available);
-}
-
-inline void to_json(nlohmann::json& j, const LlamaDiagnosticCheck& c) {
-    j = {{"id", c.id}, {"label", c.label}, {"status", c.status},
-         {"detected", c.detected}, {"required", c.required},
-         {"remediation", c.remediation}, {"blocking", c.blocking}};
-}
-inline void from_json(const nlohmann::json& j, LlamaDiagnosticCheck& c) {
-    if (j.contains("id")) j.at("id").get_to(c.id);
-    if (j.contains("label")) j.at("label").get_to(c.label);
-    if (j.contains("status")) j.at("status").get_to(c.status);
-    if (j.contains("detected")) j.at("detected").get_to(c.detected);
-    if (j.contains("required")) j.at("required").get_to(c.required);
-    if (j.contains("remediation")) j.at("remediation").get_to(c.remediation);
-    if (j.contains("blocking")) j.at("blocking").get_to(c.blocking);
-}
-
-inline void to_json(nlohmann::json& j, const LlamaRuntimeVariant& v) {
-    j = {{"id", v.id}, {"label", v.label}, {"backend", v.backend},
-         {"platform_supported", v.platform_supported},
-         {"source_supported", v.source_supported},
-         {"release_available", v.release_available},
-         {"release_asset", v.release_asset}, {"reason", v.reason},
-         {"recommended", v.recommended}};
-}
-inline void from_json(const nlohmann::json& j, LlamaRuntimeVariant& v) {
-    if (j.contains("id")) j.at("id").get_to(v.id);
-    if (j.contains("label")) j.at("label").get_to(v.label);
-    if (j.contains("backend")) j.at("backend").get_to(v.backend);
-    if (j.contains("platform_supported"))
-        j.at("platform_supported").get_to(v.platform_supported);
-    if (j.contains("source_supported"))
-        j.at("source_supported").get_to(v.source_supported);
-    if (j.contains("release_available"))
-        j.at("release_available").get_to(v.release_available);
-    if (j.contains("release_asset")) j.at("release_asset").get_to(v.release_asset);
-    if (j.contains("reason")) j.at("reason").get_to(v.reason);
-    if (j.contains("recommended")) j.at("recommended").get_to(v.recommended);
-}
-
-inline void to_json(nlohmann::json& j, const LlamaTroubleshootingReport& r) {
-    j = {{"required", r.required}, {"fingerprint", r.fingerprint},
-         {"failure_stage", r.failure_stage}, {"failure_detail", r.failure_detail},
-         {"platform", r.platform}, {"architecture", r.architecture},
-         {"target_backend", r.target_backend}, {"release_tag", r.release_tag},
-         {"summary", r.summary}, {"can_override_checks", r.can_override_checks},
-         {"checks", r.checks}, {"variants", r.variants}};
-}
-inline void from_json(const nlohmann::json& j, LlamaTroubleshootingReport& r) {
-    if (j.contains("required")) j.at("required").get_to(r.required);
-    if (j.contains("fingerprint")) j.at("fingerprint").get_to(r.fingerprint);
-    if (j.contains("failure_stage")) j.at("failure_stage").get_to(r.failure_stage);
-    if (j.contains("failure_detail")) j.at("failure_detail").get_to(r.failure_detail);
-    if (j.contains("platform")) j.at("platform").get_to(r.platform);
-    if (j.contains("architecture")) j.at("architecture").get_to(r.architecture);
-    if (j.contains("target_backend")) j.at("target_backend").get_to(r.target_backend);
-    if (j.contains("release_tag")) j.at("release_tag").get_to(r.release_tag);
-    if (j.contains("summary")) j.at("summary").get_to(r.summary);
-    if (j.contains("can_override_checks"))
-        j.at("can_override_checks").get_to(r.can_override_checks);
-    if (j.contains("checks")) j.at("checks").get_to(r.checks);
-    if (j.contains("variants")) j.at("variants").get_to(r.variants);
-}
-
-inline void to_json(nlohmann::json& j, const LlamaRuntimeStatus& r) {
-    j = { {"status",           r.status},
-          {"platform",         r.platform},
-          {"method",           r.method},
-          {"source_repo",      r.source_repo},
-          {"version",          r.version},
-          {"managed",          r.managed},
-          {"executable_path",  r.executable_path},
-          {"last_error",       r.last_error},
-          {"build_log_path",   r.build_log_path},
-          {"accelerator",      r.accelerator},
-          {"variant",          r.variant},
-          {"target_method",    r.target_method},
-          {"target_accelerator", r.target_accelerator},
-          {"target_variant",   r.target_variant},
-          {"cuda_architecture", r.cuda_architecture},
-          {"target_cuda_architecture", r.target_cuda_architecture},
-          {"target_mismatch", r.target_mismatch},
-          {"target_mismatch_reason", r.target_mismatch_reason},
-          {"available_variants", r.available_variants},
-          {"latest_version",   r.latest_version},
-          {"update_available", r.update_available},
-          {"update_action",    r.update_action},
-          {"update_release_available", r.update_release_available},
-          {"update_release_alternatives", r.update_release_alternatives},
-          {"update_warning",   r.update_warning},
-          {"troubleshooting",  r.troubleshooting} };
-}
-inline void from_json(const nlohmann::json& j, LlamaRuntimeStatus& r) {
-    if (j.contains("status"))           j.at("status").get_to(r.status);
-    if (j.contains("platform"))         j.at("platform").get_to(r.platform);
-    if (j.contains("method"))           j.at("method").get_to(r.method);
-    if (j.contains("source_repo"))      j.at("source_repo").get_to(r.source_repo);
-    if (j.contains("version"))          j.at("version").get_to(r.version);
-    if (j.contains("managed"))          j.at("managed").get_to(r.managed);
-    if (j.contains("executable_path"))  j.at("executable_path").get_to(r.executable_path);
-    if (j.contains("last_error"))       j.at("last_error").get_to(r.last_error);
-    if (j.contains("build_log_path"))   j.at("build_log_path").get_to(r.build_log_path);
-    if (j.contains("accelerator"))      j.at("accelerator").get_to(r.accelerator);
-    if (j.contains("variant"))          j.at("variant").get_to(r.variant);
-    if (j.contains("target_method"))
-        j.at("target_method").get_to(r.target_method);
-    if (j.contains("target_accelerator"))
-        j.at("target_accelerator").get_to(r.target_accelerator);
-    if (j.contains("target_variant"))
-        j.at("target_variant").get_to(r.target_variant);
-    if (j.contains("cuda_architecture"))
-        j.at("cuda_architecture").get_to(r.cuda_architecture);
-    if (j.contains("target_cuda_architecture"))
-        j.at("target_cuda_architecture").get_to(r.target_cuda_architecture);
-    if (j.contains("target_mismatch"))
-        j.at("target_mismatch").get_to(r.target_mismatch);
-    if (j.contains("target_mismatch_reason"))
-        j.at("target_mismatch_reason").get_to(r.target_mismatch_reason);
-    if (j.contains("available_variants"))
-        j.at("available_variants").get_to(r.available_variants);
-    if (j.contains("latest_version"))   j.at("latest_version").get_to(r.latest_version);
-    if (j.contains("update_available")) j.at("update_available").get_to(r.update_available);
-    if (j.contains("update_action")) j.at("update_action").get_to(r.update_action);
-    if (j.contains("update_release_available"))
-        j.at("update_release_available").get_to(r.update_release_available);
-    if (j.contains("update_release_alternatives"))
-        j.at("update_release_alternatives").get_to(r.update_release_alternatives);
-    if (j.contains("update_warning")) j.at("update_warning").get_to(r.update_warning);
-    if (j.contains("troubleshooting"))
-        j.at("troubleshooting").get_to(r.troubleshooting);
 }
 
 inline void to_json(nlohmann::json& j, const VllmInstallProgress& p) {
@@ -1586,8 +1248,6 @@ inline void to_json(nlohmann::json& j, const NodeInfo& n) {
           {"slot_error",    n.slot_error},
           {"vllm_server_path",         n.vllm_server_path},
           {"vllm_runtime",             n.vllm_runtime},
-          {"llama_server_path",        n.llama_server_path},
-          {"llama_runtime",            n.llama_runtime},
           {"vllm_install_progress",    n.vllm_install_progress},
           {"action_progress",          n.action_progress},
           {"vllm_gpu_budget",          n.vllm_gpu_budget},
@@ -1626,8 +1286,6 @@ inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     if (j.contains("slot_error"))    j.at("slot_error").get_to(n.slot_error);
     if (j.contains("vllm_server_path")) j.at("vllm_server_path").get_to(n.vllm_server_path);
     if (j.contains("vllm_runtime")) j.at("vllm_runtime").get_to(n.vllm_runtime);
-    if (j.contains("llama_server_path")) j.at("llama_server_path").get_to(n.llama_server_path);
-    if (j.contains("llama_runtime")) j.at("llama_runtime").get_to(n.llama_runtime);
     if (j.contains("vllm_install_progress")) j.at("vllm_install_progress").get_to(n.vllm_install_progress);
     if (j.contains("action_progress")) j.at("action_progress").get_to(n.action_progress);
     if (j.contains("vllm_gpu_budget")) j.at("vllm_gpu_budget").get_to(n.vllm_gpu_budget);

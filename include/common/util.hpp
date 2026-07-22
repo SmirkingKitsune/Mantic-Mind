@@ -47,7 +47,7 @@ bool is_hf_repo_id(const std::string& ref);
 bool model_ref_is_local_path(const std::string& ref);
 
 // A stable, filesystem-safe identity for a model reference: the final path
-// component (a file name like "Qwen3-8B.gguf" or a directory name), with any
+// component (a model file or directory name), with any
 // character outside [A-Za-z0-9._-] replaced by '_'. Both control and node
 // compute the same id from the same ref so they agree on the node-local
 // destination folder and the cache dedup key. Handles '/' and '\\'.

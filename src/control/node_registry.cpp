@@ -547,10 +547,6 @@ bool NodeRegistry::ping_node(NodeInfo& info) {
                 info.vllm_server_path = sj["vllm_server_path"].get<std::string>();
             if (sj.contains("vllm_runtime"))
                 info.vllm_runtime = sj["vllm_runtime"].get<VllmRuntimeStatus>();
-            if (sj.contains("llama_server_path"))
-                info.llama_server_path = sj["llama_server_path"].get<std::string>();
-            if (sj.contains("llama_runtime"))
-                info.llama_runtime = sj["llama_runtime"].get<LlamaRuntimeStatus>();
             if (sj.contains("vllm_install_progress"))
                 info.vllm_install_progress = sj["vllm_install_progress"].get<VllmInstallProgress>();
             if (sj.contains("action_progress"))
@@ -645,8 +641,6 @@ void NodeRegistry::poll_all_nodes() {
                 it->second.slot_error    = info.slot_error;
                 it->second.vllm_server_path = info.vllm_server_path;
                 it->second.vllm_runtime = info.vllm_runtime;
-                it->second.llama_server_path = info.llama_server_path;
-                it->second.llama_runtime = info.llama_runtime;
                 it->second.vllm_install_progress = info.vllm_install_progress;
                 it->second.action_progress = info.action_progress;
                 it->second.vllm_gpu_budget = info.vllm_gpu_budget;

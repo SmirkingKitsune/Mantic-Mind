@@ -23,7 +23,7 @@ if [ "$ok" = "1" ]; then
     -d '{"model":"Qwen/Qwen2.5-0.5B-Instruct","messages":[{"role":"user","content":"Say hi in 3 words"}],"max_tokens":16,"temperature":0}'
   echo ""
   echo "=== /metrics sample ==="
-  curl -s --max-time 5 http://127.0.0.1:8198/metrics | grep -E "num_requests_running|num_requests_waiting|kv_cache_usage|gpu_cache_usage" | grep -v "^#" | head
+  curl -s --max-time 5 http://127.0.0.1:8198/metrics | grep -E "num_requests_running|num_requests_waiting" | grep -v "^#" | head
 fi
 echo "=== last errors if any ==="
 grep -nE "Error|raise |Exception|failed|SM 12" "$LOG" | grep -viE "no error" | tail -8

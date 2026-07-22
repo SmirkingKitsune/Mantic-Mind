@@ -33,14 +33,6 @@ std::vector<TraceEvent> deserialize_trace_events(const std::string& s) {
     catch (const std::exception& e) { MM_DEBUG("deserialize_trace_events: {}", e.what()); return {}; }
 }
 
-std::string serialize(const std::vector<std::string>& v) {
-    return nlohmann::json(v).dump();
-}
-std::vector<std::string> deserialize_strings(const std::string& s) {
-    try { return nlohmann::json::parse(s).get<std::vector<std::string>>(); }
-    catch (const std::exception& e) { MM_DEBUG("deserialize_strings: {}", e.what()); return {}; }
-}
-
 std::string serialize(const VllmSettings& s) {
     return nlohmann::json(s).dump();
 }
@@ -69,10 +61,9 @@ VisionSettings deserialize_vision_settings(const std::string& s) {
 
 std::string normalize_inference_backend(std::string backend) {
     backend = util::to_lower(util::trim(backend));
-    // llama.cpp is the default runtime on this branch: unspecified resolves to
-    // it, and the legacy llama spellings canonicalize onto the wire form
-    // ("llama-cpp"). "vllm" and "api" pass through unchanged.
-    if (backend.empty()) return "llama-cpp";
+    // vLLM is the default local runtime on this branch. Preserve unsupported
+    // legacy values so validation can reject them explicitly.
+    if (backend.empty()) return "vllm";
     if (backend == "llama.cpp" || backend == "llama" || backend == "llama-cpp")
         return "llama-cpp";
     return backend;
@@ -296,14 +287,8 @@ void AgentDB::run_migrations() {
                 name              TEXT    NOT NULL,
                 model_path        TEXT    NOT NULL DEFAULT '',
                 system_prompt     TEXT    NOT NULL DEFAULT '',
-                inference_backend TEXT    NOT NULL DEFAULT 'llama-cpp',
+                inference_backend TEXT    NOT NULL DEFAULT 'vllm',
                 ctx_size          INTEGER NOT NULL DEFAULT 4096,
-                n_gpu_layers      INTEGER NOT NULL DEFAULT -1,
-                n_threads         INTEGER NOT NULL DEFAULT -1,
-                n_threads_http    INTEGER NOT NULL DEFAULT -1,
-                parallel          INTEGER NOT NULL DEFAULT 1,
-                batch_size        INTEGER NOT NULL DEFAULT -1,
-                ubatch_size       INTEGER NOT NULL DEFAULT -1,
                 temperature       REAL    NOT NULL DEFAULT 0.7,
                 top_p             REAL    NOT NULL DEFAULT 0.9,
                 top_k             INTEGER NOT NULL DEFAULT -1,
@@ -311,8 +296,6 @@ void AgentDB::run_migrations() {
                 presence_penalty  REAL    NOT NULL DEFAULT 0.0,
                 repeat_penalty    REAL    NOT NULL DEFAULT -1.0,
                 max_tokens        INTEGER NOT NULL DEFAULT 1024,
-                flash_attn        INTEGER NOT NULL DEFAULT 1,
-                extra_args_json   TEXT    NOT NULL DEFAULT '[]',
                 vllm_settings_json TEXT   NOT NULL DEFAULT '{}',
                 api_settings_json TEXT    NOT NULL DEFAULT '{}',
                 reasoning_enabled INTEGER NOT NULL DEFAULT 0,
@@ -454,18 +437,6 @@ void AgentDB::run_migrations() {
 
     if (!has_version(4)) {
         SQLite::Transaction tx(*db_);
-        if (!has_column("agent_config", "n_threads_http")) {
-            db_->exec("ALTER TABLE agent_config ADD COLUMN n_threads_http INTEGER NOT NULL DEFAULT -1");
-        }
-        if (!has_column("agent_config", "parallel")) {
-            db_->exec("ALTER TABLE agent_config ADD COLUMN parallel INTEGER NOT NULL DEFAULT 1");
-        }
-        if (!has_column("agent_config", "batch_size")) {
-            db_->exec("ALTER TABLE agent_config ADD COLUMN batch_size INTEGER NOT NULL DEFAULT -1");
-        }
-        if (!has_column("agent_config", "ubatch_size")) {
-            db_->exec("ALTER TABLE agent_config ADD COLUMN ubatch_size INTEGER NOT NULL DEFAULT -1");
-        }
         db_->exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (4)");
         tx.commit();
     }
@@ -619,7 +590,6 @@ void AgentDB::run_migrations() {
 void AgentDB::save_config(const AgentConfig& cfg) {
     std::lock_guard g(mutex_);
     const auto& s = cfg.runtime_settings;
-    const auto extra_args_json = serialize(s.extra_args);
     const auto vllm_settings_json = serialize(cfg.vllm_settings);
     const auto api_settings_json = serialize(cfg.api_settings);
     const auto vision_settings_json = serialize(cfg.vision_settings);
@@ -630,20 +600,18 @@ void AgentDB::save_config(const AgentConfig& cfg) {
             INSERT INTO agent_config
                 (id, name, model_path, system_prompt,
                  inference_backend,
-                 ctx_size, n_gpu_layers, n_threads, n_threads_http,
-                 parallel, batch_size, ubatch_size, temperature, top_p,
+                 ctx_size, temperature, top_p,
                  top_k, min_p, presence_penalty, repeat_penalty,
-                 max_tokens, flash_attn, extra_args_json, vllm_settings_json,
+                 max_tokens, vllm_settings_json,
                  api_settings_json, vision_settings_json,
                  reasoning_enabled, memories_enabled, tools_enabled,
                  preferred_node_id, updated_at_ms)
             VALUES
                 (:id,:name,:model_path,:system_prompt,
                  :inference_backend,
-                 :ctx_size,:n_gpu_layers,:n_threads,:n_threads_http,
-                 :parallel,:batch_size,:ubatch_size,:temperature,:top_p,
+                 :ctx_size,:temperature,:top_p,
                  :top_k,:min_p,:presence_penalty,:repeat_penalty,
-                 :max_tokens,:flash_attn,:extra_args_json,:vllm_settings_json,
+                 :max_tokens,:vllm_settings_json,
                  :api_settings_json,:vision_settings_json,
                  :reasoning,:memories,:tools,
                  :preferred_node_id,:now)
@@ -653,12 +621,6 @@ void AgentDB::save_config(const AgentConfig& cfg) {
                 system_prompt     = excluded.system_prompt,
                 inference_backend = excluded.inference_backend,
                 ctx_size          = excluded.ctx_size,
-                n_gpu_layers      = excluded.n_gpu_layers,
-                n_threads         = excluded.n_threads,
-                n_threads_http    = excluded.n_threads_http,
-                parallel          = excluded.parallel,
-                batch_size        = excluded.batch_size,
-                ubatch_size       = excluded.ubatch_size,
                 temperature       = excluded.temperature,
                 top_p             = excluded.top_p,
                 top_k             = excluded.top_k,
@@ -666,8 +628,6 @@ void AgentDB::save_config(const AgentConfig& cfg) {
                 presence_penalty  = excluded.presence_penalty,
                 repeat_penalty    = excluded.repeat_penalty,
                 max_tokens        = excluded.max_tokens,
-                flash_attn        = excluded.flash_attn,
-                extra_args_json   = excluded.extra_args_json,
                 vllm_settings_json = excluded.vllm_settings_json,
                 api_settings_json = excluded.api_settings_json,
                 vision_settings_json = excluded.vision_settings_json,
@@ -684,12 +644,6 @@ void AgentDB::save_config(const AgentConfig& cfg) {
         q.bind(":system_prompt",     cfg.system_prompt);
         q.bind(":inference_backend", inference_backend);
         q.bind(":ctx_size",          s.ctx_size);
-        q.bind(":n_gpu_layers",      s.n_gpu_layers);
-        q.bind(":n_threads",         s.n_threads);
-        q.bind(":n_threads_http",    s.n_threads_http);
-        q.bind(":parallel",          s.parallel);
-        q.bind(":batch_size",        s.batch_size);
-        q.bind(":ubatch_size",       s.ubatch_size);
         q.bind(":temperature",       static_cast<double>(s.temperature));
         q.bind(":top_p",             static_cast<double>(s.top_p));
         q.bind(":top_k",             s.top_k);
@@ -697,8 +651,6 @@ void AgentDB::save_config(const AgentConfig& cfg) {
         q.bind(":presence_penalty",  static_cast<double>(s.presence_penalty));
         q.bind(":repeat_penalty",    static_cast<double>(s.repeat_penalty));
         q.bind(":max_tokens",        s.max_tokens);
-        q.bind(":flash_attn",        s.flash_attn ? 1 : 0);
-        q.bind(":extra_args_json",   extra_args_json);
         q.bind(":vllm_settings_json", vllm_settings_json);
         q.bind(":api_settings_json", api_settings_json);
         q.bind(":vision_settings_json", vision_settings_json);
@@ -728,12 +680,6 @@ AgentConfig AgentDB::load_config() const {
 
     auto& s = cfg.runtime_settings;
     s.ctx_size      = q.getColumn("ctx_size").getInt();
-    s.n_gpu_layers  = q.getColumn("n_gpu_layers").getInt();
-    s.n_threads     = q.getColumn("n_threads").getInt();
-    s.n_threads_http = q.getColumn("n_threads_http").getInt();
-    s.parallel      = q.getColumn("parallel").getInt();
-    s.batch_size    = q.getColumn("batch_size").getInt();
-    s.ubatch_size   = q.getColumn("ubatch_size").getInt();
     s.temperature   = static_cast<float>(q.getColumn("temperature").getDouble());
     s.top_p         = static_cast<float>(q.getColumn("top_p").getDouble());
     s.top_k         = q.getColumn("top_k").getInt();
@@ -741,8 +687,6 @@ AgentConfig AgentDB::load_config() const {
     s.presence_penalty = static_cast<float>(q.getColumn("presence_penalty").getDouble());
     s.repeat_penalty = static_cast<float>(q.getColumn("repeat_penalty").getDouble());
     s.max_tokens    = q.getColumn("max_tokens").getInt();
-    s.flash_attn    = q.getColumn("flash_attn").getInt() != 0;
-    s.extra_args    = deserialize_strings(q.getColumn("extra_args_json").getText());
     cfg.vllm_settings =
         deserialize_vllm_settings(q.getColumn("vllm_settings_json").getText());
     cfg.api_settings =

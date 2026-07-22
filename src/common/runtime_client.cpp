@@ -182,8 +182,8 @@ nlohmann::json build_request(const InferenceRequest& req, bool stream) {
     if (s.presence_penalty != 0.0f) {
         body["presence_penalty"] = static_cast<double>(s.presence_penalty);
     }
-    // llama.cpp names this sampler repeat_penalty. It remains optional so
-    // OpenAI-compatible providers that do not expose the extension never see it.
+    // Some OpenAI-compatible runtimes expose this sampler as repeat_penalty.
+    // Keep it optional so providers without the extension never see it.
     if (s.repeat_penalty > 0.0f) {
         body["repeat_penalty"] = static_cast<double>(s.repeat_penalty);
     }
@@ -472,8 +472,8 @@ bool RuntimeClient::health_check() {
     cli.set_read_timeout(5);
     auto res = cli.Get("/health");
     if (!res || res->status != 200) { model_loaded_ = false; return false; }
-    // Backend-agnostic: vLLM answers 200 with an empty body; llama-server and
-    // some OpenAI-compatible servers answer 200 with {"status":"ok"}. Treat a
+    // vLLM answers 200 with an empty body; some compatible servers answer 200
+    // with {"status":"ok"}. Treat a
     // 200 as healthy unless the body carries an explicit non-ok status.
     if (util::trim(res->body).empty()) { model_loaded_ = true; return true; }
     try {

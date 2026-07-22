@@ -26,25 +26,23 @@ runtime_port_range_end   = 8090
 # Maximum number of concurrent model slots (vLLM engine processes).
 max_slots = 4
 
-# ── vLLM (opt-in peer backend) ─────────────────────────────────────────────────
-# llama.cpp is the default runtime on this branch; vLLM-as-default is preserved
-# on the vLLM-runtime branch. A vLLM already on PATH (or previously provisioned)
-# is used for agents with inference_backend = "vllm", but a missing vLLM is NOT
-# installed unless you enable auto-provisioning below.
+# ── vLLM runtime ───────────────────────────────────────────────────────────────
+# vLLM is the local inference runtime on this branch. The node uses an existing
+# vLLM on PATH (or a previously provisioned runtime) when available.
 # vllm_server_path = "vllm"
 
 # If vllm_server_path cannot be resolved, the node can create a managed vLLM
 # runtime under vllm_provision_dir and use that executable for engine slots.
 # Windows uses SystemPanic/vllm-windows, Linux uses vllm-project/vllm, and
 # Apple Silicon macOS uses vllm-project/vllm-metal.
-# vllm_auto_provision = false
+# vllm_auto_provision = true
 # vllm_provision_dir = "data/runtimes/vllm"
 # vllm_install_method = "auto"  # auto | wheel | source
 # vllm_version = "latest"
 # vllm_python_path = ""
 
-# Runtime update management. A missing runtime is always bootstrapped (per
-# vllm_auto_provision above); these keys govern *updating* an existing install.
+# Runtime update management. Auto-provisioning bootstraps a missing runtime;
+# these keys govern *updating* an existing install.
 # The node picks the accelerator-correct build for its hardware automatically
 # (CUDA / ROCm / CPU on Linux, Metal on Apple Silicon, the SystemPanic build on
 # Windows).
@@ -59,52 +57,11 @@ max_slots = 4
 # vllm_update_check = true                  # run the periodic online version check
 # vllm_update_check_interval_hours = 24
 
-# ── llama.cpp (default runtime) ────────────────────────────────────────────────
-# Agents default to inference_backend = "llama-cpp" and serve a local GGUF via
-# llama-server. vLLM runs alongside as an opt-in peer on the same node (its own
-# slots, its own runtime). llama.cpp is the reliable path for GGUF models,
-# Windows-native inference, and accelerators without a vLLM build (e.g. the
-# NVIDIA DGX Spark GB10).
-# llama_server_path = "llama-server"        # or MM_LLAMA_PATH; use an explicit path to override managed GPU selection
-# A bare PATH llama-server is accepted for CPU (or when auto-provision is off),
-# otherwise the node first retrieves the accelerator-matched official
-# release matching this OS, architecture, accelerator, and CUDA compatibility.
-# Source is built only when no matching release can be used. Provisioning runs
-# in the background, so node startup and vLLM serving never block on it.
-# llama_auto_provision = true
-# llama_provision_dir = "data/runtimes/llama.cpp"
-# llama_install_method = "auto"   # auto (release, then source) | release | source
-# llama_version = "latest"        # git ref / release tag, or "latest"
-# llama_accelerator = ""          # cuda | rocm | vulkan | metal | cpu; "" = auto-detect
-# For the DGX Spark GB10 (aarch64, sm_121) a source build with CUDA 13+ is
-# required; set the compute capability so CMake targets it:
-# llama_cuda_arch = "121"
-# llama_build_jobs = 0          # 0 = conservative default (2 for CUDA/ROCm, 4 otherwise)
-#
-# llama.cpp updates have their own policy because an accelerator without an
-# official release (currently Linux CUDA) may require a local CMake build. The
-# prompt identifies download vs compilation before approval and offers any
-# same-platform Vulkan/CPU/other release variants published for that tag.
-# llama_update_policy = "prompt"          # prompt | auto | manual
-# llama_update_check = true
-# llama_update_check_interval_hours = 24
-
 # Total fraction of GPU memory all vLLM slots on this node may claim together.
 # Each vLLM slot reserves an explicit --gpu-memory-utilization slice out of
 # this budget; loads are clamped to the remaining budget and rejected when it
 # is exhausted. Range (0, 1].
 # vllm_gpu_budget = 0.90
-
-# ── Cluster / multi-node engine groups ─────────────────────────────────────────
-# Capabilities this node advertises to control. Leave unset to auto-detect.
-# comm_backends = "nccl,gloo"   # CSV; auto-detect picks nccl+gloo on Linux+CUDA, else gloo
-# supports_ray = true            # multi-node Ray membership; auto = true on Linux
-# node_gpu_count = 0             # 0 = auto via nvidia-smi
-# interconnect_gbps = 200        # node-to-node link hint for group scoring
-
-# Ray CLI used to form multi-node vLLM engine groups (Linux nodes only).
-# ray_path = "ray"
-# ray_port = 6379
 
 # ── Hugging Face model cache ────────────────────────────────────────────────────
 # vLLM resolves a model_path as an HF repo id (auto-downloaded to the HF cache),
@@ -138,6 +95,10 @@ max_slots = 4
 # Node-to-node link bandwidth hint in Gbps (e.g. 200 for ConnectX 200GbE).
 # Used only as a tiebreak when ranking candidate engine groups.
 # interconnect_gbps = 0
+#
+# Ray CLI and head-node GCS port. Live multi-node groups are Linux/WSL only.
+# ray_path = "ray"
+# ray_port = 6379
 
 # ── Storage ────────────────────────────────────────────────────────────────────
 # Local model cache root. When a node lacks a model given as a local path,

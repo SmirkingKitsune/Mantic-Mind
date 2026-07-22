@@ -439,7 +439,7 @@ std::string openai_agent_model_id(const AgentConfig& cfg) {
 
 std::string agent_backend(const AgentConfig& cfg) {
     std::string backend = util::to_lower(util::trim(cfg.inference_backend));
-    if (backend.empty()) return "llama-cpp";  // unspecified => default runtime
+    if (backend.empty()) return "vllm";
     if (backend == "llama.cpp" || backend == "llama" || backend == "llama-cpp")
         return "llama-cpp";
     return backend;
@@ -1111,7 +1111,6 @@ ControlApiServer::ControlApiServer(AgentManager& agents,
                                    NodeRegistry& registry,
                                    AgentScheduler& scheduler,
                                    std::string data_dir,
-                                   std::string models_dir,
                                    std::string external_api_token,
                                    TtsServiceConfig tts_config)
     : agents_(agents)
@@ -1119,7 +1118,6 @@ ControlApiServer::ControlApiServer(AgentManager& agents,
     , registry_(registry)
     , scheduler_(scheduler)
     , data_dir_(std::move(data_dir))
-    , models_dir_(std::move(models_dir))
     , external_api_token_(std::move(external_api_token))
     , tts_(std::move(tts_config))
     , server_(std::make_unique<HttpServer>())
@@ -1616,6 +1614,13 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     }
 
     AgentConfig cfg = agent->get_config();
+    const std::string backend = agent_backend(cfg);
+    if (backend != "vllm" && backend != "api") {
+        done_cb({}, false,
+                "unsupported inference backend '" + backend +
+                "'; this runtime supports vllm and api");
+        return;
+    }
     const bool has_images = std::any_of(
         content_parts.begin(), content_parts.end(), [](const MessageContentPart& part) {
             return part.type == "image_attachment" || part.type == "image_url";
@@ -1630,10 +1635,6 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     perf.backend = agent_backend(cfg);
     perf.model = cfg.model_path;
     perf.vision_routing = has_images;
-    if (!cfg.vision_settings.mmproj_path.empty()) {
-        perf.projector_basename =
-            std::filesystem::path(cfg.vision_settings.mmproj_path).filename().string();
-    }
     perf.started_at_ms = request_started_ms;
 
     AgentDB& db = agent->db();
@@ -2158,31 +2159,29 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
             char buf[384];
             snprintf(buf, sizeof(buf),
                      "Chat complete: agent='%s' tokens=%d content=%zuB duration=%lldms "
-                     "images=%d image_bytes=%lld vision=%s projector='%s'",
+                     "images=%d image_bytes=%lld vision=%s",
                      agent_id.c_str(), final_total_tokens,
                      final_assistant_content.size(), static_cast<long long>(duration_ms),
                      perf.image_count,
                      static_cast<long long>(perf.decoded_image_bytes),
-                     perf.vision_routing ? "true" : "false",
-                     perf.projector_basename.c_str());
+                     perf.vision_routing ? "true" : "false");
             activity_log(0, buf);
         } else {
             char buf[384];
             if (api_backend) {
                 snprintf(buf, sizeof(buf),
                          "Chat error: agent='%s' backend=api reason='%s' duration=%lldms "
-                         "images=%d image_bytes=%lld vision=%s projector='%s'",
+                         "images=%d image_bytes=%lld vision=%s",
                          agent_id.c_str(),
                          failure_reason.substr(0, 80).c_str(),
                          static_cast<long long>(duration_ms),
                          perf.image_count,
                          static_cast<long long>(perf.decoded_image_bytes),
-                         perf.vision_routing ? "true" : "false",
-                         perf.projector_basename.c_str());
+                         perf.vision_routing ? "true" : "false");
             } else {
                 snprintf(buf, sizeof(buf),
                          "Chat error: agent='%s' node=%s slot=%s reason='%s' duration=%lldms "
-                         "images=%d image_bytes=%lld vision=%s projector='%s'",
+                         "images=%d image_bytes=%lld vision=%s",
                          agent_id.c_str(),
                          schedule_result ? schedule_result->node_id.substr(0, 8).c_str() : "",
                          active_slot_id.substr(0, 8).c_str(),
@@ -2190,8 +2189,7 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
                          static_cast<long long>(duration_ms),
                          perf.image_count,
                          static_cast<long long>(perf.decoded_image_bytes),
-                         perf.vision_routing ? "true" : "false",
-                         perf.projector_basename.c_str());
+                         perf.vision_routing ? "true" : "false");
             }
             activity_log(2, buf);
         }
@@ -2778,13 +2776,12 @@ void ControlApiServer::register_routes() {
     server_->Post("/v1/agents", [this, compute_node_compat](const Request& req, Response& res) {
         try {
             AgentConfig cfg = nlohmann::json::parse(req.body).get<AgentConfig>();
-            auto validation = validate_agent_config(cfg, &registry_, models_dir_);
+            auto validation = validate_agent_config(cfg, &registry_);
             if (!validation.ok()) {
                 nlohmann::json body = {
                     {"error", "validation_failed"},
                     {"issues", validation.issues}
                 };
-                if (validation.model_info) body["model_info"] = *validation.model_info;
                 res.status = 400;
                 res.set_content(body.dump(), "application/json");
                 return;
@@ -2832,19 +2829,31 @@ void ControlApiServer::register_routes() {
     server_->Put("/v1/agents/:id", [this](const Request& req, Response& res) {
         std::string id = req.path_params.at("id");
         try {
+            auto existing = agents_.get_agent(id);
+            if (!existing) { res.status = 404; return; }
+            const AgentConfig previous = existing->get_config();
+            existing.reset();
+
             AgentConfig cfg = nlohmann::json::parse(req.body).get<AgentConfig>();
             // If body omits "id", keep the current ID (no rename).
             if (cfg.id.empty()) cfg.id = id;
-            auto validation = validate_agent_config(cfg, &registry_, models_dir_);
+            if (cfg.id != id && agents_.get_agent(cfg.id)) {
+                throw std::invalid_argument("Agent ID '" + cfg.id +
+                                            "' is already in use");
+            }
+            auto validation = validate_agent_config(cfg, &registry_);
             if (!validation.ok()) {
                 nlohmann::json body = {
                     {"error", "validation_failed"},
                     {"issues", validation.issues}
                 };
-                if (validation.model_info) body["model_info"] = *validation.model_info;
                 res.status = 400;
                 res.set_content(body.dump(), "application/json");
                 return;
+            }
+            if (cfg.id != id ||
+                (!agent_uses_api_backend(previous) && agent_uses_api_backend(cfg))) {
+                scheduler_.release_agent(id);
             }
             AgentId final_id = agents_.update_agent(id, cfg);
             if (final_id.empty()) { res.status = 404; return; }

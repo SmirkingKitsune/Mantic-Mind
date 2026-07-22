@@ -203,16 +203,6 @@ void NodeState::set_vllm_runtime(const VllmRuntimeStatus& runtime) {
     vllm_runtime_ = runtime;
 }
 
-LlamaRuntimeStatus NodeState::get_llama_runtime() const {
-    std::lock_guard<std::mutex> g(mutex_);
-    return llama_runtime_;
-}
-
-void NodeState::set_llama_runtime(const LlamaRuntimeStatus& runtime) {
-    std::lock_guard<std::mutex> g(mutex_);
-    llama_runtime_ = runtime;
-}
-
 VllmInstallProgress NodeState::get_vllm_install_progress() const {
     std::lock_guard<std::mutex> g(mutex_);
     return vllm_install_progress_;

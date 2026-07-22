@@ -148,8 +148,8 @@ std::string ModelStore::load_path_locked(const std::string& id) const {
             only_file = entry.path();
         }
     }
-    // A single-file model (e.g. one .gguf) loads from that file; a multi-file
-    // repo loads from its directory.
+    // A single-file artifact loads from that file; a multi-file model loads
+    // from its directory.
     if (dirs == 0 && files == 1) return only_file.lexically_normal().string();
     return dir.string();
 }

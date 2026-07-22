@@ -22,7 +22,6 @@ void to_json(nlohmann::json& json, const PerformanceSample& sample) {
         {"image_count", sample.image_count},
         {"decoded_image_bytes", sample.decoded_image_bytes},
         {"vision_routing", sample.vision_routing},
-        {"projector_basename", sample.projector_basename},
         {"input_tokens_estimated", sample.input_tokens_estimated},
         {"output_tokens_per_second", sample.output_tokens_per_second},
         {"success", sample.success},

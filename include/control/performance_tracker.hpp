@@ -24,7 +24,6 @@ struct PerformanceSample {
     int image_count = 0;
     int64_t decoded_image_bytes = 0;
     bool vision_routing = false;
-    std::string projector_basename;
     bool input_tokens_estimated = true;
     double output_tokens_per_second = 0.0;
     bool success = false;

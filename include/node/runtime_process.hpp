@@ -29,16 +29,6 @@ public:
                     const VllmSettings& settings,
                     uint16_t port = 8080);
 
-    // Launches `llama-server` on the given port; blocks until /health is ready
-    // or the startup timeout expires. When slot_save_path is non-empty the
-    // engine's KV-cache slot save/restore endpoints are enabled (for suspend).
-    // Returns true on success.
-    bool start_llama_server(const std::string& model_path,
-                            const std::string& mmproj_path,
-                            const RuntimeSettings& settings,
-                            uint16_t port = 8080,
-                            const std::string& slot_save_path = {});
-
     // Graceful SIGTERM → SIGKILL fallback.
     void stop();
 

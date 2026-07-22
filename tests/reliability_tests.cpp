@@ -17,15 +17,11 @@
 #include "control/node_registry.hpp"
 #include "control/performance_tracker.hpp"
 #include "control/tts_service_client.hpp"
-#include "common/gguf_metadata.hpp"
-#include "common/inference_sizing.hpp"
 #include "control/agent_config_validator.hpp"
 #include "node/runtime_process.hpp"
 #include "node/slot_manager.hpp"
 #include "node/vllm_provisioner.hpp"
 #include "node/vllm_runtime.hpp"
-#include "node/llama_runtime.hpp"
-#include "node/llama_cpp_provisioner.hpp"
 #include "node/ray_orchestration.hpp"
 #include "node/hf_cache.hpp"
 
@@ -261,7 +257,7 @@ bool test_agent_manager_rejects_duplicates_and_defers_cleanup_until_handles_rele
     mm::AgentConfig cfg;
     cfg.id = "agent-a";
     cfg.name = "Agent A";
-    cfg.model_path = "model.gguf";
+    cfg.model_path = "Qwen/Qwen3-8B";
 
     CHECK(manager.create_agent(cfg) == "agent-a");
     auto held = manager.get_agent("agent-a");
@@ -362,7 +358,8 @@ bool test_slot_manager_not_found_statuses() {
 bool test_slot_lease_blocks_unload_and_suspend_while_busy() {
     auto dir = temp_test_dir("lease-busy");
     mm::SlotManager slots(46110, 46111, 1);
-    const auto slot_id = slots.add_ready_test_slot("test-model.gguf", "agent-a");
+    const auto slot_id = slots.add_ready_test_slot(
+        "Qwen/Qwen2.5-0.5B-Instruct", "agent-a");
 
     {
         auto inference_lease = slots.acquire_slot(slot_id);
@@ -390,19 +387,20 @@ bool test_vllm_slot_info_and_suspend_without_kv_cache() {
 
     auto info = slots.find_slot(slot_id);
     CHECK(info.has_value());
+    CHECK(info->backend == "vllm");
 
     nlohmann::json serialized = *info;
     auto parsed = serialized.get<mm::SlotInfo>();
     CHECK(parsed.model_path == "Qwen/Qwen3-8B");
+    CHECK(parsed.backend == "vllm");
 
     auto suspend = slots.suspend_slot(slot_id);
     CHECK(suspend.status == mm::SlotOperationStatus::Ok);
-    CHECK(suspend.kv_cache_path.empty());
 
     auto suspended = slots.find_slot(slot_id);
     CHECK(suspended.has_value());
     CHECK(suspended->state == mm::SlotState::Suspended);
-    CHECK(suspended->kv_cache_path.empty());
+    CHECK(!nlohmann::json(*suspended).contains("kv_cache_path"));
 
     CHECK(remove_tree(dir));
     return true;
@@ -970,22 +968,61 @@ bool test_vllm_runtime_defaults_and_args() {
     CHECK(has_arg_pair(args, "--tool-call-parser", "hermes"));
     CHECK(has_arg(args, "--disable-log-requests"));
 
-    // GGUF detection (drives the experimental-support advisory at launch).
-    CHECK(mm::model_ref_is_gguf("/models/model.GGUF"));
-    CHECK(!mm::model_ref_is_gguf("/models/model.safetensors"));
-    CHECK(!mm::model_ref_is_gguf(""));
+    mm::AgentConfig defaults;
+    CHECK(defaults.inference_backend == "vllm");
+    CHECK(mm::is_vllm_backend(defaults.inference_backend));
+    CHECK(mm::is_vllm_backend(""));
+    CHECK(mm::is_vllm_backend(" VLLM "));
+    CHECK(!mm::is_vllm_backend("api"));
 
-#ifdef _WIN32
-    CHECK(mm::default_vllm_repo_url_for_platform() == mm::kWindowsVllmRepoUrl);
-    CHECK(mm::default_vllm_branch_for_platform() == mm::kWindowsVllmBranch);
-#elif defined(__APPLE__) && defined(__aarch64__)
-    CHECK(mm::default_vllm_repo_url_for_platform() == mm::kMetalVllmRepoUrl);
-    CHECK(mm::default_vllm_branch_for_platform() == "main");
-#else
-    CHECK(mm::default_vllm_repo_url_for_platform() == mm::kOfficialVllmRepoUrl);
-    CHECK(mm::default_vllm_branch_for_platform() == "main");
-#endif
+    mm::VllmSettings compatible = settings;
+    compatible.gpu_memory_utilization = 0.5;
+    CHECK(mm::vllm_launch_compatible(settings, compatible));
+    compatible.max_model_len = settings.max_model_len + 1;
+    CHECK(!mm::vllm_launch_compatible(settings, compatible));
 
+    return true;
+}
+
+bool test_vllm_only_backend_validation_and_persistence() {
+    auto dir = temp_test_dir("vllm-backend-contract");
+    std::filesystem::create_directories(dir);
+
+    mm::AgentConfig cfg;
+    cfg.id = "vllm-agent";
+    cfg.name = "vLLM Agent";
+    cfg.model_path = "Qwen/Qwen3-8B";
+    CHECK(cfg.inference_backend == "vllm");
+    CHECK(mm::validate_agent_config(cfg).ok());
+
+    {
+        mm::AgentDB db(cfg.id, dir.string());
+        db.save_config(cfg);
+        const auto loaded = db.load_config();
+        CHECK(loaded.inference_backend == "vllm");
+        CHECK(loaded.model_path == cfg.model_path);
+        CHECK(nlohmann::json(loaded)["inference_backend"] == "vllm");
+
+        cfg.inference_backend.clear();
+        db.save_config(cfg);
+        CHECK(db.load_config().inference_backend == "vllm");
+    }
+
+    mm::AgentConfig legacy = cfg;
+    legacy.inference_backend = "llama-cpp";
+    const auto legacy_result = mm::validate_agent_config(legacy);
+    CHECK(!legacy_result.ok());
+    CHECK(std::any_of(legacy_result.issues.begin(), legacy_result.issues.end(),
+                      [](const mm::ValidationIssue& issue) {
+                          return issue.field == "inference_backend" &&
+                                 issue.severity == mm::ValidationSeverity::Error;
+                      }));
+
+    mm::AgentConfig unknown = cfg;
+    unknown.inference_backend = "tensorrt";
+    CHECK(!mm::validate_agent_config(unknown).ok());
+
+    CHECK(remove_tree(dir));
     return true;
 }
 
@@ -1257,52 +1294,6 @@ bool test_vllm_install_progress_parser() {
     return true;
 }
 
-bool test_node_action_progress_json_round_trip() {
-    mm::NodeActionProgress p;
-    p.active = true;
-    p.operation_id = "op-1";
-    p.kind = "model_receive";
-    p.action = "Downloading model";
-    p.target = "Qwen/Qwen3-8B";
-    p.stage = "receiving";
-    p.detail = "model.safetensors";
-    p.step = 2;
-    p.total_steps = 4;
-    p.bytes_done = 128;
-    p.bytes_total = 256;
-    p.fraction = 0.5;
-    p.cancelable = true;
-    p.cancel_requested = true;
-    p.last_error = "canceled";
-
-    nlohmann::json j = p;
-    auto parsed = j.get<mm::NodeActionProgress>();
-    CHECK(parsed.active);
-    CHECK(parsed.operation_id == "op-1");
-    CHECK(parsed.kind == "model_receive");
-    CHECK(parsed.action == "Downloading model");
-    CHECK(parsed.target == "Qwen/Qwen3-8B");
-    CHECK(parsed.stage == "receiving");
-    CHECK(parsed.detail == "model.safetensors");
-    CHECK(parsed.step == 2);
-    CHECK(parsed.total_steps == 4);
-    CHECK(parsed.bytes_done == 128);
-    CHECK(parsed.bytes_total == 256);
-    CHECK(parsed.fraction > 0.49 && parsed.fraction < 0.51);
-    CHECK(parsed.cancelable);
-    CHECK(parsed.cancel_requested);
-    CHECK(parsed.last_error == "canceled");
-
-    mm::NodeInfo n;
-    n.id = "node-a";
-    n.url = "http://127.0.0.1:1";
-    n.action_progress = p;
-    auto node = nlohmann::json(n).get<mm::NodeInfo>();
-    CHECK(node.action_progress.operation_id == "op-1");
-    CHECK(node.action_progress.cancel_requested);
-    return true;
-}
-
 bool test_vllm_provision_cancel() {
     auto dir = temp_test_dir("vllm-cancel");
     mm::VllmProvisionConfig cfg;
@@ -1365,6 +1356,52 @@ bool test_vllm_peer_selection() {
     CHECK(!peers.empty() && peers.front() == "same_old");
     // Unknown source id -> no peers.
     CHECK(mm::select_vllm_update_peers(nodes, "does-not-exist").empty());
+    return true;
+}
+
+bool test_node_action_progress_json_round_trip() {
+    mm::NodeActionProgress p;
+    p.active = true;
+    p.operation_id = "op-1";
+    p.kind = "model_receive";
+    p.action = "Downloading model";
+    p.target = "Qwen/Qwen3-8B";
+    p.stage = "receiving";
+    p.detail = "model.safetensors";
+    p.step = 2;
+    p.total_steps = 4;
+    p.bytes_done = 128;
+    p.bytes_total = 256;
+    p.fraction = 0.5;
+    p.cancelable = true;
+    p.cancel_requested = true;
+    p.last_error = "canceled";
+
+    nlohmann::json j = p;
+    auto parsed = j.get<mm::NodeActionProgress>();
+    CHECK(parsed.active);
+    CHECK(parsed.operation_id == "op-1");
+    CHECK(parsed.kind == "model_receive");
+    CHECK(parsed.action == "Downloading model");
+    CHECK(parsed.target == "Qwen/Qwen3-8B");
+    CHECK(parsed.stage == "receiving");
+    CHECK(parsed.detail == "model.safetensors");
+    CHECK(parsed.step == 2);
+    CHECK(parsed.total_steps == 4);
+    CHECK(parsed.bytes_done == 128);
+    CHECK(parsed.bytes_total == 256);
+    CHECK(parsed.fraction > 0.49 && parsed.fraction < 0.51);
+    CHECK(parsed.cancelable);
+    CHECK(parsed.cancel_requested);
+    CHECK(parsed.last_error == "canceled");
+
+    mm::NodeInfo n;
+    n.id = "node-a";
+    n.url = "http://127.0.0.1:1";
+    n.action_progress = p;
+    auto node = nlohmann::json(n).get<mm::NodeInfo>();
+    CHECK(node.action_progress.operation_id == "op-1");
+    CHECK(node.action_progress.cancel_requested);
     return true;
 }
 
@@ -1475,7 +1512,7 @@ bool test_scheduler_skips_failed_node_current_attempt() {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
-    mm::AgentScheduler scheduler(registry, (dir / "models").string());
+    mm::AgentScheduler scheduler(registry);
     mm::AgentConfig cfg;
     cfg.id = "agent-a";
     cfg.name = "Agent A";
@@ -1520,15 +1557,15 @@ bool test_control_api_external_token_gate() {
         mm::AgentConfig cfg;
         cfg.id = "agent-a";
         cfg.name = "Agent A";
-        cfg.model_path = "model.gguf";
+        cfg.model_path = "Qwen/Qwen3-8B";
         agents.create_agent(cfg);
 
         mm::AgentQueue queue;
         mm::NodeRegistry registry(dir.string());
-        mm::AgentScheduler scheduler(registry, (dir / "models").string());
+        mm::AgentScheduler scheduler(registry);
         mm::ControlApiServer api(
             agents, queue, registry, scheduler,
-            dir.string(), (dir / "models").string(), "control-secret");
+            dir.string(), "control-secret");
 
         const uint16_t port = find_free_test_port();
         CHECK(port != 0);
@@ -1860,16 +1897,16 @@ bool test_openai_compat_api_listener_and_model_catalog() {
         mm::AgentConfig cfg;
         cfg.id = "agent-a";
         cfg.name = "agent-a-name";
-        cfg.model_path = "model-a.gguf";
+        cfg.model_path = "Qwen/Qwen3-8B";
         cfg.vllm_settings.served_model_name = "served-agent-a";
         agents.create_agent(cfg);
 
         mm::AgentQueue queue;
         mm::NodeRegistry registry(dir.string());
-        mm::AgentScheduler scheduler(registry, (dir / "models").string());
+        mm::AgentScheduler scheduler(registry);
         mm::ControlApiServer api(
             agents, queue, registry, scheduler,
-            dir.string(), (dir / "models").string(), "control-secret");
+            dir.string(), "control-secret");
 
         const uint16_t port = find_free_test_port();
         CHECK(port != 0);
@@ -2076,10 +2113,10 @@ bool test_control_api_agent_api_mode_chat() {
         mm::AgentManager agents(dir.string());
         mm::AgentQueue queue;
         mm::NodeRegistry registry(dir.string());
-        mm::AgentScheduler scheduler(registry, (dir / "models").string());
+        mm::AgentScheduler scheduler(registry);
         mm::ControlApiServer api(
             agents, queue, registry, scheduler,
-            dir.string(), (dir / "models").string(), "");
+            dir.string(), "");
 
         const uint16_t port = find_free_test_port();
         CHECK(port != 0);
@@ -2121,7 +2158,7 @@ bool test_control_api_agent_api_mode_chat() {
                     {"name", "API Agent"},
                     {"inference_backend", "api"},
                     {"model_path", "frontier-test-model"},
-                    {"vision_settings", {{"enabled", true}, {"mmproj_path", ""}}},
+                    {"vision_settings", {{"enabled", true}}},
                     {"memories_enabled", false},
                     {"tools_enabled", false},
                     {"runtime_settings", {
@@ -2636,15 +2673,15 @@ bool test_control_api_tts_routes_disabled() {
         mm::AgentConfig cfg;
         cfg.id = "agent-a";
         cfg.name = "Agent A";
-        cfg.model_path = "model.gguf";
+        cfg.model_path = "Qwen/Qwen3-8B";
         agents.create_agent(cfg);
 
         mm::AgentQueue queue;
         mm::NodeRegistry registry(dir.string());
-        mm::AgentScheduler scheduler(registry, (dir / "models").string());
+        mm::AgentScheduler scheduler(registry);
         mm::ControlApiServer api(
             agents, queue, registry, scheduler,
-            dir.string(), (dir / "models").string());
+            dir.string());
 
         const uint16_t port = find_free_test_port();
         CHECK(port != 0);
@@ -2724,15 +2761,15 @@ bool test_control_api_curation_routes() {
     mm::AgentConfig cfg;
     cfg.id = "agent-a";
     cfg.name = "Agent A";
-    cfg.model_path = "model.gguf";
+    cfg.model_path = "Qwen/Qwen3-8B";
     agents.create_agent(cfg);
 
     mm::AgentQueue queue;
     mm::NodeRegistry registry(dir.string());
-    mm::AgentScheduler scheduler(registry, (dir / "models").string());
+    mm::AgentScheduler scheduler(registry);
     mm::ControlApiServer api(
         agents, queue, registry, scheduler,
-        dir.string(), (dir / "models").string());
+        dir.string());
 
     const uint16_t port = find_free_test_port();
     CHECK(port != 0);
@@ -3173,7 +3210,7 @@ bool test_compaction_followup_trace_provenance_survives() {
         mm::AgentConfig cfg;
         cfg.id = "agent-a";
         cfg.name = "Agent A";
-        cfg.model_path = "model.gguf";
+        cfg.model_path = "Qwen/Qwen3-8B";
         cfg.system_prompt = "Use memory provenance carefully.";
         cfg.memories_enabled = true;
         cfg.runtime_settings.ctx_size = 128;
@@ -3211,7 +3248,7 @@ bool test_compaction_followup_trace_provenance_survives() {
         const mm::ConvId continued_conv_id = conv_mgr.force_compact(source_conv_id, cfg);
         CHECK(!continued_conv_id.empty());
         CHECK(continued_conv_id != source_conv_id);
-        CHECK(runtime.last_model == "model.gguf");
+        CHECK(runtime.last_model == "Qwen/Qwen3-8B");
 
         auto source = db.load_conversation(source_conv_id);
         auto continued = db.load_conversation(continued_conv_id);
@@ -3367,59 +3404,7 @@ bool test_config_and_url_parsing_edge_cases() {
 
 } // namespace
 
-// ── llama.cpp backend ─────────────────────────────────────────────────────────
-
-bool test_llama_server_args() {
-    auto has = [](const std::vector<std::string>& a, const std::string& f) {
-        return std::find(a.begin(), a.end(), f) != a.end();
-    };
-    auto val_after = [](const std::vector<std::string>& a, const std::string& f) {
-        auto it = std::find(a.begin(), a.end(), f);
-        return (it != a.end() && std::next(it) != a.end()) ? *std::next(it) : std::string{};
-    };
-    auto count = [](const std::vector<std::string>& a, const std::string& f) {
-        return static_cast<int>(std::count(a.begin(), a.end(), f));
-    };
-
-    mm::RuntimeSettings s;
-    s.ctx_size = 4096;
-    s.parallel = 2;            // server context = ctx_size * parallel = 8192
-    s.n_gpu_layers = -1;
-    s.flash_attn = true;
-    s.batch_size = 512;
-    s.ubatch_size = 256;
-    const auto args = mm::build_llama_server_args("/models/m.gguf", s, 8081, "data/kv");
-
-    CHECK(val_after(args, "--model") == "/models/m.gguf");
-    CHECK(val_after(args, "--port") == "8081");
-    CHECK(val_after(args, "--ctx-size") == "8192");
-    CHECK(val_after(args, "--gpu-layers") == "-1");
-    CHECK(has(args, "--flash-attn"));
-    CHECK(val_after(args, "--flash-attn") == "on");   // valued form, not bare
-    CHECK(val_after(args, "--batch-size") == "512");
-    CHECK(val_after(args, "--ubatch-size") == "256");
-    CHECK(val_after(args, "--parallel") == "2");
-    CHECK(val_after(args, "--slot-save-path") == "data/kv");
-
-    // extra_args override discipline: a user --ctx-size wins (no default added),
-    // and -fa suppresses the default --flash-attn injection.
-    mm::RuntimeSettings s2;
-    s2.ctx_size = 2048;
-    s2.parallel = 1;
-    s2.flash_attn = true;
-    s2.extra_args = {"--ctx-size", "1234", "-fa"};
-    const auto args2 = mm::build_llama_server_args("m.gguf", s2, 8080, "");
-    CHECK(count(args2, "--ctx-size") == 1);      // only the user's, no injected default
-    CHECK(val_after(args2, "--ctx-size") == "1234");
-    CHECK(count(args2, "--flash-attn") == 0);    // suppressed by -fa
-    CHECK(!has(args2, "--slot-save-path"));       // omitted when empty
-
-    const auto vision_args = mm::build_llama_server_args(
-        "m.gguf", "mmproj-vision.gguf", s, 8082, "");
-    CHECK(count(vision_args, "--mmproj") == 1);
-    CHECK(val_after(vision_args, "--mmproj") == "mmproj-vision.gguf");
-    return true;
-}
+// ── vLLM multimodal persistence ───────────────────────────────────────────────
 
 bool test_vision_config_attachment_and_message_round_trip() {
     const auto dir = temp_test_dir("vision-db");
@@ -3429,13 +3414,13 @@ bool test_vision_config_attachment_and_message_round_trip() {
         mm::AgentConfig cfg;
         cfg.id = "vision-agent";
         cfg.name = "Vision Agent";
-        cfg.model_path = "model.gguf";
+        cfg.model_path = "Qwen/Qwen2.5-VL-7B-Instruct";
         cfg.vision_settings.enabled = true;
-        cfg.vision_settings.mmproj_path = "mmproj-model.gguf";
         db.save_config(cfg);
         const auto loaded_cfg = db.load_config();
+        CHECK(loaded_cfg.inference_backend == "vllm");
+        CHECK(loaded_cfg.model_path == "Qwen/Qwen2.5-VL-7B-Instruct");
         CHECK(loaded_cfg.vision_settings.enabled);
-        CHECK(loaded_cfg.vision_settings.mmproj_path == "mmproj-model.gguf");
 
         mm::ImageAttachment attachment;
         attachment.id = "image-one";
@@ -3554,1009 +3539,6 @@ bool test_vision_config_attachment_and_message_round_trip() {
     return true;
 }
 
-bool test_vision_profile_validation_and_suggestions() {
-    const auto dir = temp_test_dir("vision-validation");
-    std::filesystem::create_directories(dir);
-    const auto model_path = dir / "model.gguf";
-    const auto projector_path = dir / "MMPROJ-Vision.GGUF";
-    {
-        std::ofstream model(model_path, std::ios::binary);
-        model << "model";
-        std::ofstream projector(projector_path, std::ios::binary);
-        projector << "projector";
-    }
-
-    const auto suggestions = mm::suggest_mmproj_files(model_path.string());
-    CHECK(suggestions.size() == 1);
-    CHECK(std::filesystem::path(suggestions[0]).filename() == projector_path.filename());
-
-    mm::AgentConfig cfg;
-    cfg.name = "Vision";
-    cfg.model_path = model_path.string();
-    cfg.inference_backend = "llama-cpp";
-    cfg.vision_settings.enabled = true;
-    CHECK(!mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
-
-    cfg.vision_settings.mmproj_path = projector_path.string();
-    CHECK(mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
-
-    cfg.runtime_settings.extra_args = {"--mmproj-url=https://invalid.example/mmproj"};
-    CHECK(!mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
-    cfg.runtime_settings.extra_args.clear();
-
-    cfg.vision_settings.mmproj_path = (dir / "projector.gguf").string();
-    const auto unconventional = mm::validate_agent_config(cfg, nullptr, "", nullptr);
-    CHECK(unconventional.ok());
-    CHECK(std::any_of(unconventional.issues.begin(), unconventional.issues.end(),
-                      [](const mm::ValidationIssue& issue) {
-                          return issue.field == "vision_settings.mmproj_path" &&
-                                 issue.severity == mm::ValidationSeverity::Warning;
-                      }));
-
-    cfg.inference_backend = "vllm";
-    CHECK(!mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
-    cfg.vision_settings.mmproj_path.clear();
-    CHECK(mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
-
-    cfg.inference_backend = "api";
-    cfg.api_settings.base_url = "https://example.test";
-    cfg.api_settings.chat_completions_path = "/v1/chat/completions";
-    cfg.vision_settings.mmproj_path = projector_path.string();
-    CHECK(!mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
-    cfg.vision_settings.mmproj_path.clear();
-    CHECK(mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
-
-    CHECK(remove_tree(dir));
-    return true;
-}
-
-bool test_vision_slot_projector_isolation_and_json() {
-    mm::SlotManager slots(46250, 46253, 4, "missing-vllm");
-    mm::RuntimeSettings settings;
-    const auto first = slots.add_ready_test_slot_llama(
-        "model.gguf", "agent-a", settings, "mmproj-a.gguf");
-    CHECK(!first.empty());
-
-    const auto shared = slots.load_model_llama(
-        "model.gguf", "mmproj-a.gguf", settings, "agent-b");
-    CHECK(shared == first);
-
-    const auto different = slots.load_model_llama(
-        "model.gguf", "mmproj-b.gguf", settings, "agent-c");
-    CHECK(different.empty());
-    const auto info = slots.find_slot(first);
-    CHECK(info.has_value());
-    CHECK(info->vision_enabled);
-    CHECK(info->mmproj_path == "mmproj-a.gguf");
-    CHECK(std::find(info->agent_ids.begin(), info->agent_ids.end(), "agent-b") !=
-          info->agent_ids.end());
-    CHECK(std::find(info->agent_ids.begin(), info->agent_ids.end(), "agent-c") ==
-          info->agent_ids.end());
-
-    const auto slot_json = nlohmann::json(*info);
-    CHECK(slot_json["vision_enabled"] == true);
-    CHECK(slot_json["mmproj_path"] == "mmproj-a.gguf");
-
-    mm::Message ordered;
-    ordered.role = mm::MessageRole::User;
-    ordered.content_parts = {
-        mm::MessageContentPart{"text", "look", {}, {}, {}},
-        mm::MessageContentPart{"image_url", {}, {},
-                               "data:image/png;base64,iVBORw0KGgo=", "image/png"},
-        mm::MessageContentPart{"text", "closely", {}, {}, {}}
-    };
-    const auto round_trip = nlohmann::json(ordered).get<mm::Message>();
-    CHECK(round_trip.content_parts.size() == 3);
-    CHECK(round_trip.content_parts[1].image_url ==
-          "data:image/png;base64,iVBORw0KGgo=");
-    return true;
-}
-
-bool test_llama_model_path_normalization() {
-#ifdef _WIN32
-    CHECK(mm::normalize_llama_model_path("/mnt/y/models/m.gguf") == "Y:\\models\\m.gguf");
-    CHECK(mm::normalize_llama_model_path("\"C:\\a\\b.gguf\"") == "C:\\a\\b.gguf");
-#else
-    CHECK(mm::normalize_llama_model_path("  /models/m.gguf  ") == "/models/m.gguf");
-#endif
-    return true;
-}
-
-bool test_llama_accelerator_detection() {
-    CHECK(mm::detect_llama_accelerator("linux", "x86_64", true, false) == "cuda");
-    CHECK(mm::detect_llama_accelerator("linux", "x86_64", false, true) == "rocm");
-    CHECK(mm::detect_llama_accelerator("linux", "x86_64", false, false) == "cpu");
-    CHECK(mm::detect_llama_accelerator("macos", "aarch64", false, false) == "metal");
-    // llama.cpp builds CUDA natively on Windows — no separate "windows" variant.
-    CHECK(mm::detect_llama_accelerator("windows", "x86_64", true, false) == "cuda");
-    return true;
-}
-
-bool test_llama_launch_compatible() {
-    mm::RuntimeSettings a;
-    a.ctx_size = 4096;
-    a.parallel = 2;
-    a.temperature = 0.7f;
-    mm::RuntimeSettings b = a;
-    b.temperature = 0.2f;   // generation params do not gate engine sharing
-    b.max_tokens = 99;
-    CHECK(mm::llama_launch_compatible(a, b));
-    b.ctx_size = 8192;      // launch-time identity differs
-    CHECK(!mm::llama_launch_compatible(a, b));
-    return true;
-}
-
-bool test_llama_backend_validation_and_gguf_routing() {
-    mm::AgentConfig cfg;
-    cfg.name = "a";
-    cfg.model_path = "/models/m.gguf";
-    cfg.inference_backend = "llama-cpp";
-    auto r = mm::validate_agent_config(cfg, nullptr, "", nullptr);
-    CHECK(r.ok());
-
-    // GGUF served through vLLM should warn (routing hint), still valid overall.
-    mm::AgentConfig v = cfg;
-    v.inference_backend = "vllm";
-    auto rv = mm::validate_agent_config(v, nullptr, "", nullptr);
-    bool vllm_gguf_warn = false;
-    for (const auto& i : rv.issues)
-        if (i.field == "inference_backend" && i.severity == mm::ValidationSeverity::Warning)
-            vllm_gguf_warn = true;
-    CHECK(vllm_gguf_warn);
-
-    // llama-cpp with an HF repo id warns (needs a local GGUF).
-    mm::AgentConfig h = cfg;
-    h.model_path = "Qwen/Qwen3-8B";
-    auto rh = mm::validate_agent_config(h, nullptr, "", nullptr);
-    bool hf_warn = false;
-    for (const auto& i : rh.issues)
-        if (i.field == "model_path" && i.severity == mm::ValidationSeverity::Warning)
-            hf_warn = true;
-    CHECK(hf_warn);
-
-    // An unknown backend is a hard error.
-    mm::AgentConfig bad = cfg;
-    bad.inference_backend = "tensorrt";
-    CHECK(!mm::validate_agent_config(bad, nullptr, "", nullptr).ok());
-
-    // The legacy "llama.cpp"/"llama" spellings normalize to the llama backend.
-    mm::AgentConfig legacy = cfg;
-    legacy.inference_backend = "llama.cpp";
-    CHECK(mm::validate_agent_config(legacy, nullptr, "", nullptr).ok());
-    return true;
-}
-
-bool test_llama_install_plan_and_method() {
-    CHECK(mm::normalize_llama_install_method("SOURCE") == "source");
-    CHECK(mm::normalize_llama_install_method("release") == "release");
-    CHECK(mm::normalize_llama_install_method("garbage") == "auto");
-    CHECK(mm::normalize_llama_install_method("") == "auto");
-
-    mm::LlamaProvisionConfig cfg;
-    cfg.platform = "linux";
-    cfg.arch = "x86_64";
-    cfg.accelerator = "cuda";
-    cfg.cuda_arch = "121";          // DGX Spark GB10 sm_121
-    cfg.install_method = "source";
-    cfg.provision_dir = "data/llama-plan-test";
-    const auto plan = mm::build_llama_install_plan(cfg, false);
-    CHECK(!plan.empty());
-
-    std::string joined;
-    for (const auto& step : plan)
-        for (const auto& a : step.argv) joined += a + " ";
-    CHECK(joined.find("clone") != std::string::npos);
-    CHECK(joined.find("-DGGML_CUDA=ON") != std::string::npos);
-    CHECK(joined.find("-DCMAKE_CUDA_ARCHITECTURES=121a-real") != std::string::npos);
-    CHECK(joined.find("CMAKE_CUDA_FLAGS=-arch") == std::string::npos);
-    CHECK(joined.find("sm_$cuda_probe_arch") != std::string::npos);
-    CHECK(joined.find("CUDA compiler/assembler smoke test") != std::string::npos);
-    CHECK(joined.find("CMakeCache.txt") != std::string::npos);
-    CHECK(joined.find("CMakeFiles") != std::string::npos);
-    CHECK(joined.find("linux-x64-cuda") != std::string::npos); // isolated CMake cache
-    CHECK(joined.find("nvcc") != std::string::npos);            // CUDA preflight
-    CHECK(joined.find("--parallel 2") != std::string::npos);    // conservative default
-    CHECK(joined.find("llama-server") != std::string::npos);  // build target
-
-    // Auto starts with an official release lookup, not a source build.
-    cfg.install_method = "auto";
-    const auto auto_plan = mm::build_llama_install_plan(cfg, false);
-    CHECK(auto_plan.size() == 1);
-    CHECK(auto_plan.front().argv.front() == "python3");
-    std::string auto_joined;
-    for (const auto& a : auto_plan.front().argv) auto_joined += a + " ";
-    CHECK(auto_joined.find("api.github.com/repos/ggml-org/llama.cpp") != std::string::npos);
-    CHECK(auto_joined.find("bin-ubuntu-cuda") != std::string::npos);
-    CHECK(auto_joined.find("git clone") == std::string::npos);
-
-    // Current Windows releases need the base/server archive plus the selected
-    // backend, and CUDA needs the matching runtime DLL archive as well.
-    cfg.platform = "windows";
-    const auto windows_plan = mm::build_llama_install_plan(cfg, false);
-    CHECK(windows_plan.size() == 1);
-    CHECK(windows_plan.front().argv.front() == "powershell");
-    std::string windows_joined;
-    for (const auto& a : windows_plan.front().argv) windows_joined += a + " ";
-    CHECK(windows_joined.find("bin-win-cpu") != std::string::npos);
-    CHECK(windows_joined.find("bin-win-cuda") != std::string::npos);
-    CHECK(windows_joined.find("cudart-llama-bin-win-cuda") != std::string::npos);
-    CHECK(windows_joined.find("nvidia-smi") != std::string::npos);
-    return true;
-}
-
-bool test_llama_provisioner_disabled_and_cancel() {
-    auto dir = temp_test_dir("llama-prov");
-    // auto-provision disabled + missing executable => "disabled", no exe.
-    mm::LlamaProvisionConfig cfg;
-    cfg.requested_executable = "definitely-not-a-real-llama-server-xyz";
-    cfg.provision_dir = (dir / "prov").string();
-    cfg.auto_provision = false;
-    cfg.platform = "linux";
-    cfg.arch = "x86_64";
-    cfg.accelerator = "cpu";
-    mm::LlamaCppProvisioner prov(cfg);
-    const auto st = prov.ensure_runtime();
-    CHECK(st.status == "disabled");
-    CHECK(st.executable_path.empty());
-
-    // A cancel check that trips before the first step yields a canceled failure
-    // and never runs a command.
-    mm::LlamaProvisionConfig cfg2 = cfg;
-    cfg2.auto_provision = true;
-    bool ran = false;
-    mm::LlamaCommandRunner runner;
-    runner.run = [&](const std::vector<std::string>&, const std::filesystem::path&,
-                     const mm::StreamLineCallback&, const mm::CancelCheckCallback&,
-                     std::string*) { ran = true; return 0; };
-    runner.capture_first_line = [](const std::vector<std::string>&,
-                                   const std::filesystem::path&) { return std::string{}; };
-    mm::LlamaCppProvisioner prov2(cfg2, runner);
-    prov2.set_cancel_check([] { return true; });
-    const auto st2 = prov2.ensure_runtime();
-    CHECK(st2.status == "failed");
-    CHECK(st2.last_error.find("canceled") != std::string::npos);
-    CHECK(!ran);
-
-    CHECK(remove_tree(dir));
-    return true;
-}
-
-bool test_llama_path_resolution_respects_accelerator() {
-    auto dir = temp_test_dir("llama-path-accelerator");
-    mm::LlamaProvisionConfig cfg;
-    cfg.requested_executable = "llama-server";
-    cfg.provision_dir = (dir / "cuda").string();
-    cfg.auto_provision = true;
-    cfg.install_method = "release";
-    cfg.version = "b2000";
-    cfg.platform = "windows";
-    cfg.arch = "x86_64";
-    cfg.accelerator = "cuda";
-    cfg.accelerator_explicit = true;
-
-    const std::string winget =
-        "C:/Users/test/AppData/Local/Microsoft/WinGet/Packages/ggml.llamacpp/llama-server.exe";
-    bool ran_managed_install = false;
-    bool fail_managed_install = false;
-    mm::LlamaCommandRunner runner;
-    runner.resolve_executable = [winget](const std::string&) { return winget; };
-    runner.run = [&](const std::vector<std::string>&,
-                     const std::filesystem::path&,
-                     const mm::StreamLineCallback&,
-                     const mm::CancelCheckCallback&,
-                     std::string* error) {
-        ran_managed_install = true;
-        if (fail_managed_install) {
-            if (error) *error = "simulated target install failure";
-            return 1;
-        }
-        const auto executable = std::filesystem::path(cfg.provision_dir) /
-            "release" / "bin" / "llama-server.exe";
-        std::filesystem::create_directories(executable.parent_path());
-        std::ofstream(executable) << "fake managed CUDA llama-server";
-        return 0;
-    };
-    runner.capture_first_line = [](const std::vector<std::string>& argv,
-                                   const std::filesystem::path&) {
-        return !argv.empty() && argv.front().find("WinGet") != std::string::npos
-            ? std::string{"'--version' is not recognized as a valid option"}
-            : std::string{"llama.cpp version: 2000 (managedcuda)"};
-    };
-    runner.fetch_latest = [](const mm::LlamaProvisionConfig&) {
-        return std::string{"b2000"};
-    };
-    runner.fetch_release_assets = [](const mm::LlamaProvisionConfig&,
-                                     const std::string&) {
-        return std::vector<std::string>{};
-    };
-
-    mm::LlamaCppProvisioner cuda(cfg, runner);
-    const auto managed = cuda.ensure_runtime();
-    CHECK(ran_managed_install);
-    CHECK(managed.status == "ready");
-    CHECK(managed.managed);
-    CHECK(managed.method == "release");
-    CHECK(managed.accelerator == "cuda");
-    CHECK(managed.variant == "cuda");
-    CHECK(managed.target_method == "release");
-    CHECK(managed.target_accelerator == "cuda");
-    CHECK(managed.target_variant == "cuda");
-    CHECK(!managed.target_mismatch);
-    CHECK(!managed.available_variants.empty());
-    CHECK(managed.executable_path.find("WinGet") == std::string::npos);
-
-    // The same generic PATH result must not block managed update operations.
-    ran_managed_install = false;
-    const auto updated = cuda.update_runtime();
-    CHECK(ran_managed_install);
-    CHECK(updated.status == "ready");
-    CHECK(updated.managed);
-    CHECK(updated.last_error.empty());
-
-    // The generic PATH executable must not shadow the active managed CUDA
-    // selection on restart.
-    ran_managed_install = false;
-    mm::LlamaCppProvisioner restarted(cfg, runner);
-    const auto restored = restarted.ensure_runtime();
-    CHECK(!ran_managed_install);
-    CHECK(restored.status == "ready");
-    CHECK(restored.managed);
-    CHECK(restored.accelerator == "cuda");
-    CHECK(restored.executable_path == managed.executable_path);
-    CHECK(restored.build_log_path == updated.build_log_path);
-
-    // A generic PATH build remains valid for CPU nodes.
-    auto cpu_cfg = cfg;
-    cpu_cfg.provision_dir = (dir / "cpu").string();
-    cpu_cfg.accelerator = "cpu";
-    ran_managed_install = false;
-    mm::LlamaCppProvisioner cpu(cpu_cfg, runner);
-    const auto cpu_status = cpu.ensure_runtime();
-    CHECK(!ran_managed_install);
-    CHECK(cpu_status.status == "resolved");
-    CHECK(!cpu_status.managed);
-    CHECK(cpu_status.method == "path");
-    CHECK(cpu_status.executable_path == winget);
-    CHECK(cpu_status.version.empty());
-
-    // Disabling auto-provision or naming an explicit path is an intentional
-    // user override even for an accelerator node.
-    auto path_only_cfg = cfg;
-    path_only_cfg.provision_dir = (dir / "path-only").string();
-    path_only_cfg.auto_provision = false;
-    mm::LlamaCppProvisioner path_only(path_only_cfg, runner);
-    CHECK(path_only.ensure_runtime().executable_path == winget);
-
-    auto explicit_cfg = cfg;
-    explicit_cfg.provision_dir = (dir / "explicit").string();
-    explicit_cfg.requested_executable = "C:/custom/llama-server.exe";
-    mm::LlamaCppProvisioner explicit_runtime(explicit_cfg, runner);
-    const auto explicit_status = explicit_runtime.ensure_runtime();
-    CHECK(explicit_status.status == "resolved");
-    CHECK(explicit_status.executable_path == winget);
-    CHECK(explicit_status.version.empty());
-
-    // Backend changes are available even when no version update is pending.
-    ran_managed_install = false;
-    const auto switched = restarted.switch_runtime("vulkan");
-    CHECK(ran_managed_install);
-    CHECK(switched.status == "ready");
-    CHECK(switched.managed);
-    CHECK(switched.accelerator == "vulkan");
-    CHECK(switched.variant == "vulkan");
-    CHECK(switched.target_accelerator == "cuda");
-    CHECK(switched.target_variant == "cuda");
-    CHECK(switched.target_mismatch);
-    CHECK(switched.target_mismatch_reason.find("targets cuda") != std::string::npos);
-    nlohmann::json switched_json = switched;
-    const auto switched_round_trip = switched_json.get<mm::LlamaRuntimeStatus>();
-    CHECK(switched_round_trip.variant == "vulkan");
-    CHECK(switched_round_trip.target_accelerator == "cuda");
-    CHECK(switched_round_trip.target_mismatch);
-    CHECK(switched_round_trip.available_variants.size() ==
-          switched.available_variants.size());
-
-    ran_managed_install = false;
-    mm::LlamaCppProvisioner switched_restart(cfg, runner);
-    const auto switched_restored = switched_restart.ensure_runtime();
-    CHECK(!ran_managed_install);
-    CHECK(switched_restored.accelerator == "vulkan");
-    CHECK(switched_restored.variant == "vulkan");
-    CHECK(switched_restored.target_accelerator == "cuda");
-    CHECK(switched_restored.target_mismatch);
-
-    // A failed target attempt does not replace the persisted fallback marker.
-    fail_managed_install = true;
-    const auto failed_target = switched_restart.recover_runtime("target");
-    CHECK(failed_target.status == "failed");
-    CHECK(failed_target.last_error.find("simulated target install failure") !=
-          std::string::npos);
-    fail_managed_install = false;
-    const auto after_failed_target = switched_restart.ensure_runtime();
-    CHECK(after_failed_target.accelerator == "vulkan");
-    CHECK(after_failed_target.target_mismatch);
-
-    // The explicit configured target no longer silently displaces a working
-    // fallback at startup. A deliberate target recovery installs it instead.
-    ran_managed_install = false;
-    const auto target = switched_restart.recover_runtime("target");
-    CHECK(ran_managed_install);
-    CHECK(target.status == "ready");
-    CHECK(target.accelerator == "cuda");
-    CHECK(target.target_accelerator == "cuda");
-    CHECK(!target.target_mismatch);
-
-    CHECK(remove_tree(dir));
-    return true;
-}
-
-bool test_llama_auto_release_then_source_fallback() {
-    auto dir = temp_test_dir("llama-auto-fallback");
-    mm::LlamaProvisionConfig cfg;
-    cfg.requested_executable = "definitely-not-a-real-llama-server-auto";
-    cfg.provision_dir = (dir / "prov").string();
-    cfg.auto_provision = true;
-    cfg.install_method = "auto";
-    cfg.platform = "linux";
-    cfg.arch = "x86_64";
-    cfg.accelerator = "cuda";
-    cfg.cuda_arch = "120";
-
-    // Seed more than the retention limit; the new attempt should prune the
-    // oldest managed-runtime transcripts before creating its own.
-    const auto logs_dir = dir / "prov" / "logs";
-    std::filesystem::create_directories(logs_dir);
-    for (int i = 0; i < 21; ++i) {
-        std::ofstream(logs_dir / ("llama-build-old-" + std::to_string(i) + ".log"))
-            << "old log";
-    }
-
-    bool saw_release = false;
-    bool saw_source = false;
-    mm::LlamaCommandRunner runner;
-    runner.run = [&](const std::vector<std::string>& argv,
-                     const std::filesystem::path&,
-                     const mm::StreamLineCallback&,
-                     const mm::CancelCheckCallback&,
-                     std::string* error) {
-        if (!argv.empty() && argv.front() == "python3") {
-            saw_release = true;
-            if (error) *error = "no matching Linux CUDA release";
-            return 1;
-        }
-        saw_source = true;
-        const auto build_it = std::find(argv.begin(), argv.end(), "--build");
-        if (build_it != argv.end() && std::next(build_it) != argv.end()) {
-            const auto exe = std::filesystem::path(*std::next(build_it)) / "bin"
-                / "llama-server";
-            std::filesystem::create_directories(exe.parent_path());
-            std::ofstream(exe) << "fake llama-server";
-        }
-        return 0;
-    };
-    runner.capture_first_line = [](const std::vector<std::string>&,
-                                   const std::filesystem::path&) {
-        return std::string{"version b9999"};
-    };
-
-    mm::LlamaCppProvisioner provisioner(cfg, runner);
-    const auto status = provisioner.ensure_runtime();
-    CHECK(saw_release);
-    CHECK(saw_source);
-    CHECK(status.status == "ready");
-    CHECK(status.method == "source");
-    CHECK(status.cuda_architecture == "120a-real");
-    CHECK(status.target_cuda_architecture == "120a-real");
-    CHECK(!status.target_mismatch);
-    auto stale_architecture = status;
-    stale_architecture.cuda_architecture = "120";
-    CHECK(mm::llama_runtime_target_mismatch_reason(stale_architecture).find(
-              "targets 120a-real") != std::string::npos);
-    CHECK(status.executable_path.find("llama.cpp-src") != std::string::npos);
-    CHECK(!status.build_log_path.empty());
-    CHECK(std::filesystem::exists(status.build_log_path));
-    {
-        std::ifstream log(status.build_log_path);
-        const std::string text((std::istreambuf_iterator<char>(log)),
-                               std::istreambuf_iterator<char>());
-        CHECK(text.find("operation: install") != std::string::npos);
-        CHECK(text.find("command:") != std::string::npos);
-        CHECK(text.find("no matching Linux CUDA release") != std::string::npos);
-        CHECK(text.find("result: success") != std::string::npos);
-    }
-    size_t retained_logs = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(logs_dir)) {
-        const std::string name = entry.path().filename().string();
-        if (entry.is_regular_file() && name.rfind("llama-build-", 0) == 0 &&
-            entry.path().extension() == ".log") {
-            ++retained_logs;
-        }
-    }
-    CHECK(retained_logs == 20);
-
-    mm::LlamaCppProvisioner restarted(cfg, runner);
-    const auto restored = restarted.ensure_runtime();
-    CHECK(restored.cuda_architecture == "120a-real");
-    CHECK(restored.target_cuda_architecture == "120a-real");
-    CHECK(!restored.target_mismatch);
-
-    CHECK(remove_tree(dir));
-    return true;
-}
-
-bool test_llama_update_release_decision() {
-    auto dir = temp_test_dir("llama-update-decision");
-    mm::LlamaProvisionConfig cfg;
-    cfg.requested_executable = "definitely-not-a-real-llama-server-update";
-    cfg.provision_dir = (dir / "prov").string();
-    cfg.auto_provision = false;
-    cfg.install_method = "auto";
-    cfg.platform = "linux";
-    cfg.arch = "x86_64";
-    cfg.accelerator = "cuda";
-
-    auto source_cfg = cfg;
-    source_cfg.install_method = "source";
-    const auto managed = mm::managed_llama_executable_path(source_cfg);
-    std::filesystem::create_directories(managed.parent_path());
-    std::ofstream(managed) << "fake llama-server";
-
-    const std::vector<std::string> assets{
-        "llama-b1001-bin-ubuntu-x64.tar.gz",
-        "llama-b1001-bin-ubuntu-vulkan-x64.tar.gz",
-    };
-    const auto available = mm::llama_release_accelerators(assets, cfg);
-    CHECK(available == std::vector<std::string>({"vulkan", "cpu"}));
-
-    mm::LlamaCommandRunner runner;
-    runner.run = [&](const std::vector<std::string>& argv,
-                     const std::filesystem::path&,
-                     const mm::StreamLineCallback&,
-                     const mm::CancelCheckCallback&,
-                     std::string*) {
-        if (!argv.empty() && argv.front() == "python3") {
-            const auto executable = dir / "prov" / "release" / "bin" / "llama-server";
-            std::filesystem::create_directories(executable.parent_path());
-            std::ofstream(executable) << "fake Vulkan llama-server";
-        }
-        return 0;
-    };
-    runner.capture_first_line = [](const std::vector<std::string>&,
-                                   const std::filesystem::path&) {
-        return std::string{"llama.cpp version: 1000 (deadbeef)"};
-    };
-    std::string latest = "b1000";
-    runner.fetch_latest = [&](const mm::LlamaProvisionConfig&) {
-        return latest;
-    };
-    runner.fetch_release_assets = [assets](const mm::LlamaProvisionConfig&,
-                                           const std::string&) { return assets; };
-
-    mm::LlamaCppProvisioner provisioner(cfg, runner);
-    CHECK(provisioner.ensure_runtime().status == "ready");
-    CHECK(!provisioner.check_for_update().update_available);
-    latest = "b1001";
-    const auto update = provisioner.check_for_update();
-    CHECK(update.update_available);
-    CHECK(update.update_action == "compile");
-    CHECK(!update.update_release_available);
-    CHECK(update.update_release_alternatives ==
-          std::vector<std::string>({"vulkan", "cpu"}));
-    CHECK(update.update_warning.find("compile llama-server from source") != std::string::npos);
-    CHECK(!update.available_variants.empty());
-
-    nlohmann::json encoded = update;
-    const auto decoded = encoded.get<mm::LlamaRuntimeStatus>();
-    CHECK(decoded.update_action == "compile");
-    CHECK(decoded.update_release_alternatives == update.update_release_alternatives);
-    CHECK(decoded.available_variants.size() == update.available_variants.size());
-
-    const auto switched = provisioner.update_runtime("vulkan");
-    CHECK(switched.status == "ready");
-    CHECK(switched.method == "release");
-    CHECK(switched.accelerator == "vulkan");
-    CHECK(std::filesystem::exists(dir / "prov" / "active-runtime.json"));
-
-    mm::LlamaCppProvisioner restarted(cfg, runner);
-    const auto restored = restarted.ensure_runtime();
-    CHECK(restored.status == "ready");
-    CHECK(restored.method == "release");
-    CHECK(restored.accelerator == "vulkan");
-    const auto restored_update = restarted.check_for_update();
-    CHECK(restored_update.update_action == "release");
-    CHECK(restored_update.update_release_available);
-    CHECK(restarted.update_runtime().accelerator == "vulkan");
-
-    CHECK(remove_tree(dir));
-    return true;
-}
-
-bool test_llama_runtime_variant_matrix() {
-    mm::LlamaProvisionConfig cfg;
-    cfg.platform = "windows";
-    cfg.arch = "x86_64";
-    cfg.accelerator = "cuda";
-    const std::vector<std::string> windows_assets{
-        "llama-b2000-bin-win-cpu-x64.zip",
-        "llama-b2000-bin-win-cuda-12.4-x64.zip",
-        "llama-b2000-bin-win-cuda-13.3-x64.zip",
-        "cudart-llama-bin-win-cuda-12.4-x64.zip",
-        "cudart-llama-bin-win-cuda-13.3-x64.zip",
-        "llama-b2000-bin-win-vulkan-x64.zip",
-        "llama-b2000-bin-win-openvino-2026.2.1-x64.zip",
-    };
-    const auto windows = mm::llama_runtime_variants(windows_assets, cfg);
-    auto find = [](const auto& variants, const std::string& id) {
-        return std::find_if(variants.begin(), variants.end(),
-                            [&](const auto& v) { return v.id == id; });
-    };
-    CHECK(find(windows, "cuda-12") != windows.end());
-    CHECK(find(windows, "cuda-12")->release_available);
-    CHECK(find(windows, "cuda-13")->release_available);
-    CHECK(find(windows, "vulkan")->release_available);
-    CHECK(find(windows, "openvino")->release_available);
-    CHECK(find(windows, "cpu")->release_available);
-    CHECK(!find(windows, "sycl-fp32")->release_available); // backend DLL is not a server bundle
-    CHECK(find(windows, "sycl-fp32")->source_supported);
-    CHECK(!find(windows, "metal")->platform_supported);
-
-    cfg.platform = "linux";
-    cfg.arch = "s390x";
-    const auto s390x = mm::llama_runtime_variants(
-        {"llama-b2000-bin-ubuntu-s390x.tar.gz"}, cfg);
-    CHECK(find(s390x, "cpu")->release_available);
-    CHECK(!find(s390x, "vulkan")->platform_supported);
-    CHECK(!find(s390x, "cuda-13")->platform_supported);
-
-    cfg.platform = "macos";
-    cfg.arch = "apple-silicon";
-    const auto apple = mm::llama_runtime_variants(
-        {"llama-b2000-bin-macos-arm64.tar.gz"}, cfg);
-    CHECK(find(apple, "metal")->release_available);
-    CHECK(find(apple, "cpu")->release_available);
-    return true;
-}
-
-bool test_llama_failure_diagnostics_and_recovery() {
-    auto dir = temp_test_dir("llama-diagnostics");
-    mm::LlamaProvisionConfig cfg;
-    cfg.requested_executable = "definitely-not-a-real-llama-server-diagnostics";
-    cfg.provision_dir = (dir / "prov").string();
-    cfg.auto_provision = true;
-    cfg.install_method = "auto";
-    cfg.platform = "linux";
-    cfg.arch = "x86_64";
-    cfg.accelerator = "cuda";
-
-    const std::vector<std::string> assets{
-        "llama-b2000-bin-ubuntu-x64.tar.gz",
-        "llama-b2000-bin-ubuntu-vulkan-x64.tar.gz",
-    };
-    mm::LlamaCommandRunner runner;
-    std::string recovery_mode;
-    std::vector<std::vector<std::string>> recovery_commands;
-    runner.run = [&](const std::vector<std::string>& argv,
-                    const std::filesystem::path&,
-                    const mm::StreamLineCallback&,
-                    const mm::CancelCheckCallback&,
-                    std::string* error) {
-        recovery_commands.push_back(argv);
-        if (recovery_mode == "release") {
-            const auto executable = dir / "prov" / "release" / "bin" / "llama-server";
-            std::filesystem::create_directories(executable.parent_path());
-            std::ofstream(executable) << "fake release llama-server";
-            return 0;
-        }
-        if (recovery_mode == "compile") {
-            const auto build = std::find(argv.begin(), argv.end(), "--build");
-            if (build != argv.end() && std::next(build) != argv.end()) {
-                const auto executable = std::filesystem::path(*std::next(build)) /
-                    "bin" / "llama-server";
-                std::filesystem::create_directories(executable.parent_path());
-                std::ofstream(executable) << "fake compiled llama-server";
-            }
-            return 0;
-        }
-        if (error) *error = "simulated compiler failure";
-        return 1;
-    };
-    runner.capture_output = [](const std::vector<std::string>& argv,
-                               const std::filesystem::path&) {
-        std::string joined;
-        for (const auto& arg : argv) joined += arg + " ";
-        if (joined.find("kernel/osrelease") != std::string::npos) return std::string{"WSL"};
-        if (joined.find("MemAvailable") != std::string::npos) return std::string{"8.00 GiB free"};
-        if (!argv.empty()) {
-            const std::string tool = argv.back();
-            if (tool == "git" || tool == "cmake" || tool == "c++" ||
-                tool == "nvidia-smi")
-                return std::string{"/usr/bin/"} + tool;
-            if (tool == "nvcc") return std::string{};
-        }
-        return std::string{};
-    };
-    runner.capture_first_line = [](const std::vector<std::string>&,
-                                   const std::filesystem::path&) {
-        return std::string{};
-    };
-    runner.fetch_latest = [](const mm::LlamaProvisionConfig&) {
-        return std::string{"b2000"};
-    };
-    runner.fetch_release_assets = [assets](const mm::LlamaProvisionConfig&,
-                                           const std::string&) { return assets; };
-
-    mm::LlamaCppProvisioner provisioner(cfg, runner);
-    const auto failed = provisioner.ensure_runtime();
-    CHECK(failed.status == "failed");
-    CHECK(failed.troubleshooting.required);
-    CHECK(failed.troubleshooting.platform == "linux");
-    CHECK(failed.troubleshooting.architecture == "x64");
-    CHECK(failed.troubleshooting.can_override_checks);
-    CHECK(!failed.troubleshooting.fingerprint.empty());
-    CHECK(std::any_of(failed.troubleshooting.checks.begin(),
-                      failed.troubleshooting.checks.end(), [](const auto& check) {
-        return check.id == "cuda-toolkit" && check.status == "fail" && check.blocking;
-    }));
-    CHECK(std::any_of(failed.troubleshooting.checks.begin(),
-                      failed.troubleshooting.checks.end(), [](const auto& check) {
-        return check.id == "cuda-driver-toolkit-mismatch" && check.status == "fail";
-    }));
-    CHECK(std::count_if(failed.troubleshooting.variants.begin(),
-                        failed.troubleshooting.variants.end(), [](const auto& variant) {
-        return variant.release_available;
-    }) == 2);
-    CHECK(!failed.build_log_path.empty());
-    CHECK(std::filesystem::exists(failed.build_log_path));
-    {
-        std::ifstream log(failed.build_log_path);
-        const std::string text((std::istreambuf_iterator<char>(log)),
-                               std::istreambuf_iterator<char>());
-        CHECK(text.find("simulated compiler failure") != std::string::npos);
-        CHECK(text.find("result: failed") != std::string::npos);
-        CHECK(text.find("llama.cpp troubleshooting report") != std::string::npos);
-    }
-    const std::string report_text = mm::format_llama_troubleshooting_report(
-        failed.troubleshooting, failed.build_log_path);
-    CHECK(report_text.find("Full build log: " + failed.build_log_path) !=
-          std::string::npos);
-    CHECK(report_text.find("simulated compiler failure") != std::string::npos);
-
-    nlohmann::json encoded = failed;
-    const auto decoded = encoded.get<mm::LlamaRuntimeStatus>();
-    CHECK(decoded.build_log_path == failed.build_log_path);
-    CHECK(decoded.troubleshooting.summary == failed.troubleshooting.summary);
-    CHECK(decoded.troubleshooting.checks.size() == failed.troubleshooting.checks.size());
-
-    auto normal_source = cfg;
-    normal_source.install_method = "source";
-    auto normal_plan = mm::build_llama_install_plan(normal_source, false);
-    CHECK(std::any_of(normal_plan.begin(), normal_plan.end(), [](const auto& step) {
-        return step.label == "Checking source-build prerequisites";
-    }));
-    normal_source.bypass_environment_checks = true;
-    auto bypass_plan = mm::build_llama_install_plan(normal_source, false);
-    CHECK(std::none_of(bypass_plan.begin(), bypass_plan.end(), [](const auto& step) {
-        return step.label == "Checking source-build prerequisites";
-    }));
-
-    recovery_mode = "release";
-    recovery_commands.clear();
-    const auto released = provisioner.recover_runtime("release", "cpu");
-    CHECK(released.status == "ready");
-    CHECK(released.method == "release");
-    CHECK(released.accelerator == "cpu");
-
-    recovery_mode = "compile";
-    recovery_commands.clear();
-    const auto compiled = provisioner.recover_runtime("compile-anyway");
-    CHECK(compiled.status == "ready");
-    CHECK(compiled.method == "source");
-    CHECK(std::none_of(recovery_commands.begin(), recovery_commands.end(),
-                       [](const auto& argv) {
-        return std::find(argv.begin(), argv.end(), "mantic-mind-llama-preflight") != argv.end();
-    }));
-
-    CHECK(remove_tree(dir));
-    return true;
-}
-
-bool test_llama_nvcc_architecture_preflight_and_diagnostics() {
-    auto dir = temp_test_dir("llama-nvcc-architecture");
-    mm::LlamaProvisionConfig cfg;
-    cfg.requested_executable = "definitely-not-a-real-llama-server-nvcc";
-    cfg.provision_dir = (dir / "prov").string();
-    cfg.auto_provision = true;
-    cfg.install_method = "source";
-    cfg.platform = "linux";
-    cfg.arch = "x86_64";
-    cfg.accelerator = "cuda";
-    cfg.cuda_arch = "120";
-
-    const auto plan = mm::build_llama_install_plan(cfg, false);
-    const auto preflight = std::find_if(plan.begin(), plan.end(), [](const auto& step) {
-        return step.label == "Checking source-build prerequisites";
-    });
-    CHECK(preflight != plan.end());
-    std::string preflight_text;
-    for (const auto& arg : preflight->argv) preflight_text += arg + " ";
-    CHECK(preflight_text.find("--list-gpu-arch") != std::string::npos);
-    CHECK(preflight_text.find("CUDA Toolkit 12.8 or newer") != std::string::npos);
-    CHECK(preflight->argv[preflight->argv.size() - 2] == "120a");
-    CHECK(preflight->argv.back() == "120a");
-    const auto configure = std::find_if(plan.begin(), plan.end(), [](const auto& step) {
-        return step.label == "Configuring llama.cpp (CMake)";
-    });
-    CHECK(configure != plan.end());
-    CHECK(std::find(configure->argv.begin(), configure->argv.end(),
-                    "-DCMAKE_CUDA_ARCHITECTURES=120a-real") !=
-          configure->argv.end());
-    CHECK(std::none_of(configure->argv.begin(), configure->argv.end(),
-                       [](const auto& arg) {
-        return arg.rfind("-DCMAKE_CUDA_FLAGS=-arch", 0) == 0;
-    }));
-
-    bool supports_120 = false;
-    mm::LlamaCommandRunner runner;
-    runner.run = [](const std::vector<std::string>&,
-                    const std::filesystem::path&,
-                    const mm::StreamLineCallback&,
-                    const mm::CancelCheckCallback&,
-                    std::string* error) {
-        if (error) *error = "Selected NVCC /usr/bin/nvcc does not support compute_120";
-        return 3;
-    };
-    runner.capture_output = [&](const std::vector<std::string>& argv,
-                                const std::filesystem::path&) {
-        std::string joined;
-        for (const auto& arg : argv) joined += arg + " ";
-        if (joined.find("kernel/osrelease") != std::string::npos)
-            return std::string{"WSL"};
-        if (joined.find("MemAvailable") != std::string::npos)
-            return std::string{"8.00 GiB free"};
-        if (joined.find("CUDACXX") != std::string::npos &&
-            joined.find("command -v nvcc") != std::string::npos)
-            return std::string{"/usr/bin/nvcc"};
-        if (argv.size() == 2 && argv[0] == "/usr/bin/nvcc" && argv[1] == "--version")
-            return std::string{"Cuda compilation tools, release 11.5, V11.5.119"};
-        if (argv.size() == 2 && argv[0] == "/usr/bin/nvcc" &&
-            argv[1] == "--list-gpu-arch")
-            return supports_120 ? std::string{"compute_50\ncompute_90\ncompute_120\ncompute_120a"}
-                                : std::string{"compute_50\ncompute_90"};
-        if (!argv.empty()) {
-            const std::string tool = argv.back();
-            if (tool == "git" || tool == "cmake" || tool == "c++" ||
-                tool == "nvidia-smi")
-                return std::string{"/usr/bin/"} + tool;
-        }
-        return std::string{};
-    };
-    runner.capture_first_line = [](const std::vector<std::string>&,
-                                   const std::filesystem::path&) {
-        return std::string{};
-    };
-    runner.fetch_latest = [](const mm::LlamaProvisionConfig&) {
-        return std::string{"b2000"};
-    };
-    runner.fetch_release_assets = [](const mm::LlamaProvisionConfig&,
-                                     const std::string&) {
-        return std::vector<std::string>{};
-    };
-
-    mm::LlamaCppProvisioner provisioner(cfg, runner);
-    const auto failed = provisioner.ensure_runtime();
-    const auto incompatible = std::find_if(
-        failed.troubleshooting.checks.begin(), failed.troubleshooting.checks.end(),
-        [](const auto& check) { return check.id == "cuda-architecture"; });
-    CHECK(incompatible != failed.troubleshooting.checks.end());
-    CHECK(incompatible->status == "fail");
-    CHECK(incompatible->blocking);
-    CHECK(incompatible->detected.find("/usr/bin/nvcc") != std::string::npos);
-    CHECK(incompatible->detected.find("release 11.5") != std::string::npos);
-    CHECK(incompatible->required.find("CUDA Toolkit 12.8") != std::string::npos);
-    CHECK(incompatible->remediation.find("nvidia-smi") != std::string::npos);
-
-    supports_120 = true;
-    const auto refreshed = provisioner.diagnose_environment();
-    const auto compatible = std::find_if(
-        refreshed.troubleshooting.checks.begin(), refreshed.troubleshooting.checks.end(),
-        [](const auto& check) { return check.id == "cuda-architecture"; });
-    CHECK(compatible != refreshed.troubleshooting.checks.end());
-    CHECK(compatible->status == "pass");
-    CHECK(!compatible->blocking);
-
-    // CUDA 13 removes sm_52. Older CMake compiler-identification paths can
-    // still try that default before target CUDA_ARCHITECTURES take effect;
-    // diagnose it explicitly even when NVCC advertises sm_120 support.
-    mm::LlamaCommandRunner compiler_id_runner = runner;
-    compiler_id_runner.run = [](const std::vector<std::string>&,
-                                const std::filesystem::path&,
-                                const mm::StreamLineCallback&,
-                                const mm::CancelCheckCallback&,
-                                std::string* error) {
-        if (error) {
-            *error =
-                "ptxas -arch=sm_52 tmp/CMakeCUDACompilerId.ptx\n"
-                "ptxas fatal : Value 'sm_52' is not defined for option 'gpu-name'\n"
-                "/usr/share/cmake/Modules/CMakeDetermineCUDACompiler.cmake";
-        }
-        return 1;
-    };
-    mm::LlamaCppProvisioner compiler_id_provisioner(cfg, compiler_id_runner);
-    const auto compiler_id_failed = compiler_id_provisioner.ensure_runtime();
-    const auto compiler_id_check = std::find_if(
-        compiler_id_failed.troubleshooting.checks.begin(),
-        compiler_id_failed.troubleshooting.checks.end(),
-        [](const auto& check) { return check.id == "cuda-cmake-compiler-id"; });
-    CHECK(compiler_id_check != compiler_id_failed.troubleshooting.checks.end());
-    CHECK(compiler_id_check->status == "fail");
-    CHECK(compiler_id_check->blocking);
-    CHECK(compiler_id_check->detected.find("sm_120a") != std::string::npos);
-
-    // A baseline sm_120 override can pass a trivial architecture probe but
-    // still breaks llama.cpp's architecture-specific Blackwell FP4 kernels.
-    mm::LlamaCommandRunner blackwell_runner = runner;
-    blackwell_runner.run = [](const std::vector<std::string>&,
-                              const std::filesystem::path&,
-                              const mm::StreamLineCallback&,
-                              const mm::CancelCheckCallback&,
-                              std::string* error) {
-        if (error) {
-            *error =
-                "ptxas mmq-instance-mxfp4.compute_120.ptx; "
-                "Feature '.kind::mxf4' not supported on .target 'sm_120'; "
-                "Instruction 'mma with block scale' not supported on .target 'sm_120'";
-        }
-        return 1;
-    };
-    mm::LlamaCppProvisioner blackwell_provisioner(cfg, blackwell_runner);
-    const auto blackwell_failed = blackwell_provisioner.ensure_runtime();
-    const auto blackwell_check = std::find_if(
-        blackwell_failed.troubleshooting.checks.begin(),
-        blackwell_failed.troubleshooting.checks.end(),
-        [](const auto& check) {
-            return check.id == "cuda-blackwell-feature-target";
-        });
-    CHECK(blackwell_check != blackwell_failed.troubleshooting.checks.end());
-    CHECK(blackwell_check->status == "fail");
-    CHECK(blackwell_check->blocking);
-    CHECK(blackwell_check->required.find("sm_120a") != std::string::npos);
-    CHECK(blackwell_check->remediation.find("120a-real") != std::string::npos);
-
-    CHECK(remove_tree(dir));
-    return true;
-}
-
-bool test_llama_slot_info_backend_and_suspend() {
-    auto dir = temp_test_dir("llama-slot");
-    mm::SlotManager slots(46170, 46173, 2, "missing-vllm");
-    slots.set_llama_server_path("missing-llama");
-    slots.set_kv_cache_dir((dir / "kv").string());
-
-    mm::RuntimeSettings s;
-    s.ctx_size = 2048;
-    s.parallel = 1;
-    const auto id = slots.add_ready_test_slot_llama("m.gguf", "agent-l", s);
-
-    auto info = slots.find_slot(id);
-    CHECK(info.has_value());
-    CHECK(info->backend == "llama-cpp");
-    // Backend survives the SlotInfo JSON round-trip.
-    nlohmann::json j = *info;
-    CHECK(j.get<mm::SlotInfo>().backend == "llama-cpp");
-
-    // A test slot has no live engine (port 0), so suspend skips the KV save and
-    // still transitions to Suspended with an empty cache path.
-    auto susp = slots.suspend_slot(id);
-    CHECK(susp.status == mm::SlotOperationStatus::Ok);
-    CHECK(susp.kv_cache_path.empty());
-    auto after = slots.find_slot(id);
-    CHECK(after.has_value());
-    CHECK(after->state == mm::SlotState::Suspended);
-
-    CHECK(remove_tree(dir));
-    return true;
-}
-
 bool test_runtime_client_health_empty_body_ok() {
     // Regression: vLLM answers /health with an empty 200 body; health_check must
     // treat that (and a {"status":"ok"} body) as healthy.
@@ -4584,51 +3566,6 @@ bool test_runtime_client_health_empty_body_ok() {
     th.join();
     CHECK(reachable);
     CHECK(healthy);
-    return true;
-}
-
-bool test_llama_default_backend_and_isolation() {
-    // llama.cpp is the default runtime on this branch.
-    mm::AgentConfig fresh;
-    CHECK(fresh.inference_backend == "llama-cpp");
-    CHECK(mm::engine_backend_from_string("") == mm::EngineBackend::LlamaCpp);
-    CHECK(mm::engine_backend_from_string("vllm") == mm::EngineBackend::Vllm);
-    CHECK(mm::engine_backend_from_string("llama.cpp") == mm::EngineBackend::LlamaCpp);
-
-    // A slot payload without a backend field parses as the default runtime.
-    auto parsed = nlohmann::json{{"id", "s1"}}.get<mm::SlotInfo>();
-    CHECK(parsed.backend == "llama-cpp");
-
-    // An unspecified agent backend validates as llama-cpp (no vLLM-side errors).
-    mm::AgentConfig cfg;
-    cfg.name = "d";
-    cfg.model_path = "/models/m.gguf";
-    cfg.inference_backend = "";
-    CHECK(mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
-
-    // Cross-backend isolation: a vLLM load must never attach to a llama slot
-    // serving the same model (default settings on both sides would otherwise
-    // pass vllm_launch_compatible), and vice versa. With no real engines the
-    // load falls through to a spawn that fails fast, returning empty.
-    auto dir = temp_test_dir("backend-isolation");
-    mm::SlotManager slots(46180, 46183, 4, "missing-vllm");
-    slots.set_llama_server_path("missing-llama");
-    const auto llama_id = slots.add_ready_test_slot_llama("m.gguf", "agent-l");
-    CHECK(slots.load_model("m.gguf", mm::VllmSettings{}, "agent-v").empty());
-    auto llama_info = slots.find_slot(llama_id);
-    CHECK(llama_info.has_value());
-    CHECK(std::find(llama_info->agent_ids.begin(), llama_info->agent_ids.end(),
-                    "agent-v") == llama_info->agent_ids.end());
-
-    const auto vllm_id = slots.add_ready_test_slot("v.gguf", "agent-v2");
-    CHECK(slots.load_model_llama("v.gguf", mm::RuntimeSettings{}, "agent-l2").empty());
-    auto vllm_info = slots.find_slot(vllm_id);
-    CHECK(vllm_info.has_value());
-    CHECK(vllm_info->backend == "vllm");
-    CHECK(std::find(vllm_info->agent_ids.begin(), vllm_info->agent_ids.end(),
-                    "agent-l2") == vllm_info->agent_ids.end());
-
-    CHECK(remove_tree(dir));
     return true;
 }
 
@@ -4703,7 +3640,6 @@ bool test_performance_tracker_capacity_aggregation_and_clear() {
     third.image_count = 2;
     third.decoded_image_bytes = 8192;
     third.vision_routing = true;
-    third.projector_basename = "mmproj-test.gguf";
     third.success = true;
     tracker.record(third);
 
@@ -4721,23 +3657,9 @@ bool test_performance_tracker_capacity_aggregation_and_clear() {
     CHECK(snapshot.at("samples").at(1).at("image_count") == 2);
     CHECK(snapshot.at("samples").at(1).at("decoded_image_bytes") == 8192);
     CHECK(snapshot.at("samples").at(1).at("vision_routing") == true);
-    CHECK(snapshot.at("samples").at(1).at("projector_basename") ==
-          "mmproj-test.gguf");
 
     tracker.clear();
     CHECK(tracker.snapshot(10).at("samples").empty());
-    return true;
-}
-
-bool test_inference_sizing_estimate() {
-    // Unknown model path falls back to a positive estimate (never zero), and the
-    // effective server context honors ctx_size * parallel.
-    mm::RuntimeSettings s;
-    s.ctx_size = 4096;
-    s.parallel = 3;
-    CHECK(mm::effective_llama_server_ctx_tokens(s) == 12288);
-    CHECK(mm::effective_llama_parallel(s) == 3);
-    CHECK(mm::estimate_inference_vram_mb("does-not-exist.gguf", s, "") > 0);
     return true;
 }
 
@@ -4781,18 +3703,20 @@ int main(int argc, char** argv) {
          test_hf_cache_helpers},
         {"vllm_runtime_defaults_and_args",
          test_vllm_runtime_defaults_and_args},
+        {"vllm_only_backend_validation_and_persistence",
+         test_vllm_only_backend_validation_and_persistence},
         {"vllm_provisioner_helpers",
          test_vllm_provisioner_helpers},
         {"vllm_update_flow",
          test_vllm_update_flow},
         {"vllm_install_progress_parser",
          test_vllm_install_progress_parser},
-        {"node_action_progress_json_round_trip",
-         test_node_action_progress_json_round_trip},
         {"vllm_provision_cancel",
          test_vllm_provision_cancel},
         {"vllm_peer_selection",
          test_vllm_peer_selection},
+        {"node_action_progress_json_round_trip",
+         test_node_action_progress_json_round_trip},
         {"scheduler_skips_failed_node_current_attempt",
          test_scheduler_skips_failed_node_current_attempt},
         {"control_api_external_token_gate", test_control_api_external_token_gate},
@@ -4814,44 +3738,14 @@ int main(int argc, char** argv) {
         {"compaction_followup_trace_provenance_survives",
          test_compaction_followup_trace_provenance_survives},
         {"config_and_url_parsing_edge_cases", test_config_and_url_parsing_edge_cases},
-        {"llama_server_args", test_llama_server_args},
         {"vision_config_attachment_and_message_round_trip",
          test_vision_config_attachment_and_message_round_trip},
-        {"vision_profile_validation_and_suggestions",
-         test_vision_profile_validation_and_suggestions},
-        {"vision_slot_projector_isolation_and_json",
-         test_vision_slot_projector_isolation_and_json},
-        {"llama_model_path_normalization", test_llama_model_path_normalization},
-        {"llama_accelerator_detection", test_llama_accelerator_detection},
-        {"llama_launch_compatible", test_llama_launch_compatible},
-        {"llama_backend_validation_and_gguf_routing",
-         test_llama_backend_validation_and_gguf_routing},
-        {"llama_install_plan_and_method", test_llama_install_plan_and_method},
-        {"llama_provisioner_disabled_and_cancel",
-         test_llama_provisioner_disabled_and_cancel},
-        {"llama_path_resolution_respects_accelerator",
-         test_llama_path_resolution_respects_accelerator},
-        {"llama_auto_release_then_source_fallback",
-         test_llama_auto_release_then_source_fallback},
-        {"llama_update_release_decision",
-         test_llama_update_release_decision},
-        {"llama_runtime_variant_matrix",
-         test_llama_runtime_variant_matrix},
-        {"llama_failure_diagnostics_and_recovery",
-         test_llama_failure_diagnostics_and_recovery},
-        {"llama_nvcc_architecture_preflight_and_diagnostics",
-         test_llama_nvcc_architecture_preflight_and_diagnostics},
-        {"llama_slot_info_backend_and_suspend",
-         test_llama_slot_info_backend_and_suspend},
         {"runtime_client_health_empty_body_ok",
          test_runtime_client_health_empty_body_ok},
-        {"llama_default_backend_and_isolation",
-         test_llama_default_backend_and_isolation},
         {"node_reachability_and_json_compatibility",
          test_node_reachability_and_json_compatibility},
         {"performance_tracker_capacity_aggregation_and_clear",
          test_performance_tracker_capacity_aggregation_and_clear},
-        {"inference_sizing_estimate", test_inference_sizing_estimate},
     };
 
     const std::string filter = argc > 1 ? argv[1] : std::string{};

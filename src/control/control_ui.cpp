@@ -130,14 +130,12 @@ ftxui::Component MakeDragDivider(int* split, int lo, int hi) {
 
 ControlUI::ControlUI(NodeRegistry& registry,
                      AgentManager& agents,
-                     std::string models_dir,
                      std::string control_base_url,
                      std::string control_api_token,
                      LocalChatFallback local_chat_fallback)
     : registry_(registry)
     , control_api_token_(std::move(control_api_token))
     , agents_(agents)
-    , models_dir_(std::move(models_dir))
     , control_base_url_(std::move(control_base_url))
     , local_chat_fallback_(std::move(local_chat_fallback))
 {}
@@ -248,20 +246,14 @@ void ControlUI::run() {
     std::string ed_toolparser;         // tool_call_parser
     std::string ed_extra_args_text;    // vllm_settings.extra_args (one per line)
     int ed_backend = 0;
-    std::vector<std::string> ed_backend_labels = {"llama.cpp", "vLLM", "Remote API"};
-    std::string ed_ctx_s{"4096"}, ed_gpu_layers_s{"-1"}, ed_threads_s{"-1"};
-    std::string ed_threads_http_s{"-1"}, ed_parallel_s{"1"};
-    std::string ed_batch_s{"-1"}, ed_ubatch_s{"-1"};
-    std::string ed_llama_extra_args_text;
-    bool ed_flash{true};
+    std::vector<std::string> ed_backend_labels = {"vLLM", "Remote API"};
+    std::string ed_ctx_s{"4096"};
     std::string ed_served_model;
     std::string ed_api_base{"https://api.openai.com"}, ed_api_path{"/v1/chat/completions"};
     std::string ed_api_key, ed_api_key_env{"OPENAI_API_KEY"};
     bool ed_vision{false};
-    std::string ed_mmproj;
     bool ed_reasoning{false}, ed_memories{true}, ed_tools{false};
     bool ed_sleep{true}, ed_prefix{true}, ed_trust{false}, ed_autotool{false};
-    ModelCapabilityInfo ed_model_info;
     std::vector<ValidationIssue> ed_validation_issues;
     std::string ed_validation_signature;
     std::string agent_validation_title;
@@ -360,7 +352,7 @@ void ControlUI::run() {
     std::vector<fs::path>     fb_entry_paths;
     std::vector<bool>         fb_entry_is_dir;
     int fb_sel = 0;
-    enum class FileBrowserTarget { Model, Projector, ChatImage };
+    enum class FileBrowserTarget { Model, ChatImage };
     FileBrowserTarget fb_target = FileBrowserTarget::Model;
 
     //
@@ -480,10 +472,8 @@ void ControlUI::run() {
                      fs::directory_options::skip_permission_denied)) {
                 bool d = e.is_directory();
                 const std::string ext = util::to_lower(e.path().extension().string());
-                bool g = e.is_regular_file() &&
-                    (fb_target == FileBrowserTarget::ChatImage
-                        ? (ext == ".jpg" || ext == ".jpeg" || ext == ".png")
-                        : ext == ".gguf");
+                bool g = e.is_regular_file() && fb_target == FileBrowserTarget::ChatImage &&
+                    (ext == ".jpg" || ext == ".jpeg" || ext == ".png");
                 if (d || g) raw.push_back({e.path(), d});
             }
             std::sort(raw.begin(), raw.end(), [](auto& a, auto& b) {
@@ -510,7 +500,7 @@ void ControlUI::run() {
         cfg.model_path = ed_model;
         cfg.system_prompt = ed_sysprompt;
         cfg.preferred_node_id = ed_pref_node;
-        cfg.inference_backend = ed_backend == 1 ? "vllm" : ed_backend == 2 ? "api" : "llama-cpp";
+        cfg.inference_backend = ed_backend == 1 ? "api" : "vllm";
         // Generation (shared request contract → RuntimeSettings)
         try { cfg.runtime_settings.temperature = std::stof(ed_temp_s); } catch (...) {}
         try { cfg.runtime_settings.top_p = std::stof(ed_topp_s); } catch (...) {}
@@ -520,13 +510,6 @@ void ControlUI::run() {
         try { cfg.runtime_settings.repeat_penalty = std::stof(ed_repeat_s); } catch (...) {}
         try { cfg.runtime_settings.max_tokens = std::stoi(ed_max_s); } catch (...) {}
         try { cfg.runtime_settings.ctx_size = std::stoi(ed_ctx_s); } catch (...) {}
-        try { cfg.runtime_settings.n_gpu_layers = std::stoi(ed_gpu_layers_s); } catch (...) {}
-        try { cfg.runtime_settings.n_threads = std::stoi(ed_threads_s); } catch (...) {}
-        try { cfg.runtime_settings.n_threads_http = std::stoi(ed_threads_http_s); } catch (...) {}
-        try { cfg.runtime_settings.parallel = std::stoi(ed_parallel_s); } catch (...) {}
-        try { cfg.runtime_settings.batch_size = std::stoi(ed_batch_s); } catch (...) {}
-        try { cfg.runtime_settings.ubatch_size = std::stoi(ed_ubatch_s); } catch (...) {}
-        cfg.runtime_settings.flash_attn = ed_flash;
         // Engine · vLLM
         try { cfg.vllm_settings.max_model_len = std::stoi(ed_mml_s); } catch (...) {}
         try { cfg.vllm_settings.max_num_seqs = std::stoi(ed_seqs_s); } catch (...) {}
@@ -547,7 +530,6 @@ void ControlUI::run() {
         cfg.api_settings.api_key_env = ed_api_key_env;
         if (!ed_api_key.empty()) cfg.api_settings.api_key = ed_api_key;
         cfg.vision_settings.enabled = ed_vision;
-        cfg.vision_settings.mmproj_path = ed_mmproj;
 
         // Keep ctx_size aligned with max_model_len so the shared contract has a context.
         cfg.reasoning_enabled = ed_reasoning;
@@ -566,25 +548,7 @@ void ControlUI::run() {
             start = end + 1;
         }
 
-        cfg.runtime_settings.extra_args.clear();
-        size_t llama_start = 0;
-        while (llama_start <= ed_llama_extra_args_text.size()) {
-            const size_t end = ed_llama_extra_args_text.find('\n', llama_start);
-            std::string line = util::trim(ed_llama_extra_args_text.substr(
-                llama_start, end == std::string::npos ? std::string::npos : end - llama_start));
-            if (!line.empty()) cfg.runtime_settings.extra_args.push_back(std::move(line));
-            if (end == std::string::npos) break;
-            llama_start = end + 1;
-        }
-
         return cfg;
-    };
-
-    auto capability_status = [](bool supported,
-                                bool metadata_found,
-                                bool heuristic_only) -> std::string {
-        if (supported) return heuristic_only && !metadata_found ? "yes (heuristic)" : "yes";
-        return metadata_found ? "no" : "unknown";
     };
 
     auto refresh_editor_validation = [&]() {
@@ -595,18 +559,15 @@ void ControlUI::run() {
             ed_mml_s + '\n' + ed_seqs_s + '\n' + ed_batched_s + '\n' + ed_tp_s + '\n' + ed_pp_s +
             '\n' + ed_gpumem_s + '\n' + ed_dtype + '\n' + ed_quant + '\n' + ed_toolparser + '\n' +
             ed_extra_args_text + '\n' +
-            std::to_string(ed_backend) + '\n' + ed_ctx_s + '\n' + ed_gpu_layers_s + '\n' +
-            ed_threads_s + '\n' + ed_threads_http_s + '\n' + ed_parallel_s + '\n' + ed_batch_s + '\n' +
-            ed_ubatch_s + '\n' + ed_llama_extra_args_text + '\n' + ed_served_model + '\n' +
+            std::to_string(ed_backend) + '\n' + ed_ctx_s + '\n' + ed_served_model + '\n' +
             ed_api_base + '\n' + ed_api_path + '\n' + ed_api_key + '\n' + ed_api_key_env + '\n' +
-            (ed_vision ? "1" : "0") + '\n' + ed_mmproj + '\n' +
-            (ed_flash ? "1" : "0") +
+            (ed_vision ? "1" : "0") + '\n' +
             (ed_reasoning ? "1" : "0") + (ed_memories ? "1" : "0") + (ed_tools ? "1" : "0") +
             (ed_sleep ? "1" : "0") + (ed_prefix ? "1" : "0") + (ed_trust ? "1" : "0") +
             (ed_autotool ? "1" : "0");
         if (signature == ed_validation_signature) return;
         ed_validation_signature = signature;
-        auto validation = validate_agent_config(build_editor_cfg(), &registry_, models_dir_, &ed_model_info);
+        auto validation = validate_agent_config(build_editor_cfg(), &registry_);
         ed_validation_issues = std::move(validation.issues);
     };
 
@@ -787,7 +748,7 @@ void ControlUI::run() {
     auto btn_control_restore = Button(" Restore ", [&] {
         if (auto slot = selected_control_slot()) post_selected_node("/api/node/restore-slot", {
             {"model_path", slot->model_path}, {"agent_id", slot->assigned_agent},
-            {"backend", slot->backend}, {"kv_cache_path", slot->kv_cache_path}});
+            {"backend", slot->backend}});
     }, ButtonOption::Simple());
     auto btn_control_pull = Button(" Pull model ", [&] {
         if (!util::trim(node_model_ref).empty())
@@ -958,16 +919,13 @@ void ControlUI::run() {
         ed_dtype = "auto"; ed_quant.clear(); ed_toolparser.clear();
         ed_extra_args_text.clear();
         ed_backend = 0;
-        ed_ctx_s = "4096"; ed_gpu_layers_s = "-1"; ed_threads_s = "-1";
-        ed_threads_http_s = "-1"; ed_parallel_s = "1"; ed_batch_s = "-1"; ed_ubatch_s = "-1";
-        ed_llama_extra_args_text.clear(); ed_flash = true;
+        ed_ctx_s = "4096";
         ed_served_model.clear();
         ed_api_base = "https://api.openai.com"; ed_api_path = "/v1/chat/completions";
         ed_api_key.clear(); ed_api_key_env = "OPENAI_API_KEY";
-        ed_vision = false; ed_mmproj.clear();
+        ed_vision = false;
         ed_reasoning = false; ed_memories = true; ed_tools = false;
         ed_sleep = true; ed_prefix = true; ed_trust = false; ed_autotool = false;
-        ed_model_info = {};
         ed_validation_issues.clear();
         ed_validation_signature.clear();
         show_editor = true;
@@ -1007,23 +965,14 @@ void ControlUI::run() {
                 ed_extra_args_text += c.vllm_settings.extra_args[i];
             }
             const std::string backend = util::to_lower(c.inference_backend);
-            ed_backend = backend == "vllm" ? 1 : backend == "api" ? 2 : 0;
+            ed_backend = backend == "api" ? 1 : 0;
             ed_ctx_s = std::to_string(c.runtime_settings.ctx_size);
-            ed_gpu_layers_s = std::to_string(c.runtime_settings.n_gpu_layers);
-            ed_threads_s = std::to_string(c.runtime_settings.n_threads);
-            ed_threads_http_s = std::to_string(c.runtime_settings.n_threads_http);
-            ed_parallel_s = std::to_string(c.runtime_settings.parallel);
-            ed_batch_s = std::to_string(c.runtime_settings.batch_size);
-            ed_ubatch_s = std::to_string(c.runtime_settings.ubatch_size);
-            ed_flash = c.runtime_settings.flash_attn;
-            ed_llama_extra_args_text = util::join(c.runtime_settings.extra_args, "\n");
             ed_served_model = c.vllm_settings.served_model_name;
             ed_api_base = c.api_settings.base_url;
             ed_api_path = c.api_settings.chat_completions_path;
             ed_api_key.clear();
             ed_api_key_env = c.api_settings.api_key_env;
             ed_vision = c.vision_settings.enabled;
-            ed_mmproj = c.vision_settings.mmproj_path;
 
             ed_sleep = c.vllm_settings.enable_sleep_mode;
             ed_prefix = c.vllm_settings.enable_prefix_caching;
@@ -1032,7 +981,6 @@ void ControlUI::run() {
             ed_reasoning = c.reasoning_enabled;
             ed_memories  = c.memories_enabled;
             ed_tools     = c.tools_enabled;
-            ed_model_info = {};
             ed_validation_issues.clear();
             ed_validation_signature.clear();
             show_editor  = true;
@@ -1078,14 +1026,6 @@ void ControlUI::run() {
     auto ed_inp_max   = Input(&ed_max_s,     sl);
     auto ed_backend_toggle = Toggle(&ed_backend_labels, &ed_backend);
     auto ed_inp_ctx = Input(&ed_ctx_s, sl);
-    auto ed_inp_gpu_layers = Input(&ed_gpu_layers_s, sl);
-    auto ed_inp_threads = Input(&ed_threads_s, sl);
-    auto ed_inp_threads_http = Input(&ed_threads_http_s, sl);
-    auto ed_inp_parallel = Input(&ed_parallel_s, sl);
-    auto ed_inp_batch = Input(&ed_batch_s, sl);
-    auto ed_inp_ubatch = Input(&ed_ubatch_s, sl);
-    auto ed_inp_llama_extra = Input(&ed_llama_extra_args_text, ml);
-    auto ed_cb_flash = Checkbox("flash_attention", &ed_flash);
 
     auto ed_inp_mml       = Input(&ed_mml_s,      sl);
     auto ed_inp_seqs      = Input(&ed_seqs_s,     sl);
@@ -1104,7 +1044,6 @@ void ControlUI::run() {
     secret.placeholder = "leave blank to retain current key";
     auto ed_inp_api_key = Input(&ed_api_key, secret);
     auto ed_inp_api_key_env = Input(&ed_api_key_env, sl);
-    auto ed_inp_mmproj = Input(&ed_mmproj, sl);
     auto ed_cb_vision = Checkbox("Vision", &ed_vision);
 
     auto ed_cb_sleep     = Checkbox("sleep_mode",   &ed_sleep);
@@ -1130,24 +1069,6 @@ void ControlUI::run() {
         show_file_browser = true;
     }, ButtonOption::Simple());
     auto model_row = Container::Horizontal({ed_inp_model, btn_browse_model});
-    auto btn_browse_mmproj = Button("[Browse]", [&] {
-        fb_target = FileBrowserTarget::Projector;
-        fs::path init;
-        if (!ed_mmproj.empty()) {
-            const fs::path projector(ed_mmproj);
-            init = fs::exists(projector.parent_path())
-                ? projector.parent_path() : fs::current_path();
-        } else if (!ed_model.empty() && fs::exists(fs::path(ed_model).parent_path())) {
-            init = fs::path(ed_model).parent_path();
-        } else {
-            init = fs::current_path();
-        }
-        fb_current_path = init;
-        refresh_fb();
-        show_file_browser = true;
-    }, ButtonOption::Simple());
-    auto mmproj_row = Container::Horizontal({ed_inp_mmproj, btn_browse_mmproj});
-
     auto btn_save_a   = Button(" Save ", [&] {
         refresh_editor_validation();
         std::vector<std::string> error_lines;
@@ -1221,16 +1142,14 @@ void ControlUI::run() {
     // Section field groups, Maybe-gated so collapsed sections leave the focus tree.
     auto sampling_fields = Container::Vertical({
         ed_inp_temp, ed_inp_topp, ed_inp_topk, ed_inp_minp,
-        ed_inp_presence, ed_inp_repeat, ed_inp_max});
+        ed_inp_presence, ed_inp_repeat, ed_inp_max, ed_inp_ctx});
     auto sampling_m = Maybe(sampling_fields, [&] { return ed_open_sampling; });
     auto engine_fields = Container::Vertical({
         ed_backend_toggle,
         ed_inp_mml, ed_inp_seqs, ed_inp_batched, ed_inp_tp, ed_inp_pp,
         ed_inp_gpumem, ed_inp_dtype, ed_inp_quant, ed_inp_toolparser,
         ed_cb_sleep, ed_cb_prefix, ed_cb_trust, ed_cb_autotool,
-        ed_inp_ctx, ed_inp_gpu_layers, ed_inp_threads, ed_inp_threads_http,
-        ed_inp_parallel, ed_inp_batch, ed_inp_ubatch, ed_cb_flash, ed_inp_llama_extra,
-        ed_cb_vision, mmproj_row,
+        ed_cb_vision,
         ed_inp_served_model, ed_inp_api_base, ed_inp_api_path, ed_inp_api_key_env, ed_inp_api_key});
     auto engine_m = Maybe(engine_fields, [&] { return ed_open_engine; });
     auto caps_fields = Container::Vertical({ed_cb_reasoning, ed_cb_memories, ed_cb_tools});
@@ -1264,15 +1183,13 @@ void ControlUI::run() {
 
     auto fb_confirm = [&]() {
         if (fb_sel < 0 || fb_sel >= static_cast<int>(fb_entry_paths.size())) return;
-        if (fb_entry_is_dir[fb_sel]) { fb_navigate(); return; }
         auto chosen = fb_entry_paths[fb_sel];
         if (fb_target == FileBrowserTarget::Model) {
+            if (chosen.empty()) { fb_navigate(); return; }
             ed_model = chosen.string();
             refresh_editor_validation();
-        } else if (fb_target == FileBrowserTarget::Projector) {
-            ed_mmproj = chosen.string();
-            refresh_editor_validation();
         } else {
+            if (fb_entry_is_dir[fb_sel]) { fb_navigate(); return; }
             std::error_code ec;
             const auto size = fs::file_size(chosen, ec);
             int64_t total = 0;
@@ -1319,12 +1236,11 @@ void ControlUI::run() {
                                      ? "  (no drives detected)"
                                      : (fb_target == FileBrowserTarget::ChatImage
                                             ? "  (no JPEG/PNG files or subdirectories here)"
-                                            : "  (no .gguf files or subdirectories here)");
+                                            : "  (no model directories here)");
         return vbox({
             text(fb_target == FileBrowserTarget::ChatImage
                      ? " Select JPEG/PNG Image "
-                     : fb_target == FileBrowserTarget::Projector
-                         ? " Select GGUF Projector " : " Select Model File ") | bold | hcenter,
+                     : " Select Local Model Directory ") | bold | hcenter,
             separator(),
             text("  " + path_label) | color(Color::GrayDark),
             separator(),
@@ -1333,7 +1249,9 @@ void ControlUI::run() {
                 : (fb_menu->Render() | size(HEIGHT, LESS_THAN, 20) | yframe),
             separator(),
             fb_btns->Render() | hcenter,
-            text("  Enter: navigate/select  Esc: close") | color(Color::GrayDark),
+            text(fb_target == FileBrowserTarget::Model
+                     ? "  Enter: navigate  Select: use highlighted directory  Esc: close"
+                     : "  Enter: navigate/select  Esc: close") | color(Color::GrayDark),
         }) | border | size(WIDTH, EQUAL, 72);
     });
 
@@ -2269,8 +2187,7 @@ void ControlUI::run() {
             for (const auto& slot : n.slots)
                 node_slot_entries.push_back(slot.id + "  " + to_string(slot.state) + "  " +
                     mm::tui::short_model(slot.model_path) +
-                    (slot.vision_enabled ? "  [vision " +
-                        fs::path(slot.mmproj_path).filename().string() + "]" : ""));
+                    (slot.vision_enabled ? "  [vision]" : ""));
             if (node_slot_sel >= static_cast<int>(n.slots.size()))
                 node_slot_sel = std::max(0, static_cast<int>(n.slots.size()) - 1);
 
@@ -2400,31 +2317,6 @@ void ControlUI::run() {
             Element engine_specific;
             if (ed_backend == 0) {
                 engine_specific = vbox({
-                    hbox({field(" context", ed_inp_ctx->Render() | flex),
-                          field(" gpu_layers", ed_inp_gpu_layers->Render() | flex)}),
-                    hbox({field(" threads", ed_inp_threads->Render() | flex),
-                          field(" http_threads", ed_inp_threads_http->Render() | flex)}),
-                    hbox({field(" parallel", ed_inp_parallel->Render() | flex),
-                          field(" batch", ed_inp_batch->Render() | flex),
-                          field(" ubatch", ed_inp_ubatch->Render() | flex)}),
-                    ed_cb_flash->Render(),
-                    ed_cb_vision->Render(),
-                    hbox({text(" projector") | dim | size(WIDTH, EQUAL, 15),
-                          ed_inp_mmproj->Render() | flex, text(" "), btn_browse_mmproj->Render()}),
-                    [&]() -> Element {
-                        const auto suggestions = suggest_mmproj_files(ed_model);
-                        if (suggestions.empty()) return text("  no adjacent mmproj-*.gguf suggestions") | dim;
-                        std::string line = "  suggestions: ";
-                        for (std::size_t i = 0; i < suggestions.size() && i < 3; ++i) {
-                            if (i > 0) line += " | ";
-                            line += fs::path(suggestions[i]).filename().string();
-                        }
-                        return text(line) | color(Color::Cyan);
-                    }(),
-                    field(" extra args", ed_inp_llama_extra->Render() | border | size(HEIGHT, LESS_THAN, 4)),
-                });
-            } else if (ed_backend == 1) {
-                engine_specific = vbox({
                     hbox({field(" max_model_len", ed_inp_mml->Render() | flex),
                           field(" max_num_seqs", ed_inp_seqs->Render() | flex)}),
                     hbox({field(" gpu_mem_util", ed_inp_gpumem->Render() | flex),
@@ -2438,9 +2330,7 @@ void ControlUI::run() {
                     hbox({ed_cb_sleep->Render(), text("  "), ed_cb_prefix->Render(), text("  "),
                           ed_cb_trust->Render(), text("  "), ed_cb_autotool->Render()}),
                     ed_cb_vision->Render(),
-                    text("Vision uses the model-native vLLM processor; projector must be empty") | dim,
-                    hbox({text(" projector") | dim | size(WIDTH, EQUAL, 15),
-                          ed_inp_mmproj->Render() | flex}),
+                    text("Vision uses the model-native vLLM processor") | dim,
                     field(" extra args", ed_inp_extra->Render() | border | size(HEIGHT, LESS_THAN, 4)),
                 });
             } else {
@@ -2450,9 +2340,7 @@ void ControlUI::run() {
                     field(" key env", ed_inp_api_key_env->Render() | flex),
                     field(" API key", ed_inp_api_key->Render() | flex),
                     ed_cb_vision->Render(),
-                    text("Vision declares that the remote model accepts images; projector must be empty") | dim,
-                    hbox({text(" projector") | dim | size(WIDTH, EQUAL, 15),
-                          ed_inp_mmproj->Render() | flex}),
+                    text("Vision declares that the remote model accepts images") | dim,
                     text("API keys are process-local and never persisted") | dim,
                 });
             }
@@ -2484,22 +2372,13 @@ void ControlUI::run() {
                         field(" presence", ed_inp_presence->Render() | flex, 11),
                         field(" repeat", ed_inp_repeat->Render() | flex, 9),
                         field(" max_tokens", ed_inp_max->Render() | flex, 12),
+                        field(" context", ed_inp_ctx->Render() | flex, 10),
                     }),
                 })),
                 sec_toggle(ed_sec_engine_btn->Render(), ed_open_engine, std::move(engine_body)),
                 sec_toggle(ed_sec_caps_btn->Render(), ed_open_caps, vbox({
                     hbox({ed_cb_reasoning->Render(), text("   "), ed_cb_memories->Render(), text("   "),
                           ed_cb_tools->Render()}),
-                    text("context limit: " +
-                         (ed_model_info.n_ctx_train > 0
-                              ? std::to_string(ed_model_info.n_ctx_train) + " tokens"
-                              : "unknown")) | dim,
-                    text("tool calling: " + capability_status(ed_model_info.supports_tool_calls,
-                                                              ed_model_info.metadata_found,
-                                                              ed_model_info.used_filename_heuristics)) | dim,
-                    text("reasoning: " + capability_status(ed_model_info.supports_reasoning,
-                                                           ed_model_info.metadata_found,
-                                                           ed_model_info.used_filename_heuristics)) | dim,
                     vbox(std::move(tool_lines)) | size(HEIGHT, LESS_THAN, 6) | yframe,
                 })),
                 sec_static("Validation", vbox(std::move(validation))),
@@ -2561,11 +2440,6 @@ void ControlUI::run() {
                       feat(a.memories_enabled, "memories"), text("  "),
                       feat(a.tools_enabled, "tools"), text("  "),
                       feat(a.vision_settings.enabled, "vision")}),
-                a.vision_settings.mmproj_path.empty()
-                    ? text("")
-                    : hbox({text("projector") | dim,
-                            text(" " + fs::path(a.vision_settings.mmproj_path).filename().string()) |
-                                color(Color::Cyan)}),
             })) | size(HEIGHT, EQUAL, 10);
         } else {
             detail_panel = panel("AGENT", text("  (no agents)") | dim) | size(HEIGHT, EQUAL, 10);
