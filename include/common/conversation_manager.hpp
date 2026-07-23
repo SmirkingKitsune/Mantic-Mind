@@ -4,6 +4,7 @@
 #include "common/memory_manager.hpp"
 #include <vector>
 #include <string>
+#include <functional>
 
 namespace mm {
 
@@ -17,6 +18,8 @@ class RuntimeClient;
 // Conversation with the summary as first user message, mark old conv inactive.
 class ConversationManager {
 public:
+    using CancelCheck = std::function<bool()>;
+
     ConversationManager(AgentDB& db, RuntimeClient& runtime);
 
     // Build the message list to send to the model:
@@ -27,16 +30,19 @@ public:
 
     // Check token usage; compact if >= 80 % of ctx_size.
     // Returns the (possibly new) active ConvId after potential compaction.
-    ConvId maybe_compact(const ConvId& conv_id, const AgentConfig& cfg);
+    ConvId maybe_compact(const ConvId& conv_id, const AgentConfig& cfg,
+                         CancelCheck cancel_requested = {});
     // Compact immediately, regardless of token threshold.
-    ConvId force_compact(const ConvId& conv_id, const AgentConfig& cfg);
+    ConvId force_compact(const ConvId& conv_id, const AgentConfig& cfg,
+                         CancelCheck cancel_requested = {});
 
 private:
     AgentDB&        db_;
     RuntimeClient& runtime_;
 
     // Summarise old messages and return a new active ConvId.
-    ConvId compact_conversation(const ConvId& conv_id, const AgentConfig& cfg);
+    ConvId compact_conversation(const ConvId& conv_id, const AgentConfig& cfg,
+                                CancelCheck cancel_requested);
 
     static std::string format_memories(const std::vector<Memory>& memories);
 };

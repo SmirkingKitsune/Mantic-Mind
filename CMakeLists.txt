@@ -97,6 +97,20 @@ endif()
 add_subdirectory(src/common)
 add_subdirectory(src/node)
 add_subdirectory(src/control)
+add_subdirectory(src/aio)
+
+install(FILES
+    ${CMAKE_SOURCE_DIR}/tools/mantic-mind.toml
+    ${CMAKE_SOURCE_DIR}/tools/mantic-mind-control.toml
+    ${CMAKE_SOURCE_DIR}/tools/mantic-mind-aio.toml
+    DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+install(FILES
+    ${CMAKE_SOURCE_DIR}/README.md
+    ${CMAKE_SOURCE_DIR}/docs/aio.md
+    DESTINATION ${CMAKE_INSTALL_DOCDIR}
+)
 
 include(CTest)
 if(BUILD_TESTING)

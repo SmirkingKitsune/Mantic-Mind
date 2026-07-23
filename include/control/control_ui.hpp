@@ -34,6 +34,7 @@ public:
         std::string* out_text,
         std::string* out_conv_id,
         std::string* out_error)>;
+    using ShutdownCallback = std::function<void()>;
 
     ControlUI(NodeRegistry& registry,
               AgentManager& agents,
@@ -41,7 +42,8 @@ public:
               std::string models_dir,
               std::string control_base_url,
               std::string control_api_token,
-              LocalChatFallback local_chat_fallback = {});
+              LocalChatFallback local_chat_fallback = {},
+              ShutdownCallback shutdown_callback = {});
     ~ControlUI();
 
     // Append a log entry (thread-safe).
@@ -67,6 +69,7 @@ private:
     std::string   models_dir_;
     std::string   control_base_url_;
     LocalChatFallback local_chat_fallback_;
+    ShutdownCallback shutdown_callback_;
 
     struct LogEntry { LogLevel level; std::string message; int64_t timestamp_ms = 0; };
     std::mutex             log_mutex_;

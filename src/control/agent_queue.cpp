@@ -24,21 +24,39 @@ AgentQueue::get_or_create_worker(const AgentId& id) {
 
 void AgentQueue::enqueue(InferenceJob job) {
     std::shared_ptr<AgentWorker> w;
+    bool rejected = false;
     {
         std::lock_guard<std::mutex> g(mutex_);
-        w = get_or_create_worker(job.agent_id);
+        if (!accepting_) {
+            rejected = true;
+        } else {
+            w = get_or_create_worker(job.agent_id);
+            // Keep the admission lock until the job is visible to its worker.
+            // Otherwise shutdown() can mark/join an empty worker between the
+            // accepting_ check and this push, stranding an accepted job.
+            std::lock_guard<std::mutex> wg(w->mutex);
+            w->queue.push(std::move(job));
+        }
     }
-    {
-        std::lock_guard<std::mutex> wg(w->mutex);
-        w->queue.push(std::move(job));
+    if (rejected) {
+        // Invoke user code outside queue locks so callbacks may safely re-enter
+        // control services during teardown.
+        if (job.done_cb) job.done_cb(job.conversation_id, false);
+        return;
     }
     w->cv.notify_one();
+}
+
+void AgentQueue::stop_accepting() {
+    std::lock_guard<std::mutex> g(mutex_);
+    accepting_ = false;
 }
 
 void AgentQueue::shutdown() {
     std::vector<std::shared_ptr<AgentWorker>> snapshot;
     {
         std::lock_guard<std::mutex> g(mutex_);
+        accepting_ = false;
         for (auto& [_, w] : workers_) snapshot.push_back(w);
     }
 
@@ -53,6 +71,14 @@ void AgentQueue::shutdown() {
 
     std::lock_guard<std::mutex> g(mutex_);
     workers_.clear();
+}
+
+void AgentQueue::request_cancel_active() {
+    cancellation_requested_ = true;
+}
+
+bool AgentQueue::cancellation_requested() const {
+    return cancellation_requested_.load();
 }
 
 // ── Worker loop ────────────────────────────────────────────────────────────────

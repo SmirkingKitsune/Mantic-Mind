@@ -113,40 +113,61 @@ std::vector<DiscoveredNode> NodeDiscoveryListener::get_nodes() const {
     return out;
 }
 
-void NodeDiscoveryListener::start(uint16_t port) {
-    if (running_.exchange(true)) return;
+bool NodeDiscoveryListener::start(uint16_t port) {
+    if (running_.exchange(true)) return true;
 
-    thread_ = std::thread([this, port]() {
 #ifdef _WIN32
-        WSADATA wsa{};
-        WSAStartup(MAKEWORD(2, 2), &wsa);
+    WSADATA wsa{};
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        running_ = false;
+        MM_ERROR("NodeDiscoveryListener: WSAStartup failed");
+        return false;
+    }
 #endif
-        SockType sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (!sock_valid(sock)) {
-            running_ = false;
+    SockType sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (!sock_valid(sock)) {
+        running_ = false;
+        MM_ERROR("NodeDiscoveryListener: failed to create UDP socket");
 #ifdef _WIN32
-            WSACleanup();
+        WSACleanup();
 #endif
-            return;
-        }
+        return false;
+    }
 
-        int reuse = 1;
-        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR,
-                   reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(port);
+    addr.sin_addr.s_addr = INADDR_ANY;
 
-        sockaddr_in addr{};
-        addr.sin_family      = AF_INET;
-        addr.sin_port        = htons(port);
-        addr.sin_addr.s_addr = INADDR_ANY;
-
-        if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-            sock_close(sock);
-            running_ = false;
+    if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        sock_close(sock);
+        running_ = false;
+        MM_ERROR("NodeDiscoveryListener: failed to bind UDP port {}", port);
 #ifdef _WIN32
-            WSACleanup();
+        WSACleanup();
 #endif
-            return;
-        }
+        return false;
+    }
+
+    sockaddr_in bound{};
+#ifdef _WIN32
+    int bound_len = sizeof(bound);
+#else
+    socklen_t bound_len = sizeof(bound);
+#endif
+    if (getsockname(sock, reinterpret_cast<sockaddr*>(&bound), &bound_len) != 0) {
+        sock_close(sock);
+        running_ = false;
+        MM_ERROR("NodeDiscoveryListener: failed to inspect bound UDP port");
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        return false;
+    }
+    bound_port_ = ntohs(bound.sin_port);
+
+    try {
+        thread_ = std::thread([this, sock]() {
 
         // 1-second receive timeout so we can check running_ periodically.
 #ifdef _WIN32
@@ -213,15 +234,27 @@ void NodeDiscoveryListener::start(uint16_t port) {
         }
 
         sock_close(sock);
+        bound_port_ = 0;
 #ifdef _WIN32
         WSACleanup();
 #endif
-    });
+        });
+    } catch (...) {
+        sock_close(sock);
+        bound_port_ = 0;
+        running_ = false;
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        return false;
+    }
+    return true;
 }
 
 void NodeDiscoveryListener::stop() {
     running_ = false;
     if (thread_.joinable()) thread_.join();
+    bound_port_ = 0;
 }
 
 } // namespace mm

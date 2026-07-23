@@ -23,6 +23,7 @@
 #include "node/slot_manager.hpp"
 #include "node/llama_runtime.hpp"
 #include "node/llama_cpp_provisioner.hpp"
+#include "node/node_state.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -49,7 +50,9 @@ class FixedSummaryRuntimeClient : public mm::RuntimeClient {
 public:
     FixedSummaryRuntimeClient() : mm::RuntimeClient("http://127.0.0.1:1") {}
 
-    mm::Message complete(const mm::InferenceRequest& req) override {
+    mm::Message complete(
+        const mm::InferenceRequest& req,
+        CancelCheck /*cancel_requested*/ = {}) override {
         last_model = req.model;
 
         mm::Message summary;
@@ -61,6 +64,31 @@ public:
     }
 
     std::string last_model;
+};
+
+class CancelBlockingRuntimeClient : public mm::RuntimeClient {
+public:
+    CancelBlockingRuntimeClient()
+        : mm::RuntimeClient("http://127.0.0.1:1") {}
+
+    mm::Message complete(
+        const mm::InferenceRequest&,
+        CancelCheck cancel_requested = {}) override {
+        started = true;
+        while (true) {
+            bool cancel = false;
+            try { cancel = cancel_requested && cancel_requested(); }
+            catch (...) { cancel = true; }
+            if (cancel) {
+                observed_cancel = true;
+                return {};
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+
+    std::atomic<bool> started{false};
+    std::atomic<bool> observed_cancel{false};
 };
 
 const mm::TraceEvent* find_trace_event(const std::vector<mm::TraceEvent>& events,
@@ -168,6 +196,125 @@ bool wait_for_registered_node(mm::NodeRegistry& registry,
     }
     return false;
 }
+
+// Minimal direct transport for mixed embedded/remote scheduler tests.  It is
+// intentionally weaker than the companion HTTP node so the best-fit assertion
+// proves that the reserved "local" identity receives no scheduling bias.
+class SchedulerEmbeddedOperations final : public mm::NodeOperations {
+public:
+    bool embedded() const override { return true; }
+    std::string endpoint() const override { return {}; }
+
+    mm::NodeOperationResult health() override {
+        ++health_calls;
+        mm::NodeHealthMetrics health;
+        health.cpu_percent = 2.0f;
+        health.ram_percent = 12.0f;
+        health.ram_total_mb = 32768;
+        health.ram_used_mb = 4096;
+        health.gpu_vram_total_mb = 0;
+        health.gpu_vram_used_mb = 0;
+        health.gpu_backend_available = false;
+        return mm::NodeOperationResult::success(nlohmann::json(health));
+    }
+
+    mm::NodeOperationResult status() override {
+        ++status_calls;
+        return mm::NodeOperationResult::success(nlohmann::json{
+            {"hostname", "embedded-scheduler-test"},
+            {"slots", nlohmann::json::array()},
+            {"max_slots", 8},
+            {"slot_in_use", 0},
+            {"slot_available", 8},
+        });
+    }
+
+    mm::NodeOperationResult logs(int) override {
+        return mm::NodeOperationResult::success(
+            nlohmann::json{{"lines", nlohmann::json::array()}});
+    }
+    mm::NodeOperationResult cancel_action() override {
+        return mm::NodeOperationResult::failure(409, "nothing to cancel");
+    }
+    std::optional<mm::PreparedNodeModel> prepare_model(
+        const std::string& source_path,
+        const std::string& model_id,
+        bool,
+        bool,
+        std::string*) override {
+        return mm::PreparedNodeModel{source_path, model_id};
+    }
+    mm::NodeOperationResult load_model(const nlohmann::json& request) override {
+        ++load_calls;
+        const std::string agent_id = request.value("agent_id", std::string{});
+        return mm::NodeOperationResult::success(nlohmann::json{
+            {"status", "loaded"},
+            {"slot_id", "slot-local-" + agent_id},
+        });
+    }
+    mm::NodeOperationResult unload_model(const nlohmann::json&) override {
+        return mm::NodeOperationResult::success();
+    }
+    mm::NodeOperationResult detach_agent(const nlohmann::json&) override {
+        return mm::NodeOperationResult::success();
+    }
+    mm::NodeOperationResult suspend_slot(const nlohmann::json&) override {
+        return mm::NodeOperationResult::success();
+    }
+    mm::NodeOperationResult restore_slot(const nlohmann::json&) override {
+        return mm::NodeOperationResult::failure(404, "slot not found");
+    }
+    mm::NodeOperationResult llama_runtime() override {
+        return mm::NodeOperationResult::success();
+    }
+    mm::NodeOperationResult llama_provision(const nlohmann::json&) override {
+        return mm::NodeOperationResult::failure(501, "not configured");
+    }
+    mm::NodeOperationResult llama_update(const nlohmann::json&) override {
+        return mm::NodeOperationResult::failure(501, "not configured");
+    }
+    mm::NodeOperationResult llama_check_update(
+        const nlohmann::json&) override {
+        return mm::NodeOperationResult::failure(501, "not configured");
+    }
+    mm::NodeOperationResult llama_switch(const nlohmann::json&) override {
+        return mm::NodeOperationResult::failure(501, "not configured");
+    }
+    mm::NodeOperationResult llama_diagnose() override {
+        return mm::NodeOperationResult::success();
+    }
+    mm::NodeOperationResult llama_recover(const nlohmann::json&) override {
+        return mm::NodeOperationResult::failure(501, "not configured");
+    }
+    mm::NodeInferResult infer(
+        const mm::NodeInferRequest&,
+        InferenceChunkCallback = {}) override {
+        mm::NodeInferResult result;
+        result.status = mm::NodeServiceStatus::Unavailable;
+        result.error = "not configured";
+        return result;
+    }
+    bool stream_infer(const nlohmann::json&,
+                      SseLineCallback,
+                      int* out_status,
+                      std::string* out_body) override {
+        if (out_status) *out_status = 503;
+        if (out_body) *out_body = "not configured";
+        return false;
+    }
+    mm::NodeOperationResult pair_request(const nlohmann::json&) override {
+        return mm::NodeOperationResult::failure(
+            409, "embedded node cannot be paired");
+    }
+    mm::NodeOperationResult pair_complete(const nlohmann::json&) override {
+        return mm::NodeOperationResult::failure(
+            409, "embedded node cannot be paired");
+    }
+
+    std::atomic<int> health_calls{0};
+    std::atomic<int> status_calls{0};
+    std::atomic<int> load_calls{0};
+};
 
 template <typename Predicate>
 bool wait_for_node_snapshot(mm::NodeRegistry& registry,
@@ -304,6 +451,45 @@ bool test_agent_queue_survives_throwing_job() {
     }));
     lock.unlock();
     queue.shutdown();
+    return true;
+}
+
+bool test_agent_queue_shutdown_admission_is_atomic() {
+    // Repeatedly race admission against shutdown. Every submission must either
+    // execute or receive the rejection callback; none may be left behind in a
+    // worker that shutdown already joined.
+    for (int iteration = 0; iteration < 100; ++iteration) {
+        mm::AgentQueue queue;
+        std::atomic<bool> go{false};
+        std::atomic<int> submitted{0};
+        std::atomic<int> accounted{0};
+
+        std::vector<std::thread> producers;
+        for (int producer = 0; producer < 4; ++producer) {
+            producers.emplace_back([&, producer] {
+                while (!go.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                for (int i = 0; i < 25; ++i) {
+                    mm::InferenceJob job;
+                    job.job_id = std::to_string(producer) + "-" +
+                                 std::to_string(i);
+                    job.agent_id = "admission-race";
+                    job.process_fn = [&] { ++accounted; };
+                    job.done_cb = [&](const mm::ConvId&, bool) { ++accounted; };
+                    ++submitted;
+                    queue.enqueue(std::move(job));
+                }
+            });
+        }
+
+        go.store(true, std::memory_order_release);
+        std::this_thread::yield();
+        queue.shutdown();
+        for (auto& producer : producers) producer.join();
+        queue.shutdown();
+        CHECK(accounted.load() == submitted.load());
+    }
     return true;
 }
 
@@ -658,6 +844,236 @@ bool test_scheduler_skips_failed_node_current_attempt() {
     if (good_thread.joinable()) good_thread.join();
     RECORD(bad_listen_ok);
     RECORD(good_listen_ok);
+    RECORD(remove_tree(dir));
+
+#undef RECORD
+    return ok;
+}
+
+bool test_mixed_embedded_remote_scheduler_routing_and_persistence() {
+    bool ok = true;
+#define RECORD(expr) do { if (!(expr)) { std::cerr << "CHECK failed at line " << __LINE__ << ": " << #expr << "\n"; ok = false; } } while (0)
+
+    const uint16_t port = find_free_test_port();
+    RECORD(port != 0);
+    const std::string url =
+        "http://127.0.0.1:" + std::to_string(port);
+    const std::string api_key = "mixed-cluster-remote-secret";
+
+    httplib::Server server;
+    std::atomic<int> remote_health_calls{0};
+    std::atomic<int> remote_status_calls{0};
+    std::atomic<int> remote_load_calls{0};
+    std::atomic<int> authorization_failures{0};
+
+    auto authorize = [&](const httplib::Request& request,
+                         httplib::Response& response) {
+        if (request.get_header_value("Authorization") ==
+            "Bearer " + api_key) {
+            return true;
+        }
+        ++authorization_failures;
+        response.status = 401;
+        response.set_content(
+            nlohmann::json{{"error", "unauthorized"}}.dump(),
+            "application/json");
+        return false;
+    };
+
+    server.Get("/api/node/health", [&](const httplib::Request& request,
+                                        httplib::Response& response) {
+        if (!authorize(request, response)) return;
+        ++remote_health_calls;
+        mm::NodeHealthMetrics health;
+        health.cpu_percent = 3.0f;
+        health.ram_percent = 8.0f;
+        health.ram_total_mb = 65536;
+        health.ram_used_mb = 4096;
+        health.gpu_vram_total_mb = 24576;
+        health.gpu_vram_used_mb = 0;
+        health.gpu_backend_available = true;
+        response.set_content(nlohmann::json(health).dump(),
+                             "application/json");
+    });
+    server.Get("/api/node/status", [&](const httplib::Request& request,
+                                        httplib::Response& response) {
+        if (!authorize(request, response)) return;
+        ++remote_status_calls;
+        response.set_content(nlohmann::json{
+            {"hostname", "remote-scheduler-test"},
+            {"slots", nlohmann::json::array()},
+            {"max_slots", 8},
+            {"slot_in_use", 0},
+            {"slot_available", 8},
+        }.dump(), "application/json");
+    });
+    server.Post("/api/node/load-model", [&](const httplib::Request& request,
+                                             httplib::Response& response) {
+        if (!authorize(request, response)) return;
+        ++remote_load_calls;
+        const auto body = nlohmann::json::parse(request.body);
+        const std::string agent_id =
+            body.value("agent_id", std::string{});
+        response.set_content(nlohmann::json{
+            {"status", "loaded"},
+            {"slot_id", "slot-remote-" + agent_id},
+        }.dump(), "application/json");
+    });
+
+    std::atomic<bool> listen_ok{false};
+    std::thread server_thread([&] {
+        listen_ok = server.listen("127.0.0.1", port);
+    });
+
+    mm::HttpClient readiness_client(url);
+    readiness_client.set_bearer_token(api_key);
+    readiness_client.set_timeouts(1, 1, 1);
+    bool server_ready = false;
+    for (int attempt = 0; attempt < 80 && !server_ready; ++attempt) {
+        server_ready = readiness_client.get("/api/node/health").ok();
+        if (!server_ready) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+    }
+    RECORD(server_ready);
+
+    const auto dir = temp_test_dir("mixed-cluster-scheduler");
+    std::filesystem::create_directories(dir / "models");
+    const auto nodes_path = dir / "nodes.json";
+    std::string remote_id;
+    std::string persisted_contents;
+
+    {
+        mm::NodeRegistry registry(dir.string(), true);
+        auto embedded = std::make_shared<SchedulerEmbeddedOperations>();
+        RECORD(registry.add_embedded_node(
+                   embedded, "test", "embedded-scheduler-test") == "local");
+
+        remote_id = registry.add_node(
+            url, api_key, "test", true, "remote-scheduler-test");
+        RECORD(!remote_id.empty());
+        RECORD(remote_id != "local");
+        RECORD(registry.refresh_node(remote_id));
+
+        const auto local_info = registry.get_node("local");
+        const auto remote_info = registry.get_node(remote_id);
+        RECORD(local_info.kind == "embedded");
+        RECORD(remote_info.kind == "remote");
+        RECORD(local_info.connected);
+        RECORD(remote_info.connected);
+        RECORD(remote_info.remembered);
+        RECORD(remote_info.metrics.gpu_vram_total_mb == 24576);
+        RECORD(embedded->health_calls.load() == 1);
+        RECORD(embedded->status_calls.load() == 1);
+        RECORD(remote_health_calls.load() >= 2);
+        RECORD(remote_status_calls.load() >= 1);
+
+        const auto remote_operations = registry.operations(remote_id);
+        RECORD(!remote_operations->embedded());
+        RECORD(remote_operations->endpoint() == url);
+        RECORD(std::dynamic_pointer_cast<mm::HttpNodeOperations>(
+                   remote_operations) != nullptr);
+
+        mm::AgentScheduler scheduler(registry, (dir / "models").string());
+        auto config_for = [](const std::string& agent_id,
+                             const std::string& preferred_node_id = {}) {
+            mm::AgentConfig config;
+            config.id = agent_id;
+            config.name = agent_id;
+            config.inference_backend = "llama-cpp";
+            config.model_path = "Qwen/Qwen3-8B";
+            config.preferred_node_id = preferred_node_id;
+            config.runtime_settings.ctx_size = 128;
+            return config;
+        };
+
+        // The remote has a native 24 GiB VRAM fit while the embedded node is
+        // CPU/offload-only. Best-fit must therefore select remote regardless
+        // of the embedded node's reserved identity.
+        const auto best_fit = scheduler.ensure_agent_running(
+            config_for("best-fit-agent"));
+        RECORD(best_fit.has_value());
+        if (best_fit) {
+            RECORD(best_fit->node_id == remote_id);
+            RECORD(best_fit->slot_id == "slot-remote-best-fit-agent");
+        }
+        RECORD(remote_load_calls.load() == 1);
+        RECORD(embedded->load_calls.load() == 0);
+
+        const auto preferred_local = scheduler.ensure_agent_running(
+            config_for("preferred-local-agent", "local"));
+        RECORD(preferred_local.has_value());
+        if (preferred_local) {
+            RECORD(preferred_local->node_id == "local");
+            RECORD(preferred_local->slot_id ==
+                   "slot-local-preferred-local-agent");
+        }
+        RECORD(embedded->load_calls.load() == 1);
+        RECORD(remote_load_calls.load() == 1);
+
+        const auto preferred_remote = scheduler.ensure_agent_running(
+            config_for("preferred-remote-agent", remote_id));
+        RECORD(preferred_remote.has_value());
+        if (preferred_remote) {
+            RECORD(preferred_remote->node_id == remote_id);
+            RECORD(preferred_remote->slot_id ==
+                   "slot-remote-preferred-remote-agent");
+        }
+        RECORD(embedded->load_calls.load() == 1);
+        RECORD(remote_load_calls.load() == 2);
+        RECORD(authorization_failures.load() == 0);
+
+        // Persistence remains remote-only even though both node kinds are
+        // live in the same registry.
+        try {
+            std::ifstream input(nodes_path, std::ios::binary);
+            persisted_contents.assign(
+                std::istreambuf_iterator<char>(input),
+                std::istreambuf_iterator<char>());
+            const auto persisted = nlohmann::json::parse(persisted_contents);
+            RECORD(persisted.value("version", 0) == 2);
+            RECORD(persisted.at("nodes").size() == 1);
+            if (persisted.at("nodes").size() == 1) {
+                const auto& saved = persisted.at("nodes").at(0);
+                RECORD(saved.value("id", std::string{}) == remote_id);
+                RECORD(saved.value("url", std::string{}) == url);
+                RECORD(saved.value("api_key", std::string{}) == api_key);
+                RECORD(saved.value("id", std::string{}) != "local");
+            }
+        } catch (const std::exception& exception) {
+            std::cerr << "mixed-cluster persistence parse failed: "
+                      << exception.what() << '\n';
+            ok = false;
+        }
+    }
+
+    {
+        mm::NodeRegistry reloaded(dir.string(), true);
+        const auto remembered = reloaded.list_nodes();
+        RECORD(remembered.size() == 1);
+        if (remembered.size() == 1) {
+            RECORD(remembered.front().id == remote_id);
+            RECORD(remembered.front().kind == "remote");
+            RECORD(remembered.front().remembered);
+            RECORD(!remembered.front().connected);
+            RECORD(remembered.front().url == url);
+        }
+
+        auto embedded = std::make_shared<SchedulerEmbeddedOperations>();
+        RECORD(reloaded.add_embedded_node(embedded) == "local");
+        RECORD(reloaded.list_nodes().size() == 2);
+        RECORD(reloaded.is_embedded_node("local"));
+
+        std::ifstream input(nodes_path, std::ios::binary);
+        const std::string after_embedded_registration{
+            std::istreambuf_iterator<char>(input),
+            std::istreambuf_iterator<char>()};
+        RECORD(after_embedded_registration == persisted_contents);
+    }
+
+    server.stop();
+    if (server_thread.joinable()) server_thread.join();
+    RECORD(listen_ok);
     RECORD(remove_tree(dir));
 
 #undef RECORD
@@ -2963,6 +3379,87 @@ bool test_compaction_followup_trace_provenance_survives() {
     return true;
 }
 
+bool test_compaction_and_memory_selection_observe_cancellation() {
+    const auto dir = temp_test_dir("manager-cancellation");
+    std::filesystem::create_directories(dir);
+
+    {
+        mm::AgentDB db("cancel-agent", dir.string());
+        mm::AgentConfig cfg;
+        cfg.id = "cancel-agent";
+        cfg.name = "Cancel Agent";
+        cfg.model_path = "model.gguf";
+        cfg.memories_enabled = true;
+        cfg.runtime_settings.ctx_size = 128;
+        cfg.runtime_settings.max_tokens = 16;
+
+        const auto conv_id = db.create_conversation("Cancellation");
+        for (int index = 0; index < 6; ++index) {
+            mm::Message message;
+            message.role = index % 2 == 0
+                ? mm::MessageRole::User
+                : mm::MessageRole::Assistant;
+            message.content = "message " + std::to_string(index);
+            message.token_count = 18;
+            db.append_message(conv_id, message, index);
+        }
+
+        CancelBlockingRuntimeClient compact_runtime;
+        mm::ConversationManager conversations(db, compact_runtime);
+        std::atomic<bool> cancel_compaction{false};
+        mm::ConvId compact_result;
+        std::thread compact_thread([&] {
+            compact_result = conversations.force_compact(
+                conv_id, cfg, [&] { return cancel_compaction.load(); });
+        });
+        for (int attempt = 0;
+             attempt < 500 && !compact_runtime.started.load(); ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        CHECK(compact_runtime.started.load());
+        const auto compact_cancel_started = std::chrono::steady_clock::now();
+        cancel_compaction = true;
+        compact_thread.join();
+        CHECK(std::chrono::steady_clock::now() - compact_cancel_started <
+              std::chrono::seconds(1));
+        CHECK(compact_runtime.observed_cancel.load());
+        CHECK(compact_result == conv_id);
+
+        mm::Memory candidate;
+        candidate.id = "candidate";
+        candidate.agent_id = cfg.id;
+        candidate.content = "remember cancellation";
+        candidate.importance = 0.9f;
+        candidate.created_at_ms = mm::util::now_ms();
+        db.add_memory(candidate);
+
+        CancelBlockingRuntimeClient memory_runtime;
+        mm::MemoryManager memories(db, memory_runtime);
+        std::atomic<bool> cancel_memory{false};
+        std::vector<mm::Memory> selected;
+        std::thread memory_thread([&] {
+            selected = memories.get_relevant_memories(
+                conv_id, cfg, 40, 8,
+                [&] { return cancel_memory.load(); });
+        });
+        for (int attempt = 0;
+             attempt < 500 && !memory_runtime.started.load(); ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        CHECK(memory_runtime.started.load());
+        const auto memory_cancel_started = std::chrono::steady_clock::now();
+        cancel_memory = true;
+        memory_thread.join();
+        CHECK(std::chrono::steady_clock::now() - memory_cancel_started <
+              std::chrono::seconds(1));
+        CHECK(memory_runtime.observed_cancel.load());
+        CHECK(selected.empty());
+    }
+
+    CHECK(remove_tree(dir));
+    return true;
+}
+
 bool test_config_and_url_parsing_edge_cases() {
     auto dir = temp_test_dir("config-hash");
     std::filesystem::create_directories(dir);
@@ -3048,6 +3545,74 @@ bool test_llama_server_args() {
         "m.gguf", "mmproj-vision.gguf", s, 8082, "");
     CHECK(count(vision_args, "--mmproj") == 1);
     CHECK(val_after(vision_args, "--mmproj") == "mmproj-vision.gguf");
+    return true;
+}
+
+bool test_managed_llama_server_extra_args_are_rejected() {
+    struct ConflictCase {
+        std::vector<std::string> args;
+        std::string managed_flag;
+    };
+    const std::vector<ConflictCase> conflicts = {
+        {{"--host", "0.0.0.0"}, "--host"},
+        {{" --PORT=9090 "}, "--port"},
+        {{"--model other.gguf"}, "--model"},
+        {{"-m=other.gguf"}, "-m"},
+        {{"--slot-save-path", "outside-node-data"}, "--slot-save-path"},
+        {{"--mmproj=other.gguf"}, "--mmproj"},
+        {{"-mm", "other.gguf"}, "-mm"},
+        {{"--mmproj-url\thttps://invalid.example/projector"}, "--mmproj-url"},
+    };
+
+    for (const auto& conflict : conflicts) {
+        mm::AgentConfig cfg;
+        cfg.name = "Managed argument validation";
+        cfg.model_path = "model.gguf";
+        cfg.inference_backend = "llama-cpp";
+        cfg.runtime_settings.extra_args = conflict.args;
+
+        const auto validation =
+            mm::validate_agent_config(cfg, nullptr, "", nullptr);
+        CHECK(!validation.ok());
+        CHECK(std::any_of(validation.issues.begin(), validation.issues.end(),
+                          [&](const mm::ValidationIssue& issue) {
+                              return issue.severity == mm::ValidationSeverity::Error &&
+                                     issue.field == "runtime_settings.extra_args" &&
+                                     issue.message.find(conflict.managed_flag) !=
+                                         std::string::npos;
+                          }));
+
+        bool builder_rejected = false;
+        try {
+            static_cast<void>(mm::build_llama_server_args(
+                "model.gguf", cfg.runtime_settings, 8080, "data/kv"));
+        } catch (const std::invalid_argument& e) {
+            builder_rejected =
+                std::string(e.what()).find(conflict.managed_flag) != std::string::npos;
+        }
+        CHECK(builder_rejected);
+    }
+
+    mm::AgentConfig safe_cfg;
+    safe_cfg.name = "Safe tuning arguments";
+    safe_cfg.model_path = "model.gguf";
+    safe_cfg.inference_backend = "llama-cpp";
+    safe_cfg.runtime_settings.extra_args = {"--ctx-size=2048", "-fa"};
+    CHECK(mm::validate_agent_config(safe_cfg, nullptr, "", nullptr).ok());
+    const auto safe_args = mm::build_llama_server_args(
+        "model.gguf", safe_cfg.runtime_settings, 8080, "data/kv");
+    CHECK(std::find(safe_args.begin(), safe_args.end(), "--ctx-size=2048") !=
+          safe_args.end());
+
+    // Direct node callers bypass control profile validation, so the final
+    // launch seam must fail closed without trying to execute the runtime.
+    mm::RuntimeSettings direct_settings;
+    direct_settings.extra_args = {"--host=0.0.0.0"};
+    mm::RuntimeProcess direct_process("unused-for-rejected-arguments");
+    CHECK(!direct_process.start_llama_server(
+        "model.gguf", "", direct_settings, 8080, "data/kv"));
+    CHECK(direct_process.get_state() == mm::ProcessState::Error);
+    CHECK(direct_process.last_error().find("--host") != std::string::npos);
     return true;
 }
 
@@ -3305,6 +3870,36 @@ bool test_llama_accelerator_detection() {
     CHECK(mm::detect_llama_accelerator("macos", "aarch64", false, false) == "metal");
     // llama.cpp builds CUDA natively on Windows — no separate "windows" variant.
     CHECK(mm::detect_llama_accelerator("windows", "x86_64", true, false) == "cuda");
+
+    CHECK(mm::parse_nvidia_gpu_count("0\n1\r\n\n2\n") == 3);
+    CHECK(mm::parse_nvidia_gpu_count("\r\n  \n") == 0);
+    CHECK(mm::parse_cuda_architectures("8.9\n12.1\r\n8.9\nN/A\n") ==
+          "121;89");
+    CHECK(mm::parse_cuda_architectures("unknown\n") == "");
+
+    CHECK(mm::resolve_node_gpu_count(4, 2, true) == 4);
+    CHECK(mm::resolve_node_gpu_count(0, 3, false) == 3);
+    // Unified-memory NVIDIA parts may report N/A for memory.total. The metrics
+    // backend observation still guarantees at least one advertised GPU.
+    CHECK(mm::resolve_node_gpu_count(0, 0, true) == 1);
+    CHECK(mm::resolve_node_gpu_count(0, 0, false) == 0);
+    return true;
+}
+
+bool test_node_initial_metrics_wait() {
+    mm::NodeState state;
+    CHECK(!state.wait_for_initial_metrics(1));
+
+    std::thread updater([&state] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        mm::NodeHealthMetrics metrics;
+        metrics.gpu_backend_available = true;
+        state.update_metrics(metrics);
+    });
+    const bool observed = state.wait_for_initial_metrics(1000);
+    updater.join();
+    CHECK(observed);
+    CHECK(state.get_metrics().gpu_backend_available);
     return true;
 }
 
@@ -3421,6 +4016,7 @@ bool test_llama_install_plan_and_method() {
     CHECK(windows_joined.find("bin-win-cuda") != std::string::npos);
     CHECK(windows_joined.find("cudart-llama-bin-win-cuda") != std::string::npos);
     CHECK(windows_joined.find("nvidia-smi") != std::string::npos);
+    CHECK(windows_joined.find("-TimeoutSec 15") != std::string::npos);
     return true;
 }
 
@@ -3445,6 +4041,11 @@ bool test_llama_provisioner_disabled_and_cancel() {
     cfg2.auto_provision = true;
     bool ran = false;
     mm::LlamaCommandRunner runner;
+    bool fetched_release_metadata = false;
+    runner.fetch_latest = [&](const mm::LlamaProvisionConfig&) {
+        fetched_release_metadata = true;
+        return std::string{"b9999"};
+    };
     runner.run = [&](const std::vector<std::string>&, const std::filesystem::path&,
                      const mm::StreamLineCallback&, const mm::CancelCheckCallback&,
                      std::string*) { ran = true; return 0; };
@@ -3455,9 +4056,220 @@ bool test_llama_provisioner_disabled_and_cancel() {
     const auto st2 = prov2.ensure_runtime();
     CHECK(st2.status == "failed");
     CHECK(st2.last_error.find("canceled") != std::string::npos);
+    CHECK(!fetched_release_metadata);
     CHECK(!ran);
 
     CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_streamed_command_cancels_process_tree() {
+    std::vector<std::string> command;
+#ifdef _WIN32
+    command = {
+        "cmd.exe", "/d", "/s", "/c",
+        "ping.exe -t 127.0.0.1 | ping.exe -t 127.0.0.1"
+    };
+#else
+    command = {
+        "sh", "-c",
+        "sh -c 'while :; do echo descendant; sleep 1; done' & "
+        "while :; do sleep 1; done"
+    };
+#endif
+
+    const auto started = std::chrono::steady_clock::now();
+    std::string error;
+    const int result = mm::run_streamed_command(
+        command,
+        {},
+        [](const std::string&, bool) {},
+        [started] {
+            return std::chrono::steady_clock::now() - started >
+                   std::chrono::milliseconds(500);
+        },
+        &error);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+
+    if (result != 130) {
+        std::cerr << "process-tree cancellation returned " << result
+                  << ": " << error << "\n";
+    }
+    CHECK(result == 130);
+    CHECK(error == "command canceled");
+    CHECK(elapsed < std::chrono::seconds(5));
+    return true;
+}
+
+bool test_llama_probe_cancellation_propagates_promptly() {
+    auto wait_for_entry = [](const std::atomic<bool>& entered) {
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(2);
+        while (!entered.load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        return entered.load();
+    };
+    auto wait_until_canceled = [](const mm::CancelCheckCallback& canceled,
+                                  std::atomic<bool>& observed) {
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(3);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (canceled && canceled()) {
+                observed = true;
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    };
+
+    mm::LlamaProvisionConfig cfg;
+    cfg.requested_executable = "definitely-not-a-real-llama-server-cancel-probe";
+    cfg.provision_dir = temp_test_dir("llama-cancel-probes").string();
+    cfg.auto_provision = false;
+    cfg.install_method = "auto";
+    cfg.version = "b1000";
+    cfg.platform = "linux";
+    cfg.arch = "x86_64";
+    cfg.accelerator = "cpu";
+
+    // Update-tag metadata receives the host's cancellation predicate while it
+    // is in flight, rather than only being checked after a 10-15 second probe.
+    {
+        std::atomic<bool> cancel{false};
+        std::atomic<bool> entered{false};
+        std::atomic<bool> observed{false};
+        mm::LlamaCommandRunner runner;
+        runner.fetch_latest_cancellable =
+            [&](const mm::LlamaProvisionConfig&,
+                const mm::CancelCheckCallback& canceled) {
+                entered = true;
+                wait_until_canceled(canceled, observed);
+                return std::string{"b1001"};
+            };
+        mm::LlamaCppProvisioner provisioner(cfg, std::move(runner));
+        provisioner.set_cancel_check([&] { return cancel.load(); });
+        mm::LlamaRuntimeStatus result;
+        std::thread worker([&] { result = provisioner.check_for_update(); });
+        const bool did_enter = wait_for_entry(entered);
+        const auto canceled_at = std::chrono::steady_clock::now();
+        cancel = true;
+        worker.join();
+        const auto elapsed = std::chrono::steady_clock::now() - canceled_at;
+        CHECK(did_enter);
+        CHECK(observed);
+        CHECK(elapsed < std::chrono::seconds(1));
+        CHECK(result.last_error.find("canceled") != std::string::npos);
+    }
+
+    // The second release-assets lookup is independently cancellable.
+    {
+        std::atomic<bool> cancel{false};
+        std::atomic<bool> entered{false};
+        std::atomic<bool> observed{false};
+        mm::LlamaCommandRunner runner;
+        runner.fetch_latest_cancellable =
+            [](const mm::LlamaProvisionConfig&,
+               const mm::CancelCheckCallback&) { return std::string{"b1001"}; };
+        runner.fetch_release_assets_cancellable =
+            [&](const mm::LlamaProvisionConfig&, const std::string&,
+                const mm::CancelCheckCallback& canceled) {
+                entered = true;
+                wait_until_canceled(canceled, observed);
+                return std::vector<std::string>{};
+            };
+        mm::LlamaCppProvisioner provisioner(cfg, std::move(runner));
+        provisioner.set_cancel_check([&] { return cancel.load(); });
+        mm::LlamaRuntimeStatus result;
+        std::thread worker([&] { result = provisioner.check_for_update(); });
+        const bool did_enter = wait_for_entry(entered);
+        const auto canceled_at = std::chrono::steady_clock::now();
+        cancel = true;
+        worker.join();
+        const auto elapsed = std::chrono::steady_clock::now() - canceled_at;
+        CHECK(did_enter);
+        CHECK(observed);
+        CHECK(elapsed < std::chrono::seconds(1));
+        CHECK(result.last_error.find("canceled") != std::string::npos);
+    }
+
+    // Managed-install metadata uses the same predicate and never advances to
+    // a command step once shutdown cancels the lookup.
+    {
+        auto install_cfg = cfg;
+        install_cfg.auto_provision = true;
+        install_cfg.version = "latest";
+        std::atomic<bool> cancel{false};
+        std::atomic<bool> entered{false};
+        std::atomic<bool> observed{false};
+        std::atomic<bool> ran_step{false};
+        mm::LlamaCommandRunner runner;
+        runner.resolve_executable = [](const std::string&) { return std::string{}; };
+        runner.fetch_latest_cancellable =
+            [&](const mm::LlamaProvisionConfig&,
+                const mm::CancelCheckCallback& canceled) {
+                entered = true;
+                wait_until_canceled(canceled, observed);
+                return std::string{"b1001"};
+            };
+        runner.run = [&](const std::vector<std::string>&,
+                         const std::filesystem::path&,
+                         const mm::StreamLineCallback&,
+                         const mm::CancelCheckCallback&,
+                         std::string*) {
+            ran_step = true;
+            return 0;
+        };
+        mm::LlamaCppProvisioner provisioner(install_cfg, std::move(runner));
+        provisioner.set_cancel_check([&] { return cancel.load(); });
+        mm::LlamaRuntimeStatus result;
+        std::thread worker([&] { result = provisioner.ensure_runtime(); });
+        const bool did_enter = wait_for_entry(entered);
+        const auto canceled_at = std::chrono::steady_clock::now();
+        cancel = true;
+        worker.join();
+        const auto elapsed = std::chrono::steady_clock::now() - canceled_at;
+        CHECK(did_enter);
+        CHECK(observed);
+        CHECK(elapsed < std::chrono::seconds(1));
+        CHECK(!ran_step);
+        CHECK(result.last_error.find("canceled") != std::string::npos);
+    }
+
+    // Troubleshooting command capture also receives cancellation. Subsequent
+    // probes are skipped by their preflight checks after the first returns.
+    {
+        std::atomic<bool> cancel{false};
+        std::atomic<bool> entered{false};
+        std::atomic<bool> observed{false};
+        std::atomic<int> captures{0};
+        mm::LlamaCommandRunner runner;
+        runner.capture_output_cancellable =
+            [&](const std::vector<std::string>&,
+                const std::filesystem::path&,
+                const mm::CancelCheckCallback& canceled) {
+                ++captures;
+                entered = true;
+                wait_until_canceled(canceled, observed);
+                return std::string{};
+            };
+        mm::LlamaCppProvisioner provisioner(cfg, std::move(runner));
+        provisioner.set_cancel_check([&] { return cancel.load(); });
+        mm::LlamaRuntimeStatus result;
+        std::thread worker([&] { result = provisioner.diagnose_environment(false); });
+        const bool did_enter = wait_for_entry(entered);
+        const auto canceled_at = std::chrono::steady_clock::now();
+        cancel = true;
+        worker.join();
+        const auto elapsed = std::chrono::steady_clock::now() - canceled_at;
+        CHECK(did_enter);
+        CHECK(observed);
+        CHECK(elapsed < std::chrono::seconds(1));
+        CHECK(captures == 1);
+        CHECK(result.troubleshooting.required);
+    }
+
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(cfg.provision_dir, cleanup_error);
     return true;
 }
 
@@ -4433,6 +5245,8 @@ int main(int argc, char** argv) {
         {"non_stream_parser_extracts_thinking", test_non_stream_parser_extracts_thinking},
         {"stream_tool_call_indices", test_stream_tool_call_indices},
         {"agent_queue_survives_throwing_job", test_agent_queue_survives_throwing_job},
+        {"agent_queue_shutdown_admission_is_atomic",
+         test_agent_queue_shutdown_admission_is_atomic},
         {"agent_manager_rejects_duplicates_and_defers_cleanup_until_handles_release",
          test_agent_manager_rejects_duplicates_and_defers_cleanup_until_handles_release},
         {"agent_api_settings_round_trip_without_key_persistence",
@@ -4446,6 +5260,8 @@ int main(int argc, char** argv) {
          test_node_action_progress_json_round_trip},
         {"scheduler_skips_failed_node_current_attempt",
          test_scheduler_skips_failed_node_current_attempt},
+        {"mixed_embedded_remote_scheduler_routing_and_persistence",
+         test_mixed_embedded_remote_scheduler_routing_and_persistence},
         {"scheduler_transfers_existing_relative_models_with_unique_cache_ids",
          test_scheduler_transfers_existing_relative_models_with_unique_cache_ids},
         {"scheduler_eviction_skips_unsuspendable_shared_slot",
@@ -4470,8 +5286,12 @@ int main(int argc, char** argv) {
         {"message_trace_events_round_trip", test_message_trace_events_round_trip},
         {"compaction_followup_trace_provenance_survives",
          test_compaction_followup_trace_provenance_survives},
+        {"compaction_and_memory_selection_observe_cancellation",
+         test_compaction_and_memory_selection_observe_cancellation},
         {"config_and_url_parsing_edge_cases", test_config_and_url_parsing_edge_cases},
         {"llama_server_args", test_llama_server_args},
+        {"managed_llama_server_extra_args_are_rejected",
+         test_managed_llama_server_extra_args_are_rejected},
         {"vision_config_attachment_and_message_round_trip",
          test_vision_config_attachment_and_message_round_trip},
         {"vision_profile_validation_and_suggestions",
@@ -4480,12 +5300,17 @@ int main(int argc, char** argv) {
          test_vision_slot_projector_isolation_and_json},
         {"llama_model_path_normalization", test_llama_model_path_normalization},
         {"llama_accelerator_detection", test_llama_accelerator_detection},
+        {"node_initial_metrics_wait", test_node_initial_metrics_wait},
         {"llama_launch_compatible", test_llama_launch_compatible},
         {"llama_backend_validation_and_gguf_routing",
          test_llama_backend_validation_and_gguf_routing},
         {"llama_install_plan_and_method", test_llama_install_plan_and_method},
         {"llama_provisioner_disabled_and_cancel",
          test_llama_provisioner_disabled_and_cancel},
+        {"streamed_command_cancels_process_tree",
+         test_streamed_command_cancels_process_tree},
+        {"llama_probe_cancellation_propagates_promptly",
+         test_llama_probe_cancellation_propagates_promptly},
         {"llama_path_resolution_respects_accelerator",
          test_llama_path_resolution_respects_accelerator},
         {"llama_auto_release_then_source_fallback",

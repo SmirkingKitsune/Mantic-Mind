@@ -25,6 +25,28 @@ namespace mm {
 
 namespace {
 
+template <typename Callback>
+class ScopeExit final {
+public:
+    explicit ScopeExit(Callback callback)
+        : callback_(std::move(callback)) {}
+    ScopeExit(const ScopeExit&) = delete;
+    ScopeExit& operator=(const ScopeExit&) = delete;
+    ~ScopeExit() {
+        if (active_) callback_();
+    }
+    void dismiss() noexcept { active_ = false; }
+
+private:
+    Callback callback_;
+    bool active_ = true;
+};
+
+template <typename Callback>
+ScopeExit<Callback> make_scope_exit(Callback callback) {
+    return ScopeExit<Callback>(std::move(callback));
+}
+
 int64_t projector_file_mb(const std::string& path) {
     if (path.empty()) return 0;
     std::error_code ec;
@@ -46,11 +68,13 @@ std::string projector_identity(const std::string& path) {
     return identity;
 }
 
-bool llama_reports_vision(uint16_t port, std::string& detail) {
+bool llama_reports_vision(uint16_t port,
+                          std::string& detail,
+                          const HttpClient::CancelCheck& cancel_requested) {
     try {
         HttpClient client("http://127.0.0.1:" + std::to_string(port));
         client.set_timeouts(5, 15, 15);
-        const auto response = client.get("/props");
+        const auto response = client.get("/props", cancel_requested);
         if (!response.ok()) {
             detail = "GET /props returned HTTP " + std::to_string(response.status);
             return false;
@@ -142,6 +166,11 @@ SlotId SlotManager::load_model(const std::string& model_path,
     {
         std::lock_guard lock(mutex_);
         last_error_.clear();
+        if (shutdown_requested_.load(std::memory_order_acquire) ||
+            unloading_all_.load(std::memory_order_acquire)) {
+            last_error_ = "slot manager is shutting down";
+            return {};
+        }
 
         int active_count = pending_loads_;
         for (const auto& slot : slots_) {
@@ -168,6 +197,21 @@ SlotId SlotManager::load_model(const std::string& model_path,
         models_dir = models_dir_;
     }
 
+    bool pending_reserved = true;
+    bool port_reserved = true;
+    auto reservation_guard = make_scope_exit(
+        [this, port, &pending_reserved, &port_reserved]() noexcept {
+            try {
+                std::lock_guard lock(mutex_);
+                if (pending_reserved && pending_loads_ > 0) --pending_loads_;
+                if (port_reserved) release_port(port);
+                lease_cv_.notify_all();
+            } catch (...) {
+                // Destructors cannot report rollback failures. The reserved
+                // port set and pending counter are otherwise in-memory only.
+            }
+        });
+
     auto slot = std::make_unique<Slot>();
     slot->id = util::generate_uuid();
     slot->port = port;
@@ -186,12 +230,17 @@ SlotId SlotManager::load_model(const std::string& model_path,
     MM_INFO("SlotManager: loading llama.cpp model {} on port {} (slot {})",
             model_path, port, slot->id);
 
+    const auto startup_canceled = [this] {
+        return shutdown_requested_.load(std::memory_order_acquire) ||
+               unloading_all_.load(std::memory_order_acquire);
+    };
     bool started = slot->process->start_llama_server(
-        model_path, mmproj_path, settings, port, kv_dir);
+        model_path, mmproj_path, settings, port, kv_dir,
+        startup_canceled);
 
     if (started && !mmproj_path.empty()) {
         std::string capability_error;
-        if (!llama_reports_vision(port, capability_error)) {
+        if (!llama_reports_vision(port, capability_error, startup_canceled)) {
             slot->process->stop();
             started = false;
             std::lock_guard lock(mutex_);
@@ -204,15 +253,30 @@ SlotId SlotManager::load_model(const std::string& model_path,
 
     std::lock_guard lock(mutex_);
     --pending_loads_;
+    pending_reserved = false;
+    lease_cv_.notify_all();
 
     if (!started) {
         MM_ERROR("SlotManager: failed to start llama-server for slot {}", slot->id);
         const auto process_error = slot->process->last_error();
-        if (last_error_.empty()) {
+        if (startup_canceled()) {
+            last_error_ = "runtime startup canceled";
+        } else if (last_error_.empty()) {
             last_error_ = "failed to start llama-server (path=" + llama_path + ")"
                         + (process_error.empty() ? "" : ": " + process_error);
         }
         release_port(port);
+        port_reserved = false;
+        reservation_guard.dismiss();
+        return {};
+    }
+
+    if (startup_canceled()) {
+        slot->process->stop();
+        release_port(port);
+        port_reserved = false;
+        last_error_ = "runtime startup canceled";
+        reservation_guard.dismiss();
         return {};
     }
 
@@ -224,6 +288,8 @@ SlotId SlotManager::load_model(const std::string& model_path,
     const SlotId id = slot->id;
     const int effective_ctx_size = slot->effective_ctx_size;
     slots_.push_back(std::move(slot));
+    port_reserved = false;
+    reservation_guard.dismiss();
 
     MM_INFO("SlotManager: slot {} ready (llama.cpp, model={}, agent={}, port={}, ctx={})",
             id, model_path, agent_id, port, effective_ctx_size);
@@ -365,6 +431,11 @@ SlotId SlotManager::restore_slot(const std::string& model_path,
     {
         std::lock_guard lock(mutex_);
         last_error_.clear();
+        if (shutdown_requested_.load(std::memory_order_acquire) ||
+            unloading_all_.load(std::memory_order_acquire)) {
+            last_error_ = "slot manager is shutting down";
+            return {};
+        }
 
         int active_count = pending_loads_;
         for (const auto& slot : slots_) {
@@ -390,6 +461,20 @@ SlotId SlotManager::restore_slot(const std::string& model_path,
         models_dir = models_dir_;
     }
 
+    bool pending_reserved = true;
+    bool port_reserved = true;
+    auto reservation_guard = make_scope_exit(
+        [this, port, &pending_reserved, &port_reserved]() noexcept {
+            try {
+                std::lock_guard lock(mutex_);
+                if (pending_reserved && pending_loads_ > 0) --pending_loads_;
+                if (port_reserved) release_port(port);
+                lease_cv_.notify_all();
+            } catch (...) {
+                // Best-effort rollback from an exception path.
+            }
+        });
+
     auto slot = std::make_unique<Slot>();
     slot->id = util::generate_uuid();
     slot->port = port;
@@ -408,11 +493,16 @@ SlotId SlotManager::restore_slot(const std::string& model_path,
     MM_INFO("SlotManager: restoring llama.cpp model {} on port {} (slot {}, cache={})",
             model_path, port, slot->id, kv_cache_path);
 
+    const auto startup_canceled = [this] {
+        return shutdown_requested_.load(std::memory_order_acquire) ||
+               unloading_all_.load(std::memory_order_acquire);
+    };
     bool started = slot->process->start_llama_server(
-        model_path, mmproj_path, settings, port, kv_dir);
+        model_path, mmproj_path, settings, port, kv_dir,
+        startup_canceled);
     if (started && !mmproj_path.empty()) {
         std::string capability_error;
-        if (!llama_reports_vision(port, capability_error)) {
+        if (!llama_reports_vision(port, capability_error, startup_canceled)) {
             slot->process->stop();
             started = false;
             std::lock_guard lock(mutex_);
@@ -426,12 +516,18 @@ SlotId SlotManager::restore_slot(const std::string& model_path,
         const auto process_error = slot->process->last_error();
         std::lock_guard lock(mutex_);
         --pending_loads_;
-        if (last_error_.empty()) {
+        pending_reserved = false;
+        lease_cv_.notify_all();
+        if (startup_canceled()) {
+            last_error_ = "runtime startup canceled";
+        } else if (last_error_.empty()) {
             last_error_ = "failed to start llama-server for restore (path="
                         + llama_path + ")"
                         + (process_error.empty() ? "" : ": " + process_error);
         }
         release_port(port);
+        port_reserved = false;
+        reservation_guard.dismiss();
         return {};
     }
 
@@ -445,7 +541,8 @@ SlotId SlotManager::restore_slot(const std::string& model_path,
                 client.set_timeouts(5, 120, 30);
                 const auto response = client.post(
                     "/slots/0?action=restore",
-                    nlohmann::json{{"filename", cache_file}});
+                    nlohmann::json{{"filename", cache_file}},
+                    startup_canceled);
                 if (response.ok()) {
                     MM_INFO("SlotManager: KV cache restored for slot {}", slot->id);
                 } else {
@@ -471,16 +568,42 @@ SlotId SlotManager::restore_slot(const std::string& model_path,
 
     std::lock_guard lock(mutex_);
     --pending_loads_;
+    pending_reserved = false;
+    lease_cv_.notify_all();
+    if (startup_canceled()) {
+        slot->process->stop();
+        release_port(port);
+        port_reserved = false;
+        last_error_ = "runtime startup canceled";
+        reservation_guard.dismiss();
+        return {};
+    }
     if (!agent_id.empty()) remove_agent_from_suspended_locked(agent_id);
     slots_.push_back(std::move(slot));
+    port_reserved = false;
+    reservation_guard.dismiss();
 
     MM_INFO("SlotManager: llama.cpp slot {} restored (agent={})", id, agent_id);
     return id;
 }
 
 SlotOperationResult SlotManager::unload_all(bool force) {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
+    if (unloading_all_.load(std::memory_order_acquire)) {
+        if (!force) {
+            return {SlotOperationStatus::Busy,
+                    "slot manager is already unloading", {}};
+        }
+        lease_cv_.wait(lock, [this] {
+            return !unloading_all_.load(std::memory_order_acquire);
+        });
+        return {SlotOperationStatus::Ok, "unloaded", {}};
+    }
     if (!force) {
+        if (pending_loads_ > 0) {
+            return {SlotOperationStatus::Busy,
+                    "one or more slots are loading", {}};
+        }
         for (const auto& slot : slots_) {
             if (slot->active_requests > 0) {
                 return {SlotOperationStatus::Busy,
@@ -488,15 +611,47 @@ SlotOperationResult SlotManager::unload_all(bool force) {
             }
         }
     }
+
+    unloading_all_.store(true, std::memory_order_release);
+    // Prevent new leases before terminating the local runtimes. Existing
+    // RuntimeClient calls then observe the process/socket closure and release
+    // their leases; the slots and clients stay alive until that drain ends.
     for (auto& slot : slots_) {
+        if (slot->state == SlotState::Ready) {
+            slot->state = SlotState::Suspending;
+        }
         if (slot->process) slot->process->stop();
+    }
+    lease_cv_.wait(lock, [this] {
+        if (pending_loads_ > 0) return false;
+        return std::all_of(slots_.begin(), slots_.end(), [](const auto& slot) {
+            return slot->active_requests == 0;
+        });
+    });
+
+    for (auto& slot : slots_) {
         if (slot->port != 0) release_port(slot->port);
         remove_kv_cache_file_locked(*slot);
     }
     slots_.clear();
     used_ports_.clear();
+    unloading_all_.store(false, std::memory_order_release);
+    lock.unlock();
+    lease_cv_.notify_all();
     MM_INFO("SlotManager: all slots unloaded");
     return {SlotOperationStatus::Ok, "unloaded", {}};
+}
+
+void SlotManager::request_shutdown() {
+    shutdown_requested_.store(true, std::memory_order_release);
+    lease_cv_.notify_all();
+}
+
+void SlotManager::reset_shutdown() {
+    std::lock_guard lock(mutex_);
+    if (!unloading_all_.load(std::memory_order_acquire)) {
+        shutdown_requested_.store(false, std::memory_order_release);
+    }
 }
 
 std::optional<SlotId> SlotManager::find_slot_by_agent(const AgentId& agent_id) const {
@@ -513,6 +668,10 @@ std::optional<SlotId> SlotManager::find_slot_by_agent(const AgentId& agent_id) c
 
 SlotManager::SlotLease SlotManager::acquire_slot(const SlotId& slot_id) {
     std::lock_guard lock(mutex_);
+    if (shutdown_requested_.load(std::memory_order_acquire) ||
+        unloading_all_.load(std::memory_order_acquire)) {
+        return {};
+    }
     for (auto& slot : slots_) {
         if (slot->id == slot_id && slot->state == SlotState::Ready && slot->client) {
             ++slot->active_requests;
@@ -579,7 +738,8 @@ std::string SlotManager::last_error() const {
 SlotId SlotManager::add_ready_test_slot(std::string model_path,
                                         AgentId agent_id,
                                         RuntimeSettings settings,
-                                        std::string mmproj_path) {
+                                        std::string mmproj_path,
+                                        std::string runtime_base_url) {
     std::lock_guard lock(mutex_);
 
     auto slot = std::make_unique<Slot>();
@@ -588,7 +748,7 @@ SlotId SlotManager::add_ready_test_slot(std::string model_path,
     slot->mmproj_path = std::move(mmproj_path);
     if (!agent_id.empty()) slot->agents.push_back(std::move(agent_id));
     slot->launch_settings = std::move(settings);
-    slot->client = std::make_unique<RuntimeClient>("http://127.0.0.1:0");
+    slot->client = std::make_unique<RuntimeClient>(std::move(runtime_base_url));
     slot->state = SlotState::Ready;
     slot->last_active_ms = util::now_ms();
     slot->effective_ctx_size = effective_llama_server_ctx_tokens(slot->launch_settings);
@@ -624,9 +784,11 @@ void SlotManager::release_slot_request(const SlotId& slot_id) {
     for (auto& slot : slots_) {
         if (slot->id == slot_id) {
             if (slot->active_requests > 0) --slot->active_requests;
+            lease_cv_.notify_all();
             return;
         }
     }
+    lease_cv_.notify_all();
 }
 
 std::optional<SlotId> SlotManager::try_attach(const std::string& model_path,
@@ -634,6 +796,10 @@ std::optional<SlotId> SlotManager::try_attach(const std::string& model_path,
                                               const RuntimeSettings& settings,
                                               const AgentId& agent_id) {
     std::lock_guard lock(mutex_);
+    if (shutdown_requested_.load(std::memory_order_acquire) ||
+        unloading_all_.load(std::memory_order_acquire)) {
+        return std::nullopt;
+    }
     for (auto& slot : slots_) {
         if (slot->state != SlotState::Ready) continue;
         if (normalize_llama_model_path(slot->model_path)

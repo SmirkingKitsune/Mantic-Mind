@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -14,6 +15,7 @@ struct SseInferCtx {
     std::condition_variable cv;
     std::deque<std::string> lines; // pre-formatted "data: ...\n\n" payloads
     bool                    done = false;
+    std::atomic<bool>       canceled{false};
 };
 
 } // namespace mm

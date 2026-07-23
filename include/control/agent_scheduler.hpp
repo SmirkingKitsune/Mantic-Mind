@@ -3,9 +3,11 @@
 #include "common/models.hpp"
 
 #include <mutex>
+#include <condition_variable>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace mm {
@@ -35,9 +37,11 @@ private:
     NodeRegistry& registry_;
     std::string models_dir_;
 
-    // Scheduling can include node HTTP calls and large model transfers. Keep it
-    // serialized without blocking read-only placement queries.
-    std::mutex schedule_mutex_;
+    // Serialize competing schedules for the same agent without holding a
+    // scheduler mutex during node operations or callbacks.
+    std::mutex coordination_mutex_;
+    std::condition_variable coordination_cv_;
+    std::unordered_set<AgentId> scheduling_agents_;
     mutable std::mutex state_mutex_;
     std::unordered_map<AgentId, AgentPlacement> placements_;
     std::string last_error_;
@@ -56,6 +60,8 @@ private:
     }
 
     void set_last_error(const std::string& error);
+    void begin_agent_schedule(const AgentId& id);
+    void end_agent_schedule(const AgentId& id);
     void detach_placement_best_effort(const AgentPlacement& placement,
                                       const AgentId& agent_id,
                                       const std::string& reason);

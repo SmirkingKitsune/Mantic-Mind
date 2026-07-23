@@ -21,6 +21,7 @@ public:
     ~RuntimeProcess();
 
     using LogCallback = std::function<void(const std::string& line, bool is_stderr)>;
+    using CancelCheck = std::function<bool()>;
     void set_log_callback(LogCallback cb);
 
     // Launches `llama-server` on the given port; blocks until /health is ready
@@ -31,7 +32,8 @@ public:
                             const std::string& mmproj_path,
                             const RuntimeSettings& settings,
                             uint16_t port = 8080,
-                            const std::string& slot_save_path = {});
+                            const std::string& slot_save_path = {},
+                            CancelCheck cancel_check = {});
 
     // Graceful SIGTERM → SIGKILL fallback.
     void stop();
@@ -55,8 +57,10 @@ private:
                          const std::string& executable_path,
                          std::vector<std::string> args,
                          uint16_t port,
-                         int health_timeout_seconds);
-    bool poll_health(int timeout_seconds = 60);
+                         int health_timeout_seconds,
+                         const CancelCheck& cancel_check);
+    bool poll_health(int timeout_seconds,
+                     const CancelCheck& cancel_check);
 };
 
 } // namespace mm

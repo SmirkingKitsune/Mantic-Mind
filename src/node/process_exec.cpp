@@ -79,6 +79,21 @@ int run_streamed_command(const std::vector<std::string>& argv,
         return -1;
     }
 
+    auto is_canceled = [&]() noexcept {
+        if (!cancel_requested) return false;
+        try {
+            return cancel_requested();
+        } catch (...) {
+            // A broken cancellation source must not strand a provisioning
+            // process tree. Treat it as a cancellation request.
+            return true;
+        }
+    };
+    if (is_canceled()) {
+        if (error) *error = "command canceled";
+        return 130;
+    }
+
     // Serialize callback invocations across the two reader threads.
     std::mutex cb_mutex;
     auto emit = [&](const std::string& line, bool is_stderr) {
@@ -107,6 +122,30 @@ int run_streamed_command(const std::vector<std::string>& argv,
     }
     SetHandleInformation(err_read, HANDLE_FLAG_INHERIT, 0);
 
+    // A suspended root is assigned before it can create descendants. Closing
+    // this job (or explicitly terminating it on cancellation) tears down the
+    // entire process tree, including grandchildren that inherited stdout or
+    // stderr handles and would otherwise keep the reader threads blocked.
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    if (job == nullptr) {
+        if (error) *error = "CreateJobObject failed: " +
+                            std::to_string(GetLastError());
+        CloseHandle(out_read); CloseHandle(out_write);
+        CloseHandle(err_read); CloseHandle(err_write);
+        return -1;
+    }
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION job_info{};
+    job_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                 &job_info, sizeof(job_info))) {
+        if (error) *error = "SetInformationJobObject failed: " +
+                            std::to_string(GetLastError());
+        CloseHandle(job);
+        CloseHandle(out_read); CloseHandle(out_write);
+        CloseHandle(err_read); CloseHandle(err_write);
+        return -1;
+    }
+
     std::ostringstream cmd;
     cmd << quote_windows_arg(argv[0]);
     for (size_t i = 1; i < argv.size(); ++i) cmd << " " << quote_windows_arg(argv[i]);
@@ -132,7 +171,7 @@ int run_streamed_command(const std::vector<std::string>& argv,
 
     PROCESS_INFORMATION pi{};
     BOOL ok = CreateProcessA(app_name, cmd_buf.data(), nullptr, nullptr, TRUE,
-                             CREATE_NO_WINDOW, nullptr,
+                             CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr,
                              cwd_str.empty() ? nullptr : cwd_str.c_str(),
                              &si, &pi);
     // Parent never writes to the child's stdio; close write ends now so the
@@ -143,6 +182,31 @@ int run_streamed_command(const std::vector<std::string>& argv,
     if (!ok) {
         if (error) *error = "CreateProcess failed: " + std::to_string(GetLastError())
                           + " (" + argv[0] + ")";
+        CloseHandle(job);
+        CloseHandle(out_read); CloseHandle(err_read);
+        return -1;
+    }
+    if (!AssignProcessToJobObject(job, pi.hProcess)) {
+        const DWORD assign_error = GetLastError();
+        TerminateProcess(pi.hProcess, 130);
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        if (error) *error = "AssignProcessToJobObject failed: " +
+                            std::to_string(assign_error);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        CloseHandle(job);
+        CloseHandle(out_read); CloseHandle(err_read);
+        return -1;
+    }
+    if (ResumeThread(pi.hThread) == static_cast<DWORD>(-1)) {
+        const DWORD resume_error = GetLastError();
+        TerminateJobObject(job, 130);
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        if (error) *error = "ResumeThread failed: " +
+                            std::to_string(resume_error);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        CloseHandle(job);
         CloseHandle(out_read); CloseHandle(err_read);
         return -1;
     }
@@ -167,15 +231,25 @@ int run_streamed_command(const std::vector<std::string>& argv,
         const DWORD wait = WaitForSingleObject(pi.hProcess, 100);
         if (wait == WAIT_OBJECT_0) break;
         if (wait == WAIT_FAILED) break;
-        if (cancel_requested && cancel_requested()) {
+        if (is_canceled()) {
             canceled = true;
-            TerminateProcess(pi.hProcess, 130);
+            if (!TerminateJobObject(job, 130)) {
+                // The job should always own the process, but retain a root
+                // fallback so cancellation cannot leave it running if Windows
+                // reports an unexpected job failure.
+                TerminateProcess(pi.hProcess, 130);
+            }
             WaitForSingleObject(pi.hProcess, INFINITE);
             break;
         }
     }
     DWORD code = 0;
     GetExitCodeProcess(pi.hProcess, &code);
+
+    // On normal root exit this also cleans up any stray descendants before we
+    // join pipe readers. On cancellation it is redundant with
+    // TerminateJobObject and intentionally closes the final job handle.
+    CloseHandle(job);
 
     if (t_out.joinable()) t_out.join();
     if (t_err.joinable()) t_err.join();
@@ -189,8 +263,13 @@ int run_streamed_command(const std::vector<std::string>& argv,
     return static_cast<int>(code);
 #else
     int out_pipe[2], err_pipe[2];
-    if (::pipe(out_pipe) != 0 || ::pipe(err_pipe) != 0) {
+    if (::pipe(out_pipe) != 0) {
         if (error) *error = std::string("pipe() failed: ") + ::strerror(errno);
+        return -1;
+    }
+    if (::pipe(err_pipe) != 0) {
+        if (error) *error = std::string("pipe() failed: ") + ::strerror(errno);
+        ::close(out_pipe[0]); ::close(out_pipe[1]);
         return -1;
     }
 
@@ -203,6 +282,10 @@ int run_streamed_command(const std::vector<std::string>& argv,
     }
 
     if (pid == 0) {
+        // Put the root in its own process group before exec. Every ordinary
+        // descendant inherits the group, so cancellation can signal the full
+        // install/build tree rather than only its immediate shell.
+        if (::setpgid(0, 0) != 0) ::_exit(126);
         ::dup2(out_pipe[1], STDOUT_FILENO);
         ::dup2(err_pipe[1], STDERR_FILENO);
         // stdin from /dev/null so install tools never block on a prompt.
@@ -236,6 +319,20 @@ int run_streamed_command(const std::vector<std::string>& argv,
         ::_exit(127);
     }
 
+    // Close the fork/setpgid race from the parent side. EACCES/EPERM can mean
+    // the child already exec'd after successfully grouping itself; verify the
+    // resulting group before deciding launch safety was lost.
+    if (::setpgid(pid, pid) != 0 && ::getpgid(pid) != pid) {
+        const int group_error = errno;
+        ::kill(pid, SIGKILL);
+        while (::waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
+        ::close(out_pipe[0]); ::close(out_pipe[1]);
+        ::close(err_pipe[0]); ::close(err_pipe[1]);
+        if (error) *error = std::string("setpgid() failed: ") +
+                            ::strerror(group_error);
+        return -1;
+    }
+
     ::close(out_pipe[1]);
     ::close(err_pipe[1]);
 
@@ -255,24 +352,47 @@ int run_streamed_command(const std::vector<std::string>& argv,
 
     int status = 0;
     bool canceled = false;
+    bool root_reaped = false;
     for (;;) {
         const pid_t got = ::waitpid(pid, &status, WNOHANG);
-        if (got == pid) break;
+        if (got == pid) {
+            root_reaped = true;
+            break;
+        }
         if (got < 0 && errno != EINTR) break;
-        if (cancel_requested && cancel_requested()) {
+        if (is_canceled()) {
             canceled = true;
-            ::kill(pid, SIGTERM);
+            ::kill(-pid, SIGTERM);
             for (int i = 0; i < 20; ++i) {
-                if (::waitpid(pid, &status, WNOHANG) == pid) break;
+                if (::waitpid(pid, &status, WNOHANG) == pid) {
+                    root_reaped = true;
+                    break;
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
-            if (::waitpid(pid, &status, WNOHANG) == 0) {
-                ::kill(pid, SIGKILL);
+            // The root may have exited while a descendant kept the process
+            // group and inherited pipes alive. Always kill the remaining group
+            // before joining readers.
+            ::kill(-pid, SIGKILL);
+            if (!root_reaped) {
                 while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
             }
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    if (!canceled) {
+        // Match Windows JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE semantics: a
+        // completed command may not leave background descendants holding our
+        // output pipes open. Install steps do not intentionally daemonize.
+        if (::kill(-pid, SIGTERM) == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            ::kill(-pid, SIGKILL);
+        }
+        if (!root_reaped) {
+            while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+        }
     }
 
     if (t_out.joinable()) t_out.join();

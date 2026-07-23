@@ -23,6 +23,12 @@ static constexpr int kFallbackSelectedMemories = 3;
 
 namespace {
 
+bool cancellation_requested(
+    const MemoryManager::CancelCheck& cancel_requested) {
+    if (!cancel_requested) return false;
+    try { return cancel_requested(); } catch (...) { return true; }
+}
+
 std::string role_label(MessageRole role) {
     switch (role) {
         case MessageRole::System: return "System";
@@ -152,18 +158,23 @@ MemoryManager::MemoryManager(AgentDB& db, RuntimeClient& runtime)
     : db_(db), runtime_(runtime) {}
 
 void MemoryManager::extract_and_store_memories(const ConvId& conv_id,
-                                               const AgentConfig& cfg) {
+                                               const AgentConfig& cfg,
+                                               CancelCheck cancel_requested) {
     if (!cfg.memories_enabled) return;
+    if (cancellation_requested(cancel_requested)) return;
 
     auto messages = db_.load_messages(conv_id);
-    extract_and_store_memories_from_messages(conv_id, messages, cfg);
+    extract_and_store_memories_from_messages(
+        conv_id, messages, cfg, std::move(cancel_requested));
 }
 
 void MemoryManager::extract_and_store_memories_from_messages(
     const ConvId& conv_id,
     const std::vector<Message>& messages,
-    const AgentConfig& cfg) {
+    const AgentConfig& cfg,
+    CancelCheck cancel_requested) {
     if (messages.empty()) return;
+    if (cancellation_requested(cancel_requested)) return;
 
     const std::string transcript = build_transcript(messages);
     if (transcript.empty()) return;
@@ -187,7 +198,8 @@ void MemoryManager::extract_and_store_memories_from_messages(
     req.settings.temperature = 0.2f;
     req.messages = {{.role = MessageRole::User, .content = extraction_prompt}};
 
-    Message resp = runtime_.complete(req);
+    Message resp = runtime_.complete(req, cancel_requested);
+    if (cancellation_requested(cancel_requested)) return;
     if (resp.content.empty()) {
         MM_WARN("Memory extraction returned empty response for conv {}", conv_id);
         return;
@@ -208,6 +220,7 @@ void MemoryManager::extract_and_store_memories_from_messages(
 
         int stored = 0;
         for (const auto& item : arr) {
+            if (cancellation_requested(cancel_requested)) return;
             if (!item.contains("content")) continue;
             const std::string content = item["content"].get<std::string>();
             if (content.empty()) continue;
@@ -233,8 +246,10 @@ void MemoryManager::extract_and_store_memories_from_messages(
 std::vector<Memory> MemoryManager::get_relevant_memories(const ConvId& conv_id,
                                                          const AgentConfig& cfg,
                                                          int max_candidates,
-                                                         int max_selected) const {
+                                                         int max_selected,
+                                                         CancelCheck cancel_requested) const {
     if (!cfg.memories_enabled || max_candidates <= 0 || max_selected <= 0) return {};
+    if (cancellation_requested(cancel_requested)) return {};
 
     auto candidates = rank_candidate_memories(db_.list_memories(), max_candidates);
     if (candidates.empty()) return {};
@@ -247,7 +262,8 @@ std::vector<Memory> MemoryManager::get_relevant_memories(const ConvId& conv_id,
     req.messages = {{.role = MessageRole::User,
                      .content = build_relevance_prompt(db_, conv_id, cfg, candidates, max_selected)}};
 
-    Message response = runtime_.complete(req);
+    Message response = runtime_.complete(req, cancel_requested);
+    if (cancellation_requested(cancel_requested)) return {};
     if (response.content.empty()) {
         MM_WARN("Relevant memory selection returned empty response for conv {}", conv_id);
         return fallback_selected_memories(candidates, max_selected);

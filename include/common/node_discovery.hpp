@@ -43,8 +43,11 @@ public:
     NodeDiscoveryListener() = default;
     ~NodeDiscoveryListener() { stop(); }
 
-    void start(uint16_t port = 7072);
+    // Binds synchronously so callers can treat an unavailable discovery port
+    // as a startup failure instead of silently running without discovery.
+    bool start(uint16_t port = 7072);
     void stop();
+    uint16_t bound_port() const { return bound_port_.load(); }
 
     // Returns entries whose last_seen_ms is within the last 30 seconds.
     std::vector<DiscoveredNode> get_nodes() const;
@@ -56,6 +59,7 @@ private:
     std::unordered_map<std::string, DiscoveredNode> nodes_; // keyed by node_id
     Callback                                        callback_;
     std::atomic<bool>                               running_{false};
+    std::atomic<uint16_t>                           bound_port_{0};
     std::thread                                     thread_;
 };
 

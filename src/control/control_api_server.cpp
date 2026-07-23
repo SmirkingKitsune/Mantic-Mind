@@ -1047,7 +1047,8 @@ ControlApiServer::ControlApiServer(AgentManager& agents,
                                    std::string data_dir,
                                    std::string models_dir,
                                    std::string external_api_token,
-                                   TtsServiceConfig tts_config)
+                                   TtsServiceConfig tts_config,
+                                   bool allow_legacy_environment)
     : agents_(agents)
     , queue_(queue)
     , registry_(registry)
@@ -1056,13 +1057,14 @@ ControlApiServer::ControlApiServer(AgentManager& agents,
     , models_dir_(std::move(models_dir))
     , external_api_token_(std::move(external_api_token))
     , tts_(std::move(tts_config))
+    , allow_legacy_environment_(allow_legacy_environment)
     , server_(std::make_unique<HttpServer>())
     , openai_server_(std::make_unique<HttpServer>())
 {}
 
 ControlApiServer::~ControlApiServer() { stop(); }
 
-bool ControlApiServer::listen(uint16_t port) {
+bool ControlApiServer::listen(uint16_t port, const std::string& bind_host) {
     server_->set_payload_max_length(static_cast<std::size_t>(kMaxImageBytes) +
                                     (2ULL * 1024 * 1024));
     server_->SetPreRoutingHandler([this](const httplib::Request& req,
@@ -1070,19 +1072,20 @@ bool ControlApiServer::listen(uint16_t port) {
         return authorize_external_request(req, res);
     });
     register_routes();
-    MM_INFO("ControlApiServer listening on port {}", port);
-    return server_->listen("0.0.0.0", port);
+    MM_INFO("ControlApiServer listening on {}:{}", bind_host, port);
+    return server_->listen(bind_host, port);
 }
 
-bool ControlApiServer::listen_openai_compat(uint16_t port) {
+bool ControlApiServer::listen_openai_compat(uint16_t port,
+                                             const std::string& bind_host) {
     openai_server_->set_payload_max_length(kOpenAiJsonCeiling);
     openai_server_->SetPreRoutingHandler([this](const httplib::Request& req,
                                                 httplib::Response& res) {
         return authorize_openai_compat_request(req, res);
     });
     register_openai_compat_routes();
-    MM_INFO("OpenAI-compatible API listening on port {}", port);
-    return openai_server_->listen("0.0.0.0", port);
+    MM_INFO("OpenAI-compatible API listening on {}:{}", bind_host, port);
+    return openai_server_->listen(bind_host, port);
 }
 
 void ControlApiServer::stop() {
@@ -1091,6 +1094,12 @@ void ControlApiServer::stop() {
 }
 
 void ControlApiServer::stop_openai_compat() { openai_server_->stop(); }
+
+bool ControlApiServer::is_running() const { return server_->is_running(); }
+
+bool ControlApiServer::is_openai_compat_running() const {
+    return openai_server_->is_running();
+}
 
 void ControlApiServer::cleanup_expired_tts_cache() {
     const int64_t now = util::now_ms();
@@ -1284,6 +1293,7 @@ void ControlApiServer::register_openai_compat_routes() {
 
         auto ctx = std::make_shared<SseInferCtx>();
         auto push_event = [ctx](const nlohmann::json& payload) {
+            if (ctx->canceled) return;
             std::lock_guard<std::mutex> lk(ctx->mx);
             ctx->lines.push_back("data: " + payload.dump() + "\n\n");
             ctx->cv.notify_one();
@@ -1351,6 +1361,7 @@ void ControlApiServer::register_openai_compat_routes() {
                           conv_id_hint,
                           max_tokens_override,
                           chunk_fn,
+                          ctx,
                           done_for_handle = done_fn,
                           done_for_catch = done_fn]() mutable {
             try {
@@ -1360,7 +1371,8 @@ void ControlApiServer::register_openai_compat_routes() {
                             std::move(chunk_fn),
                             std::move(done_for_handle),
                             max_tokens_override,
-                            std::move(prepared.parts));
+                            std::move(prepared.parts),
+                            [ctx] { return ctx->canceled.load(); });
             } catch (const std::exception& e) {
                 MM_ERROR("OpenAI-compatible chat job for agent '{}' failed: {}",
                          agent_id,
@@ -1378,25 +1390,41 @@ void ControlApiServer::register_openai_compat_routes() {
             [ctx](size_t /*offset*/, httplib::DataSink& sink) -> bool {
                 std::unique_lock<std::mutex> lk(ctx->mx);
                 ctx->cv.wait(lk, [&] {
-                    return !ctx->lines.empty() || ctx->done;
+                    return !ctx->lines.empty() || ctx->done || ctx->canceled;
                 });
+
+                if (ctx->canceled) return false;
 
                 while (!ctx->lines.empty()) {
                     std::string payload = std::move(ctx->lines.front());
                     ctx->lines.pop_front();
                     lk.unlock();
-                    if (!sink.write(payload.data(), payload.size())) return false;
+                    if (!sink.write(payload.data(), payload.size())) {
+                        ctx->canceled = true;
+                        ctx->cv.notify_all();
+                        return false;
+                    }
                     lk.lock();
                 }
 
                 if (ctx->done && ctx->lines.empty()) {
                     lk.unlock();
                     const std::string fin = "data: [DONE]\n\n";
-                    sink.write(fin.data(), fin.size());
+                    if (!sink.write(fin.data(), fin.size())) {
+                        ctx->canceled = true;
+                        ctx->cv.notify_all();
+                        return false;
+                    }
                     sink.done();
                     return true;
                 }
                 return true;
+            },
+            [ctx](bool success) {
+                if (!success) {
+                    ctx->canceled = true;
+                    ctx->cv.notify_all();
+                }
             });
     });
 }
@@ -1447,68 +1475,77 @@ ControlApiServer::LocalChatResult ControlApiServer::chat_local(
 
 namespace {
 
-// Routes LLM calls through the Node API (/api/node/infer) instead of talking
-// directly to the runtime engine — necessary because the runtime is bound to
-// localhost on the node machine and not reachable from the control process.
+// Routes LLM calls through the transport-neutral node contract. Embedded AIO
+// nodes call NodeService directly; remote nodes translate through /api/node/infer.
 class NodeProxyRuntimeClient : public RuntimeClient {
 public:
-    NodeProxyRuntimeClient(std::string node_url, std::string api_key, std::string slot_id = {})
-        : RuntimeClient(node_url)
-        , node_url_(std::move(node_url))
-        , api_key_(std::move(api_key))
+    NodeProxyRuntimeClient(NodeOperationsPtr operations,
+                           std::string slot_id = {},
+                           CancelCheck cancel_requested = {})
+        : RuntimeClient("http://127.0.0.1")
+        , operations_(std::move(operations))
         , slot_id_(std::move(slot_id))
+        , cancel_requested_(std::move(cancel_requested))
     {}
 
-    Message complete(const InferenceRequest& req) override {
-        HttpClient cli(node_url_);
-        cli.set_bearer_token(api_key_);
+    Message complete(const InferenceRequest& req,
+                     CancelCheck call_cancel_requested = {}) override {
+        const auto canceled = [this, &call_cancel_requested] {
+            const auto requested = [](const CancelCheck& check) {
+                if (!check) return false;
+                try { return check(); } catch (...) { return true; }
+            };
+            return requested(cancel_requested_) ||
+                   requested(call_cancel_requested);
+        };
+        Message canceled_result;
+        canceled_result.role = MessageRole::Assistant;
+        canceled_result.timestamp_ms = util::now_ms();
+        if (canceled()) return canceled_result;
+        if (!operations_) throw std::runtime_error("node operations unavailable");
 
-        Message result;
-        result.role         = MessageRole::Assistant;
-        result.timestamp_ms = util::now_ms();
-
-        InferenceRequest req_copy = req;
-        req_copy.stream = req.stream;
-
-        nlohmann::json body = nlohmann::json(req_copy);
-        if (!slot_id_.empty()) body["slot_id"] = slot_id_;
-
-        bool ok = cli.stream_post("/api/node/infer",
-            body,
-            [&result](const std::string& data) -> bool {
-                if (data == "[DONE]") return true;
-                try {
-                    auto j = nlohmann::json::parse(data);
-                    std::string type = j.value("type", "");
-                    if (type == "delta") {
-                        result.content += j.value("content", "");
-                    } else if (type == "thinking") {
-                        result.thinking_text += j.value("content", "");
-                    } else if (type == "tool_call") {
-                        ToolCall tc;
-                        tc.id             = j.value("id", std::string{});
-                        tc.function_name  = j.value("name", "");
-                        tc.arguments_json = j.value("arguments", "");
-                        result.tool_calls.push_back(tc);
-                    } else if (type == "done") {
-                        result.token_count = j.value("tokens_used", 0);
-                    }
-                } catch (const std::exception& e) {
-                    MM_WARN("NodeProxyRuntimeClient::complete: parse error: {}", e.what());
-                }
-                return true;
-            });
-
-        if (!ok) {
-            MM_WARN("NodeProxyRuntimeClient::complete: stream failed to {}", node_url_);
+        const NodeInferRequest request{req, slot_id_, canceled};
+        NodeInferResult inference = operations_->infer(request);
+        if (!inference.ok()) {
+            if (inference.status == NodeServiceStatus::Canceled &&
+                canceled()) {
+                return canceled_result;
+            }
+            std::string detail = util::trim(inference.error);
+            if (detail.empty()) {
+                detail = std::string("node inference failed: ") +
+                         to_string(inference.status);
+            }
+            MM_WARN("NodeProxyRuntimeClient::complete: {}", detail);
+            throw std::runtime_error(detail);
         }
-        return result;
+        return inference.message;
     }
 
 private:
-    std::string node_url_;
-    std::string api_key_;
+    NodeOperationsPtr operations_;
     std::string slot_id_;
+    CancelCheck cancel_requested_;
+};
+
+class SchedulerIdleGuard {
+public:
+    void arm(AgentScheduler& scheduler, AgentId agent_id) {
+        scheduler_ = &scheduler;
+        agent_id_ = std::move(agent_id);
+    }
+    ~SchedulerIdleGuard() {
+        if (!scheduler_) return;
+        try { scheduler_->mark_agent_idle(agent_id_); }
+        catch (...) {}
+    }
+    SchedulerIdleGuard() = default;
+    SchedulerIdleGuard(const SchedulerIdleGuard&) = delete;
+    SchedulerIdleGuard& operator=(const SchedulerIdleGuard&) = delete;
+
+private:
+    AgentScheduler* scheduler_ = nullptr;
+    AgentId agent_id_;
 };
 
 bool contains_prefill_thinking_incompatibility(const std::string& text) {
@@ -1539,7 +1576,16 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
                                     ChunkCb chunk_cb,
                                     DoneCb done_cb,
                                     int max_tokens_override,
-                                    std::vector<MessageContentPart> content_parts) {
+                                    std::vector<MessageContentPart> content_parts,
+                                    CancelCheck cancel_requested) {
+    const auto canceled = [&] {
+        return queue_.cancellation_requested() ||
+               (cancel_requested && cancel_requested());
+    };
+    if (canceled()) {
+        done_cb({}, false, "inference canceled");
+        return;
+    }
     // 1. Look up agent
     const int64_t request_started_ms = util::now_ms();
     auto agent = agents_.get_agent(agent_id);
@@ -1622,8 +1668,9 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     std::unique_ptr<NodeProxyRuntimeClient> node_llm_storage;
     RuntimeClient* selected_runtime = nullptr;
     std::optional<ScheduleResult> schedule_result;
-    NodeInfo node;
+    NodeOperationsPtr selected_node_operations;
     SlotId active_slot_id;
+    SchedulerIdleGuard node_idle_guard;
 
     if (api_backend) {
         api_llm_storage = make_api_runtime_client(cfg);
@@ -1634,11 +1681,13 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     // Route to a node via AgentScheduler. If capacity is temporarily unavailable,
     // wait and retry so queued prompts can run when the next node/slot opens up.
     int64_t wait_budget_ms = 180000; // default: 3 minutes
-    if (const char* env_wait = std::getenv("MM_CHAT_QUEUE_WAIT_MS")) {
-        try {
-            int64_t parsed = std::stoll(env_wait);
-            if (parsed > 0) wait_budget_ms = parsed;
-        } catch (...) {}
+    if (allow_legacy_environment_) {
+        if (const char* env_wait = std::getenv("MM_CHAT_QUEUE_WAIT_MS")) {
+            try {
+                int64_t parsed = std::stoll(env_wait);
+                if (parsed > 0) wait_budget_ms = parsed;
+            } catch (...) {}
+        }
     }
     constexpr int64_t kRetrySleepMs = 1000;
 
@@ -1646,6 +1695,10 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     const int64_t wait_started_ms = util::now_ms();
     int wait_attempt = 0;
     while (true) {
+        if (canceled()) {
+            sched_err = "inference canceled";
+            break;
+        }
         schedule_result = scheduler_.ensure_agent_running(cfg);
         if (schedule_result) break;
 
@@ -1678,7 +1731,11 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
                 activity_log(1, "Chat queued: agent='" + agent_id + "' waiting for node");
         }
         ++wait_attempt;
-        std::this_thread::sleep_for(std::chrono::milliseconds(kRetrySleepMs));
+        // Keep shutdown/client-disconnect latency bounded while a request is
+        // queued for capacity instead of sleeping for the whole retry period.
+        for (int slept = 0; slept < kRetrySleepMs && !canceled(); slept += 50) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
     }
 
     if (!schedule_result) {
@@ -1693,10 +1750,10 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     }
 
     scheduler_.mark_agent_active(agent_id);
+    node_idle_guard.arm(scheduler_, agent_id);
 
-    try { node = registry_.get_node(schedule_result->node_id); }
+    try { selected_node_operations = registry_.operations(schedule_result->node_id); }
     catch (const std::exception& e) {
-        scheduler_.mark_agent_idle(agent_id);
         MM_WARN("handle_chat: node '{}' disappeared after routing: {}",
                 schedule_result->node_id, e.what());
         done_cb(conv_id, false, std::string("node lookup failed: ") + e.what());
@@ -1709,11 +1766,10 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
                  schedule_result->node_id.substr(0, 8) + " slot=" +
                  active_slot_id.substr(0, 8));
 
-    // 5. Real LLM client routed through the node API.
-    //    (the runtime is bound to localhost on the node machine; control
-    //     cannot reach it directly — all LLM calls go via /api/node/infer.)
+    // 5. Real LLM client routed through the typed node boundary. Remote nodes
+    //    use /api/node/infer internally; the embedded node stays in-process.
     node_llm_storage = std::make_unique<NodeProxyRuntimeClient>(
-        node.url, node.api_key, active_slot_id);
+        selected_node_operations, active_slot_id, canceled);
     selected_runtime = node_llm_storage.get();
     }
 
@@ -1723,7 +1779,7 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     //    may_compact() creates a new conversation with a summary if >80% full.
     ConversationManager conv_mgr(db, real_runtime);
     const ConvId conv_id_before_compact = conv_id;
-    conv_id = conv_mgr.maybe_compact(conv_id, cfg);
+    conv_id = conv_mgr.maybe_compact(conv_id, cfg, canceled);
     if (conv_id != conv_id_before_compact) {
         // Compaction started a fresh conversation with only the kept-recent
         // messages re-appended. `seq` tracks the last message's sequence number
@@ -1737,7 +1793,8 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
     std::vector<Memory> memories;
     if (cfg.memories_enabled) {
         MemoryManager mem_mgr(db, real_runtime);
-        memories = mem_mgr.get_relevant_memories(conv_id, cfg);
+        memories = mem_mgr.get_relevant_memories(
+            conv_id, cfg, 40, 8, canceled);
     }
 
     // 8. Set up tool executor for memory tools
@@ -1802,7 +1859,8 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
             infer_req.settings.max_tokens = max_tokens_override;
         }
 
-        // Stream from node; parse SSE events and forward via chunk_cb
+        // Stream typed chunks from either the direct embedded service or the
+        // remote HTTP adapter. Wire-format parsing stays inside the adapter.
         std::string assistant_content;
         std::string thinking_content;
         int         total_tokens  = 0;
@@ -1810,12 +1868,11 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
         bool        infer_done_seen = false;
         bool        stream_had_error = false;
         std::string stream_error_message;
-        int         infer_http_status = 0;
-        std::string infer_http_body;
+        NodeServiceStatus infer_node_status = NodeServiceStatus::Failed;
+        std::string infer_error_detail;
         std::vector<ToolCall> accumulated_tool_calls;
 
-        HttpClient node_cli(node.url);
-        node_cli.set_bearer_token(node.api_key);
+        auto node_operations = selected_node_operations;
 
         auto reset_infer_state = [&]() {
             assistant_content.clear();
@@ -1825,49 +1882,9 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
             infer_done_seen = false;
             stream_had_error = false;
             stream_error_message.clear();
-            infer_http_status = 0;
-            infer_http_body.clear();
+            infer_node_status = NodeServiceStatus::Failed;
+            infer_error_detail.clear();
             accumulated_tool_calls.clear();
-        };
-
-        auto stream_cb = [&](const std::string& data) -> bool {
-                if (data == "[DONE]") return true;
-                try {
-                    auto j = nlohmann::json::parse(data);
-                    std::string type = j.value("type", "");
-
-                    InferenceChunk chunk;
-                    if (type == "thinking") {
-                        chunk.thinking_delta = j.value("content", "");
-                        thinking_content += chunk.thinking_delta;
-                    } else if (type == "delta") {
-                        chunk.delta_content = j.value("content", "");
-                        assistant_content  += chunk.delta_content;
-                    } else if (type == "tool_call") {
-                        ToolCall tc;
-                        tc.id             = j.value("id", util::generate_uuid());
-                        tc.function_name  = j.value("name", "");
-                        tc.arguments_json = j.value("arguments", "");
-                        accumulated_tool_calls.push_back(tc);
-                        chunk.tool_call_delta = tc;
-                    } else if (type == "error") {
-                        stream_had_error = true;
-                        stream_error_message = j.value("message", std::string{});
-                    } else if (type == "done") {
-                        infer_done_seen = true;
-                        total_tokens  = j.value("tokens_used", 0);
-                        finish_reason = j.value("finish_reason", "");
-                        return true;
-                    }
-                    if (first_token_at_ms == 0 &&
-                        (!chunk.delta_content.empty() || !chunk.thinking_delta.empty() || chunk.tool_call_delta)) {
-                        first_token_at_ms = util::now_ms();
-                    }
-                    chunk_cb(chunk);
-                } catch (const std::exception& e) {
-                    MM_WARN("handle_chat: SSE parse error: {}", e.what());
-                }
-                return true;
         };
 
         auto run_infer_once = [&](bool stream_mode) -> bool {
@@ -1907,16 +1924,17 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
                             api_ok = false;
                             stream_had_error = true;
                             stream_error_message = error;
-                            infer_http_body = error;
-                        });
+                            infer_error_detail = error;
+                        },
+                        canceled);
                     return api_ok;
                 }
 
-                Message response = real_runtime.complete(req_to_send);
+                Message response = real_runtime.complete(req_to_send, canceled);
                 if (response.role != MessageRole::Assistant) {
                     stream_had_error = true;
                     stream_error_message = "API chat completion failed";
-                    infer_http_body = stream_error_message;
+                    infer_error_detail = stream_error_message;
                     return false;
                 }
                 if (first_token_at_ms == 0 &&
@@ -1944,15 +1962,41 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
                 }
                 return true;
             }
-            nlohmann::json infer_body = nlohmann::json(req_to_send);
-            infer_body["slot_id"] = active_slot_id;
-            return node_cli.stream_post(
-                "/api/node/infer",
-                infer_body,
-                stream_cb,
-                &infer_http_status,
-                &infer_http_body
-            );
+
+            const NodeInferRequest node_request{
+                req_to_send,
+                active_slot_id,
+                canceled,
+            };
+            NodeInferResult node_result = node_operations->infer(
+                node_request,
+                [&](const InferenceChunk& chunk) -> bool {
+                    if (canceled()) return false;
+                    if (first_token_at_ms == 0 &&
+                        (!chunk.delta_content.empty() ||
+                         !chunk.thinking_delta.empty() ||
+                         chunk.tool_call_delta)) {
+                        first_token_at_ms = util::now_ms();
+                    }
+                    thinking_content += chunk.thinking_delta;
+                    assistant_content += chunk.delta_content;
+                    if (chunk.tool_call_delta) {
+                        accumulated_tool_calls.push_back(*chunk.tool_call_delta);
+                    }
+                    chunk_cb(chunk);
+                    return !canceled();
+                });
+            infer_node_status = node_result.status;
+            infer_error_detail = node_result.error;
+            if (!node_result.ok()) {
+                stream_had_error = true;
+                stream_error_message = node_result.error;
+                return false;
+            }
+            infer_done_seen = true;
+            total_tokens = node_result.tokens_used;
+            finish_reason = node_result.finish_reason;
+            return true;
         };
 
         auto finalize_attempt = [&](bool transport_ok) -> bool {
@@ -1964,13 +2008,16 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
                             " accepting completion (agent='{}', conv='{}')",
                             infer_label, agent_id, conv_id);
                     ok_now = true;
-                } else if (infer_http_status > 0) {
-                    std::string body = util::trim(infer_http_body);
-                    if (body.size() > 400) body = body.substr(0, 400) + "...";
-                    failure_reason = infer_label + " failed (HTTP " + std::to_string(infer_http_status) + ")";
-                    if (!body.empty()) failure_reason += ": " + body;
+                } else if (!api_backend) {
+                    std::string detail = util::trim(infer_error_detail);
+                    if (detail.size() > 400) detail = detail.substr(0, 400) + "...";
+                    failure_reason = infer_label + " failed (" +
+                                     to_string(infer_node_status) + ")";
+                    if (!detail.empty()) failure_reason += ": " + detail;
                 } else {
-                    failure_reason = infer_label + " stream failed (connection error or non-2xx)";
+                    std::string detail = util::trim(infer_error_detail);
+                    failure_reason = infer_label + " stream failed";
+                    if (!detail.empty()) failure_reason += ": " + detail;
                 }
             }
             if (stream_had_error) {
@@ -1990,9 +2037,13 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
             const bool transport_ok = run_infer_once(true);
             stream_ok = finalize_attempt(transport_ok);
             if (stream_ok) break;
+            if (canceled()) {
+                failure_reason = "inference canceled";
+                break;
+            }
 
             if (contains_prefill_thinking_incompatibility(failure_reason)
-                || contains_prefill_thinking_incompatibility(infer_http_body)
+                || contains_prefill_thinking_incompatibility(infer_error_detail)
                 || contains_prefill_thinking_incompatibility(stream_error_message)) {
                 force_prefill_safe = true;
             }
@@ -2005,7 +2056,7 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
             }
         }
 
-        if (!stream_ok) {
+        if (!stream_ok && !canceled()) {
             reset_infer_state();
             const bool non_stream_transport_ok = run_infer_once(false);
             const bool non_stream_ok = finalize_attempt(non_stream_transport_ok);
@@ -2016,6 +2067,7 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
         }
 
         if (!stream_ok) {
+            if (canceled()) failure_reason = "inference canceled";
             ok = false;
             break;
         }
@@ -2136,12 +2188,8 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
                 agent_id, conv_id);
     }
 
-    // 10. Mark agent idle in scheduler.
-    if (!api_backend) {
-        scheduler_.mark_agent_idle(agent_id);
-    }
-
-    // 11. Signal completion to the SSE client.
+    // 10. Signal completion to the SSE client. The scheduler idle guard runs
+    // on every exit path, including compaction and memory lookup exceptions.
     done_cb(conv_id, ok, failure_reason);
     const int64_t completed_at_ms = util::now_ms();
     perf.node_id = schedule_result ? schedule_result->node_id : std::string{};
@@ -2174,6 +2222,8 @@ void ControlApiServer::queue_global_recall(const AgentId& agent_id,
     recall_job.job_id   = util::generate_uuid();
     recall_job.agent_id = agent_id;
     recall_job.process_fn = [this, agent_id, conv_id]() {
+        const auto canceled = [this] { return queue_.cancellation_requested(); };
+        if (canceled()) return;
         auto a = agents_.get_agent(agent_id);
         if (!a) return;
         AgentConfig acfg = a->get_config();
@@ -2186,12 +2236,13 @@ void ControlApiServer::queue_global_recall(const AgentId& agent_id,
         std::unique_ptr<NodeProxyRuntimeClient> node_recall_storage;
         RuntimeClient* recall_client = nullptr;
         std::optional<ScheduleResult> sched_result;
-        NodeInfo ni;
+        SchedulerIdleGuard idle_guard;
 
         if (recall_api_backend) {
             api_recall_storage = make_api_runtime_client(acfg);
             recall_client = api_recall_storage.get();
         } else {
+            if (canceled()) return;
             sched_result = scheduler_.ensure_agent_running(acfg);
             if (!sched_result) {
                 MM_WARN("Global recall: no node for agent '{}': {}",
@@ -2201,18 +2252,21 @@ void ControlApiServer::queue_global_recall(const AgentId& agent_id,
             }
 
             scheduler_.mark_agent_active(agent_id);
+            idle_guard.arm(scheduler_, agent_id);
 
-            try { ni = registry_.get_node(sched_result->node_id); }
+            NodeOperationsPtr recall_operations;
+            try { recall_operations = registry_.operations(sched_result->node_id); }
             catch (const std::exception& e) {
-                scheduler_.mark_agent_idle(agent_id);
                 MM_WARN("Global recall: node lookup failed: {}", e.what());
                 return;
             }
 
             node_recall_storage = std::make_unique<NodeProxyRuntimeClient>(
-                ni.url, ni.api_key, sched_result->slot_id);
+                std::move(recall_operations), sched_result->slot_id, canceled);
             recall_client = node_recall_storage.get();
         }
+
+        if (canceled()) return;
 
         AgentDB& db = a->db();
         ToolExecutor tool_exec(db);
@@ -2284,6 +2338,7 @@ void ControlApiServer::queue_global_recall(const AgentId& agent_id,
         static constexpr int kMaxRecallRounds = 5;
 
         for (int round = 0; round < kMaxRecallRounds; ++round) {
+            if (canceled()) break;
             InferenceRequest req;
             req.model    = acfg.model_path;
             req.messages = recall_ctx;
@@ -2291,7 +2346,8 @@ void ControlApiServer::queue_global_recall(const AgentId& agent_id,
             req.tools    = tool_exec.get_all_tool_definitions();
             req.stream   = false;
 
-            Message response = recall_runtime.complete(req);
+            Message response = recall_runtime.complete(req, canceled);
+            if (canceled()) break;
 
             // Add assistant response to context
             recall_ctx.push_back(response);
@@ -2309,6 +2365,7 @@ void ControlApiServer::queue_global_recall(const AgentId& agent_id,
 
             // Execute tool calls
             for (const auto& tc : response.tool_calls) {
+                if (canceled()) break;
                 Message tool_result;
                 if (tool_exec.is_memory_tool(tc.function_name)) {
                     tool_result = tool_exec.execute_tool(tc, conv_id);
@@ -2322,10 +2379,9 @@ void ControlApiServer::queue_global_recall(const AgentId& agent_id,
             }
         }
 
-        if (!recall_api_backend) {
-            scheduler_.mark_agent_idle(agent_id);
+        if (!canceled()) {
+            activity_log(0, "Global recall complete: agent='" + agent_id + "'");
         }
-        activity_log(0, "Global recall complete: agent='" + agent_id + "'");
     };
     queue_.enqueue(std::move(recall_job));
 }
@@ -2368,8 +2424,22 @@ void ControlApiServer::register_routes() {
         return auth_header.substr(kBearer.size());
     };
 
+    auto write_node_result = [](Response& res, const NodeOperationResult& result) {
+        res.status = result.status > 0 ? result.status : 500;
+        const std::string body = result.raw_body.empty()
+            ? result.body.dump()
+            : result.raw_body;
+        res.set_content(body.empty() ? R"({"error":"empty node response"})" : body,
+                        "application/json");
+    };
+
     // ── POST /api/control/register-node ───────────────────────────────────────
     server_->Post("/api/control/register-node", [this, extract_bearer](const Request& req, Response& res) {
+        if (!registry_.remote_nodes_enabled()) {
+            res.status = 403;
+            res.set_content(R"({"error":"cluster mode is disabled"})", "application/json");
+            return;
+        }
         try {
             auto j = nlohmann::json::parse(req.body);
             std::string node_url = j.value("node_url", "");
@@ -2430,6 +2500,11 @@ void ControlApiServer::register_routes() {
     });
 
     server_->Post("/v1/nodes", [this](const Request& req, Response& res) {
+        if (!registry_.remote_nodes_enabled()) {
+            res.status = 403;
+            res.set_content(R"({"error":"cluster mode is disabled"})", "application/json");
+            return;
+        }
         try {
             auto j = nlohmann::json::parse(req.body);
             const std::string url = util::trim(j.value("url", std::string{}));
@@ -2455,6 +2530,16 @@ void ControlApiServer::register_routes() {
 
     server_->Delete("/v1/nodes/:id", [this](const Request& req, Response& res) {
         const std::string node_id = req.path_params.at("id");
+        if (registry_.is_embedded_node(node_id)) {
+            res.status = 409;
+            res.set_content(R"({"error":"embedded node cannot be removed"})", "application/json");
+            return;
+        }
+        if (!registry_.remote_nodes_enabled()) {
+            res.status = 403;
+            res.set_content(R"({"error":"cluster mode is disabled"})", "application/json");
+            return;
+        }
         try {
             registry_.get_node(node_id);
         } catch (...) {
@@ -2469,6 +2554,16 @@ void ControlApiServer::register_routes() {
 
     server_->Post("/v1/nodes/:id/forget", [this](const Request& req, Response& res) {
         const std::string node_id = req.path_params.at("id");
+        if (registry_.is_embedded_node(node_id)) {
+            res.status = 409;
+            res.set_content(R"({"error":"embedded node cannot be forgotten"})", "application/json");
+            return;
+        }
+        if (!registry_.remote_nodes_enabled()) {
+            res.status = 403;
+            res.set_content(R"({"error":"cluster mode is disabled"})", "application/json");
+            return;
+        }
         try {
             registry_.get_node(node_id);
         } catch (...) {
@@ -2482,7 +2577,32 @@ void ControlApiServer::register_routes() {
                         "application/json");
     });
 
-    server_->Post("/v1/nodes/pair/start", [this](const Request& req, Response& res) {
+    auto pair_targets_embedded = [](const Request& req) {
+        try {
+            const auto body = nlohmann::json::parse(req.body);
+            const auto is_local = [](const std::string& value) {
+                return util::to_lower(util::trim(value)) == "local";
+            };
+            return is_local(body.value("node_id", std::string{})) ||
+                   is_local(body.value("url", std::string{}));
+        } catch (...) {
+            return false;
+        }
+    };
+
+    server_->Post("/v1/nodes/pair/start", [this, pair_targets_embedded](
+        const Request& req, Response& res) {
+        if (pair_targets_embedded(req)) {
+            res.status = 409;
+            res.set_content(R"({"error":"embedded node cannot be paired"})",
+                            "application/json");
+            return;
+        }
+        if (!registry_.remote_nodes_enabled()) {
+            res.status = 403;
+            res.set_content(R"({"error":"cluster mode is disabled"})", "application/json");
+            return;
+        }
         try {
             auto j = nlohmann::json::parse(req.body);
             const std::string url = util::trim(j.value("url", std::string{}));
@@ -2505,7 +2625,19 @@ void ControlApiServer::register_routes() {
         }
     });
 
-    server_->Post("/v1/nodes/pair/complete", [this](const Request& req, Response& res) {
+    server_->Post("/v1/nodes/pair/complete", [this, pair_targets_embedded](
+        const Request& req, Response& res) {
+        if (pair_targets_embedded(req)) {
+            res.status = 409;
+            res.set_content(R"({"error":"embedded node cannot be paired"})",
+                            "application/json");
+            return;
+        }
+        if (!registry_.remote_nodes_enabled()) {
+            res.status = 403;
+            res.set_content(R"({"error":"cluster mode is disabled"})", "application/json");
+            return;
+        }
         try {
             auto j = nlohmann::json::parse(req.body);
             const std::string url = util::trim(j.value("url", std::string{}));
@@ -2532,7 +2664,19 @@ void ControlApiServer::register_routes() {
         }
     });
 
-    server_->Post("/v1/nodes/pair/psk", [this](const Request& req, Response& res) {
+    server_->Post("/v1/nodes/pair/psk", [this, pair_targets_embedded](
+        const Request& req, Response& res) {
+        if (pair_targets_embedded(req)) {
+            res.status = 409;
+            res.set_content(R"({"error":"embedded node cannot be paired"})",
+                            "application/json");
+            return;
+        }
+        if (!registry_.remote_nodes_enabled()) {
+            res.status = 403;
+            res.set_content(R"({"error":"cluster mode is disabled"})", "application/json");
+            return;
+        }
         try {
             auto j = nlohmann::json::parse(req.body);
             const std::string url = util::trim(j.value("url", std::string{}));
@@ -2543,13 +2687,16 @@ void ControlApiServer::register_routes() {
                 res.set_content(R"({"error":"url required"})", "application/json");
                 return;
             }
-            if (psk.empty()) {
+            if (psk.empty() && allow_legacy_environment_) {
                 const char* env_psk = std::getenv("MM_PAIRING_KEY");
                 if (env_psk && *env_psk) psk = env_psk;
             }
             if (psk.empty()) {
                 res.status = 400;
-                res.set_content(nlohmann::json{{"error", "psk required (or set MM_PAIRING_KEY)"}}.dump(),
+                const std::string detail = allow_legacy_environment_
+                    ? "psk required (or set MM_PAIRING_KEY)"
+                    : "psk required";
+                res.set_content(nlohmann::json{{"error", detail}}.dump(),
                                 "application/json");
                 return;
             }
@@ -2574,6 +2721,159 @@ void ControlApiServer::register_routes() {
         for (auto& n : nodes) arr.push_back(nlohmann::json(n));
         res.set_content(arr.dump(), "application/json");
     });
+
+    // Transport-neutral node management routes used by AIO's unified control
+    // UI/CLI and also useful for remote nodes.  Embedded calls never leave the
+    // process; remote calls retain the existing node REST contract.
+    server_->Get("/v1/nodes/:id/status", [this, write_node_result](
+        const Request& req, Response& res) {
+        try {
+            write_node_result(res, registry_.operations(req.path_params.at("id"))->status());
+        } catch (const std::exception& e) {
+            res.status = 404;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+        }
+    });
+    server_->Get("/v1/nodes/:id/logs", [this, write_node_result](
+        const Request& req, Response& res) {
+        int tail = 100;
+        if (req.has_param("tail")) {
+            try { tail = std::stoi(req.get_param_value("tail")); }
+            catch (...) { tail = 100; }
+        }
+        tail = std::clamp(tail, 1, 5000);
+        try {
+            write_node_result(res, registry_.operations(req.path_params.at("id"))->logs(tail));
+        } catch (const std::exception& e) {
+            res.status = 404;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+        }
+    });
+    server_->Get("/v1/nodes/:id/runtime/llama", [this, write_node_result](
+        const Request& req, Response& res) {
+        try {
+            write_node_result(
+                res, registry_.operations(req.path_params.at("id"))->llama_runtime());
+        } catch (const std::exception& e) {
+            res.status = 404;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+        }
+    });
+    auto allow_node_mutation = [this](const Request& req, Response& res) {
+        const std::string& node_id = req.path_params.at("id");
+        if (registry_.is_embedded_node(node_id) || registry_.remote_nodes_enabled()) {
+            return true;
+        }
+        res.status = 403;
+        res.set_content(R"({"error":"cluster mode is disabled"})",
+                        "application/json");
+        return false;
+    };
+    server_->Post("/v1/nodes/:id/actions/cancel",
+        [this, write_node_result, allow_node_mutation](
+            const Request& req, Response& res) {
+            if (!allow_node_mutation(req, res)) return;
+            try {
+                write_node_result(
+                    res, registry_.operations(req.path_params.at("id"))->cancel_action());
+            } catch (const std::exception& e) {
+                res.status = 404;
+                res.set_content(nlohmann::json{{"error", e.what()}}.dump(),
+                                "application/json");
+            }
+        });
+
+    auto parse_node_action_body = [](const Request& req) {
+        if (req.body.empty()) return nlohmann::json::object();
+        return nlohmann::json::parse(req.body);
+    };
+    server_->Post("/v1/nodes/:id/runtime/llama/provision",
+        [this, write_node_result, parse_node_action_body, allow_node_mutation](
+            const Request& req, Response& res) {
+            if (!allow_node_mutation(req, res)) return;
+            try {
+                write_node_result(res, registry_.operations(req.path_params.at("id"))
+                    ->llama_provision(parse_node_action_body(req)));
+            } catch (const nlohmann::json::exception& e) {
+                res.status = 400;
+                res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+            } catch (const std::exception& e) {
+                res.status = 404;
+                res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+            }
+        });
+    server_->Post("/v1/nodes/:id/runtime/llama/update",
+        [this, write_node_result, parse_node_action_body, allow_node_mutation](
+            const Request& req, Response& res) {
+            if (!allow_node_mutation(req, res)) return;
+            try {
+                write_node_result(res, registry_.operations(req.path_params.at("id"))
+                    ->llama_update(parse_node_action_body(req)));
+            } catch (const nlohmann::json::exception& e) {
+                res.status = 400;
+                res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+            } catch (const std::exception& e) {
+                res.status = 404;
+                res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+            }
+        });
+    server_->Post("/v1/nodes/:id/runtime/llama/check-update",
+        [this, write_node_result, parse_node_action_body, allow_node_mutation](
+            const Request& req, Response& res) {
+            if (!allow_node_mutation(req, res)) return;
+            try {
+                write_node_result(res, registry_.operations(req.path_params.at("id"))
+                    ->llama_check_update(parse_node_action_body(req)));
+            } catch (const nlohmann::json::exception& e) {
+                res.status = 400;
+                res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+            } catch (const std::exception& e) {
+                res.status = 404;
+                res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+            }
+        });
+    server_->Post("/v1/nodes/:id/runtime/llama/switch",
+        [this, write_node_result, parse_node_action_body, allow_node_mutation](
+            const Request& req, Response& res) {
+            if (!allow_node_mutation(req, res)) return;
+            try {
+                write_node_result(res, registry_.operations(req.path_params.at("id"))
+                    ->llama_switch(parse_node_action_body(req)));
+            } catch (const nlohmann::json::exception& e) {
+                res.status = 400;
+                res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+            } catch (const std::exception& e) {
+                res.status = 404;
+                res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+            }
+        });
+    server_->Post("/v1/nodes/:id/runtime/llama/diagnose",
+        [this, write_node_result, allow_node_mutation](
+            const Request& req, Response& res) {
+            if (!allow_node_mutation(req, res)) return;
+            try {
+                write_node_result(res, registry_.operations(req.path_params.at("id"))
+                    ->llama_diagnose());
+            } catch (const std::exception& e) {
+                res.status = 404;
+                res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+            }
+        });
+    server_->Post("/v1/nodes/:id/runtime/llama/recover",
+        [this, write_node_result, parse_node_action_body, allow_node_mutation](
+            const Request& req, Response& res) {
+            if (!allow_node_mutation(req, res)) return;
+            try {
+                write_node_result(res, registry_.operations(req.path_params.at("id"))
+                    ->llama_recover(parse_node_action_body(req)));
+            } catch (const nlohmann::json::exception& e) {
+                res.status = 400;
+                res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+            } catch (const std::exception& e) {
+                res.status = 404;
+                res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+            }
+        });
 
     server_->Get("/v1/activity", [this](const Request& req, Response& res) {
         int tail = 20;
@@ -2794,6 +3094,13 @@ void ControlApiServer::register_routes() {
     auto infer_voice_design_proposal =
         [this](const AgentConfig& acfg,
                std::string* error) -> std::optional<VoiceDesignProposal> {
+        const auto canceled = [this] {
+            return queue_.cancellation_requested();
+        };
+        if (canceled()) {
+            if (error) *error = "voice proposal inference canceled";
+            return std::nullopt;
+        }
         const bool voice_api_backend = agent_uses_api_backend(acfg);
         std::unique_ptr<RuntimeClient> api_voice_client;
         std::unique_ptr<NodeProxyRuntimeClient> node_voice_client;
@@ -2810,9 +3117,9 @@ void ControlApiServer::register_routes() {
                 return std::nullopt;
             }
 
-            NodeInfo node;
+            NodeOperationsPtr voice_operations;
             try {
-                node = registry_.get_node(sched_result->node_id);
+                voice_operations = registry_.operations(sched_result->node_id);
             } catch (const std::exception& e) {
                 if (error) *error = e.what();
                 return std::nullopt;
@@ -2820,7 +3127,8 @@ void ControlApiServer::register_routes() {
 
             scheduler_.mark_agent_active(acfg.id);
             node_voice_client = std::make_unique<NodeProxyRuntimeClient>(
-                node.url, node.api_key, sched_result->slot_id);
+                std::move(voice_operations), sched_result->slot_id,
+                [this] { return queue_.cancellation_requested(); });
             client = node_voice_client.get();
         }
         try {
@@ -2851,7 +3159,11 @@ void ControlApiServer::register_routes() {
             req.settings.max_tokens = std::min(std::max(req.settings.max_tokens, 256), 768);
             req.stream = false;
 
-            Message response = client->complete(req);
+            Message response = client->complete(req, canceled);
+            if (canceled()) {
+                if (error) *error = "voice proposal inference canceled";
+                return std::nullopt;
+            }
             if (!voice_api_backend) {
                 scheduler_.mark_agent_idle(acfg.id);
             }
@@ -3473,6 +3785,7 @@ void ControlApiServer::register_routes() {
 
         // Chunk callback: forward InferenceChunks as SSE events to client.
         auto chunk_fn = [ctx](const InferenceChunk& chunk) {
+            if (ctx->canceled) return;
             std::string payload;
             if (!chunk.tool_result_json.empty()) {
                 payload = "data: " + chunk.tool_result_json + "\n\n";
@@ -3535,12 +3848,14 @@ void ControlApiServer::register_routes() {
                           conv_id_hint,
                           max_tokens_override,
                           chunk_fn,
+                          ctx,
                           done_for_handle = done_fn,
                           done_for_catch = done_fn]() mutable {
             try {
                 handle_chat(agent_id, message, conv_id_hint,
                             std::move(chunk_fn), std::move(done_for_handle),
-                            max_tokens_override, std::move(content_parts));
+                            max_tokens_override, std::move(content_parts),
+                            [ctx] { return ctx->canceled.load(); });
             } catch (const std::exception& e) {
                 MM_ERROR("queued chat job for agent '{}' failed: {}", agent_id, e.what());
                 done_for_catch(conv_id_hint, false, e.what());
@@ -3556,25 +3871,41 @@ void ControlApiServer::register_routes() {
             [ctx](size_t /*offset*/, httplib::DataSink& sink) -> bool {
                 std::unique_lock<std::mutex> lk(ctx->mx);
                 ctx->cv.wait(lk, [&] {
-                    return !ctx->lines.empty() || ctx->done;
+                    return !ctx->lines.empty() || ctx->done || ctx->canceled;
                 });
+
+                if (ctx->canceled) return false;
 
                 while (!ctx->lines.empty()) {
                     std::string payload = std::move(ctx->lines.front());
                     ctx->lines.pop_front();
                     lk.unlock();
-                    if (!sink.write(payload.data(), payload.size())) return false;
+                    if (!sink.write(payload.data(), payload.size())) {
+                        ctx->canceled = true;
+                        ctx->cv.notify_all();
+                        return false;
+                    }
                     lk.lock();
                 }
 
                 if (ctx->done && ctx->lines.empty()) {
                     lk.unlock();
                     const std::string fin = "data: [DONE]\n\n";
-                    sink.write(fin.data(), fin.size());
+                    if (!sink.write(fin.data(), fin.size())) {
+                        ctx->canceled = true;
+                        ctx->cv.notify_all();
+                        return false;
+                    }
                     sink.done();
                     return true;
                 }
                 return true;
+            },
+            [ctx](bool success) {
+                if (!success) {
+                    ctx->canceled = true;
+                    ctx->cv.notify_all();
+                }
             });
     });
 
@@ -3970,7 +4301,9 @@ void ControlApiServer::register_routes() {
             try {
                 auto api_runtime = make_api_runtime_client(cfg);
                 ConversationManager conv_mgr(a->db(), *api_runtime);
-                ConvId new_id = conv_mgr.force_compact(cid, cfg);
+                ConvId new_id = conv_mgr.force_compact(
+                    cid, cfg,
+                    [this] { return queue_.cancellation_requested(); });
 
                 res.set_content(
                     nlohmann::json{
@@ -4000,10 +4333,13 @@ void ControlApiServer::register_routes() {
         auto mark_idle = [&]() { scheduler_.mark_agent_idle(id); };
 
         try {
-            NodeInfo node = registry_.get_node(sched_result->node_id);
-            NodeProxyRuntimeClient real_runtime(node.url, node.api_key, sched_result->slot_id);
+            NodeProxyRuntimeClient real_runtime(
+                registry_.operations(sched_result->node_id), sched_result->slot_id,
+                [this] { return queue_.cancellation_requested(); });
             ConversationManager conv_mgr(a->db(), real_runtime);
-            ConvId new_id = conv_mgr.force_compact(cid, cfg);
+            ConvId new_id = conv_mgr.force_compact(
+                cid, cfg,
+                [this] { return queue_.cancellation_requested(); });
             mark_idle();
 
             res.set_content(
@@ -4193,21 +4529,28 @@ void ControlApiServer::register_routes() {
             job.job_id   = util::generate_uuid();
             job.agent_id = id;
             job.process_fn = [this, id, conv_id, selected]() {
+                const auto canceled = [this] {
+                    return queue_.cancellation_requested();
+                };
+                if (canceled()) return;
                 auto a_local = agents_.get_agent(id);
                 if (!a_local) return;
 
                 AgentConfig cfg = a_local->get_config();
                 if (agent_uses_api_backend(cfg)) {
+                    if (canceled()) return;
                     try {
                         auto api_runtime = make_api_runtime_client(cfg);
                         MemoryManager mem_mgr(a_local->db(), *api_runtime);
-                        mem_mgr.extract_and_store_memories_from_messages(conv_id, selected, cfg);
+                        mem_mgr.extract_and_store_memories_from_messages(
+                            conv_id, selected, cfg, canceled);
                     } catch (const std::exception& e) {
                         MM_WARN("Manual memory extraction failed for '{}': {}", id, e.what());
                     }
                     return;
                 }
 
+                if (canceled()) return;
                 auto sched_result = scheduler_.ensure_agent_running(cfg);
                 if (!sched_result) {
                     MM_WARN("Manual memory extraction: no node for agent '{}': {}",
@@ -4216,16 +4559,19 @@ void ControlApiServer::register_routes() {
                 }
 
                 scheduler_.mark_agent_active(id);
-                auto mark_idle = [&]() { scheduler_.mark_agent_idle(id); };
+                SchedulerIdleGuard idle_guard;
+                idle_guard.arm(scheduler_, id);
 
                 try {
-                    NodeInfo node = registry_.get_node(sched_result->node_id);
-                    NodeProxyRuntimeClient ext_runtime(node.url, node.api_key, sched_result->slot_id);
+                    NodeProxyRuntimeClient ext_runtime(
+                        registry_.operations(sched_result->node_id),
+                        sched_result->slot_id, canceled);
                     MemoryManager mem_mgr(a_local->db(), ext_runtime);
-                    mem_mgr.extract_and_store_memories_from_messages(conv_id, selected, cfg);
-                    mark_idle();
+                    if (!canceled()) {
+                        mem_mgr.extract_and_store_memories_from_messages(
+                            conv_id, selected, cfg, canceled);
+                    }
                 } catch (const std::exception& e) {
-                    mark_idle();
                     MM_WARN("Manual memory extraction failed for '{}': {}", id, e.what());
                 }
             };

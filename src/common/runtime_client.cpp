@@ -1,4 +1,5 @@
 #include "common/runtime_client.hpp"
+#include "common/cancellable_http.hpp"
 #include "common/inference_response_parser.hpp"
 #include "common/logger.hpp"
 #include "common/util.hpp"
@@ -7,10 +8,12 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <map>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 namespace mm {
 
@@ -240,6 +243,51 @@ httplib::Client make_client(const std::string& base_url) {
     return cli;
 }
 
+std::unique_ptr<CancellableHttpClient> make_cancellable_client(
+    const std::string& base_url,
+    RuntimeClient::CancelCheck cancel_requested) {
+    auto client = std::make_unique<CancellableHttpClient>(
+        client_base_url(base_url), std::move(cancel_requested));
+    client->set_connection_timeout(10);
+    client->set_read_timeout(infer_read_timeout_seconds());
+    client->set_write_timeout(30);
+    return client;
+}
+
+class ClientCancelWatcher {
+public:
+    ClientCancelWatcher(httplib::Client& client,
+                        std::function<bool()> cancel_requested) {
+        if (!cancel_requested) return;
+        thread_ = std::thread([this, &client,
+                               check = std::move(cancel_requested)] {
+            while (!finished_) {
+                bool canceled = false;
+                try { canceled = check(); } catch (...) { canceled = true; }
+                if (canceled) {
+                    client.stop();
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        });
+    }
+
+    ~ClientCancelWatcher() { finish(); }
+
+    void finish() {
+        finished_ = true;
+        if (thread_.joinable()) thread_.join();
+    }
+
+    ClientCancelWatcher(const ClientCancelWatcher&) = delete;
+    ClientCancelWatcher& operator=(const ClientCancelWatcher&) = delete;
+
+private:
+    std::atomic<bool> finished_{false};
+    std::thread thread_;
+};
+
 } // namespace
 
 // ── Construction ──────────────────────────────────────────────────────────────
@@ -263,9 +311,9 @@ RuntimeClient::RuntimeClient(std::string base_url,
 // Keeps the last (tag.size()-1) bytes in buf to handle tags split across chunks.
 // ── parse_sse_line ────────────────────────────────────────────────────────────
 // ── complete (non-streaming) ──────────────────────────────────────────────────
-Message RuntimeClient::complete(const InferenceRequest& req) {
+Message RuntimeClient::complete(const InferenceRequest& req,
+                                CancelCheck cancel_requested) {
     auto body = build_request(req, false);
-    auto cli  = make_client(base_url_);
 
     std::string body_str;
     try {
@@ -275,10 +323,19 @@ Message RuntimeClient::complete(const InferenceRequest& req) {
         return {};
     }
 
-    auto res = cli.Post(chat_completions_path_,
-                        auth_headers(api_key_),
-                        body_str,
-                        "application/json");
+    httplib::Result res;
+    if (cancel_requested && is_plain_http_url(base_url_)) {
+        auto client = make_cancellable_client(base_url_, cancel_requested);
+        res = client->Post(chat_completions_path_, auth_headers(api_key_),
+                           body_str, "application/json");
+    } else {
+        auto client = make_client(base_url_);
+        ClientCancelWatcher cancel_watcher(client, cancel_requested);
+        res = client.Post(chat_completions_path_, auth_headers(api_key_),
+                          body_str, "application/json");
+        cancel_watcher.finish();
+    }
+    if (cancel_requested && cancel_requested()) return {};
     if (!res) {
         MM_ERROR("RuntimeClient::complete: connection failed to {}", base_url_);
         return {};
@@ -299,9 +356,9 @@ Message RuntimeClient::complete(const InferenceRequest& req) {
 // ── stream_complete ───────────────────────────────────────────────────────────
 void RuntimeClient::stream_complete(const InferenceRequest& req,
                                      ChunkCallback chunk_cb,
-                                     ErrorCallback error_cb) {
+                                     ErrorCallback error_cb,
+                                     CancelCheck cancel_requested) {
     auto body = build_request(req, true);
-    auto cli  = make_client(base_url_);
 
     std::string  sse_buf;
     std::string  raw_body;
@@ -325,6 +382,7 @@ void RuntimeClient::stream_complete(const InferenceRequest& req,
     };
 
     auto safe_chunk = [&](const InferenceChunk& c) -> bool {
+        if (cancel_requested && cancel_requested()) return false;
         if (callback_failed) return false;
         try {
             chunk_cb(c);
@@ -366,6 +424,7 @@ void RuntimeClient::stream_complete(const InferenceRequest& req,
     };
 
     auto content_recv = [&](const char* data, size_t len) -> bool {
+        if (cancel_requested && cancel_requested()) return false;
         constexpr size_t kMaxErrBody = 64 * 1024;
         if (raw_body.size() < kMaxErrBody) {
             size_t keep = std::min(len, kMaxErrBody - raw_body.size());
@@ -414,13 +473,23 @@ void RuntimeClient::stream_complete(const InferenceRequest& req,
         safe_error(std::string("request serialization error: ") + e.what());
         return;
     }
-    auto res = cli.Post(
-        chat_completions_path_,
-        auth_headers(api_key_),
-        body_str,
-        "application/json",
-        content_recv
-    );
+    httplib::Result res;
+    if (cancel_requested && is_plain_http_url(base_url_)) {
+        auto client = make_cancellable_client(base_url_, cancel_requested);
+        res = client->Post(chat_completions_path_, auth_headers(api_key_),
+                           body_str, "application/json", content_recv);
+    } else {
+        auto client = make_client(base_url_);
+        ClientCancelWatcher cancel_watcher(client, cancel_requested);
+        res = client.Post(chat_completions_path_, auth_headers(api_key_),
+                          body_str, "application/json", content_recv);
+        cancel_watcher.finish();
+    }
+
+    // Returning false from cpp-httplib's content receiver aborts the active
+    // llama-server response. Cancellation is an expected terminal condition,
+    // not a connection error, and the caller owns its typed canceled result.
+    if (cancel_requested && cancel_requested()) return;
 
     if (callback_failed) {
         safe_error(callback_error);
@@ -438,7 +507,9 @@ void RuntimeClient::stream_complete(const InferenceRequest& req,
             safe_error("HTTP " + std::to_string(res->status) + ": " + err_body);
         }
     }
-    flush_done(); // ensure done is always sent even on error path
+    if (!(cancel_requested && cancel_requested())) {
+        flush_done(); // ensure done is always sent even on error path
+    }
 }
 
 // ── count_tokens ──────────────────────────────────────────────────────────────

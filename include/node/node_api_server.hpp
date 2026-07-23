@@ -1,10 +1,14 @@
 #pragma once
 
 #include "common/models.hpp"
+#include "node/node_service.hpp"
+#include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <cstdint>
+#include <thread>
 #include <vector>
 
 namespace mm {
@@ -13,12 +17,22 @@ class NodeState;
 class SlotManager;
 class HttpServer;
 class ModelStore;
+struct SseInferCtx;
 
 // Hosts the node REST API.
 // Most endpoints require "Authorization: Bearer <node-api-key>".
 // The /pair-request and /pair-complete endpoints are unauthenticated.
 class NodeApiServer {
 public:
+    // Preferred lifecycle-host constructor: the caller owns the typed service
+    // and this class remains a wire/authentication adapter.
+    NodeApiServer(NodeService& service,
+                  NodeState& state,
+                  SlotManager& slot_mgr,
+                  std::string control_url = {},
+                  std::string pairing_key = {});
+
+    // Compatibility constructor retained for existing embedders.
     NodeApiServer(NodeState& state,
                   SlotManager& slot_mgr,
                   std::string control_url = {},
@@ -56,21 +70,31 @@ public:
 private:
     NodeState&     state_;
     SlotManager&   slot_mgr_;
+    // Typed service boundary shared with the embedded-node transport.  The
+    // HTTP server is intentionally limited to authentication, wire parsing,
+    // and response/status translation for operations represented here.
+    std::unique_ptr<NodeService> owned_service_;
+    NodeService&   service_;
     ModelStore*    model_store_ = nullptr;
     std::string    control_url_;
     std::string    pairing_key_;
     std::unique_ptr<HttpServer> server_;
-    RuntimeLogsProvider runtime_logs_provider_;
     RememberApiKeyCallback remember_api_key_cb_;
-    LlamaProvisionCallback llama_provision_cb_;
-    LlamaUpdateCallback llama_update_cb_;
-    LlamaSwitchCallback llama_switch_cb_;
-    LlamaCheckUpdateCallback llama_check_update_cb_;
-    LlamaDiagnoseCallback llama_diagnose_cb_;
-    LlamaRecoveryCallback llama_recovery_cb_;
+
+    struct InferenceTask {
+        std::thread worker;
+        std::shared_ptr<std::atomic<bool>> finished;
+        std::weak_ptr<SseInferCtx> context;
+    };
+    std::atomic<bool> stopping_{false};
+    std::mutex inference_tasks_mutex_;
+    std::vector<InferenceTask> inference_tasks_;
 
     void register_routes();
     bool check_auth(const std::string& auth_header);
+    bool launch_inference_task(const std::shared_ptr<SseInferCtx>& context,
+                               std::function<void()> work);
+    void cancel_and_join_inference_tasks();
 };
 
 } // namespace mm

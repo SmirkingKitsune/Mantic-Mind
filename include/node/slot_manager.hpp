@@ -4,7 +4,9 @@
 #include "common/runtime_client.hpp"
 #include "node/runtime_process.hpp"
 
+#include <atomic>
 #include <cstdint>
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -106,6 +108,11 @@ public:
     }
 
     SlotOperationResult unload_all(bool force = true);
+    // Rejects new loads/leases and cancels pending runtime startups. The host
+    // calls this before joining API/queue workers; unload_all() performs the
+    // destructive drain later in shutdown.
+    void request_shutdown();
+    void reset_shutdown();
     std::optional<SlotId> find_slot_by_agent(const AgentId& agent_id) const;
     SlotLease acquire_slot(const SlotId& slot_id);
     bool touch_slot(const SlotId& slot_id);
@@ -120,7 +127,9 @@ public:
     SlotId add_ready_test_slot(std::string model_path = "model.gguf",
                                AgentId agent_id = {},
                                RuntimeSettings settings = {},
-                               std::string mmproj_path = {});
+                               std::string mmproj_path = {},
+                               std::string runtime_base_url =
+                                   "http://127.0.0.1:0");
 #endif
 
     void set_llama_server_path(const std::string& path);
@@ -155,10 +164,13 @@ private:
     LogCallback log_cb_;
 
     mutable std::mutex mutex_;
+    std::condition_variable lease_cv_;
     std::vector<std::unique_ptr<Slot>> slots_;
     std::set<uint16_t> used_ports_;
     std::string last_error_;
     int pending_loads_ = 0;
+    std::atomic<bool> unloading_all_{false};
+    std::atomic<bool> shutdown_requested_{false};
 
     void release_slot_request(const SlotId& slot_id);
     std::optional<SlotId> try_attach(const std::string& model_path,

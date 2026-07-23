@@ -3,7 +3,6 @@
 #include "node/slot_manager.hpp"
 #include "node/model_store.hpp"
 #include "common/http_server.hpp"
-#include "common/runtime_client.hpp"
 #include "common/models.hpp"
 #include "common/logger.hpp"
 #include "common/pairing.hpp"
@@ -26,12 +25,6 @@ namespace mm {
 namespace fs = std::filesystem;
 
 namespace {
-
-// A llama.cpp runtime is usable for launching engines once it resolves to an
-// executable (found on PATH or a completed managed install).
-bool node_llama_runtime_ready(const LlamaRuntimeStatus& rt) {
-    return (rt.status == "resolved" || rt.status == "ready") && !rt.executable_path.empty();
-}
 
 // Load paths currently backing a live slot — models the store must never
 // evict out from under a running engine.
@@ -68,12 +61,27 @@ std::string safe_json_dump(const nlohmann::json& j) {
 
 } // namespace
 
+NodeApiServer::NodeApiServer(NodeService& service,
+                             NodeState& state,
+                             SlotManager& slot_mgr,
+                             std::string control_url,
+                             std::string pairing_key)
+    : state_(state)
+    , slot_mgr_(slot_mgr)
+    , service_(service)
+    , control_url_(std::move(control_url))
+    , pairing_key_(std::move(pairing_key))
+    , server_(std::make_unique<HttpServer>())
+{}
+
 NodeApiServer::NodeApiServer(NodeState& state,
                              SlotManager& slot_mgr,
                              std::string control_url,
                              std::string pairing_key)
     : state_(state)
     , slot_mgr_(slot_mgr)
+    , owned_service_(std::make_unique<NodeService>(state, slot_mgr))
+    , service_(*owned_service_)
     , control_url_(std::move(control_url))
     , pairing_key_(std::move(pairing_key))
     , server_(std::make_unique<HttpServer>())
@@ -82,6 +90,7 @@ NodeApiServer::NodeApiServer(NodeState& state,
 NodeApiServer::~NodeApiServer() { stop(); }
 
 bool NodeApiServer::listen(uint16_t port) {
+    stopping_ = false;
     // Streamed model uploads far exceed cpp-httplib's 100 MB default body cap;
     // raise it so /api/node/models/receive can accept multi-GB model files.
     server_->set_payload_max_length(std::size_t{1} << 42);  // 4 TiB
@@ -90,10 +99,118 @@ bool NodeApiServer::listen(uint16_t port) {
     return server_->listen("0.0.0.0", port);
 }
 
-void NodeApiServer::stop() { server_->stop(); }
+void NodeApiServer::stop() {
+    stopping_ = true;
+    server_->stop();
+    cancel_and_join_inference_tasks();
+}
+
+bool NodeApiServer::launch_inference_task(
+    const std::shared_ptr<SseInferCtx>& context,
+    std::function<void()> work) {
+    std::vector<std::thread> completed;
+    bool launched = false;
+
+    {
+        std::lock_guard<std::mutex> lock(inference_tasks_mutex_);
+
+        // Join completed workers opportunistically so a long-running node does
+        // not retain one native thread handle for every inference request.
+        auto it = inference_tasks_.begin();
+        while (it != inference_tasks_.end()) {
+            if (it->finished && it->finished->load()) {
+                if (it->worker.joinable()) completed.push_back(std::move(it->worker));
+                it = inference_tasks_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        if (!stopping_) {
+            auto finished = std::make_shared<std::atomic<bool>>(false);
+            inference_tasks_.push_back(InferenceTask{});
+            auto& task = inference_tasks_.back();
+            task.finished = finished;
+            task.context = context;
+            try {
+                task.worker = std::thread(
+                    [this, context, work = std::move(work), finished]() mutable {
+                        std::string unhandled_error;
+                        try {
+                            work();
+                        } catch (const std::exception& e) {
+                            MM_ERROR("NodeApiServer unhandled infer task exception: {}", e.what());
+                            unhandled_error =
+                                std::string("unhandled infer task exception: ") + e.what();
+                        } catch (...) {
+                            MM_ERROR("NodeApiServer unhandled infer task exception: unknown");
+                            unhandled_error = "unhandled infer task exception: unknown";
+                        }
+                        if (!unhandled_error.empty()) {
+                            state_.set_last_error(unhandled_error);
+                            bool terminal_emitted = false;
+                            try {
+                                std::lock_guard<std::mutex> context_lock(context->mx);
+                                if (!context->done) {
+                                    if (!context->canceled) {
+                                        context->lines.push_back(
+                                            "data: " + safe_json_dump(nlohmann::json{
+                                                {"type", "error"},
+                                                {"message", unhandled_error}
+                                            }) + "\n\n");
+                                        terminal_emitted = true;
+                                    }
+                                    context->done = true;
+                                    context->cv.notify_all();
+                                }
+                            } catch (...) {
+                                context->canceled = true;
+                                context->cv.notify_all();
+                            }
+                            state_.finish_streaming_text(
+                                terminal_emitted ? "error" : "canceled", 0);
+                        }
+                        finished->store(true);
+                    });
+                launched = true;
+            } catch (...) {
+                inference_tasks_.pop_back();
+            }
+        }
+    }
+
+    for (auto& worker : completed) {
+        if (worker.joinable()) worker.join();
+    }
+    return launched;
+}
+
+void NodeApiServer::cancel_and_join_inference_tasks() {
+    std::vector<std::thread> workers;
+    std::vector<std::shared_ptr<SseInferCtx>> contexts;
+
+    {
+        std::lock_guard<std::mutex> lock(inference_tasks_mutex_);
+        workers.reserve(inference_tasks_.size());
+        contexts.reserve(inference_tasks_.size());
+        for (auto& task : inference_tasks_) {
+            if (auto context = task.context.lock()) contexts.push_back(std::move(context));
+            if (task.worker.joinable()) workers.push_back(std::move(task.worker));
+        }
+        inference_tasks_.clear();
+    }
+
+    for (const auto& context : contexts) {
+        context->canceled = true;
+        context->cv.notify_all();
+    }
+    for (auto& worker : workers) {
+        if (worker.joinable()) worker.join();
+    }
+}
 
 void NodeApiServer::set_runtime_logs_provider(RuntimeLogsProvider provider) {
-    runtime_logs_provider_ = std::move(provider);
+    service_.set_runtime_logs_provider(std::move(provider));
 }
 
 void NodeApiServer::set_remember_api_key_callback(RememberApiKeyCallback callback) {
@@ -101,31 +218,32 @@ void NodeApiServer::set_remember_api_key_callback(RememberApiKeyCallback callbac
 }
 
 void NodeApiServer::set_llama_provision_callback(LlamaProvisionCallback callback) {
-    llama_provision_cb_ = std::move(callback);
+    service_.set_llama_provision_callback(std::move(callback));
 }
 
 void NodeApiServer::set_llama_update_callback(LlamaUpdateCallback callback) {
-    llama_update_cb_ = std::move(callback);
+    service_.set_llama_update_callback(std::move(callback));
 }
 
 void NodeApiServer::set_llama_switch_callback(LlamaSwitchCallback callback) {
-    llama_switch_cb_ = std::move(callback);
+    service_.set_llama_switch_callback(std::move(callback));
 }
 
 void NodeApiServer::set_llama_check_update_callback(LlamaCheckUpdateCallback callback) {
-    llama_check_update_cb_ = std::move(callback);
+    service_.set_llama_check_update_callback(std::move(callback));
 }
 
 void NodeApiServer::set_llama_diagnose_callback(LlamaDiagnoseCallback callback) {
-    llama_diagnose_cb_ = std::move(callback);
+    service_.set_llama_diagnose_callback(std::move(callback));
 }
 
 void NodeApiServer::set_llama_recovery_callback(LlamaRecoveryCallback callback) {
-    llama_recovery_cb_ = std::move(callback);
+    service_.set_llama_recovery_callback(std::move(callback));
 }
 
 void NodeApiServer::set_model_store(ModelStore* store) {
     model_store_ = store;
+    service_.set_model_store(store);
 }
 
 // ── Auth check ────────────────────────────────────────────────────────────────
@@ -146,8 +264,8 @@ void NodeApiServer::register_routes() {
         if (!check_auth(req.get_header_value("Authorization"))) {
             res.status = 401; return;
         }
-        auto m = state_.get_metrics();
-        nlohmann::json j = m;
+        const auto snapshot = service_.snapshot();
+        nlohmann::json j = snapshot.health;
         j["status"] = "ok";
         res.set_content(j.dump(), "application/json");
     });
@@ -157,71 +275,37 @@ void NodeApiServer::register_routes() {
         if (!check_auth(req.get_header_value("Authorization"))) {
             res.status = 401; return;
         }
-        auto slots = slot_mgr_.get_slot_info();
-        const int max_slots = static_cast<int>(slot_mgr_.max_slots());
-
-        int ready_slots = 0;
-        int loading_slots = 0;
-        int suspending_slots = 0;
-        int suspended_slots = 0;
-        int error_slots = 0;
-        for (const auto& s : slots) {
-            switch (s.state) {
-                case SlotState::Ready:      ++ready_slots; break;
-                case SlotState::Loading:    ++loading_slots; break;
-                case SlotState::Suspending: ++suspending_slots; break;
-                case SlotState::Suspended:  ++suspended_slots; break;
-                case SlotState::Error:      ++error_slots; break;
-                case SlotState::Empty:
-                default:
-                    break;
-            }
-        }
-        const int in_use_slots = ready_slots + loading_slots + suspending_slots + error_slots;
-        const int available_slots = std::max(0, max_slots - in_use_slots);
-
-        const auto metrics = state_.get_metrics();
+        const auto snapshot = service_.snapshot();
         nlohmann::json j;
-        j["node_id"]       = state_.get_node_id();
-        j["hostname"]      = mm::util::hostname();
-        j["slots"]         = slots;
+        j["node_id"]       = snapshot.node_id;
+        j["hostname"]      = snapshot.hostname;
+        j["slots"]         = snapshot.slots;
         if (model_store_) {
             nlohmann::json managed = nlohmann::json::array();
-            for (const auto& m : model_store_->list())
+            for (const auto& m : snapshot.managed_models)
                 managed.push_back({{"id", m.id},
                                    {"size_bytes", m.size_bytes},
                                    {"pinned", m.pinned},
                                    {"last_used_ms", m.last_used_ms}});
             j["managed_models"] = managed;
-            j["model_cache_free_bytes"] = model_store_->free_bytes();
+            j["model_cache_free_bytes"] = snapshot.model_cache_free_bytes;
         }
-        j["disk_free_mb"]  = metrics.disk_free_mb;
-        j["health"]        = metrics;
-        j["capabilities"]  = state_.get_capabilities();
-        j["max_slots"]     = max_slots;
-        j["slot_in_use"]   = in_use_slots;
-        j["slot_available"] = available_slots;
-        j["slot_ready"]    = ready_slots;
-        j["slot_loading"]  = loading_slots;
-        j["slot_suspending"] = suspending_slots;
-        j["slot_suspended"] = suspended_slots;
-        j["slot_error"]    = error_slots;
-        j["llama_server_path"] = slot_mgr_.llama_server_path();
-        j["llama_runtime"] = state_.get_llama_runtime();
-        j["action_progress"] = state_.get_action_progress();
-
-        // Backwards compat: set single-model fields from first ready slot.
-        std::string first_model;
-        std::string first_agent;
-        for (const auto& s : slots) {
-            if (s.state == SlotState::Ready) {
-                first_model = s.model_path;
-                first_agent = s.assigned_agent;
-                break;
-            }
-        }
-        j["loaded_model"]  = first_model;
-        j["active_agent"]  = first_agent;
+        j["disk_free_mb"]  = snapshot.disk_free_mb;
+        j["health"]        = snapshot.health;
+        j["capabilities"]  = snapshot.capabilities;
+        j["max_slots"]     = snapshot.max_slots;
+        j["slot_in_use"]   = snapshot.slot_in_use;
+        j["slot_available"] = snapshot.slot_available;
+        j["slot_ready"]    = snapshot.slot_ready;
+        j["slot_loading"]  = snapshot.slot_loading;
+        j["slot_suspending"] = snapshot.slot_suspending;
+        j["slot_suspended"] = snapshot.slot_suspended;
+        j["slot_error"]    = snapshot.slot_error;
+        j["llama_server_path"] = snapshot.llama_server_path;
+        j["llama_runtime"] = snapshot.llama_runtime;
+        j["action_progress"] = snapshot.action_progress;
+        j["loaded_model"]  = snapshot.loaded_model;
+        j["active_agent"]  = snapshot.active_agent;
 
         res.set_content(j.dump(), "application/json");
     });
@@ -232,7 +316,7 @@ void NodeApiServer::register_routes() {
             res.status = 401;
             return;
         }
-        const bool accepted = state_.request_action_cancel();
+        const bool accepted = service_.cancel_action();
         if (!accepted) {
             res.status = 409;
             res.set_content(R"({"error":"no cancelable action is active"})", "application/json");
@@ -259,8 +343,7 @@ void NodeApiServer::register_routes() {
         if (tail < 1) tail = 1;
         if (tail > 5000) tail = 5000;
 
-        std::vector<std::string> lines;
-        if (runtime_logs_provider_) lines = runtime_logs_provider_(tail);
+        const std::vector<std::string> lines = service_.runtime_logs(tail);
         res.set_content(nlohmann::json{{"lines", lines}}.dump(), "application/json");
     });
 
@@ -269,7 +352,7 @@ void NodeApiServer::register_routes() {
         if (!check_auth(req.get_header_value("Authorization"))) {
             res.status = 401; return;
         }
-        res.set_content(nlohmann::json{{"llama_runtime", state_.get_llama_runtime()}}.dump(),
+        res.set_content(nlohmann::json{{"llama_runtime", service_.snapshot().llama_runtime}}.dump(),
                         "application/json");
     });
 
@@ -297,7 +380,10 @@ void NodeApiServer::register_routes() {
                 return;
             }
         }
-        if ((want_update && !llama_update_cb_) || (!want_update && !llama_provision_cb_)) {
+        const auto result = want_update
+            ? service_.update_llama_runtime(accelerator)
+            : service_.provision_llama_runtime();
+        if (result.status == NodeServiceStatus::Unavailable) {
             res.status = 501;
             res.set_content(want_update
                                 ? R"({"error":"llama.cpp update is not configured"})"
@@ -305,14 +391,10 @@ void NodeApiServer::register_routes() {
                             "application/json");
             return;
         }
-        auto runtime = want_update ? llama_update_cb_(accelerator)
-                                   : llama_provision_cb_();
-        state_.set_llama_runtime(runtime);
-        if (!runtime.last_error.empty()) state_.set_last_error(runtime.last_error);
-        if (runtime.status == "failed" || runtime.status == "disabled") res.status = 500;
-        else if (want_update && !runtime.last_error.empty()) res.status = 409;
+        if (result.status == NodeServiceStatus::Failed) res.status = 500;
+        else if (result.status == NodeServiceStatus::Conflict) res.status = 409;
         else res.status = 200;
-        res.set_content(nlohmann::json{{"llama_runtime", runtime}}.dump(),
+        res.set_content(nlohmann::json{{"llama_runtime", result.runtime}}.dump(),
                         "application/json");
     });
 
@@ -320,27 +402,20 @@ void NodeApiServer::register_routes() {
         if (!check_auth(req.get_header_value("Authorization"))) {
             res.status = 401; return;
         }
-        if (!llama_check_update_cb_) {
+        const auto result = service_.check_llama_runtime_update();
+        if (result.status == NodeServiceStatus::Unavailable) {
             res.status = 501;
             res.set_content(R"({"error":"llama.cpp update checking is not configured"})",
                             "application/json");
             return;
         }
-        auto runtime = llama_check_update_cb_();
-        state_.set_llama_runtime(runtime);
-        res.set_content(nlohmann::json{{"llama_runtime", runtime}}.dump(),
+        res.set_content(nlohmann::json{{"llama_runtime", result.runtime}}.dump(),
                         "application/json");
     });
 
     server_->Post("/api/node/runtime/llama/switch", [this](const Request& req, Response& res) {
         if (!check_auth(req.get_header_value("Authorization"))) {
             res.status = 401; return;
-        }
-        if (!llama_switch_cb_) {
-            res.status = 501;
-            res.set_content(R"({"error":"llama.cpp engine switching is not configured"})",
-                            "application/json");
-            return;
         }
         std::string variant;
         try {
@@ -356,13 +431,17 @@ void NodeApiServer::register_routes() {
             res.set_content(R"({"error":"variant is required"})", "application/json");
             return;
         }
-        auto runtime = llama_switch_cb_(variant);
-        state_.set_llama_runtime(runtime);
-        if (!runtime.last_error.empty()) state_.set_last_error(runtime.last_error);
-        if (runtime.status == "failed" || runtime.status == "disabled") res.status = 500;
-        else if (!runtime.last_error.empty()) res.status = 409;
+        const auto result = service_.switch_llama_runtime(variant);
+        if (result.status == NodeServiceStatus::Unavailable) {
+            res.status = 501;
+            res.set_content(R"({"error":"llama.cpp engine switching is not configured"})",
+                            "application/json");
+            return;
+        }
+        if (result.status == NodeServiceStatus::Failed) res.status = 500;
+        else if (result.status == NodeServiceStatus::Conflict) res.status = 409;
         else res.status = 200;
-        res.set_content(nlohmann::json{{"llama_runtime", runtime}}.dump(),
+        res.set_content(nlohmann::json{{"llama_runtime", result.runtime}}.dump(),
                         "application/json");
     });
 
@@ -370,27 +449,20 @@ void NodeApiServer::register_routes() {
         if (!check_auth(req.get_header_value("Authorization"))) {
             res.status = 401; return;
         }
-        if (!llama_diagnose_cb_) {
+        const auto result = service_.diagnose_llama_runtime();
+        if (result.status == NodeServiceStatus::Unavailable) {
             res.status = 501;
             res.set_content(R"({"error":"llama.cpp diagnostics are not configured"})",
                             "application/json");
             return;
         }
-        auto runtime = llama_diagnose_cb_();
-        state_.set_llama_runtime(runtime);
-        res.set_content(nlohmann::json{{"llama_runtime", runtime}}.dump(),
+        res.set_content(nlohmann::json{{"llama_runtime", result.runtime}}.dump(),
                         "application/json");
     });
 
     server_->Post("/api/node/runtime/llama/recover", [this](const Request& req, Response& res) {
         if (!check_auth(req.get_header_value("Authorization"))) {
             res.status = 401; return;
-        }
-        if (!llama_recovery_cb_) {
-            res.status = 501;
-            res.set_content(R"({"error":"llama.cpp recovery is not configured"})",
-                            "application/json");
-            return;
         }
         std::string action;
         std::string variant;
@@ -412,13 +484,17 @@ void NodeApiServer::register_routes() {
                 "application/json");
             return;
         }
-        auto runtime = llama_recovery_cb_(action, variant);
-        state_.set_llama_runtime(runtime);
-        if (!runtime.last_error.empty()) state_.set_last_error(runtime.last_error);
-        if (runtime.status == "failed") res.status = 500;
-        else if (!runtime.last_error.empty()) res.status = 409;
+        const auto result = service_.recover_llama_runtime(action, variant);
+        if (result.status == NodeServiceStatus::Unavailable) {
+            res.status = 501;
+            res.set_content(R"({"error":"llama.cpp recovery is not configured"})",
+                            "application/json");
+            return;
+        }
+        if (result.status == NodeServiceStatus::Failed) res.status = 500;
+        else if (result.status == NodeServiceStatus::Conflict) res.status = 409;
         else res.status = 200;
-        res.set_content(nlohmann::json{{"llama_runtime", runtime}}.dump(),
+        res.set_content(nlohmann::json{{"llama_runtime", result.runtime}}.dump(),
                         "application/json");
     });
 
@@ -427,149 +503,94 @@ void NodeApiServer::register_routes() {
             res.status = 401; return;
         }
         try {
-            auto j = nlohmann::json::parse(req.body);
-            std::string model_ref  = j.value("model_path", std::string{});
-            std::string mmproj_ref = j.value("mmproj_path", std::string{});
-            const bool vision_enabled = j.value("vision_enabled", !mmproj_ref.empty());
-            std::string agent_id   = j.value("agent_id",   std::string{});
-            // Optional: identity + pin flag for a control-transferred model, so
-            // the node can refresh the LRU use-queue and pinned state on load.
-            const std::string model_id = j.value("model_id", std::string{});
-            const std::string mmproj_model_id =
-                j.value("mmproj_model_id", std::string{});
-            const bool model_pin       = j.value("pin", false);
-            // llama.cpp is the default runtime: a payload without an explicit
-            // backend loads through llama-server. Control always sends the
-            // field, so this default only decides hand-written requests.
-            const std::string backend = mm::util::to_lower(mm::util::trim(
-                j.value("backend", std::string{"llama-cpp"})));
-            RuntimeSettings runtime_settings;
-            if (j.contains("runtime_settings")) runtime_settings = j["runtime_settings"].get<RuntimeSettings>();
-
-            if (backend != "llama-cpp") {
-                res.status = 400;
-                const std::string msg = "unsupported node inference backend: " + backend;
-                state_.set_last_error(msg);
-                res.set_content(nlohmann::json{{"error", msg},
-                                               {"supported_backends", {"llama-cpp"}}}.dump(),
-                                "application/json");
-                return;
+            const auto j = nlohmann::json::parse(req.body);
+            NodeLoadModelRequest request;
+            request.model_path = j.value("model_path", std::string{});
+            request.mmproj_path = j.value("mmproj_path", std::string{});
+            request.vision_enabled =
+                j.value("vision_enabled", !request.mmproj_path.empty());
+            request.agent_id = j.value("agent_id", std::string{});
+            request.model_id = j.value("model_id", std::string{});
+            request.mmproj_model_id = j.value("mmproj_model_id", std::string{});
+            request.pin = j.value("pin", false);
+            request.backend = j.value("backend", std::string{"llama-cpp"});
+            if (j.contains("runtime_settings")) {
+                request.runtime_settings = j["runtime_settings"].get<RuntimeSettings>();
             }
 
-            if (model_ref.empty()) {
+            if (request.model_path.empty()) {
                 res.status = 400;
                 state_.set_last_error("model_path required");
-                res.set_content(R"({"error":"model_path required"})", "application/json");
-                return;
-            }
-
-            // llama.cpp always loads a local GGUF file.
-            const std::string model_path = sanitize_path_for_runtime(model_ref);
-            const std::string mmproj_path = sanitize_path_for_runtime(mmproj_ref);
-
-            if (vision_enabled && mmproj_path.empty()) {
-                res.status = 400;
-                res.set_content(R"({"error":"vision-enabled llama-cpp load requires mmproj_path"})",
-                                "application/json");
-                return;
-            }
-            if (!vision_enabled && !mmproj_path.empty()) {
-                res.status = 400;
-                res.set_content(R"({"error":"llama.cpp mmproj_path requires vision_enabled=true"})",
-                                "application/json");
-                return;
-            }
-            if (!mmproj_path.empty()) {
-                std::error_code ec;
-                if (!fs::is_regular_file(mmproj_path, ec)) {
-                    res.status = 400;
-                    const std::string msg = "projector path not found on this node: " + mmproj_path;
-                    state_.set_last_error(msg);
-                    res.set_content(nlohmann::json{{"error", "projector not found on node"},
-                                                   {"detail", msg}}.dump(),
-                                    "application/json");
-                    return;
-                }
-            }
-
-            // Fail fast rather than spawn an engine without a usable runtime.
-            if (const auto rt = state_.get_llama_runtime(); !node_llama_runtime_ready(rt)) {
-                res.status = 503;
-                const std::string msg = rt.last_error.empty()
-                    ? "llama.cpp runtime is not ready on this node (status=" + rt.status + ")"
-                    : "llama.cpp runtime is not ready on this node: " + rt.last_error;
-                state_.set_last_error(msg);
-                res.set_content(nlohmann::json{{"error", "llama runtime not ready"},
-                                               {"detail", msg},
-                                               {"llama_runtime", rt}}.dump(),
-                                "application/json");
-                return;
-            }
-
-            // Model references must resolve to local files on this node.
-            std::error_code model_ec;
-            if (!fs::is_regular_file(model_path, model_ec)) {
-                res.status = 400;
-                const std::string msg = mm::util::is_hf_repo_id(model_path)
-                    ? "llama.cpp requires a node-local GGUF file; Hugging Face repository IDs are not loadable"
-                    : "model file not found on this node: " + model_path;
-                state_.set_last_error(msg);
-                res.set_content(nlohmann::json{{"error", "model not found on node"},
-                                               {"detail", msg},
-                                               {"model_path", model_path}}.dump(),
-                                "application/json");
-                return;
-            }
-            auto slot_id = slot_mgr_.load_model(
-                model_path, mmproj_path, runtime_settings, agent_id);
-            if (slot_id.empty()) {
-                res.status = 500;
-                nlohmann::json err = {{"error", "failed to load model"}};
-                auto detail = slot_mgr_.last_error();
-                err["llama_server_path"] = slot_mgr_.llama_server_path();
-                err["llama_runtime"] = state_.get_llama_runtime();
-                err["model_path"] = model_path;
-                state_.set_last_error(detail.empty() ? "failed to load model" : detail);
-                if (!detail.empty()) err["detail"] = detail;
-                res.set_content(err.dump(), "application/json");
-            } else {
-                // Update NodeState for UI
-                auto slots_info = slot_mgr_.get_slot_info();
-                state_.set_slots(slots_info);
-                state_.set_loaded_model(model_path);
-                if (!agent_id.empty()) state_.set_active_agent(agent_id);
-                state_.set_last_error("");
-
-                // Refresh the local cache's use-queue and pin state for a
-                // transferred model. Pin is STICKY: a load from a preferred
-                // agent pins the model, but a later load from a non-preferred
-                // agent (pin=false) must not clear a pin another agent set —
-                // otherwise the model would become evictable despite a standing
-                // preference. Unpinning is a separate, explicit lifecycle event.
-                if (model_store_) {
-                    for (const auto& id : {model_id, mmproj_model_id}) {
-                        if (id.empty()) continue;
-                        if (model_pin) model_store_->set_pinned(id, true);
-                        model_store_->touch(id);
-                        if (id == model_id && mmproj_model_id == model_id) break;
-                    }
-                }
-
-                // Find the effective_ctx_size for the newly loaded slot.
-                int effective_ctx = 0;
-                for (const auto& si : slots_info) {
-                    if (si.id == slot_id) {
-                        effective_ctx = si.effective_ctx_size;
-                        break;
-                    }
-                }
                 res.set_content(
-                    nlohmann::json{{"status","loaded"},
-                                   {"slot_id", slot_id},
-                                   {"effective_ctx_size", effective_ctx},
-                                   {"model_path", model_path}}.dump(),
+                    R"({"error":"model_path required","code":"invalid_argument"})",
                     "application/json");
+                return;
             }
+
+            const auto result = service_.load_model(request);
+            if (!result.ok()) {
+                if (result.status == NodeServiceStatus::UnsupportedBackend) {
+                    res.status = 400;
+                    res.set_content(nlohmann::json{{"error", result.error},
+                                                   {"code", "unsupported_backend"},
+                                                   {"supported_backends", {"llama-cpp"}}}.dump(),
+                                    "application/json");
+                } else if (result.status == NodeServiceStatus::RuntimeUnavailable) {
+                    res.status = 503;
+                    res.set_content(nlohmann::json{
+                        {"error", "llama runtime not ready"},
+                        {"code", "runtime_unavailable"},
+                        {"detail", result.error},
+                        {"llama_runtime", service_.snapshot().llama_runtime}
+                    }.dump(), "application/json");
+                } else if (result.status == NodeServiceStatus::ModelNotFound) {
+                    res.status = 400;
+                    const std::string model_path = sanitize_path_for_runtime(request.model_path);
+                    if (result.error.rfind("projector path", 0) == 0) {
+                        res.set_content(nlohmann::json{
+                            {"error", "projector not found on node"},
+                            {"code", "model_not_found"},
+                            {"detail", result.error}
+                        }.dump(), "application/json");
+                    } else {
+                        const std::string detail = mm::util::is_hf_repo_id(model_path)
+                            ? "llama.cpp requires a node-local GGUF file; Hugging Face repository IDs are not loadable"
+                            : result.error;
+                        res.set_content(nlohmann::json{
+                            {"error", "model not found on node"},
+                            {"code", "model_not_found"},
+                            {"detail", detail},
+                            {"model_path", model_path}
+                        }.dump(), "application/json");
+                    }
+                } else if (result.status == NodeServiceStatus::InvalidArgument) {
+                    res.status = 400;
+                    res.set_content(nlohmann::json{{"error", result.error},
+                                                   {"code", "invalid_argument"}}.dump(),
+                                    "application/json");
+                } else {
+                    res.status = 500;
+                    const auto snapshot = service_.snapshot();
+                    nlohmann::json error = {
+                        {"error", "failed to load model"},
+                        {"code", to_string(result.status)},
+                        {"llama_server_path", snapshot.llama_server_path},
+                        {"llama_runtime", snapshot.llama_runtime},
+                        {"model_path", sanitize_path_for_runtime(request.model_path)}
+                    };
+                    if (!result.error.empty()) error["detail"] = result.error;
+                    res.set_content(error.dump(), "application/json");
+                }
+                return;
+            }
+            res.set_content(nlohmann::json{
+                {"status", "loaded"},
+                {"slot_id", result.slot_id},
+                {"effective_ctx_size", result.effective_ctx_size},
+                {"model_path", result.model_path}
+            }.dump(), "application/json");
+            return;
+
         } catch (const std::exception& e) {
             res.status = 400;
             state_.set_last_error(e.what());
@@ -586,30 +607,14 @@ void NodeApiServer::register_routes() {
             auto j = nlohmann::json::parse(req.body);
             std::string slot_id = j.value("slot_id", std::string{});
 
-            if (slot_id.empty()) {
-                // Backwards compat: unload all if no slot_id given
-                auto unload = slot_mgr_.unload_all(false);
-                if (!unload.ok()) {
-                    res.status = unload.status == SlotOperationStatus::Busy ? 409 : 500;
-                    res.set_content(nlohmann::json{{"error", unload.message}}.dump(),
-                                    "application/json");
-                    return;
-                }
-                state_.set_loaded_model("");
-                state_.set_active_agent("");
-                state_.set_slots({});
-                state_.set_last_error("");
-            } else {
-                auto unload = slot_mgr_.unload_slot(slot_id);
-                state_.set_slots(slot_mgr_.get_slot_info());
-                if (!unload.ok()) {
-                    res.status = unload.status == SlotOperationStatus::NotFound ? 404
-                               : unload.status == SlotOperationStatus::Busy ? 409
-                               : 500;
-                    res.set_content(nlohmann::json{{"error", unload.message}}.dump(),
-                                    "application/json");
-                    return;
-                }
+            const auto unload = service_.unload_model({slot_id, false});
+            if (!unload.ok()) {
+                res.status = unload.status == SlotOperationStatus::NotFound ? 404
+                           : unload.status == SlotOperationStatus::Busy ? 409
+                           : 500;
+                res.set_content(nlohmann::json{{"error", unload.message}}.dump(),
+                                "application/json");
+                return;
             }
             res.set_content(R"({"status":"unloaded"})", "application/json");
         } catch (const std::exception& e) {
@@ -830,8 +835,7 @@ void NodeApiServer::register_routes() {
                 return;
             }
 
-            auto detach = slot_mgr_.detach_agent(slot_id, agent_id);
-            state_.set_slots(slot_mgr_.get_slot_info());
+            const auto detach = service_.detach_agent({slot_id, agent_id});
             if (!detach.ok()) {
                 res.status = detach.status == SlotOperationStatus::NotFound ? 404 : 500;
                 res.set_content(nlohmann::json{{"error", detach.message}}.dump(),
@@ -864,8 +868,7 @@ void NodeApiServer::register_routes() {
                 return;
             }
 
-            auto suspend = slot_mgr_.suspend_slot(slot_id);
-            state_.set_slots(slot_mgr_.get_slot_info());
+            const auto suspend = service_.suspend_slot({slot_id});
             if (!suspend.ok()) {
                 res.status = suspend.status == SlotOperationStatus::NotFound ? 404
                            : suspend.status == SlotOperationStatus::Busy ? 409
@@ -891,119 +894,87 @@ void NodeApiServer::register_routes() {
             res.status = 401; return;
         }
         try {
-            auto j = nlohmann::json::parse(req.body);
-            std::string model_path = sanitize_path_for_runtime(
-                j.value("model_path", std::string{}));
-            std::string mmproj_path = sanitize_path_for_runtime(
-                j.value("mmproj_path", std::string{}));
-            const bool vision_enabled = j.value("vision_enabled", !mmproj_path.empty());
-            std::string agent_id   = j.value("agent_id", std::string{});
-            const std::string backend = mm::util::to_lower(mm::util::trim(
-                j.value("backend", std::string{"llama-cpp"})));
-            const std::string kv_cache_path = j.value("kv_cache_path", std::string{});
-            const std::string model_id = j.value("model_id", std::string{});
-            const std::string mmproj_model_id =
-                j.value("mmproj_model_id", std::string{});
-            const bool model_pin = j.value("pin", false);
-            RuntimeSettings runtime_settings;
-            if (j.contains("runtime_settings")) runtime_settings = j["runtime_settings"].get<RuntimeSettings>();
-
-            if (backend != "llama-cpp") {
-                res.status = 400;
-                const std::string msg = "unsupported node inference backend: " + backend;
-                state_.set_last_error(msg);
-                res.set_content(nlohmann::json{{"error", msg},
-                                               {"supported_backends", {"llama-cpp"}}}.dump(),
-                                "application/json");
-                return;
+            const auto j = nlohmann::json::parse(req.body);
+            NodeRestoreModelRequest request;
+            request.model_path = j.value("model_path", std::string{});
+            request.mmproj_path = j.value("mmproj_path", std::string{});
+            request.vision_enabled =
+                j.value("vision_enabled", !request.mmproj_path.empty());
+            request.agent_id = j.value("agent_id", std::string{});
+            request.backend = j.value("backend", std::string{"llama-cpp"});
+            request.kv_cache_path = j.value("kv_cache_path", std::string{});
+            request.model_id = j.value("model_id", std::string{});
+            request.mmproj_model_id = j.value("mmproj_model_id", std::string{});
+            request.pin = j.value("pin", false);
+            if (j.contains("runtime_settings")) {
+                request.runtime_settings = j["runtime_settings"].get<RuntimeSettings>();
             }
 
-            if (model_path.empty()) {
+            if (request.model_path.empty()) {
                 res.status = 400;
                 state_.set_last_error("model_path required");
                 res.set_content(R"({"error":"model_path required"})", "application/json");
                 return;
             }
 
-            if (const auto rt = state_.get_llama_runtime(); !node_llama_runtime_ready(rt)) {
-                res.status = 503;
-                const std::string msg = rt.last_error.empty()
-                    ? "llama.cpp runtime is not ready on this node (status=" + rt.status + ")"
-                    : "llama.cpp runtime is not ready on this node: " + rt.last_error;
-                state_.set_last_error(msg);
-                res.set_content(nlohmann::json{{"error", "llama runtime not ready"},
-                                               {"detail", msg},
-                                               {"llama_runtime", rt}}.dump(),
-                                "application/json");
-                return;
-            }
-
-            if (vision_enabled && mmproj_path.empty()) {
-                res.status = 400;
-                res.set_content(R"({"error":"vision-enabled llama-cpp restore requires mmproj_path"})",
-                                "application/json");
-                return;
-            }
-            if (!vision_enabled && !mmproj_path.empty()) {
-                res.status = 400;
-                res.set_content(R"({"error":"llama.cpp mmproj_path requires vision_enabled=true"})",
-                                "application/json");
-                return;
-            }
-            if (!mmproj_path.empty()) {
-                std::error_code ec;
-                if (!fs::is_regular_file(mmproj_path, ec)) {
+            const auto result = service_.restore_slot(request);
+            if (!result.ok()) {
+                if (result.status == NodeServiceStatus::UnsupportedBackend) {
                     res.status = 400;
-                    res.set_content(nlohmann::json{{"error", "projector not found on node"},
-                                                   {"detail", "projector path not found on this node: " + mmproj_path}}.dump(),
+                    res.set_content(nlohmann::json{{"error", result.error},
+                                                   {"supported_backends", {"llama-cpp"}}}.dump(),
                                     "application/json");
-                    return;
+                } else if (result.status == NodeServiceStatus::RuntimeUnavailable) {
+                    res.status = 503;
+                    res.set_content(nlohmann::json{
+                        {"error", "llama runtime not ready"},
+                        {"detail", result.error},
+                        {"llama_runtime", service_.snapshot().llama_runtime}
+                    }.dump(), "application/json");
+                } else if (result.status == NodeServiceStatus::ModelNotFound) {
+                    res.status = 400;
+                    const std::string model_path = sanitize_path_for_runtime(request.model_path);
+                    if (result.error.rfind("projector path", 0) == 0) {
+                        res.set_content(nlohmann::json{
+                            {"error", "projector not found on node"},
+                            {"detail", result.error}
+                        }.dump(), "application/json");
+                    } else {
+                        const std::string detail = mm::util::is_hf_repo_id(model_path)
+                            ? "llama.cpp requires a node-local GGUF file; Hugging Face repository IDs are not loadable"
+                            : "model file not found on this node during restore: " + model_path;
+                        res.set_content(nlohmann::json{
+                            {"error", "model not found on node"},
+                            {"detail", detail},
+                            {"model_path", model_path}
+                        }.dump(), "application/json");
+                    }
+                } else if (result.status == NodeServiceStatus::InvalidArgument) {
+                    res.status = 400;
+                    std::string error = result.error;
+                    if (error == "vision-enabled llama-cpp load requires mmproj_path") {
+                        error = "vision-enabled llama-cpp restore requires mmproj_path";
+                    }
+                    res.set_content(nlohmann::json{{"error", error}}.dump(),
+                                    "application/json");
+                } else {
+                    res.status = 500;
+                    const auto snapshot = service_.snapshot();
+                    nlohmann::json error = {
+                        {"error", "failed to restore slot"},
+                        {"llama_server_path", snapshot.llama_server_path},
+                        {"llama_runtime", snapshot.llama_runtime}
+                    };
+                    if (!result.error.empty()) error["detail"] = result.error;
+                    res.set_content(error.dump(), "application/json");
                 }
-            }
-            std::error_code model_ec;
-            if (!fs::is_regular_file(model_path, model_ec)) {
-                res.status = 400;
-                const std::string detail = mm::util::is_hf_repo_id(model_path)
-                    ? "llama.cpp requires a node-local GGUF file; Hugging Face repository IDs are not loadable"
-                    : "model file not found on this node during restore: " + model_path;
-                res.set_content(nlohmann::json{
-                    {"error", "model not found on node"},
-                    {"detail", detail},
-                    {"model_path", model_path}
-                }.dump(), "application/json");
                 return;
             }
+            res.set_content(nlohmann::json{{"status", "restored"},
+                                           {"slot_id", result.slot_id}}.dump(),
+                            "application/json");
+            return;
 
-            auto slot_id = slot_mgr_.restore_slot(
-                model_path, mmproj_path, runtime_settings, kv_cache_path, agent_id);
-            state_.set_slots(slot_mgr_.get_slot_info());
-
-            if (slot_id.empty()) {
-                res.status = 500;
-                nlohmann::json err = {{"error", "failed to restore slot"}};
-                auto detail = slot_mgr_.last_error();
-                err["llama_server_path"] = slot_mgr_.llama_server_path();
-                err["llama_runtime"] = state_.get_llama_runtime();
-                state_.set_last_error(detail.empty() ? "failed to restore slot" : detail);
-                if (!detail.empty()) err["detail"] = detail;
-                res.set_content(err.dump(), "application/json");
-            } else {
-                state_.set_loaded_model(model_path);
-                if (!agent_id.empty()) state_.set_active_agent(agent_id);
-                state_.set_last_error("");
-                if (model_store_) {
-                    for (const auto& id : {model_id, mmproj_model_id}) {
-                        if (id.empty()) continue;
-                        if (model_pin) model_store_->set_pinned(id, true);
-                        model_store_->touch(id);
-                        if (id == model_id && mmproj_model_id == model_id) break;
-                    }
-                }
-                res.set_content(
-                    nlohmann::json{{"status","restored"},
-                                   {"slot_id", slot_id}}.dump(),
-                    "application/json");
-            }
         } catch (const std::exception& e) {
             res.status = 400;
             state_.set_last_error(e.what());
@@ -1161,7 +1132,7 @@ void NodeApiServer::register_routes() {
             return;
         }
 
-        auto slots = slot_mgr_.get_slot_info();
+        const auto slots = service_.snapshot().slots;
 
         // Resolve selected slot.
         std::string selected_slot_id = slot_id;
@@ -1175,11 +1146,11 @@ void NodeApiServer::register_routes() {
             }
         }
 
-        auto slot_lease = selected_slot_id.empty()
-            ? SlotManager::SlotLease{}
-            : slot_mgr_.acquire_slot(selected_slot_id);
-
-        if (!slot_lease) {
+        const bool selected_ready = std::any_of(
+            slots.begin(), slots.end(), [&](const SlotInfo& slot) {
+                return slot.id == selected_slot_id && slot.state == SlotState::Ready;
+            });
+        if (!selected_ready) {
             res.status = 503;
             res.set_content(R"({"error":"no ready slot available"})", "application/json");
             return;
@@ -1188,165 +1159,162 @@ void NodeApiServer::register_routes() {
         // Shared context between LLM worker and SSE provider
         auto ctx = std::make_shared<SseInferCtx>();
 
-        // Look up agent for this slot and start streaming text tracking.
-        std::string agent_for_slot;
-        std::string model_for_slot;
-        for (const auto& s : slots) {
-            if (s.id == selected_slot_id) {
-                agent_for_slot = s.assigned_agent;
-                model_for_slot = s.model_path;
-                break;
-            }
-        }
-        slot_mgr_.touch_slot(selected_slot_id);
-        state_.set_slots(slot_mgr_.get_slot_info());
-        if (!model_for_slot.empty()) state_.set_loaded_model(model_for_slot);
-        state_.start_streaming_text(selected_slot_id, agent_for_slot);
-        if (!agent_for_slot.empty()) state_.set_active_agent(agent_for_slot);
-
-        // Fire the LLM call on a background thread
-        std::thread([this,
-                     infer_req,
-                     ctx,
-                     slot_lease = std::move(slot_lease)]() mutable {
-            RuntimeClient* client = slot_lease.get();
-            auto emit_line = [ctx](const std::string& payload, bool done) {
+        const bool launched = launch_inference_task(
+            ctx,
+            [this, infer_req, selected_slot_id, ctx]() {
+            auto emit_line = [ctx](const std::string& payload, bool terminal) -> bool {
                 std::lock_guard<std::mutex> lk(ctx->mx);
+                // The first typed terminal event wins. The runtime transport
+                // can report an error and subsequently flush a done chunk; do
+                // not expose both to the node protocol.
+                if (ctx->canceled || ctx->done) return false;
                 ctx->lines.push_back(payload);
-                if (done) ctx->done = true;
-                ctx->cv.notify_one();
+                if (terminal) ctx->done = true;
+                ctx->cv.notify_all();
+                return true;
             };
 
-            try {
-                if (infer_req.stream) {
-                    client->stream_complete(infer_req,
-                        [this, emit_line](const InferenceChunk& c) {
-                            nlohmann::json j;
-                            if (!c.thinking_delta.empty()) {
-                                j = {{"type","thinking"},{"content", c.thinking_delta}};
-                                state_.append_streaming_text("", c.thinking_delta);
-                            } else if (!c.delta_content.empty()) {
-                                j = {{"type","delta"},{"content", c.delta_content}};
-                                state_.append_streaming_text(c.delta_content, "");
-                            } else if (c.tool_call_delta) {
-                                auto& tc = *c.tool_call_delta;
-                                j = {{"type","tool_call"},{"id", tc.id},
-                                     {"name", tc.function_name},
-                                     {"arguments", tc.arguments_json}};
-                            } else if (c.is_done) {
-                                j = {{"type","done"},
-                                     {"tokens_used", c.tokens_used},
-                                     {"finish_reason", c.finish_reason}};
-                                state_.finish_streaming_text(c.finish_reason, c.tokens_used);
-                            }
-                            if (!j.is_null()) {
-                                emit_line("data: " + safe_json_dump(j) + "\n\n", c.is_done);
-                            } else if (c.is_done) {
-                                emit_line("data: " + safe_json_dump(nlohmann::json{
-                                    {"type", "done"},
-                                    {"tokens_used", c.tokens_used},
-                                    {"finish_reason", c.finish_reason}
-                                }) + "\n\n", true);
-                                state_.finish_streaming_text(c.finish_reason, c.tokens_used);
-                            }
-                        },
-                        [this, emit_line](const std::string& err) {
-                            state_.finish_streaming_text("error", 0);
-                            emit_line("data: " + safe_json_dump(nlohmann::json{
-                                {"type","error"},
-                                {"message", err}
-                            }) + "\n\n", true);
-                        }
-                    );
-                } else {
-                    Message full = client->complete(infer_req);
-                    if (full.role != MessageRole::Assistant) {
-                        state_.finish_streaming_text("error", 0);
-                        emit_line("data: " + safe_json_dump(nlohmann::json{
-                            {"type", "error"},
-                            {"message", "non-stream inference failed"}
-                        }) + "\n\n", true);
-                        return;
+            const NodeInferRequest service_request{
+                infer_req,
+                selected_slot_id,
+                [ctx] { return ctx->canceled.load(); }
+            };
+            const auto inference_result = service_.infer(
+                service_request,
+                [emit_line](const InferenceChunk& chunk) {
+                    if (!chunk.thinking_delta.empty()) {
+                        if (!emit_line("data: " + safe_json_dump({
+                                {"type", "thinking"},
+                                {"content", chunk.thinking_delta}}) + "\n\n",
+                                false)) return;
                     }
-                    if (!full.thinking_text.empty()) {
-                        state_.append_streaming_text("", full.thinking_text);
-                        emit_line("data: " + safe_json_dump(nlohmann::json{
-                            {"type", "thinking"},
-                            {"content", full.thinking_text}
-                        }) + "\n\n", false);
+                    if (!chunk.delta_content.empty()) {
+                        if (!emit_line("data: " + safe_json_dump({
+                                {"type", "delta"},
+                                {"content", chunk.delta_content}}) + "\n\n",
+                                false)) return;
                     }
-                    if (!full.content.empty()) {
-                        state_.append_streaming_text(full.content, "");
-                        emit_line("data: " + safe_json_dump(nlohmann::json{
-                            {"type", "delta"},
-                            {"content", full.content}
-                        }) + "\n\n", false);
+                    if (chunk.tool_call_delta) {
+                        const auto& tool_call = *chunk.tool_call_delta;
+                        if (!emit_line("data: " + safe_json_dump({
+                                {"type", "tool_call"},
+                                {"id", tool_call.id},
+                                {"name", tool_call.function_name},
+                                {"arguments", tool_call.arguments_json}}) +
+                                "\n\n", false)) return;
                     }
-                    for (const auto& tc : full.tool_calls) {
-                        emit_line("data: " + safe_json_dump(nlohmann::json{
-                            {"type", "tool_call"},
-                            {"id", tc.id},
-                            {"name", tc.function_name},
-                            {"arguments", tc.arguments_json}
-                        }) + "\n\n", false);
+                    if (!chunk.tool_result_json.empty()) {
+                        if (!emit_line("data: " + safe_json_dump({
+                                {"type", "tool_result"},
+                                {"content", chunk.tool_result_json}}) + "\n\n",
+                                false)) return;
                     }
-                    const std::string finish_reason = full.content.empty() && full.tool_calls.empty()
-                        ? "empty"
-                        : "stop";
-                    state_.finish_streaming_text(finish_reason, full.token_count);
+                    // A backend may combine its last data with the terminal
+                    // accounting chunk. Emit every field above, then exactly
+                    // one terminal result instead of losing it to an else-if.
+                    if (chunk.is_done) {
+                        emit_line("data: " + safe_json_dump({
+                            {"type", "done"},
+                            {"tokens_used", chunk.tokens_used},
+                            {"finish_reason", chunk.finish_reason}}) + "\n\n",
+                            true);
+                    }
+                },
+                [emit_line, stream = infer_req.stream](const std::string& error) {
                     emit_line("data: " + safe_json_dump(nlohmann::json{
-                        {"type", "done"},
-                        {"tokens_used", full.token_count},
-                        {"finish_reason", finish_reason}
+                        {"type", "error"},
+                        {"message", stream ? error : "non-stream inference failed"}
                     }) + "\n\n", true);
+                });
+
+            if (!inference_result.ok() &&
+                inference_result.status != NodeServiceStatus::Canceled) {
+                const std::string message = infer_req.stream
+                    ? (inference_result.error.empty()
+                           ? "inference failed"
+                           : inference_result.error)
+                    : "non-stream inference failed";
+                emit_line("data: " + safe_json_dump(nlohmann::json{
+                    {"type", "error"}, {"message", message}
+                }) + "\n\n", true);
+            }
+
+            const std::string missing_terminal_payload =
+                "data: " + safe_json_dump(nlohmann::json{
+                    {"type", "error"},
+                    {"message", "inference ended without a terminal result"}
+                }) + "\n\n";
+            bool fallback_terminal = false;
+            bool canceled_without_terminal = false;
+            {
+                std::lock_guard<std::mutex> lk(ctx->mx);
+                if (!ctx->done) {
+                    canceled_without_terminal = ctx->canceled;
+                    if (!canceled_without_terminal) {
+                        ctx->lines.push_back(missing_terminal_payload);
+                        fallback_terminal = true;
+                    }
+                    ctx->done = true;
+                    ctx->cv.notify_all();
                 }
-            } catch (const std::exception& e) {
-                MM_ERROR("NodeApiServer infer worker exception: {}", e.what());
-                state_.set_last_error(std::string("infer worker exception: ") + e.what());
-                state_.finish_streaming_text("error", 0);
-                emit_line("data: " + safe_json_dump(nlohmann::json{
-                    {"type","error"},
-                    {"message", std::string("infer worker exception: ") + e.what()}
-                }) + "\n\n", true);
-            } catch (...) {
-                MM_ERROR("NodeApiServer infer worker exception: unknown");
-                state_.set_last_error("infer worker exception: unknown");
-                state_.finish_streaming_text("error", 0);
-                emit_line("data: " + safe_json_dump(nlohmann::json{
-                    {"type","error"},
-                    {"message", "infer worker exception: unknown"}
-                }) + "\n\n", true);
             }
-
-            std::lock_guard<std::mutex> lk(ctx->mx);
-            if (!ctx->done) {
-                ctx->done = true;
-                ctx->cv.notify_one();
+            if (fallback_terminal) {
+                state_.finish_streaming_text("error", 0);
+            } else if (canceled_without_terminal) {
+                state_.finish_streaming_text("canceled", 0);
             }
-        }).detach();
+        });
 
-        // Stream SSE to client via chunked content provider
+        if (!launched) {
+            state_.finish_streaming_text("canceled", 0);
+            res.status = 503;
+            res.set_content(R"({"error":"node is stopping"})", "application/json");
+            return;
+        }
+
+        // Stream SSE to client via chunked content provider. A failed sink or
+        // resource release marks the context canceled; NodeService propagates
+        // that flag to the active llama-server request.
         res.set_chunked_content_provider("text/event-stream",
             [ctx](size_t /*offset*/, httplib::DataSink& sink) -> bool {
                 std::unique_lock<std::mutex> lk(ctx->mx);
-                ctx->cv.wait(lk, [&]{ return !ctx->lines.empty() || ctx->done; });
+                ctx->cv.wait(lk, [&] {
+                    return !ctx->lines.empty() || ctx->done || ctx->canceled;
+                });
+
+                if (ctx->canceled) return false;
 
                 while (!ctx->lines.empty()) {
                     std::string payload = std::move(ctx->lines.front());
                     ctx->lines.pop_front();
                     lk.unlock();
-                    if (!sink.write(payload.data(), payload.size())) return false;
+                    if (!sink.write(payload.data(), payload.size())) {
+                        ctx->canceled = true;
+                        ctx->cv.notify_all();
+                        return false;
+                    }
                     lk.lock();
+                    if (ctx->canceled) return false;
                 }
 
                 if (ctx->done && ctx->lines.empty()) {
                     lk.unlock();
                     const std::string fin = "data: [DONE]\n\n";
-                    sink.write(fin.data(), fin.size());
+                    if (!sink.write(fin.data(), fin.size())) {
+                        ctx->canceled = true;
+                        ctx->cv.notify_all();
+                        return false;
+                    }
                     sink.done();
                     return true;
                 }
                 return true;
+            },
+            [ctx](bool success) {
+                if (!success) {
+                    ctx->canceled = true;
+                    ctx->cv.notify_all();
+                }
             }
         );
     });

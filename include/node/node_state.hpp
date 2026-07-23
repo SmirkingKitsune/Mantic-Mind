@@ -102,6 +102,9 @@ public:
     // ── Background metrics polling ────────────────────────────────────────────
     // Polls CPU/RAM/GPU every `interval_ms` milliseconds.
     void start_metrics_poll(int interval_ms = 2000);
+    // Wait until the polling thread has committed at least one complete sample.
+    // Returns false on timeout; callers may then fall back to direct host probes.
+    bool wait_for_initial_metrics(int timeout_ms = 5000);
     void stop_metrics_poll();
 
     // Callback fired after each metrics refresh (for UI updates).
@@ -128,6 +131,8 @@ private:
 
     std::atomic<bool>            polling_{false};
     std::thread                  poll_thread_;
+    bool                         metrics_sampled_ = false;
+    std::condition_variable      metrics_ready_cv_;
     std::mutex                   poll_mutex_;   // guards poll_cv_ wait predicate
     std::condition_variable      poll_cv_;      // wakes the poll loop on stop
     MetricsCallback              metrics_cb_;

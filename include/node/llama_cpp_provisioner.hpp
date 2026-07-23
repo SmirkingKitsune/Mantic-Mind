@@ -65,13 +65,27 @@ struct LlamaCommandRunner {
                                     std::string* error)>;
     using CaptureFn = std::function<std::string(const std::vector<std::string>&,
                                                 const std::filesystem::path&)>;
+    // Cancellation-aware counterparts used by production probes.  The
+    // legacy callbacks above remain available for deterministic/offline
+    // embedders, but cannot interrupt an arbitrary callback once it starts.
+    using CancellableCaptureFn =
+        std::function<std::string(const std::vector<std::string>&,
+                                  const std::filesystem::path&,
+                                  const CancelCheckCallback&)>;
     // Newest llama.cpp release tag available upstream, or "" when unknown.
     using FetchLatestFn = std::function<std::string(const LlamaProvisionConfig&)>;
+    using CancellableFetchLatestFn =
+        std::function<std::string(const LlamaProvisionConfig&,
+                                  const CancelCheckCallback&)>;
     // Asset names attached to a release tag. Kept separate from fetch_latest so
     // tests and offline callers can make the update decision deterministically.
     using FetchReleaseAssetsFn =
         std::function<std::vector<std::string>(const LlamaProvisionConfig&,
                                                const std::string& tag)>;
+    using CancellableFetchReleaseAssetsFn =
+        std::function<std::vector<std::string>(const LlamaProvisionConfig&,
+                                               const std::string& tag,
+                                               const CancelCheckCallback&)>;
     using ResolveExecutableFn = std::function<std::string(const std::string&)>;
     RunFn run;
     CaptureFn capture_output;
@@ -81,6 +95,10 @@ struct LlamaCommandRunner {
     // Test hook and policy seam for distinguishing an explicitly configured
     // executable from an incidental generic PATH installation.
     ResolveExecutableFn resolve_executable;
+    CancellableCaptureFn capture_output_cancellable;
+    CancellableCaptureFn capture_first_line_cancellable;
+    CancellableFetchLatestFn fetch_latest_cancellable;
+    CancellableFetchReleaseAssetsFn fetch_release_assets_cancellable;
 };
 
 std::string normalize_llama_install_method(const std::string& method);
@@ -134,7 +152,9 @@ public:
     // an update is pending. `variant` is one of status().variants[].id.
     LlamaRuntimeStatus switch_runtime(const std::string& variant);
     // Re-run all non-mutating probes and attach a fresh report to status().
-    LlamaRuntimeStatus diagnose_environment();
+    // allow_network=false skips release metadata enrichment and runs only local
+    // environment probes (used by AIO prompt/offline policy).
+    LlamaRuntimeStatus diagnose_environment(bool allow_network = true);
     // action: retry | target | compile-anyway | release. `target` reinstalls
     // the configured/detected build. `variant` is required for a release
     // action and is one of troubleshooting.variants[].id.
@@ -153,6 +173,14 @@ private:
     LlamaRuntimeStatus status_;
 
     LlamaRuntimeStatus make_base_status() const;
+    bool cancellation_requested() const noexcept;
+    std::string capture_output(const std::vector<std::string>& argv,
+                               const std::filesystem::path& cwd) const;
+    std::string capture_first_line(const std::vector<std::string>& argv,
+                                   const std::filesystem::path& cwd) const;
+    std::string fetch_latest(const LlamaProvisionConfig& cfg) const;
+    std::vector<std::string> fetch_release_assets(
+        const LlamaProvisionConfig& cfg, const std::string& tag) const;
     std::string capture_version(const std::string& executable) const;
     LlamaRuntimeStatus run_managed_install(bool upgrade,
                                            const std::string& accelerator_override = {},
@@ -161,7 +189,8 @@ private:
                                            bool release_only_override = true);
     LlamaTroubleshootingReport build_troubleshooting_report(
         const std::string& failure_detail,
-        const LlamaProvisionConfig& install_cfg) const;
+        const LlamaProvisionConfig& install_cfg,
+        bool allow_network = true) const;
     void emit_progress(const RuntimeInstallProgress& p);
     void set_status(LlamaRuntimeStatus& status);
 };

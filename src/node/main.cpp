@@ -6,10 +6,10 @@
 #include "common/util.hpp"
 #include "node/node_api_server.hpp"
 #include "node/node_config.hpp"
+#include "node/node_host.hpp"
 #include "node/model_store.hpp"
 #include "node/node_state.hpp"
 #include "node/node_ui.hpp"
-#include "node/singleton_lock.hpp"
 #include "node/slot_manager.hpp"
 #include "node/llama_cpp_provisioner.hpp"
 #include "node/llama_runtime.hpp"
@@ -28,7 +28,6 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
-#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -203,64 +202,12 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
 
 namespace {
 
-// Count GPUs visible via nvidia-smi (one CSV line per GPU).
-int detect_gpu_count() {
-    const std::string cmd =
-        "nvidia-smi --query-gpu=index --format=csv,noheader,nounits";
-#ifdef _WIN32
-    FILE* f = _popen((cmd + " 2>nul").c_str(), "r");
-#else
-    FILE* f = ::popen((cmd + " 2>/dev/null").c_str(), "r");
-#endif
-    if (!f) return 0;
-    int count = 0;
-    char buf[256];
-    while (fgets(buf, static_cast<int>(sizeof(buf)), f)) {
-        if (!mm::util::trim(buf).empty()) ++count;
-    }
-#ifdef _WIN32
-    _pclose(f);
-#else
-    ::pclose(f);
-#endif
-    return count;
-}
-
-// Resolve every visible NVIDIA GPU's compute capability to the CMake form
-// (8.9 -> 89, 12.1 -> 121). Passing an explicit list avoids fragile "native"
-// architecture probing in older CMake versions and WSL toolchains.
-std::string detect_cuda_architectures() {
-    const std::string cmd =
-        "nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits";
-#ifdef _WIN32
-    FILE* f = _popen((cmd + " 2>nul").c_str(), "r");
-#else
-    FILE* f = ::popen((cmd + " 2>/dev/null").c_str(), "r");
-#endif
-    if (!f) return {};
-    std::set<std::string> capabilities;
-    char buf[256];
-    while (fgets(buf, static_cast<int>(sizeof(buf)), f)) {
-        std::string value = mm::util::trim(buf);
-        value.erase(std::remove(value.begin(), value.end(), '.'), value.end());
-        if (!value.empty() && std::all_of(value.begin(), value.end(), [](unsigned char ch) {
-                return std::isdigit(ch) != 0;
-            }))
-            capabilities.insert(value);
-    }
-#ifdef _WIN32
-    _pclose(f);
-#else
-    ::pclose(f);
-#endif
-    std::vector<std::string> ordered(capabilities.begin(), capabilities.end());
-    return mm::util::join(ordered, ";");
-}
-
 // Build the capability block this node advertises. Detection fills the gaps
 // the config left blank. llama_version is the resolved llama.cpp build
 // fingerprint (from the llama provisioner), "" while unknown/provisioning.
 mm::NodeCapabilities detect_node_capabilities(const mm::NodeConfig& cfg,
+                                              int detected_nvidia_count,
+                                              bool nvidia_backend_observed,
                                               const std::string& llama_version = {}) {
     mm::NodeCapabilities caps;
 
@@ -272,7 +219,8 @@ mm::NodeCapabilities detect_node_capabilities(const mm::NodeConfig& cfg,
     caps.arch = "";
 #endif
 
-    caps.gpu_count = cfg.node_gpu_count > 0 ? cfg.node_gpu_count : detect_gpu_count();
+    caps.gpu_count = mm::resolve_node_gpu_count(
+        cfg.node_gpu_count, detected_nvidia_count, nvidia_backend_observed);
 
     // llama.cpp build fingerprint (RPC groups need matching builds; advertised
     // for planning even while supports_llama_rpc stays a future capability).
@@ -329,7 +277,8 @@ bool save_remembered_api_keys(const std::filesystem::path& path,
 
 static bool try_register(const mm::NodeConfig& cfg,
                           mm::NodeState& state,
-                          const std::string& api_key) {
+                          const std::string& api_key,
+                          mm::HttpClient::CancelCheck cancel_requested = {}) {
     const char* self_env = std::getenv("MM_SELF_URL");
     std::string self_url = self_env
         ? std::string(self_env)
@@ -350,7 +299,8 @@ static bool try_register(const mm::NodeConfig& cfg,
     };
 
     MM_INFO("Attempting registration with control at {} ...", cfg.control_url);
-    auto resp = ctrl.post("/api/control/register-node", body);
+    auto resp = ctrl.post("/api/control/register-node", body,
+                          std::move(cancel_requested));
     if (!resp.ok()) {
         MM_WARN("Registration failed (HTTP {}): {}", resp.status, resp.body);
         return false;
@@ -746,15 +696,22 @@ int main(int argc, char** argv) {
     }
 
     // ── Singleton lock ────────────────────────────────────────────────────────
-    auto instance_lock = mm::SingletonLock::try_acquire();
-    if (!instance_lock) {
-        std::cerr << "ERROR: Another mantic-mind node instance is already running.\n";
-        return 1;
-    }
-
     // Try config file first, then override with env vars.
     std::string cfg_path;
     auto cfg = load_config(&cfg_path);
+
+    const std::string local_node_id = "local-" + mm::util::generate_uuid();
+    mm::NodeHost::Options host_options;
+    host_options.config = cfg;
+    host_options.node_id = local_node_id;
+    host_options.registered = false;
+    host_options.manage_model_cache = true;
+    mm::NodeHost node_host(std::move(host_options));
+    std::string host_error;
+    if (!node_host.acquire_singleton_lock(&host_error)) {
+        std::cerr << "ERROR: " << host_error << ".\n";
+        return 1;
+    }
 
     namespace fs = std::filesystem;
     {
@@ -777,18 +734,32 @@ int main(int argc, char** argv) {
             cfg.control_url, cfg.models_dir);
     MM_INFO("Node llama-server path: {}", cfg.llama_server_path);
 
+    if (!node_host.initialize(&host_error)) {
+        std::cerr << "ERROR: " << host_error << ".\n";
+        return 1;
+    }
+    auto& state = node_host.state();
+    auto& slot_mgr = node_host.slots();
+    auto& node_service = node_host.service();
+    auto* model_store_ptr = node_host.model_store();
+    if (!model_store_ptr) {
+        std::cerr << "ERROR: standalone node model cache failed to initialize.\n";
+        return 1;
+    }
+    auto& model_store = *model_store_ptr;
+
     // ── NodeState ─────────────────────────────────────────────────────────────
 
-    mm::NodeState state;
-    const std::string local_node_id = "local-" + mm::util::generate_uuid();
-    state.set_registered(false, local_node_id);
     MM_INFO("Local node identity: {}", local_node_id);
 
-    // Start metrics polling before provisioning so the GPU-backend probe
-    // (nvidia-smi) has populated gpu_backend_available before we pick the
-    // accelerator-correct llama.cpp build variant.
-    state.start_metrics_poll(2000);
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // Start metrics polling before provisioning so the GPU-backend probe has
+    // committed a complete sample before we choose capabilities/build variant.
+    if (!node_host.initial_metrics_ready()) {
+        MM_WARN("Timed out waiting for the initial hardware metrics sample; "
+                "falling back to direct host GPU probes");
+    }
+    const auto initial_host_metrics = state.get_metrics();
+    const int detected_nvidia_gpu_count = mm::detect_nvidia_gpu_count();
 
     const auto remembered_keys_path = remembered_api_keys_file(cfg);
     std::vector<std::string> remembered_api_keys =
@@ -811,19 +782,11 @@ int main(int argc, char** argv) {
 
     // ── SlotManager ───────────────────────────────────────────────────────────
 
-    mm::SlotManager slot_mgr(cfg.runtime_port_range_start,
-                             cfg.runtime_port_range_end,
-                             cfg.max_slots);
-    slot_mgr.set_llama_server_path(cfg.llama_server_path);
-    slot_mgr.set_kv_cache_dir(cfg.kv_cache_dir);
-    slot_mgr.set_models_dir(cfg.models_dir);
-
     // ── Local model cache ─────────────────────────────────────────────────────
     // Control transfers models into models_dir; the store keeps an LRU
     // use-queue, evicts unpinned models under disk pressure, and clears
     // unpinned models on shutdown. Pinned models — those control marked this
     // node preferred for — are retained.
-    mm::ModelStore model_store(cfg.models_dir, cfg.model_cache_min_free_mb);
     MM_INFO("Model cache: root={} min_free={}MB clear_on_shutdown={}",
             model_store.root(), cfg.model_cache_min_free_mb,
             cfg.model_cache_clear_on_shutdown);
@@ -832,7 +795,10 @@ int main(int argc, char** argv) {
     {
         const auto llama_rt = state.get_llama_runtime();
         auto caps = detect_node_capabilities(
-            cfg, mm::llama_runtime_usable(llama_rt) ? llama_rt.version : std::string{});
+            cfg,
+            detected_nvidia_gpu_count,
+            initial_host_metrics.gpu_backend_available,
+            mm::llama_runtime_usable(llama_rt) ? llama_rt.version : std::string{});
         state.set_capabilities(caps);
         MM_INFO("Node capabilities: arch={} gpus={} llama={}",
                 caps.arch.empty() ? "?" : caps.arch, caps.gpu_count,
@@ -840,23 +806,6 @@ int main(int argc, char** argv) {
     }
 
     // Periodically relieve disk pressure without evicting a live model.
-    std::atomic<bool> stop_model_housekeeping{false};
-    std::thread model_housekeeping_thread([&slot_mgr, &model_store, &stop_model_housekeeping]() {
-        while (!stop_model_housekeeping) {
-            // Relieve disk pressure: evict LRU unpinned models that are not
-            // backing a live slot.
-            std::set<std::string> in_use;
-            for (const auto& s : slot_mgr.get_slot_info()) {
-                if (!s.model_path.empty()) in_use.insert(s.model_path);
-                if (!s.mmproj_path.empty()) in_use.insert(s.mmproj_path);
-            }
-            for (const auto& id : model_store.enforce_min_free(in_use))
-                MM_INFO("Model cache: disk pressure evicted {}", id);
-            for (int i = 0; i < 25 && !stop_model_housekeeping; ++i)
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-    });
-
     // ── llama.cpp runtime management (provision in the background) ─────────────
     // Release retrieval or its source-build fallback runs on a background
     // thread, so node startup never blocks on it. The fast
@@ -876,11 +825,12 @@ int main(int argc, char** argv) {
     llama_provision_cfg.accelerator = !cfg.llama_accelerator.empty()
         ? cfg.llama_accelerator
         : mm::detect_llama_accelerator(mm::current_runtime_platform(), mm::current_runtime_arch(),
-                                       state.get_metrics().gpu_backend_available,
+                                       initial_host_metrics.gpu_backend_available ||
+                                           detected_nvidia_gpu_count > 0,
                                        mm::detect_rocm_present());
     if (llama_provision_cfg.accelerator == "cuda" &&
         llama_provision_cfg.cuda_arch.empty()) {
-        llama_provision_cfg.cuda_arch = detect_cuda_architectures();
+        llama_provision_cfg.cuda_arch = mm::detect_cuda_architectures();
         if (!llama_provision_cfg.cuda_arch.empty())
             MM_INFO("Detected CUDA compute architecture(s) for llama.cpp: {}",
                     llama_provision_cfg.cuda_arch);
@@ -933,7 +883,11 @@ int main(int argc, char** argv) {
         if (mm::llama_runtime_usable(runtime)) {
             cfg.llama_server_path = runtime.executable_path;
             slot_mgr.set_llama_server_path(cfg.llama_server_path);
-            auto caps = detect_node_capabilities(cfg, runtime.version);
+            auto caps = detect_node_capabilities(
+                cfg,
+                detected_nvidia_gpu_count,
+                state.get_metrics().gpu_backend_available,
+                runtime.version);
             state.set_capabilities(caps);
         }
         if (!runtime.last_error.empty()) {
@@ -1116,7 +1070,7 @@ int main(int argc, char** argv) {
 
     // ── API server ────────────────────────────────────────────────────────────
 
-    mm::NodeApiServer api_server(state, slot_mgr,
+    mm::NodeApiServer api_server(node_service, state, slot_mgr,
                                  cfg.control_url, cfg.pairing_key);
     api_server.set_model_store(&model_store);
     api_server.set_llama_provision_callback([&]() {
@@ -1239,7 +1193,8 @@ int main(int argc, char** argv) {
                     mm::HttpClient ctrl(cfg.control_url);
                     if (!cfg.control_api_key.empty())
                         ctrl.set_bearer_token(cfg.control_api_key);
-                    auto ping = ctrl.get("/v1/nodes");
+                    auto ping = ctrl.get(
+                        "/v1/nodes", [&] { return stop_reconnect.load(); });
                     if (!ping.ok()) {
                         MM_WARN("Control ping failed (HTTP {}) — marking node as disconnected", ping.status);
                         state.set_registered(false);
@@ -1267,7 +1222,8 @@ int main(int argc, char** argv) {
                 continue;
             }
 
-            if (try_register(cfg, state, initial_key)) {
+            if (try_register(cfg, state, initial_key,
+                             [&] { return stop_reconnect.load(); })) {
                 for (int i = 0; i < (kActivePollMs / 100) && !stop_reconnect; ++i)
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 continue;
@@ -1311,6 +1267,14 @@ int main(int argc, char** argv) {
 
     // ── Graceful shutdown ─────────────────────────────────────────────────────
 
+    // Signal every long-running node action before stopping/joining the HTTP
+    // listener. Runtime routes execute inside listener workers; waiting for
+    // the listener first would deadlock shutdown behind a download/build whose
+    // cancellation flag had not yet been set.
+    stop_llama_update_check = true;
+    llama_provision_stop = true;
+    node_host.request_shutdown();
+    state.request_action_cancel();
     stop_reconnect = true;
     reconnect_thread.join();
 
@@ -1319,12 +1283,6 @@ int main(int argc, char** argv) {
     api_server.stop();
     if (api_thread.joinable()) api_thread.join();
 
-    stop_model_housekeeping = true;
-    if (model_housekeeping_thread.joinable()) model_housekeeping_thread.join();
-
-    stop_llama_update_check = true;
-    llama_provision_stop = true;
-    state.request_action_cancel();
     if (llama_provision_thread.joinable()) llama_provision_thread.join();
     if (llama_update_check_thread.joinable()) llama_update_check_thread.join();
     if (manual_llama_update_thread.joinable()) {
@@ -1336,17 +1294,7 @@ int main(int argc, char** argv) {
         manual_llama_recovery_thread.join();
     }
 
-    state.stop_metrics_poll();
-    slot_mgr.unload_all();
-
-    // With all slots down nothing is in use; drop every unpinned model so the
-    // node keeps only the models control pinned to it.
-    if (cfg.model_cache_clear_on_shutdown) {
-        const auto cleared = model_store.clear_unpinned({});
-        if (!cleared.empty())
-            MM_INFO("Model cache: cleared {} unpinned model(s) on shutdown",
-                    cleared.size());
-    }
+    node_host.stop();
 
     MM_INFO("mantic-mind node stopped");
     return 0;

@@ -101,5 +101,17 @@ jobs:
       - name: Build
         run: cmake --build "${{ env.BUILD_DIR }}" --config "${{ matrix.build_type }}" --parallel
 
+      - name: Verify AIO entry point
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $executableName = if ($IsWindows) { "mantic-mind-aio.exe" } else { "mantic-mind-aio" }
+          $aio = Get-ChildItem -Path (Join-Path $env:BUILD_DIR "src/aio") `
+            -Recurse -File -Filter $executableName | Select-Object -First 1
+          if (-not $aio) {
+            throw "AIO executable was not produced by the ${{ matrix.name }} build"
+          }
+          & $aio.FullName --help
+
       - name: Test
         run: ctest --test-dir "${{ env.BUILD_DIR }}" -C "${{ matrix.build_type }}" --output-on-failure

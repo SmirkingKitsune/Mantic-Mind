@@ -10,6 +10,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -26,12 +27,13 @@ NodeConnectionStatus classify_node_reachability(int64_t unreachable_since_ms,
 
 NodeRegistry::NodeRegistry() = default;
 
-NodeRegistry::NodeRegistry(std::string data_dir) {
+NodeRegistry::NodeRegistry(std::string data_dir, bool enable_remote_nodes)
+    : remote_nodes_enabled_(enable_remote_nodes) {
     if (data_dir.empty()) return;
 
     namespace fs = std::filesystem;
     remembered_nodes_path_ = (fs::path(data_dir) / "nodes.json").string();
-    load_remembered_nodes();
+    if (remote_nodes_enabled_) load_remembered_nodes();
 }
 void NodeRegistry::set_offline_after_seconds(int seconds) {
     const int clamped = std::max(1, seconds);
@@ -39,7 +41,11 @@ void NodeRegistry::set_offline_after_seconds(int seconds) {
 }
 
 
-NodeRegistry::~NodeRegistry() { stop_health_poll(); }
+NodeRegistry::~NodeRegistry() {
+    request_operations_shutdown();
+    stop_discovery_listen();
+    stop_health_poll();
+}
 
 // ── Node management ────────────────────────────────────────────────────────────
 NodeId NodeRegistry::add_node(const std::string& url,
@@ -47,48 +53,149 @@ NodeId NodeRegistry::add_node(const std::string& url,
                                const std::string& platform,
                                bool remember,
                                const std::string& hostname) {
-    std::lock_guard<std::mutex> g(mutex_);
+    if (!remote_nodes_enabled_) {
+        throw std::runtime_error("remote nodes are disabled");
+    }
+    if (shutting_down_) {
+        throw std::runtime_error("node registry is shutting down");
+    }
 
-    for (auto& [id, n] : nodes_) {
-        if (n.url != url && (api_key.empty() || n.api_key != api_key)) continue;
+    NodeOperationsPtr retired;
+    NodeId result;
+    bool updated = false;
+    {
+        std::lock_guard<std::mutex> g(mutex_);
+        if (shutting_down_) {
+            throw std::runtime_error("node registry is shutting down");
+        }
 
-        n.url = url;
-        // Never wipe a stored credential with an empty one (e.g. a URL-only
-        // re-registration must not break a remembered node).
-        if (!api_key.empty()) n.api_key = api_key;
-        if (!platform.empty()) n.platform = platform;
-        if (remember) remembered_nodes_.insert(id);
-        if (!hostname.empty()) n.hostname = hostname;
-        n.remembered = remembered_nodes_.count(id) > 0;
-        if (n.remembered) save_remembered_nodes_unlocked();
-        MM_INFO("NodeRegistry: updated node {} @ {}", id, url);
-        return id;
+        for (auto& [id, n] : nodes_) {
+            if (n.url != url && (api_key.empty() || n.api_key != api_key)) continue;
+
+            n.url = url;
+            // Never wipe a stored credential with an empty one (e.g. a URL-only
+            // re-registration must not break a remembered node).
+            if (!api_key.empty()) n.api_key = api_key;
+            if (!platform.empty()) n.platform = platform;
+            if (remember) remembered_nodes_.insert(id);
+            if (!hostname.empty()) n.hostname = hostname;
+            n.remembered = remembered_nodes_.count(id) > 0;
+            const auto old = operations_.find(id);
+            if (old != operations_.end()) retired = old->second;
+            operations_[id] =
+                std::make_shared<HttpNodeOperations>(n.url, n.api_key);
+            if (n.remembered) save_remembered_nodes_unlocked();
+            result = id;
+            updated = true;
+            break;
+        }
+
+        if (result.empty()) {
+            NodeInfo info;
+            info.id       = mm::util::generate_uuid();
+            info.url      = url;
+            info.api_key  = api_key;
+            info.platform = platform;
+            info.connected = false;
+            info.hostname = hostname;
+            info.health    = NodeHealthStatus::Unknown;
+            info.remembered = remember;
+            info.connection_status = NodeConnectionStatus::Unknown;
+            nodes_[info.id] = info;
+            operations_[info.id] =
+                std::make_shared<HttpNodeOperations>(info.url, info.api_key);
+            if (remember) {
+                remembered_nodes_.insert(info.id);
+                save_remembered_nodes_unlocked();
+            }
+            result = info.id;
+        }
+    }
+
+    if (retired) retired->request_shutdown();
+    MM_INFO("NodeRegistry: {} node {} @ {}",
+            updated ? "updated" : "added", result, url);
+    return result;
+}
+
+NodeId NodeRegistry::add_embedded_node(NodeOperationsPtr node_operations,
+                                       const std::string& platform,
+                                       const std::string& hostname) {
+    if (!node_operations || !node_operations->embedded()) {
+        throw std::invalid_argument("embedded node requires local operations");
     }
 
     NodeInfo info;
-    info.id       = mm::util::generate_uuid();
-    info.url      = url;
-    info.api_key  = api_key;
+    info.id = "local";
+    info.kind = "embedded";
+    info.hostname = hostname.empty() ? mm::util::hostname() : hostname;
     info.platform = platform;
-    info.connected = false;
-    info.hostname = hostname;
-    info.health    = NodeHealthStatus::Unknown;
-    info.remembered = remember;
-    info.connection_status = NodeConnectionStatus::Unknown;
-    nodes_[info.id] = info;
-    if (remember) {
-        remembered_nodes_.insert(info.id);
-        save_remembered_nodes_unlocked();
+    info.connected = true;
+    info.connection_status = NodeConnectionStatus::Online;
+    info.health = NodeHealthStatus::Unknown;
+    info.last_seen_ms = mm::util::now_ms();
+
+    NodeOperationsPtr retired;
+    {
+        std::lock_guard<std::mutex> g(mutex_);
+        if (shutting_down_) {
+            throw std::runtime_error("node registry is shutting down");
+        }
+        nodes_[info.id] = info;
+        const auto old = operations_.find(info.id);
+        if (old != operations_.end()) retired = old->second;
+        operations_[info.id] = std::move(node_operations);
+        remembered_nodes_.erase(info.id);
     }
-    MM_INFO("NodeRegistry: added node {} @ {}", info.id, url);
+    if (retired) retired->request_shutdown();
+
+    // Populate the first snapshot synchronously so scheduling never observes a
+    // connected local node with empty capabilities/metrics.
+    NodeInfo populated = info;
+    ping_node(populated);
+    UpdateCallback cb;
+    {
+        std::lock_guard<std::mutex> g(mutex_);
+        nodes_[info.id] = populated;
+        cb = update_cb_;
+    }
+    if (cb) cb(populated);
+    MM_INFO("NodeRegistry: registered embedded node {}", info.id);
     return info.id;
 }
 
-void NodeRegistry::remove_node(const NodeId& id) {
+bool NodeRegistry::is_embedded_node(const NodeId& id) const {
     std::lock_guard<std::mutex> g(mutex_);
-    nodes_.erase(id);
-    const bool was_remembered = remembered_nodes_.erase(id) > 0;
-    if (was_remembered) save_remembered_nodes_unlocked();
+    const auto it = nodes_.find(id);
+    return it != nodes_.end() && it->second.kind == "embedded";
+}
+
+NodeOperationsPtr NodeRegistry::operations(const NodeId& id) const {
+    std::lock_guard<std::mutex> g(mutex_);
+    const auto it = operations_.find(id);
+    if (it == operations_.end()) {
+        throw std::out_of_range("node operations not found: " + id);
+    }
+    return it->second;
+}
+
+void NodeRegistry::remove_node(const NodeId& id) {
+    NodeOperationsPtr retired;
+    {
+        std::lock_guard<std::mutex> g(mutex_);
+        const auto existing = nodes_.find(id);
+        if (existing != nodes_.end() && existing->second.kind == "embedded") {
+            MM_WARN("NodeRegistry: refusing to remove embedded node {}", id);
+            return;
+        }
+        const auto operation = operations_.find(id);
+        if (operation != operations_.end()) retired = operation->second;
+        nodes_.erase(id);
+        operations_.erase(id);
+        const bool was_remembered = remembered_nodes_.erase(id) > 0;
+        if (was_remembered) save_remembered_nodes_unlocked();
+    }
+    if (retired) retired->request_shutdown();
     MM_INFO("NodeRegistry: removed node {}", id);
 }
 
@@ -96,6 +203,7 @@ bool NodeRegistry::forget_node(const NodeId& id) {
     std::lock_guard<std::mutex> g(mutex_);
     auto it = nodes_.find(id);
     if (it == nodes_.end()) return false;
+    if (it->second.kind == "embedded") return false;
 
     const bool was_remembered = remembered_nodes_.erase(id) > 0;
     it->second.remembered = false;
@@ -251,7 +359,11 @@ void NodeRegistry::set_update_callback(UpdateCallback cb) {
 }
 
 // ── Discovery ──────────────────────────────────────────────────────────────────
-void NodeRegistry::start_discovery_listen(uint16_t port) {
+bool NodeRegistry::start_discovery_listen(uint16_t port) {
+    if (!remote_nodes_enabled_) {
+        MM_INFO("NodeRegistry: discovery disabled for local-only mode");
+        return true;
+    }
     discovery_listener_.set_callback([this](const DiscoveredNode&) {
         // Fire the update callback to nudge the UI.
         UpdateCallback cb;
@@ -263,8 +375,12 @@ void NodeRegistry::start_discovery_listen(uint16_t port) {
             cb(sentinel);
         }
     });
-    discovery_listener_.start(port);
+    if (!discovery_listener_.start(port)) {
+        MM_ERROR("NodeRegistry: discovery listener failed to bind port {}", port);
+        return false;
+    }
     MM_INFO("NodeRegistry: discovery listener started on port {}", port);
+    return true;
 }
 
 void NodeRegistry::stop_discovery_listen() {
@@ -272,6 +388,7 @@ void NodeRegistry::stop_discovery_listen() {
 }
 
 std::vector<DiscoveredNode> NodeRegistry::get_discovered_nodes() const {
+    if (!remote_nodes_enabled_) return {};
     auto all = discovery_listener_.get_nodes();
 
     // Build set of already-registered URLs.
@@ -291,16 +408,24 @@ std::vector<DiscoveredNode> NodeRegistry::get_discovered_nodes() const {
 
 // ── Pairing ────────────────────────────────────────────────────────────────────
 std::string NodeRegistry::start_pair(const std::string& url) {
-    HttpClient cli(url);
+    if (!remote_nodes_enabled_ || url.empty()) return {};
+    auto client = begin_transient_operation(url);
+    if (!client) return {};
     std::string nonce = mm::pairing::generate_nonce();
-    auto req_res = cli.post("/api/node/pair-request",
-                            nlohmann::json{{"challenge", nonce}});
+    NodeOperationResult req_res;
+    try {
+        req_res = client->pair_request(nlohmann::json{{"challenge", nonce}});
+    } catch (...) {
+        end_transient_operation(client);
+        throw;
+    }
+    end_transient_operation(client);
     if (!req_res.ok()) {
-        MM_WARN("NodeRegistry: pair-request to {} failed (HTTP {})", url, req_res.status);
+        MM_WARN("NodeRegistry: pair-request to {} failed (status {})", url, req_res.status);
         return {};
     }
     try {
-        auto j = nlohmann::json::parse(req_res.body);
+        const auto& j = req_res.body;
         if (!j.value("accepted", false)) {
             MM_WARN("NodeRegistry: pair-request rejected by {}", url);
             return {};
@@ -318,18 +443,27 @@ std::string NodeRegistry::complete_pair(const std::string& url,
                                          const std::string& nonce,
                                          const std::string& pin_or_psk,
                                          bool remember) {
-    HttpClient cli(url);
+    if (!remote_nodes_enabled_ || url.empty()) return {};
+    auto client = begin_transient_operation(url);
+    if (!client) return {};
     std::string response = mm::pairing::hmac_sha256_hex(pin_or_psk, nonce);
-    auto cpl_res = cli.post("/api/node/pair-complete",
-                            nlohmann::json{{"challenge", nonce},
-                                           {"response",  response},
-                                           {"remember",  remember}});
+    NodeOperationResult cpl_res;
+    try {
+        cpl_res = client->pair_complete(
+            nlohmann::json{{"challenge", nonce},
+                           {"response",  response},
+                           {"remember",  remember}});
+    } catch (...) {
+        end_transient_operation(client);
+        throw;
+    }
+    end_transient_operation(client);
     if (!cpl_res.ok()) {
-        MM_WARN("NodeRegistry: pair-complete to {} failed (HTTP {})", url, cpl_res.status);
+        MM_WARN("NodeRegistry: pair-complete to {} failed (status {})", url, cpl_res.status);
         return {};
     }
     try {
-        auto j = nlohmann::json::parse(cpl_res.body);
+        const auto& j = cpl_res.body;
         if (!j.value("accepted", false)) {
             MM_WARN("NodeRegistry: pair-complete rejected by {}: {}",
                     url, j.value("error", std::string{}));
@@ -365,6 +499,7 @@ void NodeRegistry::load_remembered_nodes() {
         auto root = nlohmann::json::parse(in);
         const auto& nodes_json = root.is_array() ? root : root.at("nodes");
         std::lock_guard<std::mutex> g(mutex_);
+        bool normalized_reserved_id = false;
         for (const auto& item : nodes_json) {
             const std::string url = item.value("url", std::string{});
             const std::string api_key = item.value("api_key", std::string{});
@@ -373,6 +508,12 @@ void NodeRegistry::load_remembered_nodes() {
             NodeInfo info;
             info.id = item.value("id", mm::util::generate_uuid());
             if (info.id.empty()) info.id = mm::util::generate_uuid();
+            if (info.id == "local") {
+                // "local" is process-owned by AIO and can never identify a
+                // persisted remote, including in legacy or hand-edited files.
+                info.id = mm::util::generate_uuid();
+                normalized_reserved_id = true;
+            }
             info.url = url;
             info.api_key = api_key;
             info.platform = item.value("platform", std::string{});
@@ -383,8 +524,11 @@ void NodeRegistry::load_remembered_nodes() {
             info.connection_status = NodeConnectionStatus::Unknown;
 
             nodes_[info.id] = info;
+            operations_[info.id] =
+                std::make_shared<HttpNodeOperations>(info.url, info.api_key);
             remembered_nodes_.insert(info.id);
         }
+        if (normalized_reserved_id) save_remembered_nodes_unlocked();
         MM_INFO("NodeRegistry: loaded {} remembered node(s)", remembered_nodes_.size());
     } catch (const std::exception& e) {
         MM_WARN("NodeRegistry: failed to load remembered nodes from {}: {}",
@@ -449,12 +593,98 @@ void NodeRegistry::stop_health_poll() {
     if (poll_thread_.joinable()) poll_thread_.join();
 }
 
+void NodeRegistry::request_operations_shutdown() {
+    shutting_down_ = true;
+    std::vector<NodeOperationsPtr> operations;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        operations.reserve(operations_.size() + transient_operations_.size());
+        for (const auto& [id, adapter] : operations_) {
+            (void)id;
+            if (adapter) operations.push_back(adapter);
+        }
+        for (const auto& adapter : transient_operations_) {
+            if (adapter) operations.push_back(adapter);
+        }
+    }
+    for (const auto& adapter : operations) {
+        try {
+            adapter->request_shutdown();
+        } catch (const std::exception& exception) {
+            MM_WARN("NodeRegistry: transport shutdown failed: {}",
+                    exception.what());
+        } catch (...) {
+            MM_WARN("NodeRegistry: transport shutdown failed");
+        }
+    }
+}
+
+NodeOperationsPtr NodeRegistry::begin_transient_operation(
+    const std::string& url) {
+    auto operation = std::make_shared<HttpNodeOperations>(url, std::string{});
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (shutting_down_) return {};
+    transient_operations_.push_back(operation);
+    return operation;
+}
+
+void NodeRegistry::end_transient_operation(
+    const NodeOperationsPtr& operation) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    transient_operations_.erase(
+        std::remove(transient_operations_.begin(), transient_operations_.end(),
+                    operation),
+        transient_operations_.end());
+}
+
+bool NodeRegistry::refresh_node(const NodeId& id) {
+    NodeInfo info;
+    {
+        std::lock_guard<std::mutex> g(mutex_);
+        const auto it = nodes_.find(id);
+        if (it == nodes_.end()) return false;
+        info = it->second;
+    }
+
+    const auto previous_connection = info.connection_status;
+    const bool responding = ping_node(info);
+    UpdateCallback cb;
+    {
+        std::lock_guard<std::mutex> g(mutex_);
+        const auto it = nodes_.find(id);
+        if (it == nodes_.end()) return false;
+        // Preserve registry-owned identity and credentials while replacing the
+        // complete mutable snapshot returned by the transport.
+        const std::string kind = it->second.kind;
+        const std::string url = it->second.url;
+        const std::string api_key = it->second.api_key;
+        const bool remembered = it->second.remembered;
+        it->second = info;
+        it->second.kind = kind;
+        it->second.url = url;
+        it->second.api_key = api_key;
+        it->second.remembered = remembered;
+        cb = update_cb_;
+    }
+
+    if (info.connection_status != previous_connection) {
+        MM_INFO("Node {} is now {}", id, to_string(info.connection_status));
+    }
+    if (cb) cb(info);
+    return responding;
+}
+
 // ── ping_node ─────────────────────────────────────────────────────────────────
-// Makes HTTP calls to the node; updates info fields in-place.
+// Queries the node through its registered transport; updates info in-place.
 // Returns true if node is responding.
 bool NodeRegistry::ping_node(NodeInfo& info) {
-    HttpClient cli(info.url);
-    cli.set_bearer_token(info.api_key);
+    NodeOperationsPtr node;
+    try {
+        node = operations(info.id);
+    } catch (const std::exception& e) {
+        MM_WARN("NodeRegistry: no transport for {}: {}", info.id, e.what());
+        return false;
+    }
 
     // GET /api/node/health → metrics
 
@@ -469,14 +699,14 @@ bool NodeRegistry::ping_node(NodeInfo& info) {
         // current health cannot be known while the node is unreachable.
         info.health = NodeHealthStatus::Unknown;
     };
-    auto health_res = cli.get("/api/node/health");
+    auto health_res = node->health();
     if (!health_res.ok()) {
         mark_unreachable();
         return false;
     }
 
     try {
-        auto j = nlohmann::json::parse(health_res.body);
+        const auto& j = health_res.body;
         info.metrics   = j.get<NodeHealthMetrics>();
         info.connected = true;
 
@@ -498,10 +728,10 @@ bool NodeRegistry::ping_node(NodeInfo& info) {
     }
 
     // GET /api/node/status → slots, loaded_model
-    auto status_res = cli.get("/api/node/status");
+    auto status_res = node->status();
     if (status_res.ok()) {
         try {
-            auto sj = nlohmann::json::parse(status_res.body);
+            const auto& sj = status_res.body;
             info.loaded_model = sj.value("loaded_model", std::string{});
 
             // Parse multi-slot fields if present
@@ -579,58 +809,7 @@ void NodeRegistry::poll_all_nodes() {
     }
 
     for (auto& id : ids) {
-        // Get a copy of the current info
-        NodeInfo info;
-        {
-            std::lock_guard<std::mutex> g(mutex_);
-            auto it = nodes_.find(id);
-            if (it == nodes_.end()) continue;
-            info = it->second;
-        }
-
-        const auto previous_connection = info.connection_status;
-        ping_node(info); // modifies info in place
-
-        // Write updated info back; grab callback outside the lock
-        UpdateCallback cb;
-        {
-            std::lock_guard<std::mutex> g(mutex_);
-            auto it = nodes_.find(id);
-            if (it != nodes_.end()) {
-                it->second.connected     = info.connected;
-                it->second.health        = info.health;
-                it->second.metrics       = info.metrics;
-                it->second.loaded_model  = info.loaded_model;
-                it->second.slots         = info.slots;
-                it->second.disk_free_mb  = info.disk_free_mb;
-                it->second.max_slots     = info.max_slots;
-                it->second.slot_in_use   = info.slot_in_use;
-                it->second.connection_status = info.connection_status;
-                it->second.last_seen_ms = info.last_seen_ms;
-                it->second.slot_snapshot_at_ms = info.slot_snapshot_at_ms;
-                it->second.unreachable_since_ms = info.unreachable_since_ms;
-                it->second.metrics_sampled_at_ms = info.metrics_sampled_at_ms;
-                it->second.consecutive_failures = info.consecutive_failures;
-                it->second.hostname = info.hostname;
-                it->second.slot_available = info.slot_available;
-                it->second.slot_ready    = info.slot_ready;
-                it->second.slot_loading  = info.slot_loading;
-                it->second.slot_suspending = info.slot_suspending;
-                it->second.slot_suspended = info.slot_suspended;
-                it->second.slot_error    = info.slot_error;
-                it->second.llama_server_path = info.llama_server_path;
-                it->second.llama_runtime = info.llama_runtime;
-                it->second.action_progress = info.action_progress;
-                it->second.capabilities = info.capabilities;
-            }
-            cb = update_cb_;
-        }
-
-        if (info.connection_status != previous_connection) {
-            MM_INFO("Node {} is now {}", id, to_string(info.connection_status));
-        }
-
-        if (cb) cb(info);
+        refresh_node(id);
     }
 }
 

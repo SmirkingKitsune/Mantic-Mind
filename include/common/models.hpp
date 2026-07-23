@@ -504,6 +504,10 @@ struct NodeActionProgress {
 
 struct NodeInfo {
     NodeId           id;
+    // "remote" for normal REST-connected nodes; "embedded" for the AIO
+    // process-local node.  Missing values deserialize as remote for wire
+    // compatibility with older controls and nodes.
+    std::string      kind = "remote";
     std::string      hostname;
     std::string      url;
     std::string      api_key;
@@ -1373,6 +1377,7 @@ inline void from_json(const nlohmann::json& j, NodeActionProgress& p) {
 
 inline void to_json(nlohmann::json& j, const NodeInfo& n) {
     j = { {"id",            n.id},
+          {"kind",          n.kind},
           {"hostname",      n.hostname},
           {"url",           n.url},
           {"loaded_model",  n.loaded_model},
@@ -1405,6 +1410,7 @@ inline void to_json(nlohmann::json& j, const NodeInfo& n) {
 inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     j.at("id").get_to(n.id);
     j.at("url").get_to(n.url);
+    if (j.contains("kind"))          j.at("kind").get_to(n.kind);
     if (j.contains("hostname"))      j.at("hostname").get_to(n.hostname);
     if (j.contains("api_key"))       j.at("api_key").get_to(n.api_key);
     if (j.contains("loaded_model"))  j.at("loaded_model").get_to(n.loaded_model);

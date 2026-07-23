@@ -9,6 +9,7 @@
 #include "control/agent_scheduler.hpp"
 #include "control/agent_queue.hpp"
 #include "control/control_api_server.hpp"
+#include "control/control_host.hpp"
 #include "control/control_ui.hpp"
 
 #include <atomic>
@@ -28,16 +29,6 @@
 #include <functional>
 #include <memory>
 
-#ifdef _WIN32
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  include <windows.h>
-#else
-#  include <fcntl.h>
-#  include <sys/file.h>
-#  include <unistd.h>
-#endif
 // ── Config loading ─────────────────────────────────────────────────────────────
 // Priority: config file < environment variables.
 
@@ -174,69 +165,6 @@ static mm::ControlConfig load_config(
 }
 // ── main ──────────────────────────────────────────────────────────────────────
 
-namespace {
-
-class ProcessSingletonLock {
-public:
-    ~ProcessSingletonLock() {
-#ifdef _WIN32
-        if (handle_) {
-            ReleaseMutex(handle_);
-            CloseHandle(handle_);
-        }
-#else
-        if (fd_ >= 0) {
-            flock(fd_, LOCK_UN);
-            close(fd_);
-        }
-#endif
-    }
-
-    ProcessSingletonLock(const ProcessSingletonLock&) = delete;
-    ProcessSingletonLock& operator=(const ProcessSingletonLock&) = delete;
-
-    static std::unique_ptr<ProcessSingletonLock> try_acquire(const std::string& data_dir,
-                                                             uint16_t port) {
-        const std::string key = data_dir + "|" + std::to_string(port);
-        const std::string suffix = std::to_string(std::hash<std::string>{}(key));
-
-#ifdef _WIN32
-        const std::string mutex_name = "Global\\mantic-mind-control-" + suffix;
-        HANDLE handle = CreateMutexA(nullptr, TRUE, mutex_name.c_str());
-        if (!handle || GetLastError() == ERROR_ALREADY_EXISTS) {
-            if (handle) CloseHandle(handle);
-            return nullptr;
-        }
-
-        auto lock = std::unique_ptr<ProcessSingletonLock>(new ProcessSingletonLock());
-        lock->handle_ = handle;
-        return lock;
-#else
-        const std::string lock_path = "/tmp/mantic-mind-control-" + suffix + ".lock";
-        int fd = open(lock_path.c_str(), O_CREAT | O_RDWR, 0600);
-        if (fd < 0) return nullptr;
-        if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
-            close(fd);
-            return nullptr;
-        }
-
-        auto lock = std::unique_ptr<ProcessSingletonLock>(new ProcessSingletonLock());
-        lock->fd_ = fd;
-        return lock;
-#endif
-    }
-
-private:
-    ProcessSingletonLock() = default;
-
-#ifdef _WIN32
-    HANDLE handle_ = nullptr;
-#else
-    int fd_ = -1;
-#endif
-};
-
-} // namespace
 enum class ControlRunMode { Tui, Cli };
 enum class CliOutputMode { Text, Json };
 
@@ -844,32 +772,17 @@ int main(int argc, char** argv) {
     std::string cfg_path;
     auto cfg = load_config(&cfg_path);
 
-    std::error_code data_ec;
-    std::filesystem::path data_dir_abs =
-        std::filesystem::absolute(cfg.data_dir, data_ec);
-    const std::string lock_data_dir =
-        data_ec ? cfg.data_dir : data_dir_abs.lexically_normal().string();
-    auto instance_lock =
-        ProcessSingletonLock::try_acquire(lock_data_dir, cfg.listen_port);
-    if (!instance_lock) {
-        std::fprintf(stderr,
-                     "Another mantic-mind-control instance appears to be running for data_dir='%s' and port=%u.\n",
-                     cfg.data_dir.c_str(),
-                     static_cast<unsigned>(cfg.listen_port));
+    mm::ControlHost::Options host_options;
+    host_options.config = cfg;
+    host_options.bind_host = "0.0.0.0";
+    host_options.enable_remote_nodes = true;
+    host_options.enable_discovery = true;
+    host_options.allow_legacy_environment = true;
+    mm::ControlHost host(std::move(host_options));
+    std::string host_error;
+    if (!host.acquire_singleton_lock(&host_error)) {
+        std::fprintf(stderr, "ERROR: %s.\n", host_error.c_str());
         return 1;
-    }
-
-    if (cfg.openai_compat_port != 0 && cfg.openai_compat_port == cfg.listen_port) {
-        std::fprintf(stderr,
-                     "openai_compat_port must differ from listen_port, or be 0 to disable it.\n");
-        return 1;
-    }
-
-    // Ensure models directory exists.
-    {
-        namespace fs = std::filesystem;
-        std::error_code ec;
-        fs::create_directories(cfg.models_dir, ec);
     }
 
     // Disable console logging — the TUI owns the terminal.
@@ -886,19 +799,17 @@ int main(int argc, char** argv) {
     MM_INFO("Control config source: {}",
             cfg_path.empty() ? "(defaults/env only; no config file found)" : cfg_path);
 
+    if (!host.initialize(&host_error)) {
+        std::fprintf(stderr, "ERROR: %s.\n", host_error.c_str());
+        return 1;
+    }
+
     // ── Core services ─────────────────────────────────────────────────────────
 
-    mm::AgentManager agents(cfg.data_dir);
-    agents.load_all();
-
-    mm::NodeRegistry      registry(cfg.data_dir);
-    mm::AgentScheduler    scheduler(registry, cfg.models_dir);
-    registry.set_offline_after_seconds(static_cast<int>(cfg.node_offline_after_s));
-    mm::AgentQueue        queue;
-    mm::ControlApiServer  api_server(
-        agents, queue, registry, scheduler,
-        cfg.data_dir, cfg.models_dir, cfg.external_api_token, cfg.tts);
-    api_server.cleanup_expired_tts_cache();
+    auto& agents = host.agents();
+    auto& registry = host.registry();
+    auto& scheduler = host.scheduler();
+    auto& api_server = host.api();
     mm::ControlUI         ui(
         registry,
         agents,
@@ -922,7 +833,8 @@ int main(int argc, char** argv) {
             if (out_conv_id) *out_conv_id = res.conv_id;
             if (out_error) *out_error = res.error;
             return res.success;
-        });
+        },
+        [&host] { host.request_shutdown(); });
 
     api_server.set_log_callback([&](int level, const std::string& message) {
         auto ll = level == 2 ? mm::ControlUI::LogLevel::Error
@@ -944,60 +856,29 @@ int main(int argc, char** argv) {
             (n.connected ? " [up]" : " [down]");
         api_server.publish_activity(0, msg);
     });
-    registry.start_health_poll(
-        static_cast<int>(cfg.node_health_poll_interval_s));
-    registry.start_discovery_listen(cfg.discovery_port);
-
     ui.set_pairing_key(cfg.pairing_key);
 
     // ── Housekeeping thread (every 5 min) ─────────────────────────────────────
 
-    std::atomic<bool> stop_housekeeping{false};
-    std::thread housekeeping_thread([&]() {
-        while (!stop_housekeeping) {
-            // Sleep 5 minutes in small increments for responsive shutdown.
-            for (int i = 0; i < 300 && !stop_housekeeping; ++i)
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-
-            if (!stop_housekeeping) {
-                MM_INFO("Running scheduler housekeeping");
-                scheduler.housekeeping(agents.list_agents());
-                api_server.cleanup_expired_tts_cache();
-            }
-        }
-    });
-
     // ── API server on background thread ───────────────────────────────────────
 
-    std::thread server_thread([&] {
-        MM_INFO("API server listening on 0.0.0.0:{}", cfg.listen_port);
-        api_server.publish_activity(0, "API server listening on port " + std::to_string(cfg.listen_port));
-        if (!api_server.listen(cfg.listen_port)) {
-            MM_ERROR("Server failed on port {}", cfg.listen_port);
-            api_server.publish_activity(2, "Server failed to start on port " + std::to_string(cfg.listen_port));
-            ui.quit();
-            if (g_control_cli_stop) g_control_cli_stop->store(true);
-        }
+    host.set_failure_callback([&ui](const std::string&) {
+        ui.quit();
+        if (g_control_cli_stop) g_control_cli_stop->store(true);
     });
-
-    std::thread openai_server_thread;
+    if (!host.start(&host_error)) {
+        std::fprintf(stderr, "ERROR: %s.\n", host_error.c_str());
+        return 1;
+    }
+    MM_INFO("API server listening on 0.0.0.0:{}", cfg.listen_port);
+    api_server.publish_activity(
+        0, "API server listening on port " + std::to_string(cfg.listen_port));
     if (cfg.openai_compat_port != 0) {
-        openai_server_thread = std::thread([&] {
-            MM_INFO("OpenAI-compatible API listening on 0.0.0.0:{}", cfg.openai_compat_port);
-            api_server.publish_activity(
-                0,
-                "OpenAI-compatible API listening on port " +
-                    std::to_string(cfg.openai_compat_port));
-            if (!api_server.listen_openai_compat(cfg.openai_compat_port)) {
-                MM_ERROR("OpenAI-compatible API failed on port {}", cfg.openai_compat_port);
-                api_server.publish_activity(
-                    2,
-                    "OpenAI-compatible API failed to start on port " +
-                        std::to_string(cfg.openai_compat_port));
-                ui.quit();
-                if (g_control_cli_stop) g_control_cli_stop->store(true);
-            }
-        });
+        MM_INFO("OpenAI-compatible API listening on 0.0.0.0:{}",
+                cfg.openai_compat_port);
+        api_server.publish_activity(
+            0, "OpenAI-compatible API listening on port " +
+                   std::to_string(cfg.openai_compat_port));
     }
 
     // ── TUI on main thread (blocks until user quits) ──────────────────────────
@@ -1023,16 +904,7 @@ int main(int argc, char** argv) {
 
     // ── Graceful shutdown ─────────────────────────────────────────────────────
 
-    stop_housekeeping = true;
-    if (housekeeping_thread.joinable()) housekeeping_thread.join();
-
-    api_server.stop();
-    api_server.stop_openai_compat();
-    registry.stop_discovery_listen();
-    registry.stop_health_poll();
-    queue.shutdown();
-    if (server_thread.joinable()) server_thread.join();
-    if (openai_server_thread.joinable()) openai_server_thread.join();
+    host.stop();
     MM_INFO("mantic-mind-control stopped");
 
     return 0;

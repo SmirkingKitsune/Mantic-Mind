@@ -1,6 +1,7 @@
 #include "control/agent_config_validator.hpp"
 
 #include "common/gguf_metadata.hpp"
+#include "common/runtime_args.hpp"
 #include "common/util.hpp"
 #include "control/node_registry.hpp"
 
@@ -28,19 +29,6 @@ bool is_blank(const std::string& s) {
 bool looks_like_gguf(const std::string& model_path) {
     const std::string p = util::to_lower(util::trim(model_path));
     return p.size() >= 5 && p.compare(p.size() - 5, 5, ".gguf") == 0;
-}
-
-bool has_authoritative_mmproj_flag(const RuntimeSettings& settings) {
-    for (const auto& raw : settings.extra_args) {
-        const std::string arg = util::to_lower(util::trim(raw));
-        for (const std::string flag : {"--mmproj", "-mm", "--mmproj-url"}) {
-            if (arg == flag || arg.rfind(flag + "=", 0) == 0 ||
-                arg.rfind(flag + " ", 0) == 0) {
-                return true;
-            }
-        }
-    }
-    return false;
 }
 
 std::string normalized_backend(const AgentConfig& cfg) {
@@ -126,11 +114,15 @@ AgentValidationResult validate_agent_config(const AgentConfig& cfg,
                 }
             }
         }
-        if (has_authoritative_mmproj_flag(cfg.runtime_settings)) {
+        if (const auto managed_arg =
+                managed_llama_server_extra_arg(cfg.runtime_settings)) {
             add_issue(result,
                       ValidationSeverity::Error,
                       "runtime_settings.extra_args",
-                      "Projector flags (--mmproj, -mm, --mmproj-url) are controlled by vision_settings.mmproj_path and cannot appear in extra_args.");
+                      "Argument '" + *managed_arg +
+                          "' is managed by Mantic Mind and cannot appear in extra_args. "
+                          "Model/projector paths, the loopback host, runtime port, and "
+                          "KV save path are authoritative node settings.");
         }
     } else if (!mmproj_path.empty()) {
         add_issue(result,

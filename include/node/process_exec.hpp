@@ -18,7 +18,9 @@ namespace mm {
 //   with is_stderr distinguishing the two streams. Trailing CR/LF are stripped.
 //
 // Returns the process exit code, or -1 if the process could not be launched
-// (with *error set when non-null). Blocks until the process exits.
+// (with *error set when non-null). Blocks until the process exits. The
+// cancellation overload returns 130 after terminating the complete spawned
+// process tree (Windows Job Object / POSIX process group).
 using StreamLineCallback = std::function<void(const std::string& line, bool is_stderr)>;
 using CancelCheckCallback = std::function<bool()>;
 

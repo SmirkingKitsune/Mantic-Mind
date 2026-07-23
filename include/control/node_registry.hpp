@@ -2,6 +2,7 @@
 
 #include "common/models.hpp"
 #include "common/node_discovery.hpp"
+#include "control/node_operations.hpp"
 #include <unordered_map>
 #include <vector>
 #include <functional>
@@ -24,7 +25,7 @@ NodeConnectionStatus classify_node_reachability(int64_t unreachable_since_ms,
 class NodeRegistry {
 public:
     NodeRegistry();
-    explicit NodeRegistry(std::string data_dir);
+    explicit NodeRegistry(std::string data_dir, bool enable_remote_nodes = true);
     ~NodeRegistry();
 
     // Register a node; returns assigned NodeId.
@@ -33,6 +34,15 @@ public:
                     const std::string& platform = {},
                     bool remember = false,
                     const std::string& hostname = {});
+
+    // Register the process-local AIO node.  It has the stable id "local", is
+    // never persisted, and cannot be paired, removed, or forgotten.
+    NodeId add_embedded_node(NodeOperationsPtr operations,
+                             const std::string& platform = {},
+                             const std::string& hostname = {});
+    bool is_embedded_node(const NodeId& id) const;
+    NodeOperationsPtr operations(const NodeId& id) const;
+    bool remote_nodes_enabled() const { return remote_nodes_enabled_; }
 
     void set_offline_after_seconds(int seconds);
 
@@ -70,9 +80,15 @@ public:
     // Start/stop background health polling (every interval_s seconds).
     void start_health_poll(int interval_s = 30);
     void stop_health_poll();
+    // Cancels active transport calls without holding the registry lock while
+    // invoking adapters. Safe and idempotent during lifecycle teardown.
+    void request_operations_shutdown();
+    // Refresh one node synchronously. AIO uses this for its two-second local
+    // snapshot cadence without increasing the configured remote poll rate.
+    bool refresh_node(const NodeId& id);
 
     // ── Discovery ─────────────────────────────────────────────────────────────
-    void start_discovery_listen(uint16_t port = 7072);
+    bool start_discovery_listen(uint16_t port = 7072);
     void stop_discovery_listen();
     // Returns discovered nodes whose URL is not already registered.
     std::vector<DiscoveredNode> get_discovered_nodes() const;
@@ -97,10 +113,14 @@ public:
 private:
     mutable std::mutex                    mutex_;
     std::unordered_map<NodeId, NodeInfo>  nodes_;
+    std::unordered_map<NodeId, NodeOperationsPtr> operations_;
+    std::vector<NodeOperationsPtr>                transient_operations_;
     std::unordered_set<NodeId>            remembered_nodes_;
     std::string                           remembered_nodes_path_;
     UpdateCallback                        update_cb_;
     std::atomic<int64_t> offline_after_ms_{90000};
+    std::atomic<bool> shutting_down_{false};
+    bool remote_nodes_enabled_ = true;
 
     std::atomic<bool>       polling_{false};
     std::thread             poll_thread_;
@@ -111,6 +131,8 @@ private:
 
     void poll_all_nodes();
     bool ping_node(NodeInfo& info);
+    NodeOperationsPtr begin_transient_operation(const std::string& url);
+    void end_transient_operation(const NodeOperationsPtr& operation);
     void load_remembered_nodes();
     void save_remembered_nodes_unlocked() const;
 };

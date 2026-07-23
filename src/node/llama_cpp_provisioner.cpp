@@ -489,38 +489,28 @@ void write_active_runtime(const LlamaProvisionConfig& cfg,
 std::string join_shell_command(const std::vector<std::string>& args);
 
 std::string default_capture_output(const std::vector<std::string>& args,
-                                   const fs::path& cwd) {
+                                   const fs::path& cwd,
+                                   const CancelCheckCallback& cancel_requested) {
     if (args.empty()) return {};
-    std::string cmd = join_shell_command(args);
-    if (!cwd.empty()) {
-#ifdef _WIN32
-        cmd = "cd /d \"" + cwd.string() + "\" && " + cmd;
-#else
-        cmd = "cd '" + cwd.string() + "' && " + cmd;
-#endif
-    }
-    // llama-server historically prints `--version` to stderr, so merge it into
-    // the captured stream instead of discarding it.
-#ifdef _WIN32
-    FILE* f = _popen((cmd + " 2>&1").c_str(), "r");
-#else
-    FILE* f = ::popen((cmd + " 2>&1").c_str(), "r");
-#endif
-    if (!f) return {};
     std::string output;
-    char buf[512];
-    while (fgets(buf, static_cast<int>(sizeof(buf)), f)) output += buf;
-#ifdef _WIN32
-    _pclose(f);
-#else
-    ::pclose(f);
-#endif
+    std::string error;
+    // Use the same process-tree runner as provisioning.  The previous popen
+    // path could not be interrupted while a version, metadata, or diagnostic
+    // probe was waiting on network or a broken toolchain executable.
+    run_streamed_command(
+        args, cwd,
+        [&](const std::string& line, bool) {
+            output += line;
+            output.push_back('\n');
+        },
+        cancel_requested, &error);
     return output;
 }
 
 std::string default_capture_first_line(const std::vector<std::string>& args,
-                                       const fs::path& cwd) {
-    const std::string output = default_capture_output(args, cwd);
+                                       const fs::path& cwd,
+                                       const CancelCheckCallback& cancel_requested) {
+    const std::string output = default_capture_output(args, cwd, cancel_requested);
     for (const auto& line : util::split(output, '\n')) {
         const std::string trimmed = util::trim(line);
         if (!trimmed.empty()) return trimmed;
@@ -554,27 +544,31 @@ std::string join_shell_command(const std::vector<std::string>& args) {
 // GitHub release-tag probe for ggml-org/llama.cpp. Windows uses PowerShell
 // (system cert store); POSIX uses python3 + urllib. "" on any failure.
 std::string default_fetch_latest(const LlamaProvisionConfig& cfg,
-                                 const LlamaCommandRunner::CaptureFn& capture) {
+                                 const LlamaCommandRunner::CancellableCaptureFn& capture,
+                                 const CancelCheckCallback& cancel_requested) {
     if (!capture) return {};
     const std::string url =
         "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest";
     if (!cfg.bypass_environment_checks && cfg.platform == "windows") {
         const std::string ps =
             "try { (Invoke-RestMethod -Uri '" + url +
-            "' -Headers @{ 'User-Agent' = 'mantic-mind' }).tag_name } catch { '' }";
+            "' -Headers @{ 'User-Agent' = 'mantic-mind' } -TimeoutSec 15).tag_name } "
+            "catch { '' }";
         return util::trim(capture({"powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                                   "-Command", ps}, {}));
+                                   "-Command", ps}, {}, cancel_requested));
     }
     const std::string program =
         "import json, urllib.request\n"
         "req = urllib.request.Request(\"" + url + "\", headers={\"User-Agent\": \"mantic-mind\"})\n"
         "d = json.load(urllib.request.urlopen(req, timeout=10))\n"
         "print(d.get(\"tag_name\", \"\"))\n";
-    return util::trim(capture({"python3", "-c", program}, {}));
+    return util::trim(capture({"python3", "-c", program}, {}, cancel_requested));
 }
 
 std::vector<std::string> default_fetch_release_assets(const LlamaProvisionConfig& cfg,
-                                                      const std::string& tag) {
+                                                      const std::string& tag,
+                                                      const LlamaCommandRunner::CancellableCaptureFn& capture,
+                                                      const CancelCheckCallback& cancel_requested) {
     if (tag.empty()) return {};
     const std::string url =
         "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/" + tag;
@@ -582,10 +576,11 @@ std::vector<std::string> default_fetch_release_assets(const LlamaProvisionConfig
     if (cfg.platform == "windows") {
         const std::string ps =
             "try { (Invoke-RestMethod -Uri '" + url +
-            "' -Headers @{ 'User-Agent' = 'mantic-mind' }).assets | "
+            "' -Headers @{ 'User-Agent' = 'mantic-mind' } -TimeoutSec 15).assets | "
             "ForEach-Object { $_.name } } catch { '' }";
-        output = default_capture_output(
-            {"powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps}, {});
+        output = capture(
+            {"powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+             ps}, {}, cancel_requested);
     } else {
         const std::string program =
             "import json, urllib.request\n"
@@ -593,7 +588,7 @@ std::vector<std::string> default_fetch_release_assets(const LlamaProvisionConfig
             "\", headers={\"User-Agent\": \"mantic-mind\"})\n"
             "d = json.load(urllib.request.urlopen(req, timeout=10))\n"
             "print('\\n'.join(a.get('name', '') for a in d.get('assets', [])))\n";
-        output = default_capture_output({"python3", "-c", program}, {});
+        output = capture({"python3", "-c", program}, {}, cancel_requested);
     }
 
     std::vector<std::string> assets;
@@ -662,7 +657,7 @@ std::vector<LlamaInstallStep> build_release_plan(const LlamaProvisionConfig& cfg
         ps << "$rel='" << rel.string() << "'; $stage='" << stage.string()
            << "'; $next='" << next_bin.string() << "'; $bin='" << bin.string() << "'; ";
         ps << "New-Item -ItemType Directory -Force -Path $rel | Out-Null; ";
-        ps << "$r=Invoke-RestMethod -Uri $api -Headers @{'User-Agent'='mantic-mind'}; $assets=@($r.assets); ";
+        ps << "$r=Invoke-RestMethod -Uri $api -Headers @{'User-Agent'='mantic-mind'} -TimeoutSec 15; $assets=@($r.assets); ";
         ps << "$archRx=[regex]::Escape($arch); ";
         ps << "$base=@($assets | Where-Object {$_.name -match ('^llama-.*-bin-win-cpu-'+$archRx+'\\.zip$')})[0]; ";
         ps << "if ($backend -eq 'openvino') {$full=$assets | Where-Object {$_.name -match ('^llama-.*-bin-win-openvino-.*-'+$archRx+'\\.zip$')} | Select-Object -First 1; if($null -eq $full){throw 'No matching llama.cpp Windows OpenVINO release'}; $selected=@($full)} else { ";
@@ -1339,17 +1334,7 @@ LlamaCppProvisioner::LlamaCppProvisioner(LlamaProvisionConfig cfg,
             return run_streamed_command(argv, cwd, on_line, cancel_requested, error);
         };
     }
-    if (!runner_.capture_output) runner_.capture_output = default_capture_output;
-    if (!runner_.capture_first_line) runner_.capture_first_line = default_capture_first_line;
     if (!runner_.resolve_executable) runner_.resolve_executable = resolve_llama_executable;
-    if (!runner_.fetch_latest) {
-        runner_.fetch_latest =
-            [capture = runner_.capture_first_line](const LlamaProvisionConfig& c) {
-                return default_fetch_latest(c, capture);
-            };
-    }
-    if (!runner_.fetch_release_assets)
-        runner_.fetch_release_assets = default_fetch_release_assets;
     status_ = make_base_status();
 }
 
@@ -1407,9 +1392,97 @@ LlamaRuntimeStatus LlamaCppProvisioner::status() const {
 
 LlamaProvisionConfig LlamaCppProvisioner::config() const { return cfg_; }
 
+bool LlamaCppProvisioner::cancellation_requested() const noexcept {
+    if (!cancel_check_) return false;
+    try {
+        return cancel_check_();
+    } catch (...) {
+        // A broken cancellation source must not strand a shutdown behind a
+        // metadata or diagnostic subprocess.
+        return true;
+    }
+}
+
+std::string LlamaCppProvisioner::capture_output(
+    const std::vector<std::string>& argv, const fs::path& cwd) const {
+    if (cancellation_requested()) return {};
+    std::string output;
+    if (runner_.capture_output_cancellable) {
+        output = runner_.capture_output_cancellable(argv, cwd, cancel_check_);
+    } else if (runner_.capture_output) {
+        // Compatibility seam for existing deterministic embedders. Production
+        // defaults always use the cancellable process-tree path below.
+        output = runner_.capture_output(argv, cwd);
+    } else {
+        output = default_capture_output(argv, cwd, cancel_check_);
+    }
+    return cancellation_requested() ? std::string{} : output;
+}
+
+std::string LlamaCppProvisioner::capture_first_line(
+    const std::vector<std::string>& argv, const fs::path& cwd) const {
+    if (cancellation_requested()) return {};
+    std::string output;
+    if (runner_.capture_first_line_cancellable) {
+        output = runner_.capture_first_line_cancellable(argv, cwd, cancel_check_);
+    } else if (runner_.capture_first_line) {
+        output = runner_.capture_first_line(argv, cwd);
+    } else if (runner_.capture_output || runner_.capture_output_cancellable) {
+        const std::string captured = capture_output(argv, cwd);
+        for (const auto& line : util::split(captured, '\n')) {
+            const std::string trimmed = util::trim(line);
+            if (!trimmed.empty()) {
+                output = trimmed;
+                break;
+            }
+        }
+    } else {
+        output = default_capture_first_line(argv, cwd, cancel_check_);
+    }
+    return cancellation_requested() ? std::string{} : output;
+}
+
+std::string LlamaCppProvisioner::fetch_latest(
+    const LlamaProvisionConfig& cfg) const {
+    if (cancellation_requested()) return {};
+    std::string latest;
+    if (runner_.fetch_latest_cancellable) {
+        latest = runner_.fetch_latest_cancellable(cfg, cancel_check_);
+    } else if (runner_.fetch_latest) {
+        latest = runner_.fetch_latest(cfg);
+    } else {
+        LlamaCommandRunner::CancellableCaptureFn capture =
+            [this](const std::vector<std::string>& argv, const fs::path& cwd,
+                   const CancelCheckCallback&) {
+                return capture_first_line(argv, cwd);
+            };
+        latest = default_fetch_latest(cfg, capture, cancel_check_);
+    }
+    return cancellation_requested() ? std::string{} : latest;
+}
+
+std::vector<std::string> LlamaCppProvisioner::fetch_release_assets(
+    const LlamaProvisionConfig& cfg, const std::string& tag) const {
+    if (cancellation_requested() || tag.empty()) return {};
+    std::vector<std::string> assets;
+    if (runner_.fetch_release_assets_cancellable) {
+        assets = runner_.fetch_release_assets_cancellable(cfg, tag, cancel_check_);
+    } else if (runner_.fetch_release_assets) {
+        assets = runner_.fetch_release_assets(cfg, tag);
+    } else {
+        LlamaCommandRunner::CancellableCaptureFn capture =
+            [this](const std::vector<std::string>& argv, const fs::path& cwd,
+                   const CancelCheckCallback&) {
+                return capture_output(argv, cwd);
+            };
+        assets = default_fetch_release_assets(cfg, tag, capture, cancel_check_);
+    }
+    return cancellation_requested() ? std::vector<std::string>{} : assets;
+}
+
 std::string LlamaCppProvisioner::capture_version(const std::string& executable) const {
     return validated_llama_version(
-        runner_.capture_first_line({executable, "--version"}, {}));
+        capture_first_line({executable, "--version"}, {}));
 }
 
 LlamaRuntimeStatus LlamaCppProvisioner::ensure_runtime() {
@@ -1504,9 +1577,32 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
     }
     if (force_source) install_cfg.install_method = "source";
     install_cfg.bypass_environment_checks = bypass_environment_checks;
-    if (install_cfg.install_method == "auto" && install_cfg.version == "latest" &&
-        runner_.fetch_latest) {
-        const std::string release_tag = util::trim(runner_.fetch_latest(install_cfg));
+
+    auto canceled_before_start = [&]() {
+        LlamaRuntimeStatus canceled = make_base_status();
+        canceled.status = "failed";
+        canceled.managed = true;
+        canceled.method = install_cfg.install_method;
+        canceled.accelerator = install_cfg.accelerator;
+        canceled.variant = install_cfg.release_variant.empty()
+            ? install_cfg.accelerator : install_cfg.release_variant;
+        canceled.version = install_cfg.version;
+        canceled.last_error =
+            std::string("llama.cpp ") + (upgrade ? "update" : "install") +
+            " canceled";
+        set_status(canceled);
+        RuntimeInstallProgress done;
+        emit_progress(done);
+        return canceled;
+    };
+
+    // Do not begin even the release metadata lookup after a queued action was
+    // canceled. Default metadata probes run through the cancellable process
+    // runner, so cancellation also interrupts an in-flight network request.
+    if (cancellation_requested()) return canceled_before_start();
+    if (install_cfg.install_method == "auto" && install_cfg.version == "latest") {
+        const std::string release_tag = util::trim(fetch_latest(install_cfg));
+        if (cancellation_requested()) return canceled_before_start();
         if (is_llama_release_tag(release_tag)) install_cfg.version = release_tag;
     }
     LlamaRuntimeStatus status = make_base_status();
@@ -1628,7 +1724,7 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
         }
         for (int i = 0; i < total && attempt_error.empty(); ++i) {
             const LlamaInstallStep& step = plan[static_cast<size_t>(i)];
-            if (cancel_check_ && cancel_check_()) return canceled_status();
+            if (cancellation_requested()) return canceled_status();
 
             RuntimeInstallProgress prog;
             prog.active = true;
@@ -1668,7 +1764,7 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
             const int rc = runner_.run(step.argv, cwd, on_line, cancel_check_, &step_err);
             write_build_log("exit_code: " + std::to_string(rc));
             if (!step_err.empty()) write_build_log("runner_error: " + step_err);
-            if (cancel_check_ && cancel_check_()) return canceled_status();
+            if (cancellation_requested()) return canceled_status();
             if (rc != 0 && !step.allow_failure) {
                 std::string detail = step_err;
                 if (detail.empty() && !output_tail.empty()) {
@@ -1755,7 +1851,8 @@ LlamaRuntimeStatus LlamaCppProvisioner::run_managed_install(
 
 LlamaTroubleshootingReport LlamaCppProvisioner::build_troubleshooting_report(
     const std::string& failure_detail,
-    const LlamaProvisionConfig& raw_install_cfg) const {
+    const LlamaProvisionConfig& raw_install_cfg,
+    bool allow_network) const {
     const LlamaProvisionConfig install_cfg = normalized_config(raw_install_cfg);
     LlamaTroubleshootingReport report;
     report.required = true;
@@ -1771,12 +1868,14 @@ LlamaTroubleshootingReport LlamaCppProvisioner::build_troubleshooting_report(
         report.failure_stage = stage_match[1].str();
     if (report.failure_stage.empty()) report.failure_stage = "Managed provisioning";
 
-    if (report.release_tag == "latest" && runner_.fetch_latest) {
-        const std::string latest = util::trim(runner_.fetch_latest(install_cfg));
+    if (allow_network && report.release_tag == "latest" &&
+        !cancellation_requested()) {
+        const std::string latest = util::trim(fetch_latest(install_cfg));
         if (!latest.empty()) report.release_tag = latest;
     }
-    const auto assets = runner_.fetch_release_assets && !report.release_tag.empty()
-        ? runner_.fetch_release_assets(install_cfg, report.release_tag)
+    const auto assets = allow_network && !cancellation_requested() &&
+                        !report.release_tag.empty()
+        ? fetch_release_assets(install_cfg, report.release_tag)
         : std::vector<std::string>{};
     report.variants = llama_runtime_variants(assets, install_cfg);
 
@@ -1788,9 +1887,7 @@ LlamaTroubleshootingReport LlamaCppProvisioner::build_troubleshooting_report(
                                  std::move(remediation), blocking});
     };
     auto capture = [&](const std::vector<std::string>& argv) {
-        return runner_.capture_output
-            ? util::trim(runner_.capture_output(argv, install_cfg.provision_dir))
-            : std::string{};
+        return util::trim(capture_output(argv, install_cfg.provision_dir));
     };
     auto locate = [&](const std::string& tool) {
         if (install_cfg.platform == "windows") {
@@ -2066,7 +2163,7 @@ LlamaTroubleshootingReport LlamaCppProvisioner::build_troubleshooting_report(
     return report;
 }
 
-LlamaRuntimeStatus LlamaCppProvisioner::diagnose_environment() {
+LlamaRuntimeStatus LlamaCppProvisioner::diagnose_environment(bool allow_network) {
     LlamaRuntimeStatus current = status();
     LlamaProvisionConfig install_cfg = cfg_;
     if (!current.target_accelerator.empty())
@@ -2077,7 +2174,8 @@ LlamaRuntimeStatus LlamaCppProvisioner::diagnose_environment() {
     const std::string failure = current.last_error.empty()
         ? std::string{"Manual llama.cpp environment diagnostic"}
         : current.last_error;
-    current.troubleshooting = build_troubleshooting_report(failure, install_cfg);
+    current.troubleshooting = build_troubleshooting_report(
+        failure, install_cfg, allow_network);
     set_status(current);
     return current;
 }
@@ -2096,7 +2194,7 @@ LlamaRuntimeStatus LlamaCppProvisioner::recover_runtime(
                                    /*bypass_environment_checks=*/true);
     if (action == "release") {
         LlamaRuntimeStatus current = status();
-        if (!current.troubleshooting.required) current = diagnose_environment();
+        if (!current.troubleshooting.required) current = diagnose_environment(true);
         const auto found = std::find_if(
             current.troubleshooting.variants.begin(),
             current.troubleshooting.variants.end(),
@@ -2118,17 +2216,29 @@ LlamaRuntimeStatus LlamaCppProvisioner::recover_runtime(
 
 LlamaRuntimeStatus LlamaCppProvisioner::check_for_update() {
     LlamaRuntimeStatus status = this->status();
-    const std::string latest =
-        runner_.fetch_latest ? util::trim(runner_.fetch_latest(cfg_)) : std::string{};
+    auto canceled = [&]() {
+        status.update_available = false;
+        status.update_action.clear();
+        status.update_release_available = false;
+        status.update_release_alternatives.clear();
+        status.update_warning.clear();
+        status.last_error = "llama.cpp update check canceled";
+        set_status(status);
+        return status;
+    };
+    if (cancellation_requested()) return canceled();
+    const std::string latest = util::trim(fetch_latest(cfg_));
+    if (cancellation_requested()) return canceled();
     status.latest_version = latest;
     const std::string installed = util::trim(status.version);
     status.update_action.clear();
     status.update_release_available = false;
     status.update_release_alternatives.clear();
     status.update_warning.clear();
-    const auto assets = runner_.fetch_release_assets && !latest.empty()
-        ? runner_.fetch_release_assets(cfg_, latest)
+    const auto assets = !latest.empty()
+        ? fetch_release_assets(cfg_, latest)
         : std::vector<std::string>{};
+    if (cancellation_requested()) return canceled();
     status.available_variants = llama_runtime_variants(assets, cfg_);
     // `llama-server --version` commonly returns a sentence containing the tag,
     // so treat a contained tag as current instead of comparing whole strings.

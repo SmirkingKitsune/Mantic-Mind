@@ -1,13 +1,18 @@
 #include "node/llama_runtime.hpp"
 
+#include "common/runtime_args.hpp"
 #include "common/util.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <initializer_list>
 #include <optional>
+#include <set>
+#include <stdexcept>
 
 namespace mm {
 
@@ -50,6 +55,27 @@ bool detect_rocm_present() {
 
 namespace {
 
+std::string capture_command_output(const std::string& command) {
+#ifdef _WIN32
+    FILE* pipe = _popen((command + " 2>nul").c_str(), "r");
+#else
+    FILE* pipe = ::popen((command + " 2>/dev/null").c_str(), "r");
+#endif
+    if (!pipe) return {};
+
+    std::string output;
+    std::array<char, 256> buffer{};
+    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe)) {
+        output += buffer.data();
+    }
+#ifdef _WIN32
+    _pclose(pipe);
+#else
+    ::pclose(pipe);
+#endif
+    return output;
+}
+
 std::string strip_wrapping_quotes(std::string s) {
     s = mm::util::trim(s);
     if (s.size() >= 2) {
@@ -63,6 +89,48 @@ std::string strip_wrapping_quotes(std::string s) {
 }
 
 } // namespace
+
+int parse_nvidia_gpu_count(std::string_view output) {
+    int count = 0;
+    for (const auto& line : util::split(std::string(output), '\n')) {
+        if (!util::trim(line).empty()) ++count;
+    }
+    return count;
+}
+
+std::string parse_cuda_architectures(std::string_view output) {
+    std::set<std::string> capabilities;
+    for (const auto& line : util::split(std::string(output), '\n')) {
+        std::string value = util::trim(line);
+        value.erase(std::remove(value.begin(), value.end(), '.'), value.end());
+        if (!value.empty() &&
+            std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+                return std::isdigit(ch) != 0;
+            })) {
+            capabilities.insert(std::move(value));
+        }
+    }
+    return util::join(
+        std::vector<std::string>(capabilities.begin(), capabilities.end()), ";");
+}
+
+int detect_nvidia_gpu_count() {
+    return parse_nvidia_gpu_count(capture_command_output(
+        "nvidia-smi --query-gpu=index --format=csv,noheader,nounits"));
+}
+
+std::string detect_cuda_architectures() {
+    return parse_cuda_architectures(capture_command_output(
+        "nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits"));
+}
+
+int resolve_node_gpu_count(int configured_count,
+                           int detected_nvidia_count,
+                           bool nvidia_backend_observed) {
+    if (configured_count > 0) return configured_count;
+    if (detected_nvidia_count > 0) return detected_nvidia_count;
+    return nvidia_backend_observed ? 1 : 0;
+}
 
 std::string normalize_llama_model_path(const std::string& raw) {
     std::string p = strip_wrapping_quotes(raw);
@@ -118,6 +186,12 @@ std::vector<std::string> build_llama_server_args(const std::string& model_path,
                                                  const RuntimeSettings& s,
                                                  uint16_t port,
                                                  const std::string& slot_save_path) {
+    if (const auto managed_arg = managed_llama_server_extra_arg(s)) {
+        throw std::invalid_argument(
+            "runtime_settings.extra_args contains node-managed llama-server argument '" +
+            *managed_arg + "'");
+    }
+
     std::vector<std::string> args;
     const auto& extra = s.extra_args;
 

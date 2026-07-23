@@ -136,7 +136,8 @@ ControlUI::ControlUI(NodeRegistry& registry,
                      std::string models_dir,
                      std::string control_base_url,
                      std::string control_api_token,
-                     LocalChatFallback local_chat_fallback)
+                     LocalChatFallback local_chat_fallback,
+                     ShutdownCallback shutdown_callback)
     : registry_(registry)
     , control_api_token_(std::move(control_api_token))
     , agents_(agents)
@@ -144,6 +145,7 @@ ControlUI::ControlUI(NodeRegistry& registry,
     , models_dir_(std::move(models_dir))
     , control_base_url_(std::move(control_base_url))
     , local_chat_fallback_(std::move(local_chat_fallback))
+    , shutdown_callback_(std::move(shutdown_callback))
 {}
 
 ControlUI::~ControlUI() = default;
@@ -208,6 +210,30 @@ void ControlUI::run() {
     int node_slot_sel = 0;
     std::vector<std::string> node_slot_entries;
     std::string node_operation_status;
+    std::mutex node_operation_mutex;
+    std::atomic<bool> node_operation_inflight{false};
+    std::thread node_operation_thread;
+    std::atomic<bool> pairing_inflight{false};
+    std::thread pairing_thread;
+    std::mutex active_node_operation_mutex;
+    NodeOperationsPtr active_node_operation;
+    bool show_node_network_confirm = false;
+    NodeId pending_node_network_id;
+    enum class NodeRuntimeNetworkAction {
+        Provision,
+        CheckUpdate,
+        Update,
+        Switch,
+        Recover,
+    };
+    NodeRuntimeNetworkAction pending_node_network_action =
+        NodeRuntimeNetworkAction::Provision;
+    std::string node_runtime_accelerator_input;
+    std::string node_runtime_variant_input;
+    std::string node_runtime_variant_hint;
+    int node_runtime_recovery_action = 0;
+    std::vector<std::string> node_runtime_recovery_labels = {
+        "retry", "target", "compile-anyway", "release"};
 
     // 1a "Overview" dashboard state. node_rows is the per-frame node snapshot the
     // node-menu transform indexes into (set at the top of nodes_renderer, read
@@ -397,6 +423,167 @@ void ControlUI::run() {
         return "(empty response body)";
     };
 
+    auto set_node_operation_status = [&](std::string status) {
+        std::lock_guard<std::mutex> lock(node_operation_mutex);
+        node_operation_status = std::move(status);
+    };
+
+    auto summarize_node_operation = [](const std::string& operation,
+                                       const NodeOperationResult& response) {
+        if (!response.ok()) {
+            return operation + " failed (" + std::to_string(response.status) + "): " +
+                   response.error_message();
+        }
+
+        try {
+            const auto& body = response.body;
+            if (body.contains("lines") && body["lines"].is_array()) {
+                std::string summary = operation + ":";
+                for (const auto& line : body["lines"]) {
+                    if (!line.is_string()) continue;
+                    std::string value = line.get<std::string>();
+                    if (value.size() > 240) value.resize(240);
+                    summary += "\n" + value;
+                    if (summary.size() >= 2400) {
+                        summary.resize(2400);
+                        summary += "...";
+                        break;
+                    }
+                }
+                if (body["lines"].empty()) summary += "\n(no log lines)";
+                return summary;
+            }
+
+            const auto runtime = body.value("llama_runtime", nlohmann::json::object());
+            if (runtime.is_object() && !runtime.empty()) {
+                std::string summary = operation + ": " +
+                    runtime.value("status", std::string{"unknown"});
+                const std::string version = runtime.value("version", std::string{});
+                const std::string accelerator = runtime.value("accelerator", std::string{});
+                const std::string variant = runtime.value("variant", std::string{});
+                const std::string latest = runtime.value("latest_version", std::string{});
+                const std::string error = runtime.value("last_error", std::string{});
+                if (!version.empty()) summary += " · " + version;
+                if (!accelerator.empty()) summary += " · " + accelerator;
+                if (!variant.empty() && variant != accelerator) summary += " · " + variant;
+                if (!latest.empty()) {
+                    summary += runtime.value("update_available", false)
+                        ? "\nUpdate available: " + latest
+                        : "\nLatest upstream: " + latest + " (current)";
+                    const std::string update_action =
+                        runtime.value("update_action", std::string{});
+                    if (!update_action.empty()) summary += " · " + update_action;
+                }
+                const std::string update_warning =
+                    runtime.value("update_warning", std::string{});
+                if (!update_warning.empty()) summary += "\n" + update_warning;
+                const auto troubleshooting = runtime.value(
+                    "troubleshooting", nlohmann::json::object());
+                const std::string diagnostic = troubleshooting.value(
+                    "summary", std::string{});
+                if (!diagnostic.empty()) summary += "\n" + diagnostic;
+                if (!error.empty()) summary += "\n" + error;
+                return summary;
+            }
+
+            if (body.contains("slots")) {
+                const auto slots = body.value("slots", nlohmann::json::array());
+                std::string summary = operation + ": " +
+                    body.value("hostname", std::string{"node"}) + " · " +
+                    std::to_string(slots.is_array() ? slots.size() : 0U) + " slots";
+                const std::string runtime_status = body.value("llama_runtime",
+                    nlohmann::json::object()).value("status", std::string{});
+                if (!runtime_status.empty()) summary += " · runtime " + runtime_status;
+                return summary;
+            }
+
+            if (body.contains("cancel_requested")) return operation + ": requested";
+            std::string summary = operation + ": " + body.dump();
+            if (summary.size() > 800) summary = summary.substr(0, 800) + "...";
+            return summary;
+        } catch (const std::exception& e) {
+            return operation + " completed; response could not be summarized: " + e.what();
+        }
+    };
+
+    auto run_node_operation_async = [&](std::string operation,
+                                        NodeOperationsPtr node,
+                                        std::function<NodeOperationResult(NodeOperations&)> fn) {
+        if (node_operation_inflight.exchange(true)) {
+            set_node_operation_status("another node operation is already running");
+            return;
+        }
+        if (node_operation_thread.joinable()) node_operation_thread.join();
+        {
+            std::lock_guard<std::mutex> lock(active_node_operation_mutex);
+            active_node_operation = node;
+        }
+        set_node_operation_status("running: " + operation);
+        refresh();
+        node_operation_thread = std::thread(
+            [&, operation = std::move(operation), node = std::move(node), fn = std::move(fn)]() {
+                try {
+                    set_node_operation_status(summarize_node_operation(operation, fn(*node)));
+                } catch (const std::exception& e) {
+                    set_node_operation_status(operation + " failed: " + e.what());
+                } catch (...) {
+                    set_node_operation_status(operation + " failed: unknown error");
+                }
+                {
+                    std::lock_guard<std::mutex> lock(active_node_operation_mutex);
+                    if (active_node_operation == node) {
+                        active_node_operation.reset();
+                    }
+                }
+                node_operation_inflight = false;
+                refresh();
+            });
+    };
+
+    auto run_pairing_async = [&screen, &pairing_inflight, &pairing_thread,
+                              &ui_shutting_down, &set_node_operation_status,
+                              this](
+        std::string operation,
+        std::function<std::string()> work,
+        std::function<void(const std::string&)> complete) {
+        if (pairing_inflight.exchange(true)) {
+            set_node_operation_status("another pairing operation is already running");
+            return;
+        }
+        if (pairing_thread.joinable()) pairing_thread.join();
+        set_node_operation_status("running: " + operation);
+        refresh();
+        pairing_thread = std::thread(
+            [&, operation = std::move(operation), work = std::move(work),
+             complete = std::move(complete)]() mutable {
+                std::string result;
+                std::string error;
+                try {
+                    result = work();
+                } catch (const std::exception& exception) {
+                    error = exception.what();
+                } catch (...) {
+                    error = "unknown error";
+                }
+                if (ui_shutting_down.load()) {
+                    pairing_inflight = false;
+                    return;
+                }
+                screen.Post([&, operation = std::move(operation),
+                             result = std::move(result),
+                             error = std::move(error),
+                             complete = std::move(complete)]() mutable {
+                    if (!error.empty()) {
+                        set_node_operation_status(operation + " failed: " + error);
+                    } else {
+                        complete(result);
+                    }
+                    pairing_inflight = false;
+                    refresh();
+                });
+            });
+    };
+
     auto set_curation_status = [&](const std::string& status, const std::string& error) {
         std::lock_guard<std::mutex> lk(cur_status_mutex);
         cur_status = status;
@@ -577,35 +764,61 @@ void ControlUI::run() {
 
     //
 
-    // Discovered (unregistered) nodes section
+    // Discovered (unregistered) nodes section. AIO keeps this entire surface
+    // out of the component tree when clustering is disabled, so hidden pairing
+    // buttons cannot receive keyboard focus or invoke remote-node mutations.
+    const bool remote_nodes_enabled = registry_.remote_nodes_enabled();
     auto disc_menu    = Menu(&disc_entries, &disc_sel, MenuOption::Vertical());
     auto btn_pair     = Button("[P] Pair", [&] {
+        if (!remote_nodes_enabled) {
+            set_node_operation_status("clustering is disabled; enable [cluster].enabled and restart");
+            return;
+        }
         auto dns = registry_.get_discovered_nodes();
         if (disc_sel < 0 || disc_sel >= static_cast<int>(dns.size())) return;
         pair_url = dns[disc_sel].url;
         remember_pair_node = true;
         if (!pairing_key_.empty()) {
-            //
-            auto key = registry_.pair_node(pair_url, pairing_key_, remember_pair_node);
-            if (!key.empty())
-                log(LogLevel::Info,
-                    "Paired with " + pair_url + " (PSK)" +
-                    (remember_pair_node ? " and remembered" : ""));
-            else
-                log(LogLevel::Error, "PSK pairing failed for " + pair_url);
+            const std::string url = pair_url;
+            const std::string psk = pairing_key_;
+            const bool remember = remember_pair_node;
+            run_pairing_async(
+                "pair " + url,
+                [this, url, psk, remember] {
+                    return registry_.pair_node(url, psk, remember);
+                },
+                [this, url, remember](const std::string& key) {
+                    if (!key.empty()) {
+                        log(LogLevel::Info,
+                            "Paired with " + url + " (PSK)" +
+                            (remember ? " and remembered" : ""));
+                    } else {
+                        log(LogLevel::Error, "PSK pairing failed for " + url);
+                    }
+                });
         } else {
-            //
-            // then open the PIN entry modal for the user to read it from the node TUI.
-            pair_nonce = registry_.start_pair(pair_url);
-            if (pair_nonce.empty()) {
-                log(LogLevel::Error, "Could not reach node for pairing: " + pair_url);
-                return;
-            }
-            pin_input.clear();
-            show_pin_entry = true;
+            const std::string url = pair_url;
+            run_pairing_async(
+                "request pairing PIN from " + url,
+                [this, url] { return registry_.start_pair(url); },
+                [&, url](const std::string& nonce) {
+                    if (nonce.empty()) {
+                        log(LogLevel::Error,
+                            "Could not reach node for pairing: " + url);
+                        return;
+                    }
+                    pair_url = url;
+                    pair_nonce = nonce;
+                    pin_input.clear();
+                    show_pin_entry = true;
+                });
         }
     }, ButtonOption::Simple());
     auto btn_add_manual = Button("[+] Add Manually", [&] {
+        if (!remote_nodes_enabled) {
+            set_node_operation_status("clustering is disabled; enable [cluster].enabled and restart");
+            return;
+        }
         add_url.clear();
         remember_pair_node = true;
         show_add_node = true;
@@ -615,6 +828,7 @@ void ControlUI::run() {
     // when disc_entries is empty, preventing FTXUI from indexing an empty vector.
     auto disc_menu_m  = Maybe(disc_menu, [&]() { return !disc_entries.empty(); });
     auto disc_comp    = Container::Vertical({disc_menu_m, disc_btns});
+    auto disc_comp_m  = Maybe(disc_comp, [&]() { return remote_nodes_enabled; });
 
     // Connected (registered) nodes section. The menu keeps FTXUI's keyboard
     // navigation + click-to-select, but each entry is rendered as a rich 1a table
@@ -627,7 +841,8 @@ void ControlUI::run() {
         const NodeInfo& n = node_rows[static_cast<size_t>(st.index)];
         auto sep = [] { return text(" │ ") | dim; };
 
-        const std::string display_name = mm::tui::node_display_name(n, node_rows);
+        std::string display_name = mm::tui::node_display_name(n, node_rows);
+        if (n.kind == "embedded" || n.id == "local") display_name += " [embedded]";
         Element reachability = mm::tui::connection_status_el(n);
 
         const bool gpu = n.metrics.gpu_vram_total_mb > 0 || n.metrics.gpu_backend_available;
@@ -681,26 +896,56 @@ void ControlUI::run() {
         return row;
     };
     auto node_menu   = Menu(&node_entries, &node_sel, node_menu_opt);
+    auto selected_control_node = [&]() -> std::optional<NodeInfo> {
+        if (node_sel >= 0 && node_sel < static_cast<int>(node_rows.size()))
+            return node_rows[static_cast<std::size_t>(node_sel)];
+        const auto nodes = registry_.list_nodes();
+        if (node_sel < 0 || node_sel >= static_cast<int>(nodes.size())) return std::nullopt;
+        return nodes[static_cast<std::size_t>(node_sel)];
+    };
+    auto selected_node_is_embedded = [&]() {
+        const auto node = selected_control_node();
+        return node && (node->kind == "embedded" || node->id == "local");
+    };
     auto forget_selected_node = [&]() {
-        auto ns = registry_.list_nodes();
-        if (node_sel < 0 || node_sel >= static_cast<int>(ns.size())) return;
-        const auto& n = ns[node_sel];
-        const bool changed = registry_.forget_node(n.id);
-        log(LogLevel::Info,
-            changed ? ("Forgot saved node " + n.id)
-                    : ("Node " + n.id + " was not remembered"));
+        const auto node = selected_control_node();
+        if (!node) return;
+        if (node->kind == "embedded" || node->id == "local") {
+            set_node_operation_status("the embedded node is process-owned and cannot be forgotten");
+            return;
+        }
+        try {
+            const bool changed = registry_.forget_node(node->id);
+            log(LogLevel::Info,
+                changed ? ("Forgot saved node " + node->id)
+                        : ("Node " + node->id + " was not remembered"));
+        } catch (const std::exception& e) {
+            set_node_operation_status(std::string{"forget failed: "} + e.what());
+        }
     };
     auto btn_forget_n = Button("[F] Forget", forget_selected_node, ButtonOption::Simple());
     auto btn_rem_n   = Button("[-] Remove", [&] {
-        auto ns = registry_.list_nodes();
-        if (node_sel >= 0 && node_sel < static_cast<int>(ns.size())) {
-            registry_.remove_node(ns[node_sel].id);
-            if (node_sel >= static_cast<int>(ns.size()) - 1)
-                node_sel = std::max(0, static_cast<int>(ns.size()) - 2);
+        const auto node = selected_control_node();
+        if (!node) return;
+        if (node->kind == "embedded" || node->id == "local") {
+            set_node_operation_status("the embedded node is process-owned and cannot be removed");
+            return;
+        }
+        try {
+            registry_.remove_node(node->id);
+            const auto remaining = registry_.list_nodes().size();
+            if (node_sel >= static_cast<int>(remaining))
+                node_sel = std::max(0, static_cast<int>(remaining) - 1);
+        } catch (const std::exception& e) {
+            set_node_operation_status(std::string{"remove failed: "} + e.what());
         }
     }, ButtonOption::Simple());
     auto node_menu_m  = Maybe(node_menu, [&]() { return !node_entries.empty(); });
     auto node_btns    = Container::Horizontal({btn_forget_n, btn_rem_n});
+    auto node_btns_m  = Maybe(node_btns, [&]() {
+        const auto node = selected_control_node();
+        return node && node->kind != "embedded" && node->id != "local";
+    });
     auto save_node_layout = [&]() {
         layout.set("nodes.detail_height", node_detail_height);
         layout.set("nodes.name_width", node_name_width);
@@ -713,31 +958,124 @@ void ControlUI::run() {
         &node_name_width, 12, 36, mm::tui::SplitAxis::Columns,
         [&](int) { save_node_layout(); });
 
-    auto nodes_section = Container::Vertical({node_menu_m, node_btns});
+    auto nodes_section = Container::Vertical({node_menu_m, node_btns_m});
 
-    auto selected_control_node = [&]() -> std::optional<NodeInfo> {
-        const auto nodes = registry_.list_nodes();
-        if (node_sel < 0 || node_sel >= static_cast<int>(nodes.size())) return std::nullopt;
-        return nodes[static_cast<std::size_t>(node_sel)];
-    };
-    auto post_selected_node = [&](const std::string& path, const nlohmann::json& body) {
+    auto selected_node_operations = [&]() -> NodeOperationsPtr {
         const auto node = selected_control_node();
-        if (!node || !node->connected) { node_operation_status = "node is not online"; return false; }
-        HttpClient client(node->url);
-        client.set_bearer_token(node->api_key);
-        const auto response = client.post(path, body);
-        node_operation_status = response.ok() ? "ok: " + path
-            : "failed " + std::to_string(response.status) + ": " + parse_api_error(response);
+        if (!node || !node->connected) {
+            set_node_operation_status("node is not online");
+            return {};
+        }
+        try {
+            return registry_.operations(node->id);
+        } catch (const std::exception& e) {
+            set_node_operation_status(std::string{"node operation unavailable: "} + e.what());
+            return {};
+        }
+    };
+    auto cancel_selected_node_action = [&]() {
+        const auto operations = selected_node_operations();
+        if (!operations) return false;
+        const auto response = operations->cancel_action();
+        set_node_operation_status(summarize_node_operation("cancel action", response));
         return response.ok();
     };
     auto node_slot_menu = Menu(&node_slot_entries, &node_slot_sel, MenuOption::Vertical());
-    auto btn_control_cancel = Button(" Cancel action ", [&] {
-        post_selected_node("/api/node/actions/cancel", nlohmann::json::object());
+    auto btn_control_status = Button(" Status ", [&] {
+        auto operations = selected_node_operations();
+        if (operations) run_node_operation_async("node status", std::move(operations),
+            [](NodeOperations& node) { return node.status(); });
     }, ButtonOption::Simple());
-    auto control_action_buttons = Container::Horizontal({btn_control_cancel});
+    auto btn_control_logs = Button(" Log tail ", [&] {
+        auto operations = selected_node_operations();
+        if (operations) run_node_operation_async("last 50 node log lines", std::move(operations),
+            [](NodeOperations& node) { return node.logs(50); });
+    }, ButtonOption::Simple());
+    auto btn_control_runtime = Button(" Runtime ", [&] {
+        auto operations = selected_node_operations();
+        if (operations) run_node_operation_async("llama.cpp runtime", std::move(operations),
+            [](NodeOperations& node) { return node.llama_runtime(); });
+    }, ButtonOption::Simple());
+    auto btn_control_diagnose = Button(" Diagnose ", [&] {
+        auto operations = selected_node_operations();
+        if (operations) run_node_operation_async("llama.cpp diagnosis", std::move(operations),
+            [](NodeOperations& node) { return node.llama_diagnose(); });
+    }, ButtonOption::Simple());
+    auto btn_control_cancel = Button(" Cancel action ", [&] {
+        cancel_selected_node_action();
+    }, ButtonOption::Simple());
+
+    auto open_node_network_confirmation = [&](NodeRuntimeNetworkAction action) {
+        const auto node = selected_control_node();
+        if (!node || !node->connected) {
+            set_node_operation_status("node is not online");
+            return;
+        }
+        pending_node_network_action = action;
+        pending_node_network_id = node->id;
+        node_runtime_accelerator_input.clear();
+        node_runtime_variant_input.clear();
+        node_runtime_variant_hint.clear();
+        node_runtime_recovery_action = 0;
+
+        auto append_variant = [&](const LlamaRuntimeVariant& variant,
+                                  bool release_only) {
+            if (variant.id.empty() || !variant.platform_supported) return;
+            if (release_only && !variant.release_available) return;
+            if (!release_only && !variant.release_available && !variant.source_supported) return;
+            if (!node_runtime_variant_hint.empty()) node_runtime_variant_hint += ", ";
+            node_runtime_variant_hint += variant.id;
+            if (node_runtime_variant_hint.size() > 120) {
+                node_runtime_variant_hint.resize(120);
+                node_runtime_variant_hint += "...";
+            }
+        };
+
+        if (action == NodeRuntimeNetworkAction::Switch) {
+            for (const auto& variant : node->llama_runtime.available_variants) {
+                append_variant(variant, false);
+                if (node_runtime_variant_input.empty() && variant.recommended &&
+                    (variant.release_available || variant.source_supported)) {
+                    node_runtime_variant_input = variant.id;
+                }
+            }
+            if (node_runtime_variant_input.empty()) {
+                node_runtime_variant_input = !node->llama_runtime.target_variant.empty()
+                    ? node->llama_runtime.target_variant
+                    : node->llama_runtime.variant;
+            }
+        } else if (action == NodeRuntimeNetworkAction::Recover) {
+            for (const auto& variant : node->llama_runtime.troubleshooting.variants)
+                append_variant(variant, true);
+        }
+        show_node_network_confirm = true;
+    };
+
+    auto btn_control_provision = Button(" Provision... ", [&] {
+        open_node_network_confirmation(NodeRuntimeNetworkAction::Provision);
+    }, ButtonOption::Simple());
+    auto btn_control_check_update = Button(" Check update... ", [&] {
+        open_node_network_confirmation(NodeRuntimeNetworkAction::CheckUpdate);
+    }, ButtonOption::Simple());
+    auto btn_control_update = Button(" Update... ", [&] {
+        open_node_network_confirmation(NodeRuntimeNetworkAction::Update);
+    }, ButtonOption::Simple());
+    auto btn_control_switch = Button(" Switch... ", [&] {
+        open_node_network_confirmation(NodeRuntimeNetworkAction::Switch);
+    }, ButtonOption::Simple());
+    auto btn_control_recover = Button(" Recover... ", [&] {
+        open_node_network_confirmation(NodeRuntimeNetworkAction::Recover);
+    }, ButtonOption::Simple());
+    auto control_read_buttons = Container::Horizontal({btn_control_status, btn_control_logs,
+        btn_control_runtime, btn_control_diagnose, btn_control_cancel});
+    auto control_runtime_buttons = Container::Horizontal({btn_control_provision,
+        btn_control_check_update, btn_control_update, btn_control_switch,
+        btn_control_recover});
+    auto control_action_buttons = Container::Vertical(
+        {control_read_buttons, control_runtime_buttons});
     auto node_operations = Container::Vertical({node_slot_menu, control_action_buttons});
 
-    auto nodes_comp  = Container::Vertical({disc_comp, nodes_section, node_name_divider,
+    auto nodes_comp  = Container::Vertical({disc_comp_m, nodes_section, node_name_divider,
         node_rows_divider, node_operations});
 
     //
@@ -748,24 +1086,40 @@ void ControlUI::run() {
     auto modal_remember_cb = Checkbox("Remember this node", &remember_pair_node);
     auto modal_ok     = Button("  Connect  ", [&] {
         if (!add_url.empty()) {
+            const std::string url = add_url;
+            const bool remember = remember_pair_node;
             if (!pairing_key_.empty()) {
-                auto key = registry_.pair_node(add_url, pairing_key_, remember_pair_node);
-                if (!key.empty()) {
-                    log(LogLevel::Info,
-                        "Paired with " + add_url + " (PSK)" +
-                        (remember_pair_node ? " and remembered" : ""));
-                } else {
-                    log(LogLevel::Error, "PSK pairing failed for " + add_url);
-                }
+                const std::string psk = pairing_key_;
+                run_pairing_async(
+                    "pair " + url,
+                    [this, url, psk, remember] {
+                        return registry_.pair_node(url, psk, remember);
+                    },
+                    [this, url, remember](const std::string& key) {
+                        if (!key.empty()) {
+                            log(LogLevel::Info,
+                                "Paired with " + url + " (PSK)" +
+                                (remember ? " and remembered" : ""));
+                        } else {
+                            log(LogLevel::Error,
+                                "PSK pairing failed for " + url);
+                        }
+                    });
             } else {
-                pair_url = add_url;
-                pair_nonce = registry_.start_pair(pair_url);
-                if (pair_nonce.empty()) {
-                    log(LogLevel::Error, "Could not reach node for pairing: " + pair_url);
-                } else {
-                    pin_input.clear();
-                    show_pin_entry = true;
-                }
+                run_pairing_async(
+                    "request pairing PIN from " + url,
+                    [this, url] { return registry_.start_pair(url); },
+                    [&, url](const std::string& nonce) {
+                        if (nonce.empty()) {
+                            log(LogLevel::Error,
+                                "Could not reach node for pairing: " + url);
+                            return;
+                        }
+                        pair_url = url;
+                        pair_nonce = nonce;
+                        pin_input.clear();
+                        show_pin_entry = true;
+                    });
             }
         }
         show_add_node = false;
@@ -796,13 +1150,26 @@ void ControlUI::run() {
     auto pin_remember_cb  = Checkbox("Remember this node", &remember_pair_node);
     auto pin_ok           = Button("  Pair  ", [&] {
         if (!pin_input.empty()) {
-            auto key = registry_.complete_pair(pair_url, pair_nonce, pin_input, remember_pair_node);
-            if (!key.empty())
-                log(LogLevel::Info,
-                    "Paired with " + pair_url +
-                    (remember_pair_node ? " and remembered" : ""));
-            else
-                log(LogLevel::Error, "PIN pairing failed for " + pair_url);
+            const std::string url = pair_url;
+            const std::string nonce = pair_nonce;
+            const std::string pin = pin_input;
+            const bool remember = remember_pair_node;
+            run_pairing_async(
+                "complete pairing with " + url,
+                [this, url, nonce, pin, remember] {
+                    return registry_.complete_pair(
+                        url, nonce, pin, remember);
+                },
+                [this, url, remember](const std::string& key) {
+                    if (!key.empty()) {
+                        log(LogLevel::Info,
+                            "Paired with " + url +
+                            (remember ? " and remembered" : ""));
+                    } else {
+                        log(LogLevel::Error,
+                            "PIN pairing failed for " + url);
+                    }
+                });
         }
         show_pin_entry = false;
     }, ButtonOption::Simple());
@@ -821,6 +1188,177 @@ void ControlUI::run() {
             separator(),
             pin_modal_btns->Render() | hcenter,
         }) | border | size(WIDTH, EQUAL, 36);
+    });
+
+    // Runtime discovery, installation, switching, and recovery can query a
+    // release service, download artifacts, or compile llama.cpp. Every such
+    // operation comes through this one-shot consent modal and receives an
+    // explicit allow_network flag. Standalone remote nodes simply ignore the
+    // additive field while retaining their existing REST behavior.
+    auto node_network_operation_label = [&]() -> std::string {
+        switch (pending_node_network_action) {
+            case NodeRuntimeNetworkAction::Provision:   return "provision llama.cpp";
+            case NodeRuntimeNetworkAction::CheckUpdate: return "check for llama.cpp updates";
+            case NodeRuntimeNetworkAction::Update:      return "update llama.cpp";
+            case NodeRuntimeNetworkAction::Switch:      return "switch llama.cpp engine";
+            case NodeRuntimeNetworkAction::Recover:     return "recover llama.cpp runtime";
+        }
+        return "run llama.cpp operation";
+    };
+
+    InputOption node_runtime_accelerator_option;
+    node_runtime_accelerator_option.multiline = false;
+    node_runtime_accelerator_option.placeholder = "optional: cuda, vulkan, cpu, ...";
+    auto node_runtime_accelerator_input_comp =
+        Input(&node_runtime_accelerator_input, node_runtime_accelerator_option);
+    auto node_runtime_accelerator_field = Renderer(
+        node_runtime_accelerator_input_comp, [&] {
+            return hbox({text(" Accelerator: "),
+                         node_runtime_accelerator_input_comp->Render() | flex});
+        });
+    auto node_runtime_accelerator_field_maybe = Maybe(
+        node_runtime_accelerator_field, [&] {
+            return pending_node_network_action == NodeRuntimeNetworkAction::Update;
+        });
+
+    auto node_runtime_recovery_toggle = Toggle(
+        &node_runtime_recovery_labels, &node_runtime_recovery_action);
+    auto node_runtime_recovery_field = Renderer(node_runtime_recovery_toggle, [&] {
+        return vbox({text(" Recovery action: ") | dim,
+                     node_runtime_recovery_toggle->Render()});
+    });
+    auto node_runtime_recovery_field_maybe = Maybe(
+        node_runtime_recovery_field, [&] {
+            return pending_node_network_action == NodeRuntimeNetworkAction::Recover;
+        });
+
+    InputOption node_runtime_variant_option;
+    node_runtime_variant_option.multiline = false;
+    node_runtime_variant_option.placeholder = "variant id";
+    auto node_runtime_variant_input_comp =
+        Input(&node_runtime_variant_input, node_runtime_variant_option);
+    auto node_runtime_variant_field = Renderer(node_runtime_variant_input_comp, [&] {
+        return hbox({text(" Variant: "), node_runtime_variant_input_comp->Render() | flex});
+    });
+    auto node_runtime_variant_field_maybe = Maybe(
+        node_runtime_variant_field, [&] {
+            return pending_node_network_action == NodeRuntimeNetworkAction::Switch ||
+                   (pending_node_network_action == NodeRuntimeNetworkAction::Recover &&
+                    node_runtime_recovery_action == 3);
+        });
+
+    auto node_network_confirm = Button(" Allow network and run ", [&] {
+        nlohmann::json request = {{"allow_network", true}};
+        std::string operation = node_network_operation_label();
+        std::function<NodeOperationResult(NodeOperations&)> fn;
+
+        switch (pending_node_network_action) {
+            case NodeRuntimeNetworkAction::Provision:
+                fn = [request](NodeOperations& node) {
+                    return node.llama_provision(request);
+                };
+                break;
+            case NodeRuntimeNetworkAction::CheckUpdate:
+                fn = [request](NodeOperations& node) {
+                    return node.llama_check_update(request);
+                };
+                break;
+            case NodeRuntimeNetworkAction::Update: {
+                const std::string accelerator =
+                    util::trim(node_runtime_accelerator_input);
+                if (!accelerator.empty()) request["accelerator"] = accelerator;
+                fn = [request](NodeOperations& node) {
+                    return node.llama_update(request);
+                };
+                break;
+            }
+            case NodeRuntimeNetworkAction::Switch: {
+                const std::string variant = util::trim(node_runtime_variant_input);
+                if (variant.empty()) {
+                    set_node_operation_status("switch requires a runtime variant id");
+                    return;
+                }
+                request["variant"] = variant;
+                fn = [request](NodeOperations& node) {
+                    return node.llama_switch(request);
+                };
+                break;
+            }
+            case NodeRuntimeNetworkAction::Recover: {
+                const int action_index = std::clamp(
+                    node_runtime_recovery_action, 0,
+                    static_cast<int>(node_runtime_recovery_labels.size()) - 1);
+                const std::string action =
+                    node_runtime_recovery_labels[static_cast<std::size_t>(action_index)];
+                request["action"] = action;
+                if (action == "release") {
+                    const std::string variant = util::trim(node_runtime_variant_input);
+                    if (variant.empty()) {
+                        set_node_operation_status(
+                            "release recovery requires a published variant id");
+                        return;
+                    }
+                    request["variant"] = variant;
+                }
+                fn = [request](NodeOperations& node) {
+                    return node.llama_recover(request);
+                };
+                break;
+            }
+        }
+
+        try {
+            auto operations = registry_.operations(pending_node_network_id);
+            show_node_network_confirm = false;
+            pending_node_network_id.clear();
+            run_node_operation_async(std::move(operation), std::move(operations),
+                                     std::move(fn));
+        } catch (const std::exception& e) {
+            set_node_operation_status(
+                std::string{"runtime operation unavailable: "} + e.what());
+        }
+    }, ButtonOption::Simple());
+    auto node_network_cancel = Button(" Cancel ", [&] {
+        show_node_network_confirm = false;
+        pending_node_network_id.clear();
+    }, ButtonOption::Simple());
+    auto node_network_buttons = Container::Horizontal({node_network_confirm,
+                                                        node_network_cancel});
+    auto node_network_controls = Container::Vertical({
+        node_runtime_accelerator_field_maybe,
+        node_runtime_recovery_field_maybe,
+        node_runtime_variant_field_maybe,
+        node_network_buttons,
+    });
+    auto node_network_modal_renderer = Renderer(node_network_controls, [&]() {
+        Elements rows = {
+            text(" Runtime Network Consent ") | bold | hcenter,
+            separator(),
+            text("Operation: " + node_network_operation_label()) | bold,
+            text("Node: " + pending_node_network_id) | dim,
+        };
+        if (pending_node_network_action == NodeRuntimeNetworkAction::Update)
+            rows.push_back(node_runtime_accelerator_field->Render());
+        if (pending_node_network_action == NodeRuntimeNetworkAction::Recover)
+            rows.push_back(node_runtime_recovery_field->Render());
+        if (pending_node_network_action == NodeRuntimeNetworkAction::Switch ||
+            (pending_node_network_action == NodeRuntimeNetworkAction::Recover &&
+             node_runtime_recovery_action == 3)) {
+            rows.push_back(node_runtime_variant_field->Render());
+            if (!node_runtime_variant_hint.empty())
+                rows.push_back(paragraph("Available: " + node_runtime_variant_hint) | dim);
+        }
+        rows.push_back(paragraph(
+            pending_node_network_action == NodeRuntimeNetworkAction::CheckUpdate
+                ? "This check contacts the upstream release service."
+                : "This action may query releases, download artifacts or source code, and "
+                  "run a local compilation."));
+        rows.push_back(paragraph(
+            "Only this operation receives allow_network: true; automatic checks remain "
+            "disabled under the prompt policy.") | color(Color::Yellow));
+        rows.push_back(separator());
+        rows.push_back(node_network_buttons->Render() | hcenter);
+        return vbox(std::move(rows)) | border | size(WIDTH, EQUAL, 72);
     });
 
     auto agent_validation_ok = Button(" OK ", [&] {
@@ -1610,7 +2148,15 @@ void ControlUI::run() {
             if (!base_url.empty()) {
                 attempted_base_urls.push_back(base_url);
                 HttpClient cli(base_url);
-                stream_ok = cli.stream_post(path, body, stream_cb, &stream_status, &stream_body);
+                stream_ok = cli.stream_post(
+                    path,
+                    body,
+                    stream_cb,
+                    &stream_status,
+                    &stream_body,
+                    [&ui_shutting_down] {
+                        return ui_shutting_down.load();
+                    });
                 if (stream_ok) {
                     used_base_url = base_url;
                 }
@@ -1620,7 +2166,8 @@ void ControlUI::run() {
             // Only use local fallback when there was no transport-level response
             // and no stream payload at all. This prevents duplicate turns when
             // a partial or completed stream already reached the UI.
-            if (staged_images.empty() && !stream_ok && stream_status == 0 &&
+            if (!ui_shutting_down.load() && staged_images.empty() &&
+                !stream_ok && stream_status == 0 &&
                 !stream_payload_seen && !done_seen && local_chat_fallback_) {
                 local_fallback_used = true;
                 std::string local_text;
@@ -2077,7 +2624,8 @@ void ControlUI::run() {
         using mm::tui::col;
 
         // Discovered (unregistered) nodes
-        auto dns = registry_.get_discovered_nodes();
+        auto dns = remote_nodes_enabled ? registry_.get_discovered_nodes()
+                                        : std::vector<DiscoveredNode>{};
         disc_entries.resize(dns.size());
         for (size_t i = 0; i < dns.size(); ++i)
             disc_entries[i] = dns[i].url + "  [" + dns[i].node_id.substr(0, 8) + "…]";
@@ -2158,10 +2706,21 @@ void ControlUI::run() {
         std::snprintf(gcap, sizeof(gcap), "60s · %d%%", static_cast<int>(avg_gpu + 0.5f));
         Element gpu_panel = panel("GPU", gcap, braille_graph(cluster_gpu_hist, 34, 4, Color::Green));
 
-        Element disc_panel = panel("DISCOVERED", std::to_string(dns.size()), vbox({
-            dns.empty() ? (text("  listening…") | dim) : (disc_menu->Render() | yframe | flex),
-            disc_btns->Render(),
-        }));
+        Element disc_panel;
+        if (remote_nodes_enabled) {
+            disc_panel = panel("DISCOVERED", std::to_string(dns.size()), vbox({
+                dns.empty() ? (text("  listening…") | dim)
+                            : (disc_menu->Render() | yframe | flex),
+                disc_btns->Render(),
+            }));
+        } else {
+            disc_panel = panel("CLUSTERING OFF", vbox({
+                paragraph("This AIO instance accepts only its private embedded node.") |
+                    color(Color::Green),
+                paragraph("Set [cluster].enabled = true in mantic-mind-aio.toml and restart "
+                          "to discover, pair, or add remote nodes.") | dim,
+            }));
+        }
 
         Element top_strip = hbox({
             cluster_panel | flex,
@@ -2187,7 +2746,10 @@ void ControlUI::run() {
             head,
             separator(),
             table_body,
-            node_btns->Render(),
+            selected_node_is_embedded()
+                ? (text("  Embedded node · process-owned · remove/forget disabled") |
+                   color(Color::Cyan))
+                : node_btns_m->Render(),
         })) | flex;
 
         // ── Detail (selected node) ───────────────────────────────────────
@@ -2205,8 +2767,10 @@ void ControlUI::run() {
             if (node_slot_sel >= static_cast<int>(n.slots.size()))
                 node_slot_sel = std::max(0, static_cast<int>(n.slots.size()) - 1);
 
-            detail_title = "DETAIL · " + mm::tui::node_display_name(n, node_rows);
-            detail_cap = n.url;
+            const bool embedded = n.kind == "embedded" || n.id == "local";
+            detail_title = "DETAIL · " + mm::tui::node_display_name(n, node_rows) +
+                           (embedded ? " · EMBEDDED" : " · REMOTE");
+            detail_cap = embedded ? "private in-process transport · no node API listener" : n.url;
             // Per-node CPU/GPU/VRAM live in the NODES table row (sparklines/gauge)
             // and the CLUSTER tile; matching 1a, the detail shows the slot table +
             // capabilities only — no duplicate gauges here.
@@ -2214,7 +2778,8 @@ void ControlUI::run() {
                 hbox({mm::tui::connection_status_el(n), text("   resource health ") | dim,
                       text(to_string(n.health)), text("   "), mm::tui::stale_caption(n)}),
 
-                hbox({text("saved ") | dim, text(n.remembered ? "yes" : "no"),
+                hbox({text(embedded ? "ownership " : "saved ") | dim,
+                      text(embedded ? "AIO process" : (n.remembered ? "yes" : "no")),
                       text("   platform ") | dim, text(n.platform.empty() ? "—" : n.platform),
                       text("   model ") | dim,
                       text(n.loaded_model.empty() ? "(engine-managed)" : n.loaded_model)}),
@@ -2222,11 +2787,37 @@ void ControlUI::run() {
                 slot_table(n.slots, true),
                 node_slot_menu->Render() | yframe | size(HEIGHT, LESS_THAN, 4),
                 text("Slot suspend, restore, and unload are managed by the agent scheduler.") | dim,
+                hbox({text("runtime ") | dim,
+                      text(n.llama_runtime.status.empty() ? "unknown" : n.llama_runtime.status) |
+                          color(n.llama_runtime.status == "ready" ||
+                                n.llama_runtime.status == "resolved"
+                                    ? Color::Green : Color::Yellow),
+                      text("   version ") | dim,
+                      text(n.llama_runtime.version.empty() ? "—" : n.llama_runtime.version),
+                      text("   accelerator ") | dim,
+                      text(n.llama_runtime.accelerator.empty() ? "—" :
+                           n.llama_runtime.accelerator)}),
+                n.action_progress.active
+                    ? hbox({text("action ") | dim,
+                            text(n.action_progress.action) | color(Color::Yellow),
+                            text(" · " + n.action_progress.stage + " · ") | dim,
+                            text(n.action_progress.cancel_requested
+                                ? "cancel requested" : "running")})
+                    : (text("action idle") | dim),
                 control_action_buttons->Render(),
-                node_operation_status.empty() ? text("") : paragraph(node_operation_status),
 
                 text(""),
             };
+            std::string operation_status_snapshot;
+            {
+                std::lock_guard<std::mutex> lock(node_operation_mutex);
+                operation_status_snapshot = node_operation_status;
+            }
+            if (node_operation_inflight.load())
+                operation_status_snapshot += "  " + std::string(mm::tui::spinner_frame());
+            if (!operation_status_snapshot.empty())
+                rows.push_back(paragraph(operation_status_snapshot) |
+                    color(node_operation_inflight.load() ? Color::Yellow : Color::GrayLight));
             std::vector<std::string> caps = {
                 "arch " + (n.capabilities.arch.empty() ? std::string("—") : n.capabilities.arch),
                 std::to_string(n.capabilities.gpu_count) + " GPU",
@@ -3090,11 +3681,14 @@ void ControlUI::run() {
         const int tot = static_cast<int>(ns.size());
         const int conn = static_cast<int>(std::count_if(
             ns.begin(), ns.end(), [](const NodeInfo& n) { return n.connected; }));
+        const bool aio_mode = std::any_of(ns.begin(), ns.end(), [](const NodeInfo& n) {
+            return n.kind == "embedded" || n.id == "local";
+        });
         const Color dot = (tot > 0 && conn == tot) ? Color::Green
                         : (conn > 0)               ? Color::Yellow
                                                    : Color::Red;
         auto header = hbox({
-            text(" mantic-mind-control ") | bold,
+            text(aio_mode ? " mantic-mind-aio " : " mantic-mind-control ") | bold,
             text("│ ") | dim,
             tab_btn_row->Render(),
             filler(),
@@ -3110,7 +3704,7 @@ void ControlUI::run() {
         auto footer = hbox({
             text(" 1-7 tabs · ↑/↓ select · click rows · q quit") | dim,
             filler(),
-            text("mantic-mind · control ") | dim,
+            text(aio_mode ? "mantic-mind · AIO " : "mantic-mind · control ") | dim,
         });
 
         return vbox({
@@ -3125,7 +3719,8 @@ void ControlUI::run() {
     //
 
     auto root = MakeCatchEventAfter(top_renderer, [&](Event ev) {
-        if (show_add_node || show_pin_entry || show_agent_validation_modal ||
+        if (show_add_node || show_pin_entry || show_node_network_confirm ||
+            show_agent_validation_modal ||
             show_file_browser || show_cur_delete_confirm) return false;
         if (!show_editor) {
             if (ev == Event::Character('1')) { tab_index = 0; return true; }
@@ -3156,7 +3751,10 @@ void ControlUI::run() {
 
     auto with_add    = Modal(root,        modal_renderer,     &show_add_node);
     auto with_pin    = Modal(with_add,    pin_modal_renderer, &show_pin_entry);
-    auto with_agent_validation = Modal(with_pin, agent_validation_modal_renderer, &show_agent_validation_modal);
+    auto with_network_consent = Modal(with_pin, node_network_modal_renderer,
+                                      &show_node_network_confirm);
+    auto with_agent_validation = Modal(with_network_consent, agent_validation_modal_renderer,
+                                       &show_agent_validation_modal);
     auto with_fb     = Modal(with_agent_validation, fb_renderer_comp,   &show_file_browser);
     auto final_comp  = Modal(with_fb,     cur_delete_modal_renderer, &show_cur_delete_confirm);
 
@@ -3200,8 +3798,43 @@ void ControlUI::run() {
     // Signal the chat stream to abort, then join every thread so none is destroyed
     // while joinable (which would terminate the process) — including on the error path.
     ui_shutting_down = true;
+    if (shutdown_callback_) {
+        try {
+            // Stop ingress and signal the shared queue/node work before joining
+            // UI-owned workers. In AIO this also reaches an embedded inference
+            // that has not emitted its first byte yet.
+            shutdown_callback_();
+        } catch (const std::exception& exception) {
+            MM_WARN("Control UI shutdown callback failed: {}", exception.what());
+        } catch (...) {
+            MM_WARN("Control UI shutdown callback failed");
+        }
+    }
+    if (node_operation_inflight.load()) {
+        try {
+            NodeOperationsPtr operation;
+            {
+                std::lock_guard<std::mutex> lock(active_node_operation_mutex);
+                operation = active_node_operation;
+            }
+            if (operation) {
+                // Embedded cancellation is a direct, bounded state mutation.
+                // Remote shutdown instead aborts the active HTTP transport;
+                // sending a second request to a silent remote could itself
+                // delay UI teardown.
+                if (operation->embedded()) {
+                    (void)operation->cancel_action();
+                }
+                operation->request_shutdown();
+            }
+        } catch (...) {
+            // Best-effort cancellation; the worker is still joined below.
+        }
+    }
     ticker_running = false;
     if (ticker.joinable())      ticker.join();
+    if (pairing_thread.joinable()) pairing_thread.join();
+    if (node_operation_thread.joinable()) node_operation_thread.join();
     if (chat_thread.joinable()) chat_thread.join();
     if (cur_thread.joinable())  cur_thread.join();
     if (voice_thread.joinable()) voice_thread.join();

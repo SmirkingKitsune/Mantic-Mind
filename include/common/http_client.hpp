@@ -26,10 +26,17 @@ public:
     void set_bearer_token(const std::string& token);
     void set_timeouts(int connect_s, int read_s, int write_s);
 
-    HttpResponse get (const std::string& path);
-    HttpResponse post(const std::string& path, const nlohmann::json& body);
-    HttpResponse put (const std::string& path, const nlohmann::json& body);
-    HttpResponse del (const std::string& path);
+    using CancelCheck = std::function<bool()>;
+    HttpResponse get (const std::string& path,
+                      CancelCheck cancel_requested = {});
+    HttpResponse post(const std::string& path,
+                      const nlohmann::json& body,
+                      CancelCheck cancel_requested = {});
+    HttpResponse put (const std::string& path,
+                      const nlohmann::json& body,
+                      CancelCheck cancel_requested = {});
+    HttpResponse del (const std::string& path,
+                      CancelCheck cancel_requested = {});
 
     // Stream a file as the raw request body without buffering it in memory —
     // for large model transfers. extra_headers carry out-of-band metadata
@@ -38,7 +45,8 @@ public:
         const std::string& path,
         const std::string& file_path,
         const std::vector<std::pair<std::string, std::string>>& extra_headers = {},
-        const std::string& content_type = "application/octet-stream");
+        const std::string& content_type = "application/octet-stream",
+        CancelCheck cancel_requested = {});
 
     // SSE streaming GET.  line_cb is called for each raw "data: ..." line.
     // Returns false if the connection could not be established.
@@ -50,7 +58,8 @@ public:
                      const nlohmann::json& body,
                      SseLineCallback line_cb,
                      int* out_status = nullptr,
-                     std::string* out_body = nullptr);
+                     std::string* out_body = nullptr,
+                     CancelCheck cancel_requested = {});
 
 private:
     std::string base_url_;

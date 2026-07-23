@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/models.hpp"
+#include <atomic>
 #include <functional>
 #include <queue>
 #include <mutex>
@@ -38,7 +39,10 @@ public:
     void enqueue(InferenceJob job);
 
     // Drain all pending jobs and join all worker threads.
+    void stop_accepting();
     void shutdown();
+    void request_cancel_active();
+    bool cancellation_requested() const;
 
 private:
     struct AgentWorker {
@@ -51,6 +55,8 @@ private:
 
     std::mutex mutex_;
     std::unordered_map<AgentId, std::shared_ptr<AgentWorker>> workers_;
+    std::atomic<bool> cancellation_requested_{false};
+    bool accepting_ = true; // guarded by mutex_
 
     std::shared_ptr<AgentWorker> get_or_create_worker(const AgentId& id);
     static void worker_loop(std::shared_ptr<AgentWorker> w);

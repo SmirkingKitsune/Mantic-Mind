@@ -1,7 +1,9 @@
 # mantic-mind
 
-Distributed LLM inference cluster — two executables that turn any collection of machines into a coordinated AI backend.
+Local-first and distributed LLM inference. Use the all-in-one executable on one
+computer, or split control and nodes across a cluster.
 
+- **mantic-mind-aio** — recommended single-computer path; combines control and a private embedded node without control-to-node HTTP
 - **mantic-mind** — cluster node; spawns and manages `llama-server` inference subprocesses; FTXUI status TUI
 - **mantic-mind-control** — cluster head; manages nodes, agents, conversations, memories; FTXUI management TUI
 
@@ -23,6 +25,31 @@ Python is optional and used only by the bundled Qwen3-TTS sidecar and smoke-test
 utilities; it is not required for text inference.
 
 Set the `VCPKG_ROOT` environment variable to your bootstrapped vcpkg directory, or put `vcpkg` on `PATH`. If vcpkg is not available, CMake must find all dependencies through the system package manager or another toolchain.
+
+## Quick Start: One Computer
+
+For a single computer, `mantic-mind-aio` is the recommended deployment. Build
+the project and launch it with the committed AIO template explicitly:
+
+```powershell
+.\build\windows-x64-release\src\aio\Release\mantic-mind-aio.exe --config .\tools\mantic-mind-aio.toml
+```
+
+```sh
+./build/linux-x64-release/src/aio/mantic-mind-aio --config ./tools/mantic-mind-aio.toml
+```
+
+The default configuration binds the control and OpenAI-compatible APIs only to
+`127.0.0.1`, disables clustering and UDP discovery, and creates no embedded
+node API listener. The embedded node appears as `local` in the control TUI.
+Existing model files are loaded from their canonical paths without being
+uploaded or copied into a node cache.
+
+An installed `llama-server` is resolved without network access. Downloads,
+builds, and online update checks require confirmation under the default
+`runtime_network_policy = "prompt"`; CLI users can grant consent for the
+current process with `--allow-network`. See [AIO architecture and
+configuration](docs/aio.md) for cluster mode and security requirements.
 
 On Ubuntu/Debian, the non-vcpkg build expects these development packages:
 
@@ -82,7 +109,7 @@ You can also use CMake directly:
 # Configure (vcpkg installs all dependencies automatically)
 cmake -B build -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
 
-# Build both executables
+# Build all three executables
 cmake --build build
 ```
 
@@ -90,6 +117,7 @@ For a Release build with single-config generators, add `-DCMAKE_BUILD_TYPE=Relea
 
 Binaries are produced at:
 
+- `build/<...>/src/aio/<config>/mantic-mind-aio[.exe]`
 - `build/<...>/src/node/<config>/mantic-mind[.exe]`
 - `build/<...>/src/control/<config>/mantic-mind-control[.exe]`
 
@@ -139,12 +167,18 @@ cmake --build --preset vcpkg-aarch64-linux-release
 
 Presets also exist for `vcpkg-aarch64-macos-release` and `vcpkg-aarch64-windows-release`.
 
-Install both binaries into a predictable layout with:
+Install all three binaries, all three default templates, and the AIO guide into
+a predictable layout with:
 
 ```sh
 cmake --install build --config Release --prefix dist
 # dist/bin/mantic-mind[.exe]
+# dist/bin/mantic-mind.toml
 # dist/bin/mantic-mind-control[.exe]
+# dist/bin/mantic-mind-control.toml
+# dist/bin/mantic-mind-aio[.exe]
+# dist/bin/mantic-mind-aio.toml
+# dist/share/doc/mantic-mind/aio.md
 ```
 
 ### GitHub Release Packages
@@ -157,10 +191,10 @@ Create GitHub-ready ZIP assets from a Release build with:
 
 The packager writes `dist/mantic-mind-<version>-<platform>-<arch>.zip`, a
 matching `-symbols.zip` when PDBs are available, and `dist/checksums.txt`.
-The runtime archive includes `bin/`, default root config files, `tools/`,
-`README.md`, `LICENSE`, and a release manifest. It does not bundle managed
-llama.cpp runtime installs, Python environments, model weights, runtime data,
-logs, or local agent databases.
+The runtime archive includes `bin/`, platform runtime libraries, default root
+config files, `tools/`, `README.md`, `docs/aio.md`, `LICENSE`, and a release
+manifest. It does not bundle managed llama.cpp runtime installs, Python
+environments, model weights, runtime data, logs, or local agent databases.
 
 ## llama.cpp Runtime
 
@@ -265,7 +299,10 @@ python tests/vision_smoke.py \
   --token "$MM_CONTROL_EXTERNAL_API_TOKEN"
 ```
 
-## Quick Start
+## Quick Start: Cluster
+
+Use the two-process workflow below when control and inference nodes will run on
+different computers, or when you deliberately want remote-node clustering.
 
 Local `mantic-mind.toml` and `mantic-mind-control.toml` copies are intentionally gitignored. Keep committed defaults in `tools/`, then copy them into the working directory for local runs.
 
@@ -308,7 +345,7 @@ curl -N -X POST http://localhost:9090/v1/agents/<id>/chat \
 
 ## CLI Mode (Terminal Assistant)
 
-Both binaries support explicit mode selection:
+All three binaries support explicit mode selection:
 
 ```sh
 ./mantic-mind --mode tui   # default
@@ -318,14 +355,24 @@ Both binaries support explicit mode selection:
 ./mantic-mind-control --mode tui   # default
 ./mantic-mind-control --mode cli   # interactive REPL
 ./mantic-mind-control --mode cli --output json
+
+./mantic-mind-aio --config ./tools/mantic-mind-aio.toml --mode tui   # default
+./mantic-mind-aio --config ./tools/mantic-mind-aio.toml --mode cli
+./mantic-mind-aio --config ./tools/mantic-mind-aio.toml --mode cli --output json
 ```
 
-Use `--help` on either binary for full command help:
+Use `--help` on any binary for full command help:
 
 ```sh
 ./mantic-mind --help
 ./mantic-mind-control --help
+./mantic-mind-aio --help
 ```
+
+The AIO CLI exposes the control-oriented `nodes`, `agents`, and `chat`
+commands plus embedded/remote node status, slot, log, cancellation, runtime,
+update, switch, diagnosis, and recovery commands. Runtime commands that may
+download or build require `--allow-network` under the default prompt policy.
 
 ### Assistant-oriented CLI flow
 
@@ -650,30 +697,29 @@ data: [DONE]
 ## Architecture
 
 ```
-External Client
-      │  REST + SSE
-      ▼
-mantic-mind-control  (:9090)
-  ├─ AgentManager      — per-agent SQLite  (data/agents/{uuid}/agent.db)
-  ├─ NodeRegistry      — node list + health/metrics polling, capabilities
-  ├─ AgentScheduler    — placement: existing/suspended → shared engine →
-  │                       VRAM-suitable node → suspend/evict + retry
-  ├─ AgentQueue        — per-agent FIFO worker threads
-  └─ ControlApiServer  — REST endpoints + SSE chat proxy
-         │  REST + SSE
-         ▼
-mantic-mind  (:7070)
-  ├─ NodeState          — API keys, metrics, capabilities
-  ├─ SlotManager        — shared engines, VRAM estimates, KV save/restore
-  ├─ RuntimeProcess     — engine subprocess supervisor (Windows CreateProcess / POSIX fork+exec)
-  ├─ RuntimeClient      — OpenAI-compatible HTTP client → the engine
-  └─ NodeApiServer      — node endpoints + SSE infer proxy
-         │  HTTP (OpenAI-compatible)
-         ▼
-   llama-server  (engine, :8080+)
+Single-computer (recommended)
+
+External Client -- REST/SSE --> mantic-mind-aio (:9090/:9091)
+                                  |-- ControlHost (agents, queue, scheduler)
+                                  |-- NodeOperations --direct--> NodeHost/NodeService
+                                  `-- RuntimeProcess/RuntimeClient --loopback HTTP-->
+                                      llama-server (:8080+)
+
+Cluster workflow
+
+External Client -- REST/SSE --> mantic-mind-control (:9090)
+                                  `-- HttpNodeOperations --REST/SSE-->
+                                      mantic-mind node (:7070)
+                                        `-- RuntimeProcess/RuntimeClient
+                                            --loopback HTTP--> llama-server (:8080+)
 ```
 
-(`RuntimeProcess` supervises and `RuntimeClient` talks to `llama-server`.)
+Both paths share the `ControlHost` and `NodeHost` lifecycle graphs from the
+control and node core libraries. In AIO, the reserved
+`local` node crosses a typed in-process boundary and has no node API listener;
+remote cluster nodes retain the existing REST/SSE protocol. `RuntimeProcess`
+still supervises each `llama-server`, and `RuntimeClient` still talks to it on
+loopback.
 
 ## TUI Keyboard Shortcuts
 

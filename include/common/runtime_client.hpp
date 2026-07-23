@@ -18,15 +18,19 @@ public:
                             std::string chat_completions_path = "/v1/chat/completions");
     virtual ~RuntimeClient() = default;
 
+    using CancelCheck = std::function<bool()>;
+
     // Non-streaming: waits for the full response.
-    virtual Message complete(const InferenceRequest& req);
+    virtual Message complete(const InferenceRequest& req,
+                             CancelCheck cancel_requested = {});
 
     // Streaming: chunk_cb fires for each parsed SSE event.
     using ChunkCallback = std::function<void(const InferenceChunk&)>;
     using ErrorCallback = std::function<void(const std::string&)>;
     void stream_complete(const InferenceRequest& req,
                          ChunkCallback chunk_cb,
-                         ErrorCallback error_cb);
+                         ErrorCallback error_cb,
+                         CancelCheck cancel_requested = {});
 
     int  count_tokens(const std::string& text);
     bool load_model(const std::string& model_path, const RuntimeSettings& settings);

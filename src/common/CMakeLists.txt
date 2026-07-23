@@ -10,6 +10,7 @@ set(MM_COMMON_SOURCES
     trace_provenance.cpp
     http_server.cpp
     http_client.cpp
+    cancellable_http.cpp
     sse_emitter.cpp
     config_file.cpp
     pairing.cpp

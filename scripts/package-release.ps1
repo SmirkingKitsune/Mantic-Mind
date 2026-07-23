@@ -268,39 +268,74 @@ New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
 
 $NodeExe = Get-ExecutableName "mantic-mind"
 $ControlExe = Get-ExecutableName "mantic-mind-control"
+$AioExe = Get-ExecutableName "mantic-mind-aio"
 $NodeOutputDir = Get-BuildOutputDir "node" $NodeExe
 $ControlOutputDir = Get-BuildOutputDir "control" $ControlExe
-$OutputDirs = @($NodeOutputDir, $ControlOutputDir)
+$AioOutputDir = Get-BuildOutputDir "aio" $AioExe
+$OutputDirs = @($NodeOutputDir, $ControlOutputDir, $AioOutputDir)
+
+$VcpkgArch = switch ($TargetArch) {
+    "aarch64" { "arm64" }
+    default { $TargetArch }
+}
+$VcpkgPlatform = switch ($Platform) {
+    "darwin" { "osx" }
+    default { $Platform }
+}
+$RuntimeTriplet = if ($Triplet) { $Triplet } else { "$VcpkgArch-$VcpkgPlatform" }
+$VcpkgTripletRoot = Join-Path $BuildDir "vcpkg_installed/$RuntimeTriplet"
+$RuntimeLibraryDirs = @($OutputDirs)
+foreach ($RuntimeSubdir in @("bin", "lib")) {
+    $RuntimeCandidate = Join-Path $VcpkgTripletRoot $RuntimeSubdir
+    if (Test-Path $RuntimeCandidate) {
+        $RuntimeLibraryDirs += $RuntimeCandidate
+    }
+}
 
 Write-Host "==> Copy executables"
-# This CMake tree has no install() rules, so `cmake --install` does not populate
-# bin/. Copy the built executables explicitly (as we do for DLLs) so the package
-# actually contains the binaries the manifest advertises.
+# `cmake --install` supplies the normal layout. Copy the selected build outputs
+# once more so packaging an older configured tree still uses the requested
+# configuration's executables.
 $NodeExePath = Join-Path $NodeOutputDir $NodeExe
 $ControlExePath = Join-Path $ControlOutputDir $ControlExe
+$AioExePath = Join-Path $AioOutputDir $AioExe
 if (-not (Test-Path -LiteralPath $NodeExePath)) {
     throw "Node executable not found at $NodeExePath. Build the project before packaging."
 }
 if (-not (Test-Path -LiteralPath $ControlExePath)) {
     throw "Control executable not found at $ControlExePath. Build the project before packaging."
 }
+if (-not (Test-Path -LiteralPath $AioExePath)) {
+    throw "AIO executable not found at $AioExePath. Build the project before packaging."
+}
 Copy-Item -LiteralPath $NodeExePath -Destination (Join-Path $BinDir $NodeExe) -Force
 Copy-Item -LiteralPath $ControlExePath -Destination (Join-Path $BinDir $ControlExe) -Force
+Copy-Item -LiteralPath $AioExePath -Destination (Join-Path $BinDir $AioExe) -Force
 
-Write-Host "==> Copy runtime DLLs"
-Copy-MatchingFiles $OutputDirs "*.dll" $BinDir
+Write-Host "==> Copy runtime shared libraries"
+switch ($Platform) {
+    "windows" { Copy-MatchingFiles $RuntimeLibraryDirs "*.dll" $BinDir }
+    "linux" { Copy-MatchingFiles $RuntimeLibraryDirs "*.so*" $BinDir }
+    "darwin" { Copy-MatchingFiles $RuntimeLibraryDirs "*.dylib" $BinDir }
+}
 
 Write-Host "==> Copy configs, tools, and docs"
 Copy-Item -LiteralPath (Join-Path $RepoRoot "tools/mantic-mind.toml") `
     -Destination (Join-Path $PackageRoot "mantic-mind.toml") -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot "tools/mantic-mind-control.toml") `
     -Destination (Join-Path $PackageRoot "mantic-mind-control.toml") -Force
+Copy-Item -LiteralPath (Join-Path $RepoRoot "tools/mantic-mind-aio.toml") `
+    -Destination (Join-Path $PackageRoot "mantic-mind-aio.toml") -Force
 Copy-DirectoryContents (Join-Path $RepoRoot "tools") (Join-Path $PackageRoot "tools")
 if (Test-Path (Join-Path $PackageRoot "tools/__pycache__")) {
     Remove-Item -LiteralPath (Join-Path $PackageRoot "tools/__pycache__") -Recurse -Force
 }
 Copy-Item -LiteralPath (Join-Path $RepoRoot "README.md") -Destination $PackageRoot -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot "LICENSE") -Destination $PackageRoot -Force
+$PackageDocsDir = Join-Path $PackageRoot "docs"
+New-Item -ItemType Directory -Path $PackageDocsDir -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $RepoRoot "docs/aio.md") `
+    -Destination (Join-Path $PackageDocsDir "aio.md") -Force
 
 $Branch = Invoke-Capture "git" @("-C", $RepoRoot, "-c", "core.excludesfile=", "rev-parse", "--abbrev-ref", "HEAD")
 $Commit = Invoke-Capture "git" @("-C", $RepoRoot, "-c", "core.excludesfile=", "rev-parse", "HEAD")
@@ -319,10 +354,11 @@ $Manifest = @(
     "Included:",
     "- bin/mantic-mind",
     "- bin/mantic-mind-control",
-    "- runtime DLLs copied from the build output",
+    "- bin/mantic-mind-aio",
+    "- runtime shared libraries copied from the selected build/vcpkg output",
     "- default root config files copied from tools/",
     "- tools/qwen_tts_service.py",
-    "- README.md and LICENSE",
+    "- README.md, docs/aio.md, and LICENSE",
     "",
     "Not included:",
     "- managed inference runtime installs and Python package environments",

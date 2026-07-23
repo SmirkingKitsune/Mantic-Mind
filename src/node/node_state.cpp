@@ -1,6 +1,7 @@
 #include "node/node_state.hpp"
 #include "common/util.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -72,9 +73,15 @@ void NodeState::set_slots(const std::vector<SlotInfo>& slots) {
 // ── Metrics ────────────────────────────────────────────────────────────────────
 NodeHealthMetrics NodeState::get_metrics() const { std::lock_guard<std::mutex> g(mutex_); return metrics_; }
 void NodeState::update_metrics(const NodeHealthMetrics& m) {
-    std::lock_guard<std::mutex> g(mutex_);
-    metrics_ = m;
-    if (metrics_cb_) metrics_cb_(m);
+    MetricsCallback callback;
+    {
+        std::lock_guard<std::mutex> g(mutex_);
+        metrics_ = m;
+        metrics_sampled_ = true;
+        callback = metrics_cb_;
+    }
+    metrics_ready_cv_.notify_all();
+    if (callback) callback(m);
 }
 
 std::string NodeState::get_last_error() const {
@@ -162,6 +169,10 @@ void NodeState::set_metrics_callback(MetricsCallback cb) {
 // ── Background polling ─────────────────────────────────────────────────────────
 void NodeState::start_metrics_poll(int interval_ms) {
     if (polling_.exchange(true)) return;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        metrics_sampled_ = false;
+    }
     poll_thread_ = std::thread([this, interval_ms]() {
         while (polling_) {
             update_metrics(sample_metrics());
@@ -172,6 +183,14 @@ void NodeState::start_metrics_poll(int interval_ms) {
                               [this] { return !polling_; });
         }
     });
+}
+
+bool NodeState::wait_for_initial_metrics(int timeout_ms) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return metrics_ready_cv_.wait_for(
+        lock,
+        std::chrono::milliseconds(std::max(0, timeout_ms)),
+        [this] { return metrics_sampled_; });
 }
 
 void NodeState::stop_metrics_poll() {

@@ -38,13 +38,17 @@ public:
                      std::string data_dir,
                      std::string models_dir,
                      std::string external_api_token = {},
-                     TtsServiceConfig tts_config = {});
+                     TtsServiceConfig tts_config = {},
+                     bool allow_legacy_environment = true);
     ~ControlApiServer();
 
-    bool listen(uint16_t port);
-    bool listen_openai_compat(uint16_t port);
+    bool listen(uint16_t port, const std::string& bind_host = "0.0.0.0");
+    bool listen_openai_compat(uint16_t port,
+                              const std::string& bind_host = "0.0.0.0");
     void stop();
     void stop_openai_compat();
+    bool is_running() const;
+    bool is_openai_compat_running() const;
     void cleanup_expired_tts_cache();
 
     // Activity logging callback — 0=Info, 1=Warn, 2=Error.
@@ -69,6 +73,7 @@ private:
     std::string     models_dir_;
     std::string     external_api_token_;
     TtsServiceClient tts_;
+    bool allow_legacy_environment_ = true;
     std::unique_ptr<HttpServer> server_;
     PerformanceTracker performance_;
     std::unique_ptr<HttpServer> openai_server_;
@@ -79,6 +84,7 @@ private:
 
     using ChunkCb = std::function<void(const InferenceChunk&)>;
     using DoneCb  = std::function<void(const ConvId&, bool, const std::string&)>;
+    using CancelCheck = std::function<bool()>;
 
     void register_routes();
     void register_openai_compat_routes();
@@ -95,7 +101,8 @@ private:
                      ChunkCb chunk_cb,
                      DoneCb done_cb,
                      int max_tokens_override = 0,
-                     std::vector<MessageContentPart> content_parts = {});
+                     std::vector<MessageContentPart> content_parts = {},
+                     CancelCheck cancel_requested = {});
 
     // Queue a global recall job for a conversation being deactivated.
     // Runs as an internal inference round where the agent reviews local

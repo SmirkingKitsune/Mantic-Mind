@@ -15,6 +15,7 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -95,6 +96,17 @@ struct RuntimeProcess::Impl {
 
 // ── Arg builder ───────────────────────────────────────────────────────────────
 namespace {
+
+bool cancellation_requested(const RuntimeProcess::CancelCheck& cancel_check) noexcept {
+    if (!cancel_check) return false;
+    try {
+        return cancel_check();
+    } catch (...) {
+        // A failed cancellation source cannot safely authorize a long-lived
+        // subprocess startup to continue during teardown.
+        return true;
+    }
+}
 
 std::string strip_wrapping_quotes(std::string s) {
     s = mm::util::trim(s);
@@ -207,7 +219,8 @@ bool RuntimeProcess::start_llama_server(const std::string& model_path,
                                         const std::string& mmproj_path,
                                         const RuntimeSettings& settings,
                                         uint16_t port,
-                                        const std::string& slot_save_path) {
+                                        const std::string& slot_save_path,
+                                        CancelCheck cancel_check) {
     const std::string runtime_model_path = normalize_llama_model_path(model_path);
     if (runtime_model_path != strip_wrapping_quotes(model_path)) {
         MM_INFO("Normalized model path for llama.cpp runtime: '{}' -> '{}'",
@@ -218,22 +231,42 @@ bool RuntimeProcess::start_llama_server(const std::string& model_path,
         MM_INFO("Normalized projector path for llama.cpp runtime: '{}' -> '{}'",
                 strip_wrapping_quotes(mmproj_path), runtime_mmproj_path);
     }
-    auto args = build_llama_server_args(runtime_model_path, runtime_mmproj_path, settings, port,
-                                        slot_save_path);
+    std::vector<std::string> args;
+    try {
+        args = build_llama_server_args(runtime_model_path,
+                                       runtime_mmproj_path,
+                                       settings,
+                                       port,
+                                       slot_save_path);
+    } catch (const std::invalid_argument& e) {
+        last_error_ = e.what();
+        state_ = ProcessState::Error;
+        impl_->call_log(last_error_, true);
+        MM_ERROR("Refusing unsafe llama-server arguments: {}", last_error_);
+        return false;
+    }
     return start_with_args("llama.cpp", strip_wrapping_quotes(runtime_path_),
-                           std::move(args), port, load_health_timeout_seconds());
+                           std::move(args), port, load_health_timeout_seconds(),
+                           cancel_check);
 }
 
 bool RuntimeProcess::start_with_args(const std::string& runtime_name,
-                                         const std::string& executable_path,
-                                         std::vector<std::string> args,
-                                         uint16_t port,
-                                         int health_timeout_seconds) {
+                                     const std::string& executable_path,
+                                     std::vector<std::string> args,
+                                     uint16_t port,
+                                     int health_timeout_seconds,
+                                     const CancelCheck& cancel_check) {
     if (state_ != ProcessState::Stopped) stop();
 
     port_  = port;
     state_ = ProcessState::Starting;
     last_error_.clear();
+
+    if (cancellation_requested(cancel_check)) {
+        last_error_ = runtime_name + " startup canceled";
+        state_ = ProcessState::Error;
+        return false;
+    }
 
     std::string exe_path = strip_wrapping_quotes(executable_path);
     if (exe_path.empty()) {
@@ -605,13 +638,19 @@ bool RuntimeProcess::start_with_args(const std::string& runtime_name,
 #endif
 
     // Poll /health until ready or timeout
-    bool ready = poll_health(health_timeout_seconds);
+    bool ready = poll_health(health_timeout_seconds, cancel_check);
     if (!ready) {
-        MM_ERROR("{} did not become healthy within {}s - aborting",
-                 runtime_name, health_timeout_seconds);
-        last_error_ = runtime_name + " did not become healthy within "
-                    + std::to_string(health_timeout_seconds) + "s (startup failed)";
-        impl_->call_log(last_error_, true);
+        if (cancellation_requested(cancel_check)) {
+            MM_INFO("{} startup canceled before health became ready", runtime_name);
+            last_error_ = runtime_name + " startup canceled";
+        } else {
+            MM_ERROR("{} did not become healthy within {}s - aborting",
+                     runtime_name, health_timeout_seconds);
+            last_error_ = runtime_name + " did not become healthy within "
+                        + std::to_string(health_timeout_seconds)
+                        + "s (startup failed)";
+            impl_->call_log(last_error_, true);
+        }
         stop();
         return false;
     }
@@ -673,14 +712,18 @@ std::string RuntimeProcess::get_url() const {
 std::string RuntimeProcess::last_error() const { return last_error_; }
 
 // ── poll_health ───────────────────────────────────────────────────────────────
-bool RuntimeProcess::poll_health(int timeout_seconds) {
+bool RuntimeProcess::poll_health(int timeout_seconds,
+                                 const CancelCheck& cancel_check) {
     httplib::Client cli("127.0.0.1", port_);
-    cli.set_connection_timeout(2);
-    cli.set_read_timeout(3);
+    // Startup cancellation is cooperative. Keep each health probe bounded so
+    // a host stop does not wait on a silent listener before the next check.
+    cli.set_connection_timeout(std::chrono::milliseconds(250));
+    cli.set_read_timeout(std::chrono::milliseconds(250));
 
     auto deadline = std::chrono::steady_clock::now()
                     + std::chrono::seconds(timeout_seconds);
     while (std::chrono::steady_clock::now() < deadline) {
+        if (cancellation_requested(cancel_check)) return false;
         if (impl_->process_exited()) {
             MM_WARN("poll_health: server process exited before becoming healthy");
             return false;
@@ -697,7 +740,10 @@ bool RuntimeProcess::poll_health(int timeout_seconds) {
                 return true;
             }
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        for (int attempt = 0; attempt < 10; ++attempt) {
+            if (cancellation_requested(cancel_check)) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
     }
     return false;
 }

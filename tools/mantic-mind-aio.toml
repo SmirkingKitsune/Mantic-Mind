@@ -1,0 +1,82 @@
+# Mantic-Mind all-in-one configuration
+#
+# The AIO process embeds its node and does not expose a node API port. By
+# default, only loopback control clients can connect and LAN discovery is off.
+# Every key may be overridden as MM_AIO_<SECTION>_<KEY>; for example:
+#   MM_AIO_CONTROL_LISTEN_PORT=9190
+#   MM_AIO_NODE_RUNTIME_NETWORK_POLICY=offline
+# Use MM_AIO_CONFIG_FILE to select a different file.
+
+[shared]
+# Shared by control state and the embedded node runtime/cache.
+data_dir = "data"
+models_dir = "models"
+log_file = "logs/mantic-mind-aio.log"
+
+[control]
+# One bind host is used for both the control API and OpenAI-compatible API.
+# Cluster-disabled mode requires a loopback host.
+bind_host = "127.0.0.1"
+listen_port = 9090
+# Set to 0 to disable the OpenAI-compatible listener.
+openai_compat_port = 9091
+
+node_health_poll_interval_s = 30
+node_offline_after_s = 90
+
+# Required together with cluster.pairing_key before bind_host may be changed to
+# a non-loopback address such as 0.0.0.0.
+external_api_token = ""
+
+# Optional Qwen3-TTS sidecar.
+tts_enabled = false
+tts_service_url = "http://127.0.0.1:9188"
+# tts_service_command = "python tools/qwen_tts_service.py --host 127.0.0.1 --port 9188"
+# tts_cache_dir = ""
+tts_voice_design_model_id = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+tts_clone_model_id = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+tts_custom_voice_model_id = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+tts_cache_ttl_ms = 86400000
+tts_timeout_s = 120
+
+[node]
+# The embedded node has no bind/listen/API-key/advertise settings.
+llama_server_path = "llama-server"
+llama_auto_provision = true
+# Empty derives {shared.data_dir}/runtimes/llama.cpp.
+llama_provision_dir = ""
+llama_install_method = "auto" # auto | release | source
+llama_version = "latest"
+llama_accelerator = ""
+llama_cuda_arch = ""
+llama_cmake_args = []
+llama_build_jobs = 0
+
+llama_update_policy = "prompt" # prompt | auto | manual
+llama_update_check = true
+llama_update_check_interval_hours = 24
+
+# Network needed by runtime provisioning/update: prompt | auto | offline.
+# Prompt is the fail-safe default for first-run downloads or source retrieval.
+runtime_network_policy = "prompt"
+
+node_gpu_count = 0
+runtime_port_range_start = 8080
+runtime_port_range_end = 8090
+max_slots = 4
+
+# Empty derives {shared.data_dir}/kv_cache.
+kv_cache_dir = ""
+model_cache_min_free_mb = 10240
+model_cache_clear_on_shutdown = true
+
+[cluster]
+# Enables management of additional remote nodes. The embedded node itself
+# always stays in-process and never advertises or listens on a node API port.
+enabled = false
+discovery_enabled = false
+discovery_port = 7072
+
+# Required together with control.external_api_token when control.bind_host is
+# non-loopback. Leave empty to use the existing PIN pairing flow on loopback.
+pairing_key = ""

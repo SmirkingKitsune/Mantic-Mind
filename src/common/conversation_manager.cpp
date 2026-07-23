@@ -15,6 +15,12 @@ static constexpr int    kImageTokenEstimate   = 2048;
 static constexpr int    kMaxContextImages     = 8;
 static constexpr int64_t kMaxContextImageBytes = 400LL * 1024 * 1024;
 
+bool cancellation_requested(
+    const ConversationManager::CancelCheck& cancel_requested) {
+    if (!cancel_requested) return false;
+    try { return cancel_requested(); } catch (...) { return true; }
+}
+
 struct ImageUsage {
     int count = 0;
     int64_t bytes = 0;
@@ -88,7 +94,9 @@ std::vector<Message> ConversationManager::build_context(
 
 // ── Compaction ────────────────────────────────────────────────────────────────
 ConvId ConversationManager::maybe_compact(const ConvId& conv_id,
-                                           const AgentConfig& cfg) {
+                                           const AgentConfig& cfg,
+                                           CancelCheck cancel_requested) {
+    if (cancellation_requested(cancel_requested)) return conv_id;
     int total   = db_.get_total_tokens(conv_id);
     int ctx_sz  = cfg.runtime_settings.ctx_size;
     // Reserve the configured completion allowance before deciding how much
@@ -107,18 +115,22 @@ ConvId ConversationManager::maybe_compact(const ConvId& conv_id,
 
     if (ratio >= kCompactionThreshold || image_pressure) {
         MM_INFO("Conversation {} at {:.0f}% context — compacting", conv_id, ratio * 100);
-        return compact_conversation(conv_id, cfg);
+        return compact_conversation(conv_id, cfg, std::move(cancel_requested));
     }
     return conv_id;
 }
 
 ConvId ConversationManager::force_compact(const ConvId& conv_id,
-                                          const AgentConfig& cfg) {
-    return compact_conversation(conv_id, cfg);
+                                          const AgentConfig& cfg,
+                                          CancelCheck cancel_requested) {
+    if (cancellation_requested(cancel_requested)) return conv_id;
+    return compact_conversation(conv_id, cfg, std::move(cancel_requested));
 }
 
 ConvId ConversationManager::compact_conversation(const ConvId& conv_id,
-                                                   const AgentConfig& cfg) {
+                                                   const AgentConfig& cfg,
+                                                   CancelCheck cancel_requested) {
+    if (cancellation_requested(cancel_requested)) return conv_id;
     auto conv = db_.load_conversation(conv_id);
     if (!conv) return conv_id;
 
@@ -192,7 +204,8 @@ ConvId ConversationManager::compact_conversation(const ConvId& conv_id,
     req.settings = cfg.runtime_settings;
     req.messages = {{ .role = MessageRole::User, .content = prompt.str() }};
 
-    Message summary = runtime_.complete(req);
+    Message summary = runtime_.complete(req, cancel_requested);
+    if (cancellation_requested(cancel_requested)) return conv_id;
     if (summary.content.empty()) {
         MM_WARN("Compaction summary is empty — skipping compaction");
         return conv_id;
