@@ -1,0 +1,43 @@
+{
+  "fixture_version": 1,
+  "generate": 256,
+  "greedy_first_16": [
+    53,
+    302,
+    26,
+    228,
+    53,
+    53,
+    26,
+    53,
+    26,
+    228,
+    119,
+    290,
+    228,
+    119,
+    392,
+    228
+  ],
+  "implementation": "native",
+  "layer_kinds": [
+    "moe",
+    "moe",
+    "moe",
+    "moe"
+  ],
+  "n_params": 611008,
+  "numpy_version": "2.4.6",
+  "positions": 512,
+  "seed": 20260727,
+  "slug": "Qwen3-30B-A3B",
+  "source": "Z:/AI/Ubiquitious-Memories/Mantic-Mind/models/Qwen/Qwen3-30B-A3B",
+  "source_architectures": [
+    "Qwen3MoeForCausalLM"
+  ],
+  "source_model_type": "qwen3_moe",
+  "tf_logits_sha256": "b9ecdf8a71f55cf642c1fd833502be9d458e5ddbd2b3d5d52c8c44aa410615dc",
+  "torch_version": "2.13.0+cpu",
+  "transformers_version": "4.57.6",
+  "weights_sha256": "493e396c37c6422e541da5372d72a08050486ab27cee77b0c43251c8aa8ea705"
+}

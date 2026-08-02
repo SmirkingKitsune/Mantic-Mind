@@ -1,0 +1,14 @@
+{
+  "add_prefix_space": false,
+  "corpus_size": 36,
+  "n_added": 26,
+  "n_classes": 7,
+  "n_merges": 151387,
+  "n_vocab": 151669,
+  "nfc_implemented_in_engine": false,
+  "nfc_unstable_dropped": 1,
+  "normalizer": "NFC",
+  "program": "qwen",
+  "source": "Z:\\AI\\Ubiquitious-Memories\\Mantic-Mind\\models\\Qwen\\Qwen3-30B-A3B",
+  "total_oracle_tokens": 331
+}

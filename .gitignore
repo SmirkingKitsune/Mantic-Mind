@@ -57,6 +57,10 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Admission tooling virtualenv. Offline-only and never a runtime dependency;
+# reproducible from tools/admission/requirements.txt.
+/tools/admission/.venv/
+
 # OS
 .DS_Store
 Thumbs.db

@@ -10,3 +10,14 @@ CMakeLists.txt text eol=lf
 *.sql text eol=lf
 
 *.ps1 text eol=crlf
+
+# Conformance fixture binaries.
+#
+# `* text=auto` above would let git normalize line endings inside these, which
+# on a Windows checkout silently rewrites bytes that happen to look like CRLF.
+# Every weights_sha256 and tf_logits_sha256 in meta.json would then fail to
+# reproduce — and it would fail only on some platforms, which is the worst way
+# to discover it.
+*.safetensors binary
+*.npz         binary
+*.gguf        binary

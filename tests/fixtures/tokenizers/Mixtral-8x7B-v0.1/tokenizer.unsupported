@@ -1,0 +1,1 @@
+byte_fallback BPE (SentencePiece-converted pipeline) needs a different encode path — unk fusing and byte tokens — and is not implemented

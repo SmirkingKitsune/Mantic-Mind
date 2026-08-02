@@ -1,0 +1,43 @@
+{
+  "fixture_version": 1,
+  "generate": 256,
+  "greedy_first_16": [
+    38,
+    429,
+    509,
+    38,
+    429,
+    509,
+    38,
+    429,
+    509,
+    38,
+    429,
+    509,
+    38,
+    467,
+    38,
+    429
+  ],
+  "implementation": "native",
+  "layer_kinds": [
+    "moe",
+    "moe",
+    "moe",
+    "moe"
+  ],
+  "n_params": 529472,
+  "numpy_version": "2.4.6",
+  "positions": 512,
+  "seed": 20260727,
+  "slug": "OLMoE-1B-7B-0924",
+  "source": "Z:/AI/Ubiquitious-Memories/Mantic-Mind/models/allenai/OLMoE-1B-7B-0924",
+  "source_architectures": [
+    "OlmoeForCausalLM"
+  ],
+  "source_model_type": "olmoe",
+  "tf_logits_sha256": "0a7e602518b608d05f49cc2b1cacc04f54d56362623efea76a6d90c48fcfc23a",
+  "torch_version": "2.13.0+cpu",
+  "transformers_version": "4.57.6",
+  "weights_sha256": "bc6d6b0c9bd894bba0d6c61465b2c4c101de1827b0a7ed099141a59de904884a"
+}

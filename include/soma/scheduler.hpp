@@ -1,0 +1,164 @@
+#pragma once
+
+// Soma — the step-major scheduler. Concurrency is a first-class primitive here,
+// not a FIFO in front of a single-sequence engine.
+//
+//   for each step {
+//       collect ready sequences   -> ragged batch of (seq*, token)
+//       one batched forward       -> dense GEMMs + union MoE
+//       scatter outputs           -> per-sequence sampling, stop checks
+//   }
+//
+// Decode rows and prefill rows are just rows.
+
+#include "soma/f32_model.hpp"
+#include "soma/model.hpp"
+#include "soma/types.hpp"
+
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace soma {
+
+class MemoryHierarchy;
+class KvCheckpointStore;
+
+struct SchedulerConfig {
+    std::uint32_t max_batch = 0; ///< 0 = derive from the cache-aware gate
+    std::uint32_t kv_slots = 4;
+    std::uint32_t ctx_size = 4096;
+
+    /// Chunked prefill interleaves with decode in the SAME union forward.
+    std::uint32_t prefill_chunk_tokens = 512;
+
+    /// Fairness cap: max prefill rows one sequence may contribute per step, so a
+    /// long prompt cannot starve interactive turns.
+    std::uint32_t max_prefill_rows_per_seq = 256;
+
+    /// Speculation is disabled when batch > 1 in v1: batching already amortizes
+    /// the reads speculation was buying, and the interaction between draft
+    /// acceptance and batch composition is a second-order problem. Grammar-forced
+    /// drafts compose more easily and stay on.
+    bool enable_speculation = true;
+};
+
+/// Why admit() refused. Distinguished because the remedies differ: Thrash means
+/// wait, NoKvSlot means preempt, ContextTooLong means fail the request.
+enum class AdmitRejection : std::uint8_t {
+    None = 0,
+    NoKvSlot,
+    Thrash,
+    ContextTooLong,
+    ShuttingDown,
+};
+
+struct SeqRequest {
+    std::vector<TokenId> prompt;
+    SamplerState sampler{};
+    Determinism determinism = Determinism::Batched;
+    std::uint32_t max_tokens = 0;
+    std::vector<std::string> stop_strings;
+};
+
+/// Fired on the scheduler thread as tokens are produced. Must not block.
+using TokenCallback = std::function<void(SeqId, TokenId, bool is_last)>;
+using ErrorCallback = std::function<void(SeqId, StatusCode, const char* what)>;
+
+struct SchedulerStats {
+    std::uint32_t active_sequences = 0;
+    std::uint32_t queued_sequences = 0;
+    std::uint32_t current_batch = 0;
+    std::uint32_t effective_max_batch = 0; ///< after the cache-aware gate
+    std::uint32_t prefill_rows_last_step = 0;
+    std::uint32_t decode_rows_last_step = 0;
+
+    /// The payoff, made observable: unique experts read per step vs. the naive
+    /// count (rows × top_k). A ratio near 1.0 means the union is buying nothing
+    /// and something upstream is wrong.
+    std::uint32_t unique_experts_last_step = 0;
+    std::uint32_t naive_expert_reads_last_step = 0;
+
+    std::uint64_t steps = 0;
+    std::uint64_t tokens_out = 0;
+    std::uint64_t preemptions = 0;
+};
+
+class Scheduler {
+public:
+    Scheduler();
+    Scheduler(const Scheduler&) = delete;
+    Scheduler& operator=(const Scheduler&) = delete;
+    ~Scheduler();
+
+    Status open(const ModelState& model,
+                MemoryHierarchy& memory,
+                KvCheckpointStore& checkpoints,
+                const SchedulerConfig& config);
+
+    /// Drive the scheduler against the fp32 reference model.
+    ///
+    /// The path that exists at G3. Every conformance gate is expressed against
+    /// F32Model, so scheduling it directly is what lets "a batch of N sequences
+    /// produces the same tokens as N separate runs" be checked against the same
+    /// numbers the ladder already trusts. `memory` may be null for a resident
+    /// model. The ModelState overload lands with the engine at G5.
+    /// `checkpoints` may be null; preempt/resume then report Unsupported rather
+    /// than silently doing nothing.
+    Status open_f32(const F32Model& model,
+                    MemoryHierarchy* memory,
+                    const SchedulerConfig& config,
+                    KvCheckpointStore* checkpoints = nullptr);
+
+    void close();
+
+    /// No sequences left — the step loop's termination condition.
+    bool idle() const noexcept;
+
+    void set_token_callback(TokenCallback cb);
+    void set_error_callback(ErrorCallback cb);
+
+    /// Cache-aware admission control — the constraint most likely to be got
+    /// wrong, and getting it wrong inverts the entire benefit of batching.
+    ///
+    ///     max_batch <= cap_per_layer / expected_unique_experts_per_step
+    ///
+    /// N sequences x top_k against a small per-layer LRU thrashes: every step
+    /// evicts what the next needs, the union degenerates into per-row reads plus
+    /// eviction overhead, and throughput falls BELOW single-sequence. The gate
+    /// drops only when the expert set is fully resident, at which point there is
+    /// no read to amortize and concurrency is bounded by compute instead.
+    ///
+    /// A fixed max_batch constant would be a bug wearing a config key's clothing.
+    Status admit(SeqRequest request, SeqId& out_id, AdmitRejection& out_reason);
+
+    /// One ragged-batch forward. Called in a loop by the serve thread.
+    Status step();
+
+    /// Evict a sequence by persisting its KV checkpoint; re-admit later.
+    ///
+    /// Nearly free once KV persistence exists, and it is THE SAME MECHANISM as
+    /// warm conversation reopen and as cluster-level slot suspend/restore. One
+    /// format, three callers. See kv_checkpoint.hpp.
+    Status preempt(SeqId id);
+    Status resume(SeqId id);
+
+    Status cancel(SeqId id);
+
+    SchedulerStats stats() const noexcept;
+
+    /// The gate's current value, recomputed as residency changes. Reported on
+    /// /v1/engines/{id}/slots so operators can see WHY concurrency is limited
+    /// rather than inferring it from throughput.
+    std::uint32_t effective_max_batch() const noexcept;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+const char* to_string(AdmitRejection reason) noexcept;
+
+} // namespace soma

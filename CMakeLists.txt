@@ -94,11 +94,15 @@ else()
 endif()
 
 # ── Subdirectories ────────────────────────────────────────────────────────────
+# CTest is included before the subdirectories so they can register their own
+# tests (src/soma registers the seam check).
+include(CTest)
+
 add_subdirectory(src/common)
 add_subdirectory(src/node)
 add_subdirectory(src/control)
+add_subdirectory(src/soma)
 
-include(CTest)
 if(BUILD_TESTING)
     add_subdirectory(tests)
 endif()

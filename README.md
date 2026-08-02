@@ -8,6 +8,31 @@ Distributed LLM inference cluster — two executables that turn any collection o
 > **Branch note:** `main` is the llama.cpp runtime line. The alternative runtime
 > implementation is maintained separately on the `vLLM-runtime` branch.
 
+> **This branch — Soma.** An experimental line adding **Soma**, a concurrency-first MoE
+> streaming inference engine, as a peer of llama.cpp. Soma runs oversized Mixture-of-Experts models on
+> modest hardware by treating VRAM/RAM/disk as one managed hierarchy and streaming routed experts from
+> NVMe; llama.cpp becomes the **fallback** for models Soma can't or shouldn't run, chosen by an offline
+> **verdict** rather than by configuration.
+>
+> The Soma engine core currently implements and tests the G0–G4 roadmap gates: fp32 and quantized
+> inference, compiled tokenizers, containers and verdicts, expert streaming, deterministic scheduling,
+> checkpointing, sampling, SIMD kernels, and the MLA positional path. The external API, admission/control
+> plane integration, and the G5 serving executable remain planned. The sections further down describe the
+> shipping llama.cpp system and remain accurate for it.
+>
+> | Document | |
+> |---|---|
+> | [docs/architecture.md](docs/architecture.md) | The seam, the three state-ownership tiers, the step-major scheduler, and the before/after of every subsystem being rebuilt |
+> | [docs/external-api.md](docs/external-api.md) | The full new `/v1/*` surface, three-scope auth, SSE throttling |
+> | [docs/mantic-mind-integration.md](docs/mantic-mind-integration.md) | Engine↔node boundary, verdict routing, FTXUI panels |
+> | [docs/roadmap.md](docs/roadmap.md) | G0–G8 validation gates |
+> | [docs/repo-layout.md](docs/repo-layout.md) | Tree, seam boundary, where new code goes |
+> | [schemas/arch-ir.md](schemas/arch-ir.md) | `arch.json` and the verdict function |
+>
+> Note that the API section below documents the **current** routes. The design reclaims
+> `GET /v1/models` for the admission registry and moves the agents-as-models catalog to the
+> OpenAI-compat listener on `:9091`; that has not happened yet.
+
 ## Prerequisites
 
 | Tool | Minimum version |

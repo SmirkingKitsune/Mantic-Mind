@@ -1,0 +1,209 @@
+#pragma once
+
+// Soma — MLA attention backend (Multi-head Latent Attention).
+//
+// Second architecture through the seam, at G4. Its job at that gate is proving
+// the seam carries a second attention FAMILY — architectural correctness, not
+// streaming economics.
+//
+// Reference config this backend is designed against:
+//
+//   DeepSeek-V2-Lite  27 layers, d_model 2048, 16 heads
+//                     kv_lora_rank 512, q_lora_rank null (no Q down-projection)
+//                     qk_nope_head_dim 128, qk_rope_head_dim 64, v_head_dim 128
+//                     64 routed experts, top-6, 2 shared, moe_intermediate 1408
+//                     first_k_dense_replace 1  -> 26 MoE layers, layer 0 dense
+//                     softmax scoring, n_group 1, routed_scaling_factor 1.0
+//                     rope_theta 1e4 with YaRN scaling (factor 40, mscale 0.707)
+//
+// The cheapest real MLA + fine-grained-MoE checkpoint that exists, so G4 does
+// not require 100B-class hardware.
+//
+// NOTE it will likely admit as resident-only at q4 (7.2 GB routed set fits in
+// RAM). That is expected and fine: the conformance ladder runs regardless of
+// verdict, production PLACEMENT is what the verdict gates, and forcing Soma for
+// the test is exactly what backend_override: soma exists for.
+//
+// DEPENDENCY RULE: this header may include core headers. Core headers may not
+// include this one, and may not mention "mla". CI enforces it.
+
+#include "soma/arch_backend.hpp"
+#include "soma/arch_ir.hpp"
+#include "soma/attention_backend.hpp"
+#include "soma/f32_model.hpp"
+#include "soma/types.hpp"
+
+#include <cstddef>
+#include <span>
+
+namespace soma::arch::mla {
+
+/// This backend's KV checkpoint tag. Owned here, not in a core enum.
+inline constexpr KvFormatId kKvFormat = kv_format_id("soma.kv.mla.latent.v1");
+
+/// Compressed latent + RoPE slice: kv_lora_rank + qk_rope_head_dim elements per
+/// token per layer. Note this is independent of head count — the whole point.
+///
+///   DeepSeek-V2-Lite  512 + 64 = 576 elem/tok/layer × 27 = 31 KB/tok @fp16
+///                     vs. uncompressed 16×(128+64) + 16×128 = 5120 -> ~8.9x
+///
+/// The ratio grows with head count, so it is far larger on full-size V2/V3
+/// (128 heads). Compressed KV is the difference between feasible and not for
+/// this family, which is why it is carried forward from the prior art rather
+/// than treated as an optimization.
+std::size_t kv_bytes_per_token(const ArchIr& arch) noexcept;
+
+/// Weight absorption. THE reason AttentionBackend has this hook.
+///
+/// Folds the KV up-projections into Q (and into the output projection) at load,
+/// so decode operates in latent space and never materializes full K/V. There is
+/// no GQA analogue — it is not a faster path to the same intermediate, it
+/// removes the intermediate.
+///
+/// Runs exactly once, from load_model(), and mutates ModelState BEFORE the model
+/// tier becomes visible to any worker thread. That ordering is load-bearing:
+/// tier 1's lock-free read depends on nothing mutating it after publication
+/// (model.hpp).
+///
+/// Skipped when MlaSpec::absorb_weights is false, which the conformance harness
+/// uses to check the absorbed and unabsorbed paths against each other.
+Status prepare_weights(ModelState& model);
+
+StatusCode prefill(const ModelState& model,
+                   ExecScratch& exec,
+                   SeqBatch& batch,
+                   LayerIndex layer,
+                   std::span<const float> in,
+                   std::span<float> out) noexcept;
+
+/// Latent-space decode against the compressed cache.
+///
+/// Same signature as the GQA path, and that is the seam working: the core calls
+/// this identically, having never learned that the cache holds a latent rather
+/// than K and V.
+StatusCode decode(const ModelState& model,
+                  ExecScratch& exec,
+                  SeqBatch& batch,
+                  LayerIndex layer,
+                  std::span<const float> in,
+                  std::span<float> out) noexcept;
+
+StatusCode init_kv_region(const ArchIr& arch, KvRegion& region) noexcept;
+
+/// Partial RoPE: only qk_rope_head_dim of each head carries position, the
+/// qk_nope_head_dim remainder does not. Applied to the RoPE slice only.
+StatusCode apply_rope(const ArchIr& arch,
+                      std::span<float> q,
+                      std::span<float> k,
+                      std::span<const std::uint32_t> positions) noexcept;
+
+/// YaRN scaling, including the mscale attenuation applied to attention logits.
+/// Declared separately because it is not a rope variant so much as a rope
+/// variant plus a logit scale, and folding it into apply_rope would hide the
+/// second half.
+float yarn_mscale(const ArchIr& arch) noexcept;
+
+const AttentionBackend& attention_backend() noexcept;
+
+// ── Router ───────────────────────────────────────────────────────────────────
+
+/// Group-limited top-k with optional pre-selection bias correction and
+/// post-selection scaling.
+///
+/// V2-Lite is the degenerate case (n_group 1, topk_group 1, no bias correction,
+/// routed_scaling_factor 1.0) but the general form is implemented from the
+/// start: n_group > 1 selects candidate groups by their top expert before
+/// selecting experts within them, which is a different algorithm rather than a
+/// filter applied afterwards. Retrofitting it would mean rewriting the function
+/// that decides which experts fire.
+StatusCode route(const ArchIr& arch,
+                 std::span<const float> logits_f32,
+                 std::uint32_t n_rows,
+                 RouterOut& out) noexcept;
+
+StatusCode apply_expert(const ModelState& model,
+                        ExecScratch& exec,
+                        LayerIndex layer,
+                        ExpertId expert,
+                        CByteSpan expert_bytes,
+                        std::span<const std::uint32_t> row_indices,
+                        std::span<const float> row_weights) noexcept;
+
+/// Layer 0 on V2-Lite (first_k_dense_replace 1). Topology::layer_kinds is
+/// authoritative; this reads it rather than re-deriving the stride.
+StatusCode dense_ffn(const ModelState& model,
+                     ExecScratch& exec,
+                     LayerIndex layer,
+                     std::uint32_t n_rows) noexcept;
+
+/// Two shared experts on V2-Lite, applied to every row unconditionally —
+/// unlike the routed experts, they are never streamed and live in the resident
+/// half of the static partition.
+StatusCode shared_experts(const ModelState& model,
+                          ExecScratch& exec,
+                          LayerIndex layer,
+                          std::uint32_t n_rows) noexcept;
+
+StatusCode apply_norm(const ModelState& model,
+                      ExecScratch& exec,
+                      const DenseTensor& weight,
+                      std::uint32_t n_rows) noexcept;
+
+Status validate(const ArchIr& arch);
+
+const ArchBackend& backend() noexcept;
+
+// ── fp32 reference path ──────────────────────────────────────────────────────
+
+/// MLA's per-layer attention weights. Nothing here is shared with GQA — which is
+/// the point of the opaque payload: neither family's tensor list appears in core.
+struct F32AttnWeights {
+    /// Used when q_lora_rank == 0 (DeepSeek-V2-Lite). Mutually exclusive with
+    /// the q_a/q_b pair, which the full V2 uses instead.
+    soma::WeightRef q_proj;
+    soma::WeightRef q_a_proj, q_b_proj;
+    std::span<const float> q_a_norm;
+
+    soma::WeightRef kv_a_proj; ///< kv_a_proj_with_mqa: latent ++ shared rope
+    std::span<const float> kv_a_norm;
+    soma::WeightRef kv_b_proj; ///< latent -> per-head (K-nope ++ V)
+    soma::WeightRef o_proj;
+
+    /// `mlp.gate.e_score_correction_bias` — V3's `noaux_tc` routing bias.
+    ///
+    /// A ROUTER parameter living in the attention payload, which is only odd
+    /// until you notice the payload is the backend's per-layer state and not
+    /// specifically its attention weights. Empty on V2 and on dense layers.
+    std::span<const float> e_score_bias;
+};
+
+StatusCode f32_bind_layer(const ArchIr& arch,
+                          const soma::LayerBindCtx& ctx,
+                          soma::ArchLayerPayload& out) noexcept;
+
+StatusCode f32_attention(const ArchIr& arch,
+                         const soma::F32LayerWeights& lw,
+                         const float* x,
+                         std::uint32_t n_tokens,
+                         soma::F32Workspace& ws,
+                         float* out) noexcept;
+
+StatusCode f32_attention_kv(const ArchIr& arch,
+                            const soma::F32LayerWeights& lw,
+                            const float* x,
+                            std::uint32_t n_rows,
+                            LayerIndex layer,
+                            const soma::KvRow* rows,
+                            soma::F32Workspace& ws,
+                            float* out) noexcept;
+
+StatusCode f32_route(const ArchIr& arch,
+                     const soma::F32LayerWeights& lw,
+                     const float* logits,
+                     std::uint32_t n_tokens,
+                     std::uint32_t* out_ids,
+                     float* out_weights) noexcept;
+
+const soma::F32Backend& f32_backend() noexcept;
+
+} // namespace soma::arch::mla

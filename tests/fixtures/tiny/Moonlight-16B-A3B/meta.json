@@ -1,0 +1,43 @@
+{
+  "fixture_version": 1,
+  "generate": 256,
+  "greedy_first_16": [
+    431,
+    126,
+    455,
+    126,
+    473,
+    431,
+    431,
+    126,
+    473,
+    431,
+    126,
+    473,
+    431,
+    431,
+    126,
+    473
+  ],
+  "implementation": "native",
+  "layer_kinds": [
+    "dense",
+    "moe",
+    "moe",
+    "moe"
+  ],
+  "n_params": 493248,
+  "numpy_version": "2.4.6",
+  "positions": 512,
+  "seed": 20260727,
+  "slug": "Moonlight-16B-A3B",
+  "source": "Z:/AI/Ubiquitious-Memories/Mantic-Mind/models/moonshotai/Moonlight-16B-A3B",
+  "source_architectures": [
+    "DeepseekV3ForCausalLM"
+  ],
+  "source_model_type": "deepseek_v3",
+  "tf_logits_sha256": "c76e586a9ce11dfb18c838e99d7b4dd8bfc8aa3dac834bbd45b7242846e0d948",
+  "torch_version": "2.13.0+cpu",
+  "transformers_version": "4.57.6",
+  "weights_sha256": "fcfda0b224a06e63e2eea826e81cde064650d74fa4867c0438332ac0ed6bd1d0"
+}

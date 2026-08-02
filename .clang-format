@@ -1,0 +1,60 @@
+# Mantic-Mind / Soma formatting.
+#
+# Derived from the style the existing sources already use, not imposed on top of
+# it: 4-space indent, ~100 columns, attached braces, left-aligned pointers and
+# references (`const std::string& path`, `const char* name`).
+#
+# SCOPE: enforced on include/soma/**, src/soma/**, and the rebuild headers only.
+# Reformatting the other ~40 existing translation units would produce a diff that
+# buries the actual change and makes every future `git blame` land here. The
+# scope widens when a file is substantially rewritten anyway.
+
+Language: Cpp
+BasedOnStyle: LLVM
+
+ColumnLimit: 100
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+AccessModifierOffset: -4
+
+PointerAlignment: Left
+ReferenceAlignment: Left
+DerivePointerAlignment: false
+
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+
+AlignAfterOpenBracket: Align
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+AlignTrailingComments: true
+
+BinPackArguments: false
+BinPackParameters: false
+AlwaysBreakTemplateDeclarations: Yes
+NamespaceIndentation: None
+FixNamespaceComments: true
+CompactNamespaces: false
+
+SeparateDefinitionBlocks: Always
+EmptyLineBeforeAccessModifier: LogicalBlock
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1
+
+# Own-project headers first, then the standard library. Matches the existing
+# convention (`#include "common/models.hpp"` above `#include <string>`).
+SortIncludes: CaseSensitive
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^"(soma|common|node|control)/'
+    Priority: 1
+  - Regex: '^"'
+    Priority: 2
+  - Regex: '^<(SQLiteCpp|httplib|nlohmann|spdlog|ftxui|openssl)'
+    Priority: 3
+  - Regex: '^<'
+    Priority: 4
