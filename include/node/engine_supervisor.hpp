@@ -151,6 +151,31 @@ public:
     void set_kv_checkpoint_dir(const std::string& dir);
     void set_models_dir(const std::string& dir);
 
+#ifdef MM_TESTING
+    /// A Ready engine with no process behind it.
+    ///
+    /// Test-only, and gated at compile time so it cannot be reached in a shipped
+    /// binary. The alternative is spawning a real engine for tests about slot
+    /// bookkeeping — leases, detach, suspend refusals — which are the parts that
+    /// have nothing to do with inference.
+    SlotId add_ready_test_engine(const std::string& engine_id = "llama-cpp",
+                                 std::string model_path = "model.gguf",
+                                 AgentId agent_id = {},
+                                 RuntimeSettings settings = {},
+                                 std::string mmproj_path = {});
+
+    /// A Suspended record — one whose process is already stopped.
+    ///
+    /// Needed because suspend() cannot be used to produce one in a test: a test
+    /// engine has no live process, so its KV save fails and the suspend is
+    /// correctly refused. Constructing the end state directly is honest; making
+    /// suspend() succeed without a checkpoint would not be.
+    SlotId add_suspended_test_engine(const std::string& engine_id = "llama-cpp",
+                                     std::string model_path = "model.gguf",
+                                     AgentId agent_id = {},
+                                     RuntimeSettings settings = {});
+#endif
+
     /// Per-engine provisioning/health, keyed by engine id. Generalizes the
     /// single LlamaRuntimeStatus field on NodeState.
     void set_runtime_status(const RuntimeStatus& status);
@@ -177,6 +202,12 @@ private:
         std::int64_t last_active_ms = 0;
         SlotState state = SlotState::Empty;
         int effective_ctx_size = 0;
+        /// Reported as SlotInfo::backend when no descriptor is registered.
+        /// NOT behind #ifdef MM_TESTING on purpose: a conditional member gives
+        /// the library and a test-instrumented build different layouts for the
+        /// same struct, and one string per engine is a cheap price for not
+        /// having that hazard at all.
+        std::string fallback_backend_id;
     };
 
     std::string kv_checkpoint_dir_ = "data/kv_cache";

@@ -38,6 +38,13 @@ public:
 
     virtual const char* engine_id() const = 0;
 
+    /// The on-disk extension this backend's format uses, including the dot.
+    ///
+    /// Backend-owned for the same reason format_id is: the supervisor names a
+    /// checkpoint after the slot and must not know that llama.cpp writes
+    /// llama-server session blobs while Soma writes its own versioned format.
+    virtual const char* file_extension() const = 0;
+
     /// Whether this engine can checkpoint sequences beyond index 0.
     ///
     /// False for llama.cpp. The supervisor consults it before advertising
@@ -76,6 +83,7 @@ public:
 class LlamaKvBackend final : public KvCheckpointBackend {
 public:
     const char* engine_id() const override;
+    const char* file_extension() const override;
     bool supports_multi_sequence() const override;
     bool save(const std::string&,
               const std::string&,
@@ -95,6 +103,7 @@ public:
 class SomaKvBackend final : public KvCheckpointBackend {
 public:
     const char* engine_id() const override;
+    const char* file_extension() const override;
     bool supports_multi_sequence() const override; ///< true
     bool save(const std::string&,
               const std::string&,
@@ -106,8 +115,18 @@ public:
                  std::uint32_t,
                  const std::string&,
                  std::string&) override;
+    /// Aggregate view of a suspended engine, read from the session manifest.
     bool stat(const std::string&, KvCheckpointInfo&, std::string&) override;
     bool remove(const std::string&, std::string&) override;
+
+    /// One session's KV file, read through the engine's own header codec.
+    ///
+    /// A different question from stat(): "is this cache replayable on this host"
+    /// rather than "what does this suspended engine contain". Both run before an
+    /// engine is spawned, which is why neither asks a running process.
+    bool stat_sequence(const std::string& checkpoint_path,
+                       KvCheckpointInfo& out,
+                       std::string& out_error);
 };
 
 } // namespace mm

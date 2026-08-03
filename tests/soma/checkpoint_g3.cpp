@@ -143,12 +143,28 @@ int main(int argc, char** argv) {
         soma::KvCache kv;
         (void)kv.open(model.arch, 64);
         (void)kv.set_length(8);
-        check(store.save("gate-probe", kv).ok(), "a valid checkpoint saves");
+        // v2 carries the ids occupying the cached positions, so a restore can be
+        // checked against the prompt it is about to be attached to.
+        const std::vector<soma::TokenId> probe_tokens{3, 1, 4, 1, 5, 9, 2, 6};
+        check(store.save("gate-probe", kv, probe_tokens).ok(), "a valid checkpoint saves");
         check(store.exists("gate-probe"), "and is visible to exists()");
 
         soma::KvCache dst;
+        std::vector<soma::TokenId> read_back;
         (void)dst.open(model.arch, 64);
-        check(store.load("gate-probe", dst).ok(), "and loads back into a matching engine");
+        check(store.load("gate-probe", dst, read_back).ok(),
+              "and loads back into a matching engine");
+        check(read_back == probe_tokens, "the token ids round-trip with the cache",
+              std::to_string(read_back.size()) + " ids");
+
+        // A token list that does not line up with the cached positions is refused
+        // rather than padded: a prefix check against a misaligned list reads as a
+        // guarantee while proving nothing.
+        soma::KvCache short_kv;
+        (void)short_kv.open(model.arch, 64);
+        (void)short_kv.set_length(8);
+        check(!store.save("bad-count", short_kv, {1, 2, 3}).ok(),
+              "a token count that disagrees with the cache is refused");
 
         // The gate is only meaningful if the value it compares is real.
         //
@@ -166,8 +182,9 @@ int main(int argc, char** argv) {
         soma::KvCheckpointStore other_store;
         if (other_store.open(dir.string(), other).ok()) {
             soma::KvCache d2;
+            std::vector<soma::TokenId> ignored;
             (void)d2.open(other, 64);
-            const auto st = other_store.load("gate-probe", d2);
+            const auto st = other_store.load("gate-probe", d2, ignored);
             check(st.code() == soma::StatusCode::ArchMismatch,
                   "arch_hash mismatch is refused with ArchMismatch",
                   st.ok() ? "LOADED ANYWAY" : st.message());
@@ -183,8 +200,9 @@ int main(int argc, char** argv) {
             f.write(reinterpret_cast<const char*>(&bogus), 4);
         }
         soma::KvCache d3;
+        std::vector<soma::TokenId> ignored3;
         (void)d3.open(model.arch, 64);
-        const auto vst = store.load("gate-probe", d3);
+        const auto vst = store.load("gate-probe", d3, ignored3);
         check(vst.code() == soma::StatusCode::VersionMismatch,
               "version mismatch is refused with VersionMismatch",
               vst.ok() ? "LOADED ANYWAY" : vst.message());

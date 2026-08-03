@@ -195,48 +195,32 @@ std::vector<NodeInfo> NodeRegistry::nodes_with_model_loaded(
     return out;
 }
 
-std::vector<NodeInfo> NodeRegistry::nodes_with_available_vram(
-    int64_t min_vram_mb) const
+std::vector<NodeInfo> NodeRegistry::nodes_with_capacity(const ResourceFootprint& footprint,
+                                                       const CapacityPolicy& policy) const
 {
     std::lock_guard<std::mutex> g(mutex_);
     struct Candidate {
         NodeInfo info;
-        bool     native_vram_fit = false;
-        int64_t  score_mb = 0;
+        double   score = 0.0;
     };
     std::vector<Candidate> cands;
 
-    constexpr int64_t kVramHeadroomMb = 1024;       // keep 1 GiB VRAM safety margin
-    constexpr int64_t kRamHeadroomMb  = 2048;       // keep 2 GiB system RAM safety margin
-    constexpr double  kRamOffloadWeight = 0.60;     // CPU-offloaded weights are slower/less reliable
-    constexpr int64_t kMinGpuForOffloadMb = 8192;   // require at least 8 GiB GPU for hybrid loads
-
+    // The policy constants that used to live here as four `constexpr`s are now
+    // CapacityPolicy's defaults, unchanged in value. Moving them means the node
+    // and control cannot disagree about what fits — and that the caller can pass
+    // a different policy without editing this function.
     for (auto& [_, n] : nodes_) {
         if (!n.connected) continue;
-
-        int64_t vram_free_raw = n.metrics.gpu_vram_total_mb - n.metrics.gpu_vram_used_mb;
-        int64_t ram_free_raw  = n.metrics.ram_total_mb - n.metrics.ram_used_mb;
-        int64_t vram_free = std::max<int64_t>(0, vram_free_raw - kVramHeadroomMb);
-        int64_t ram_free  = std::max<int64_t>(0, ram_free_raw  - kRamHeadroomMb);
-
-        bool native_fit = vram_free >= min_vram_mb;
-        bool allow_offload = (n.metrics.gpu_vram_total_mb >= kMinGpuForOffloadMb) ||
-                             (n.metrics.gpu_vram_total_mb <= 0);
-        int64_t effective_mb = vram_free + static_cast<int64_t>(ram_free * kRamOffloadWeight);
-        bool offload_fit = allow_offload && effective_mb >= min_vram_mb;
-
-        if (!native_fit && !offload_fit) continue;
-
-        Candidate c;
-        c.info = n;
-        c.native_vram_fit = native_fit;
-        c.score_mb = native_fit ? vram_free : effective_mb;
-        cands.push_back(std::move(c));
+        const auto capacity = capacity_of(n);
+        if (evaluate_fit(footprint, capacity, policy, nullptr) == FitQuality::None) continue;
+        cands.push_back({n, capacity_score(footprint, capacity, policy)});
     }
 
+    // capacity_score() already ranks a native fit above every offloaded one, so
+    // the two-key sort this replaces collapses into one. Ties still break on id
+    // so the order is stable across polls rather than hash-order.
     std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b) {
-        if (a.native_vram_fit != b.native_vram_fit) return a.native_vram_fit > b.native_vram_fit;
-        if (a.score_mb != b.score_mb) return a.score_mb > b.score_mb;
+        if (a.score != b.score) return a.score > b.score;
         return a.info.id < b.info.id;
     });
 

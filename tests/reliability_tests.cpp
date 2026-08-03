@@ -13,6 +13,7 @@
 #include "control/agent_queue.hpp"
 #include "control/agent_scheduler.hpp"
 #include "control/control_api_server.hpp"
+#include "control/model_registry.hpp"
 #include "control/node_registry.hpp"
 #include "control/performance_tracker.hpp"
 #include "control/tts_service_client.hpp"
@@ -20,7 +21,7 @@
 #include "common/inference_sizing.hpp"
 #include "control/agent_config_validator.hpp"
 #include "node/runtime_process.hpp"
-#include "node/slot_manager.hpp"
+#include "node/engine_supervisor.hpp"
 #include "node/llama_runtime.hpp"
 #include "node/llama_cpp_provisioner.hpp"
 
@@ -441,18 +442,18 @@ bool test_served_model_name_legacy_compatibility() {
     return true;
 }
 
-bool test_slot_manager_not_found_statuses() {
+bool test_engine_supervisor_not_found_statuses() {
     auto dir = temp_test_dir("slots");
-    mm::SlotManager slots(46100, 46101, 1);
+    mm::EngineSupervisor slots(46100, 46101, 1);
 
-    auto unload = slots.unload_slot("missing-slot");
-    CHECK(unload.status == mm::SlotOperationStatus::NotFound);
+    auto unload = slots.unload("missing-slot");
+    CHECK(unload.status == mm::EngineOpStatus::NotFound);
 
-    auto suspend = slots.suspend_slot("missing-slot");
-    CHECK(suspend.status == mm::SlotOperationStatus::NotFound);
+    auto suspend = slots.suspend("missing-slot");
+    CHECK(suspend.status == mm::EngineOpStatus::NotFound);
 
     auto unload_all = slots.unload_all(false);
-    CHECK(unload_all.status == mm::SlotOperationStatus::Ok);
+    CHECK(unload_all.status == mm::EngineOpStatus::Ok);
 
     CHECK(remove_tree(dir));
     return true;
@@ -460,22 +461,22 @@ bool test_slot_manager_not_found_statuses() {
 
 bool test_slot_lease_blocks_unload_and_suspend_while_busy() {
     auto dir = temp_test_dir("lease-busy");
-    mm::SlotManager slots(46110, 46111, 1);
-    const auto slot_id = slots.add_ready_test_slot("test-model.gguf", "agent-a");
+    mm::EngineSupervisor slots(46110, 46111, 1);
+    const auto slot_id = slots.add_ready_test_engine("llama-cpp", "test-model.gguf", "agent-a");
 
     {
-        auto inference_lease = slots.acquire_slot(slot_id);
+        auto inference_lease = slots.acquire(slot_id);
         CHECK(static_cast<bool>(inference_lease));
 
-        auto unload = slots.unload_slot(slot_id);
-        CHECK(unload.status == mm::SlotOperationStatus::Busy);
+        auto unload = slots.unload(slot_id);
+        CHECK(unload.status == mm::EngineOpStatus::Busy);
 
-        auto suspend = slots.suspend_slot(slot_id);
-        CHECK(suspend.status == mm::SlotOperationStatus::Busy);
+        auto suspend = slots.suspend(slot_id);
+        CHECK(suspend.status == mm::EngineOpStatus::Busy);
     }
 
-    auto unload_after_release = slots.unload_slot(slot_id);
-    CHECK(unload_after_release.status == mm::SlotOperationStatus::Ok);
+    auto unload_after_release = slots.unload(slot_id);
+    CHECK(unload_after_release.status == mm::EngineOpStatus::Ok);
 
     CHECK(remove_tree(dir));
     return true;
@@ -637,10 +638,33 @@ bool test_scheduler_skips_failed_node_current_attempt() {
     retired.id = "retired-agent";
     retired.inference_backend = "vllm";
     RECORD(!scheduler.ensure_agent_running(retired).has_value());
-    RECORD(scheduler.last_error().find("supports llama-cpp only") !=
-           std::string::npos);
+    // Asserted STRUCTURALLY: an agent with no node-local backend resolves to an
+    // empty engine id. The previous version matched the phrase "supports
+    // llama-cpp only", which made the test a hostage of the error prose — the
+    // same mistake the capacity-pressure substring matcher made.
+    RECORD(mm::AgentScheduler::resolve_backend(retired).engine_id.empty());
     RECORD(bad_loads.load() == 0);
     RECORD(good_loads.load() == 0);
+
+    // And the agent that DOES own a slot routes to a real engine. `auto` with no
+    // admission record is the fallback, which is policy rather than a placeholder:
+    // absence of a record is not evidence of admissibility.
+    RECORD(mm::AgentScheduler::resolve_backend(cfg).engine_id == "llama-cpp");
+
+    // An operator override to Soma is REFUSED while no record admits these
+    // weights — forcing the streaming engine onto a model nothing has passed
+    // through conformance is the same bet as overriding a `reject`, with less
+    // evidence behind it. Once the model registry lands, an admitted model with
+    // a stream verdict is what makes this resolve to "soma".
+    auto forced = cfg;
+    forced.backend_override = "soma";
+    RECORD(mm::AgentScheduler::resolve_backend(forced).engine_id == "llama-cpp");
+    RECORD(mm::AgentScheduler::resolve_backend(forced).reason.find("override_refused") !=
+           std::string::npos);
+
+    auto forced_fallback = cfg;
+    forced_fallback.backend_override = "fallback";
+    RECORD(mm::AgentScheduler::resolve_backend(forced_fallback).engine_id == "llama-cpp");
 
     auto scheduled = scheduler.ensure_agent_running(cfg);
     RECORD(scheduled.has_value());
@@ -1042,8 +1066,11 @@ bool test_scheduler_backend_change_releases_local_placement() {
         RECORD(detach_body.value("slot_id", std::string{}) == "slot-local");
         RECORD(detach_body.value("agent_id", std::string{}) == cfg.id);
     }
-    RECORD(scheduler.last_error().find("supports llama-cpp only") !=
-           std::string::npos);
+    // Structural again: an "api" agent owns no node-local slot, so it resolves
+    // to no engine at all — which is a different statement from "this branch
+    // only supports llama-cpp", and the one that stays true now that it does not.
+    RECORD(mm::AgentScheduler::resolve_backend(api_cfg).engine_id.empty());
+    RECORD(scheduler.last_error().find("no node-local backend") != std::string::npos);
 
     registry.stop_health_poll();
     server.stop();
@@ -1367,9 +1394,16 @@ bool test_control_api_external_token_gate() {
         client.set_bearer_token("control-secret");
         auto valid = with_retry([&] { return client.get("/v1/nodes"); });
         RECORD(valid.status == 200);
+        // /v1/models is the ADMISSION REGISTRY now, not agents wearing model
+        // costumes — the agents catalog lives on the :9091 OpenAI-compat
+        // listener where it belongs. This server has no registry attached, so
+        // the route answers 503; that still proves the token gate let it
+        // through, which is what this test is about. The old assertion (that the
+        // body contained "agent:agent-a") is the behaviour being retired.
         auto valid_models = with_retry([&] { return client.get("/v1/models"); });
-        RECORD(valid_models.status == 200);
-        RECORD(valid_models.body.find("agent:agent-a") != std::string::npos);
+        RECORD(valid_models.status == 503);
+        RECORD(valid_models.body.find("registry") != std::string::npos);
+        RECORD(valid_models.body.find("agent:agent-a") == std::string::npos);
         auto valid_voice = with_retry([&] { return client.get("/v1/agents/agent-a/voice"); });
         RECORD(valid_voice.status == 200);
 
@@ -3245,21 +3279,31 @@ bool test_vision_profile_validation_and_suggestions() {
 }
 
 bool test_vision_slot_projector_isolation_and_json() {
-    mm::SlotManager slots(46250, 46253, 4);
-    slots.set_llama_server_path("missing-llama-server");
+    // Sharing is decided by the DESCRIPTOR's launch_compatible predicate now, so
+    // the registry has to hold one. The executable is deliberately bogus: a load
+    // that cannot attach must try to spawn and fail, which is the case under test.
+    mm::EngineRegistry::instance().register_engine(
+        mm::make_llama_descriptor("missing-llama-server"));
+
+    mm::EngineSupervisor slots(46250, 46253, 4);
+    slots.set_models_dir("missing-llama-server");
     mm::RuntimeSettings settings;
-    const auto first = slots.add_ready_test_slot(
+    const auto first = slots.add_ready_test_engine("llama-cpp",
         "model.gguf", "agent-a", settings, "mmproj-a.gguf");
     CHECK(!first.empty());
 
-    const auto shared = slots.load_model(
-        "model.gguf", "mmproj-a.gguf", settings, "agent-b");
+    mm::EngineLoadRequest same_req;
+    same_req.model_path = "model.gguf";
+    same_req.mmproj_path = "mmproj-a.gguf";
+    same_req.settings = settings;
+    const auto shared = slots.load("llama-cpp", same_req, "agent-b");
     CHECK(shared == first);
 
-    const auto different = slots.load_model(
-        "model.gguf", "mmproj-b.gguf", settings, "agent-c");
+    mm::EngineLoadRequest other_req = same_req;
+    other_req.mmproj_path = "mmproj-b.gguf";
+    const auto different = slots.load("llama-cpp", other_req, "agent-c");
     CHECK(different.empty());
-    const auto info = slots.find_slot(first);
+    const auto info = slots.find(first);
     CHECK(info.has_value());
     CHECK(info->backend == "llama-cpp");
     CHECK(info->vision_enabled);
@@ -4168,30 +4212,32 @@ bool test_llama_nvcc_architecture_preflight_and_diagnostics() {
 
 bool test_llama_slot_info_backend_and_suspend() {
     auto dir = temp_test_dir("llama-slot");
-    mm::SlotManager slots(46170, 46173, 2);
-    slots.set_llama_server_path("missing-llama");
-    slots.set_kv_cache_dir((dir / "kv").string());
+    mm::EngineSupervisor slots(46170, 46173, 2);
+    slots.set_models_dir("missing-llama");
+    slots.set_kv_checkpoint_dir((dir / "kv").string());
 
     mm::RuntimeSettings s;
     s.ctx_size = 2048;
     s.parallel = 1;
-    const auto id = slots.add_ready_test_slot("m.gguf", "agent-l", s);
+    const auto id = slots.add_ready_test_engine("llama-cpp", "m.gguf", "agent-l", s);
 
-    auto info = slots.find_slot(id);
+    auto info = slots.find(id);
     CHECK(info.has_value());
     CHECK(info->backend == "llama-cpp");
     // Backend survives the SlotInfo JSON round-trip.
     nlohmann::json j = *info;
     CHECK(j.get<mm::SlotInfo>().backend == "llama-cpp");
 
-    // A test slot has no live engine (port 0), so suspend skips the KV save and
-    // still transitions to Suspended with an empty cache path.
-    auto susp = slots.suspend_slot(id);
-    CHECK(susp.status == mm::SlotOperationStatus::Ok);
-    CHECK(susp.kv_cache_path.empty());
-    auto after = slots.find_slot(id);
+    // A test engine has no live process, so the KV save cannot succeed — and a
+    // suspend whose checkpoint was not written now FAILS rather than reporting
+    // success with an empty path. SlotManager reported Ok here and dropped the
+    // context silently; that is the behaviour the rebuild does not carry forward.
+    // The engine is left Ready, not killed.
+    auto susp = slots.suspend(id);
+    CHECK(susp.status == mm::EngineOpStatus::Failed);
+    auto after = slots.find(id);
     CHECK(after.has_value());
-    CHECK(after->state == mm::SlotState::Suspended);
+    CHECK(after->state == mm::SlotState::Ready);
 
     CHECK(remove_tree(dir));
     return true;
@@ -4252,13 +4298,18 @@ bool test_llama_default_backend_and_slot_sharing() {
     // Compatible agents share one ready process. A launch-setting mismatch
     // cannot attach; the attempted new process then fails on the fake path.
     auto dir = temp_test_dir("llama-sharing");
-    mm::SlotManager slots(46180, 46183, 4);
-    slots.set_llama_server_path("missing-llama");
+    mm::EngineSupervisor slots(46180, 46183, 4);
+    slots.set_models_dir("missing-llama");
     mm::RuntimeSettings settings;
     settings.ctx_size = 4096;
-    const auto llama_id = slots.add_ready_test_slot("m.gguf", "agent-a", settings);
-    CHECK(slots.load_model("m.gguf", settings, "agent-b") == llama_id);
-    auto llama_info = slots.find_slot(llama_id);
+    mm::EngineRegistry::instance().register_engine(
+        mm::make_llama_descriptor("missing-llama"));
+    const auto llama_id = slots.add_ready_test_engine("llama-cpp", "m.gguf", "agent-a", settings);
+    mm::EngineLoadRequest compat_req;
+    compat_req.model_path = "m.gguf";
+    compat_req.settings = settings;
+    CHECK(slots.load("llama-cpp", compat_req, "agent-b") == llama_id);
+    auto llama_info = slots.find(llama_id);
     CHECK(llama_info.has_value());
     CHECK(llama_info->backend == "llama-cpp");
     CHECK(llama_info->assigned_agent == "agent-a");
@@ -4268,8 +4319,11 @@ bool test_llama_default_backend_and_slot_sharing() {
 
     auto incompatible = settings;
     incompatible.ctx_size = 8192;
-    CHECK(slots.load_model("m.gguf", incompatible, "agent-c").empty());
-    llama_info = slots.find_slot(llama_id);
+    mm::EngineLoadRequest incompat_req;
+    incompat_req.model_path = "m.gguf";
+    incompat_req.settings = incompatible;
+    CHECK(slots.load("llama-cpp", incompat_req, "agent-c").empty());
+    llama_info = slots.find(llama_id);
     CHECK(llama_info.has_value());
     CHECK(std::find(llama_info->agent_ids.begin(), llama_info->agent_ids.end(),
                     "agent-c") == llama_info->agent_ids.end());
@@ -4281,7 +4335,7 @@ bool test_llama_default_backend_and_slot_sharing() {
     const auto last_detach = slots.detach_agent(llama_id, "agent-a");
     CHECK(last_detach.ok());
     CHECK(last_detach.unloaded);
-    CHECK(!slots.find_slot(llama_id).has_value());
+    CHECK(!slots.find(llama_id).has_value());
 
     CHECK(remove_tree(dir));
     return true;
@@ -4289,22 +4343,27 @@ bool test_llama_default_backend_and_slot_sharing() {
 
 bool test_llama_restore_attaches_and_cleans_suspended_record() {
     auto dir = temp_test_dir("llama-restore-attach");
-    mm::SlotManager slots(46190, 46193, 4);
+    mm::EngineSupervisor slots(46190, 46193, 4);
     mm::RuntimeSettings settings;
     settings.ctx_size = 4096;
 
+    // Constructed directly rather than via suspend(): a test engine has no live
+    // process, so its KV save fails and the suspend is correctly refused. What
+    // this test is about is what RESTORE does with a suspended record.
     const auto suspended_id =
-        slots.add_ready_test_slot("m.gguf", "agent-b", settings);
-    CHECK(slots.suspend_slot(suspended_id).ok());
-    CHECK(slots.find_slot(suspended_id)->state == mm::SlotState::Suspended);
+        slots.add_suspended_test_engine("llama-cpp", "m.gguf", "agent-b", settings);
+    CHECK(slots.find(suspended_id)->state == mm::SlotState::Suspended);
 
-    const auto ready_id = slots.add_ready_test_slot("m.gguf", "agent-a", settings);
-    const auto restored = slots.restore_slot("m.gguf", settings, "", "agent-b");
+    const auto ready_id = slots.add_ready_test_engine("llama-cpp", "m.gguf", "agent-a", settings);
+    mm::EngineLoadRequest restore_req;
+    restore_req.model_path = "m.gguf";
+    restore_req.settings = settings;
+    const auto restored = slots.restore("llama-cpp", restore_req, "", "agent-b");
     CHECK(restored == ready_id);
-    CHECK(!slots.find_slot(suspended_id).has_value());
-    CHECK(slots.find_slot_by_agent("agent-b") == ready_id);
+    CHECK(!slots.find(suspended_id).has_value());
+    CHECK(slots.find_by_agent("agent-b") == ready_id);
 
-    const auto ready = slots.find_slot(ready_id);
+    const auto ready = slots.find(ready_id);
     CHECK(ready.has_value());
     CHECK(ready->agent_ids.size() == 2);
     CHECK(ready->backend == "llama-cpp");
@@ -4422,6 +4481,225 @@ bool test_inference_sizing_estimate() {
     return true;
 }
 
+bool test_multi_shard_directory_sizes_correctly() {
+    // The bug: fs::file_size() sets an error_code on a DIRECTORY, and the caller
+    // fell through to a flat 2048 MB. Every multi-shard HF checkpoint and every
+    // converted Soma container therefore reported the same size — and that single
+    // number is what placement consumed.
+    auto dir = temp_test_dir("multi-shard");
+    const auto model = dir / "model";
+    std::filesystem::create_directories(model / "nested");
+
+    const auto write_blob = [](const std::filesystem::path& p, std::size_t bytes) {
+        std::ofstream f(p, std::ios::binary);
+        const std::vector<char> chunk(bytes, '\0');
+        f.write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+    };
+    write_blob(model / "shard-00001.safetensors", 3 * 1024 * 1024);
+    write_blob(model / "shard-00002.safetensors", 5 * 1024 * 1024);
+    write_blob(model / "nested" / "extra.bin", 1024 * 1024);
+
+    // Recursive, and it finds the nested file too.
+    const auto bytes = mm::measure_model_bytes(model.string(), "", nullptr);
+    CHECK(bytes == 9 * 1024 * 1024);
+
+    // A single file still works, and a missing path reports nothing rather than
+    // a plausible-looking constant.
+    write_blob(dir / "single.gguf", 2 * 1024 * 1024);
+    CHECK(mm::measure_model_bytes((dir / "single.gguf").string(), "", nullptr) ==
+          2 * 1024 * 1024);
+    CHECK(mm::measure_model_bytes((dir / "absent.gguf").string(), "", nullptr) == 0);
+
+    // Two DIFFERENT directories must not size identically, which is the whole
+    // point — the old path returned 2048 MB for both.
+    const auto other = dir / "other";
+    std::filesystem::create_directories(other);
+    write_blob(other / "shard-00001.safetensors", 7 * 1024 * 1024);
+    CHECK(mm::measure_model_bytes(model.string(), "", nullptr) !=
+          mm::measure_model_bytes(other.string(), "", nullptr));
+
+    CHECK(mm::bytes_to_mb(0) == 0);
+    CHECK(mm::bytes_to_mb(1) == 1);            // rounds UP, never to zero
+    CHECK(mm::bytes_to_mb(9 * 1024 * 1024) == 9);
+
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_model_registry_makes_soma_routable() {
+    auto dir = temp_test_dir("control-db");
+    mm::ControlModelRegistry reg;
+    std::string err;
+    CHECK(reg.open(dir.string(), err));
+    CHECK(reg.schema_version() == 1);
+    CHECK(reg.list().empty());
+    CHECK(std::filesystem::exists(dir / "control.db"));
+
+    mm::NodeRegistry nodes((dir / "nodes").string());
+    mm::AgentScheduler scheduler(nodes, (dir / "models").string());
+
+    mm::AgentConfig cfg;
+    cfg.id = "agent-soma";
+    cfg.name = "Soma Agent";
+    cfg.model_path = "Qwen/Qwen3-30B-A3B";
+
+    // ── before: nothing admitted it, so nothing routes to Soma ───────────────
+    scheduler.set_model_registry(&reg);
+    CHECK(scheduler.resolve_backend_for(cfg).engine_id == "llama-cpp");
+    auto forced = cfg;
+    forced.backend_override = "soma";
+    CHECK(scheduler.resolve_backend_for(forced).engine_id == "llama-cpp");
+
+    // ── admit it with a stream verdict ───────────────────────────────────────
+    mm::AdmittedModel m;
+    m.arch_hash = std::string(64, 'a');
+    m.name = "Qwen3-30B-A3B";
+    m.model_dir = "/containers/Qwen3-30B-A3B";
+    m.attention_family = "gqa";
+    m.n_layers = 48; m.n_moe_layers = 48; m.n_experts = 128; m.top_k = 8;
+    m.bytes_per_token = 1098ll * 1024 * 1024;
+    m.total_routed_bytes = 17ll * 1024 * 1024 * 1024;
+    m.active_fraction = 0.0625;
+    m.verdict = mm::ModelVerdict::Stream;
+    CHECK(reg.upsert(m, err));
+    CHECK(m.id > 0);
+
+    // The agent's model_path is "Qwen/Qwen3-30B-A3B" and the record's name is
+    // "Qwen3-30B-A3B": resolution compares the trailing component, so an agent
+    // configured with an HF-style ref matches a record admitted from a directory.
+    CHECK(reg.resolve("Qwen/Qwen3-30B-A3B").has_value());
+    CHECK(reg.resolve("/some/where/qwen3-30b-a3b/").has_value());   // case + trailing slash
+    CHECK(!reg.resolve("Mistral-7B").has_value());
+    CHECK(!reg.resolve("").has_value());
+
+    // ── after: the SAME agent config now routes to Soma, unprompted ──────────
+    CHECK(scheduler.resolve_backend_for(cfg).engine_id == "soma");
+    CHECK(scheduler.resolve_backend_for(cfg).reason.find("verdict") != std::string::npos);
+
+    // An explicit fallback override still wins: it can only be more conservative.
+    auto pinned = cfg;
+    pinned.backend_override = "fallback";
+    CHECK(scheduler.resolve_backend_for(pinned).engine_id == "llama-cpp");
+
+    // resident-only means it fits and streaming buys nothing → fallback.
+    CHECK(reg.set_verdict(m.id, mm::ModelVerdict::ResidentOnly, "fits in RAM", err));
+    CHECK(scheduler.resolve_backend_for(cfg).engine_id == "llama-cpp");
+    // ...but an operator may override THAT, because it is an economics call.
+    CHECK(scheduler.resolve_backend_for(forced).engine_id == "soma");
+
+    // reject means it FAILED CONFORMANCE, and the override is refused. This is
+    // the one asymmetry in the policy: no config flag turns "produces wrong
+    // tokens" into "serve it anyway".
+    CHECK(reg.set_verdict(m.id, mm::ModelVerdict::Reject, "stage 2 divergence", err));
+    CHECK(scheduler.resolve_backend_for(cfg).engine_id == "llama-cpp");
+    CHECK(scheduler.resolve_backend_for(forced).engine_id == "llama-cpp");
+    CHECK(scheduler.resolve_backend_for(forced).reason.find("refused") != std::string::npos);
+
+    // An unparseable verdict must not become a licence to stream.
+    CHECK(mm::parse_verdict("nonsense") == mm::ModelVerdict::Reject);
+    CHECK(mm::parse_verdict("STREAM") == mm::ModelVerdict::Stream);
+    CHECK(mm::verdict_selects_soma(mm::ModelVerdict::Hybrid));
+    CHECK(!mm::verdict_selects_soma(mm::ModelVerdict::ResidentOnly));
+
+    // ── persistence, and re-admission updating rather than duplicating ───────
+    CHECK(reg.set_verdict(m.id, mm::ModelVerdict::Stream, "re-profiled", err));
+    mm::AdmittedModel again = m;
+    again.name = "Qwen3-30B-A3B (requantized labels)";
+    again.verdict = mm::ModelVerdict::Hybrid;
+    CHECK(reg.upsert(again, err));
+    CHECK(again.id == m.id);          // same arch_hash is the same model
+    CHECK(reg.list().size() == 1);
+
+    reg.close();
+    mm::ControlModelRegistry reopened;
+    CHECK(reopened.open(dir.string(), err));
+    const auto rows = reopened.list();
+    CHECK(rows.size() == 1);
+    CHECK(rows[0].verdict == mm::ModelVerdict::Hybrid);
+    CHECK(rows[0].arch_hash == m.arch_hash);
+    CHECK(rows[0].top_k == 8);
+
+    // Removal, and a scheduler with no registry at all.
+    CHECK(reopened.remove(rows[0].id, err));
+    CHECK(reopened.list().empty());
+    CHECK(!reopened.remove(rows[0].id, err));   // gone stays gone, and says so
+
+    mm::AgentScheduler bare(nodes, (dir / "models").string());
+    CHECK(bare.resolve_backend_for(cfg).engine_id == "llama-cpp");
+
+    reopened.close();
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_capacity_fit_across_three_axes() {
+    mm::CapacityPolicy policy;   // defaults are the constants this replaced
+
+    mm::ResourceFootprint model;
+    model.vram_mb = 8000;
+
+    // A node with plenty of everything: native fit.
+    mm::HostCapacity roomy;
+    roomy.vram_total_mb = 24576; roomy.vram_free_mb = 20000;
+    roomy.ram_total_mb = 65536;  roomy.ram_free_mb = 40000;
+    roomy.disk_free_mb = 500000;
+    CHECK(mm::evaluate_fit(model, roomy, policy) == mm::FitQuality::Native);
+
+    // Not enough VRAM but a big GPU and spare RAM: offload, and it must rank
+    // BELOW a native fit however much headroom it has left.
+    mm::HostCapacity offloadable = roomy;
+    offloadable.vram_free_mb = 4000;
+    CHECK(mm::evaluate_fit(model, offloadable, policy) == mm::FitQuality::Offload);
+    CHECK(mm::capacity_score(model, roomy, policy) >
+          mm::capacity_score(model, offloadable, policy));
+
+    // A small GPU cannot offload against: hybrid loads need a real one.
+    mm::HostCapacity tiny_gpu = roomy;
+    tiny_gpu.vram_total_mb = 4096; tiny_gpu.vram_free_mb = 4000;
+    CHECK(mm::evaluate_fit(model, tiny_gpu, policy) == mm::FitQuality::None);
+
+    // DISK. Collected by the health poll since it was written and consulted by
+    // nothing until now: a node with no room cannot write a KV checkpoint or
+    // spill, so it cannot host anything however much VRAM it has.
+    mm::HostCapacity no_disk = roomy;
+    no_disk.disk_free_mb = 512;
+    std::string why;
+    CHECK(mm::evaluate_fit(model, no_disk, policy, &why) == mm::FitQuality::None);
+    CHECK(why.find("disk") != std::string::npos);
+
+    // Zero means NOT REPORTED, not full — the field defaults to zero and an
+    // older node never sends it. Enforcing against that would exclude every node
+    // predating the field.
+    mm::HostCapacity silent = roomy;
+    silent.disk_free_mb = 0;
+    CHECK(mm::evaluate_fit(model, silent, policy) == mm::FitQuality::Native);
+
+    // A streaming footprint — RAM + disk, no VRAM — fits when the disk is there.
+    mm::ResourceFootprint streamed;
+    streamed.ram_mb = 4000;
+    streamed.disk_mb = 400000;
+    CHECK(mm::evaluate_fit(streamed, roomy, policy) == mm::FitQuality::Native);
+
+    // And is refused when it is not, with no offload path: there is nothing to
+    // trade disk against, which is exactly why one scalar could not carry it.
+    // 495000 leaves 5000 MB, under the 8192 MB headroom.
+    streamed.disk_mb = 495000;
+    std::string disk_why;
+    CHECK(mm::evaluate_fit(streamed, roomy, policy, &disk_why) == mm::FitQuality::None);
+    CHECK(disk_why.find("disk") != std::string::npos);
+    // The same node still takes the VRAM-shaped model, so the refusal is about
+    // the axis that ran out rather than about the node.
+    CHECK(mm::evaluate_fit(model, roomy, policy) == mm::FitQuality::Native);
+
+    // A no-VRAM footprint fits natively; the old scalar had no way to say this.
+    mm::ResourceFootprint cpu_only;
+    cpu_only.ram_mb = 8000;
+    CHECK(mm::evaluate_fit(cpu_only, roomy, policy) == mm::FitQuality::Native);
+    CHECK(!cpu_only.empty());
+    CHECK(cpu_only.dominant_mb() == 8000);
+    return true;
+}
+
 int main(int argc, char** argv) {
     struct TestCase {
         const char* name;
@@ -4439,7 +4717,7 @@ int main(int argc, char** argv) {
          test_agent_api_settings_round_trip_without_key_persistence},
         {"served_model_name_legacy_compatibility",
          test_served_model_name_legacy_compatibility},
-        {"slot_manager_not_found_statuses", test_slot_manager_not_found_statuses},
+        {"engine_supervisor_not_found_statuses", test_engine_supervisor_not_found_statuses},
         {"slot_lease_blocks_unload_and_suspend_while_busy",
          test_slot_lease_blocks_unload_and_suspend_while_busy},
         {"node_action_progress_json_round_trip",
@@ -4511,6 +4789,9 @@ int main(int argc, char** argv) {
         {"performance_tracker_capacity_aggregation_and_clear",
          test_performance_tracker_capacity_aggregation_and_clear},
         {"inference_sizing_estimate", test_inference_sizing_estimate},
+        {"multi_shard_directory_sizes_correctly", test_multi_shard_directory_sizes_correctly},
+        {"capacity_fit_across_three_axes", test_capacity_fit_across_three_axes},
+        {"model_registry_makes_soma_routable", test_model_registry_makes_soma_routable},
     };
 
     const std::string filter = argc > 1 ? argv[1] : std::string{};

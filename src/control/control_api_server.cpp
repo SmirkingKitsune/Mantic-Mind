@@ -1,4 +1,5 @@
 #include "control/control_api_server.hpp"
+#include "control/model_registry.hpp"
 #include "control/agent_manager.hpp"
 #include "control/agent_queue.hpp"
 #include "control/node_registry.hpp"
@@ -41,6 +42,47 @@
 #include <vector>
 
 namespace mm {
+
+namespace {
+
+/// One admitted model as JSON. The verdict is labelled with the scope it applies
+/// to, because a reader who takes it as "what this node will do" will eventually
+/// be wrong: the verdict is a property of (model, quantization, host budget).
+nlohmann::json admitted_model_json(const AdmittedModel& m) {
+    return nlohmann::json{
+        {"id", m.id},
+        {"object", "model"},
+        {"arch_hash", m.arch_hash},
+        {"name", m.name},
+        {"source_repo", m.source_repo},
+        {"source_revision", m.source_revision},
+        {"model_dir", m.model_dir},
+        {"attention_family", m.attention_family},
+        {"n_layers", m.n_layers},
+        {"n_moe_layers", m.n_moe_layers},
+        {"n_experts", m.n_experts},
+        {"top_k", m.top_k},
+        {"expert_bytes", m.expert_bytes},
+        {"bytes_per_token", m.bytes_per_token},
+        {"total_routed_bytes", m.total_routed_bytes},
+        {"active_fraction", m.active_fraction},
+        {"verdict", to_string(m.verdict)},
+        {"verdict_scope", "admission-host"},
+        {"verdict_reason", m.verdict_reason},
+        {"selects_soma", verdict_selects_soma(m.verdict)},
+        {"admitted_at_ms", m.admitted_at_ms},
+        {"profiled_at_ms", m.profiled_at_ms},
+    };
+}
+
+std::int64_t parse_model_id(const std::string& raw) {
+    try {
+        return std::stoll(raw);
+    } catch (...) {
+        return -1;   // never matches a row; the caller answers 404
+    }
+}
+}  // namespace
 
 namespace {
 
@@ -2348,7 +2390,9 @@ void ControlApiServer::register_routes() {
 
         const int64_t estimated_vram = 2048; // conservative default
 
-        auto compatible = registry_.nodes_with_available_vram(estimated_vram);
+        ResourceFootprint probe;
+        probe.vram_mb = estimated_vram;
+        auto compatible = registry_.nodes_with_capacity(probe);
         auto all_nodes  = registry_.list_nodes();
         int total_connected = 0;
         for (const auto& n : all_nodes) {
@@ -2641,10 +2685,157 @@ void ControlApiServer::register_routes() {
         res.set_content(R"({"cleared":true})", "application/json");
     });
 
-    // ── GET /v1/agents ────────────────────────────────────────────────────────
+    // ── /v1/models — the ADMISSION REGISTRY ─────────────────────────────────
+    //
+    // Reclaimed. This route used to return agents wearing model costumes, with
+    // an `openai_compat_note` pointing at the other port for the real thing. The
+    // agents-as-models catalog lives on the :9091 OpenAI-compat listener where
+    // it belongs; here /v1/models means what it says.
     server_->Get("/v1/models", [this](const Request& /*req*/, Response& res) {
-        res.set_content(mantic_model_list(agents_.list_agents()).dump(), "application/json");
+        if (models_ == nullptr) {
+            res.status = 503;
+            res.set_content(nlohmann::json{{"error", "model registry is not open"}}.dump(),
+                            "application/json");
+            return;
+        }
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& m : models_->list()) arr.push_back(admitted_model_json(m));
+        res.set_content(nlohmann::json{{"object", "list"}, {"data", arr}}.dump(),
+                        "application/json");
     });
+
+    server_->Get("/v1/models/:id", [this](const Request& req, Response& res) {
+        if (models_ == nullptr) { res.status = 503; return; }
+        const auto model = models_->find_by_id(parse_model_id(req.path_params.at("id")));
+        if (!model) { res.status = 404; return; }
+        auto j = admitted_model_json(*model);
+        auto& stages = j["conformance"] = nlohmann::json::array();
+        for (const auto& c : models_->conformance(model->id)) {
+            stages.push_back(nlohmann::json{{"stage", c.stage},
+                                            {"passed", c.passed},
+                                            {"detail", c.detail},
+                                            {"ran_at_ms", c.ran_at_ms}});
+        }
+        res.set_content(j.dump(), "application/json");
+    });
+
+    // Register an ALREADY-CONVERTED model. The conversion pipeline is offline
+    // (tools/admission/), and a model converted there still has to become
+    // evidence here — without a record, every agent routes to the fallback.
+    server_->Post("/v1/models", [this](const Request& req, Response& res) {
+        if (models_ == nullptr) { res.status = 503; return; }
+        AdmittedModel m;
+        try {
+            const auto j = nlohmann::json::parse(req.body);
+            m.arch_hash = j.value("arch_hash", std::string{});
+            m.name = j.value("name", std::string{});
+            m.source_repo = j.value("source_repo", std::string{});
+            m.source_revision = j.value("source_revision", std::string{});
+            m.model_dir = j.value("model_dir", std::string{});
+            m.attention_family = j.value("attention_family", std::string{"gqa"});
+            m.n_layers = j.value("n_layers", 0u);
+            m.n_moe_layers = j.value("n_moe_layers", 0u);
+            m.n_experts = j.value("n_experts", 0u);
+            m.top_k = j.value("top_k", 0u);
+            m.expert_bytes = j.value("expert_bytes", std::int64_t{0});
+            m.bytes_per_token = j.value("bytes_per_token", std::int64_t{0});
+            m.total_routed_bytes = j.value("total_routed_bytes", std::int64_t{0});
+            m.active_fraction = j.value("active_fraction", 0.0);
+            m.verdict = parse_verdict(j.value("verdict", std::string{"reject"}));
+            m.verdict_basis = j.contains("verdict_basis") ? j["verdict_basis"].dump()
+                                                          : std::string("{}");
+            m.verdict_reason = j.value("verdict_reason", std::string{});
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+            return;
+        }
+        std::string err;
+        if (!models_->upsert(m, err)) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", err}}.dump(), "application/json");
+            return;
+        }
+        res.status = 201;
+        res.set_content(admitted_model_json(m).dump(), "application/json");
+    });
+
+    // The operator override of a computed verdict.
+    server_->Put("/v1/models/:id/verdict", [this](const Request& req, Response& res) {
+        if (models_ == nullptr) { res.status = 503; return; }
+        std::string verdict_text, reason;
+        try {
+            const auto j = nlohmann::json::parse(req.body);
+            verdict_text = j.value("verdict", std::string{});
+            reason = j.value("reason", std::string{});
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+            return;
+        }
+        // Validated against the spelling, not silently coerced: parse_verdict()
+        // defaults to `reject`, so a typo would otherwise quietly become the
+        // most restrictive verdict and read as the engine refusing the model.
+        static const std::vector<std::string> kValid = {"stream", "hybrid", "resident-only",
+                                                        "reject"};
+        if (std::find(kValid.begin(), kValid.end(), util::to_lower(util::trim(verdict_text))) ==
+            kValid.end()) {
+            res.status = 400;
+            res.set_content(
+                nlohmann::json{{"error", "verdict must be stream, hybrid, resident-only or reject"},
+                               {"got", verdict_text}}
+                    .dump(),
+                "application/json");
+            return;
+        }
+        std::string err;
+        const auto id = parse_model_id(req.path_params.at("id"));
+        if (!models_->set_verdict(id, parse_verdict(verdict_text), reason, err)) {
+            res.status = 404;
+            res.set_content(nlohmann::json{{"error", err}}.dump(), "application/json");
+            return;
+        }
+        const auto model = models_->find_by_id(id);
+        res.set_content(model ? admitted_model_json(*model).dump() : std::string("{}"),
+                        "application/json");
+    });
+
+    server_->Delete("/v1/models/:id", [this](const Request& req, Response& res) {
+        if (models_ == nullptr) { res.status = 503; return; }
+        std::string err;
+        if (!models_->remove(parse_model_id(req.path_params.at("id")), err)) {
+            res.status = 404;
+            res.set_content(nlohmann::json{{"error", err}}.dump(), "application/json");
+            return;
+        }
+        res.set_content(nlohmann::json{{"status", "deleted"}}.dump(), "application/json");
+    });
+
+    server_->Get("/v1/models/:id/plan", [this](const Request& req, Response& res) {
+        if (models_ == nullptr) { res.status = 503; return; }
+        std::string body, err;
+        if (!models_->plan_for_host(parse_model_id(req.path_params.at("id")), {}, body, err)) {
+            res.status = 404;
+            res.set_content(nlohmann::json{{"error", err}}.dump(), "application/json");
+            return;
+        }
+        res.set_content(body, "application/json");
+    });
+
+    server_->Get("/v1/models/:id/heat", [this](const Request& req, Response& res) {
+        if (models_ == nullptr) { res.status = 503; return; }
+        // Bucketed by DEFAULT; `?resolution=full` is an explicit opt-in. A model
+        // with 60k experts is not something a client should get by accident.
+        const bool bucketed = req.get_param_value("resolution") != "full";
+        std::string body;
+        if (!models_->heat(parse_model_id(req.path_params.at("id")), bucketed, body)) {
+            res.status = 404;
+            return;
+        }
+        res.set_content(body, "application/json");
+    });
+
+    // ── GET /v1/agents ────────────────────────────────────────────────────────
 
     server_->Get("/v1/agents", [this](const Request& /*req*/, Response& res) {
         auto configs = agents_.list_agents();
@@ -3582,8 +3773,63 @@ void ControlApiServer::register_routes() {
     server_->Get("/v1/placements", [this](const Request& /*req*/, Response& res) {
         auto placements = scheduler_.list_placements();
         nlohmann::json arr = nlohmann::json::array();
-        for (auto& p : placements) arr.push_back(nlohmann::json(p));
+        for (auto& p : placements) {
+            auto entry = nlohmann::json(p);
+            // WHICH engine, and WHY. An operator could previously only infer the
+            // routing decision from behaviour; the reason string is the same one
+            // the scheduler acted on, not a reconstruction.
+            if (auto a = agents_.get_agent(p.agent_id)) {
+                const auto routing = scheduler_.resolve_backend_for(a->get_config());
+                entry["backend"] = routing.engine_id;
+                entry["backend_reason"] = routing.reason;
+            }
+            arr.push_back(std::move(entry));
+        }
         res.set_content(arr.dump(), "application/json");
+    });
+
+    // ── PUT /v1/agents/:id/backend ──────────────────────────────────────────
+    //
+    // The operator override, persistent on the agent. P1: if a capability
+    // exists, it is reachable on /v1/* — this one had no route at all, so the
+    // only way to change an agent's engine would have been to edit the database.
+    server_->Put("/v1/agents/:id/backend", [this](const Request& req, Response& res) {
+        const std::string id = req.path_params.at("id");
+        auto a = agents_.get_agent(id);
+        if (!a) { res.status = 404; return; }
+
+        std::string value;
+        try {
+            value = util::to_lower(util::trim(
+                nlohmann::json::parse(req.body).value("backend_override", std::string{})));
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+            return;
+        }
+        if (value != "auto" && value != "soma" && value != "fallback") {
+            res.status = 400;
+            res.set_content(
+                nlohmann::json{{"error", "backend_override must be auto, soma or fallback"},
+                               {"got", value}}
+                    .dump(),
+                "application/json");
+            return;
+        }
+
+        auto cfg = a->get_config();
+        cfg.backend_override = value;
+        agents_.update_agent(id, cfg);
+
+        // The decision is returned, not just the setting. Asking for `soma` on a
+        // model nothing has admitted is REFUSED, and an operator who is told only
+        // "saved" would reasonably believe it took effect.
+        const auto routing = scheduler_.resolve_backend_for(cfg);
+        res.set_content(nlohmann::json{{"backend_override", value},
+                                       {"backend", routing.engine_id},
+                                       {"backend_reason", routing.reason}}
+                            .dump(),
+                        "application/json");
     });
 
     // ── POST /v1/agents/:id/curation/proposals ───────────────────────────────

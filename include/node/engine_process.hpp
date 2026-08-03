@@ -98,18 +98,27 @@ public:
     std::string last_error() const;
     bool alive() const;
 
+    /// OS process id, or 0 when not running.
+    ///
+    /// Exposed because "which process" is otherwise unanswerable from outside:
+    /// the supervisor logs it, and the conformance harness needs it to kill
+    /// exactly this child. Matching on the image name instead would take down
+    /// every engine on the machine, including ones a developer is using.
+    std::uint32_t pid() const;
+
+    /// The descriptor id this process was launched from, for labelling.
+    const std::string& runtime_name() const { return runtime_name_; }
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 
+    // State lives in Impl, not here. It is read from the watchdog thread while
+    // start()/stop() write it, so it needs the atomics and the mutex that Impl
+    // already owns — and a second copy out here would be a second answer to
+    // "is this engine alive", which is the exact question the watchdog exists
+    // to settle.
     std::string runtime_name_;
-    std::uint16_t port_ = 0;
-    std::atomic<ProcessState> state_{ProcessState::Stopped};
-    std::string last_error_;
-    LogCallback log_cb_;
-    CrashCallback crash_cb_;
-
-    bool run_readiness_probe(const ReadinessProbe& probe);
 };
 
 } // namespace mm

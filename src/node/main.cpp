@@ -4,13 +4,14 @@
 #include "common/logger.hpp"
 #include "common/node_discovery.hpp"
 #include "common/util.hpp"
+#include "node/engine_descriptor.hpp"
 #include "node/node_api_server.hpp"
 #include "node/node_config.hpp"
 #include "node/model_store.hpp"
 #include "node/node_state.hpp"
 #include "node/node_ui.hpp"
 #include "node/singleton_lock.hpp"
-#include "node/slot_manager.hpp"
+#include "node/engine_supervisor.hpp"
 #include "node/llama_cpp_provisioner.hpp"
 #include "node/llama_runtime.hpp"
 
@@ -83,6 +84,7 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
         cfg.control_url       = file.get("control_url",       "");
         cfg.control_api_key   = file.get("control_api_key",   "");
         cfg.llama_server_path = file.get("llama_server_path", "llama-server");
+        cfg.soma_path         = file.get("soma_path",         "soma");
         cfg.llama_auto_provision = file.get_bool("llama_auto_provision", true);
         cfg.llama_provision_dir = file.get("llama_provision_dir", "");
         cfg.llama_install_method = file.get("llama_install_method", "auto");
@@ -140,6 +142,7 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
     cfg.control_url       = env("MM_CONTROL_URL",     cfg.control_url);
     cfg.control_api_key   = env("MM_CONTROL_API_KEY", cfg.control_api_key);
     cfg.llama_server_path = env("MM_LLAMA_PATH", cfg.llama_server_path);
+    cfg.soma_path         = env("MM_SOMA_PATH",  cfg.soma_path);
     cfg.llama_auto_provision = env_bool("MM_LLAMA_AUTO_PROVISION", cfg.llama_auto_provision);
     cfg.llama_provision_dir = env("MM_LLAMA_PROVISION_DIR", cfg.llama_provision_dir);
     cfg.llama_install_method = env("MM_LLAMA_INSTALL_METHOD", cfg.llama_install_method);
@@ -809,14 +812,24 @@ int main(int argc, char** argv) {
         MM_INFO("Loaded {} remembered node API key(s)", remembered_api_keys.size());
     }
 
-    // ── SlotManager ───────────────────────────────────────────────────────────
+    // ── Engine registry ───────────────────────────────────────────────────────
+    //
+    // Populated once, here. Every "is this backend supported?" question in the
+    // node is now a lookup against this, rather than a comparison with a string
+    // literal repeated at each call site — which is how the two copies in
+    // node_api_server drifted apart in the first place.
+    mm::EngineRegistry::instance().register_engine(
+        mm::make_llama_descriptor(cfg.llama_server_path));
+    mm::EngineRegistry::instance().register_engine(mm::make_soma_descriptor(cfg.soma_path));
+    MM_INFO("Engines registered: {}", mm::util::join(mm::EngineRegistry::instance().ids(), ", "));
 
-    mm::SlotManager slot_mgr(cfg.runtime_port_range_start,
-                             cfg.runtime_port_range_end,
-                             cfg.max_slots);
-    slot_mgr.set_llama_server_path(cfg.llama_server_path);
-    slot_mgr.set_kv_cache_dir(cfg.kv_cache_dir);
-    slot_mgr.set_models_dir(cfg.models_dir);
+    // ── EngineSupervisor ──────────────────────────────────────────────────────
+
+    mm::EngineSupervisor engines(cfg.runtime_port_range_start,
+                                 cfg.runtime_port_range_end,
+                                 cfg.max_slots);
+    engines.set_kv_checkpoint_dir(cfg.kv_cache_dir);
+    engines.set_models_dir(cfg.models_dir);
 
     // ── Local model cache ─────────────────────────────────────────────────────
     // Control transfers models into models_dir; the store keeps an LRU
@@ -841,12 +854,12 @@ int main(int argc, char** argv) {
 
     // Periodically relieve disk pressure without evicting a live model.
     std::atomic<bool> stop_model_housekeeping{false};
-    std::thread model_housekeeping_thread([&slot_mgr, &model_store, &stop_model_housekeeping]() {
+    std::thread model_housekeeping_thread([&engines, &model_store, &stop_model_housekeeping]() {
         while (!stop_model_housekeeping) {
             // Relieve disk pressure: evict LRU unpinned models that are not
             // backing a live slot.
             std::set<std::string> in_use;
-            for (const auto& s : slot_mgr.get_slot_info()) {
+            for (const auto& s : engines.slots()) {
                 if (!s.model_path.empty()) in_use.insert(s.model_path);
                 if (!s.mmproj_path.empty()) in_use.insert(s.mmproj_path);
             }
@@ -932,7 +945,11 @@ int main(int argc, char** argv) {
         std::lock_guard<std::mutex> lk(runtime_apply_mutex);
         if (mm::llama_runtime_usable(runtime)) {
             cfg.llama_server_path = runtime.executable_path;
-            slot_mgr.set_llama_server_path(cfg.llama_server_path);
+            // Re-register rather than append: register_engine() replaces by id,
+            // so the provisioner resolving a real path updates the descriptor
+            // instead of leaving a stale one ahead of it in the search order.
+            mm::EngineRegistry::instance().register_engine(
+                mm::make_llama_descriptor(cfg.llama_server_path));
             auto caps = detect_node_capabilities(cfg, runtime.version);
             state.set_capabilities(caps);
         }
@@ -1108,7 +1125,7 @@ int main(int argc, char** argv) {
     };
 
     mm::NodeUI* ui_ptr = nullptr;
-    slot_mgr.set_log_callback([&](const std::string& line, bool is_stderr) {
+    engines.set_log_callback([&](const std::string& line, bool is_stderr) {
         const std::string out = is_stderr ? "[stderr] " + line : line;
         append_runtime_log(out);
         if (ui_ptr) ui_ptr->append_log(out);
@@ -1116,7 +1133,7 @@ int main(int argc, char** argv) {
 
     // ── API server ────────────────────────────────────────────────────────────
 
-    mm::NodeApiServer api_server(state, slot_mgr,
+    mm::NodeApiServer api_server(state, engines,
                                  cfg.control_url, cfg.pairing_key);
     api_server.set_model_store(&model_store);
     api_server.set_llama_provision_callback([&]() {
@@ -1337,7 +1354,7 @@ int main(int argc, char** argv) {
     }
 
     state.stop_metrics_poll();
-    slot_mgr.unload_all();
+    engines.unload_all();
 
     // With all slots down nothing is in use; drop every unpinned model so the
     // node keeps only the models control pinned to it.

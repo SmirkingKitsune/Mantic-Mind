@@ -123,6 +123,29 @@ public:
     std::string
     admit(const std::string& source_ref, AdmissionProgressSink sink, std::string& out_error);
 
+    /// Write (or update) a record for an ALREADY-CONVERTED model.
+    ///
+    /// The write primitive admit() ends with, exposed on its own because the
+    /// conversion pipeline is offline (tools/admission/) and a model converted
+    /// there still has to become evidence here. Keyed on arch_hash, which is the
+    /// model's identity — re-registering the same weights updates rather than
+    /// duplicating, and requantized weights are a different row because they
+    /// have a different verdict.
+    ///
+    /// `model.id` is filled in on success.
+    bool upsert(AdmittedModel& model, std::string& out_error);
+
+    /// Record which backend an agent actually got, and why.
+    ///
+    /// Rare, causally interesting, and otherwise unrecoverable after the fact.
+    /// Never fatal: losing an audit row must not fail a placement that worked.
+    void record_placement(const AgentId& agent_id,
+                          const NodeId& node_id,
+                          const SlotId& slot_id,
+                          const std::string& backend,
+                          const std::string& backend_reason,
+                          const ResourceFootprint& footprint);
+
     std::string reprofile(std::int64_t id, AdmissionProgressSink sink, std::string& out_error);
     bool cancel(const std::string& operation_id);
     bool remove(std::int64_t id, std::string& out_error);

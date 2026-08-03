@@ -2,6 +2,7 @@ add_executable(mantic-mind-control
     main.cpp
     node_registry.cpp
     agent_scheduler.cpp
+    model_registry.cpp
     agent_queue.cpp
     agent_manager.cpp
     agent_config_validator.cpp
@@ -12,8 +13,14 @@ add_executable(mantic-mind-control
     control_ui.cpp
 )
 
+# mm_soma is here for the ROUTING decision — select_backend() and its verdict
+# types. Control does not run the engine; it decides which engine an agent gets,
+# and that policy has one implementation shared with the engine rather than a
+# reimplementation that drifts. src/soma/routing.cpp depends only on
+# soma/types.hpp, so static linkage pulls two small objects.
 target_link_libraries(mantic-mind-control PRIVATE
     mm_common
+    mm_soma
     ftxui::screen
     ftxui::dom
     ftxui::component

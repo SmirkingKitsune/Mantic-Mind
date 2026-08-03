@@ -63,6 +63,15 @@ enum class FitQuality : std::uint8_t {
     Native,   ///< fits on the axes it actually wants
 };
 
+struct NodeInfo;
+
+/// A node's capacity, read from the fields the health poll already collects.
+///
+/// `disk_free_mb` in particular: it has been collected on every poll and never
+/// consulted for placement, because the scalar the scheduler passed around had
+/// nowhere to put it.
+HostCapacity capacity_of(const NodeInfo& node);
+
 /// Does `footprint` fit in `capacity`?
 ///
 /// Disk is a hard constraint with no offload equivalent — there is nothing to
@@ -89,5 +98,9 @@ std::int64_t measure_model_bytes(const std::string& model_path,
                                  std::string* out_resolved_path = nullptr);
 
 const char* to_string(FitQuality quality);
+
+/// Bytes to whole MB, rounding UP and never to zero for a non-empty model.
+/// Rounding down would let a model that does not fit look like it does.
+std::int64_t bytes_to_mb(std::int64_t bytes);
 
 } // namespace mm

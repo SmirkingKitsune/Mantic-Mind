@@ -27,6 +27,7 @@ set(SOMA_CORE_HEADERS
     soma/kv_checkpoint.hpp
     soma/tokenizer.hpp
     soma/plan.hpp
+    soma/routing.hpp
     soma/registry.hpp
     soma/telemetry.hpp
     soma/serve.hpp
@@ -71,7 +72,10 @@ set(MM_SOMA_SOURCES
     memory_hierarchy.cpp
     f32_model.cpp
     kv_checkpoint.cpp
+    kv_checkpoint_header.cpp   # standalone codec; the node links this object alone
+    routing.cpp
     sampler.cpp
+    serve.cpp
     scheduler.cpp
     tokenizer.cpp
     arch_registry.cpp      # the ONE core TU permitted to include soma/arch/
@@ -150,6 +154,32 @@ endif()
 # arch_hash. Deliberately nothing else — the engine's dependency surface is a
 # property worth defending early.
 target_link_libraries(mm_soma PUBLIC nlohmann_json::nlohmann_json OpenSSL::Crypto)
+
+# httplib for `soma serve`. PUBLIC because serve.hpp is part of the library's
+# surface; the header itself does not include httplib, but the TU does and the
+# link has to reach whoever pulls mm_soma in.
+if(TARGET httplib::httplib)
+    target_link_libraries(mm_soma PUBLIC httplib::httplib)
+elseif(TARGET PkgConfig::CPP_HTTPLIB)
+    target_link_libraries(mm_soma PUBLIC PkgConfig::CPP_HTTPLIB)
+endif()
+
+# ── soma ──────────────────────────────────────────────────────────────────────
+# The engine executable the node supervises: `serve` and `plan`.
+add_executable(soma main.cpp)
+target_link_libraries(soma PRIVATE mm_soma)
+
+# The node launches this binary as a subprocess with an inherited environment, so
+# a PATH that happens to be right in a developer's shell is not a guarantee.
+# Without its OpenSSL DLLs beside it the child dies with 0xC0000135 before main(),
+# and the supervisor reports "engine exited before becoming ready" — accurate, and
+# about a fault with nothing to do with supervision.
+if(WIN32)
+    add_custom_command(TARGET soma POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_RUNTIME_DLLS:soma>" "$<TARGET_FILE_DIR:soma>"
+        COMMAND_EXPAND_LISTS)
+endif()
 
 # ── Header self-test ──────────────────────────────────────────────────────────
 set(SOMA_SELFTEST_DIR "${CMAKE_CURRENT_BINARY_DIR}/header_selftest")
@@ -348,6 +378,13 @@ if(BUILD_TESTING)
     add_executable(soma_mla_g4 ${CMAKE_SOURCE_DIR}/tests/soma/mla_g4.cpp)
     target_link_libraries(soma_mla_g4 PRIVATE mm_soma)
     add_test(NAME soma_mla_g4 COMMAND soma_mla_g4)
+
+    # ── G5 verdict routing ────────────────────────────────────────────────────
+    # The whole policy table, plus the gate: Mixtral admits resident-only and
+    # routes to the fallback with no override and no model-specific special case.
+    add_executable(soma_routing_g5 ${CMAKE_SOURCE_DIR}/tests/soma/routing_g5.cpp)
+    target_link_libraries(soma_routing_g5 PRIVATE mm_soma)
+    add_test(NAME soma_routing_g5 COMMAND soma_routing_g5)
 
     # Activation dumper. An operator tool, not a CTest entry: its counterpart is
     # a Python reference run, and the diff between them is the deliverable.

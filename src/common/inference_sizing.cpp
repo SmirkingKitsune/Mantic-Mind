@@ -1,5 +1,6 @@
 #include "common/inference_sizing.hpp"
 
+#include "common/footprint.hpp"
 #include "common/gguf_metadata.hpp"
 #include "common/util.hpp"
 
@@ -79,15 +80,17 @@ int64_t ceil_to_int64(double value) {
 int64_t model_file_size_mb(const std::string& model_path,
                            const std::string& models_dir,
                            std::string* out_source_path) {
-    const std::string resolved = resolve_model_path_for_metadata(model_path, models_dir);
-    const fs::path path = resolved.empty() ? fs::path(model_path) : fs::path(resolved);
-    if (out_source_path) *out_source_path = path.string();
-
-    std::error_code ec;
-    const auto bytes = fs::file_size(path, ec);
-    if (ec || bytes == 0) return kFallbackModelMb;
-
-    return std::max<int64_t>(1, static_cast<int64_t>((bytes + kMiB - 1) / kMiB));
+    // measure_model_bytes() sizes a DIRECTORY recursively.
+    //
+    // This used to call fs::file_size() on the path, which sets an error_code on
+    // a directory and fell through to a flat 2048 MB — so every multi-shard HF
+    // checkpoint and every converted Soma container reported the same size, and
+    // that single number is what the scheduler placed against. The fallback below
+    // is now reached only when the path genuinely cannot be measured (missing, or
+    // unreadable), which is the case it was always meant for.
+    const auto bytes = measure_model_bytes(model_path, models_dir, out_source_path);
+    if (bytes <= 0) return kFallbackModelMb;
+    return bytes_to_mb(bytes);
 }
 
 } // namespace

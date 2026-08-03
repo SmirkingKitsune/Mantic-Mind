@@ -1,7 +1,9 @@
 #include "node/node_api_server.hpp"
+#include "node/engine_descriptor.hpp"
 #include "node/node_state.hpp"
-#include "node/slot_manager.hpp"
+#include "node/engine_supervisor.hpp"
 #include "node/model_store.hpp"
+#include "common/engine_client.hpp"
 #include "common/http_server.hpp"
 #include "common/runtime_client.hpp"
 #include "common/models.hpp"
@@ -35,13 +37,37 @@ bool node_llama_runtime_ready(const LlamaRuntimeStatus& rt) {
 
 // Load paths currently backing a live slot — models the store must never
 // evict out from under a running engine.
-std::set<std::string> loaded_model_paths(SlotManager& mgr) {
+std::set<std::string> loaded_model_paths(EngineSupervisor& engines) {
     std::set<std::string> paths;
-    for (const auto& s : mgr.get_slot_info()) {
+    for (const auto& s : engines.slots()) {
         if (!s.model_path.empty()) paths.insert(s.model_path);
         if (!s.mmproj_path.empty()) paths.insert(s.mmproj_path);
     }
     return paths;
+}
+
+/// Classify a slot failure into a STRUCTURED code for control.
+///
+/// What this ends: AgentScheduler decided whether to evict-and-retry by
+/// substring-matching six English phrases against this body
+/// (agent_scheduler.cpp:904). Every engine had to reproduce those literals
+/// verbatim to earn a retry, and rewording any of them would have broken
+/// eviction with nothing to catch it. The phrases are still produced — they are
+/// the human-readable detail — but the DECISION now rides a code.
+std::string engine_error_code_for(const std::string& detail) {
+    const auto lower = mm::util::to_lower(detail);
+    const auto has = [&](const char* needle) {
+        return lower.find(needle) != std::string::npos;
+    };
+    if (has("max slots reached") || has("max active slots reached") ||
+        has("no available ports") || has("out of memory") || has("insufficient memory") ||
+        has("insufficient vram")) {
+        return "capacity_pressure";
+    }
+    if (has("not found") || has("no such file") || has("does not exist")) {
+        return "model_not_found";
+    }
+    return "internal";
 }
 
 std::string sanitize_path_for_runtime(std::string p) {
@@ -69,11 +95,11 @@ std::string safe_json_dump(const nlohmann::json& j) {
 } // namespace
 
 NodeApiServer::NodeApiServer(NodeState& state,
-                             SlotManager& slot_mgr,
+                             EngineSupervisor& engines,
                              std::string control_url,
                              std::string pairing_key)
     : state_(state)
-    , slot_mgr_(slot_mgr)
+    , engines_(engines)
     , control_url_(std::move(control_url))
     , pairing_key_(std::move(pairing_key))
     , server_(std::make_unique<HttpServer>())
@@ -157,8 +183,8 @@ void NodeApiServer::register_routes() {
         if (!check_auth(req.get_header_value("Authorization"))) {
             res.status = 401; return;
         }
-        auto slots = slot_mgr_.get_slot_info();
-        const int max_slots = static_cast<int>(slot_mgr_.max_slots());
+        auto slots = engines_.slots();
+        const int max_slots = static_cast<int>(engines_.max_slots());
 
         int ready_slots = 0;
         int loading_slots = 0;
@@ -206,7 +232,13 @@ void NodeApiServer::register_routes() {
         j["slot_suspending"] = suspending_slots;
         j["slot_suspended"] = suspended_slots;
         j["slot_error"]    = error_slots;
-        j["llama_server_path"] = slot_mgr_.llama_server_path();
+        // Engines are DATA now, so health advertises the whole registry rather
+        // than one runtime's path. `llama_server_path` is retained because
+        // control's UI reads it, but it comes from the descriptor.
+        j["engines"] = EngineRegistry::instance().ids();
+        if (const auto* llama = EngineRegistry::instance().find("llama-cpp")) {
+            j["llama_server_path"] = llama->build_launch({}).executable;
+        }
         j["llama_runtime"] = state_.get_llama_runtime();
         j["action_progress"] = state_.get_action_progress();
 
@@ -446,13 +478,19 @@ void NodeApiServer::register_routes() {
             RuntimeSettings runtime_settings;
             if (j.contains("runtime_settings")) runtime_settings = j["runtime_settings"].get<RuntimeSettings>();
 
-            if (backend != "llama-cpp") {
+            // A registry lookup, not a string literal. The `supported_backends`
+            // list in the body is now the registry's ACTUAL contents, so it is
+            // accurate by construction — the two hand-maintained copies of this
+            // check (here and in the restore handler below) could not be.
+            if (mm::EngineRegistry::instance().find(backend) == nullptr) {
                 res.status = 400;
                 const std::string msg = "unsupported node inference backend: " + backend;
                 state_.set_last_error(msg);
-                res.set_content(nlohmann::json{{"error", msg},
-                                               {"supported_backends", {"llama-cpp"}}}.dump(),
-                                "application/json");
+                res.set_content(
+                    nlohmann::json{{"error", msg},
+                                   {"supported_backends", mm::EngineRegistry::instance().ids()}}
+                        .dump(),
+                    "application/json");
                 return;
             }
 
@@ -520,13 +558,23 @@ void NodeApiServer::register_routes() {
                                 "application/json");
                 return;
             }
-            auto slot_id = slot_mgr_.load_model(
-                model_path, mmproj_path, runtime_settings, agent_id);
+            // The engine id travels with the request now. Which engine to launch,
+            // what argv it takes and how to probe it are the descriptor's; this
+            // handler's job is to pass the id along, not to know any of that.
+            EngineLoadRequest load_req;
+            load_req.model_path = model_path;
+            load_req.mmproj_path = mmproj_path;
+            load_req.settings = runtime_settings;
+            auto slot_id = engines_.load(backend, load_req, agent_id);
             if (slot_id.empty()) {
-                res.status = 500;
                 nlohmann::json err = {{"error", "failed to load model"}};
-                auto detail = slot_mgr_.last_error();
-                err["llama_server_path"] = slot_mgr_.llama_server_path();
+                auto detail = engines_.last_error();
+                const auto code = engine_error_code_for(detail);
+                // 503 for capacity, so the status alone already says "try again
+                // elsewhere"; the code says it unambiguously.
+                res.status = code == "capacity_pressure" ? 503 : 500;
+                err["code"] = code;
+                err["engine"] = backend;
                 err["llama_runtime"] = state_.get_llama_runtime();
                 err["model_path"] = model_path;
                 state_.set_last_error(detail.empty() ? "failed to load model" : detail);
@@ -534,7 +582,7 @@ void NodeApiServer::register_routes() {
                 res.set_content(err.dump(), "application/json");
             } else {
                 // Update NodeState for UI
-                auto slots_info = slot_mgr_.get_slot_info();
+                auto slots_info = engines_.slots();
                 state_.set_slots(slots_info);
                 state_.set_loaded_model(model_path);
                 if (!agent_id.empty()) state_.set_active_agent(agent_id);
@@ -588,9 +636,9 @@ void NodeApiServer::register_routes() {
 
             if (slot_id.empty()) {
                 // Backwards compat: unload all if no slot_id given
-                auto unload = slot_mgr_.unload_all(false);
+                auto unload = engines_.unload_all(false);
                 if (!unload.ok()) {
-                    res.status = unload.status == SlotOperationStatus::Busy ? 409 : 500;
+                    res.status = unload.status == EngineOpStatus::Busy ? 409 : 500;
                     res.set_content(nlohmann::json{{"error", unload.message}}.dump(),
                                     "application/json");
                     return;
@@ -600,11 +648,11 @@ void NodeApiServer::register_routes() {
                 state_.set_slots({});
                 state_.set_last_error("");
             } else {
-                auto unload = slot_mgr_.unload_slot(slot_id);
-                state_.set_slots(slot_mgr_.get_slot_info());
+                auto unload = engines_.unload(slot_id);
+                state_.set_slots(engines_.slots());
                 if (!unload.ok()) {
-                    res.status = unload.status == SlotOperationStatus::NotFound ? 404
-                               : unload.status == SlotOperationStatus::Busy ? 409
+                    res.status = unload.status == EngineOpStatus::NotFound ? 404
+                               : unload.status == EngineOpStatus::Busy ? 409
                                : 500;
                     res.set_content(nlohmann::json{{"error", unload.message}}.dump(),
                                     "application/json");
@@ -686,7 +734,7 @@ void NodeApiServer::register_routes() {
         // abandoned. 1h matches the upload write-timeout ceiling.
         model_store_->reserve(id, 3600LL * 1000);
 
-        const auto in_use = loaded_model_paths(slot_mgr_);
+        const auto in_use = loaded_model_paths(engines_);
         std::vector<std::string> evicted = model_store_->make_room_for(size, in_use);
 
         auto slot = model_store_->begin_file(id, rel);
@@ -830,10 +878,10 @@ void NodeApiServer::register_routes() {
                 return;
             }
 
-            auto detach = slot_mgr_.detach_agent(slot_id, agent_id);
-            state_.set_slots(slot_mgr_.get_slot_info());
+            auto detach = engines_.detach_agent(slot_id, agent_id);
+            state_.set_slots(engines_.slots());
             if (!detach.ok()) {
-                res.status = detach.status == SlotOperationStatus::NotFound ? 404 : 500;
+                res.status = detach.status == EngineOpStatus::NotFound ? 404 : 500;
                 res.set_content(nlohmann::json{{"error", detach.message}}.dump(),
                                 "application/json");
                 return;
@@ -864,11 +912,11 @@ void NodeApiServer::register_routes() {
                 return;
             }
 
-            auto suspend = slot_mgr_.suspend_slot(slot_id);
-            state_.set_slots(slot_mgr_.get_slot_info());
+            auto suspend = engines_.suspend(slot_id);
+            state_.set_slots(engines_.slots());
             if (!suspend.ok()) {
-                res.status = suspend.status == SlotOperationStatus::NotFound ? 404
-                           : suspend.status == SlotOperationStatus::Busy ? 409
+                res.status = suspend.status == EngineOpStatus::NotFound ? 404
+                           : suspend.status == EngineOpStatus::Busy ? 409
                            : 500;
                 res.set_content(nlohmann::json{{"error", suspend.message}}.dump(),
                                 "application/json");
@@ -877,7 +925,8 @@ void NodeApiServer::register_routes() {
 
             nlohmann::json resp;
             resp["status"] = "suspended";
-            resp["kv_cache_path"] = suspend.kv_cache_path;
+            // Field name unchanged on the wire; control reads it.
+            resp["kv_cache_path"] = suspend.kv_checkpoint_path;
             res.set_content(resp.dump(), "application/json");
         } catch (const std::exception& e) {
             res.status = 400;
@@ -908,13 +957,18 @@ void NodeApiServer::register_routes() {
             RuntimeSettings runtime_settings;
             if (j.contains("runtime_settings")) runtime_settings = j["runtime_settings"].get<RuntimeSettings>();
 
-            if (backend != "llama-cpp") {
+            // The second of the two copies. Now the same registry lookup, so the
+            // pair cannot drift — which is exactly how the first one would have
+            // been updated and this one missed.
+            if (mm::EngineRegistry::instance().find(backend) == nullptr) {
                 res.status = 400;
                 const std::string msg = "unsupported node inference backend: " + backend;
                 state_.set_last_error(msg);
-                res.set_content(nlohmann::json{{"error", msg},
-                                               {"supported_backends", {"llama-cpp"}}}.dump(),
-                                "application/json");
+                res.set_content(
+                    nlohmann::json{{"error", msg},
+                                   {"supported_backends", mm::EngineRegistry::instance().ids()}}
+                        .dump(),
+                    "application/json");
                 return;
             }
 
@@ -974,15 +1028,20 @@ void NodeApiServer::register_routes() {
                 return;
             }
 
-            auto slot_id = slot_mgr_.restore_slot(
-                model_path, mmproj_path, runtime_settings, kv_cache_path, agent_id);
-            state_.set_slots(slot_mgr_.get_slot_info());
+            EngineLoadRequest restore_req;
+            restore_req.model_path = model_path;
+            restore_req.mmproj_path = mmproj_path;
+            restore_req.settings = runtime_settings;
+            auto slot_id = engines_.restore(backend, restore_req, kv_cache_path, agent_id);
+            state_.set_slots(engines_.slots());
 
             if (slot_id.empty()) {
-                res.status = 500;
                 nlohmann::json err = {{"error", "failed to restore slot"}};
-                auto detail = slot_mgr_.last_error();
-                err["llama_server_path"] = slot_mgr_.llama_server_path();
+                auto detail = engines_.last_error();
+                const auto code = engine_error_code_for(detail);
+                res.status = code == "capacity_pressure" ? 503 : 500;
+                err["code"] = code;
+                err["engine"] = backend;
                 err["llama_runtime"] = state_.get_llama_runtime();
                 state_.set_last_error(detail.empty() ? "failed to restore slot" : detail);
                 if (!detail.empty()) err["detail"] = detail;
@@ -1161,7 +1220,7 @@ void NodeApiServer::register_routes() {
             return;
         }
 
-        auto slots = slot_mgr_.get_slot_info();
+        auto slots = engines_.slots();
 
         // Resolve selected slot.
         std::string selected_slot_id = slot_id;
@@ -1176,8 +1235,8 @@ void NodeApiServer::register_routes() {
         }
 
         auto slot_lease = selected_slot_id.empty()
-            ? SlotManager::SlotLease{}
-            : slot_mgr_.acquire_slot(selected_slot_id);
+            ? EngineSupervisor::Lease{}
+            : engines_.acquire(selected_slot_id);
 
         if (!slot_lease) {
             res.status = 503;
@@ -1198,8 +1257,8 @@ void NodeApiServer::register_routes() {
                 break;
             }
         }
-        slot_mgr_.touch_slot(selected_slot_id);
-        state_.set_slots(slot_mgr_.get_slot_info());
+        engines_.touch(selected_slot_id);
+        state_.set_slots(engines_.slots());
         if (!model_for_slot.empty()) state_.set_loaded_model(model_for_slot);
         state_.start_streaming_text(selected_slot_id, agent_for_slot);
         if (!agent_for_slot.empty()) state_.set_active_agent(agent_for_slot);
@@ -1209,7 +1268,7 @@ void NodeApiServer::register_routes() {
                      infer_req,
                      ctx,
                      slot_lease = std::move(slot_lease)]() mutable {
-            RuntimeClient* client = slot_lease.get();
+            EngineClient* client = slot_lease.get();
             auto emit_line = [ctx](const std::string& payload, bool done) {
                 std::lock_guard<std::mutex> lk(ctx->mx);
                 ctx->lines.push_back(payload);
@@ -1221,40 +1280,63 @@ void NodeApiServer::register_routes() {
                 if (infer_req.stream) {
                     client->stream_complete(infer_req,
                         [this, emit_line](const InferenceChunk& c) {
-                            nlohmann::json j;
+                            // EVERY field the chunk carries, not the first one
+                            // that matches.
+                            //
+                            // This was an if/else-if priority chain, so a chunk
+                            // carrying both thinking_delta and delta_content
+                            // silently dropped one, and tool_result_json was
+                            // never emitted at all — it had no branch. Both are
+                            // documented in mantic-mind-integration.md as faults
+                            // the rebuild must not inherit, and a dropped delta
+                            // presents as the model omitting a word rather than
+                            // as a transport bug.
                             if (!c.thinking_delta.empty()) {
-                                j = {{"type","thinking"},{"content", c.thinking_delta}};
                                 state_.append_streaming_text("", c.thinking_delta);
-                            } else if (!c.delta_content.empty()) {
-                                j = {{"type","delta"},{"content", c.delta_content}};
-                                state_.append_streaming_text(c.delta_content, "");
-                            } else if (c.tool_call_delta) {
-                                auto& tc = *c.tool_call_delta;
-                                j = {{"type","tool_call"},{"id", tc.id},
-                                     {"name", tc.function_name},
-                                     {"arguments", tc.arguments_json}};
-                            } else if (c.is_done) {
-                                j = {{"type","done"},
-                                     {"tokens_used", c.tokens_used},
-                                     {"finish_reason", c.finish_reason}};
-                                state_.finish_streaming_text(c.finish_reason, c.tokens_used);
+                                emit_line("data: " + safe_json_dump(nlohmann::json{
+                                    {"type","thinking"},{"content", c.thinking_delta}
+                                }) + "\n\n", false);
                             }
-                            if (!j.is_null()) {
-                                emit_line("data: " + safe_json_dump(j) + "\n\n", c.is_done);
-                            } else if (c.is_done) {
+                            if (!c.delta_content.empty()) {
+                                state_.append_streaming_text(c.delta_content, "");
+                                emit_line("data: " + safe_json_dump(nlohmann::json{
+                                    {"type","delta"},{"content", c.delta_content}
+                                }) + "\n\n", false);
+                            }
+                            if (c.tool_call_delta) {
+                                const auto& tc = *c.tool_call_delta;
+                                emit_line("data: " + safe_json_dump(nlohmann::json{
+                                    {"type","tool_call"},{"id", tc.id},
+                                    {"name", tc.function_name},
+                                    {"arguments", tc.arguments_json}
+                                }) + "\n\n", false);
+                            }
+                            if (!c.tool_result_json.empty()) {
+                                emit_line("data: " + safe_json_dump(nlohmann::json{
+                                    {"type","tool_result"},{"result", c.tool_result_json}
+                                }) + "\n\n", false);
+                            }
+                            // Always last, and always sent: `done` is what closes
+                            // the stream, so it cannot be conditional on any of
+                            // the above having matched.
+                            if (c.is_done) {
+                                state_.finish_streaming_text(c.finish_reason, c.tokens_used);
                                 emit_line("data: " + safe_json_dump(nlohmann::json{
                                     {"type", "done"},
                                     {"tokens_used", c.tokens_used},
                                     {"finish_reason", c.finish_reason}
                                 }) + "\n\n", true);
-                                state_.finish_streaming_text(c.finish_reason, c.tokens_used);
                             }
                         },
-                        [this, emit_line](const std::string& err) {
+                        [this, emit_line](const EngineError& err) {
                             state_.finish_streaming_text("error", 0);
+                            // The structured code rides through to control, which
+                            // no longer has to read the message to decide whether
+                            // this was capacity.
                             emit_line("data: " + safe_json_dump(nlohmann::json{
                                 {"type","error"},
-                                {"message", err}
+                                {"code", err.code},
+                                {"message", err.message}
                             }) + "\n\n", true);
                         }
                     );

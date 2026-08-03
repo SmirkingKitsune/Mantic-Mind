@@ -22,6 +22,8 @@ class HttpServer;
 
 // Hosts the external REST + SSE API for mantic-mind-control (see plan §REST API).
 // Also hosts the node registration endpoint (/api/control/register-node).
+class ControlModelRegistry;
+
 class ControlApiServer {
 public:
     struct LocalChatResult {
@@ -60,11 +62,19 @@ public:
                                int max_tokens_override = 0,
                                const std::vector<std::string>& attachment_ids = {});
 
+    /// The admission registry backing /v1/models. Optional; when unset those
+    /// routes answer 503.
+    void set_model_registry(ControlModelRegistry* registry) { models_ = registry; }
+
 private:
     AgentManager&   agents_;
     AgentQueue&     queue_;
     NodeRegistry&   registry_;
     AgentScheduler& scheduler_;
+    /// Optional. When absent every /v1/models route answers 503 rather than
+    /// pretending an empty registry, because "no models admitted" and "the
+    /// registry never opened" are different facts and only one is actionable.
+    ControlModelRegistry* models_ = nullptr;
     std::string     data_dir_;
     std::string     models_dir_;
     std::string     external_api_token_;

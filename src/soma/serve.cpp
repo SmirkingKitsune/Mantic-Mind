@@ -1,0 +1,978 @@
+// Soma — `soma serve`: the OpenAI-compatible HTTP surface the node supervises.
+//
+// This is the boundary that makes Soma a peer of the llama.cpp fallback rather
+// than a library the node has to learn about. The node launches a process,
+// polls GET /health until it reports ready, and then speaks the same protocol it
+// already speaks to llama-server.
+//
+// Two things are deliberately NOT inherited from the fallback path:
+//
+//   * Readiness is an HTTP poll, not a stdout sentinel. RuntimeProcess already
+//     works this way and it is the right shape — a sentinel is a line-buffering
+//     bug waiting to happen on Windows.
+//   * Capacity pressure is a STRUCTURED CODE. The existing scheduler detects it
+//     by substring-matching six English phrases against the node's error body
+//     (agent_scheduler.cpp:904), so a new engine would have to emit those exact
+//     literals to earn an evict-and-retry. This emits
+//     {"error":{"code":"capacity_pressure"}} instead.
+
+#include "soma/serve.hpp"
+
+#include "soma/expert_store.hpp"
+#include "soma/f32_model.hpp"
+#include "soma/kv_checkpoint.hpp"
+#include "soma/memory_hierarchy.hpp"
+#include "soma/plan.hpp"
+#include "soma/scheduler.hpp"
+#include "soma/tokenizer.hpp"
+
+#include <httplib.h>
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+namespace fs = std::filesystem;
+using json = nlohmann::json;
+
+namespace soma {
+
+const char* to_string(ServeError error) noexcept {
+    switch (error) {
+    case ServeError::None:
+        return "none";
+    case ServeError::BadRequest:
+        return "bad_request";
+    case ServeError::NotFound:
+        return "not_found";
+    case ServeError::UnsupportedContent:
+        return "unsupported_content";
+    case ServeError::CapacityPressure:
+        return "capacity_pressure";
+    case ServeError::Internal:
+        return "internal";
+    }
+    return "unknown";
+}
+
+int http_status_for(ServeError error) noexcept {
+    switch (error) {
+    case ServeError::None:
+        return 200;
+    case ServeError::BadRequest:
+        return 400;
+    case ServeError::NotFound:
+        return 404;
+    case ServeError::UnsupportedContent:
+        return 422;
+    case ServeError::CapacityPressure:
+        return 503;
+    case ServeError::Internal:
+        return 500;
+    }
+    return 500;
+}
+
+namespace {
+
+std::string env_or(const char* key, const std::string& fallback) {
+#if defined(_MSC_VER)
+    char* buf = nullptr;
+    std::size_t len = 0;
+    const bool have = (_dupenv_s(&buf, &len, key) == 0 && buf != nullptr);
+    std::string v = have ? std::string(buf) : fallback;
+    std::free(buf);
+    return v;
+#else
+    const char* raw = std::getenv(key);
+    return raw ? std::string(raw) : fallback;
+#endif
+}
+
+std::string error_body(ServeError kind, const std::string& message) {
+    json j;
+    j["error"]["code"] = to_string(kind);
+    j["error"]["message"] = message;
+    j["error"]["type"] = "invalid_request_error";
+    return j.dump();
+}
+
+/// Flatten OpenAI `messages` into a prompt.
+///
+/// Image content parts are REFUSED with 422 rather than dropped. Silently
+/// discarding them is the failure mode worth designing out: the request
+/// succeeds, the answer ignores the picture, and nothing in the response says
+/// why.
+/// Checkpoint key for a conversation.
+///
+/// Sanitised because the key becomes a FILENAME and arrives from a client. A
+/// conversation id of "../../etc/passwd" must not decide where the engine writes.
+std::string session_key(const std::string& conversation) {
+    std::string safe;
+    safe.reserve(conversation.size() + 8);
+    for (const char c : conversation) {
+        const bool allowed = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                             (c >= '0' && c <= '9') || c == '-' || c == '_';
+        safe.push_back(allowed ? c : '_');
+    }
+    if (safe.size() > 96) safe.resize(96);
+    return "conv-" + safe;
+}
+
+Status flatten_messages(const json& msgs, std::string& out, ServeError& err) {
+    for (const auto& m : msgs) {
+        const auto role = m.value("role", "user");
+        const auto& c = m.at("content");
+        if (c.is_string()) {
+            out += role + ": " + c.get<std::string>() + "\n";
+            continue;
+        }
+        if (!c.is_array()) {
+            err = ServeError::BadRequest;
+            return {StatusCode::InvalidArgument, "message content must be string or array"};
+        }
+        for (const auto& part : c) {
+            const auto type = part.value("type", "");
+            if (type == "text") {
+                out += role + ": " + part.value("text", "") + "\n";
+            } else {
+                err = ServeError::UnsupportedContent;
+                return {StatusCode::Unsupported,
+                        "content part '" + type + "' is not supported; this engine is text-only"};
+            }
+        }
+    }
+    out += "assistant:";
+    return {};
+}
+
+} // namespace
+
+struct ServeServer::Impl {
+    ServeConfig cfg;
+    PlanDocument plan_doc;
+
+    F32Model model;
+    ExpertStore store;
+    MemoryHierarchy memory;
+    KvCheckpointStore checkpoints;
+    CompiledTokenizer tokenizer;
+    bool have_tokenizer = false;
+
+    Scheduler sched;
+
+    /// Guards `sessions` and `waiters` only — NOT the scheduler.
+    ///
+    /// LOCK ORDER, and the one rule this file has to keep: the scheduler's own
+    /// lock is taken first, always. Its token and finish callbacks fire from
+    /// inside step() and take state_mu, so any path that holds state_mu while
+    /// calling into the Scheduler inverts the order and deadlocks. Every call
+    /// site below releases state_mu before touching `sched`.
+    std::mutex state_mu;
+
+    httplib::Server http;
+    std::atomic<bool> is_ready{false};
+
+    bool sched_open = false;
+
+    // ── the shared step loop ─────────────────────────────────────────────────
+    //
+    // One thread drives step(); request threads admit and wait. That is what
+    // makes the batch union reachable over HTTP: its payoff comes from
+    // CONCURRENT sequences sharing a step, and a mutex held across a whole turn
+    // gives it exactly one sequence to union.
+    std::thread stepper;
+    std::mutex work_mu;
+    std::condition_variable work_cv;
+    std::atomic<bool> stop_stepping{false};
+
+    /// One in-flight turn. Owned by the request thread, reached by the callbacks.
+    struct Waiter {
+        std::mutex mu;
+        std::condition_variable cv;
+        std::vector<TokenId> emitted;
+        std::string acc;
+        bool done = false;
+        Status error;
+        std::function<void(const std::string&)> on_delta;
+    };
+
+    std::map<SeqId, std::shared_ptr<Waiter>> waiters;
+
+    /// conversation key -> the sequence holding its KV.
+    ///
+    /// The whole point: a sequence now outlives the request that created it.
+    /// Without this every turn re-prefills the entire conversation, which is
+    /// exactly the cost warm reopen exists to remove — and there is nothing live
+    /// for the node to checkpoint at suspend time either, so cluster
+    /// suspend/restore has nothing to save.
+    struct Session {
+        SeqId seq = 0;
+        std::uint64_t last_used = 0;
+    };
+
+    std::map<std::string, Session> sessions;
+    std::uint64_t session_clock = 0;
+
+    /// Open ONCE, at ServeServer::open().
+    ///
+    /// It used to be re-opened per request, which discarded every sequence and
+    /// made sessions impossible before the question was even asked.
+    Status open_scheduler() {
+        SchedulerConfig sc;
+        sc.kv_slots = std::max(1u, cfg.kv_slots);
+        sc.ctx_size = cfg.ctx_size;
+        sc.max_batch = cfg.max_batch;
+        if (auto st = sched.open_f32(model, memory_ptr(), sc, &checkpoints); !st.ok()) return st;
+
+        // Set ONCE, dispatching by SeqId. Re-registering per request was fine
+        // when one turn ran at a time and is not: the last writer would own every
+        // sequence's tokens.
+        sched.set_token_callback([this](SeqId id, TokenId t, bool) { on_token(id, t); });
+        sched.set_finish_callback([this](SeqId id) { finish(id, {}); });
+        sched.set_error_callback([this](SeqId id, StatusCode code, const char* what) {
+            finish(id, Status{code, what ? what : "sequence failed"});
+        });
+
+        sched_open = true;
+        stop_stepping.store(false);
+        stepper = std::thread([this] { step_loop(); });
+        return {};
+    }
+
+    void close_scheduler() {
+        stop_stepping.store(true);
+        work_cv.notify_all();
+        if (stepper.joinable()) stepper.join();
+        sched_open = false;
+        // Once the driver is gone nothing will ever finish a waiting turn, so
+        // release them now. Without this a request in flight at shutdown blocks
+        // on its deadline — ten minutes of a connection that is never going to
+        // be answered.
+        fail_all({StatusCode::Cancelled, "engine is shutting down"});
+    }
+
+    /// The driver. Steps while there is work, sleeps when there is not.
+    void step_loop() {
+        while (!stop_stepping.load()) {
+            if (sched.idle()) {
+                std::unique_lock<std::mutex> lk(work_mu);
+                // Timed, not indefinite: a sequence admitted between the idle()
+                // check and this wait would otherwise sit until the next admit
+                // happened to arrive.
+                work_cv.wait_for(lk, std::chrono::milliseconds(5));
+                continue;
+            }
+            if (auto st = sched.step(); !st.ok()) {
+                // step() re-queues the rows it failed on, so retrying forever
+                // would spin on a permanent fault while every caller waits on a
+                // response that is not coming. Fail the in-flight turns instead.
+                fail_all(st);
+            }
+        }
+    }
+
+    void on_token(SeqId id, TokenId t) {
+        std::shared_ptr<Waiter> w;
+        {
+            std::lock_guard<std::mutex> lk(state_mu);
+            if (auto it = waiters.find(id); it != waiters.end()) w = it->second;
+        }
+        if (!w) return; // a session with no turn in flight
+
+        std::string delta;
+        {
+            std::lock_guard<std::mutex> lk(w->mu);
+            w->emitted.push_back(t);
+            std::string full;
+            if (have_tokenizer) {
+                if (!tokenizer.decode(w->emitted, full).ok()) return;
+            } else {
+                for (const auto tok : w->emitted)
+                    full += std::to_string(tok) + " ";
+            }
+            if (full.size() <= w->acc.size()) return;
+            delta = full.substr(w->acc.size());
+            w->acc = std::move(full);
+        }
+        // Outside the waiter's lock: on_delta writes to a socket, and the
+        // scheduler's lock is still held further up the stack. Holding a third
+        // lock across a network write is how a slow client stalls every sequence
+        // in the batch.
+        if (w->on_delta) w->on_delta(delta);
+    }
+
+    void finish(SeqId id, Status error) {
+        std::shared_ptr<Waiter> w;
+        {
+            std::lock_guard<std::mutex> lk(state_mu);
+            if (auto it = waiters.find(id); it != waiters.end()) w = it->second;
+        }
+        if (!w) return;
+        {
+            std::lock_guard<std::mutex> lk(w->mu);
+            if (!error.ok()) w->error = std::move(error);
+            w->done = true;
+        }
+        w->cv.notify_all();
+    }
+
+    void fail_all(const Status& error) {
+        std::vector<std::shared_ptr<Waiter>> all;
+        {
+            std::lock_guard<std::mutex> lk(state_mu);
+            for (auto& [_, w] : waiters)
+                all.push_back(w);
+        }
+        for (auto& w : all) {
+            {
+                std::lock_guard<std::mutex> lk(w->mu);
+                w->error = error;
+                w->done = true;
+            }
+            w->cv.notify_all();
+        }
+    }
+
+    /// Retire the least-recently-used session to free a KV slot.
+    ///
+    /// A KV slot is real memory, so the scheduler REFUSES rather than silently
+    /// evicting; deciding whose context to drop is a policy question and belongs
+    /// here, where the sessions have names.
+    ///
+    /// A session with a turn IN FLIGHT is never the victim — evicting it would
+    /// cancel a sequence someone is waiting on, and the wait would time out
+    /// rather than fail.
+    bool evict_lru_session(const std::string& except) {
+        SeqId victim_seq = 0;
+        std::string victim_key;
+        {
+            std::lock_guard<std::mutex> lk(state_mu);
+            std::uint64_t oldest = 0;
+            for (const auto& [key, s] : sessions) {
+                if (key == except) continue;
+                if (waiters.count(s.seq) != 0) continue;
+                if (victim_key.empty() || s.last_used < oldest) {
+                    victim_key = key;
+                    victim_seq = s.seq;
+                    oldest = s.last_used;
+                }
+            }
+            if (victim_key.empty()) return false;
+            sessions.erase(victim_key);
+        }
+        // Outside state_mu: cancel() takes the scheduler's lock.
+        (void)sched.cancel(victim_seq);
+        return true;
+    }
+
+    /// Admit one turn and WAIT for it. The step loop belongs to nobody.
+    ///
+    /// This used to hold a mutex across the whole turn, which meant the batch
+    /// union — the mechanism the entire engine is built around — only ever had
+    /// one sequence to union over HTTP. Concurrent requests now land as
+    /// concurrent rows in one forward, and each expert is read once for all of
+    /// them regardless of which conversation asked.
+    Status generate(const std::string& prompt,
+                    std::uint32_t max_tokens,
+                    const SamplerState& sampler,
+                    const std::string& conversation,
+                    const std::function<void(const std::string&)>& on_delta,
+                    std::string& out_text) {
+        std::vector<TokenId> ids;
+        if (have_tokenizer) {
+            if (auto st = tokenizer.encode(prompt, ids); !st.ok()) return st;
+        } else {
+            // No tokenizer: fall back to BYTES, one token per byte, folded into
+            // the vocabulary. Not a tokenizer and not pretending to be one — but
+            // it makes prompt length track the prompt, which the previous
+            // fallback (a single token 0 for every request, however long) did
+            // not. A session cannot be exercised at all when every prompt
+            // encodes identically.
+            const auto vocab = model.vocab();
+            ids.reserve(prompt.size());
+            for (const unsigned char c : prompt) {
+                ids.push_back(static_cast<TokenId>(vocab > 0 ? c % vocab : 0u));
+            }
+        }
+        if (ids.empty()) ids.push_back(0);
+
+        if (!sched_open) return {StatusCode::InvalidArgument, "scheduler is not open"};
+
+        SeqId id = 0;
+        bool warm = false;
+
+        // ── continue an existing session ─────────────────────────────────────
+        //
+        // The session is LOOKED UP under state_mu and the scheduler is called
+        // after releasing it. Holding state_mu across extend() would invert the
+        // lock order against the callbacks and deadlock against the step loop.
+        SeqId existing = 0;
+        {
+            std::lock_guard<std::mutex> lk(state_mu);
+            if (!conversation.empty()) {
+                if (auto it = sessions.find(conversation); it != sessions.end()) {
+                    existing = it->second.seq;
+                }
+            }
+        }
+        if (existing != 0) {
+            if (sched.extend(existing, ids, max_tokens).ok()) {
+                id = existing;
+                warm = true;
+            } else {
+                // The prompt is not an extension of what the cache holds — an
+                // edited earlier turn, or a client reusing a key. Retire the
+                // sequence and start cold: correct output costs a re-prefill,
+                // a mismatched cache costs correctness.
+                (void)sched.cancel(existing);
+                std::lock_guard<std::mutex> lk(state_mu);
+                if (auto it = sessions.find(conversation);
+                    it != sessions.end() && it->second.seq == existing) {
+                    sessions.erase(it);
+                }
+            }
+        }
+
+        // ── or start a new one ───────────────────────────────────────────────
+        AdmitRejection why{};
+        if (!warm) {
+            SeqRequest req;
+            req.prompt = ids;
+            req.max_tokens = max_tokens;
+            req.sampler = sampler;
+            // Cross-PROCESS warm reopen: if this conversation was checkpointed
+            // before the engine was stopped, attach that cache. Same mechanism,
+            // one tier up — see kv_checkpoint.hpp's "one format, three callers".
+            if (!conversation.empty()) req.resume_key = session_key(conversation);
+
+            SeqRequest retry = req;
+            auto st = sched.admit(std::move(req), id, why);
+            if (!st.ok() && why == AdmitRejection::NoKvSlot && evict_lru_session(conversation)) {
+                st = sched.admit(std::move(retry), id, why);
+            }
+            if (!st.ok()) return st;
+        }
+
+        // Register the waiter BEFORE waking the stepper, or a fast turn can
+        // finish before anyone is listening for it.
+        //
+        // Decoding happens in the callback: the emitted prefix is re-decoded each
+        // step and the SUFFIX is sent. CompiledTokenizer::Streamer is declared in
+        // the header with no implementation — a design-pass stub. Re-decoding is
+        // O(n^2) in tokens and correct, including the case the Streamer exists to
+        // handle: a multi-byte codepoint split across two tokens never emits a
+        // replacement character, because every delta is the difference between
+        // two complete decodes.
+        auto waiter = std::make_shared<Waiter>();
+        waiter->on_delta = on_delta;
+        {
+            std::lock_guard<std::mutex> lk(state_mu);
+            waiters[id] = waiter;
+            if (!conversation.empty()) sessions[conversation] = Session{id, ++session_clock};
+        }
+        work_cv.notify_one();
+
+        // Bounded, and generously: the deadline exists so a lost finish signal
+        // presents as a failed request rather than a hung connection, not as a
+        // generation limit. A step-loop fault reaches the waiter through
+        // fail_all() long before this fires.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(10);
+        Status result;
+        {
+            std::unique_lock<std::mutex> lk(waiter->mu);
+            const bool finished = waiter->cv.wait_until(lk, deadline, [&] { return waiter->done; });
+            if (!finished) {
+                result = {StatusCode::Internal, "generation did not complete within 10 minutes"};
+            } else {
+                result = waiter->error;
+            }
+            out_text = waiter->acc;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(state_mu);
+            if (auto it = waiters.find(id); it != waiters.end() && it->second == waiter) {
+                waiters.erase(it);
+            }
+        }
+
+        // A turn with no conversation key has nobody to come back to it, so its
+        // sequence is retired here. Retaining finished sequences is what makes a
+        // session warm; doing it for stateless turns as well would hold a KV slot
+        // per request until the pool was exhausted and every later request was
+        // refused with NoKvSlot.
+        if (conversation.empty()) (void)sched.cancel(id);
+        return result;
+    }
+
+    MemoryHierarchy* memory_ptr() { return model.experts_are_streamed ? &memory : nullptr; }
+
+    // ── suspend / restore ────────────────────────────────────────────────────
+    //
+    // The node asks for ONE artifact, and this engine holds N sessions. That is
+    // the difference the KvCheckpointBackend interface calls
+    // supports_multi_sequence(): llama.cpp answers false and saves sequence 0,
+    // silently losing the rest; Soma writes every session and a manifest naming
+    // them, so a restore brings back the whole engine rather than one agent's
+    // context.
+
+    /// A snapshot of the session table, taken under state_mu and used after it
+    /// is released. Every scheduler call below needs the lock released first.
+    std::vector<std::pair<std::string, Session>> snapshot_sessions() {
+        std::lock_guard<std::mutex> lk(state_mu);
+        return {sessions.begin(), sessions.end()};
+    }
+
+    Status save_sessions(const std::string& manifest_path, std::uint32_t& out_saved) {
+        out_saved = 0;
+        if (cfg.checkpoint_dir.empty()) {
+            return {StatusCode::InvalidArgument, "engine was launched without --kv-dir"};
+        }
+        const auto snap = snapshot_sessions();
+
+        json m;
+        m["version"] = 1;
+        m["engine"] = "soma";
+        m["arch_hash"] = model.arch.arch_hash;
+        m["written_at_ms"] =
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           std::chrono::system_clock::now().time_since_epoch())
+                                           .count());
+        auto& arr = m["sessions"] = json::array();
+
+        std::uint32_t total_tokens = 0;
+        for (const auto& [conversation, session] : snap) {
+            const auto key = session_key(conversation);
+            if (auto st = sched.checkpoint(session.seq, key); !st.ok()) {
+                // One unsaveable session does not invalidate the others. Recorded
+                // rather than dropped: a manifest that silently omits a session
+                // is indistinguishable from one that never had it.
+                m["skipped"].push_back(
+                    json{{"conversation", conversation}, {"reason", st.message()}});
+                continue;
+            }
+            std::vector<TokenId> toks;
+            (void)sched.sequence_tokens(session.seq, toks);
+            arr.push_back(
+                json{{"conversation", conversation}, {"key", key}, {"tokens", toks.size()}});
+            total_tokens += static_cast<std::uint32_t>(toks.size());
+            ++out_saved;
+        }
+        m["total_tokens"] = total_tokens;
+
+        std::ofstream out(manifest_path, std::ios::binary | std::ios::trunc);
+        if (!out) return {StatusCode::IoError, "cannot write " + manifest_path};
+        const auto text = m.dump(2);
+        out.write(text.data(), static_cast<std::streamsize>(text.size()));
+        if (!out) return {StatusCode::IoError, "short write to " + manifest_path};
+        return {};
+    }
+
+    /// Live per-sequence state — what EngineSupervisor::sequences() has had
+    /// nothing to report. A stalled sequence and a saturated batch look identical
+    /// from a request counter; they do not look identical here.
+    json sessions_json() {
+        const auto snap = snapshot_sessions();
+        const auto st = sched.stats();
+        json j;
+        j["kv_slots"] = cfg.kv_slots;
+        j["effective_max_batch"] = st.effective_max_batch;
+        j["active_sequences"] = st.active_sequences;
+        j["current_batch"] = st.current_batch;
+        // The payoff, made visible on the wire: unique experts read per step vs.
+        // rows x top_k. A ratio near 1.0 means the union is buying nothing.
+        j["unique_experts_last_step"] = st.unique_experts_last_step;
+        j["naive_expert_reads_last_step"] = st.naive_expert_reads_last_step;
+        auto& arr = j["sessions"] = json::array();
+        for (const auto& [conversation, session] : snap) {
+            std::vector<TokenId> toks;
+            (void)sched.sequence_tokens(session.seq, toks);
+            arr.push_back(json{{"conversation", conversation},
+                               {"sequence", session.seq},
+                               {"kv_tokens", toks.size()},
+                               {"last_used", session.last_used}});
+        }
+        return j;
+    }
+
+    Status restore_sessions(const std::string& manifest_path, std::uint32_t& out_restored) {
+        out_restored = 0;
+
+        std::ifstream in(manifest_path, std::ios::binary);
+        if (!in) return {StatusCode::NotFound, "no manifest at " + manifest_path};
+        json m;
+        try {
+            in >> m;
+        } catch (const std::exception& e) {
+            return {StatusCode::InvalidArgument, std::string("bad manifest: ") + e.what()};
+        }
+        if (m.value("arch_hash", std::string{}) != model.arch.arch_hash) {
+            // Refused, not read. The KV of a different architecture has the wrong
+            // cache shape; every byte would load and the output would be quietly
+            // degraded, which is the single most confusing bug this could produce.
+            return {StatusCode::ArchMismatch,
+                    "manifest arch_hash " + m.value("arch_hash", std::string{}) +
+                        " != " + model.arch.arch_hash};
+        }
+        if (!sched_open) return {StatusCode::InvalidArgument, "scheduler is not open"};
+
+        // The sessions are re-created lazily: the next request for a conversation
+        // passes its key as resume_key and admit() attaches the cache after
+        // checking it is a prefix. Restoring here would mean prefilling nothing
+        // and holding KV slots for conversations that may never come back.
+        for (const auto& s : m.value("sessions", json::array())) {
+            const auto key = s.value("key", std::string{});
+            if (key.empty() || !checkpoints.exists(key)) continue;
+            ++out_restored;
+        }
+        return {};
+    }
+};
+
+ServeServer::ServeServer() : impl_(std::make_unique<Impl>()) {}
+
+ServeServer::~ServeServer() {
+    stop();
+}
+
+Status ServeServer::open(const ServeConfig& config) {
+    auto& im = *impl_;
+    im.cfg = config;
+    if (config.model_dir.empty()) {
+        return {StatusCode::InvalidArgument, "--model-dir is required"};
+    }
+
+    QuantMap qm;
+    qm.expert_gate = {DType::Q4_G, 128};
+    qm.expert_up = {DType::Q4_G, 128};
+    qm.expert_down = {DType::Q6_G, 128};
+    if (auto st = load_f32_model(config.model_dir, im.model, qm); !st.ok()) return st;
+
+    // A container directory streams; a plain checkpoint is resident. Both are
+    // legitimate residency modes — `resident-only` is a verdict, not a failure —
+    // so the server supports either without a flag.
+    if (im.model.experts_are_streamed) {
+        if (auto st = im.store.open(config.model_dir, im.model.arch); !st.ok()) return st;
+        MemoryBudget b;
+        b.ram_expert_cache_bytes = config.ram_budget_bytes ? config.ram_budget_bytes : (2ull << 30);
+        b.pin_bytes = config.pin_bytes;
+        if (auto st = im.memory.open(im.model.arch, im.store, b); !st.ok()) return st;
+        im.model.streamed_experts = &im.memory;
+    }
+
+    HostBudget host;
+    host.ram_total_bytes = config.ram_budget_bytes ? config.ram_budget_bytes * 2 : (8ull << 30);
+    host.ram_free_bytes = config.ram_budget_bytes ? config.ram_budget_bytes : (4ull << 30);
+    host.ctx_size = config.ctx_size;
+    (void)compute_plan(im.model.arch, host, im.plan_doc);
+
+    const auto tok = fs::path(config.model_dir) / "tokenizer.soma";
+    if (fs::exists(tok)) {
+        im.have_tokenizer = im.tokenizer.open(tok.string()).ok();
+    }
+
+    if (!config.checkpoint_dir.empty()) {
+        (void)im.checkpoints.open(config.checkpoint_dir, im.model.arch);
+    }
+
+    // Opened ONCE, here — not per request. Re-opening it per request discarded
+    // every sequence, which made a session impossible before the question of
+    // sessions was even asked.
+    if (auto st = im.open_scheduler(); !st.ok()) return st;
+
+    const auto served = config.served_model_name.empty()
+                            ? fs::path(config.model_dir).filename().string()
+                            : config.served_model_name;
+
+    // ── routes ───────────────────────────────────────────────────────────────
+
+    im.http.Get("/health", [this, served](const httplib::Request&, httplib::Response& res) {
+        json j;
+        j["status"] = impl_->is_ready.load() ? "ok" : "loading";
+        j["model"] = served;
+        j["engine"] = "soma";
+        j["streamed"] = impl_->model.experts_are_streamed;
+        j["verdict"] = to_string(impl_->plan_doc.verdict);
+        res.status = impl_->is_ready.load() ? 200 : 503;
+        res.set_content(j.dump(), "application/json");
+    });
+
+    // The footprint source. `estimate_inference_vram_mb()` guesses from file
+    // size; this is the planner's own answer, from the model actually loaded, so
+    // the node reports what the engine is doing rather than what a size heuristic
+    // predicted it would do.
+    im.http.Get("/internal/plan", [this](const httplib::Request&, httplib::Response& res) {
+        std::string body;
+        if (auto st = serialize_plan(impl_->plan_doc, body); !st.ok()) {
+            res.status = 500;
+            res.set_content(
+                json{{"error", {{"code", "internal"}, {"message", st.message()}}}}.dump(),
+                "application/json");
+            return;
+        }
+        res.set_content(body, "application/json");
+    });
+
+    // ── suspend / restore ────────────────────────────────────────────────────
+    // The node's KvCheckpointBackend speaks to these. `path` is chosen by the
+    // node and is absolute; the engine writes exactly there so the node's record
+    // and the file on disk cannot disagree.
+    im.http.Post("/internal/kv/save", [this](const httplib::Request& req, httplib::Response& res) {
+        std::string path;
+        try {
+            path = json::parse(req.body).value("path", std::string{});
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(error_body(ServeError::BadRequest, e.what()), "application/json");
+            return;
+        }
+        if (path.empty()) {
+            res.status = 400;
+            res.set_content(error_body(ServeError::BadRequest, "path is required"),
+                            "application/json");
+            return;
+        }
+        std::uint32_t saved = 0;
+        if (auto st = impl_->save_sessions(path, saved); !st.ok()) {
+            res.status = http_status_for(ServeError::Internal);
+            res.set_content(error_body(ServeError::Internal, st.message()), "application/json");
+            return;
+        }
+        res.set_content(json{{"saved", saved}, {"path", path}}.dump(), "application/json");
+    });
+
+    im.http.Post(
+        "/internal/kv/restore", [this](const httplib::Request& req, httplib::Response& res) {
+            std::string path;
+            try {
+                path = json::parse(req.body).value("path", std::string{});
+            } catch (const std::exception& e) {
+                res.status = 400;
+                res.set_content(error_body(ServeError::BadRequest, e.what()), "application/json");
+                return;
+            }
+            std::uint32_t restored = 0;
+            if (auto st = impl_->restore_sessions(path, restored); !st.ok()) {
+                const auto kind = st.code() == StatusCode::NotFound ? ServeError::NotFound
+                                                                    : ServeError::BadRequest;
+                res.status = http_status_for(kind);
+                res.set_content(error_body(kind, st.message()), "application/json");
+                return;
+            }
+            res.set_content(json{{"restored", restored}}.dump(), "application/json");
+        });
+
+    im.http.Get("/internal/sessions", [this](const httplib::Request&, httplib::Response& res) {
+        res.set_content(impl_->sessions_json().dump(), "application/json");
+    });
+
+    im.http.Get("/v1/models", [served](const httplib::Request&, httplib::Response& res) {
+        json j;
+        j["object"] = "list";
+        j["data"] = json::array({json{{"id", served}, {"object", "model"}, {"owned_by", "soma"}}});
+        res.set_content(j.dump(), "application/json");
+    });
+
+    im.http.Post(
+        "/v1/chat/completions",
+        [this, served](const httplib::Request& req, httplib::Response& res) {
+            json body;
+            try {
+                body = json::parse(req.body);
+            } catch (const std::exception& e) {
+                res.status = http_status_for(ServeError::BadRequest);
+                res.set_content(error_body(ServeError::BadRequest, e.what()), "application/json");
+                return;
+            }
+            if (!body.contains("messages") || !body["messages"].is_array()) {
+                res.status = 400;
+                res.set_content(error_body(ServeError::BadRequest, "messages[] is required"),
+                                "application/json");
+                return;
+            }
+
+            std::string prompt;
+            ServeError err = ServeError::None;
+            if (auto st = flatten_messages(body["messages"], prompt, err); !st.ok()) {
+                res.status = http_status_for(err);
+                res.set_content(error_body(err, st.message()), "application/json");
+                return;
+            }
+
+            SamplerState sampler;
+            sampler.temperature = body.value("temperature", 0.7f);
+            sampler.top_p = body.value("top_p", 0.9f);
+            sampler.rng_state = body.value("seed", 0ull);
+            const auto max_tokens = body.value("max_tokens", 64u);
+            const bool stream = body.value("stream", false);
+
+            // The conversation key. Body field first, header second: the body is what
+            // an OpenAI-shaped client can set, the header is what a proxy can add
+            // without rewriting a payload. Absent means stateless — every turn cold,
+            // which is the old behaviour and stays the default.
+            std::string conversation = body.value("conversation", std::string{});
+            if (conversation.empty() && req.has_header("X-Conversation-Id")) {
+                conversation = req.get_header_value("X-Conversation-Id");
+            }
+
+            if (!stream) {
+                std::string text;
+                if (auto st =
+                        impl_->generate(prompt, max_tokens, sampler, conversation, nullptr, text);
+                    !st.ok()) {
+                    const auto kind = (st.code() == StatusCode::CapacityPressure)
+                                          ? ServeError::CapacityPressure
+                                          : ServeError::Internal;
+                    res.status = http_status_for(kind);
+                    res.set_content(error_body(kind, st.message()), "application/json");
+                    return;
+                }
+                json out;
+                out["object"] = "chat.completion";
+                out["model"] = served;
+                out["choices"] =
+                    json::array({json{{"index", 0},
+                                      {"message", json{{"role", "assistant"}, {"content", text}}},
+                                      {"finish_reason", "length"}}});
+                res.set_content(out.dump(), "application/json");
+                return;
+            }
+
+            // SSE. Deltas are emitted as they are produced rather than buffered and
+            // chunked at the end — a "streaming" endpoint that streams only after
+            // the answer is complete is the thing clients notice immediately.
+            res.set_chunked_content_provider(
+                "text/event-stream",
+                [this, prompt, max_tokens, sampler, served, conversation](std::size_t,
+                                                                          httplib::DataSink& sink) {
+                    auto send = [&](const json& j) {
+                        const auto s = "data: " + j.dump() + "\n\n";
+                        return sink.write(s.data(), s.size());
+                    };
+                    std::string text;
+                    const auto st = impl_->generate(
+                        prompt,
+                        max_tokens,
+                        sampler,
+                        conversation,
+                        [&](const std::string& delta) {
+                            json chunk;
+                            chunk["object"] = "chat.completion.chunk";
+                            chunk["model"] = served;
+                            chunk["choices"] = json::array(
+                                {json{{"index", 0}, {"delta", json{{"content", delta}}}}});
+                            (void)send(chunk);
+                        },
+                        text);
+                    if (!st.ok()) {
+                        json e;
+                        e["error"]["code"] = to_string(st.code() == StatusCode::CapacityPressure
+                                                           ? ServeError::CapacityPressure
+                                                           : ServeError::Internal);
+                        e["error"]["message"] = st.message();
+                        (void)send(e);
+                    }
+                    const std::string done = "data: [DONE]\n\n";
+                    sink.write(done.data(), done.size());
+                    sink.done();
+                    return true;
+                });
+        });
+
+    im.is_ready.store(true);
+    return {};
+}
+
+Status ServeServer::listen() {
+    auto& im = *impl_;
+    if (!im.http.listen(im.cfg.host.c_str(), im.cfg.port)) {
+        return {StatusCode::IoError,
+                "cannot bind " + im.cfg.host + ":" + std::to_string(im.cfg.port)};
+    }
+    return {};
+}
+
+void ServeServer::stop() {
+    if (impl_) {
+        impl_->is_ready.store(false);
+        impl_->http.stop();
+        // The step thread outlives the HTTP server by design — an in-flight turn
+        // should reach its waiter — but it must not outlive this object. Joined
+        // before Impl's members start being destroyed under it.
+        impl_->close_scheduler();
+    }
+}
+
+bool ServeServer::ready() const noexcept {
+    return impl_->is_ready.load();
+}
+
+const PlanDocument& ServeServer::plan() const noexcept {
+    return impl_->plan_doc;
+}
+
+const ServeConfig& ServeServer::config() const noexcept {
+    return impl_->cfg;
+}
+
+Status parse_serve_config(int argc, const char* const* argv, ServeConfig& out) {
+    // Env first, CLI second, so CLI wins. Both are supported because the node
+    // launches with argv while a container image is configured with env, and
+    // making one of them second-class means one caller has to work around it.
+    out.host = env_or("SOMA_HOST", out.host);
+    out.model_dir = env_or("SOMA_MODEL_DIR", out.model_dir);
+    out.checkpoint_dir = env_or("SOMA_KV_DIR", out.checkpoint_dir);
+    out.served_model_name = env_or("SOMA_SERVED_NAME", out.served_model_name);
+    if (const auto p = env_or("SOMA_PORT", ""); !p.empty()) {
+        out.port = static_cast<std::uint16_t>(std::stoul(p));
+    }
+    if (const auto c = env_or("SOMA_CTX_SIZE", ""); !c.empty()) {
+        out.ctx_size = static_cast<std::uint32_t>(std::stoul(c));
+    }
+    if (const auto r = env_or("SOMA_RAM_BUDGET", ""); !r.empty()) {
+        out.ram_budget_bytes = std::stoull(r);
+    }
+
+    for (int i = 0; i < argc; ++i) {
+        const std::string a = argv[i];
+        const auto next = [&](std::string& dst) {
+            if (i + 1 < argc) dst = argv[++i];
+        };
+        if (a == "--host")
+            next(out.host);
+        else if (a == "--model-dir")
+            next(out.model_dir);
+        else if (a == "--kv-dir")
+            next(out.checkpoint_dir);
+        else if (a == "--served-name")
+            next(out.served_model_name);
+        else if (a == "--port" && i + 1 < argc)
+            out.port = static_cast<std::uint16_t>(std::stoul(argv[++i]));
+        else if (a == "--ctx-size" && i + 1 < argc)
+            out.ctx_size = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+        else if (a == "--ram-budget" && i + 1 < argc)
+            out.ram_budget_bytes = std::stoull(argv[++i]);
+        else if (a == "--pin" && i + 1 < argc)
+            out.pin_bytes = std::stoull(argv[++i]);
+    }
+    if (out.model_dir.empty()) {
+        return {StatusCode::InvalidArgument, "--model-dir (or SOMA_MODEL_DIR) is required"};
+    }
+    return {};
+}
+
+} // namespace soma

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/footprint.hpp"
 #include "common/models.hpp"
 #include "common/node_discovery.hpp"
 #include <unordered_map>
@@ -58,10 +59,19 @@ public:
 
     /// Nodes that have a model loaded in a ready slot.
     std::vector<NodeInfo> nodes_with_model_loaded(const std::string& model_path) const;
-    /// Nodes that can likely host a model requiring `min_vram_mb`:
-    /// - preferred: enough free VRAM
-    /// - fallback: VRAM + weighted RAM budget (CPU offload)
-    std::vector<NodeInfo> nodes_with_available_vram(int64_t min_vram_mb) const;
+    /// Nodes that can host `footprint`, best fit first.
+    ///
+    /// REPLACES nodes_with_available_vram(int64_t). The policy is unchanged —
+    /// same headroom, same 0.60 offload weight, same 8 GiB minimum GPU, and a
+    /// native fit still outranks an offloaded one — but it is expressed over
+    /// three axes instead of one, and it lives in common/footprint.cpp so the
+    /// node and control agree on what "fits" means.
+    ///
+    /// Soma's cost is RAM + disk + optional VRAM, and no amount of tuning a VRAM
+    /// scalar expresses that. `NodeInfo::disk_free_mb` has been collected by the
+    /// health poll since it was written and consulted by nothing.
+    std::vector<NodeInfo> nodes_with_capacity(const ResourceFootprint& footprint,
+                                              const CapacityPolicy& policy = {}) const;
 
     // Callback fired whenever node status changes (health poll results).
     using UpdateCallback = std::function<void(const NodeInfo&)>;

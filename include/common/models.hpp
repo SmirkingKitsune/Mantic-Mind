@@ -160,6 +160,17 @@ struct AgentConfig {
     std::string   model_path;
     std::string   system_prompt;
     std::string   inference_backend = "llama-cpp"; // llama-cpp (default) | api
+
+    // Which local engine serves this agent: auto | soma | fallback.
+    //
+    // PERSISTENT and on the agent, not per placement. Placement is recomputed on
+    // every ensure_agent_running(), so a per-placement override would evaporate
+    // on the next eviction cycle and read as a flapping bug rather than as a
+    // setting that stopped applying.
+    //
+    // `auto` defers to the admission verdict. Absence of a verdict routes to the
+    // fallback — absence of a record is not evidence of admissibility.
+    std::string   backend_override = "auto";
     // Public alias advertised by the control server's OpenAI-compatible model
     // catalog. Older profiles stored this inside their backend-specific block.
     std::string   served_model_name;
@@ -805,6 +816,7 @@ inline void to_json(nlohmann::json& j, const AgentConfig& a) {
           {"model_path",        a.model_path},
           {"system_prompt",     a.system_prompt},
           {"inference_backend", a.inference_backend},
+          {"backend_override",  a.backend_override},
           {"served_model_name", a.served_model_name},
           {"runtime_settings",  a.runtime_settings},
           {"api_settings",      a.api_settings},
@@ -820,6 +832,7 @@ inline void from_json(const nlohmann::json& j, AgentConfig& a) {
     if (j.contains("model_path"))        j.at("model_path").get_to(a.model_path);
     if (j.contains("system_prompt"))     j.at("system_prompt").get_to(a.system_prompt);
     if (j.contains("inference_backend")) j.at("inference_backend").get_to(a.inference_backend);
+    if (j.contains("backend_override"))  j.at("backend_override").get_to(a.backend_override);
     if (j.contains("served_model_name")) j.at("served_model_name").get_to(a.served_model_name);
     if (j.contains("runtime_settings"))  j.at("runtime_settings").get_to(a.runtime_settings);
     // Compatibility reader for agents serialized before the runtime split.

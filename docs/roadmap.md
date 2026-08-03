@@ -1502,6 +1502,465 @@ That is fine and expected — G4 tests the **seam**, not the economics. Run it w
 
 ## G5 — subprocess integration + verdict routing
 
+### G5 status — verdict routing PASSES; `soma serve` and the node-side supervision layer PASS
+
+The call sites are ported: `SlotManager` is deleted, placement runs on `ResourceFootprint`, `control.db`
+exists and an admitted model routes to Soma. Remaining for the gate: the offline admission pipeline
+(`admit()` over SSE) and the scope-annotated route table, both of which belong to later gates.
+
+`include/soma/routing.hpp` + `src/soma/routing.cpp`. `select_backend(config, record)` is **pure** — no
+node, no placement, no I/O — which is what lets the whole policy be tested exhaustively rather than
+observed, and lets `GET /v1/agents/{id}` show the decision without causing a placement.
+
+The policy table, all of it, asserted:
+
+| | choice | reason |
+|---|---|---|
+| `stream` / `hybrid` | Soma | verdict |
+| `resident-only` | fallback | verdict |
+| `reject` | fallback | verdict |
+| no record | fallback | absence is not evidence of admissibility |
+| record for **different weights** | fallback | a verdict for other weights is not a verdict for these |
+| override `fallback` | fallback | always honoured — it can only be more conservative |
+| override `soma` + `resident-only` | Soma | honoured: an economics call, and what G4 relies on |
+| override `soma` + `reject` | **fallback** | **refused** |
+
+**The one refusal is a deliberate asymmetry.** `resident-only` means streaming buys nothing on this
+host, so an operator who wants Soma anyway is making a legitimate performance choice. `reject` means the
+model FAILED conformance stage 1 or 2 — Soma's output does not match the reference. Honouring the
+override there would serve knowingly-wrong tokens because of a config flag, and it would present as
+model quality rather than as configuration. The remedy for `reject` is to re-admit with a different
+quantization map, which is a different action, and the API should not let one masquerade as the other.
+
+#### The gate, and a contradiction in the first attempt at it
+
+| model | routed | MiB/token | verdict @48 GiB | verdict @8 GiB |
+|---|---|---|---|---|
+| Mixtral-8x7B | 23 GiB | 6048 | **resident-only** | reject |
+| Qwen3-30B-A3B | 17 GiB | 1098 | resident-only | **stream** |
+
+Mixtral admits as `resident-only` and routes to the fallback **unprompted** — no override, no
+model-specific case, driven through the real planner rather than a hand-written verdict. Asserting
+`select_backend(ResidentOnly) == Fallback` would have proved only the router; the gate is about whether
+Mixtral *earns* that verdict.
+
+The first version of the test used one roomy host and expected Mixtral resident-only alongside Qwen3
+streaming. **That is unsatisfiable**, and the contradiction was in the test: Qwen3's routed set is
+*smaller* than Mixtral's, so every host where Mixtral fits is one where Qwen3 fits too. Worth recording
+because "the big model streams, the small one stays resident" is exactly the intuition the verdict
+exists to correct.
+
+What separates them is the **active fraction**, not size. Mixtral fires 2 of 8 experts per token (25%);
+Qwen3 fires 8 of 128 (6.25%). Streaming reads what fires, so Mixtral moves **5× the bytes per token
+while being only 1.35× larger** — asserted directly, since it is the quantity the whole verdict rests
+on. On the host where neither can be resident, that difference is what makes one `reject` and the other
+`stream`.
+
+#### `soma serve` — the subprocess boundary works
+
+`src/soma/serve.cpp` + `src/soma/main.cpp`. The `soma` executable now has `serve` and `plan`, and the
+whole contract a node needs was exercised against a live process:
+
+```
+$ soma plan --model-dir tests/fixtures/tiny/Qwen3-30B-A3B
+verdict      resident-only
+reason       routed set (1 MiB) fits the expert cache (8175 MiB); streaming has nothing to do
+
+$ soma serve --model-dir ... --port 8099
+GET  /health              -> {"status":"ok","engine":"soma","verdict":"resident-only","streamed":false}
+GET  /v1/models           -> {"data":[{"id":"Qwen3-30B-A3B","owned_by":"soma"}]}
+POST /v1/chat/completions -> {"choices":[{"message":{"role":"assistant","content":"..."}}]}
+POST ... "stream":true    -> data: {...delta...}  x4  then  data: [DONE]
+POST ... image content    -> 422
+```
+
+Three things deliberately not inherited from the fallback path:
+
+- **Readiness is an HTTP poll, not a stdout sentinel.** `RuntimeProcess` already works this way and it
+  is the right shape; a sentinel is a line-buffering bug waiting to happen on Windows. The probe above
+  is literally what the node's `ReadinessProbe::HttpHealth` will do.
+- **Capacity pressure is a structured code.** The existing scheduler detects it by substring-matching
+  six English phrases against the node's error body (`agent_scheduler.cpp:904`), so a new engine would
+  have to emit those exact literals to earn an evict-and-retry. This emits
+  `{"error":{"code":"capacity_pressure"}}`.
+- **Image parts are refused with 422, not dropped.** Silent dropping is the failure worth designing out:
+  the request succeeds, the answer ignores the picture, and nothing says why.
+
+`plan` accepts either a converted container or a raw HF checkpoint — refusing the latter would make the
+subcommand useless exactly when it is most wanted, which is *before* conversion. It runs the same
+planner the server runs, so an operator asking "what will this do here?" and the engine deciding what to
+do cannot disagree.
+
+##### Three limitations, named rather than left to be discovered
+
+1. ~~**Requests serialise on a mutex.**~~ **Fixed** — see "Concurrent turns" below. One thread drives
+   `step()`; request threads admit and wait. Session-scoped sequences were the prerequisite: a shared
+   step loop needs sequences that are not owned by whichever request holds the mutex.
+2. **`CompiledTokenizer::Streamer` is declared and never implemented** — a design-pass stub. The server
+   re-decodes the emitted prefix each step and sends the suffix: O(n²) in tokens, correct, and it
+   handles the split-multi-byte-codepoint case the Streamer exists for, because every delta is the
+   difference between two complete decodes.
+3. **The tiny fixtures ship no `tokenizer.soma`**, so the demo above returns raw token ids as text. That
+   is the documented no-tokenizer fallback and it exercises the full HTTP path; it is not evidence about
+   detokenisation.
+
+#### The node side — supervision, and a watchdog that did not exist
+
+`src/node/engine_process.cpp`, `engine_descriptor.cpp`, `engine_supervisor.cpp`,
+`src/common/engine_client.cpp`. Verified by `tests/soma/engine_g5.cpp`, which launches the **real**
+`soma` binary rather than a mock — the failure modes that matter here (a child that exits during
+startup, a child that dies after reporting ready) do not exist against a stub.
+
+```
+1. engines are DATA, not code paths          7/7    registry, capabilities, argv, probe kind
+2. launch -> ready -> clean stop              5/5   ready in 0.60s; a clean stop is not a crash
+3. an engine that dies is NOTICED             4/4   callback + state=Crashed, by pid
+4. a start-up failure fails fast              4/4   1.22s of a 30s budget
+5. supervisor: sharing, leases, unknown ids  16/16  attach, lease, refuse-unload, detach
+6. a crashed engine stops advertising Ready   6/6   Ready -> Error, and acquire() refuses it
+```
+
+Four results worth stating on their own:
+
+- **A dead engine now stops advertising `Ready`.** The pre-existing gap: nothing polled the child after
+  readiness, so a crashed engine held `SlotState::Ready` until an inference request happened to fail,
+  and the scheduler kept placing work on it. Test 6 kills the process behind the supervisor's back and
+  requires the state transition, then requires `acquire()` to refuse the slot. The record is moved to
+  `Error` rather than removed — control has to be able to *see* that a placement died; a deleted record
+  reads as an engine that was never there.
+- **A start-up failure costs child-exit time, not budget time.** The readiness poll checks child liveness
+  on *every* iteration, not once at the end. A bad model path fails in 1.22 s against a 30 s budget; the
+  naive version would sit for the full 30 s and still pass a boolean assertion.
+- **Two agents share one Soma engine at different `ctx_size`.** This is the descriptor abstraction
+  earning its keep. `llama_launch_compatible()` gates on `ctx_size` because llama-server carves context
+  per slot at launch; Soma's KV slot is per-sequence, so its predicate omits it — one field, and it is
+  the difference between one process per agent and one process for all of them.
+- **`SlotInfo::backend` comes from the descriptor.** It was hardcoded to `"llama-cpp"` in
+  `make_slot_info()`, so every slot reported the same backend regardless of what was running. Likewise
+  an unknown engine id now produces a message listing `EngineRegistry::ids()` — accurate by
+  construction, not by a maintained literal, which is what the two duplicated
+  `backend != "llama-cpp"` checks were.
+
+**Lock discipline is load-bearing, and the watchdog is why.** `on_engine_crash` fires from the watchdog
+thread and takes the supervisor's mutex; `EngineProcess::stop()` joins that thread. Holding the mutex
+across `stop()` therefore deadlocks. Every mutating path extracts the engine under the lock and does the
+blocking work after releasing it — the structure `SlotManager` used for load only, now required
+everywhere.
+
+#### KV checkpoints — one format, one parser, two backends
+
+`src/node/kv_checkpoint_backend.cpp`, wired into `descriptor->kv` for both engines.
+
+**`LlamaKvBackend` is complete.** Same wire protocol as before (`POST /slots/0?action=save|restore`,
+`{"filename": basename}`) because it is the only one llama-server speaks, with three changes:
+
+- `supports_multi_sequence()` returns **false**, and the supervisor consults it. A suspend on an engine
+  holding more than one sequence is now refused with `Unsupported` instead of silently saving sequence 0
+  and discarding the rest — a latent data-loss bug in the current system, since the resumed slot comes
+  back with one agent's context and several agents' expectations.
+- A non-zero `sequence` argument is **refused** rather than quietly rewritten to 0.
+- `save()` verifies the file actually appeared. Which exposed a second bug: the llama descriptor never
+  passed `--slot-save-path`, so llama-server resolved the basename against its own default and the node
+  wrote checkpoints it would never find again. Now passed from `kv_checkpoint_dir`, and a misconfigured
+  launch fails at the save rather than at the restore hours later.
+
+**`SomaKvBackend` saves EVERY session, and that is the substantive difference from the fallback.**
+llama.cpp is asked for one sequence and gives you sequence 0; Soma is asked for the engine and writes
+all of them plus a manifest naming them. `file_extension()` is therefore `.somasession` (the manifest),
+not `.somakv` (one sequence's KV) — the two answer different questions, and `stat_sequence()` exists for
+the second. The manifest carries `arch_hash`, so the pre-spawn cross-architecture rejection works from
+the manifest alone without opening any KV file.
+
+**The header codec now has exactly one owner.** `stat()` has to run *before* an engine is spawned —
+rejecting a cross-architecture resume after a 60-second model load is the confusing version of that
+error — so the node must read the checkpoint header itself. Rather than a second parser in `src/node`,
+the parse moved to `src/soma/kv_checkpoint_header.cpp`, a TU with no dependencies beyond the struct.
+`KvCheckpointStore::load/stat/sweep` go through it, and the node links that one object. Static-library
+linkage pulls only what is referenced, so this does not drag the engine into the node.
+
+The test writes the header bytes **by hand**, deliberately: this is a wire format between two binaries,
+and an independent encoder checking the shared decoder is the point. The other half of the chain — the
+engine's writer against that same decoder — is `soma_checkpoint_g3`.
+
+```
+7. KV checkpoints: the format is owned in ONE place   17/17
+   .kvbin vs .somasession, backend-owned; multi-seq flags; seq!=0 refused;
+   arch_hash/format_id/length_tokens round-trip; v1 refused not misread;
+   missing, empty, bad-magic and truncated all refused; remove idempotent
+```
+
+**A failed suspend no longer kills the engine.** The first version stopped the process and *then*
+discovered the checkpoint had not been written, losing both the context it was trying to preserve and
+the engine along with it. Save now happens first, behind `SlotState::Suspending` so `acquire()` refuses
+during the window; on failure the state goes back to `Ready` and nothing else changes.
+
+#### Session-scoped sequences — what the rest was waiting on
+
+`soma serve` created a sequence per request and finished it with the response, and re-opened the
+scheduler on *every* request, discarding every sequence. Two consequences: each turn re-prefilled the
+whole conversation, and at suspend time there was no live KV for the node to checkpoint at all.
+
+The scheduler is now opened once, at `ServeServer::open()`, and a finished sequence is **retained**
+rather than erased. A conversation key (`"conversation"` in the body, or `X-Conversation-Id`) maps to
+the sequence holding its KV; the next turn calls `Scheduler::extend()`, which prefills only the suffix.
+An absent key means stateless — the previous behaviour, and still the default. A KV slot is real memory,
+so the scheduler REFUSES rather than silently evicting; choosing whose context to drop is policy and
+lives in serve, where sessions have names (LRU, then one retry).
+
+```
+8. a sequence outlives the request that created it     8/8
+   turn 1 -> seq 1, 36 KV tokens
+   turn 2 -> seq 1, 70 KV tokens        reused and EXTENDED, not rebuilt
+   different key -> its own sequence
+   edited prompt -> seq 3, 47 tokens    cold start, not a wrong cache
+9. suspend writes EVERY session, not sequence 0        7/7
+   manifest stats with no running engine; 2 sessions, 87 tokens, arch_hash present
+```
+
+`EngineSupervisor::sequences()` now returns real data, asked of the engine through a new
+`EngineDescriptor::fetch_sequences` hook rather than synthesised from an agent count — a fabricated row
+looks like per-sequence data while carrying none. llama.cpp has no such route and reports nothing, which
+is the truth there.
+
+**Checkpoint format v2 carries the token ids.** v1 did not, and that made every checkpoint unsafe to
+replay: a cache of length L attaches to any prompt, and if the first L tokens differ the attention reads
+a context nobody supplied. Nothing detects it — the output is fluent and wrong. The ids cost 4 bytes per
+position against a payload of `L x n_kv x n_layers x 2 x 4` (0.016% for a 24-layer model with 128 kv
+channels) and turn "trust the caller" into a checkable prefix. v1 files refuse to load, and that version
+check moved into the shared parser because the node reads headers without a store: every offset in a v1
+layout is wrong by `4 x length_tokens`, silently.
+
+Three places check the prefix rather than assume it — `Scheduler::extend` (same process, next turn),
+`Scheduler::admit` via `SeqRequest::resume_key` (next process, after a restore), and
+`KvCheckpointStore::save`, which refuses a token list whose length disagrees with the cached positions.
+A misaligned list makes the check downstream meaningless while still reading as a guarantee.
+
+**Two faults this exposed, both fixed.** The token callback was unfiltered — harmless when the scheduler
+held one sequence, and it would now splice another conversation's tokens into a response. And the
+no-tokenizer fallback encoded *every* prompt as the single token 0, so prompt length did not track the
+prompt; a session cannot be exercised at all under that. It falls back to bytes now, which is not a
+tokenizer and does not pretend to be one, but makes length real.
+
+#### Concurrent turns — the union, finally reachable over HTTP
+
+`generate()` held a mutex across the entire turn, so the batch union — the mechanism this whole engine
+is built around — only ever had **one** sequence to union. One thread now drives `step()`; request
+threads admit and wait on their own completion signal.
+
+```
+10. concurrent turns land in ONE forward               6/6
+    output IDENTICAL alone vs batched      byte-for-byte
+    4 concurrent turns, distinct answers, not spliced
+    max observed batch = 4
+    union at the widest sampled step: 26 unique / 64 naive = 2.46x
+```
+
+**The gate is the identity check, not the batch size.** Batching sequences together must not change what
+any of them says — the same property G3 asserts inside the scheduler, now asserted through the HTTP
+boundary where the batch is actually assembled. A concurrency win that quietly perturbs output is not a
+win.
+
+Three things had to change underneath, and each was a real defect rather than plumbing:
+
+- **`Scheduler::step()` now takes the same lock `admit`/`cancel`/`extend` take.** It read and wrote
+  `ready`, `seqs` and `stats` unlocked, which was correct exactly as long as one thread did everything.
+  `idle()` likewise, and it lost its `noexcept`. The rule this creates is worth stating once: the token
+  and finish callbacks fire from inside that lock, so a callback that calls back into the scheduler
+  deadlocks.
+- **A finish callback.** `is_last` on the token callback was not enough — a sequence can end without
+  producing a token (a prompt that fills the context during prefill does), and a caller keying
+  completion off `is_last` waits forever. `last` is also now computed *before* the token goes out, so a
+  listener is not told about a token and then, separately, that the turn is over.
+- **Stateless turns retire their sequence.** Retaining finished sequences is what makes a session warm;
+  doing it for keyless turns too would hold a KV slot per request until the pool was exhausted and every
+  later request was refused with `NoKvSlot`. Introduced by the retain change one section above, found by
+  the concurrency test.
+
+**Lock order is the one rule this file keeps:** the scheduler's lock is always taken first. `serve`'s
+`state_mu` guards only the session and waiter tables, and every path releases it before calling into the
+`Scheduler` — the callbacks run the other way round, and holding both in either order in two places is a
+deadlock. `on_delta` is likewise called outside the waiter's lock: it writes to a socket, and holding a
+lock across a network write is how one slow client stalls every sequence in the batch.
+
+##### Named gaps, not silent ones
+
+1. **Warm continuation needs a tokenizer whose decode-then-encode round-trips.** The tiny fixtures ship
+   no `tokenizer.soma`, so the test pins `max_tokens = 1` — the cache then holds exactly the prompt,
+   since the single sampled token is never fed back — and sends the full transcript each turn the way a
+   real client does. The mechanism is what is under test; the round-trip property belongs to the
+   tokenizer.
+2. **Restore is lazy.** `/internal/kv/restore` validates the manifest's `arch_hash` and reports what is
+   replayable; the caches are attached when each conversation's next request arrives, via `resume_key`.
+   Eagerly restoring would hold KV slots for conversations that may never come back.
+3. **`SomaEngineClient::stream_telemetry` has no server route yet.** The client is correct; the engine
+   publishes `/health`, `/v1/models`, `/internal/plan`, `/internal/sessions`, `/internal/kv/*` and the
+   chat surface today.
+4. **`estimate_footprint` sizes the directory rather than reading `soma plan --json`.** Recursive
+   directory sizing already fixes the live bug it replaces — `fs::file_size()` errors on a directory and
+   falls through to a flat 2048 MB, so every multi-shard HF model and every Soma container sized
+   identically. `GET /internal/plan` now exists to make the honest version a small change.
+
+**Found while wiring this:** `mm_reliability_tests` could not run under `ctest` on Windows at all — the
+loader failed with `0xC0000135` before `main()`, which presents as an exception with no output. Its
+vcpkg DLLs were only ever on PATH by accident of the invoking shell. Fixed by copying
+`$<TARGET_RUNTIME_DLLS:...>` beside each executable, so the suite is runnable from any shell. 18/18 pass.
+
+#### Porting the live call sites
+
+The abstractions existed and were tested; the running system still used the old ones. This is the pass
+that connects them.
+
+**Node.**
+- The two duplicated `backend != "llama-cpp"` 400s (`node_api_server.cpp:449` and `:911`) are now
+  registry lookups, and the `supported_backends` list in the body is `EngineRegistry::ids()` — accurate
+  by construction rather than by a hand-maintained literal that had already been copied once.
+- The registry is populated at startup from `llama_server_path` and a new `soma_path`
+  (`MM_SOMA_PATH`), and the llama descriptor is **re-registered** when the provisioner resolves a real
+  executable, so the placeholder does not shadow it.
+- Load and restore failures now carry a structured `code`, and capacity failures answer **503** rather
+  than 500.
+
+**Control.**
+- `response_indicates_capacity_pressure` reads the structured code. The six-English-phrase substring
+  match survives only as a fallback for a stale engine on the far side of a rolling upgrade, and is
+  documented as such. A structured code is authoritative: one that says something else means the engine
+  decided this is not capacity, and reading its prose for a contradicting hint would undo the point of
+  asking.
+- The hard `is_llama_backend` gate at `agent_scheduler.cpp:304` — which refused any non-llama agent
+  outright — is replaced by `AgentScheduler::resolve_backend()`, which calls the same
+  `soma::select_backend()` the engine uses. Control links `mm_soma` for exactly two objects so the
+  policy has one implementation rather than a copy that drifts.
+- `backend_override` (`auto | soma | fallback`) is persistent on the agent, migration 11, normalised on
+  write so a typo cannot reach the router.
+- Three hardcoded `{"backend", "llama-cpp"}` bodies and the slot-reuse filter now use the *resolved*
+  engine id. The engine fingerprint does too — with a literal there, an agent whose routing changed
+  would have kept a slot running the other engine.
+- `PUT /v1/agents/{id}/backend` exists, and `GET /v1/placements` reports `backend` and
+  `backend_reason`. The override had no route at all, so changing an agent's engine would have meant
+  editing the database.
+
+**The flat-2048 bug is fixed.** `estimate_inference_vram_mb()` called `fs::file_size()` on the model
+path, which sets an `error_code` on a directory and fell through to a flat 2048 MB — so every
+multi-shard HF checkpoint and every converted Soma container reported the same size, and that single
+number was what placement consumed. `src/common/footprint.cpp` now exists (it was a declared header with
+no implementation) and `measure_model_bytes()` sizes directories recursively.
+
+**One ODR violation found on the way.** `runtime_process.hpp` and `engine_process.hpp` both declared
+`enum class ProcessState` in namespace `mm` — the old four-state one and the new five-state one, which
+adds `Crashed`. Any translation unit needing both the registry and a slot manager would have failed;
+none had, yet. The definition follows the replacement.
+
+**`SlotManager` is gone.** `src/node/slot_manager.{cpp,hpp}` are deleted; the node holds an
+`EngineSupervisor`. The renames were mechanical, but three things were not:
+
+- **`load` and `restore` take an engine id.** The handler passes the `backend` from the request
+  through; which executable that is, what argv it takes and how to probe it belong to the descriptor.
+- **The lease yields an `EngineClient`, so streaming errors arrive structured.** The node forwards the
+  code, and control no longer has to read a message to decide whether a failure was capacity.
+- **`suspend()` on an engine with no live process now FAILS.** `SlotManager` reported `Ok` with an
+  empty cache path, which is a suspend that silently dropped the context it was called to preserve.
+  Two tests asserted that old behaviour and now assert the refusal; a third needed a suspended record
+  it could no longer produce, so `add_suspended_test_engine()` constructs the end state directly —
+  making `suspend()` succeed without a checkpoint to keep a test green would have been the wrong repair.
+
+**And the SSE mapping bug is fixed while the handler was open.** `/api/node/infer` mapped chunks through
+an if/else-if priority chain, so a chunk carrying both `thinking_delta` and `delta_content` silently
+dropped one, and `tool_result_json` had no branch at all and was never emitted. Both are named in
+[mantic-mind-integration.md](mantic-mind-integration.md) as faults the rebuild must not inherit. Every
+field the chunk carries is now emitted, and `done` is unconditional — it closes the stream, so it cannot
+depend on one of the other branches having matched. A dropped delta presents as the model omitting a
+word, not as a transport bug, which is why it survived this long.
+
+#### Placement over three axes
+
+`nodes_with_available_vram(int64_t)` is now `nodes_with_capacity(ResourceFootprint, CapacityPolicy)`.
+The policy is unchanged in value — same 1 GiB VRAM and 2 GiB RAM headroom, same 0.60 offload weight,
+same 8 GiB minimum GPU for hybrid loads, and a native fit still outranks every offloaded one — but the
+four `constexpr`s that lived inside the registry are `CapacityPolicy`'s defaults, so the node and
+control cannot disagree about what "fits" means.
+
+**`NodeInfo::disk_free_mb` is read for the first time.** It has been collected on every health poll
+since it was written and consulted by nothing, because the scalar the scheduler passed around had
+nowhere to put it. `evaluate_fit()` now checks disk headroom on *every* placement, not only when the
+footprint asks for disk: a node with no room cannot write a KV checkpoint or spill, whatever the model
+costs. `disk_free_mb == 0` is treated as **not reported** rather than full — the field defaults to zero
+and an older node never sends it, so enforcing against it would exclude every node predating the field.
+
+llama.cpp's estimate still goes in `vram_mb` and `ram_mb`/`disk_mb` stay zero for it: the estimate folds
+weights, KV and overhead into one number that behaves like VRAM, and the offload path inside
+`evaluate_fit()` is what trades RAM against it, exactly as before. What changed is that a Soma
+footprint — RAM + disk, from its plan — now has somewhere to go.
+
+Two tests cover it, both asserting things that could not be asserted before:
+
+```
+multi_shard_directory_sizes_correctly
+    a 3-file directory sizes to 9 MiB, nested file included
+    two different directories no longer size identically   <- the 2048 MB bug
+    a missing path reports 0, not a plausible constant
+capacity_fit_across_three_axes
+    native outranks offload however much headroom offload has left
+    a 4 GiB GPU cannot be offloaded against
+    a node with 512 MB free disk is refused, and the reason says "disk"
+    disk_free_mb == 0 means not-reported, and still fits
+    a RAM+disk footprint with no VRAM fits natively
+```
+
+#### control.db — Soma becomes routable
+
+The first control-wide database in this system: until now the only SQLite was per-agent
+(`data/agents/{id}/agent.db`), with remembered nodes in `nodes.json` and node model state in a JSON
+journal. Migrations follow `AgentDB::run_migrations()` exactly — a `schema_migrations` table and one
+`if (!has_version(N)) { Transaction; DDL; INSERT N; commit; }` block per version. That pattern works;
+there was no reason to invent a second one.
+
+All seven tables from [001_init.sql](schemas/registry/001_init.sql) are created: `model`,
+`expert_heat`, `kernel_choice`, `pilot_profile`, `conformance`, `api_token`, `placement_history`.
+
+**`/v1/models` is reclaimed.** It returned agents wearing model costumes, with an `openai_compat_note`
+pointing at the other port for the real thing. The agents catalog stays on the `:9091` OpenAI-compat
+listener where it belongs; on `:9090` the route now means the admission registry — `GET` (list and by
+id, with conformance stages), `POST` (register an already-converted model), `PUT .../verdict`,
+`DELETE`, `.../plan`, `.../heat`. The token-gate test asserted the old meaning and now asserts the new
+one.
+
+**The routing loop is closed.** `AgentScheduler::resolve_backend` stays pure — it takes an
+`AdmissionRecord` — and `resolve_backend_for()` looks the record up. The two verdict enums
+(`mm::ModelVerdict` for storage, `soma::Verdict` for the engine) are mapped with an explicit switch
+rather than a cast, so adding a value to one cannot silently reinterpret rows written under the other.
+
+```
+model_registry_makes_soma_routable
+    before admission: auto -> llama-cpp, AND override=soma -> llama-cpp
+    admit with verdict=stream: the same agent config -> soma, reason cites the verdict
+    override=fallback still wins (it can only be more conservative)
+    resident-only -> llama-cpp, but override=soma IS honoured (economics)
+    reject -> llama-cpp, and override=soma is REFUSED (conformance)
+    "nonsense" parses to reject, not to a licence to stream
+    re-upsert on the same arch_hash updates rather than duplicating
+    verdict survives close/reopen; delete cascades; a scheduler with no registry
+      still routes to the fallback
+```
+
+**Registration is separate from admission, and that is the honest split.** `admit()` — fetch, convert,
+compile the tokenizer, run the ladder, profile — is the offline pipeline in `tools/admission/` and
+returns an error saying exactly that. What exists is everything *downstream* of it: `upsert()` is the
+write primitive `admit()` would end with, so a model converted offline can become evidence here. Keyed
+on `arch_hash`, because that is the model's identity — requantized weights are a different row, since
+they have a different verdict.
+
+**`plan_for_host()` returns the admission-host verdict and labels it as such.** It cannot compute the
+effective one: the verdict is a property of `(model, quantization, host budget)`, which is why
+`soma plan --json` runs on the *target node*. Every model JSON carries `verdict_scope:
+"admission-host"` for the same reason — a reader who takes the stored verdict as "what this node will
+do" will eventually be wrong.
+
+##### What is NOT ported yet, stated plainly
+
+1. **`admit()` is not in-process.** Converting a model is `tools/admission/convert.py`, and the SSE
+   progress stream that would report it (`POST /v1/models/admit`) lands with the self-service gate.
+   Registering the result is a `POST /v1/models` away.
+
 **Build:** the supervision rebuild — `EngineProcess`, `EngineSupervisor`, `EngineDescriptor` +
 registry, `EngineClient` with virtual `stream_complete`, `KvCheckpointBackend` ×2, `PlacementEngine`,
 `ResourceFootprint`, `control.db`. llama.cpp **ported onto** these abstractions.
@@ -1514,11 +1973,14 @@ registry, `EngineClient` with virtual `stream_complete`, `KvCheckpointBackend` �
   at will happily be bad at it.
 - A Soma agent and a fallback agent run **concurrently on the same node**.
 - A converted model directory sizes correctly. Assert the old flat-2048 MB path is gone by checking a
-  multi-shard fallback model too.
+  multi-shard fallback model too. **Done** — `measure_model_bytes()` sizes directories recursively and
+  `multi_shard_directory_sizes_correctly` asserts two different directories no longer size identically.
 - Killing a Soma process is detected by the watchdog within one poll interval, and the engine transitions
   to `Error` rather than advertising `Ready`.
 - `capacity_pressure` as a structured code drives evict-and-retry, with the substring matcher deleted.
 - Suspend on a multi-sequence llama.cpp slot returns 409 rather than silently saving sequence 0.
+  **Done** — `LlamaKvBackend::supports_multi_sequence()` is false and `EngineSupervisor::suspend`
+  refuses with `Unsupported` / `unsupported_content`. The HTTP status mapping lands with the route at G6.
 
 ---
 

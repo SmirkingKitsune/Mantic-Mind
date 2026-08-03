@@ -61,11 +61,32 @@ struct SeqRequest {
     Determinism determinism = Determinism::Batched;
     std::uint32_t max_tokens = 0;
     std::vector<std::string> stop_strings;
+
+    /// Optional: replay this persisted checkpoint as the prompt's prefix.
+    ///
+    /// The checkpoint carries the token ids it covers, and admit() VERIFIES they
+    /// are a prefix of `prompt` before attaching the cache. A mismatch is not an
+    /// error — it is a cold start with a log line — because the alternative,
+    /// attaching a cache that belongs to different tokens, produces fluent
+    /// output about a context nobody supplied and nothing detects it.
+    std::string resume_key;
 };
 
 /// Fired on the scheduler thread as tokens are produced. Must not block.
+///
+/// ALL THREE fire from inside step(), which holds the scheduler's own lock. A
+/// callback that calls back into the Scheduler therefore deadlocks. They are the
+/// hot path's only outward edge, so they must be short: append and signal, never
+/// decode-and-write-a-socket.
 using TokenCallback = std::function<void(SeqId, TokenId, bool is_last)>;
 using ErrorCallback = std::function<void(SeqId, StatusCode, const char* what)>;
+
+/// A sequence reached its end. The unambiguous completion signal.
+///
+/// `is_last` on TokenCallback is not enough: a sequence can end without
+/// producing a token — a prompt that fills the context during prefill does —
+/// and a caller keying completion off `is_last` would wait forever.
+using FinishCallback = std::function<void(SeqId)>;
 
 struct SchedulerStats {
     std::uint32_t active_sequences = 0;
@@ -115,10 +136,11 @@ public:
     void close();
 
     /// No sequences left — the step loop's termination condition.
-    bool idle() const noexcept;
+    bool idle() const;
 
     void set_token_callback(TokenCallback cb);
     void set_error_callback(ErrorCallback cb);
+    void set_finish_callback(FinishCallback cb);
 
     /// Cache-aware admission control — the constraint most likely to be got
     /// wrong, and getting it wrong inverts the entire benefit of batching.
@@ -136,6 +158,38 @@ public:
 
     /// One ragged-batch forward. Called in a loop by the serve thread.
     Status step();
+
+    /// Continue a sequence that has finished its turn, with more prompt.
+    ///
+    /// This is what makes a sequence SESSION-scoped rather than request-scoped. A
+    /// finished sequence keeps its KV, its emitted history (the input to the
+    /// repetition penalties) and its sampler RNG; extend() appends the new turn
+    /// and prefills only the suffix.
+    ///
+    /// `prompt` is the FULL conversation, not the delta. The scheduler holds the
+    /// ids its cache covers and checks they are a prefix — so a client that
+    /// edits earlier turns gets a correct cold start rather than a warm cache
+    /// describing a conversation that no longer exists. Returns ArchMismatch on
+    /// that check, and the caller's remedy is to cancel() and admit() fresh.
+    Status extend(SeqId id, std::vector<TokenId> prompt, std::uint32_t max_tokens);
+
+    /// Persist a sequence WITHOUT releasing it — the node's suspend path.
+    ///
+    /// preempt() releases the KV buffer because reclaiming memory is its whole
+    /// point. Suspend is different: the checkpoint must exist before the process
+    /// is stopped, and if the stop is abandoned the engine has to still be
+    /// serving. One format, two lifetimes.
+    Status checkpoint(SeqId id, const std::string& key);
+
+    /// The token ids currently covered by a sequence's KV, in order.
+    ///
+    /// The authority for what a warm cache actually contains. A caller that keeps
+    /// its own copy and trusts it will eventually be wrong about one of them.
+    Status sequence_tokens(SeqId id, std::vector<TokenId>& out) const;
+
+    /// Ids of every live sequence, finished ones included — a finished session is
+    /// still holding a KV slot and is still resumable.
+    std::vector<SeqId> sequence_ids() const;
 
     /// Evict a sequence by persisting its KV checkpoint; re-admit later.
     ///

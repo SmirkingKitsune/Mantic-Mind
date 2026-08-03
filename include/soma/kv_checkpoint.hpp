@@ -25,7 +25,18 @@
 
 namespace soma {
 
-inline constexpr std::uint32_t kKvCheckpointVersion = 1;
+/// v2 carries the TOKEN IDS the cached positions correspond to.
+///
+/// v1 did not, and that made every checkpoint unsafe to replay: a cache of
+/// length L can be attached to any prompt, and if the first L tokens differ the
+/// attention reads a context nobody asked for and the output is quietly wrong.
+/// Nothing detects it. Carrying the ids costs 4 bytes per position against a
+/// payload of `L x n_kv x n_layers x 2 x 4` — for a 24-layer model with 128 kv
+/// channels, 0.016% — and turns "trust the caller" into a checkable prefix.
+///
+/// v1 files refuse to load rather than being reinterpreted, which is the same
+/// rule every other on-disk format here follows.
+inline constexpr std::uint32_t kKvCheckpointVersion = 2;
 
 struct KvCheckpointHeader {
     std::uint32_t version = kKvCheckpointVersion;
@@ -41,6 +52,33 @@ struct KvCheckpointHeader {
     std::uint64_t payload_bytes = 0;
     std::uint64_t written_at_ms = 0;
 };
+
+/// Parse a checkpoint header out of raw bytes. `payload_at` receives the offset
+/// the KV payload starts at.
+///
+/// Exposed as a free function because the header is a WIRE FORMAT between two
+/// binaries, not an implementation detail of the store. The node has to read it
+/// before spawning an engine — that is the whole point of a pre-spawn resume
+/// check — and a second parser living in the node is how the two would drift.
+/// The store's own load()/stat()/sweep() go through this same function.
+/// `tokens_at`, when given, receives the offset of the token-id array.
+///
+/// Both offsets are computed arithmetically, so neither the tokens nor the
+/// payload need to be present in `data`. That is what lets stat() read a bounded
+/// prefix of a multi-gigabyte checkpoint.
+Status parse_kv_checkpoint_header(const std::byte* data,
+                                  std::size_t size,
+                                  KvCheckpointHeader& out,
+                                  std::size_t& payload_at,
+                                  std::size_t* tokens_at = nullptr);
+
+/// Read just the header from a file. Reads a bounded prefix, never the payload —
+/// a checkpoint is gigabytes and the caller only wants to know whether it is
+/// replayable here.
+Status read_kv_checkpoint_header(const std::string& path, KvCheckpointHeader& out);
+
+/// The extension this format uses on disk. Backend-owned, like format_id.
+const char* kv_checkpoint_extension() noexcept;
 
 /// Persists and restores per-sequence KV regions.
 ///
@@ -67,8 +105,13 @@ public:
     /// in-memory type differs. Keeping one on-disk format across both is the
     /// whole premise of this file: a checkpoint written by the scheduler must be
     /// loadable by warm reopen and by cluster slot restore without translation.
-    Status save(const std::string& key, const KvCache& kv);
-    Status load(const std::string& key, KvCache& kv);
+    ///
+    /// `tokens` must be exactly the ids occupying the cached positions, in order.
+    /// It is not metadata: it is what makes a restore checkable, and load()
+    /// returns it so the caller can prove the checkpoint is a prefix of the
+    /// prompt it is about to be attached to.
+    Status save(const std::string& key, const KvCache& kv, const std::vector<TokenId>& tokens);
+    Status load(const std::string& key, KvCache& kv, std::vector<TokenId>& out_tokens);
 
     Status stat(const std::string& key, KvCheckpointHeader& out) const;
     bool exists(const std::string& key) const noexcept;

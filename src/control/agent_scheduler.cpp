@@ -1,10 +1,13 @@
 #include "control/agent_scheduler.hpp"
 
+#include "soma/routing.hpp"
+
 #include "common/http_client.hpp"
 #include "common/inference_sizing.hpp"
 #include "common/logger.hpp"
 #include "common/pairing.hpp"
 #include "common/util.hpp"
+#include "control/model_registry.hpp"
 #include "control/node_registry.hpp"
 
 #include <nlohmann/json.hpp>
@@ -199,10 +202,17 @@ std::string resolved_manifest_identity(const std::string& ref,
 }
 
 std::string engine_fingerprint(const AgentConfig& cfg,
-                               const std::string& models_dir) {
+                               const std::string& models_dir,
+                               const std::string& engine_id) {
     const auto& runtime = cfg.runtime_settings;
     const nlohmann::json identity = {
-        {"backend", "llama-cpp"},
+        // The RESOLVED engine, passed IN. The fingerprint decides whether an
+        // existing placement still describes this agent, so an agent whose
+        // routing changed from fallback to Soma must not keep a slot running the
+        // other engine — with a literal here, it would. Threaded through rather
+        // than looked up again, so it cannot disagree with the decision the
+        // caller already acted on.
+        {"backend", engine_id},
         {"model", resolved_manifest_identity(cfg.model_path, models_dir)},
         {"vision_enabled", cfg.vision_settings.enabled},
         {"projector", cfg.vision_settings.enabled
@@ -299,18 +309,62 @@ AgentScheduler::AgentScheduler(NodeRegistry& registry, std::string models_dir)
     : registry_(registry)
     , models_dir_(std::move(models_dir)) {}
 
+AgentScheduler::BackendRouting AgentScheduler::resolve_backend(
+    const AgentConfig& cfg, const soma::AdmissionRecord& record) {
+    if (!is_llama_backend(cfg.inference_backend)) {
+        // API-backed (and unsupported legacy) agents own no node slot at all.
+        // This is a different question from which local engine to use.
+        return {{}, "inference_backend '" + cfg.inference_backend + "' is not node-local"};
+    }
+
+    soma::AgentBackendConfig rc;
+    if (cfg.backend_override == "soma") rc.override = soma::BackendOverride::Soma;
+    else if (cfg.backend_override == "fallback") rc.override = soma::BackendOverride::Fallback;
+    rc.arch_hash = record.arch_hash;
+
+    const auto decision = soma::select_backend(rc, record);
+    return {decision.choice == soma::BackendChoice::Soma ? "soma" : "llama-cpp",
+            decision.explain()};
+}
+
+void AgentScheduler::set_model_registry(const ControlModelRegistry* registry) {
+    models_ = registry;
+}
+
+AgentScheduler::BackendRouting
+AgentScheduler::resolve_backend_for(const AgentConfig& cfg) const {
+    soma::AdmissionRecord record;   // absent by default, which routes to fallback
+    if (models_ != nullptr) {
+        if (const auto admitted = models_->resolve(cfg.model_path)) {
+            record.present = true;
+            record.arch_hash = admitted->arch_hash;
+            // Two verdict enums, one meaning. ModelVerdict is the registry's
+            // storage type and soma::Verdict is the engine's; they are mapped
+            // explicitly rather than static_cast so adding a value to one cannot
+            // silently reinterpret rows written under the other.
+            switch (admitted->verdict) {
+                case ModelVerdict::Stream:       record.verdict = soma::Verdict::Stream; break;
+                case ModelVerdict::Hybrid:       record.verdict = soma::Verdict::Hybrid; break;
+                case ModelVerdict::ResidentOnly: record.verdict = soma::Verdict::ResidentOnly; break;
+                case ModelVerdict::Reject:       record.verdict = soma::Verdict::Reject; break;
+            }
+        }
+    }
+    return resolve_backend(cfg, record);
+}
+
 std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     const AgentConfig& cfg) {
-    if (!is_llama_backend(cfg.inference_backend)) {
-        // API-backed (and unsupported legacy) agents do not own node slots.
+    const auto routing = resolve_backend_for(cfg);
+    if (routing.engine_id.empty()) {
         // Release a prior local placement before reporting the routing result.
         release_agent(cfg.id);
-        set_last_error("unsupported local inference backend '" + cfg.inference_backend
-                       + "'; this branch supports llama-cpp only");
+        set_last_error("agent has no node-local backend: " + routing.reason);
         return std::nullopt;
     }
 
-    const std::string desired_fingerprint = engine_fingerprint(cfg, models_dir_);
+    const std::string desired_fingerprint =
+        engine_fingerprint(cfg, models_dir_, routing.engine_id);
     std::lock_guard schedule_lock(schedule_mutex_);
     set_last_error({});
 
@@ -375,9 +429,20 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         }
     }
 
-    const int64_t vram_needed = estimate_inference_vram_mb(
-        cfg.model_path, cfg.runtime_settings, models_dir_)
-        + projector_file_mb(cfg, models_dir_);
+    // Three axes, not one.
+    //
+    // llama.cpp's estimate folds weights, KV and overhead into a single number
+    // that behaves like VRAM, so that is where it goes and `ram_mb` stays zero —
+    // the offload path inside evaluate_fit() is what trades RAM against it, as
+    // before. `disk_mb` stays zero too, because the model file's residency is
+    // not additional to what the node already holds and NodeInfo cannot yet say
+    // whether it does. What changed is that disk headroom is now checked on
+    // every placement, and that a Soma footprint — RAM + disk, from its plan —
+    // has somewhere to go.
+    ResourceFootprint needed;
+    needed.vram_mb = estimate_inference_vram_mb(
+                         cfg.model_path, cfg.runtime_settings, models_dir_) +
+                     projector_file_mb(cfg, models_dir_);
 
     if (existing && existing->suspended) {
         AgentPlacement placement = *existing;
@@ -423,7 +488,7 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
             }
         }
 
-        for (const auto& node : registry_.nodes_with_available_vram(vram_needed)) {
+        for (const auto& node : registry_.nodes_with_capacity(needed)) {
             if (node.id == placement.node_id) continue;
             slot_id = restore_agent_on_node(placement, cfg, node.id);
             if (slot_id) return publish_restored(node.id, *slot_id);
@@ -471,7 +536,10 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         if (attempted_nodes.count(node.id)) continue;
         std::optional<SharedCandidate> best;
         for (const auto& slot : node.slots) {
-            if (slot.state != SlotState::Ready || slot.backend != "llama-cpp") continue;
+            // Match the agent's RESOLVED engine, not "llama-cpp". Sharing a slot
+            // running a different engine would attach the agent to a process
+            // that cannot serve it.
+            if (slot.state != SlotState::Ready || slot.backend != routing.engine_id) continue;
             if (!same_model_reference(slot.model_path, cfg.model_path)) continue;
             if (slot.vision_enabled != cfg.vision_settings.enabled) continue;
             if (cfg.vision_settings.enabled) {
@@ -506,7 +574,7 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         }
     }
 
-    for (const auto& node : registry_.nodes_with_available_vram(vram_needed)) {
+    for (const auto& node : registry_.nodes_with_capacity(needed)) {
         if (const auto slot_id = try_load(node.id)) {
             return publish_new(node.id, *slot_id);
         }
@@ -778,7 +846,9 @@ std::optional<SlotId> AgentScheduler::restore_agent_on_node(
                 {"runtime_settings", cfg.runtime_settings},
                 {"kv_cache_path", node_id == placement.node_id
                     ? placement.kv_cache_node_path : std::string{}},
-                {"backend", "llama-cpp"},
+                // The RESOLVED engine id. Hardcoding "llama-cpp" here is what
+                // made a Soma agent unplaceable regardless of its verdict.
+                {"backend", resolve_backend_for(cfg).engine_id},
                 {"agent_id", cfg.id},
             };
             if (!prepared->model_id.empty()) {
@@ -842,7 +912,9 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
                 {"mmproj_path", prepared->mmproj_path},
                 {"vision_enabled", cfg.vision_settings.enabled},
                 {"runtime_settings", cfg.runtime_settings},
-                {"backend", "llama-cpp"},
+                // The RESOLVED engine id. Hardcoding "llama-cpp" here is what
+                // made a Soma agent unplaceable regardless of its verdict.
+                {"backend", resolve_backend_for(cfg).engine_id},
                 {"agent_id", cfg.id},
             };
             if (!prepared->model_id.empty()) {
@@ -902,6 +974,41 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
 }
 
 bool AgentScheduler::response_indicates_capacity_pressure(const std::string& body) {
+    // A STRUCTURED code, with the six-phrase substring match retained only as a
+    // fallback for engines that have not been updated.
+    //
+    // What it replaces: matching "max slots reached", "out of memory" and four
+    // other English strings against the node's error body. Every engine had to
+    // reproduce those literals verbatim to earn an evict-and-retry, so a new one
+    // silently got a hard failure instead — and translating or rewording any of
+    // those messages would have broken eviction with nothing to catch it.
+    //
+    // Both engines emit {"error":{"code":"capacity_pressure"}} now, and both
+    // paths are exercised because the substring fallback still covers a stale
+    // llama-server on the far side of a rolling upgrade.
+    // Two shapes, because two producers. `soma serve` and the node's own
+    // proxy emit {"error":{"code":...}}; the node's slot handlers keep `error` as
+    // a human string and carry the code alongside it, so existing clients are not
+    // broken by the addition.
+    try {
+        const auto j = nlohmann::json::parse(body);
+        std::string code;
+        if (j.contains("error") && j["error"].is_object()) {
+            const auto& e = j["error"];
+            if (e.contains("code") && e["code"].is_string()) code = e["code"];
+        } else if (j.contains("code") && j["code"].is_string()) {
+            code = j["code"];
+        }
+        if (!code.empty()) {
+            // A structured code is AUTHORITATIVE: one that says something else
+            // means the engine has decided this is not capacity, and reading its
+            // prose for a contradicting hint would undo the point of asking.
+            return code == "capacity_pressure";
+        }
+    } catch (const std::exception&) {
+        // Not JSON — fall through to the legacy match below.
+    }
+
     const std::string lower = util::to_lower(body);
     return lower.find("max slots reached") != std::string::npos
         || lower.find("max active slots reached") != std::string::npos

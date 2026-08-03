@@ -5,6 +5,7 @@
 #include "common/util.hpp"
 #include "control/control_config.hpp"
 #include "control/agent_manager.hpp"
+#include "control/model_registry.hpp"
 #include "control/node_registry.hpp"
 #include "control/agent_scheduler.hpp"
 #include "control/agent_queue.hpp"
@@ -888,6 +889,27 @@ int main(int argc, char** argv) {
 
     // ── Core services ─────────────────────────────────────────────────────────
 
+    // ── control.db ────────────────────────────────────────────────────────────
+    //
+    // The first control-wide database in this system. Without an admission
+    // record, select_backend() routes every agent to the fallback — absence of a
+    // record is not evidence of admissibility — so this is what makes Soma
+    // reachable at all.
+    mm::ControlModelRegistry model_registry;
+    {
+        std::string registry_error;
+        if (!model_registry.open(cfg.data_dir, registry_error)) {
+            // Non-fatal. A control that cannot open its registry still serves
+            // llama.cpp agents correctly; refusing to start would turn a routing
+            // limitation into an outage.
+            MM_WARN("Model registry unavailable ({}); every agent will route to the "
+                    "fallback engine", registry_error);
+        } else {
+            MM_INFO("Model registry: {} models, schema v{}",
+                    model_registry.list().size(), model_registry.schema_version());
+        }
+    }
+
     mm::AgentManager agents(cfg.data_dir);
     agents.load_all();
 
@@ -895,9 +917,14 @@ int main(int argc, char** argv) {
     mm::AgentScheduler    scheduler(registry, cfg.models_dir);
     registry.set_offline_after_seconds(static_cast<int>(cfg.node_offline_after_s));
     mm::AgentQueue        queue;
+    // Both sides of the routing decision see the same registry: the scheduler
+    // reads it to choose an engine, the API serves and edits it. Two lookups
+    // against one table rather than a cached copy that can disagree with itself.
+    scheduler.set_model_registry(&model_registry);
     mm::ControlApiServer  api_server(
         agents, queue, registry, scheduler,
         cfg.data_dir, cfg.models_dir, cfg.external_api_token, cfg.tts);
+    api_server.set_model_registry(&model_registry);
     api_server.cleanup_expired_tts_cache();
     mm::ControlUI         ui(
         registry,

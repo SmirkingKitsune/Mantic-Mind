@@ -77,6 +77,17 @@ struct Seq {
     std::vector<TokenId> emitted;
     SamplerScratch scratch;
 
+    /// The token ids occupying the cached positions, in order.
+    ///
+    /// Appended exactly where kv.commit() advances the cache, so the two cannot
+    /// drift. This is what a checkpoint persists and what extend() checks a new
+    /// prompt against — without it, "resume from this cache" is an act of faith
+    /// whose failure mode is fluent output about a context nobody supplied.
+    std::vector<TokenId> history;
+
+    /// Finished its turn. The sequence STAYS in the map: its KV, its emitted
+    /// history and its sampler RNG are the session, and a session outlives the
+    /// request that created it. cancel() is what actually retires one.
     bool finished = false;
     /// KV is on disk and the buffer has been released; the sequence stays in the
     /// map so its prompt, position and sampler survive the round trip.
@@ -112,6 +123,7 @@ struct Scheduler::Impl {
 
     TokenCallback on_token;
     ErrorCallback on_error;
+    FinishCallback on_finish;
 
     F32Workspace ws;
     std::vector<float> logits;
@@ -223,6 +235,10 @@ void Scheduler::set_error_callback(ErrorCallback cb) {
     impl_->on_error = std::move(cb);
 }
 
+void Scheduler::set_finish_callback(FinishCallback cb) {
+    impl_->on_finish = std::move(cb);
+}
+
 Status Scheduler::admit(SeqRequest request, SeqId& out_id, AdmitRejection& out_reason) {
     auto& im = *impl_;
     std::lock_guard<std::mutex> lk(im.mu);
@@ -258,6 +274,30 @@ Status Scheduler::admit(SeqRequest request, SeqId& out_id, AdmitRejection& out_r
     s->determinism = request.determinism;
     s->max_tokens = request.max_tokens;
 
+    // ── warm reopen ──────────────────────────────────────────────────────────
+    //
+    // Attach a persisted cache as the prompt's prefix, but only after proving it
+    // IS the prefix. Every failure here degrades to a cold start rather than an
+    // error: a missing checkpoint, a stale architecture, or an edited earlier
+    // turn all mean "prefill from scratch", and none of them should fail a
+    // request the engine can serve correctly.
+    if (!request.resume_key.empty() && im.checkpoints != nullptr) {
+        std::vector<TokenId> cached;
+        const auto st = im.checkpoints->load(request.resume_key, s->kv, cached);
+        const bool is_prefix = st.ok() && cached.size() <= s->prompt.size() &&
+                               std::equal(cached.begin(), cached.end(), s->prompt.begin());
+        if (is_prefix && !cached.empty()) {
+            s->history = std::move(cached);
+            s->prompt_pos = static_cast<std::uint32_t>(s->history.size());
+        } else {
+            // Reopen the cache: load() may have written into it before failing,
+            // and a partially populated cache with length 0 is worse than none.
+            if (auto reopen = s->kv.open(im.model->arch, im.cfg.ctx_size); !reopen.ok()) {
+                return reopen;
+            }
+        }
+    }
+
     out_id = s->id;
     im.ready.push_back(s->id);
     im.seqs.emplace(s->id, std::move(s));
@@ -267,6 +307,19 @@ Status Scheduler::admit(SeqRequest request, SeqId& out_id, AdmitRejection& out_r
 
 Status Scheduler::step() {
     auto& im = *impl_;
+
+    // The step now runs UNDER the same lock admit/cancel/extend take.
+    //
+    // It read and wrote `ready`, `seqs` and `stats` unlocked, which was correct
+    // exactly as long as one thread did everything — the serve path held a mutex
+    // across the whole turn. A shared step loop with concurrent admits makes that
+    // a data race, and the batch union's payoff is unreachable without one.
+    //
+    // A forward is milliseconds and an admit is a memcpy, so the contention this
+    // introduces is not the interesting cost. The rule it creates IS interesting:
+    // the token and finish callbacks fire from inside this lock, so a callback
+    // that calls back into the scheduler deadlocks. Callers get told once, here.
+    std::lock_guard<std::mutex> lk(im.mu);
     if (!im.open) return {StatusCode::InvalidArgument, "scheduler is not open"};
 
     im.gate = im.compute_gate();
@@ -385,6 +438,10 @@ Status Scheduler::step() {
         Seq* s = batch[i];
         const auto [first, count] = span[i];
         s->kv.commit(count);
+        // Alongside the commit, never before it: a forward that fails re-queues
+        // its rows without committing, and a history recorded at row-build time
+        // would then claim positions the cache does not hold.
+        s->history.insert(s->history.end(), tokens.begin() + first, tokens.begin() + first + count);
 
         // The LAST row of this sequence's span carries its prediction. Interior
         // prefill rows exist to populate the cache; sampling from one would emit
@@ -401,27 +458,39 @@ Status Scheduler::step() {
             ++im.stats.tokens_out;
         };
 
+        bool produced = false;
         if (s->prefilling()) {
             s->prompt_pos += count;
             if (!s->prefilling()) {
                 emit();
                 s->have_next = true;
-                if (im.on_token) im.on_token(s->id, s->next_token, false);
+                produced = true;
             }
         } else {
             emit();
-            const bool last = (s->generated >= s->max_tokens);
-            if (im.on_token) im.on_token(s->id, s->next_token, last);
+            produced = true;
         }
 
-        if (s->generated >= s->max_tokens && !s->prefilling()) {
+        // Finished sequences are RETAINED, not erased. The KV, the emitted
+        // history and the sampler RNG are the session; erasing here would make
+        // every follow-up turn re-prefill the whole conversation, which is the
+        // cost warm reopen exists to remove. The slot is real memory, so the
+        // caller is responsible for cancel()ing sessions it no longer wants —
+        // admit() reports NoKvSlot rather than silently evicting someone.
+        const bool done = (!s->prefilling() && s->generated >= s->max_tokens) ||
+                          s->kv.length() >= s->kv.capacity();
+
+        // `last` is computed BEFORE the token goes out, so a listener that keys
+        // completion off it is not told about a token and then, separately, that
+        // the turn is over.
+        if (produced && im.on_token) im.on_token(s->id, s->next_token, done);
+
+        if (done) {
             s->finished = true;
-            im.seqs.erase(s->id);
-            continue;
-        }
-        if (s->kv.length() >= s->kv.capacity()) {
-            s->finished = true;
-            im.seqs.erase(s->id);
+            // The unambiguous signal. A sequence can end without producing a
+            // token — a prompt that fills the context during prefill does — so a
+            // caller waiting on `last` from on_token would wait forever.
+            if (im.on_finish) im.on_finish(s->id);
             continue;
         }
         im.ready.push_back(s->id);
@@ -438,6 +507,84 @@ Status Scheduler::step() {
     return {};
 }
 
+Status Scheduler::extend(SeqId id, std::vector<TokenId> prompt, std::uint32_t max_tokens) {
+    auto& im = *impl_;
+    std::lock_guard<std::mutex> lk(im.mu);
+    if (!im.open) return {StatusCode::InvalidArgument, "scheduler is not open"};
+
+    auto it = im.seqs.find(id);
+    if (it == im.seqs.end()) return {StatusCode::NotFound, "no such sequence"};
+    Seq* s = it->second.get();
+    if (s->preempted) return {StatusCode::InvalidArgument, "sequence is preempted; resume first"};
+    if (!s->finished) return {StatusCode::InvalidArgument, "sequence is still generating"};
+
+    // The check that makes a warm cache safe. A client that edits an earlier turn
+    // sends a prompt this cache does not describe, and attaching it anyway
+    // produces fluent output about a conversation that no longer exists.
+    if (prompt.size() < s->history.size() ||
+        !std::equal(s->history.begin(), s->history.end(), prompt.begin())) {
+        return {StatusCode::ArchMismatch,
+                "the cached " + std::to_string(s->history.size()) +
+                    " tokens are not a prefix of this prompt; cancel and admit fresh"};
+    }
+    if (prompt.size() == s->history.size()) {
+        // Nothing new to prefill. The last emitted token was sampled but never
+        // fed back, so an empty extension has no row to contribute and would
+        // spin the step loop forever.
+        return {StatusCode::InvalidArgument, "prompt adds no tokens beyond the cached prefix"};
+    }
+    const auto ctx_needed = prompt.size() + max_tokens;
+    if (ctx_needed > im.cfg.ctx_size) {
+        return {StatusCode::InvalidArgument,
+                "prompt + max_tokens (" + std::to_string(ctx_needed) + ") exceeds ctx_size " +
+                    std::to_string(im.cfg.ctx_size)};
+    }
+
+    s->prompt = std::move(prompt);
+    s->prompt_pos = static_cast<std::uint32_t>(s->history.size());
+    s->max_tokens = max_tokens;
+    s->generated = 0;
+    s->have_next = false;
+    s->finished = false;
+    // `emitted` and `sampler` deliberately survive: the repetition penalties and
+    // the RNG stream are properties of the conversation, not of one turn.
+    im.ready.push_back(id);
+    im.stats.active_sequences = static_cast<std::uint32_t>(im.seqs.size());
+    return {};
+}
+
+Status Scheduler::checkpoint(SeqId id, const std::string& key) {
+    auto& im = *impl_;
+    std::lock_guard<std::mutex> lk(im.mu);
+    if (im.checkpoints == nullptr) {
+        return {StatusCode::Unsupported, "no checkpoint store; scheduler opened without one"};
+    }
+    auto it = im.seqs.find(id);
+    if (it == im.seqs.end()) return {StatusCode::NotFound, "no such sequence"};
+    Seq* s = it->second.get();
+    if (s->preempted) return {StatusCode::InvalidArgument, "sequence is preempted; nothing live"};
+    return im.checkpoints->save(key, s->kv, s->history);
+}
+
+Status Scheduler::sequence_tokens(SeqId id, std::vector<TokenId>& out) const {
+    auto& im = *impl_;
+    std::lock_guard<std::mutex> lk(im.mu);
+    auto it = im.seqs.find(id);
+    if (it == im.seqs.end()) return {StatusCode::NotFound, "no such sequence"};
+    out = it->second->history;
+    return {};
+}
+
+std::vector<SeqId> Scheduler::sequence_ids() const {
+    auto& im = *impl_;
+    std::lock_guard<std::mutex> lk(im.mu);
+    std::vector<SeqId> out;
+    out.reserve(im.seqs.size());
+    for (const auto& [id, _] : im.seqs)
+        out.push_back(id);
+    return out;
+}
+
 Status Scheduler::preempt(SeqId id) {
     auto& im = *impl_;
     std::lock_guard<std::mutex> lk(im.mu);
@@ -448,7 +595,7 @@ Status Scheduler::preempt(SeqId id) {
     if (it == im.seqs.end()) return {StatusCode::NotFound, "no such sequence"};
     Seq* s = it->second.get();
 
-    if (auto st = im.checkpoints->save(checkpoint_key(id), s->kv); !st.ok()) return st;
+    if (auto st = im.checkpoints->save(checkpoint_key(id), s->kv, s->history); !st.ok()) return st;
 
     // The KV buffer is released here — that is the entire point. Preemption that
     // keeps the memory it was called to reclaim is a no-op with extra steps.
@@ -473,7 +620,7 @@ Status Scheduler::resume(SeqId id) {
     if (!s->preempted) return {StatusCode::InvalidArgument, "sequence is not preempted"};
 
     if (auto st = s->kv.open(im.model->arch, im.cfg.ctx_size); !st.ok()) return st;
-    if (auto st = im.checkpoints->load(checkpoint_key(id), s->kv); !st.ok()) return st;
+    if (auto st = im.checkpoints->load(checkpoint_key(id), s->kv, s->history); !st.ok()) return st;
 
     s->preempted = false;
     im.waiting.erase(std::remove(im.waiting.begin(), im.waiting.end(), id), im.waiting.end());
@@ -504,10 +651,15 @@ std::uint32_t Scheduler::effective_max_batch() const noexcept {
     return impl_->gate;
 }
 
-bool Scheduler::idle() const noexcept {
+bool Scheduler::idle() const {
+    // Locked, and no longer noexcept. `ready` is mutated by step() on the driver
+    // thread and by admit() on request threads; reading it unlocked was safe only
+    // while one thread did everything.
+    //
     // Preempted sequences are still live work — they are waiting for a resume,
     // not finished. Reporting idle here would let a driver loop exit while a
     // sequence sits half-generated on disk.
+    std::lock_guard<std::mutex> lk(impl_->mu);
     return impl_->ready.empty();
 }
 

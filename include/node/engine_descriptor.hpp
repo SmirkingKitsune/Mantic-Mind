@@ -79,21 +79,48 @@ struct EngineDescriptor {
     /// Whether two agents may share one live engine process.
     std::function<bool(const RuntimeSettings& a, const RuntimeSettings& b)> launch_compatible;
 
+    /// Live per-sequence state as JSON, for GET /v1/engines/{id}/slots.
+    ///
+    /// Optional; absent means the engine cannot report it, and the supervisor
+    /// returns an empty list rather than synthesising one row per attached agent.
+    /// A fabricated row looks like per-sequence data while carrying none, which
+    /// is the confusion a bare request counter already causes.
+    std::function<bool(const std::string& base_url, std::string& out_json)> fetch_sequences;
+
     bool supports_vision = false;
     bool supports_suspend = false;
     bool supports_multi_seq = false; ///< true for Soma: real per-sequence state
 };
 
 /// Every engine this node can run. Populated once at startup.
+/// The two engines this node knows how to run, as DATA.
+///
+/// `executable` is passed in rather than discovered, because where the binary
+/// lives is deployment configuration and neither descriptor should be reading
+/// the environment behind the caller's back.
+EngineDescriptor make_soma_descriptor(const std::string& executable);
+EngineDescriptor make_llama_descriptor(const std::string& executable);
+
 class EngineRegistry {
 public:
     static EngineRegistry& instance();
+    ~EngineRegistry();
 
+    EngineRegistry(const EngineRegistry&) = delete;
+    EngineRegistry& operator=(const EngineRegistry&) = delete;
+
+    /// Replaces any descriptor already registered under the same id, so a
+    /// re-registration (a provisioner resolving a new executable path) updates
+    /// rather than shadowing.
     void register_engine(EngineDescriptor descriptor);
 
     /// nullptr when unknown. Callers turn that into a 400 whose body lists
     /// ids() — so the error is accurate by construction rather than by a
     /// hand-maintained literal.
+    ///
+    /// The returned pointer stays valid across later registrations: descriptors
+    /// are held indirectly for exactly that reason. A vector of values would
+    /// dangle every previously-handed-out pointer on the next push_back.
     const EngineDescriptor* find(const std::string& id) const;
 
     std::vector<std::string> ids() const;
@@ -101,7 +128,8 @@ public:
 
 private:
     EngineRegistry();
-    std::vector<EngineDescriptor> engines_;
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 /// Per-runtime provisioning/health status, keyed by engine id.

@@ -29,6 +29,11 @@ struct NodeConfig {
     bool        llama_update_check = true;
     int         llama_update_check_interval_hours = 24;
 
+    // Soma — the MoE streaming engine, a PEER of the llama.cpp fallback rather
+    // than a replacement for it. Both are registered at startup and an agent's
+    // verdict decides which one runs it.
+    std::string soma_path = "soma";     // soma executable  MM_SOMA_PATH
+
     // Hardware capability override; zero lets startup detect visible GPUs.
     int         node_gpu_count = 0;        // 0 = auto (nvidia-smi)
     uint16_t    runtime_port_range_start = 8080;

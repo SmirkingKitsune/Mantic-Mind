@@ -10,7 +10,7 @@
 namespace mm {
 
 class NodeState;
-class SlotManager;
+class EngineSupervisor;
 class HttpServer;
 class ModelStore;
 
@@ -20,7 +20,7 @@ class ModelStore;
 class NodeApiServer {
 public:
     NodeApiServer(NodeState& state,
-                  SlotManager& slot_mgr,
+                  EngineSupervisor& engines,
                   std::string control_url = {},
                   std::string pairing_key = {});
     ~NodeApiServer();
@@ -54,8 +54,8 @@ public:
     void set_model_store(ModelStore* store);
 
 private:
-    NodeState&     state_;
-    SlotManager&   slot_mgr_;
+    NodeState&        state_;
+    EngineSupervisor& engines_;
     ModelStore*    model_store_ = nullptr;
     std::string    control_url_;
     std::string    pairing_key_;
