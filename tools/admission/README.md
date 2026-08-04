@@ -17,6 +17,11 @@ below. See [../../docs/roadmap.md](../../docs/roadmap.md).
 ```
 HF repo or local weights
     │
+    ├─ fetch.py              repo id → a local directory                      [G6]
+    │                        safetensors only unless --allow-pickle; never
+    │                        the TF/Flax/GGUF copies of the same weights
+    │                        SKIPPED entirely when `source` is already a path
+    │
     ├─ convert.py            tensor names → canonical roles → our layout      [G2]
     │                        one expert = one contiguous range (gate/up/down
     │                        interleaved), 4 KB-aligned, sidecar index,

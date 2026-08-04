@@ -88,8 +88,26 @@ data: {"type":"error","stage":"conformance","message":"…"}
 data: [DONE]
 ```
 
-Stages: `fetch → convert → tokenize → conformance → profile → finalize`. Cancel with
+Stages: `fetch → convert → tokenize → profile → conformance → finalize`. Cancel with
 `POST /v1/models/admit/{operation_id}/cancel` (`operator`).
+
+**`step` and `total_steps` describe THIS run, not a fixed ladder.** A local directory skips `fetch`; an
+already-converted container (`admit_container`, and what `reprofile` runs) skips `fetch`, `convert` and
+`tokenize` and reports 3 total. Read `stage` for what is happening and `fraction` for how far along;
+`step`/`total_steps` are for rendering "2 of 6".
+
+**`bytes_done` / `bytes_total` are populated by `fetch` only** — it is the one stage whose remaining
+time is estimable. Zero elsewhere means "not reported", not "nothing to transfer".
+
+`source` is a local path if one exists at that name, otherwise a HuggingFace repo id, optionally
+`repo@revision`. A repo id becomes a directory under `sources_dir`, so it is validated as one: at most
+one `/`, no `..`, no backslash. Auth is whatever `huggingface_hub` already resolves (`HF_TOKEN` or a
+cached login) — control never reads or stores a credential.
+
+**A repo with no safetensors is refused unless `admission_allow_pickle` is set.** Converting `.bin`
+weights means unpickling them, which executes code from the repo; that is an operator's decision per
+deployment rather than a default. Framework duplicates (`.h5`, `.msgpack`, `.onnx`, `.gguf`) are never
+transferred, and neither are `.bin` files in a repo that also ships safetensors.
 
 **Failing conformance stage 1 or 2 yields `verdict: "reject"` — it does not fail the request.** A
 rejected model is a successfully-admitted *record* saying "run this on the fallback". That distinction

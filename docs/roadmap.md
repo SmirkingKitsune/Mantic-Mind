@@ -2294,8 +2294,7 @@ is both correct and a closer model of the thing it stands in for.
 
 ##### What is NOT ported yet, stated plainly
 
-1. **Fetching is not implemented.** `admit()` takes a local directory; pulling from a HF repo id is the
-   `fetch` stage's name and not yet its behaviour.
+1. ~~**Fetching is not implemented.**~~ **Done** — see [The fetch stage](#the-fetch-stage) below.
 2. **The OpenAI-compat listener on `:9091` still uses the flat token.** It serves one surface with one
    meaning — chat against agents-as-models — so a scope table for it would have one row. Worth doing
    when it grows a second capability, not before.
@@ -2371,11 +2370,63 @@ store; SSE telemetry with throttling; `/v1/models` reclamation.
 
 ---
 
+#### The fetch stage
+
+`tools/admission/fetch.py`, driven from `run_admission`. `admit()` now takes a HuggingFace repo id —
+optionally `repo@revision` — as well as a local directory. A local path wins if one exists at that name;
+anything else has to pass as a repo id, and both are checked *before* the operation exists, so a typo is
+a 400 rather than an operation that appears to start and dies a second later.
+
+**The repo id is validated because it becomes a directory name.** `../../etc` is a legal-looking string
+and an illegal path, and this field arrives over HTTP from an `operator`-scoped caller. `valid_repo_id`
+is a free function rather than a detail of the pipeline, so the rule is tested for itself — "the
+download failed" is not evidence that path containment held. It is enforced twice, in C++ and again in
+`fetch.py`, and `check_fetch_selection.py` tests the Python half against the same table.
+
+**What it deliberately does not download.** A published checkpoint routinely ships the same weights
+three times — safetensors, PyTorch `.bin`, and a TF/Flax copy. Taking everything triples the transfer
+and the disk for bytes nothing will ever read; on the synthetic repo in the test, selection cuts 41 GB
+to 9 GB. Framework duplicates are never transferred. `.bin` files are skipped when safetensors exist —
+**and so is `pytorch_model.bin.index.json`**, which is the subtle half: an index left behind after its
+shards were dropped points conversion at files that are not there.
+
+**A repo with no safetensors is refused by default.** Converting `.bin` weights means unpickling them,
+which executes code from the repo. `admission_allow_pickle` is the operator saying they meant it, per
+deployment; the error names the reason rather than the file. Auth is whatever `huggingface_hub` already
+resolves — `HF_TOKEN` or a cached login — and nothing here reads, prints, or stores a credential.
+
+**Progress comes from watching the output directory**, not from hooking the downloader's progress bars.
+A 20 GB shard is one file, so per-file granularity reports nothing for twenty minutes; and any
+implementation that puts bytes on disk is observable this way, which a `tqdm` hook is not. `fetch` is
+the only stage that populates `bytes_done`/`bytes_total`, because it is the only one whose remaining
+time a client can estimate — those two fields existed on `AdmissionProgress` and had never been set.
+
+**A bug found on the way past.** `step` and `total_steps` were written independently: a container
+admission advertised `total_steps = 2` and then emitted steps 3, 4 and 5, which a progress bar renders
+as 250%. Both now come from one ordered stage list per run — `fetch` is present only when fetching, and
+a container admission is honestly 3 steps rather than 5-of-2.
+
+**Testing a network stage without a network.** A stub `fetch.py` in a temp tools directory emits exactly
+the line protocol the real one promises. `convert.py` is stubbed too — copying the committed container —
+so the run reaches the *real* `soma plan --json` and all six stages execute end to end. The three cases
+that matter are the ones a mock can actually cover: a fetch that works, one that exits non-zero, and one
+that **exits 0 having produced nothing**. The last is why the resolved path is checked rather than
+trusted; without it, conversion is handed a path that does not exist and the error names `convert.py`.
+Reverting either guard turns the test red, which is how it was confirmed to be load-bearing.
+
+Still not implemented, and named rather than stubbed: resumption across a *control restart* (an
+interrupted transfer restarts the operation, though `snapshot_download` skips what is already on disk),
+and any bandwidth limit.
+
+---
+
 ## G8 — admission pipeline self-service
 
 **Gate:**
 - A GQA MoE checkpoint **not seen during development** goes from `POST /v1/models/admit` to a served
-  agent with **no C++ change**. That is the whole gate.
+  agent with **no C++ change**. That is the whole gate. **`source` may now be a repo id** — see
+  [The fetch stage](#the-fetch-stage) — so the gate no longer presumes an operator downloaded the
+  weights by hand first.
 - An architecture with no backend fails at `validate()` with a clear message, before conversion spends
   hours.
 - Re-admission with different quantization produces a new `arch_hash` and invalidates KV checkpoints;

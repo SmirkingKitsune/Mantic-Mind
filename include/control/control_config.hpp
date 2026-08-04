@@ -26,8 +26,13 @@ struct ControlConfig {
     std::string admission_tools_dir  = "tools/admission";  // MM_ADMISSION_TOOLS
     std::string admission_soma_path  = "soma";             // MM_SOMA_PATH
     std::string containers_dir       = "data/containers";  // MM_CONTAINERS_DIR
+    std::string sources_dir          = "data/sources";     // MM_SOURCES_DIR
     std::string admission_quant      = "q4_g";             // MM_ADMISSION_QUANT
     std::string admission_expert_down = "q6_g";
+
+    // Allow admitting a repo that publishes only pickled .bin weights, which
+    // conversion has to unpickle — i.e. execute. Opt-in per deployment.
+    bool admission_allow_pickle      = false;              // MM_ADMISSION_ALLOW_PICKLE
 
     // Optional bearer token required by external /v1/* client routes.
     std::string external_api_token;

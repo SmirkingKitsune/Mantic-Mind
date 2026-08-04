@@ -56,5 +56,24 @@ add_test(NAME mm_reliability_tests COMMAND mm_reliability_tests)
 # The admission test drives the REAL `soma plan --json` rather than a mock, so it
 # needs the binary and a model. Passed as environment rather than argv because
 # reliability_tests takes an optional test-name filter and nothing else.
+# Called here as well as in src/soma: find_package results live in the directory
+# scope that ran them, and src/soma is a sibling, not a parent.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+
+#
+# MM_TEST_PYTHON drives the fetch stage against a STUB fetch.py. The stage is
+# the only one that touches the network, so it is the only one that cannot be
+# tested against the real thing — what is under test is the C++ side: the
+# progress parsing, the resolved path, and the two ways a fetch can lie about
+# succeeding.
 set_tests_properties(mm_reliability_tests PROPERTIES
-    ENVIRONMENT "MM_TEST_SOMA_PATH=$<TARGET_FILE:soma>;MM_TEST_MODEL_DIR=${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/Qwen3-30B-A3B")
+    ENVIRONMENT "MM_TEST_SOMA_PATH=$<TARGET_FILE:soma>;MM_TEST_MODEL_DIR=${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/Qwen3-30B-A3B;MM_TEST_PYTHON=${Python3_EXECUTABLE}")
+
+if(Python3_Interpreter_FOUND)
+    # Pure, no network, no huggingface_hub: which files a repo transfer takes is
+    # both the economic argument for this stage and its safety boundary.
+    add_test(NAME mm_fetch_selection
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_SOURCE_DIR}/tools/ci/check_fetch_selection.py"
+                     "${CMAKE_SOURCE_DIR}")
+endif()

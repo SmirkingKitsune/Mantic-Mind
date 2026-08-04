@@ -112,12 +112,31 @@ struct AdmissionTools {
     std::string soma_path = "soma"; ///< for `soma plan --json`
     std::string containers_dir = "data/containers";
 
+    /// Where fetched repos land. Separate from containers_dir because these are
+    /// the ORIGINAL weights: conversion reads them and never writes them, and an
+    /// operator reclaiming disk wants to delete one without touching the other.
+    std::string sources_dir = "data/sources"; ///< MM_SOURCES_DIR
+
+    /// Permit `.bin` weights when a repo publishes no safetensors. Off by
+    /// default: converting a pickle executes code from the repo, and that is a
+    /// decision an operator makes per model rather than a default they inherit.
+    bool allow_pickle = false;
+
     /// Quantization for the converted container. Part of the verdict's identity:
     /// the same weights at a different quant are a different admission.
     std::string quant = "q4_g";
     std::string expert_down = "q6_g";
     int group = 128;
 };
+
+/// Is `ref` a HuggingFace repo id this pipeline is willing to fetch?
+///
+/// Accepts `name`, `org/name`, and either with an `@revision` suffix. Validated
+/// rather than trusted, because the id becomes a DIRECTORY NAME under
+/// `sources_dir`: `../../etc` is a legal-looking string and an illegal path.
+/// Exposed as a free function so the rule can be tested for itself rather than
+/// only through a download that fails.
+bool valid_repo_id(const std::string& ref, std::string& out_why);
 
 /// One row of api_token. The token itself is NEVER stored — only its SHA-256 —
 /// so a leaked database backup does not hand over working credentials.

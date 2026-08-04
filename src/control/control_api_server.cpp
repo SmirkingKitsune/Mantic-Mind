@@ -84,6 +84,11 @@ nlohmann::json admission_progress_json(const AdmissionProgress& p) {
         {"step", p.step},
         {"total_steps", p.total_steps},
         {"fraction", p.fraction},
+        // Populated by the fetch stage, which is the only one whose remaining
+        // time a client can estimate. Zero elsewhere, and a client should read
+        // it as "not reported" rather than "nothing to do".
+        {"bytes_done", p.bytes_done},
+        {"bytes_total", p.bytes_total},
         {"cancelable", p.cancelable},
         {"done", p.done},
         {"canceled", p.canceled},

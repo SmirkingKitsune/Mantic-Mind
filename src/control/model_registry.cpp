@@ -27,10 +27,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <cstdio>
 #include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -57,7 +60,92 @@ std::string ref_key(const std::string& ref) {
     return util::to_lower(trimmed);
 }
 
+/// The stages this run will actually go through, in order.
+///
+/// One list rather than hardcoded step numbers, so `step` and `total_steps`
+/// cannot disagree. They did: a container admission advertised 2 total steps and
+/// then emitted steps 3, 4 and 5, which a progress bar reads as 250%.
+std::vector<std::string> admission_stages(bool container_is_ready, bool needs_fetch) {
+    if (container_is_ready) return {"profile", "conformance", "finalize"};
+    std::vector<std::string> s;
+    if (needs_fetch) s.push_back("fetch");
+    s.insert(s.end(), {"convert", "tokenize", "profile", "conformance", "finalize"});
+    return s;
+}
+
+/// Bytes as an operator reads them. Only ever a `detail` string — the numeric
+/// fields carry the exact values, so rounding here loses nothing.
+std::string bytes_label(std::int64_t n) {
+    static const char* kUnits[] = {"B", "KB", "MB", "GB", "TB"};
+    double v = static_cast<double>(n);
+    int u = 0;
+    while (v >= 1024.0 && u + 1 < 5) {
+        v /= 1024.0;
+        ++u;
+    }
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), u == 0 ? "%.0f %s" : "%.2f %s", v, kUnits[u]);
+    return buf;
+}
+
+/// One component of a repo id: starts alphanumeric, then alphanumeric `.`, `-`, `_`.
+bool valid_repo_component(const std::string& c) {
+    if (c.empty() || !std::isalnum(static_cast<unsigned char>(c.front()))) return false;
+    return std::all_of(c.begin(), c.end(), [](unsigned char ch) {
+        return std::isalnum(ch) != 0 || ch == '.' || ch == '-' || ch == '_';
+    });
+}
+
 } // namespace
+
+bool valid_repo_id(const std::string& ref, std::string& out_why) {
+    auto id = util::trim(ref);
+    if (id.empty()) {
+        out_why = "empty";
+        return false;
+    }
+
+    // `@revision` first: it is the only place `/` is allowed to appear freely,
+    // since a branch name may contain one.
+    if (const auto at = id.rfind('@'); at != std::string::npos) {
+        const auto rev = id.substr(at + 1);
+        id = id.substr(0, at);
+        if (rev.empty() || rev.find("..") != std::string::npos ||
+            !std::isalnum(static_cast<unsigned char>(rev.front())) ||
+            !std::all_of(rev.begin(), rev.end(), [](unsigned char ch) {
+                return std::isalnum(ch) != 0 || ch == '.' || ch == '-' || ch == '_' || ch == '/';
+            })) {
+            out_why = "bad revision after '@'";
+            return false;
+        }
+    }
+
+    // Rejected explicitly rather than left to the component rule, because these
+    // are the strings that would escape sources_dir and the error should say so.
+    if (id.find('\\') != std::string::npos || id.find("..") != std::string::npos) {
+        out_why = "a repo id becomes a directory name; '..' and '\\' are not allowed";
+        return false;
+    }
+
+    const auto slash = id.find('/');
+    if (slash == std::string::npos) {
+        if (!valid_repo_component(id)) {
+            out_why = "not a repo id";
+            return false;
+        }
+        return true;
+    }
+    if (id.find('/', slash + 1) != std::string::npos) {
+        out_why = "a repo id has at most one '/'";
+        return false;
+    }
+    if (!valid_repo_component(id.substr(0, slash)) ||
+        !valid_repo_component(id.substr(slash + 1))) {
+        out_why = "not a repo id";
+        return false;
+    }
+    return true;
+}
 
 ModelVerdict parse_verdict(const std::string& text) {
     const auto v = util::to_lower(util::trim(text));
@@ -841,10 +929,22 @@ std::string ControlModelRegistry::admit(const std::string& source_ref,
     }
     const auto source = util::trim(source_ref);
     std::error_code ec;
-    if (source.empty() || !fs::exists(source, ec)) {
-        // Checked BEFORE the operation exists, so a typo is a 400 rather than an
-        // operation that appears to start and fails a second later.
-        out_error = "source model directory not found: " + source;
+    if (source.empty()) {
+        out_error = "no source given";
+        return {};
+    }
+    // A local directory is used as-is; anything else has to be a repo id worth
+    // fetching. Both are checked BEFORE the operation exists, so a typo is a 400
+    // rather than an operation that appears to start and fails a second later.
+    if (fs::exists(source, ec)) {
+        return start_operation(source, /*container_is_ready=*/false, std::move(sink));
+    }
+    std::string why;
+    if (!valid_repo_id(source, why)) {
+        // Both halves, because "not found" alone sends the operator looking for a
+        // typo in a path when they meant a repo id, and vice versa.
+        out_error = "source not found: no directory at '" + source +
+                    "', and it is not a usable repo id (" + why + ")";
         return {};
     }
     return start_operation(source, /*container_is_ready=*/false, std::move(sink));
@@ -891,11 +991,15 @@ std::string ControlModelRegistry::start_operation(const std::string& source,
     const auto tools_copy = tools();
     const auto id = util::generate_uuid();
 
+    std::error_code ec;
+    const bool needs_fetch = !container_is_ready && !fs::exists(source, ec);
+    const auto stages = admission_stages(container_is_ready, needs_fetch);
+
     auto op = std::make_shared<AdmissionOperation>();
     op->progress.operation_id = id;
-    op->progress.stage = container_is_ready ? "profile" : "fetch";
+    op->progress.stage = stages.front();
     op->progress.detail = "queued";
-    op->progress.total_steps = container_is_ready ? 2 : 5;
+    op->progress.total_steps = static_cast<int>(stages.size());
     op->progress.source_ref = source;
     op->progress.started_at_ms = util::now_ms();
     // The sink is attached BEFORE the thread starts, so the first frames cannot
@@ -924,10 +1028,17 @@ void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
                                          const AdmissionTools& tools,
                                          bool container_is_ready) {
     auto progress = op->progress;
-    const auto emit = [&](const std::string& stage, int step, const std::string& detail,
-                          double fraction) {
+
+    std::error_code fs_ec;
+    const bool needs_fetch = !container_is_ready && !fs::exists(source, fs_ec);
+    const auto stages = admission_stages(container_is_ready, needs_fetch);
+
+    // `step` is derived from the stage name, never written by hand. The two used
+    // to be independent and drifted immediately.
+    const auto emit = [&](const std::string& stage, const std::string& detail, double fraction) {
+        const auto at = std::find(stages.begin(), stages.end(), stage);
         progress.stage = stage;
-        progress.step = step;
+        progress.step = static_cast<int>(std::distance(stages.begin(), at)) + 1;
         progress.detail = detail;
         progress.fraction = fraction;
         impl_->publish(op, progress);
@@ -943,18 +1054,113 @@ void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
     const auto canceled = [&] { return op->cancel.load(); };
 
     const fs::path tools_dir(tools.tools_dir);
-    const auto name = fs::path(source).filename().string();
+
+    // The model's name comes from the trailing component either way — a repo id
+    // `Qwen/Qwen3-30B-A3B` and a directory `.../Qwen3-30B-A3B` are the same
+    // model and must produce the same container, or admitting one after the
+    // other silently makes two.
+    auto name = fs::path(source).filename().string();
+    if (needs_fetch) {
+        auto id = source;
+        if (const auto at = id.rfind('@'); at != std::string::npos) id = id.substr(0, at);
+        const auto slash = id.find_last_of('/');
+        name = (slash == std::string::npos) ? id : id.substr(slash + 1);
+    }
     const auto container = (fs::path(tools.containers_dir) / name).string();
 
-    // ── 1. convert ───────────────────────────────────────────────────────────
+    // What conversion actually reads. For a local source that is the source; for
+    // a repo id it is whatever fetch.py resolves to, which is NOT assumed to be
+    // the directory we asked for.
+    std::string local_source = source;
+
+    // ── 1. fetch ─────────────────────────────────────────────────────────────
+    //
+    // The only stage that touches the network. Everything after it works on a
+    // local directory, which is why this is a separate stage rather than a mode
+    // of conversion.
+    if (needs_fetch) {
+        const auto dest = (fs::path(tools.sources_dir) / name).string();
+        emit("fetch", "fetching " + source + " -> " + dest, 0.01);
+        std::error_code ec;
+        fs::create_directories(tools.sources_dir, ec);
+
+        std::vector<std::string> argv{tools.python, (tools_dir / "fetch.py").string(), source,
+                                      "--out", dest};
+        if (tools.allow_pickle) argv.push_back("--allow-pickle");
+
+        std::string err, resolved;
+        std::int64_t seen = 0, expect = 0;
+        const int frc = run_streamed_command(
+            argv, fs::current_path(),
+            [&](const std::string& line, bool) {
+                const auto text = util::trim(line);
+                if (text.empty()) return;
+                // `manifest <files> <bytes>` and `progress <done> <total>` are the
+                // machine-readable lines; everything else is detail for the
+                // operator and is forwarded unchanged.
+                if (text.rfind("resolved ", 0) == 0) {
+                    resolved = util::trim(text.substr(9));
+                    return;
+                }
+                if (text.rfind("manifest ", 0) == 0) {
+                    std::istringstream in(text.substr(9));
+                    long long files = 0, bytes = 0;
+                    if (in >> files >> bytes) expect = bytes;
+                    return;
+                }
+                if (text.rfind("progress ", 0) == 0) {
+                    std::istringstream in(text.substr(9));
+                    long long done = 0, total = 0;
+                    if (in >> done >> total) {
+                        seen = done;
+                        if (total > 0) expect = total;
+                        progress.bytes_done = seen;
+                        progress.bytes_total = expect;
+                        // The fetch owns 0.01..0.35. It is frequently the longest
+                        // stage in wall-clock and the only one whose remaining
+                        // time a client can actually estimate.
+                        const double f = expect > 0 ? static_cast<double>(seen) /
+                                                          static_cast<double>(expect)
+                                                    : 0.0;
+                        emit("fetch", bytes_label(seen) + " / " + bytes_label(expect),
+                             0.01 + 0.34 * f);
+                    }
+                    return;
+                }
+                emit("fetch", text, progress.fraction);
+            },
+            canceled, &err);
+        if (canceled()) {
+            progress.canceled = true;
+            fail("canceled during fetch");
+            return;
+        }
+        if (frc != 0) {
+            fail("fetch.py failed (exit " + std::to_string(frc) + ")" +
+                 (err.empty() ? "" : ": " + err));
+            return;
+        }
+        if (resolved.empty() || !fs::exists(resolved, ec)) {
+            // fetch.py exiting 0 without a directory would send conversion at a
+            // path that is not there, and the error would name convert.py.
+            fail("fetch reported success but produced no directory");
+            return;
+        }
+        local_source = resolved;
+        progress.bytes_done = progress.bytes_total = 0;
+        emit("fetch", "fetched " + bytes_label(seen), 0.35);
+    }
+
+    // ── 2. convert ───────────────────────────────────────────────────────────
     if (!container_is_ready) {
-        emit("convert", 1, "converting " + name + " -> " + container, 0.05);
+        const double convert_lo = needs_fetch ? 0.35 : 0.05;
+        emit("convert", "converting " + name + " -> " + container, convert_lo);
         std::error_code ec;
         fs::create_directories(tools.containers_dir, ec);
 
         std::string err;
         const int rc = run_streamed_command(
-            {tools.python, (tools_dir / "convert.py").string(), source, "--out", container,
+            {tools.python, (tools_dir / "convert.py").string(), local_source, "--out", container,
              "--quant", tools.quant, "--expert-down", tools.expert_down, "--group",
              std::to_string(tools.group)},
             fs::current_path(),
@@ -971,7 +1177,7 @@ void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
                             const int total = std::stoi(line.substr(slash + 1));
                             if (total > 0) {
                                 // Conversion is the long pole; it owns 5%..70%.
-                                emit("convert", 1, util::trim(line),
+                                emit("convert", util::trim(line),
                                      0.05 + 0.65 * static_cast<double>(done) / total);
                                 return;
                             }
@@ -980,7 +1186,7 @@ void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
                         }
                     }
                 }
-                if (!util::trim(line).empty()) emit("convert", 1, util::trim(line), progress.fraction);
+                if (!util::trim(line).empty()) emit("convert", util::trim(line), progress.fraction);
             },
             canceled, &err);
         if (canceled()) {
@@ -995,13 +1201,13 @@ void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
         }
 
         // ── 2. tokenizer ─────────────────────────────────────────────────────
-        emit("tokenize", 2, "compiling tokenizer", 0.72);
+        emit("tokenize", "compiling tokenizer", 0.72);
         const int trc = run_streamed_command(
-            {tools.python, (tools_dir / "compile_tokenizer.py").string(), source, "--out",
+            {tools.python, (tools_dir / "compile_tokenizer.py").string(), local_source, "--out",
              (fs::path(container) / "tokenizer.soma").string()},
             fs::current_path(),
             [&](const std::string& line, bool) {
-                if (!util::trim(line).empty()) emit("tokenize", 2, util::trim(line), 0.72);
+                if (!util::trim(line).empty()) emit("tokenize", util::trim(line), 0.72);
             },
             canceled, &err);
         if (canceled()) {
@@ -1015,7 +1221,7 @@ void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
             // the whole admission over it would discard hours of conversion.
             MM_WARN("admission {}: tokenizer compilation failed (exit {}); container is "
                     "usable but will not detokenize", progress.operation_id, trc);
-            emit("tokenize", 2, "tokenizer compilation failed; continuing without it", 0.72);
+            emit("tokenize", "tokenizer compilation failed; continuing without it", 0.72);
         }
     }
 
@@ -1024,12 +1230,12 @@ void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
     // `soma plan --json` is the verdict. It reads headers only and allocates
     // nothing, which is why it is safe to run on control rather than requiring a
     // node that could host the model.
-    emit("profile", 3, "planning", 0.80);
+    emit("profile", "planning", 0.80);
     std::string plan_json;
     {
         std::string err;
         const int prc = run_streamed_command(
-            {tools.soma_path, "plan", "--model-dir", container_is_ready ? source : container,
+            {tools.soma_path, "plan", "--model-dir", container_is_ready ? local_source : container,
              "--json"},
             fs::current_path(),
             [&](const std::string& line, bool is_stderr) {
@@ -1055,14 +1261,14 @@ void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
     // needs a reference run for THIS model, which is a separate artifact this
     // pipeline does not have. Writing a `passed` row we did not earn would make
     // the verdict look validated when it is only computed.
-    emit("conformance", 4, "not run in-process; see tests/soma and stage3", 0.90);
+    emit("conformance", "not run in-process; see tests/soma and stage3", 0.90);
 
     // ── 5. finalize ──────────────────────────────────────────────────────────
-    emit("finalize", 5, "recording", 0.95);
+    emit("finalize", "recording", 0.95);
     // Keyed on arch_hash below, so a reprofile updates the row it came from
     // rather than creating a second one for the same weights.
     AdmittedModel m;
-    m.model_dir = container_is_ready ? source : container;
+    m.model_dir = container_is_ready ? local_source : container;
     m.name = name;
     m.source_repo = container_is_ready ? std::string{} : source;
     try {
@@ -1105,7 +1311,7 @@ void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
     progress.done = true;
     progress.cancelable = false;
     progress.finished_at_ms = util::now_ms();
-    emit("finalize", 5, "admitted as model " + std::to_string(m.id) + " (" +
+    emit("finalize", "admitted as model " + std::to_string(m.id) + " (" +
                             to_string(m.verdict) + ")", 1.0);
     MM_INFO("admission {}: {} admitted as model {} with verdict {}", progress.operation_id,
             m.name, m.id, to_string(m.verdict));

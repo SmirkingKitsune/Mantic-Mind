@@ -4741,6 +4741,204 @@ bool test_admission_pipeline_runs_and_reports() {
     return true;
 }
 
+bool test_admission_fetch_stage() {
+    // The fetch stage is the only one that touches the network, so it is the
+    // only one that cannot be driven against the real thing here. What IS under
+    // test is everything on this side of the subprocess: the repo-id rule, the
+    // progress parsing, the resolved path, and the two ways a fetch can exit 0
+    // while having produced nothing.
+    //
+    // A stub tools/ directory does that. convert.py is stubbed too, so the run
+    // reaches the REAL `soma plan --json` on a real container and the whole
+    // six-stage path is exercised end to end.
+
+    // ── the repo-id rule, on its own ─────────────────────────────────────────
+    //
+    // Checked directly rather than only through a failed download: this is what
+    // stands between an operator-scoped `source` field and a write outside
+    // sources_dir, and "the download failed" is not evidence that it held.
+    std::string why;
+    CHECK(mm::valid_repo_id("gpt2", why));
+    CHECK(mm::valid_repo_id("Qwen/Qwen3-30B-A3B", why));
+    CHECK(mm::valid_repo_id("org/model@refs/pr/1", why));
+    CHECK(mm::valid_repo_id("a.b/c-d_e", why));
+    CHECK(!mm::valid_repo_id("", why));
+    CHECK(!mm::valid_repo_id("../../etc/passwd", why));
+    CHECK(!mm::valid_repo_id("org/../../x", why));
+    CHECK(!mm::valid_repo_id("a/b/c", why));       // more than one component
+    CHECK(!mm::valid_repo_id("C:\\weights", why)); // a Windows path is not a repo id
+    CHECK(!mm::valid_repo_id("org/model@../evil", why));
+    CHECK(!mm::valid_repo_id("-leading-dash/x", why));
+
+    const char* python = std::getenv("MM_TEST_PYTHON");
+    const char* soma_path = std::getenv("MM_TEST_SOMA_PATH");
+    const char* model_dir = std::getenv("MM_TEST_MODEL_DIR");
+    if (python == nullptr || soma_path == nullptr || model_dir == nullptr) {
+        std::cout << "  (stage skipped: MM_TEST_PYTHON / SOMA_PATH / MODEL_DIR unset)\n";
+        return true;
+    }
+
+    auto dir = temp_test_dir("admission-fetch");
+    const auto tools_dir = dir / "tools";
+    std::filesystem::create_directories(tools_dir);
+
+    // The stub. Emits exactly the line protocol fetch.py promises, writes a
+    // directory, and can be told to fail in each of the interesting ways.
+    {
+        std::ofstream f(tools_dir / "fetch.py", std::ios::binary);
+        f << "import os, sys\n"
+             "repo = sys.argv[1]\n"
+             "out = sys.argv[sys.argv.index('--out') + 1]\n"
+             "mode = os.environ.get('MM_STUB_FETCH', 'ok')\n"
+             "if mode == 'fail':\n"
+             "    print('cannot read %s: 401 Unauthorized' % repo, flush=True)\n"
+             "    sys.exit(3)\n"
+             "print('manifest 3 4096', flush=True)\n"
+             "print('progress 1024 4096', flush=True)\n"
+             "print('progress 4096 4096', flush=True)\n"
+             // Exits 0 having produced no directory.
+             "if mode == 'silent':\n"
+             "    sys.exit(0)\n"
+             "os.makedirs(out, exist_ok=True)\n"
+             "open(os.path.join(out, 'config.json'), 'w').write('{}')\n"
+             "print('resolved ' + os.path.abspath(out), flush=True)\n";
+    }
+    // Conversion, stubbed: copy the real fixture so `soma plan` has something
+    // true to read. Stubbing the planner too would leave nothing under test.
+    {
+        std::ofstream f(tools_dir / "convert.py", std::ios::binary);
+        f << "import shutil, sys, os\n"
+             "src = os.environ['MM_STUB_CONTAINER']\n"
+             "out = sys.argv[sys.argv.index('--out') + 1]\n"
+             "shutil.rmtree(out, ignore_errors=True)\n"
+             "shutil.copytree(src, out)\n"
+             "print('    layer 1/1  0.00 GB', flush=True)\n";
+        std::ofstream t(tools_dir / "compile_tokenizer.py", std::ios::binary);
+        t << "print('stub tokenizer', flush=True)\n";
+    }
+
+    mm::ControlModelRegistry reg;
+    std::string err;
+    CHECK(reg.open(dir.string(), err));
+
+    mm::AdmissionTools tools;
+    tools.python = python;
+    tools.soma_path = soma_path;
+    tools.tools_dir = tools_dir.string();
+    tools.containers_dir = (dir / "containers").string();
+    tools.sources_dir = (dir / "sources").string();
+    reg.set_tools(tools);
+
+#ifdef _WIN32
+    _putenv_s("MM_STUB_CONTAINER", model_dir);
+#else
+    setenv("MM_STUB_CONTAINER", model_dir, 1);
+#endif
+
+    // ── a source that is neither a directory nor a repo id ───────────────────
+    //
+    // Refused before an operation exists, so a typo is a 400 rather than an
+    // operation that appears to start and dies a second later.
+    CHECK(reg.admit("org/../../escape", nullptr, err).empty());
+    CHECK(!err.empty());
+    CHECK(reg.operations().empty());
+
+    struct Run {
+        std::vector<mm::AdmissionProgress> frames;
+        std::mutex m;
+        std::condition_variable cv;
+        bool finished = false;
+    };
+    const auto drive = [&](const char* mode, const std::string& source) {
+#ifdef _WIN32
+        _putenv_s("MM_STUB_FETCH", mode);
+#else
+        setenv("MM_STUB_FETCH", mode, 1);
+#endif
+        auto run = std::make_shared<Run>();
+        std::string e;
+        const auto id = reg.admit(source, [run](const mm::AdmissionProgress& p) {
+            std::lock_guard<std::mutex> lk(run->m);
+            run->frames.push_back(p);
+            if (p.done) {
+                run->finished = true;
+                run->cv.notify_all();
+            }
+        }, e);
+        if (!id.empty()) {
+            std::unique_lock<std::mutex> lk(run->m);
+            (void)run->cv.wait_for(lk, std::chrono::seconds(120), [&] { return run->finished; });
+        }
+        return run;
+    };
+
+    // ── the happy path ───────────────────────────────────────────────────────
+    const auto good = drive("ok", "fake-org/Qwen3-30B-A3B");
+    CHECK(!good->frames.empty());
+    CHECK(good->finished);
+
+    // Every stage, in order, and `step` consistent with `total_steps`. Those two
+    // used to be written independently: a container admission advertised 2 total
+    // steps and then emitted step 5, which renders as 250%.
+    const std::vector<std::string> want{"fetch",   "convert",    "tokenize",
+                                        "profile", "conformance", "finalize"};
+    std::size_t at = 0;
+    std::int64_t peak_bytes = 0, peak_total = 0;
+    for (const auto& f : good->frames) {
+        CHECK(f.step >= 1 && f.step <= f.total_steps);
+        CHECK(f.total_steps == static_cast<int>(want.size()));
+        if (at < want.size() && f.stage == want[at]) ++at;
+        peak_bytes = std::max(peak_bytes, f.bytes_done);
+        peak_total = std::max(peak_total, f.bytes_total);
+    }
+    CHECK(at == want.size()); // all six seen, in order
+
+    // The byte counters are the reason fetch is worth a stage of its own: it is
+    // the only one whose remaining time a client can estimate.
+    CHECK(peak_bytes == 4096);
+    CHECK(peak_total == 4096);
+
+    const auto& done = good->frames.back();
+    CHECK(done.done);
+    CHECK(done.last_error.empty());
+    CHECK(done.model_id > 0);
+
+    const auto admitted = reg.find_by_id(done.model_id);
+    CHECK(admitted.has_value());
+    // The trailing component, so `fake-org/Qwen3-30B-A3B` and a local directory
+    // of the same name are ONE model rather than two rows for one set of weights.
+    CHECK(admitted->name.find("Qwen3-30B-A3B") != std::string::npos);
+    CHECK(!admitted->arch_hash.empty());
+    // The fetched directory is where it was told to put it, not somewhere the
+    // repo id chose.
+    CHECK(std::filesystem::exists(dir / "sources" / "Qwen3-30B-A3B" / "config.json"));
+
+    // ── a fetch that fails ───────────────────────────────────────────────────
+    const auto failed = drive("fail", "fake-org/unauthorized-model");
+    CHECK(!failed->frames.empty());
+    CHECK(failed->frames.back().done);
+    CHECK(!failed->frames.back().last_error.empty());
+    CHECK(failed->frames.back().last_error.find("fetch.py") != std::string::npos);
+    CHECK(failed->frames.back().model_id == 0);
+
+    // ── a fetch that exits 0 having produced nothing ─────────────────────────
+    //
+    // The failure this guards is a confusing one: conversion would be handed a
+    // path that is not there and the error would name convert.py.
+    const auto silent = drive("silent", "fake-org/silent-model");
+    CHECK(!silent->frames.empty());
+    CHECK(silent->frames.back().done);
+    CHECK(silent->frames.back().last_error.find("no directory") != std::string::npos);
+
+    // One record from three admissions: two of them never got far enough to
+    // write one, and neither left a half-row behind.
+    CHECK(reg.list().size() == 1);
+
+    reg.close();
+    CHECK(remove_tree(dir));
+    return true;
+}
+
 bool test_scope_negatives_over_http() {
     // The predicate is asserted elsewhere; this asserts the WIRE. A scope table
     // that is right in a unit test and unreached by the middleware protects
@@ -5374,6 +5572,7 @@ int main(int argc, char** argv) {
         {"capacity_fit_across_three_axes", test_capacity_fit_across_three_axes},
         {"model_registry_makes_soma_routable", test_model_registry_makes_soma_routable},
         {"admission_pipeline_runs_and_reports", test_admission_pipeline_runs_and_reports},
+        {"admission_fetch_stage", test_admission_fetch_stage},
         {"route_scopes_and_token_store", test_route_scopes_and_token_store},
         {"scope_negatives_over_http", test_scope_negatives_over_http},
         {"engine_telemetry_republication", test_engine_telemetry_republication},

@@ -95,6 +95,9 @@ static mm::ControlConfig load_config(
         cfg.admission_tools_dir   = file.get("admission_tools_dir",   cfg.admission_tools_dir);
         cfg.admission_soma_path   = file.get("soma_path",             cfg.admission_soma_path);
         cfg.containers_dir        = file.get("containers_dir",        cfg.containers_dir);
+        cfg.sources_dir           = file.get("sources_dir",           cfg.sources_dir);
+        cfg.admission_allow_pickle =
+            file.get_bool("admission_allow_pickle", cfg.admission_allow_pickle);
         cfg.admission_quant       = file.get("admission_quant",       cfg.admission_quant);
         cfg.admission_expert_down = file.get("admission_expert_down", cfg.admission_expert_down);
         cfg.log_file    = file.get("log_file",   cfg.log_file);
@@ -154,6 +157,9 @@ static mm::ControlConfig load_config(
     cfg.admission_tools_dir   = env("MM_ADMISSION_TOOLS",  cfg.admission_tools_dir);
     cfg.admission_soma_path   = env("MM_SOMA_PATH",        cfg.admission_soma_path);
     cfg.containers_dir        = env("MM_CONTAINERS_DIR",   cfg.containers_dir);
+    cfg.sources_dir           = env("MM_SOURCES_DIR",      cfg.sources_dir);
+    cfg.admission_allow_pickle =
+        env_bool("MM_ADMISSION_ALLOW_PICKLE", cfg.admission_allow_pickle);
     cfg.admission_quant       = env("MM_ADMISSION_QUANT",  cfg.admission_quant);
     cfg.log_file    = env("MM_LOG_FILE",    cfg.log_file);
     cfg.models_dir  = env("MM_MODELS_DIR",  cfg.models_dir);
@@ -921,6 +927,8 @@ int main(int argc, char** argv) {
             tools.tools_dir = cfg.admission_tools_dir;
             tools.soma_path = cfg.admission_soma_path;
             tools.containers_dir = cfg.containers_dir;
+            tools.sources_dir = cfg.sources_dir;
+            tools.allow_pickle = cfg.admission_allow_pickle;
             tools.quant = cfg.admission_quant;
             tools.expert_down = cfg.admission_expert_down;
             model_registry.set_tools(tools);

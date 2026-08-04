@@ -31,6 +31,11 @@ torch>=2.7.0
 # Lower bound is 4.51: Qwen3-MoE support landed there.
 transformers>=4.51.0,<5.0.0
 
+# fetch.py only. Everything else here works on a local directory, which is the
+# point of fetch being its own stage — a host that converts models someone else
+# downloaded does not need this, and `fetch.py` says so rather than crashing.
+huggingface-hub>=0.26.0
+
 safetensors>=0.4.5
 numpy>=1.26.0,<3.0.0
 accelerate>=1.0.0
