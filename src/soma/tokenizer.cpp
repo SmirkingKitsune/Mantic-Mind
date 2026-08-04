@@ -481,4 +481,85 @@ Status CompiledTokenizer::decode(std::span<const TokenId> tokens, std::string& o
     return {};
 }
 
+// ── incremental decode ───────────────────────────────────────────────────────
+//
+// decode() is a concatenation of vocab entries, so a token's bytes do not depend
+// on its neighbours and streaming is exact rather than approximate. The only
+// thing that cannot be decided from one token is where a UTF-8 codepoint ENDS: a
+// byte-fallback vocabulary emits one token per byte, so a three-byte CJK
+// character arrives as three tokens and the first two are not text.
+//
+// The invariant, and what the test checks: for any token sequence, the deltas
+// from push() concatenated with flush() equal decode() of the same sequence,
+// byte for byte. Streaming changes when bytes are handed over, never which.
+
+namespace {
+
+/// Bytes occupied by the sequence this byte leads, or 0 if it does not lead one
+/// (a continuation byte, or an invalid lead).
+std::size_t utf8_seq_len(unsigned char b) noexcept {
+    if (b < 0x80) return 1;
+    if ((b & 0xE0) == 0xC0) return 2;
+    if ((b & 0xF0) == 0xE0) return 3;
+    if ((b & 0xF8) == 0xF0) return 4;
+    return 0;
+}
+
+/// Length of the longest prefix of `buf` that ends on a codepoint boundary.
+///
+/// Bounded at three bytes of lookback, which is what makes malformed input safe:
+/// an incomplete sequence is at most a lead plus two continuations, so anything
+/// further back is complete no matter what it is. Bytes that are not a valid
+/// prefix of a multi-byte sequence are released rather than held, matching
+/// utf8_next()'s latin-1 leniency — holding them would stall the stream forever
+/// waiting for a continuation that is never coming.
+std::size_t complete_prefix(const std::string& buf) noexcept {
+    const auto n = buf.size();
+    const auto lookback = n < 3 ? n : std::size_t{3};
+    for (std::size_t back = 1; back <= lookback; ++back) {
+        const auto i = n - back;
+        const auto len = utf8_seq_len(static_cast<unsigned char>(buf[i]));
+        if (len == 0) continue; // continuation byte: keep walking back to its lead
+        return (len <= back) ? n : i;
+    }
+    return n;
+}
+
+} // namespace
+
+struct CompiledTokenizer::Streamer::Impl {
+    const CompiledTokenizer* tok = nullptr;
+    std::string held; ///< a codepoint's bytes so far, never more than three
+};
+
+CompiledTokenizer::Streamer::Streamer(const CompiledTokenizer& tokenizer)
+    : impl_(std::make_unique<Impl>()) {
+    impl_->tok = &tokenizer;
+}
+
+CompiledTokenizer::Streamer::~Streamer() = default;
+
+Status CompiledTokenizer::Streamer::push(TokenId token, std::string& out_delta) {
+    out_delta.clear();
+    const auto& vocab = impl_->tok->impl_->vocab;
+    if (token >= vocab.size()) {
+        return {StatusCode::InvalidArgument, "token id " + std::to_string(token) + " out of range"};
+    }
+    impl_->held += vocab[token];
+    const auto cut = complete_prefix(impl_->held);
+    if (cut == 0) return {};
+    out_delta.assign(impl_->held, 0, cut);
+    impl_->held.erase(0, cut);
+    return {};
+}
+
+Status CompiledTokenizer::Streamer::flush(std::string& out_delta) {
+    // Unconditional, including a partial codepoint. At end of stream the missing
+    // bytes are not late, they are absent — and withholding them would make the
+    // streamed text differ from decode(), which is the one thing this must not do.
+    out_delta = std::move(impl_->held);
+    impl_->held.clear();
+    return {};
+}
+
 } // namespace soma

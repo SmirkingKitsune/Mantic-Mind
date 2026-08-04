@@ -81,6 +81,92 @@ json user_msg(const std::string& text) {
     return json{{"role", "user"}, {"content", text}};
 }
 
+/// A greedy turn, non-streaming. `temperature: 0` is argmax and consumes no RNG,
+/// which is what makes the streamed and non-streamed forms of the same prompt
+/// comparable at all.
+std::string chat_greedy(std::uint16_t port, const json& messages, std::uint32_t max_tokens) {
+    httplib::Client cli("127.0.0.1", port);
+    cli.set_read_timeout(60);
+    const json body{{"messages", messages}, {"max_tokens", max_tokens}, {"temperature", 0.0f}};
+    auto res = cli.Post("/v1/chat/completions", body.dump(), "application/json");
+    if (!res || res->status != 200) return {};
+    try {
+        return json::parse(res->body)["choices"][0]["message"].value("content", std::string{});
+    } catch (const std::exception&) {
+        return {};
+    }
+}
+
+/// The same turn over SSE, returning every `delta.content` in order.
+///
+/// Kept separate rather than folded into chat(): the point is the SEQUENCE of
+/// deltas, not the text they add up to, and a helper that concatenated them
+/// would discard the thing under test.
+std::vector<std::string>
+chat_stream_deltas(std::uint16_t port, const json& messages, std::uint32_t max_tokens) {
+    httplib::Client cli("127.0.0.1", port);
+    cli.set_read_timeout(60);
+    const json body{{"messages", messages},
+                    {"max_tokens", max_tokens},
+                    {"temperature", 0.0f},
+                    {"stream", true}};
+
+    std::vector<std::string> deltas;
+    std::string buf;
+    auto res = cli.Post(
+        "/v1/chat/completions",
+        httplib::Headers{},
+        body.dump(),
+        "application/json",
+        [&](const char* data, std::size_t len) {
+            buf.append(data, len);
+            for (std::size_t p; (p = buf.find("\n\n")) != std::string::npos;) {
+                const std::string frame = buf.substr(0, p);
+                buf.erase(0, p + 2);
+                if (frame.rfind("data: ", 0) != 0) continue;
+                const std::string payload = frame.substr(6);
+                if (payload == "[DONE]") continue;
+                try {
+                    const auto j = json::parse(payload);
+                    if (j.contains("choices")) {
+                        deltas.push_back(j["choices"][0]["delta"].value("content", std::string{}));
+                    }
+                } catch (const std::exception&) {
+                }
+            }
+            return true;
+        });
+    if (!res || res->status != 200) return {};
+    return deltas;
+}
+
+/// Does `s` end on a codepoint boundary? Malformed bytes count as latin-1, which
+/// is how the tokenizer treats them.
+bool ends_on_codepoint_boundary(const std::string& s) {
+    std::size_t i = 0;
+    while (i < s.size()) {
+        const auto b = static_cast<unsigned char>(s[i]);
+        std::size_t len = 1;
+        if ((b & 0xE0) == 0xC0)
+            len = 2;
+        else if ((b & 0xF0) == 0xE0)
+            len = 3;
+        else if ((b & 0xF8) == 0xF0)
+            len = 4;
+        if (len > 1) {
+            if (i + len > s.size()) return false;
+            for (std::size_t k = 1; k < len; ++k) {
+                if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80) {
+                    len = 1;
+                    break;
+                }
+            }
+        }
+        i += len;
+    }
+    return true;
+}
+
 /// GET /internal/sessions — live per-sequence state, straight from the engine.
 json sessions(std::uint16_t port) {
     httplib::Client cli("127.0.0.1", port);
@@ -658,6 +744,73 @@ int main(int argc, char** argv) {
         fs::remove_all(kvdir);
     }
 
+    // ── 9b. streamed deltas reconstruct the answer ───────────────────────────
+    //
+    // The seam the Streamer sits in. Its own test proves the class is exact; this
+    // proves the WIRING is — that the tail still held when generation ends is
+    // flushed, and flushed before the request thread stops listening. A lost
+    // flush is invisible in the happy case and eats the last character of every
+    // answer that ends mid-codepoint.
+    //
+    // Greedy on both sides, because otherwise the two turns sample different text
+    // and there is nothing to compare.
+    std::cout << "\n9b. streamed deltas equal the non-streamed answer\n";
+    {
+        mm::EngineSupervisor sup(8290, 8300, /*max_slots=*/1);
+        mm::EngineLoadRequest req;
+        req.model_path = model;
+        const auto slot = sup.load("soma", req, "agent-stream");
+        check(!slot.empty(), "engine loaded", slot);
+        if (!slot.empty()) {
+            const auto port = sup.slots().front().port;
+            const auto msgs = json::array({user_msg("the quick brown fox")});
+
+            const auto whole = chat_greedy(port, msgs, 24);
+            const auto deltas = chat_stream_deltas(port, msgs, 24);
+
+            std::string joined;
+            for (const auto& d : deltas)
+                joined += d;
+
+            check(!whole.empty(),
+                  "the non-streamed turn produced text",
+                  std::to_string(whole.size()) + " bytes");
+            check(!deltas.empty(),
+                  "the streamed turn produced deltas",
+                  std::to_string(deltas.size()) + " frames");
+            check(joined == whole,
+                  "and they agree byte-for-byte",
+                  joined == whole ? "identical"
+                                  : (std::to_string(joined.size()) + " streamed vs " +
+                                     std::to_string(whole.size()) + " whole"));
+
+            // Every frame must be text on its own. This is the property the old
+            // re-decode path did NOT have: it sent the difference between two
+            // decodes, and that difference is a bare lead byte whenever a
+            // codepoint spans two tokens.
+            std::size_t bad = 0;
+            for (const auto& d : deltas) {
+                if (!ends_on_codepoint_boundary(d)) ++bad;
+            }
+            check(bad == 0,
+                  "and no frame ends mid-codepoint",
+                  bad == 0 ? "all frames are complete UTF-8"
+                           : (std::to_string(bad) + " truncated frames"));
+
+            // Say what was actually exercised. Fewer frames than tokens means a
+            // codepoint spanned two tokens and the streamer held one back; equal
+            // counts mean this particular generation never hit that case, and the
+            // boundary check above passed without being tested. That is a fact
+            // about the fixture's random weights, not something to assert — the
+            // deterministic version of it lives in soma_tokenizer_g0's probe.
+            std::cout << "   " << deltas.size() << " frames for 24 tokens — "
+                      << (deltas.size() < 24 ? "a codepoint spanned two tokens"
+                                             : "no split this run; see tokenizer_g0's probe")
+                      << "\n";
+        }
+        (void)sup.unload_all(true);
+    }
+
     // ── 10. concurrent turns share one forward ───────────────────────────────
     //
     // The batch union is the mechanism the whole engine is built around, and it
@@ -778,8 +931,8 @@ int main(int argc, char** argv) {
             }
             auto full = cli.Get("/internal/heat?resolution=full");
             check(full && full->status == 200 &&
-                      json::parse(full->body, nullptr, false)
-                              .value("resolution", std::string{}) == "full",
+                      json::parse(full->body, nullptr, false).value("resolution", std::string{}) ==
+                          "full",
                   "?resolution=full is an explicit opt-in");
 
             auto dump = cli.Get("/internal/telemetry/dump");
@@ -795,8 +948,8 @@ int main(int argc, char** argv) {
                 check(health && health->body.find("\"streamed\":true") != std::string::npos,
                       "the container is served as STREAMED");
 
-                chat(port, json::array({user_msg("route some experts through this prompt")}), "",
-                     8);
+                chat(
+                    port, json::array({user_msg("route some experts through this prompt")}), "", 8);
 
                 auto after = cli.Get("/internal/heat");
                 check(after && after->status == 200, "heat answers after a turn");
@@ -810,7 +963,8 @@ int main(int argc, char** argv) {
                     for (const auto& c : j.value("counts", json::array())) {
                         hottest = std::max<std::uint64_t>(hottest, c.get<std::uint64_t>());
                     }
-                    check(hottest > 0, "with NON-ZERO counts — experts actually fired",
+                    check(hottest > 0,
+                          "with NON-ZERO counts — experts actually fired",
                           "hottest cell = " + std::to_string(hottest));
                 }
                 auto stats = cli.Get("/internal/telemetry/dump");
@@ -827,8 +981,7 @@ int main(int argc, char** argv) {
             httplib::Client cli("127.0.0.1", port);
             cli.set_read_timeout(1, 0);
             int ticks = 0;
-            const auto deadline =
-                std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
             cli.Get(("/internal/telemetry" + query).c_str(),
                     [&](const char* data, std::size_t len) {
                         const std::string chunk(data, len);
@@ -845,24 +998,27 @@ int main(int argc, char** argv) {
         // ~2 Hz over 1.5 s is about 3 frames. Bounded generously on both sides:
         // this is a scheduling assertion on a shared machine, not a stopwatch.
         const int slow = count_frames("", 1500);
-        check(slow >= 2 && slow <= 8, "the default feed ticks near 2 Hz",
+        check(slow >= 2 && slow <= 8,
+              "the default feed ticks near 2 Hz",
               std::to_string(slow) + " frames in 1.5s");
 
         const int fast = count_frames("?hz=10", 1500);
-        check(fast > slow, "?hz=10 is faster than the default",
+        check(fast > slow,
+              "?hz=10 is faster than the default",
               std::to_string(fast) + " vs " + std::to_string(slow));
 
         // The ceiling is the ENGINE's. A client asking for 1000 Hz gets 10 — not
         // an error, because the limit is a property of the engine rather than a
         // mistake by the caller.
         const int clamped = count_frames("?hz=1000", 1500);
-        check(clamped > 0, "?hz=1000 is CLAMPED, not refused",
-              std::to_string(clamped) + " frames");
-        check(clamped <= 30, "and does not exceed the 10 Hz ceiling",
+        check(clamped > 0, "?hz=1000 is CLAMPED, not refused", std::to_string(clamped) + " frames");
+        check(clamped <= 30,
+              "and does not exceed the 10 Hz ceiling",
               std::to_string(clamped) + " frames in 1.5s");
 
         const int garbage = count_frames("?hz=banana", 1200);
-        check(garbage > 0, "an unparseable hz falls back to the default",
+        check(garbage > 0,
+              "an unparseable hz falls back to the default",
               std::to_string(garbage) + " frames");
 
         (void)sup.unload_all(true);

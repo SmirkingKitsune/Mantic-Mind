@@ -1596,10 +1596,11 @@ do cannot disagree.
 1. ~~**Requests serialise on a mutex.**~~ **Fixed** — see "Concurrent turns" below. One thread drives
    `step()`; request threads admit and wait. Session-scoped sequences were the prerequisite: a shared
    step loop needs sequences that are not owned by whichever request holds the mutex.
-2. **`CompiledTokenizer::Streamer` is declared and never implemented** — a design-pass stub. The server
-   re-decodes the emitted prefix each step and sends the suffix: O(n²) in tokens, correct, and it
-   handles the split-multi-byte-codepoint case the Streamer exists for, because every delta is the
-   difference between two complete decodes.
+2. ~~**`CompiledTokenizer::Streamer` is declared and never implemented.**~~ **Fixed** — see
+   [Incremental detokenisation](#incremental-detokenisation) below. The claim recorded here, that
+   re-decoding "handles the split-multi-byte-codepoint case … because every delta is the difference
+   between two complete decodes", was **wrong**, and the test written for the replacement failed against
+   the old path on 4 of 72 corpus cases.
 3. **The tiny fixtures ship no `tokenizer.soma`**, so the demo above returns raw token ids as text. That
    is the documented no-tokenizer fallback and it exercises the full HTTP path; it is not evidence about
    detokenisation.
@@ -1802,6 +1803,58 @@ resume, and with the fix reverted they split precisely as the failure predicts:
 A resume that handles only the second looks correct until someone checkpoints at a turn boundary — which
 is what cluster suspend/restore does every time. Removed alongside it: `Seq::have_next`, written in two
 places and read in none.
+
+#### Incremental detokenisation
+
+`CompiledTokenizer::Streamer` was declared in the header with no implementation. The server re-decoded
+the entire emitted prefix on every token and sent the suffix — **O(n²)** in tokens, and inside the
+scheduler's lock, so a long answer taxed every *other* sequence in the batch too. That is the reason it
+had to go. The reason it was worth writing a test for is different.
+
+The deferred-items list claimed the re-decode "handles the split-multi-byte-codepoint case the Streamer
+exists for, because every delta is the difference between two complete decodes." That is false, and the
+argument for it is the kind that sounds airtight. `decode()` is a concatenation of vocabulary entries;
+a byte-fallback vocabulary has one token per byte; so `decode(["\xE4"])` **is** a complete decode, and
+its value is a bare lead byte. Both decodes are complete and the difference between them is still not
+text. The invariant the client needs is not "the delta came from a complete decode" but "the delta ends
+on a codepoint boundary", and nothing was enforcing it.
+
+The implementation is a hold-back buffer with three bytes of lookback. Three is what makes malformed
+input safe rather than merely handled: an incomplete sequence is at most a lead plus two continuations,
+so anything further back is complete whatever it is, and bytes that are not a valid prefix of a sequence
+are *released* rather than held — otherwise a stream stalls forever waiting for a continuation byte that
+is never coming. `flush()` is unconditional, including a partial codepoint: at end of stream the missing
+bytes are not late, they are absent, and withholding them would make the streamed text differ from
+`decode()`.
+
+**The invariant, and the three ways it is checked.** For any token sequence, the deltas from `push()`
+concatenated with `flush()` equal `decode()` of that sequence, byte for byte — streaming changes *when*
+bytes are handed over, never *which*.
+
+- `soma_tokenizer_g0` runs every corpus case through the Streamer and compares against `decode()`, with
+  an independently written boundary checker (a test that calls the function under test to decide whether
+  the function under test is right proves only self-consistency). It reports a `held` count, so a green
+  column cannot mean "no split ever happened" — OLMoE holds 8, Qwen3 holds 1.
+- A **synthetic split**, because a gate whose interesting case shows up by luck is not a gate. It finds
+  the ids that decode to the individual bytes of `U+4E2D`, feeds exactly those, and requires the
+  character back in exactly one delta. Zero deltas would be a stall; two would mean a partial codepoint
+  went out.
+- A **flush check**, which nothing else reaches: the corpus is valid UTF-8, so no case ends
+  mid-codepoint and every `flush()` in the loop above returns empty. Pushing two of the three bytes and
+  flushing is the deterministic version of a turn that hits `max_tokens` partway through a character.
+
+Reverting the boundary logic to the old always-release behaviour turns all three red, and the corpus
+alone catches it — 33/36 and 35/36, with the first failure reported as a delta ending mid-codepoint.
+This was a live defect on the streaming path, not a hypothetical one.
+
+**And the wiring, separately.** `soma_engine_g5` §9b streams a greedy turn and a non-streaming one
+(`temperature: 0` is argmax and consumes no RNG, which is the only reason the two are comparable) and
+requires the concatenated SSE deltas to equal the returned `content`. The unit test proves the class is
+exact; this proves `finish()` flushes the tail, and flushes it *before* setting `done` — after that the
+request thread returns and a late frame is sent to nobody. The section prints how many frames it got for
+24 tokens rather than asserting a split occurred, because whether one does is a fact about the fixture's
+random weights: on the committed fixture it is 24 frames, no split, and the boundary check there passes
+without being exercised. Saying so is the point — the deterministic coverage is the probe above.
 
 #### Concurrent turns — the union, finally reachable over HTTP
 
@@ -2298,6 +2351,10 @@ store; SSE telemetry with throttling; `/v1/models` reclamation.
   one that happens to share a cache. **Done** — checkpoint format v3 carries `rng_state` and the emitted
   history; `soma_checkpoint_g3` §2b resumes into a fresh `Scheduler` and compares against both the
   uninterrupted tail and a cold start. The cold start must *diverge*, or the check is vacuous.
+- Every streamed delta is **text on its own** — no frame ends mid-codepoint — and the deltas concatenate
+  to exactly what the non-streaming form returns. **Done** — `CompiledTokenizer::Streamer` replaces the
+  O(n²) re-decode; checked in `soma_tokenizer_g0` against the corpus, against a synthetic byte-fallback
+  split, and against `flush()` with a partial codepoint held, and end-to-end in `soma_engine_g5` §9b.
 
 ---
 

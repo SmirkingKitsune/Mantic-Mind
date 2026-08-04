@@ -269,7 +269,12 @@ struct ServeServer::Impl {
     struct Waiter {
         std::mutex mu;
         std::condition_variable cv;
-        std::vector<TokenId> emitted;
+
+        /// Incremental decode. Per-turn because it carries a partial codepoint
+        /// across tokens — the state that makes streaming exact rather than a
+        /// repeated full decode.
+        std::unique_ptr<CompiledTokenizer::Streamer> stream;
+
         std::string acc;
         bool done = false;
         Status error;
@@ -362,17 +367,13 @@ struct ServeServer::Impl {
         std::string delta;
         {
             std::lock_guard<std::mutex> lk(w->mu);
-            w->emitted.push_back(t);
-            std::string full;
-            if (have_tokenizer) {
-                if (!tokenizer.decode(w->emitted, full).ok()) return;
+            if (w->stream) {
+                if (!w->stream->push(t, delta).ok()) return;
             } else {
-                for (const auto tok : w->emitted)
-                    full += std::to_string(tok) + " ";
+                delta = std::to_string(t) + " ";
             }
-            if (full.size() <= w->acc.size()) return;
-            delta = full.substr(w->acc.size());
-            w->acc = std::move(full);
+            if (delta.empty()) return; // the codepoint is not finished yet
+            w->acc += delta;
         }
         // Outside the waiter's lock: on_delta writes to a socket, and the
         // scheduler's lock is still held further up the stack. Holding a third
@@ -388,6 +389,22 @@ struct ServeServer::Impl {
             if (auto it = waiters.find(id); it != waiters.end()) w = it->second;
         }
         if (!w) return;
+
+        // Release whatever the streamer is still holding. A turn that ends
+        // mid-codepoint — a truncated byte-fallback sequence at max_tokens — has
+        // no continuation coming, and those bytes belong in `acc` or the streamed
+        // text and the returned text disagree.
+        std::string tail;
+        {
+            std::lock_guard<std::mutex> lk(w->mu);
+            if (w->stream) (void)w->stream->flush(tail);
+            w->acc += tail;
+        }
+        // Before `done`, and outside the lock for the same reason as on_token:
+        // once done is set the request thread returns and stops reading, so a
+        // tail sent afterwards would be sent to nobody.
+        if (!tail.empty() && w->on_delta) w->on_delta(tail);
+
         {
             std::lock_guard<std::mutex> lk(w->mu);
             if (!error.ok()) w->error = std::move(error);
@@ -536,15 +553,17 @@ struct ServeServer::Impl {
         // Register the waiter BEFORE waking the stepper, or a fast turn can
         // finish before anyone is listening for it.
         //
-        // Decoding happens in the callback: the emitted prefix is re-decoded each
-        // step and the SUFFIX is sent. CompiledTokenizer::Streamer is declared in
-        // the header with no implementation — a design-pass stub. Re-decoding is
-        // O(n^2) in tokens and correct, including the case the Streamer exists to
-        // handle: a multi-byte codepoint split across two tokens never emits a
-        // replacement character, because every delta is the difference between
-        // two complete decodes.
+        // Decoding happens in the callback, incrementally. It used to re-decode
+        // the whole emitted prefix each step and send the suffix — O(n^2) in tokens,
+        // inside the scheduler's lock, so the cost fell on every OTHER sequence in
+        // the batch as well. It was also wrong at the boundary it looked right at:
+        // a codepoint split across two tokens produced a delta that was a bare
+        // lead byte, which is not text.
         auto waiter = std::make_shared<Waiter>();
         waiter->on_delta = on_delta;
+        if (have_tokenizer) {
+            waiter->stream = std::make_unique<CompiledTokenizer::Streamer>(tokenizer);
+        }
         {
             std::lock_guard<std::mutex> lk(state_mu);
             waiters[id] = waiter;
