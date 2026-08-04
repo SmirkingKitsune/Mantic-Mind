@@ -91,6 +91,12 @@ static mm::ControlConfig load_config(
         cfg.openai_compat_port = static_cast<uint16_t>(
             file.get_int("openai_compat_port", static_cast<int>(cfg.openai_compat_port)));
         cfg.data_dir    = file.get("data_dir",  cfg.data_dir);
+        cfg.admission_python      = file.get("admission_python",      cfg.admission_python);
+        cfg.admission_tools_dir   = file.get("admission_tools_dir",   cfg.admission_tools_dir);
+        cfg.admission_soma_path   = file.get("soma_path",             cfg.admission_soma_path);
+        cfg.containers_dir        = file.get("containers_dir",        cfg.containers_dir);
+        cfg.admission_quant       = file.get("admission_quant",       cfg.admission_quant);
+        cfg.admission_expert_down = file.get("admission_expert_down", cfg.admission_expert_down);
         cfg.log_file    = file.get("log_file",   cfg.log_file);
         cfg.node_health_poll_interval_s = static_cast<uint32_t>(
             file.get_int("node_health_poll_interval_s",
@@ -144,6 +150,11 @@ static mm::ControlConfig load_config(
     cfg.openai_compat_port = static_cast<uint16_t>(
         env_int("MM_OPENAI_COMPAT_PORT", static_cast<int>(cfg.openai_compat_port)));
     cfg.data_dir    = env("MM_DATA_DIR",    cfg.data_dir);
+    cfg.admission_python      = env("MM_ADMISSION_PYTHON", cfg.admission_python);
+    cfg.admission_tools_dir   = env("MM_ADMISSION_TOOLS",  cfg.admission_tools_dir);
+    cfg.admission_soma_path   = env("MM_SOMA_PATH",        cfg.admission_soma_path);
+    cfg.containers_dir        = env("MM_CONTAINERS_DIR",   cfg.containers_dir);
+    cfg.admission_quant       = env("MM_ADMISSION_QUANT",  cfg.admission_quant);
     cfg.log_file    = env("MM_LOG_FILE",    cfg.log_file);
     cfg.models_dir  = env("MM_MODELS_DIR",  cfg.models_dir);
     cfg.external_api_token =
@@ -905,6 +916,14 @@ int main(int argc, char** argv) {
             MM_WARN("Model registry unavailable ({}); every agent will route to the "
                     "fallback engine", registry_error);
         } else {
+            mm::AdmissionTools tools;
+            tools.python = cfg.admission_python;
+            tools.tools_dir = cfg.admission_tools_dir;
+            tools.soma_path = cfg.admission_soma_path;
+            tools.containers_dir = cfg.containers_dir;
+            tools.quant = cfg.admission_quant;
+            tools.expert_down = cfg.admission_expert_down;
+            model_registry.set_tools(tools);
             MM_INFO("Model registry: {} models, schema v{}",
                     model_registry.list().size(), model_registry.schema_version());
         }

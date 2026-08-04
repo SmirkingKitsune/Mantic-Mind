@@ -69,6 +69,22 @@ struct PlanDocument {
     std::uint64_t bytes_per_token = 0;
     float projected_tok_s = 0.0f;
 
+    /// Topology and per-expert economics, carried so a CONSUMER of the plan does
+    /// not need to parse arch.json to learn what it is looking at. Control's
+    /// registry denormalizes exactly these for its queries and its TUI, and the
+    /// plan is the only view of the model it has.
+    std::string attention_family; ///< mha | gqa | mla | mla+dsa
+    std::uint32_t n_layers = 0;
+    std::uint32_t n_moe_layers = 0;
+    std::uint32_t n_experts = 0;
+    std::uint32_t top_k = 0;
+    std::uint64_t expert_bytes = 0; ///< one expert: gate + up + down
+    /// Fraction of the routed set that fires per token — top_k / n_experts. THE
+    /// number the verdict turns on: Mixtral moves 5x the bytes of Qwen3 per token
+    /// while being 1.35x larger, because it fires 25% of its experts and Qwen3
+    /// fires 6.25%.
+    double active_fraction = 0.0;
+
     /// Effective for THIS host — not necessarily the registry's stored value.
     Verdict verdict = Verdict::Reject;
     std::string verdict_reason;

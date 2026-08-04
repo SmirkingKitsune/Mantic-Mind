@@ -60,4 +60,22 @@ std::string hmac_sha256_hex(const std::string& key, const std::string& data) {
     return oss.str();
 }
 
+std::string sha256_hex(const std::string& data) {
+    unsigned char out[EVP_MAX_MD_SIZE];
+    unsigned int len = 0;
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (ctx == nullptr) throw std::runtime_error("sha256_hex: EVP_MD_CTX_new failed");
+    const bool ok = EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) == 1 &&
+                    EVP_DigestUpdate(ctx, data.data(), data.size()) == 1 &&
+                    EVP_DigestFinal_ex(ctx, out, &len) == 1;
+    EVP_MD_CTX_free(ctx);
+    if (!ok) throw std::runtime_error("sha256_hex: digest failed");
+
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (unsigned int i = 0; i < len; ++i)
+        oss << std::setw(2) << static_cast<unsigned int>(out[i]);
+    return oss.str();
+}
+
 } // namespace mm::pairing

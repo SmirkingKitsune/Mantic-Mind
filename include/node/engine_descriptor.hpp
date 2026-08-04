@@ -79,6 +79,15 @@ struct EngineDescriptor {
     /// Whether two agents may share one live engine process.
     std::function<bool(const RuntimeSettings& a, const RuntimeSettings& b)> launch_compatible;
 
+    /// The engine's own telemetry paths, relative to its base URL.
+    ///
+    /// DATA, not a code path: the node proxies whatever is here and never learns
+    /// that Soma calls it /internal/telemetry. Empty means the engine publishes
+    /// none, which is the honest answer for llama.cpp rather than a route that
+    /// 404s halfway down the chain.
+    std::string telemetry_path; ///< SSE
+    std::string heat_path;      ///< snapshot
+
     /// Live per-sequence state as JSON, for GET /v1/engines/{id}/slots.
     ///
     /// Optional; absent means the engine cannot report it, and the supervisor

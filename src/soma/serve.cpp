@@ -24,6 +24,7 @@
 #include "soma/memory_hierarchy.hpp"
 #include "soma/plan.hpp"
 #include "soma/scheduler.hpp"
+#include "soma/telemetry.hpp"
 #include "soma/tokenizer.hpp"
 
 #include <httplib.h>
@@ -34,6 +35,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -110,12 +112,6 @@ std::string error_body(ServeError kind, const std::string& message) {
     return j.dump();
 }
 
-/// Flatten OpenAI `messages` into a prompt.
-///
-/// Image content parts are REFUSED with 422 rather than dropped. Silently
-/// discarding them is the failure mode worth designing out: the request
-/// succeeds, the answer ignores the picture, and nothing in the response says
-/// why.
 /// Checkpoint key for a conversation.
 ///
 /// Sanitised because the key becomes a FILENAME and arrives from a client. A
@@ -132,6 +128,76 @@ std::string session_key(const std::string& conversation) {
     return "conv-" + safe;
 }
 
+/// A telemetry tick as JSON. Flat on purpose: this is emitted at up to 10 Hz to
+/// every watcher, and a nested shape would cost more to build than to send.
+json telemetry_frame_json(const TelemetryFrame& f) {
+    const auto lookups = f.cache.hits + f.cache.misses;
+    return json{
+        {"tick_ms", f.tick_ms},
+        {"tier",
+         {{"vram_experts", f.occupancy.vram_experts},
+          {"ram_experts", f.occupancy.ram_experts},
+          {"disk_experts", f.occupancy.disk_experts},
+          {"pinned_experts", f.occupancy.pinned_experts},
+          {"ram_bytes", f.occupancy.ram_bytes},
+          {"ram_capacity_bytes", f.occupancy.ram_capacity_bytes}}},
+        {"cache",
+         {{"hits", f.cache.hits},
+          {"misses", f.cache.misses},
+          {"evictions", f.cache.evictions},
+          {"prefetch_hits", f.cache.prefetch_hits},
+          {"prefetch_wasted", f.cache.prefetch_wasted},
+          {"bytes_read", f.cache.bytes_read},
+          {"hit_rate",
+           lookups > 0 ? static_cast<double>(f.cache.hits) / static_cast<double>(lookups) : 0.0}}},
+        {"scheduler",
+         {{"active_sequences", f.scheduler.active_sequences},
+          {"queued_sequences", f.scheduler.queued_sequences},
+          {"current_batch", f.scheduler.current_batch},
+          {"effective_max_batch", f.scheduler.effective_max_batch},
+          {"prefill_rows", f.scheduler.prefill_rows_last_step},
+          {"decode_rows", f.scheduler.decode_rows_last_step},
+          // The payoff, on the wire. A ratio near 1.0 means the
+          // union is buying nothing and something upstream is wrong.
+          {"unique_experts", f.scheduler.unique_experts_last_step},
+          {"naive_expert_reads", f.scheduler.naive_expert_reads_last_step},
+          {"steps", f.scheduler.steps},
+          {"tokens_out", f.scheduler.tokens_out},
+          {"preemptions", f.scheduler.preemptions}}},
+    };
+}
+
+/// The brain grid. Cells are emitted as flat parallel arrays rather than an
+/// array of objects: at 4096 cells the object form is roughly 6x the bytes for
+/// the same information, and this goes out on every tick.
+json heat_frame_json(const HeatFrame& h) {
+    json counts = json::array();
+    json tiers = json::array();
+    counts.get_ref<json::array_t&>().reserve(h.cells.size());
+    tiers.get_ref<json::array_t&>().reserve(h.cells.size());
+    for (const auto& c : h.cells) {
+        counts.push_back(c.count);
+        tiers.push_back(static_cast<int>(c.tier));
+    }
+    return json{
+        {"tick_ms", h.tick_ms},
+        {"resolution", to_string(h.resolution)},
+        {"n_layers", h.n_layers},
+        {"n_experts", h.n_experts},
+        {"layer_bucket", h.layer_bucket},
+        {"expert_bucket", h.expert_bucket},
+        {"rows", h.layer_bucket ? (h.n_layers + h.layer_bucket - 1) / h.layer_bucket : 0},
+        {"cols", h.expert_bucket ? (h.n_experts + h.expert_bucket - 1) / h.expert_bucket : 0},
+        {"counts", std::move(counts)},
+        {"tiers", std::move(tiers)}};
+}
+
+/// Flatten OpenAI `messages` into a prompt.
+///
+/// Image content parts are REFUSED with 422 rather than dropped. Silently
+/// discarding them is the failure mode worth designing out: the request
+/// succeeds, the answer ignores the picture, and nothing in the response says
+/// why.
 Status flatten_messages(const json& msgs, std::string& out, ServeError& err) {
     for (const auto& m : msgs) {
         const auto role = m.value("role", "user");
@@ -521,6 +587,104 @@ struct ServeServer::Impl {
 
     MemoryHierarchy* memory_ptr() { return model.experts_are_streamed ? &memory : nullptr; }
 
+    // ── telemetry ────────────────────────────────────────────────────────────
+    //
+    // ONE channel sampling the engine, fanned out to N watchers — not one
+    // sampler per connection. The whole premise is that aggregation costs the
+    // engine once regardless of how many clients are looking; a per-connection
+    // sampler would make that cost linear in watchers, which is the thing the
+    // design says it avoids.
+    TelemetryChannel telemetry;
+
+    struct TelemetryFeed {
+        std::mutex mu;
+        std::condition_variable cv;
+        std::deque<std::string> frames;
+        bool closed = false;
+        std::uint32_t hz = kDefaultTelemetryHz;
+        HeatResolution resolution = HeatResolution::Bucketed;
+    };
+
+    std::mutex feeds_mu;
+    std::vector<std::weak_ptr<TelemetryFeed>> feeds;
+
+    /// Frames a watcher may fall behind by before the oldest are dropped.
+    ///
+    /// OLD frames go, not new ones: telemetry is a sample of NOW, and a stale
+    /// frame delivered late is worse than a gap. Without a bound the engine
+    /// would spend memory on a client that has already stopped reading.
+    static constexpr std::size_t kMaxQueuedFrames = 32;
+
+    void attach_feed(const std::shared_ptr<TelemetryFeed>& feed) {
+        std::lock_guard<std::mutex> lk(feeds_mu);
+        feeds.push_back(feed);
+        retune_locked();
+    }
+
+    void detach_feed(const std::shared_ptr<TelemetryFeed>& feed) {
+        std::lock_guard<std::mutex> lk(feeds_mu);
+        feeds.erase(std::remove_if(feeds.begin(),
+                                   feeds.end(),
+                                   [&](const std::weak_ptr<TelemetryFeed>& weak) {
+                                       auto f = weak.lock();
+                                       return !f || f == feed;
+                                   }),
+                    feeds.end());
+        retune_locked();
+    }
+
+    /// The channel samples ONCE, so it must sample at least as often and as
+    /// finely as its most demanding watcher. Recomputed on every attach and
+    /// detach so a departing client's higher rate does not persist.
+    void retune_locked() {
+        std::uint32_t fastest = kDefaultTelemetryHz;
+        bool want_full = false;
+        for (const auto& weak : feeds) {
+            if (auto f = weak.lock()) {
+                fastest = std::max(fastest, f->hz);
+                want_full |= (f->resolution == HeatResolution::Full);
+            }
+        }
+        telemetry.set_rate(fastest);
+        telemetry.set_heat_resolution(want_full ? HeatResolution::Full : HeatResolution::Bucketed);
+    }
+
+    void broadcast(const std::string& payload) {
+        std::vector<std::shared_ptr<TelemetryFeed>> live;
+        {
+            std::lock_guard<std::mutex> lk(feeds_mu);
+            for (const auto& weak : feeds) {
+                if (auto f = weak.lock()) live.push_back(std::move(f));
+            }
+        }
+        for (auto& f : live) {
+            {
+                std::lock_guard<std::mutex> lk(f->mu);
+                if (f->frames.size() >= kMaxQueuedFrames) f->frames.pop_front();
+                f->frames.push_back(payload);
+            }
+            f->cv.notify_one();
+        }
+    }
+
+    void close_feeds() {
+        std::vector<std::shared_ptr<TelemetryFeed>> live;
+        {
+            std::lock_guard<std::mutex> lk(feeds_mu);
+            for (const auto& weak : feeds) {
+                if (auto f = weak.lock()) live.push_back(std::move(f));
+            }
+            feeds.clear();
+        }
+        for (auto& f : live) {
+            {
+                std::lock_guard<std::mutex> lk(f->mu);
+                f->closed = true;
+            }
+            f->cv.notify_all();
+        }
+    }
+
     // ── suspend / restore ────────────────────────────────────────────────────
     //
     // The node asks for ONE artifact, and this engine holds N sessions. That is
@@ -694,6 +858,22 @@ Status ServeServer::open(const ServeConfig& config) {
     // sessions was even asked.
     if (auto st = im.open_scheduler(); !st.ok()) return st;
 
+    // ── telemetry ────────────────────────────────────────────────────────────
+    //
+    // Started with the engine, not with the first watcher: the channel is what
+    // SAMPLES, and sampling has to be running for a snapshot route to have
+    // anything to return. It ticks at the default rate with no sinks attached,
+    // which costs one atomic read per tick.
+    (void)im.telemetry.open(im.memory, im.sched, config.telemetry_hz);
+    im.telemetry.set_telemetry_sink([this](const TelemetryFrame& f) {
+        impl_->broadcast("event: telemetry\ndata: " + telemetry_frame_json(f).dump() + "\n\n");
+    });
+    im.telemetry.set_heat_sink([this](const HeatFrame& h) {
+        // A named event, so a client that only wants the cheap frame can ignore
+        // the grid without parsing it — which is most of the payload.
+        impl_->broadcast("event: heat\ndata: " + heat_frame_json(h).dump() + "\n\n");
+    });
+
     const auto served = config.served_model_name.empty()
                             ? fs::path(config.model_dir).filename().string()
                             : config.served_model_name;
@@ -779,6 +959,90 @@ Status ServeServer::open(const ServeConfig& config) {
     im.http.Get("/internal/sessions", [this](const httplib::Request&, httplib::Response& res) {
         res.set_content(impl_->sessions_json().dump(), "application/json");
     });
+
+    // ── GET /internal/telemetry ─────────────────────────────────────────────
+    //
+    // The tier/heat feed the node forwards and control re-publishes. Two things
+    // are decided in the ENGINE rather than at the transport:
+    //
+    //   * the rate. `?hz=` is CLAMPED to [1, 10] rather than rejected — the
+    //     ceiling is a property of the engine, not a mistake by the caller.
+    //   * the resolution. Bucketed by default; `?resolution=full` is an explicit
+    //     opt-in, so a client cannot ask for a 60k-cell grid by accident.
+    //
+    // Aggregation happens in MemoryHierarchy and is SAMPLED at the tick rate.
+    // Nothing is emitted per token, so a client asking for maximum telemetry
+    // cannot make the chat path pay for it.
+    im.http.Get("/internal/telemetry", [this](const httplib::Request& req, httplib::Response& res) {
+        std::uint32_t hz = kDefaultTelemetryHz;
+        if (req.has_param("hz")) {
+            try {
+                hz = static_cast<std::uint32_t>(std::stoul(req.get_param_value("hz")));
+            } catch (const std::exception&) {
+                hz = kDefaultTelemetryHz;
+            }
+        }
+        const auto resolution = req.get_param_value("resolution") == "full"
+                                    ? HeatResolution::Full
+                                    : HeatResolution::Bucketed;
+
+        auto feed = std::make_shared<Impl::TelemetryFeed>();
+        feed->hz = std::clamp<std::uint32_t>(hz, 1, kMaxTelemetryHz);
+        feed->resolution = resolution;
+        impl_->attach_feed(feed);
+
+        res.set_chunked_content_provider("text/event-stream",
+                                         [this, feed](std::size_t, httplib::DataSink& sink) {
+                                             std::unique_lock<std::mutex> lk(feed->mu);
+                                             feed->cv.wait_for(lk, std::chrono::seconds(5), [&] {
+                                                 return !feed->frames.empty() || feed->closed;
+                                             });
+                                             if (feed->closed) {
+                                                 lk.unlock();
+                                                 impl_->detach_feed(feed);
+                                                 sink.done();
+                                                 return false;
+                                             }
+                                             std::deque<std::string> batch;
+                                             batch.swap(feed->frames);
+                                             lk.unlock();
+
+                                             if (batch.empty()) {
+                                                 // A comment frame: invisible to an SSE parser, and
+                                                 // it keeps proxies from closing a connection that
+                                                 // is merely idle because the engine has nothing to
+                                                 // report.
+                                                 static const std::string beat = ": keepalive\n\n";
+                                                 return sink.write(beat.data(), beat.size());
+                                             }
+                                             for (const auto& line : batch) {
+                                                 if (!sink.write(line.data(), line.size())) {
+                                                     impl_->detach_feed(feed);
+                                                     return false;
+                                                 }
+                                             }
+                                             return true;
+                                         });
+    });
+
+    // Non-streaming snapshot, for a client that wants one look rather than a
+    // feed — and for the G3 text dump, which is the same data in the shape a
+    // human reads.
+    im.http.Get("/internal/heat", [this](const httplib::Request& req, httplib::Response& res) {
+        const auto resolution = req.get_param_value("resolution") == "full"
+                                    ? HeatResolution::Full
+                                    : HeatResolution::Bucketed;
+        HeatFrame frame;
+        (void)impl_->telemetry.snapshot_heat(resolution, frame);
+        res.set_content(heat_frame_json(frame).dump(), "application/json");
+    });
+
+    im.http.Get("/internal/telemetry/dump",
+                [this](const httplib::Request&, httplib::Response& res) {
+                    std::string text;
+                    (void)impl_->telemetry.write_text_dump(text);
+                    res.set_content(text, "text/plain");
+                });
 
     im.http.Get("/v1/models", [served](const httplib::Request&, httplib::Response& res) {
         json j;
@@ -910,6 +1174,11 @@ void ServeServer::stop() {
     if (impl_) {
         impl_->is_ready.store(false);
         impl_->http.stop();
+        // Watchers first: they hold a condition variable the sampler notifies,
+        // and closing the channel underneath a waiting reader would leave it
+        // parked until its keepalive timeout.
+        impl_->close_feeds();
+        impl_->telemetry.close();
         // The step thread outlives the HTTP server by design — an in-flight turn
         // should reach its waiter — but it must not outlive this object. Joined
         // before Impl's members start being destroyed under it.

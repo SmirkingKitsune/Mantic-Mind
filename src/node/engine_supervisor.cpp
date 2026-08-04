@@ -709,6 +709,21 @@ std::vector<SequenceInfo> EngineSupervisor::sequences(const SlotId& slot_id) con
     return out;
 }
 
+EngineSupervisor::EngineEndpoint EngineSupervisor::endpoint(const SlotId& slot_id) const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    for (const auto& e : engines_) {
+        if (e->id != slot_id || !e->process) continue;
+        EngineEndpoint out;
+        out.base_url = e->process->url();
+        if (e->descriptor != nullptr) {
+            out.telemetry_path = e->descriptor->telemetry_path;
+            out.heat_path = e->descriptor->heat_path;
+        }
+        return out;
+    }
+    return {};
+}
+
 int EngineSupervisor::available_slot_count() const {
     std::lock_guard<std::mutex> lk(mutex_);
     const int live = static_cast<int>(

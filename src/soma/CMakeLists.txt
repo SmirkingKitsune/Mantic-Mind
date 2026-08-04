@@ -72,6 +72,7 @@ set(MM_SOMA_SOURCES
     memory_hierarchy.cpp
     f32_model.cpp
     kv_checkpoint.cpp
+    telemetry.cpp
     kv_checkpoint_header.cpp   # standalone codec; the node links this object alone
     routing.cpp
     sampler.cpp
@@ -378,6 +379,15 @@ if(BUILD_TESTING)
     add_executable(soma_mla_g4 ${CMAKE_SOURCE_DIR}/tests/soma/mla_g4.cpp)
     target_link_libraries(soma_mla_g4 PRIVATE mm_soma)
     add_test(NAME soma_mla_g4 COMMAND soma_mla_g4)
+
+    # ── G6 telemetry ──────────────────────────────────────────────────────────
+    # bucket_heat() is pure, so the downsampling claims are checked without a
+    # model: a grid that exceeds the cap, or loses counts on the way down, is a
+    # fault the brain view would show as understated load exactly where it is
+    # highest.
+    add_executable(soma_telemetry_g6 ${CMAKE_SOURCE_DIR}/tests/soma/telemetry_g6.cpp)
+    target_link_libraries(soma_telemetry_g6 PRIVATE mm_soma)
+    add_test(NAME soma_telemetry_g6 COMMAND soma_telemetry_g6)
 
     # ── G5 verdict routing ────────────────────────────────────────────────────
     # The whole policy table, plus the gate: Mixtral admits resident-only and

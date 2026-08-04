@@ -1792,9 +1792,8 @@ lock across a network write is how one slow client stalls every sequence in the 
 2. **Restore is lazy.** `/internal/kv/restore` validates the manifest's `arch_hash` and reports what is
    replayable; the caches are attached when each conversation's next request arrives, via `resume_key`.
    Eagerly restoring would hold KV slots for conversations that may never come back.
-3. **`SomaEngineClient::stream_telemetry` has no server route yet.** The client is correct; the engine
-   publishes `/health`, `/v1/models`, `/internal/plan`, `/internal/sessions`, `/internal/kv/*` and the
-   chat surface today.
+3. ~~**`SomaEngineClient::stream_telemetry` has no server route yet.**~~ **Fixed** — see "The telemetry
+   feed" below.
 4. **`estimate_footprint` sizes the directory rather than reading `soma plan --json`.** Recursive
    directory sizing already fixes the live bug it replaces — `fs::file_size()` errors on a directory and
    falls through to a flat 2048 MB, so every multi-shard HF model and every Soma container sized
@@ -1955,11 +1954,236 @@ effective one: the verdict is a property of `(model, quantization, host budget)`
 "admission-host"` for the same reason — a reader who takes the stored verdict as "what this node will
 do" will eventually be wrong.
 
+#### Admission, in-process and over SSE
+
+`POST /v1/models/admit` runs the pipeline and streams `AdmissionProgress` frames:
+`fetch → convert → tokenize → conformance → profile → finalize`. It ends in exactly one frame with
+`done: true`, and `last_error` distinguishes failure from success there — because a stream that simply
+goes quiet is indistinguishable from a network fault.
+
+**Orchestration, not reimplementation.** The converter and the tokenizer compiler stay Python: they read
+HF checkpoints and that ecosystem is theirs. Control runs them through `run_streamed_command()` and
+parses their output. `convert.py` already prints `layer 12/48 3.40 GB` per layer with `flush=True`, so
+the fraction tracks the model's real shape rather than an assumed one. `tools/admission/` remains never
+a runtime dependency — it is a dependency of *admitting*, which happens once per model.
+
+`process_exec` moved from `node/` to `common/` to make that possible. Nothing in it was ever
+node-specific; a subprocess whose output is streamed line by line is the visible alternative to running
+something blind, and that is as true of a model conversion as of a llama.cpp build.
+
+Three routes beyond the stream itself, because an hours-long operation needs more than one connection:
+`GET /v1/models/admissions` lists every operation this process has run, `GET
+/v1/models/admissions/{op}` rejoins one (sending the current state first, so a client joining late — or
+after the end — learns where things stand immediately), and `POST .../cancel` stops one. **A client
+disconnecting does not cancel anything**: hours of conversion must not be discarded because a browser
+tab closed.
+
+```
+admission_pipeline_runs_and_reports            (drives the real `soma` binary)
+    a nonexistent source fails BEFORE an operation exists — nothing to list
+    staged frames arrive: profile, finalize
+    exactly one terminal frame, with finished_at >= started_at
+    the row carries n_experts/top_k/active_fraction from `soma plan --json`
+    the operation is retrievable after it ends; a late watcher gets the outcome
+    cancelling a finished operation is refused, not silently accepted
+```
+
+**Two gaps this exposed and closed.** `compute_plan(model_dir)` was a stub returning "lands with the
+admission converter's arch.json output" — so nothing produced an `arch_hash`, which is the identity the
+registry keys every row on. Every unconverted model would have collided on the empty string. It now
+reads `config.json` (which an HF checkpoint and a converted container both carry — a second description
+file that had to agree with the first is how they drift) and stamps the hash. And the plan document
+gained the topology and per-expert economics it was missing: `attention_family`, `n_layers`,
+`n_moe_layers`, `n_experts`, `top_k`, `expert_bytes`, `active_fraction`. Control's registry denormalizes
+exactly those, and the plan is the only view of the model it has.
+
+**Conformance is not run, and the record says so** rather than implying a pass. Stages 1–2 run against
+committed tiny fixtures in CI; stage 3 needs a reference run for *this* model, which is a separate
+artifact this pipeline does not have. Writing a `passed` row it did not earn would make the verdict look
+validated when it is only computed.
+
+**A failed tokenizer compilation is not fatal.** A container without one serves token ids rather than
+text — degraded but honest — and refusing the whole admission over it would discard hours of conversion.
+
+#### Scoped authorization
+
+Auth was ONE flat bearer token compared with a plain `!=`, gating every `/v1/*` path identically, and
+entirely opt-in — an empty `external_api_token` left the whole surface open. Three scopes now, and
+**the split is by blast radius, not by resource**: `GET /v1/agents/{id}/memories` is `read` while
+`POST .../memories` is `chat`, because they touch the same rows and only one can change anything.
+
+| scope | covers |
+|---|---|
+| `read` | every GET, every telemetry stream — no side effects |
+| `chat` | chat, conversations, memories, uploads, speech — bounded, per-agent |
+| `operator` | admission, deletes, verdict and backend overrides, token minting |
+
+`operator` implies the other two and `chat` implies `read`: sending a message you cannot then fetch is
+not a coherent permission, and a credential that can delete an agent but not read it is a distinction
+nobody wants to administer. DELETEs are `operator` even when they are per-agent and small — "bounded"
+is about what a mistake costs, not how many rows it touches.
+
+**The legacy token is grandfathered and never becomes a row.** Matched before the table lookup and
+granted every scope, so existing deployments keep working unchanged — and rotating it in config takes
+effect immediately rather than leaving a stale grant behind, which is exactly what inserting it at
+startup would have caused.
+
+**Tokens are stored hashed.** `api_token` keeps `token_sha256` and never the token, so a leaked backup
+does not hand over working credentials. `POST /v1/tokens` returns the secret once; a caller that loses
+it mints another. Revoking sets `revoked_at` rather than deleting — the row is the audit trail, and a
+deleted token cannot answer "what was this credential allowed to do".
+
+**Coverage is checked at startup against the server's own registrations**, not against a second list
+someone maintains. `HttpServer` records each route as it is registered, and `listen()` refuses to start
+if any `/v1/*` handler has no scope entry: defaulting an unlisted route to `read` would silently
+under-protect a new mutation, and defaulting to `operator` would silently break a new GET.
+
+That check earned its keep immediately. `POST /v1/agents/{id}/attachments` is registered through
+`PostUpload` rather than `Post`, so it was missing from the first draft of the table — and the server
+refused to start until it was added. A grep-built table would have shipped with an unscoped upload route.
+
+```
+route_scopes_and_token_store
+    the coverage check reports a missing route (not just accepts a good list)
+    read !-> chat !-> operator; chat -> read; operator -> everything
+    "read,opereator" is REJECTED, not silently reduced to read
+    the stored hash is not the token, and the raw token is not a lookup key
+    revoke keeps the row; a second revoke reports it is already gone
+    a zero-scope token is refused rather than minted useless
+
+scope_negatives_over_http                (a live server, three minted tokens)
+    read    GET /v1/{nodes,agents,models} -> 200
+            POST /v1/models/admit -> 403 naming required=operator, granted=read
+            DELETE /v1/agents/:id -> 403, and the agent is still there
+    chat    POST .../conversations -> 200   (chat implies read)
+            POST /v1/models/admit -> 403;  GET /v1/tokens -> 403
+    operator POST /v1/models/admit -> 400   authorization PASSED; rejected on
+                                            its merits, which is the distinction
+            DELETE /v1/agents/:id -> 200    the mutation both others were refused
+    a revoked token stops working immediately -> 403
+    an unknown token -> 403; no token at all -> 401
+```
+
+**The negatives are asserted on the wire, not just in the predicate**, because a scope table that is
+right in a unit test and unreached by the middleware protects nothing — and that failure is silent, since
+every request simply succeeds. The `read` token getting 200 on a GET and 403 on a POST against the same
+server is what makes the test self-verifying: auth off would give 200 for both, auth broken-closed 403
+for both, and only a working table produces the split.
+
+Confirmed by breaking it: changing `POST /v1/models/admit` to `Scope::Read` turns the test red on exactly
+the six assertions that matter, and reverting turns it green. A test that has never been seen to fail is
+a test whose passing means nothing.
+
+**One bug this surfaced in my own wiring:** I first configured the authorizer only from
+`set_model_registry()`, so any caller that never attached a registry — including the reliability
+suite — ran with auth entirely off. Configured from the constructor now, since the legacy token is a
+constructor argument and the registry is optional.
+
+#### The telemetry feed
+
+`GET /internal/telemetry` (SSE), `/internal/heat` (snapshot) and `/internal/telemetry/dump` (the G3 text
+view). `TelemetryChannel` was a declared header with no implementation; it exists now.
+
+**One channel samples, N watchers read.** Not one sampler per connection — the whole premise is that
+aggregation costs the engine once regardless of how many clients are looking, and a per-connection
+sampler would make that cost linear in watchers, which is the thing the design says it avoids. The
+channel retunes on every attach *and* detach: the fastest watcher sets the rate and full resolution is
+sticky only while someone is asking for it, so a departing client's higher rate does not persist.
+
+**The rate ceiling is the engine's.** `?hz=` is a request; `?hz=1000` yields 10 Hz rather than an error,
+because the limit is a property of the engine rather than a mistake by the caller. `?hz=banana` falls
+back to the default for the same reason. Measured on the wire: 4 frames in 1.5 s at the default, 11 at
+`hz=10`, and 15 at `hz=1000` — clamped, not obeyed.
+
+**Downsampling is the default and it conserves counts.** A bucketed grid that dropped counts on the way
+down would make the brain view understate load exactly where it is highest, so `bucket_heat()` is tested
+for conservation, not just for size:
+
+```
+soma_telemetry_g6
+    Qwen3-30B-A3B  48x128    6144 -> 1536 cells (2x2), all 6144 counts preserved
+    hypothetical   60x256   15360 -> 3840 cells (2x2)
+    pathological  128x512   65536 -> 4096 cells (4x4), still a 32x128 GRID
+    DeepSeek-V2-Lite 27x64   under the cap: passed through 1:1, bucket factors stay 1
+    a mostly-cold bucket reports COLD, not the one warm cell in it
+    empty snapshot / zero cap: no crash, no claimed bucketing
+
+engine_g5 §11                                          (against a live engine)
+    /internal/heat is bucketed by default; ?resolution=full is an opt-in
+    default ~2 Hz; hz=10 faster; hz=1000 CLAMPED; hz=banana falls back
+```
+
+**Both axes are reduced, not one.** Bucketing only experts turns 128x512 into 128x1 — every layer keeps
+its row and the expert axis vanishes, so the display shows which layers are hot and nothing about which
+experts. Reducing both keeps the grid a grid, which is the entire point of the brain view.
+
+Two smaller decisions worth stating. Heat cells go out as **flat parallel arrays** rather than an array
+of objects: at 4096 cells the object form is roughly 6× the bytes for identical information, and this
+ships on every tick. And a watcher that stops draining has its **oldest** frames dropped at 32 queued —
+telemetry is a sample of *now*, so a stale frame delivered late is worse than a gap.
+
+**The container fixtures are usable now.** They carried no `config.json`, so `soma serve` and `soma plan`
+both refused them and the streaming path could not be exercised from the repo at all. `convert.py`
+already copies it — the committed fixtures simply predate that fix — so backfilling the five containers
+from their tiny checkpoints was enough. `soma_engine_g5` now takes the container as a third argument and
+CI serves one:
+
+```
+the container is served as STREAMED
+heat reports the model's real dimensions             4x16
+with NON-ZERO counts — experts actually fired        hottest cell = 8
+the cache reports a hit rate, so lookups happened
+```
+
+That closes a real hole in the coverage. Every telemetry number before this came from a resident model,
+where the grid is empty by construction — so the feed was exercised and **the thing it reports was
+not**. A telemetry route emitting structurally-correct zeros is indistinguishable from one wired to
+nothing, and only a streamed model tells the two apart.
+
+#### Republication — engine → node → control
+
+`GET /v1/engines`, `/v1/engines/{id}/telemetry` (SSE), `/heat` and `/slots`. Cluster-wide an "engine" is
+a **(node, slot) pair**, so the id is the slot id and the node is *discovered* rather than supplied — the
+answer changes on every eviction, and a client should not have to track it.
+
+**The node forwards what the descriptor names.** `EngineDescriptor` gained `telemetry_path` and
+`heat_path`; the node proxies those and never learns that Soma calls one `/internal/telemetry`. An
+engine with no telemetry surface — llama.cpp, whose paths are empty — answers **501**, and that survives
+both hops: "this engine does not publish that" and "no such engine" are different facts, and only one is
+the caller's mistake.
+
+**`hz` is forwarded, never re-clamped.** The ceiling is the engine's, and a second clamp at the node or
+at control would be a second number to keep in step with it. Bucketing is likewise the default at every
+hop rather than defaulted back to full by a middle layer.
+
+```
+engine_telemetry_republication              (control against a live stand-in node)
+    GET /v1/engines lists both slots WITH their node, and sums the tier summary
+    /heat proxies through and passes the body back
+    no ?resolution -> the node sees no query at all (bucketed all the way down)
+    ?resolution=full -> the node sees "full"
+    /slots returns the sequence list
+    an unknown engine -> 404 "no such engine"
+    an engine with no telemetry -> 501 SURVIVES the hop, not flattened to 500
+    a node that has gone away -> 502 naming the node, not 500
+```
+
+The registry is driven through the **real health poll** rather than a setter: `connected` and the slot
+list arrive that way in the running system, and faking them would have tested a state it never reaches.
+
+**One bug, and it was in the test.** The stand-in node registered `/api/node/engines/:slot/heat` before
+a more specific `/api/node/engines/no-telemetry/heat`, and httplib matches in registration order — so
+the parameterised route swallowed both and the 501 case returned 200. The real node has no such problem
+because it consults the descriptor *inside* the parameterised handler; the fake now does the same, which
+is both correct and a closer model of the thing it stands in for.
+
 ##### What is NOT ported yet, stated plainly
 
-1. **`admit()` is not in-process.** Converting a model is `tools/admission/convert.py`, and the SSE
-   progress stream that would report it (`POST /v1/models/admit`) lands with the self-service gate.
-   Registering the result is a `POST /v1/models` away.
+1. **Fetching is not implemented.** `admit()` takes a local directory; pulling from a HF repo id is the
+   `fetch` stage's name and not yet its behaviour.
+2. **The OpenAI-compat listener on `:9091` still uses the flat token.** It serves one surface with one
+   meaning — chat against agents-as-models — so a scope table for it would have one row. Worth doing
+   when it grows a second capability, not before.
 
 **Build:** the supervision rebuild — `EngineProcess`, `EngineSupervisor`, `EngineDescriptor` +
 registry, `EngineClient` with virtual `stream_complete`, `KvCheckpointBackend` ×2, `PlacementEngine`,
@@ -1991,13 +2215,22 @@ store; SSE telemetry with throttling; `/v1/models` reclamation.
 
 **Gate:**
 - `require_complete_coverage()` green: every registered handler has a scope-table entry. Startup fails
-  otherwise.
+  otherwise. **Done** — checked against `HttpServer::registered_routes()` in `listen()`, and it caught
+  an unscoped upload route on its first run.
 - A `read`-scoped token can stream telemetry and **cannot** admit, delete, or chat. Test the negative.
-- A `chat`-scoped token cannot admit. Test the negative.
-- The legacy flat token still works as all-scopes.
-- `hz` clamps to 10; `resolution=full` requires the explicit parameter.
+  **Done** over HTTP — `scope_negatives_over_http`. The telemetry half of it lands with the telemetry
+  routes; the admit/delete/chat negatives are asserted against a live server.
+- A `chat`-scoped token cannot admit. Test the negative. **Done** over HTTP.
+- The legacy flat token still works as all-scopes. **Done** — `control_api_external_token_gate` is
+  unchanged and passing, which is the regression that matters.
+- `hz` clamps to 10; `resolution=full` requires the explicit parameter. **Done** in the ENGINE —
+  measured on the wire, `?hz=1000` produces 15 frames in 1.5 s rather than 1500. Control's
+  `/v1/engines/{id}/telemetry` re-publishes it and inherits the ceiling.
 - A client requesting maximum telemetry on a 60k-expert model does not measurably affect chat latency —
-  the aggregation-in-engine claim, verified rather than asserted.
+  the aggregation-in-engine claim, verified rather than asserted. **Structurally done, not yet
+  measured**: one channel samples for all watchers, nothing is emitted per token, and the grid is capped
+  at 4096 cells. The latency comparison itself needs a model with tens of thousands of experts, which
+  the committed fixtures are three orders of magnitude away from.
 - Image content parts return **422**, not a dropped part.
 
 ---

@@ -30,7 +30,6 @@ target_include_directories(mm_node_engine PUBLIC
 
 add_executable(mantic-mind
     main.cpp
-    process_exec.cpp
     runtime_process.cpp
     llama_runtime.cpp
     llama_cpp_provisioner.cpp
@@ -67,10 +66,15 @@ if(BUILD_TESTING)
     add_executable(soma_engine_g5 ${CMAKE_SOURCE_DIR}/tests/soma/engine_g5.cpp)
     target_link_libraries(soma_engine_g5 PRIVATE mm_node_engine)
 
+    # The third argument is a converted CONTAINER, which is what makes the
+    # streaming path real: a plain checkpoint is resident, so its expert cache
+    # and heat grid are empty by construction. The fixtures carry config.json
+    # now, so the engine can open one straight from the repo.
     add_test(NAME soma_engine_g5
              COMMAND soma_engine_g5
                      "$<TARGET_FILE:soma>"
-                     "${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/Qwen3-30B-A3B")
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/Qwen3-30B-A3B"
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/containers/Qwen3-30B-A3B")
 
     # On Windows both binaries resolve OpenSSL/SQLiteCpp/spdlog beside the .exe or
     # from PATH; with neither, the loader fails with 0xC0000135 before main() and

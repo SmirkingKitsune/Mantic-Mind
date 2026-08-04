@@ -18,6 +18,17 @@ struct ControlConfig {
     // Model distribution
     std::string models_dir  = "models";
 
+    // ── admission ─────────────────────────────────────────────────────────────
+    // Converting a model runs the Python tools in tools/admission/ as
+    // subprocesses. They are a dependency of ADMITTING, which happens once per
+    // model — never of serving.
+    std::string admission_python     = "python";           // MM_ADMISSION_PYTHON
+    std::string admission_tools_dir  = "tools/admission";  // MM_ADMISSION_TOOLS
+    std::string admission_soma_path  = "soma";             // MM_SOMA_PATH
+    std::string containers_dir       = "data/containers";  // MM_CONTAINERS_DIR
+    std::string admission_quant      = "q4_g";             // MM_ADMISSION_QUANT
+    std::string admission_expert_down = "q6_g";
+
     // Optional bearer token required by external /v1/* client routes.
     std::string external_api_token;
 

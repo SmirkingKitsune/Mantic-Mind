@@ -20,6 +20,7 @@ set(MM_COMMON_SOURCES
     gguf_metadata.cpp
     inference_sizing.cpp
     footprint.cpp
+    process_exec.cpp
 )
 
 add_library(mm_common STATIC ${MM_COMMON_SOURCES})

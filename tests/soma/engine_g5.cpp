@@ -141,11 +141,15 @@ void write_soma_header(const std::string& path,
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::cerr << "usage: engine_g5 <soma_exe> <model_dir>\n";
+        std::cerr << "usage: engine_g5 <soma_exe> <model_dir> [container_dir]\n";
         return 2;
     }
     const std::string exe = argv[1];
     const std::string model = argv[2];
+    // Optional. A converted container is what makes the STREAMING path real: a
+    // plain checkpoint is resident, so its expert cache and heat grid are empty
+    // by construction and every counter reads zero.
+    const std::string container = argc > 3 ? argv[3] : std::string{};
 
     // ── 1. the registry ──────────────────────────────────────────────────────
     std::cout << "1. engines are DATA, not code paths\n";
@@ -735,6 +739,131 @@ int main(int argc, char** argv) {
             std::cout << "   union at the widest sampled step: " << max_unique.load()
                       << " unique / " << max_naive.load() << " naive = " << ratio << "x\n";
         }
+
+        (void)sup.unload_all(true);
+    }
+
+    // ── 11. telemetry over the wire ──────────────────────────────────────────
+    //
+    // bucket_heat()'s maths is checked in soma_telemetry_g6 without a model.
+    // What needs a LIVE engine is the transport: that frames arrive at the
+    // requested rate, that `?hz=` is clamped rather than obeyed or rejected, and
+    // that a snapshot answers whether or not anyone is streaming.
+    std::cout << "\n11. the telemetry feed ticks, and the rate is clamped\n";
+    {
+        // A CONTAINER when one is given, not the plain checkpoint. A resident
+        // model has no MemoryHierarchy at all, so its grid is legitimately empty
+        // and the counters this section reads would all be zero — the feed would
+        // be exercised and the thing it reports would not.
+        mm::EngineSupervisor sup(8300, 8310, /*max_slots=*/1);
+        mm::EngineLoadRequest req;
+        req.model_path = container.empty() ? model : container;
+        const auto slot = sup.load("soma", req, "agent-t");
+        check(!slot.empty(), "engine loaded", slot);
+        if (slot.empty()) {
+            std::cout << "   last_error: " << sup.last_error() << "\n";
+            return 1;
+        }
+        const auto port = sup.slots().front().port;
+
+        {
+            httplib::Client cli("127.0.0.1", port);
+            cli.set_read_timeout(10);
+            auto res = cli.Get("/internal/heat");
+            check(res && res->status == 200, "GET /internal/heat answers");
+            if (res) {
+                const auto j = json::parse(res->body, nullptr, false);
+                check(!j.is_discarded() && j.value("resolution", std::string{}) == "bucketed",
+                      "and is BUCKETED by default");
+            }
+            auto full = cli.Get("/internal/heat?resolution=full");
+            check(full && full->status == 200 &&
+                      json::parse(full->body, nullptr, false)
+                              .value("resolution", std::string{}) == "full",
+                  "?resolution=full is an explicit opt-in");
+
+            auto dump = cli.Get("/internal/telemetry/dump");
+            check(dump && dump->status == 200 && dump->body.find("sched") != std::string::npos,
+                  "and the G3 text dump still reads");
+
+            if (!container.empty()) {
+                // Drive one turn so the expert cache is actually touched, then
+                // assert the counters MOVED. A telemetry feed reporting
+                // structurally-correct zeros is indistinguishable from one wired
+                // to nothing, which is the failure this catches.
+                auto health = cli.Get("/health");
+                check(health && health->body.find("\"streamed\":true") != std::string::npos,
+                      "the container is served as STREAMED");
+
+                chat(port, json::array({user_msg("route some experts through this prompt")}), "",
+                     8);
+
+                auto after = cli.Get("/internal/heat");
+                check(after && after->status == 200, "heat answers after a turn");
+                if (after) {
+                    const auto j = json::parse(after->body, nullptr, false);
+                    check(!j.is_discarded() && j.value("n_experts", 0u) > 0,
+                          "and reports the model's real dimensions",
+                          std::to_string(j.value("n_layers", 0u)) + "x" +
+                              std::to_string(j.value("n_experts", 0u)));
+                    std::uint64_t hottest = 0;
+                    for (const auto& c : j.value("counts", json::array())) {
+                        hottest = std::max<std::uint64_t>(hottest, c.get<std::uint64_t>());
+                    }
+                    check(hottest > 0, "with NON-ZERO counts — experts actually fired",
+                          "hottest cell = " + std::to_string(hottest));
+                }
+                auto stats = cli.Get("/internal/telemetry/dump");
+                check(stats && stats->body.find("hit_rate") != std::string::npos,
+                      "and the cache reports a hit rate, so lookups happened");
+            } else {
+                std::cout << "   (no container given; streaming counters not exercised)\n";
+            }
+        }
+
+        // Counted over a fixed window rather than waited on frame-by-frame: the
+        // assertion is about RATE, and a per-frame wait would pass at any rate.
+        const auto count_frames = [&](const std::string& query, int ms) {
+            httplib::Client cli("127.0.0.1", port);
+            cli.set_read_timeout(1, 0);
+            int ticks = 0;
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+            cli.Get(("/internal/telemetry" + query).c_str(),
+                    [&](const char* data, std::size_t len) {
+                        const std::string chunk(data, len);
+                        std::size_t at = 0;
+                        while ((at = chunk.find("event: telemetry", at)) != std::string::npos) {
+                            ++ticks;
+                            at += 16;
+                        }
+                        return std::chrono::steady_clock::now() < deadline;
+                    });
+            return ticks;
+        };
+
+        // ~2 Hz over 1.5 s is about 3 frames. Bounded generously on both sides:
+        // this is a scheduling assertion on a shared machine, not a stopwatch.
+        const int slow = count_frames("", 1500);
+        check(slow >= 2 && slow <= 8, "the default feed ticks near 2 Hz",
+              std::to_string(slow) + " frames in 1.5s");
+
+        const int fast = count_frames("?hz=10", 1500);
+        check(fast > slow, "?hz=10 is faster than the default",
+              std::to_string(fast) + " vs " + std::to_string(slow));
+
+        // The ceiling is the ENGINE's. A client asking for 1000 Hz gets 10 — not
+        // an error, because the limit is a property of the engine rather than a
+        // mistake by the caller.
+        const int clamped = count_frames("?hz=1000", 1500);
+        check(clamped > 0, "?hz=1000 is CLAMPED, not refused",
+              std::to_string(clamped) + " frames");
+        check(clamped <= 30, "and does not exceed the 10 Hz ceiling",
+              std::to_string(clamped) + " frames in 1.5s");
+
+        const int garbage = count_frames("?hz=banana", 1200);
+        check(garbage > 0, "an unparseable hz falls back to the default",
+              std::to_string(garbage) + " frames");
 
         (void)sup.unload_all(true);
     }

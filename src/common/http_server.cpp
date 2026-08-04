@@ -6,6 +6,10 @@ namespace mm {
 
 struct HttpServer::Impl {
     httplib::Server srv;
+    /// Recorded as they are registered. httplib keeps its own handler lists but
+    /// does not expose them, and the alternative — a hand-maintained second list
+    /// — is exactly the thing the coverage check exists to make unnecessary.
+    std::vector<std::string> routes;
 };
 
 HttpServer::HttpServer() : impl_(std::make_unique<Impl>()) {}
@@ -21,19 +25,26 @@ void HttpServer::SetPreRoutingHandler(PreRoutingHandler h) {
 }
 
 void HttpServer::Get(const std::string& pattern, Handler h) {
+    impl_->routes.push_back("GET " + pattern);
     impl_->srv.Get(pattern, std::move(h));
 }
 void HttpServer::Post(const std::string& pattern, Handler h) {
+    impl_->routes.push_back("POST " + pattern);
     impl_->srv.Post(pattern, std::move(h));
 }
 void HttpServer::Put(const std::string& pattern, Handler h) {
+    impl_->routes.push_back("PUT " + pattern);
     impl_->srv.Put(pattern, std::move(h));
 }
 void HttpServer::Delete(const std::string& pattern, Handler h) {
+    impl_->routes.push_back("DELETE " + pattern);
     impl_->srv.Delete(pattern, std::move(h));
 }
 
+std::vector<std::string> HttpServer::registered_routes() const { return impl_->routes; }
+
 void HttpServer::PostUpload(const std::string& pattern, UploadHandler h) {
+    impl_->routes.push_back("POST " + pattern);
     impl_->srv.Post(
         pattern,
         [handler = std::move(h)](const httplib::Request& req, httplib::Response& res,

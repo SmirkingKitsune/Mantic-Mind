@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -79,9 +80,56 @@ struct AdmissionProgress {
     double fraction = 0.0;
     bool cancelable = true;
     std::string last_error;
+
+    /// Terminal states. `done` without `last_error` is success; the two are
+    /// separate because a client needs to stop waiting either way, and a stream
+    /// that just goes quiet is indistinguishable from a network fault.
+    bool done = false;
+    bool canceled = false;
+    std::int64_t model_id = 0; ///< set on success
+    std::string source_ref;
+    std::int64_t started_at_ms = 0;
+    std::int64_t finished_at_ms = 0;
 };
 
 using AdmissionProgressSink = std::function<void(const AdmissionProgress&)>;
+
+/// One in-flight (or finished) admission. Opaque here on purpose: it owns a
+/// thread, a cancel flag and a sink list, none of which is anyone else's
+/// business. Defined in model_registry.cpp.
+struct AdmissionOperation;
+
+/// Where the offline tools live, and how to run them.
+///
+/// Admission is orchestration, not reimplementation: the converter and the
+/// tokenizer compiler are Python and stay Python, because they read HF
+/// checkpoints and that ecosystem is theirs. Control runs them as subprocesses
+/// and streams their output. `tools/admission/` is NEVER a runtime dependency —
+/// it is a dependency of ADMITTING, which happens once per model.
+struct AdmissionTools {
+    std::string python = "python"; ///< MM_ADMISSION_PYTHON
+    std::string tools_dir = "tools/admission";
+    std::string soma_path = "soma"; ///< for `soma plan --json`
+    std::string containers_dir = "data/containers";
+
+    /// Quantization for the converted container. Part of the verdict's identity:
+    /// the same weights at a different quant are a different admission.
+    std::string quant = "q4_g";
+    std::string expert_down = "q6_g";
+    int group = 128;
+};
+
+/// One row of api_token. The token itself is NEVER stored — only its SHA-256 —
+/// so a leaked database backup does not hand over working credentials.
+struct ApiToken {
+    std::int64_t id = 0;
+    std::string token_sha256;
+    std::string label;
+    std::uint8_t scopes = 0; ///< ScopeSet; see control/route_scope.hpp
+    std::int64_t created_at_ms = 0;
+    std::int64_t last_used_at_ms = 0;
+    bool revoked = false;
+};
 
 class ControlModelRegistry {
 public:
@@ -91,6 +139,15 @@ public:
     /// Opens {data_dir}/control.db, creating it and running pending migrations.
     bool open(const std::string& data_dir, std::string& out_error);
     void close();
+
+    void set_tools(const AdmissionTools& tools);
+    AdmissionTools tools() const;
+
+    /// Every admission this process has run, newest first. Survives the SSE
+    /// stream disconnecting — a client that loses its connection mid-conversion
+    /// must be able to find out how it ended.
+    std::vector<AdmissionProgress> operations() const;
+    std::optional<AdmissionProgress> operation(const std::string& id) const;
 
     std::uint32_t schema_version() const;
 
@@ -123,6 +180,16 @@ public:
     std::string
     admit(const std::string& source_ref, AdmissionProgressSink sink, std::string& out_error);
 
+    /// Admit a container that has ALREADY been converted.
+    ///
+    /// Same pipeline minus conversion: plan, then record. This is the path for a
+    /// model converted by hand with tools/admission/convert.py, and it is what
+    /// reprofile() runs — re-deriving a verdict should not rewrite gigabytes to
+    /// arrive at the same bytes.
+    std::string admit_container(const std::string& container_dir,
+                                AdmissionProgressSink sink,
+                                std::string& out_error);
+
     /// Write (or update) a record for an ALREADY-CONVERTED model.
     ///
     /// The write primitive admit() ends with, exposed on its own because the
@@ -134,6 +201,26 @@ public:
     ///
     /// `model.id` is filled in on success.
     bool upsert(AdmittedModel& model, std::string& out_error);
+
+    // ── api tokens ───────────────────────────────────────────────────────────
+    //
+    // Admission is why scopes exist: hours of CPU and tens of GB of disk must not
+    // sit behind the token that lets a client send a chat message.
+
+    /// Mint a token. Returns the SECRET, which is shown once and never stored —
+    /// only its hash is. A caller that loses it mints another.
+    std::string
+    create_api_token(const std::string& label, std::uint8_t scopes, std::string& out_error);
+
+    /// By hash, and only if not revoked. Touches last_used_at.
+    bool find_api_token(const std::string& token_sha256, ApiToken& out) const;
+
+    std::vector<ApiToken> list_api_tokens() const;
+    bool revoke_api_token(std::int64_t id, std::string& out_error);
+
+    /// Whether ANY usable token exists. Together with the legacy config token,
+    /// this is what decides whether auth is on at all.
+    bool has_api_tokens() const;
 
     /// Record which backend an agent actually got, and why.
     ///
@@ -147,6 +234,16 @@ public:
                           const ResourceFootprint& footprint);
 
     std::string reprofile(std::int64_t id, AdmissionProgressSink sink, std::string& out_error);
+    /// Watch an operation that is already running.
+    ///
+    /// The SSE route for an admission that started before this client connected.
+    /// `out_current` always receives the latest snapshot, so a caller learns the
+    /// outcome of an operation that has already finished rather than attaching
+    /// to a stream that will never speak again. Returns false for an unknown id.
+    bool attach_sink(const std::string& operation_id,
+                     AdmissionProgressSink sink,
+                     AdmissionProgress& out_current);
+
     bool cancel(const std::string& operation_id);
     bool remove(std::int64_t id, std::string& out_error);
 
@@ -167,6 +264,23 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+
+    /// The staged pipeline, on the operation's own thread.
+    ///
+    /// `container_is_ready` skips conversion: reprofile() re-derives a verdict
+    /// for a container that already exists, and rewriting gigabytes to reach the
+    /// same bytes is not what "re-profile" should mean.
+    /// Register an operation and start its thread. Shared by admit(),
+    /// admit_container() and reprofile(), which differ only in whether
+    /// conversion runs and what they validate first.
+    std::string
+    start_operation(const std::string& source, bool container_is_ready, AdmissionProgressSink sink);
+    std::mutex& ops_mu_ref() const;
+
+    void run_admission(std::shared_ptr<AdmissionOperation> op,
+                       const std::string& source,
+                       const AdmissionTools& tools,
+                       bool container_is_ready = false);
 };
 
 ModelVerdict parse_verdict(const std::string& text);

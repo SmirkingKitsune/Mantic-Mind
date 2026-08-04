@@ -5,11 +5,11 @@ add_executable(mm_reliability_tests
     ${CMAKE_SOURCE_DIR}/src/control/agent_config_validator.cpp
     ${CMAKE_SOURCE_DIR}/src/control/agent_scheduler.cpp
     ${CMAKE_SOURCE_DIR}/src/control/model_registry.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/route_scope.cpp
     ${CMAKE_SOURCE_DIR}/src/control/control_api_server.cpp
     ${CMAKE_SOURCE_DIR}/src/control/performance_tracker.cpp
     ${CMAKE_SOURCE_DIR}/src/control/tts_service_client.cpp
     ${CMAKE_SOURCE_DIR}/src/control/node_registry.cpp
-    ${CMAKE_SOURCE_DIR}/src/node/process_exec.cpp
     ${CMAKE_SOURCE_DIR}/src/node/engine_process.cpp
     ${CMAKE_SOURCE_DIR}/src/node/engine_descriptor.cpp
     ${CMAKE_SOURCE_DIR}/src/node/engine_supervisor.cpp
@@ -52,3 +52,9 @@ if(WIN32)
 endif()
 
 add_test(NAME mm_reliability_tests COMMAND mm_reliability_tests)
+
+# The admission test drives the REAL `soma plan --json` rather than a mock, so it
+# needs the binary and a model. Passed as environment rather than argv because
+# reliability_tests takes an optional test-name filter and nothing else.
+set_tests_properties(mm_reliability_tests PROPERTIES
+    ENVIRONMENT "MM_TEST_SOMA_PATH=$<TARGET_FILE:soma>;MM_TEST_MODEL_DIR=${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/Qwen3-30B-A3B")

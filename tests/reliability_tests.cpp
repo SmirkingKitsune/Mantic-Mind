@@ -13,7 +13,9 @@
 #include "control/agent_queue.hpp"
 #include "control/agent_scheduler.hpp"
 #include "control/control_api_server.hpp"
+#include "common/pairing.hpp"
 #include "control/model_registry.hpp"
+#include "control/route_scope.hpp"
 #include "control/node_registry.hpp"
 #include "control/performance_tracker.hpp"
 #include "control/tts_service_client.hpp"
@@ -4632,6 +4634,585 @@ bool test_model_registry_makes_soma_routable() {
     return true;
 }
 
+bool test_admission_pipeline_runs_and_reports() {
+    // Drives the REAL pipeline against the real `soma` binary — no mock. What is
+    // under test is orchestration: staged progress, a terminal frame, cancel, and
+    // the registry row at the end. Conversion is skipped by pointing at a
+    // container that already exists, which is exactly what reprofile() does.
+    const char* soma_path = std::getenv("MM_TEST_SOMA_PATH");
+    const char* model_dir = std::getenv("MM_TEST_MODEL_DIR");
+    if (soma_path == nullptr || model_dir == nullptr) {
+        // Skipped rather than silently passing: CTest passes both, and a
+        // developer running the binary by hand should be told why this is quiet.
+        std::cout << "  (skipped: MM_TEST_SOMA_PATH / MM_TEST_MODEL_DIR unset)\n";
+        return true;
+    }
+
+    auto dir = temp_test_dir("admission");
+    mm::ControlModelRegistry reg;
+    std::string err;
+    CHECK(reg.open(dir.string(), err));
+
+    mm::AdmissionTools tools;
+    tools.soma_path = soma_path;
+    tools.containers_dir = (dir / "containers").string();
+    reg.set_tools(tools);
+
+    // ── a source that does not exist fails BEFORE an operation exists ────────
+    CHECK(reg.admit((dir / "nope").string(), nullptr, err).empty());
+    CHECK(!err.empty());
+    CHECK(reg.operations().empty());   // nothing was started, so nothing is listed
+
+    // ── the real thing ───────────────────────────────────────────────────────
+    std::mutex m;
+    std::condition_variable cv;
+    std::vector<mm::AdmissionProgress> frames;
+    bool finished = false;
+
+    const auto op = reg.admit_container(model_dir, [&](const mm::AdmissionProgress& p) {
+        std::lock_guard<std::mutex> lk(m);
+        frames.push_back(p);
+        if (p.done) { finished = true; cv.notify_all(); }
+    }, err);
+    CHECK(!op.empty());
+
+    {
+        std::unique_lock<std::mutex> lk(m);
+        CHECK(cv.wait_for(lk, std::chrono::seconds(120), [&] { return finished; }));
+    }
+
+    CHECK(!frames.empty());
+    const auto& last = frames.back();
+    CHECK(last.done);
+    CHECK(last.operation_id == op);
+    // A terminal frame ALWAYS arrives. A stream that just goes quiet is
+    // indistinguishable from a network fault, which is why `done` is a field and
+    // not the absence of further frames.
+    CHECK(last.finished_at_ms >= last.started_at_ms);
+
+    // The tiny fixture is a raw HF checkpoint, not a converted container, so it
+    // carries no arch_hash — and without an identity there is nothing to key a
+    // row on. Refused with that reason rather than recorded under an empty hash,
+    // which would collide with every other unconverted model.
+    if (!last.last_error.empty()) {
+        CHECK(last.last_error.find("arch_hash") != std::string::npos);
+        CHECK(reg.list().empty());
+    } else {
+        CHECK(last.model_id > 0);
+        const auto admitted = reg.find_by_id(last.model_id);
+        CHECK(admitted.has_value());
+        // Straight from `soma plan --json`, which is why those fields were added
+        // to the plan document: control has no other view of the model.
+        CHECK(admitted->n_experts > 0);
+        CHECK(admitted->top_k > 0);
+        CHECK(admitted->active_fraction > 0.0);
+        CHECK(!admitted->attention_family.empty());
+    }
+
+    // Progress is STAGED, and the operation is retrievable after it ends — an
+    // SSE connection will not survive a real conversion, so a client that
+    // reconnects has to be able to find out how it went.
+    bool saw_profile = false, saw_finalize = false;
+    for (const auto& f : frames) {
+        if (f.stage == "profile") saw_profile = true;
+        if (f.stage == "finalize") saw_finalize = true;
+    }
+    CHECK(saw_profile);
+    CHECK(saw_finalize);
+    CHECK(reg.operation(op).has_value());
+    CHECK(reg.operation(op)->done);
+    CHECK(reg.operations().size() == 1);
+    CHECK(!reg.operation("no-such-operation").has_value());
+
+    // Cancelling a finished operation is refused rather than silently accepted:
+    // "too late" and "never existed" are both false, but only one is confusing.
+    CHECK(!reg.cancel(op));
+    CHECK(!reg.cancel("no-such-operation"));
+
+    // A late watcher still gets the outcome, immediately, and is not registered
+    // as a sink for a stream that is over.
+    mm::AdmissionProgress snapshot;
+    CHECK(reg.attach_sink(op, [](const mm::AdmissionProgress&) {}, snapshot));
+    CHECK(snapshot.done);
+    CHECK(snapshot.operation_id == op);
+
+    reg.close();
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_scope_negatives_over_http() {
+    // The predicate is asserted elsewhere; this asserts the WIRE. A scope table
+    // that is right in a unit test and unreached by the middleware protects
+    // nothing, and the failure mode is silent — every request succeeds.
+    auto dir = temp_test_dir("scope-http");
+    std::filesystem::create_directories(dir / "models");
+
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    {
+        mm::AgentManager agents(dir.string());
+        mm::AgentConfig cfg;
+        cfg.id = "agent-a";
+        cfg.name = "Agent A";
+        cfg.model_path = "model.gguf";
+        agents.create_agent(cfg);
+
+        mm::AgentQueue queue;
+        mm::NodeRegistry registry(dir.string());
+        mm::AgentScheduler scheduler(registry, (dir / "models").string());
+
+        // The registry has to be attached: without one, has_api_tokens() is
+        // false and — with no legacy token either — auth is off entirely, so
+        // the scoped path is never reached. That is the exact shape of the bug
+        // this test would otherwise miss.
+        mm::ControlModelRegistry models;
+        std::string err;
+        RECORD(models.open(dir.string(), err));
+
+        const auto read_token = models.create_api_token(
+            "dashboard", static_cast<mm::ScopeSet>(mm::Scope::Read), err);
+        const auto chat_token = models.create_api_token(
+            "assistant", static_cast<mm::ScopeSet>(mm::Scope::Chat), err);
+        const auto op_token = models.create_api_token(
+            "ops", static_cast<mm::ScopeSet>(mm::Scope::Operator), err);
+        RECORD(!read_token.empty() && !chat_token.empty() && !op_token.empty());
+
+        // No legacy token: auth is on purely because api_token has rows.
+        mm::ControlApiServer api(agents, queue, registry, scheduler, dir.string(),
+                                 (dir / "models").string(), /*external_api_token=*/"");
+        api.set_model_registry(&models);
+
+        const uint16_t port = find_free_test_port();
+        CHECK(port != 0);
+        const std::string base_url = "http://127.0.0.1:" + std::to_string(port);
+        std::atomic<bool> listen_ok{false};
+        std::thread server_thread([&] { listen_ok = api.listen(port); });
+
+        mm::HttpClient probe(base_url);
+        bool ready = false;
+        for (int i = 0; i < 50 && !ready; ++i) {
+            if (probe.get("/v1/nodes").status != 0) ready = true;
+            else std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        RECORD(ready);
+
+        auto with_retry = [](auto&& request) {
+            mm::HttpResponse resp;
+            for (int attempt = 0; attempt < 8; ++attempt) {
+                resp = request();
+                if (resp.status != 0) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            return resp;
+        };
+        auto as = [&](const std::string& token) {
+            auto c = std::make_shared<mm::HttpClient>(base_url);
+            c->set_bearer_token(token);
+            return c;
+        };
+
+        // ── read: GETs yes, everything else no ───────────────────────────────
+        auto reader = as(read_token);
+        RECORD(with_retry([&] { return reader->get("/v1/nodes"); }).status == 200);
+        RECORD(with_retry([&] { return reader->get("/v1/agents"); }).status == 200);
+        RECORD(with_retry([&] { return reader->get("/v1/models"); }).status == 200);
+
+        auto reader_admits = with_retry([&] {
+            return reader->post("/v1/models/admit", nlohmann::json{{"source", "/nope"}});
+        });
+        RECORD(reader_admits.status == 403);
+        // The body names WHICH scope was needed and which were held. "403
+        // forbidden" with no detail sends an operator to read source to find out
+        // what to grant.
+        RECORD(reader_admits.body.find("insufficient scope") != std::string::npos);
+        RECORD(reader_admits.body.find("operator") != std::string::npos);
+        RECORD(reader_admits.body.find("read") != std::string::npos);
+
+        RECORD(with_retry([&] { return reader->del("/v1/agents/agent-a"); }).status == 403);
+        RECORD(with_retry([&] {
+                   return reader->post("/v1/agents/agent-a/conversations",
+                                       nlohmann::json{{"title", "nope"}});
+               }).status == 403);
+        // Still there: the refusal was a refusal, not a 403 after the fact.
+        RECORD(agents.get_agent("agent-a") != nullptr);
+
+        // ── chat: conversations yes, admission and deletes no ────────────────
+        auto chatter = as(chat_token);
+        // chat implies read.
+        RECORD(with_retry([&] { return chatter->get("/v1/agents"); }).status == 200);
+        auto chat_creates = with_retry([&] {
+            return chatter->post("/v1/agents/agent-a/conversations",
+                                 nlohmann::json{{"title", "Allowed"}, {"set_active", true}});
+        });
+        RECORD(chat_creates.status == 200 || chat_creates.status == 201);
+
+        auto chat_admits = with_retry([&] {
+            return chatter->post("/v1/models/admit", nlohmann::json{{"source", "/nope"}});
+        });
+        RECORD(chat_admits.status == 403);
+        RECORD(chat_admits.body.find("insufficient scope") != std::string::npos);
+        RECORD(with_retry([&] { return chatter->del("/v1/agents/agent-a"); }).status == 403);
+        RECORD(with_retry([&] { return chatter->get("/v1/tokens"); }).status == 403);
+
+        // ── operator: everything, including the things that refused above ────
+        auto op = as(op_token);
+        RECORD(with_retry([&] { return op->get("/v1/agents"); }).status == 200);
+        RECORD(with_retry([&] { return op->get("/v1/tokens"); }).status == 200);
+        auto op_admits = with_retry([&] {
+            return op->post("/v1/models/admit", nlohmann::json{{"source", "/nope"}});
+        });
+        // 400, not 403: authorization PASSED and the request was then rejected on
+        // its merits. That distinction is the whole point — a 403 here would mean
+        // the operator scope was not being honoured.
+        RECORD(op_admits.status == 400);
+        RECORD(op_admits.body.find("not found") != std::string::npos);
+
+        // ── a revoked token stops working immediately ────────────────────────
+        const auto rows = models.list_api_tokens();
+        std::int64_t chat_id = 0;
+        for (const auto& t : rows) {
+            if (t.label == "assistant") chat_id = t.id;
+        }
+        RECORD(chat_id != 0);
+        RECORD(models.revoke_api_token(chat_id, err));
+        auto revoked = with_retry([&] { return chatter->get("/v1/agents"); });
+        RECORD(revoked.status == 403);
+        RECORD(revoked.body.find("invalid bearer token") != std::string::npos);
+
+        // ── an unknown token is 403, a missing one is 401 ────────────────────
+        RECORD(with_retry([&] { return as("never-minted")->get("/v1/agents"); }).status == 403);
+        RECORD(with_retry([&] { return probe.get("/v1/agents"); }).status == 401);
+
+        // Deleting the agent as operator — the mutation the reader and chatter
+        // were both refused — proves the route works and the refusals were about
+        // the credential rather than the request.
+        RECORD(with_retry([&] { return op->del("/v1/agents/agent-a"); }).status == 200);
+
+        api.stop();
+        if (server_thread.joinable()) server_thread.join();
+        RECORD(listen_ok.load());
+        models.close();
+    }
+
+    RECORD(remove_tree(dir));
+#undef RECORD
+    return ok;
+}
+
+bool test_engine_telemetry_republication() {
+    // Control's half of the chain, against a node that answers. What is under
+    // test is the ROUTING: finding which node holds an engine, passing the
+    // upstream status through rather than flattening it, and distinguishing
+    // "no such engine" from "the node is unreachable".
+    auto dir = temp_test_dir("engine-telemetry");
+    std::filesystem::create_directories(dir / "models");
+
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    {
+        // A stand-in node exposing the two proxied GETs.
+        httplib::Server node;
+        std::atomic<int> heat_calls{0};
+        std::string last_heat_query;
+        std::mutex query_mutex;
+
+        node.Get("/api/node/engines/:slot/heat",
+                 [&](const httplib::Request& req, httplib::Response& res) {
+                     const auto slot = req.path_params.at("slot");
+                     // The 501 lives INSIDE the parameterised handler, exactly as
+                     // it does on the real node: the descriptor is consulted per
+                     // slot, not routed around. A second, more specific httplib
+                     // route would never be reached — `:slot` is registered first
+                     // and matches everything.
+                     if (slot == "no-telemetry") {
+                         res.status = 501;
+                         res.set_content(
+                             nlohmann::json{{"error", "this engine publishes no heat map"}}
+                                 .dump(),
+                             "application/json");
+                         return;
+                     }
+                     ++heat_calls;
+                     {
+                         std::lock_guard<std::mutex> lk(query_mutex);
+                         last_heat_query = req.get_param_value("resolution");
+                     }
+                     res.set_content(nlohmann::json{{"slot", slot},
+                                                    {"resolution", "bucketed"},
+                                                    {"n_layers", 4},
+                                                    {"n_experts", 16}}
+                                         .dump(),
+                                     "application/json");
+                 });
+        node.Get("/api/node/engines/:slot/sequences",
+                 [&](const httplib::Request&, httplib::Response& res) {
+                     res.set_content(
+                         nlohmann::json{{"sequences", nlohmann::json::array()}}.dump(),
+                         "application/json");
+                 });
+
+        // Health and status too: `connected` and the slot list come from the
+        // POLL, not from a setter. Faking them would test a registry state the
+        // real system never reaches this way.
+        node.Get("/api/node/health", [&](const httplib::Request&, httplib::Response& res) {
+            res.set_content(nlohmann::json{{"cpu_percent", 10.0},
+                                           {"ram_percent", 20.0},
+                                           {"ram_total_mb", 65536},
+                                           {"ram_used_mb", 8192},
+                                           {"gpu_vram_total_mb", 24576},
+                                           {"gpu_vram_used_mb", 1024}}
+                                .dump(),
+                            "application/json");
+        });
+        node.Get("/api/node/status", [&](const httplib::Request&, httplib::Response& res) {
+            nlohmann::json soma_slot = {{"id", "slot-soma"},
+                                        {"backend", "soma"},
+                                        {"state", "ready"},
+                                        {"model_path", "container/Qwen3-30B-A3B"},
+                                        {"vram_usage_mb", 512},
+                                        {"agent_ids", nlohmann::json::array()}};
+            nlohmann::json llama_slot = {{"id", "no-telemetry"},
+                                         {"backend", "llama-cpp"},
+                                         {"state", "ready"},
+                                         {"model_path", "m.gguf"},
+                                         {"agent_ids", nlohmann::json::array()}};
+            res.set_content(nlohmann::json{{"slots", {soma_slot, llama_slot}},
+                                           {"max_slots", 4},
+                                           {"slot_available", 2},
+                                           {"disk_free_mb", 100000}}
+                                .dump(),
+                            "application/json");
+        });
+
+        const uint16_t node_port = find_free_test_port();
+        RECORD(node_port != 0);
+        std::thread node_thread([&] { node.listen("127.0.0.1", node_port); });
+        for (int i = 0; i < 50 && !node.is_running(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+
+        mm::AgentManager agents(dir.string());
+        mm::AgentQueue queue;
+        mm::NodeRegistry registry(dir.string());
+        mm::AgentScheduler scheduler(registry, (dir / "models").string());
+        mm::ControlApiServer api(agents, queue, registry, scheduler, dir.string(),
+                                 (dir / "models").string(), "");
+
+        const auto node_url = "http://127.0.0.1:" + std::to_string(node_port);
+        RECORD(wait_for_test_server(node_url));
+        const auto node_id = registry.add_node(node_url, "", "engine-host", false);
+        RECORD(!node_id.empty());
+        // The slot list is what makes an engine FINDABLE: control discovers which
+        // node holds it rather than making the caller supply one, because the
+        // answer changes on every eviction. It arrives through the health poll,
+        // which is the path the real system uses.
+        registry.start_health_poll(1);
+        RECORD(wait_for_registered_node(registry, node_id));
+        RECORD(wait_for_node_snapshot(registry, node_id, 0, [](const mm::NodeInfo& n) {
+            return n.slots.size() == 2;
+        }));
+
+        const uint16_t port = find_free_test_port();
+        RECORD(port != 0);
+        const std::string base = "http://127.0.0.1:" + std::to_string(port);
+        std::thread api_thread([&] { api.listen(port); });
+        mm::HttpClient client(base);
+        for (int i = 0; i < 50; ++i) {
+            if (client.get("/v1/engines").status != 0) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+
+        auto with_retry = [](auto&& request) {
+            mm::HttpResponse resp;
+            for (int attempt = 0; attempt < 8; ++attempt) {
+                resp = request();
+                if (resp.status != 0) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            return resp;
+        };
+
+        // ── the cluster view ─────────────────────────────────────────────────
+        auto engines = with_retry([&] { return client.get("/v1/engines"); });
+        RECORD(engines.status == 200);
+        {
+            const auto j = nlohmann::json::parse(engines.body, nullptr, false);
+            RECORD(!j.is_discarded());
+            RECORD(j.value("data", nlohmann::json::array()).size() == 2);
+            // The node is reported WITH the engine, so a client never has to
+            // resolve it separately.
+            RECORD(engines.body.find("\"node_id\"") != std::string::npos);
+            RECORD(engines.body.find("\"backend\":\"soma\"") != std::string::npos);
+            RECORD(j["tier_summary"].value("vram_mb", 0) == 512);
+        }
+
+        // ── the proxied GETs ─────────────────────────────────────────────────
+        auto heat = with_retry([&] { return client.get("/v1/engines/slot-soma/heat"); });
+        RECORD(heat.status == 200);
+        RECORD(heat.body.find("\"n_experts\":16") != std::string::npos);
+        RECORD(heat_calls.load() >= 1);
+        {
+            std::lock_guard<std::mutex> lk(query_mutex);
+            // Bucketed by default all the way down: the opt-in is explicit at
+            // every hop rather than defaulted back to full by a middle layer.
+            RECORD(last_heat_query.empty());
+        }
+
+        auto full = with_retry([&] {
+            return client.get("/v1/engines/slot-soma/heat?resolution=full");
+        });
+        RECORD(full.status == 200);
+        {
+            std::lock_guard<std::mutex> lk(query_mutex);
+            RECORD(last_heat_query == "full");
+        }
+
+        auto slots = with_retry([&] { return client.get("/v1/engines/slot-soma/slots"); });
+        RECORD(slots.status == 200);
+        RECORD(slots.body.find("sequences") != std::string::npos);
+
+        // ── the refusals ─────────────────────────────────────────────────────
+        auto unknown = with_retry([&] { return client.get("/v1/engines/nope/heat"); });
+        RECORD(unknown.status == 404);
+        RECORD(unknown.body.find("no such engine") != std::string::npos);
+
+        // 501 survives the hop rather than becoming a generic control error.
+        auto unsupported = with_retry([&] {
+            return client.get("/v1/engines/no-telemetry/heat");
+        });
+        RECORD(unsupported.status == 501);
+        RECORD(unsupported.body.find("publishes no heat map") != std::string::npos);
+
+        // A node that has gone away is 502, not 500 — an operator chasing this
+        // should be pointed at the node rather than at control.
+        node.stop();
+        if (node_thread.joinable()) node_thread.join();
+        auto gone = with_retry([&] { return client.get("/v1/engines/slot-soma/heat"); });
+        RECORD(gone.status == 502);
+        RECORD(gone.body.find("node unreachable") != std::string::npos);
+        RECORD(gone.body.find(node_id) != std::string::npos);
+
+        registry.stop_health_poll();
+        api.stop();
+        if (api_thread.joinable()) api_thread.join();
+    }
+
+    RECORD(remove_tree(dir));
+#undef RECORD
+    return ok;
+}
+
+bool test_route_scopes_and_token_store() {
+    // ── the table is exhaustive, and the check that says so actually works ───
+    //
+    // A coverage check that cannot fail is decoration. This asserts BOTH
+    // directions: the real table covers a realistic route set, and a route
+    // absent from it is reported rather than defaulted.
+    std::vector<std::string> missing;
+    CHECK(mm::require_complete_coverage(
+        {"GET /v1/agents", "POST /v1/agents/:id/chat", "POST /v1/models/admit",
+         "PUT /v1/agents/:id/backend", "DELETE /v1/models/:id", "GET /v1/tokens"},
+        missing));
+    CHECK(missing.empty());
+
+    CHECK(!mm::require_complete_coverage({"GET /v1/agents", "POST /v1/not/in/the/table"},
+                                         missing));
+    CHECK(missing.size() == 1);
+    CHECK(missing[0] == "POST /v1/not/in/the/table");
+
+    // Every entry has a method and a pattern — an empty one would match nothing
+    // and silently fall through to the restrictive default.
+    for (const auto& rs : mm::route_scope_table()) {
+        CHECK(rs.method != nullptr && *rs.method != '\0');
+        CHECK(rs.pattern != nullptr && *rs.pattern != '\0');
+    }
+
+    // ── the implication order ────────────────────────────────────────────────
+    const auto read = static_cast<mm::ScopeSet>(mm::Scope::Read);
+    const auto chat = static_cast<mm::ScopeSet>(mm::Scope::Chat);
+    const auto oper = static_cast<mm::ScopeSet>(mm::Scope::Operator);
+
+    CHECK(mm::scope_permits(read, mm::Scope::Read));
+    CHECK(!mm::scope_permits(read, mm::Scope::Chat));
+    CHECK(!mm::scope_permits(read, mm::Scope::Operator));
+    // chat implies read: sending a message you cannot then fetch is not a
+    // coherent permission.
+    CHECK(mm::scope_permits(chat, mm::Scope::Read));
+    CHECK(mm::scope_permits(chat, mm::Scope::Chat));
+    CHECK(!mm::scope_permits(chat, mm::Scope::Operator));
+    // operator implies everything.
+    CHECK(mm::scope_permits(oper, mm::Scope::Read));
+    CHECK(mm::scope_permits(oper, mm::Scope::Chat));
+    CHECK(mm::scope_permits(oper, mm::Scope::Operator));
+    CHECK(!mm::scope_permits(mm::kScopeNone, mm::Scope::Read));
+
+    // ── parsing rejects rather than drops ────────────────────────────────────
+    mm::ScopeSet parsed = mm::kScopeNone;
+    CHECK(mm::parse_scopes("read,operator", parsed));
+    CHECK(parsed == (read | oper));
+    CHECK(mm::parse_scopes(" READ , chat ", parsed));   // case and space tolerant
+    CHECK(parsed == (read | chat));
+    // "opereator" must be REPORTED. Silently ignoring it would mint a token that
+    // looks right in the request and cannot do what it was minted for.
+    CHECK(!mm::parse_scopes("read,opereator", parsed));
+    CHECK(parsed == read);
+    CHECK(mm::format_scopes(read | oper) == "read,operator");
+
+    // ── the token store ──────────────────────────────────────────────────────
+    auto dir = temp_test_dir("scopes");
+    mm::ControlModelRegistry reg;
+    std::string err;
+    CHECK(reg.open(dir.string(), err));
+    CHECK(!reg.has_api_tokens());
+
+    // A token with no scopes can do nothing; minting one is refused rather than
+    // producing a credential that fails every request mysteriously.
+    CHECK(reg.create_api_token("empty", mm::kScopeNone, err).empty());
+
+    const auto reader = reg.create_api_token("dashboard", read, err);
+    CHECK(!reader.empty());
+    CHECK(reg.has_api_tokens());
+    const auto admin = reg.create_api_token("ops", oper, err);
+    CHECK(!admin.empty());
+    CHECK(reader != admin);
+    CHECK(reader.size() >= 32);   // CSPRNG material, not a counter
+
+    // The token is stored HASHED. A leaked backup must not hand over working
+    // credentials, so the secret appears in no row.
+    mm::ApiToken row;
+    CHECK(reg.find_api_token(mm::pairing::sha256_hex(reader), row));
+    CHECK(row.label == "dashboard");
+    CHECK(row.scopes == read);
+    CHECK(row.token_sha256 != reader);
+    CHECK(!reg.find_api_token(reader, row));            // the raw token is not a key
+    CHECK(!reg.find_api_token(mm::pairing::sha256_hex("guessed"), row));
+
+    CHECK(reg.list_api_tokens().size() == 2);
+    for (const auto& t : reg.list_api_tokens()) CHECK(t.token_sha256.size() == 64);
+
+    // Revoked, not deleted: the row is the audit trail, and a deleted token
+    // cannot answer "what was this credential allowed to do".
+    const auto reader_id = reg.list_api_tokens().front().id;
+    CHECK(reg.revoke_api_token(reader_id, err));
+    CHECK(!reg.find_api_token(mm::pairing::sha256_hex(reader), row));
+    CHECK(reg.list_api_tokens().size() == 2);
+    CHECK(!reg.revoke_api_token(reader_id, err));       // already revoked
+    CHECK(reg.has_api_tokens());                        // the operator token remains
+
+    reg.close();
+    CHECK(remove_tree(dir));
+    return true;
+}
+
 bool test_capacity_fit_across_three_axes() {
     mm::CapacityPolicy policy;   // defaults are the constants this replaced
 
@@ -4792,6 +5373,10 @@ int main(int argc, char** argv) {
         {"multi_shard_directory_sizes_correctly", test_multi_shard_directory_sizes_correctly},
         {"capacity_fit_across_three_axes", test_capacity_fit_across_three_axes},
         {"model_registry_makes_soma_routable", test_model_registry_makes_soma_routable},
+        {"admission_pipeline_runs_and_reports", test_admission_pipeline_runs_and_reports},
+        {"route_scopes_and_token_store", test_route_scopes_and_token_store},
+        {"scope_negatives_over_http", test_scope_negatives_over_http},
+        {"engine_telemetry_republication", test_engine_telemetry_republication},
     };
 
     const std::string filter = argc > 1 ? argv[1] : std::string{};

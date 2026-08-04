@@ -9,12 +9,18 @@
 
 #include "soma/plan.hpp"
 
+#include "soma/arch_ir.hpp"
 #include "soma/attention_backend.hpp"
 #include "soma/quant_format.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <sstream>
+
+namespace fs = std::filesystem;
 
 namespace soma {
 
@@ -71,6 +77,15 @@ Status compute_plan(const ArchIr& arch, const HostBudget& budget, PlanDocument& 
     const std::uint64_t expert_bytes = bytes_for(arch, fi, d, TensorRole::ExpertGate) +
                                        bytes_for(arch, fi, d, TensorRole::ExpertUp) +
                                        bytes_for(arch, d, fi, TensorRole::ExpertDown);
+
+    out.attention_family = to_string(arch.attention.family);
+    out.n_layers = n_layers;
+    out.n_moe_layers = n_moe;
+    out.n_experts = n_experts;
+    out.top_k = top_k;
+    out.expert_bytes = expert_bytes;
+    out.active_fraction =
+        n_experts > 0 ? static_cast<double>(top_k) / static_cast<double>(n_experts) : 0.0;
 
     out.total_routed_bytes = static_cast<std::uint64_t>(n_moe) * n_experts * expert_bytes;
     out.bytes_per_token = static_cast<std::uint64_t>(n_moe) * top_k * expert_bytes;
@@ -252,7 +267,18 @@ Status serialize_plan(const PlanDocument& plan, std::string& out_json) {
       << "  \"max_batch\": " << plan.max_batch << ",\n"
       << "  \"expert_set_fully_resident\": " << (plan.expert_set_fully_resident ? "true" : "false")
       << ",\n"
-      << "  \"bytes_per_token\": " << plan.bytes_per_token << ",\n"
+      << "  \"bytes_per_token\": " << plan.bytes_per_token
+      << ",\n"
+      // Topology and per-expert economics, so a consumer of the plan does not
+      // have to parse arch.json to learn what it is looking at. Control's
+      // registry denormalizes exactly these, and the plan is its only view.
+      << "  \"attention_family\": \"" << plan.attention_family << "\",\n"
+      << "  \"n_layers\": " << plan.n_layers << ",\n"
+      << "  \"n_moe_layers\": " << plan.n_moe_layers << ",\n"
+      << "  \"n_experts\": " << plan.n_experts << ",\n"
+      << "  \"top_k\": " << plan.top_k << ",\n"
+      << "  \"expert_bytes\": " << plan.expert_bytes << ",\n"
+      << "  \"active_fraction\": " << plan.active_fraction << ",\n"
       << "  \"projected_tok_s\": " << plan.projected_tok_s << ",\n"
       << "  \"prefetch_enabled_layers\": " << plan.prefetch_enabled_layers << ",\n"
       << "  \"verdict\": \"" << to_string(plan.verdict) << "\",\n"
@@ -263,14 +289,33 @@ Status serialize_plan(const PlanDocument& plan, std::string& out_json) {
 }
 
 Status compute_plan(const std::string& model_dir, const HostBudget& budget, PlanDocument& out) {
-    // Reads arch.json only — no weights, no container payload. This is what makes
-    // the call safe on a node that could not host the model.
-    (void)model_dir;
-    (void)budget;
-    (void)out;
-    return {StatusCode::Unsupported,
-            "directory-based plan lands with the admission converter's arch.json output; "
-            "use compute_plan(ArchIr, ...) with an adapted config for now"};
+    // Reads config.json only — no weights, no container payload. That is what
+    // makes the call safe on a host that could not possibly load the model, and
+    // it is the reason admission can plan before it has anywhere to run.
+    //
+    // A converted container carries the same config.json beside its payload, so
+    // one path serves both an HF checkpoint and a container. Adding a second
+    // description file that had to agree with the first is how they drift.
+    const fs::path root(model_dir);
+    std::ifstream in(root / "config.json", std::ios::binary);
+    if (!in) {
+        return {StatusCode::NotFound,
+                "no config.json in " + model_dir + "; a plan needs the model's architecture"};
+    }
+    std::string cfg_text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+
+    ArchIr arch;
+    if (auto st = adapt_hf_config(cfg_text, arch); !st.ok()) return st;
+
+    // Stamped HERE, not left empty.
+    //
+    // arch_hash is the model's IDENTITY: the registry keys rows on it, KV
+    // checkpoints gate on it, and containers refuse to load across a mismatch.
+    // A plan that omitted it left admission with nothing to record a model
+    // under, so every unconverted model would have collided on the empty string.
+    if (auto st = compute_arch_hash(arch, arch.arch_hash); !st.ok()) return st;
+
+    return compute_plan(arch, budget, out);
 }
 
 } // namespace soma

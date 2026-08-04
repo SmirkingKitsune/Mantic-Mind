@@ -174,6 +174,9 @@ EngineDescriptor make_soma_descriptor(const std::string& executable) {
 
     d.kv = &soma_kv();
 
+    d.telemetry_path = "/internal/telemetry";
+    d.heat_path = "/internal/heat";
+
     d.fetch_sequences = [](const std::string& base_url, std::string& out_json) {
         httplib::Client cli(base_url);
         cli.set_connection_timeout(2);

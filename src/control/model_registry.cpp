@@ -15,15 +15,24 @@
 
 #include "control/model_registry.hpp"
 
+#include "control/route_scope.hpp"
+
 #include "common/logger.hpp"
+#include "common/pairing.hpp"
+#include "common/process_exec.hpp"
 #include "common/util.hpp"
 
 #include <SQLiteCpp/SQLiteCpp.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
+#include <map>
+#include <memory>
 #include <mutex>
+#include <thread>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -78,10 +87,35 @@ bool verdict_selects_soma(ModelVerdict verdict) {
     return verdict == ModelVerdict::Stream || verdict == ModelVerdict::Hybrid;
 }
 
+/// One running (or finished) admission.
+///
+/// Kept after it finishes, deliberately: conversion runs for hours, an SSE
+/// connection will not survive that reliably, and a client that reconnects must
+/// be able to find out how its operation ended rather than guess.
+struct AdmissionOperation {
+    AdmissionProgress progress;
+    std::vector<AdmissionProgressSink> sinks;
+    std::atomic<bool> cancel{false};
+    std::thread worker;
+};
+
 struct ControlModelRegistry::Impl {
     mutable std::mutex mu;
     std::unique_ptr<SQLite::Database> db;
     std::string path;
+
+    AdmissionTools tools;
+
+    mutable std::mutex ops_mu;
+    std::map<std::string, std::shared_ptr<AdmissionOperation>> ops;
+    std::vector<std::string> op_order; ///< newest last
+
+    /// Publish a progress update to every attached sink.
+    ///
+    /// Sinks are copied out under the lock and called OUTSIDE it: a sink writes
+    /// to a socket, and a slow client holding ops_mu would stall the conversion
+    /// it is watching.
+    void publish(const std::shared_ptr<AdmissionOperation>& op, const AdmissionProgress& p);
 
     bool has_version(std::uint32_t v) const {
         SQLite::Statement q(*db, "SELECT 1 FROM schema_migrations WHERE version = ? LIMIT 1");
@@ -245,6 +279,26 @@ struct ControlModelRegistry::Impl {
         return m;
     }
 };
+
+void ControlModelRegistry::Impl::publish(const std::shared_ptr<AdmissionOperation>& op,
+                                         const AdmissionProgress& p) {
+    // Sinks are copied out under the lock and called OUTSIDE it: a sink writes to
+    // a socket, and a slow client holding ops_mu would stall the conversion it is
+    // watching.
+    std::vector<AdmissionProgressSink> sinks;
+    {
+        std::lock_guard<std::mutex> lk(ops_mu);
+        op->progress = p;
+        sinks = op->sinks;
+    }
+    for (const auto& s : sinks) {
+        try {
+            if (s) s(p);
+        } catch (const std::exception& e) {
+            MM_WARN("admission sink threw: {}", e.what());
+        }
+    }
+}
 
 ControlModelRegistry::ControlModelRegistry() : impl_(std::make_unique<Impl>()) {}
 
@@ -590,34 +644,471 @@ void ControlModelRegistry::record_placement(const AgentId& agent_id,
     }
 }
 
-// ── not implemented, and saying so ────────────────────────────────────────────
+// ── api tokens ────────────────────────────────────────────────────────────────
+
+std::string ControlModelRegistry::create_api_token(const std::string& label,
+                                                   std::uint8_t scopes,
+                                                   std::string& out_error) {
+    if (scopes == 0) {
+        out_error = "a token with no scopes can do nothing; refusing to mint one";
+        return {};
+    }
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    if (!impl_->db) {
+        out_error = "registry is not open";
+        return {};
+    }
+    // 32 bytes of CSPRNG. Returned once and never stored — only the hash goes to
+    // the table, so this is the only moment the secret exists anywhere we
+    // control, and losing it means minting another rather than recovering it.
+    const auto secret = pairing::generate_nonce(32);
+    try {
+        SQLite::Statement q(*impl_->db,
+                            "INSERT INTO api_token(token_sha256, label, scopes, created_at) "
+                            "VALUES (?,?,?,?)");
+        q.bind(1, pairing::sha256_hex(secret));
+        q.bind(2, label.empty() ? std::string("unnamed") : label);
+        q.bind(3, format_scopes(scopes));
+        q.bind(4, util::now_ms());
+        q.exec();
+    } catch (const std::exception& e) {
+        out_error = e.what();
+        return {};
+    }
+    MM_INFO("ControlModelRegistry: minted api token '{}' with scopes [{}]",
+            label, format_scopes(scopes));
+    return secret;
+}
+
+bool ControlModelRegistry::find_api_token(const std::string& token_sha256, ApiToken& out) const {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    if (!impl_->db || token_sha256.empty()) return false;
+    try {
+        SQLite::Statement q(*impl_->db,
+                            "SELECT id, token_sha256, label, scopes, created_at, last_used_at "
+                            "FROM api_token WHERE token_sha256 = ? AND revoked_at IS NULL "
+                            "LIMIT 1");
+        q.bind(1, token_sha256);
+        if (!q.executeStep()) return false;
+        out.id = q.getColumn(0).getInt64();
+        out.token_sha256 = q.getColumn(1).getText();
+        out.label = q.getColumn(2).getText();
+        (void)parse_scopes(q.getColumn(3).getText(), out.scopes);
+        out.created_at_ms = q.getColumn(4).getInt64();
+        out.last_used_at_ms = q.getColumn(5).getInt64();
+        out.revoked = false;
+
+        // Best-effort: a failed last_used update must not fail the request that
+        // was otherwise authorized.
+        try {
+            SQLite::Statement t(*impl_->db, "UPDATE api_token SET last_used_at = ? WHERE id = ?");
+            t.bind(1, util::now_ms());
+            t.bind(2, out.id);
+            t.exec();
+        } catch (const std::exception&) {
+        }
+        return true;
+    } catch (const std::exception& e) {
+        MM_WARN("ControlModelRegistry::find_api_token: {}", e.what());
+        return false;
+    }
+}
+
+std::vector<ApiToken> ControlModelRegistry::list_api_tokens() const {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    std::vector<ApiToken> out;
+    if (!impl_->db) return out;
+    try {
+        SQLite::Statement q(*impl_->db,
+                            "SELECT id, token_sha256, label, scopes, created_at, last_used_at, "
+                            "revoked_at FROM api_token ORDER BY id");
+        while (q.executeStep()) {
+            ApiToken t;
+            t.id = q.getColumn(0).getInt64();
+            // The hash is listed, not the token: there is nothing to leak here,
+            // and it is what an operator needs to correlate a row with a log line.
+            t.token_sha256 = q.getColumn(1).getText();
+            t.label = q.getColumn(2).getText();
+            (void)parse_scopes(q.getColumn(3).getText(), t.scopes);
+            t.created_at_ms = q.getColumn(4).getInt64();
+            t.last_used_at_ms = q.getColumn(5).getInt64();
+            t.revoked = !q.getColumn(6).isNull();
+            out.push_back(std::move(t));
+        }
+    } catch (const std::exception& e) {
+        MM_WARN("ControlModelRegistry::list_api_tokens: {}", e.what());
+    }
+    return out;
+}
+
+bool ControlModelRegistry::revoke_api_token(std::int64_t id, std::string& out_error) {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    if (!impl_->db) {
+        out_error = "registry is not open";
+        return false;
+    }
+    try {
+        // Revoked, not deleted: the row is the audit trail, and a deleted token
+        // cannot answer "what was this credential allowed to do".
+        SQLite::Statement q(*impl_->db,
+                            "UPDATE api_token SET revoked_at = ? WHERE id = ? AND "
+                            "revoked_at IS NULL");
+        q.bind(1, util::now_ms());
+        q.bind(2, id);
+        if (q.exec() == 0) {
+            out_error = "no active token with id " + std::to_string(id);
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        out_error = e.what();
+        return false;
+    }
+}
+
+bool ControlModelRegistry::has_api_tokens() const {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    if (!impl_->db) return false;
+    try {
+        SQLite::Statement q(*impl_->db,
+                            "SELECT 1 FROM api_token WHERE revoked_at IS NULL LIMIT 1");
+        return q.executeStep();
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+// ── admission ─────────────────────────────────────────────────────────────────
+
+void ControlModelRegistry::set_tools(const AdmissionTools& tools) {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    impl_->tools = tools;
+}
+
+AdmissionTools ControlModelRegistry::tools() const {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    return impl_->tools;
+}
+
+std::vector<AdmissionProgress> ControlModelRegistry::operations() const {
+    std::lock_guard<std::mutex> lk(impl_->ops_mu);
+    std::vector<AdmissionProgress> out;
+    out.reserve(impl_->op_order.size());
+    for (auto it = impl_->op_order.rbegin(); it != impl_->op_order.rend(); ++it) {
+        if (auto found = impl_->ops.find(*it); found != impl_->ops.end()) {
+            out.push_back(found->second->progress);
+        }
+    }
+    return out;
+}
+
+std::optional<AdmissionProgress>
+ControlModelRegistry::operation(const std::string& id) const {
+    std::lock_guard<std::mutex> lk(impl_->ops_mu);
+    if (auto it = impl_->ops.find(id); it != impl_->ops.end()) return it->second->progress;
+    return std::nullopt;
+}
+
+bool ControlModelRegistry::attach_sink(const std::string& operation_id,
+                                       AdmissionProgressSink sink,
+                                       AdmissionProgress& out_current) {
+    std::lock_guard<std::mutex> lk(impl_->ops_mu);
+    auto it = impl_->ops.find(operation_id);
+    if (it == impl_->ops.end()) return false;
+    out_current = it->second->progress;
+    // A finished operation gets no sink: there will never be another update, and
+    // registering one would leave the caller waiting on a stream that is over.
+    // It still gets the terminal snapshot above, which is the answer it wanted.
+    if (!out_current.done) it->second->sinks.push_back(std::move(sink));
+    return true;
+}
+
+bool ControlModelRegistry::cancel(const std::string& operation_id) {
+    std::lock_guard<std::mutex> lk(impl_->ops_mu);
+    auto it = impl_->ops.find(operation_id);
+    if (it == impl_->ops.end()) return false;
+    if (it->second->progress.done) return false;   // too late is not a failure to report
+    it->second->cancel.store(true);
+    return true;
+}
 
 std::string ControlModelRegistry::admit(const std::string& source_ref,
                                         AdmissionProgressSink sink,
                                         std::string& out_error) {
-    (void)source_ref;
-    (void)sink;
-    // The conversion pipeline is tools/admission/ and lands with the
-    // self-service gate. What exists now is everything DOWNSTREAM of it: the
-    // record, the verdict, and the routing that reads them — which is what makes
-    // an already-converted model routable via upsert().
-    out_error = "in-process admission is not implemented; convert with "
-                "tools/admission/convert.py and register the result with POST /v1/models";
-    return {};
+    if (!impl_->db) {
+        out_error = "registry is not open";
+        return {};
+    }
+    const auto source = util::trim(source_ref);
+    std::error_code ec;
+    if (source.empty() || !fs::exists(source, ec)) {
+        // Checked BEFORE the operation exists, so a typo is a 400 rather than an
+        // operation that appears to start and fails a second later.
+        out_error = "source model directory not found: " + source;
+        return {};
+    }
+    return start_operation(source, /*container_is_ready=*/false, std::move(sink));
+}
+
+std::string ControlModelRegistry::admit_container(const std::string& container_dir,
+                                                 AdmissionProgressSink sink,
+                                                 std::string& out_error) {
+    if (!impl_->db) {
+        out_error = "registry is not open";
+        return {};
+    }
+    const auto dir = util::trim(container_dir);
+    std::error_code ec;
+    if (dir.empty() || !fs::exists(dir, ec)) {
+        out_error = "container directory not found: " + dir;
+        return {};
+    }
+    return start_operation(dir, /*container_is_ready=*/true, std::move(sink));
 }
 
 std::string ControlModelRegistry::reprofile(std::int64_t id,
                                             AdmissionProgressSink sink,
                                             std::string& out_error) {
-    (void)id;
-    (void)sink;
-    out_error = "reprofiling is not implemented; it shares the admission pipeline";
-    return {};
+    const auto model = find_by_id(id);
+    if (!model) {
+        out_error = "no model with id " + std::to_string(id);
+        return {};
+    }
+    if (model->model_dir.empty()) {
+        out_error = "model has no container directory to re-plan";
+        return {};
+    }
+    // Conversion is skipped: the container is what conversion produces, and
+    // re-running it would rewrite gigabytes to reach the same bytes. What gets
+    // re-derived is the verdict, which is the part that goes stale — a changed
+    // host budget changes it without any weight changing.
+    return start_operation(model->model_dir, /*container_is_ready=*/true, std::move(sink));
 }
 
-bool ControlModelRegistry::cancel(const std::string& operation_id) {
-    (void)operation_id;
-    return false;
+std::string ControlModelRegistry::start_operation(const std::string& source,
+                                                 bool container_is_ready,
+                                                 AdmissionProgressSink sink) {
+    const auto tools_copy = tools();
+    const auto id = util::generate_uuid();
+
+    auto op = std::make_shared<AdmissionOperation>();
+    op->progress.operation_id = id;
+    op->progress.stage = container_is_ready ? "profile" : "fetch";
+    op->progress.detail = "queued";
+    op->progress.total_steps = container_is_ready ? 2 : 5;
+    op->progress.source_ref = source;
+    op->progress.started_at_ms = util::now_ms();
+    // The sink is attached BEFORE the thread starts, so the first frames cannot
+    // be produced before anyone is listening for them.
+    if (sink) op->sinks.push_back(std::move(sink));
+    {
+        std::lock_guard<std::mutex> lk(ops_mu_ref());
+        impl_->ops[id] = op;
+        impl_->op_order.push_back(id);
+    }
+
+    op->worker = std::thread([this, op, source, tools_copy, container_is_ready] {
+        run_admission(op, source, tools_copy, container_is_ready);
+    });
+    // Detached because the operation outlives its request by design: a client
+    // that disconnects mid-conversion must not cancel it, and joining here would
+    // block the HTTP thread for hours.
+    op->worker.detach();
+    return id;
+}
+
+std::mutex& ControlModelRegistry::ops_mu_ref() const { return impl_->ops_mu; }
+
+void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
+                                         const std::string& source,
+                                         const AdmissionTools& tools,
+                                         bool container_is_ready) {
+    auto progress = op->progress;
+    const auto emit = [&](const std::string& stage, int step, const std::string& detail,
+                          double fraction) {
+        progress.stage = stage;
+        progress.step = step;
+        progress.detail = detail;
+        progress.fraction = fraction;
+        impl_->publish(op, progress);
+    };
+    const auto fail = [&](const std::string& why) {
+        progress.last_error = why;
+        progress.done = true;
+        progress.cancelable = false;
+        progress.finished_at_ms = util::now_ms();
+        impl_->publish(op, progress);
+        MM_ERROR("admission {}: {}", progress.operation_id, why);
+    };
+    const auto canceled = [&] { return op->cancel.load(); };
+
+    const fs::path tools_dir(tools.tools_dir);
+    const auto name = fs::path(source).filename().string();
+    const auto container = (fs::path(tools.containers_dir) / name).string();
+
+    // ── 1. convert ───────────────────────────────────────────────────────────
+    if (!container_is_ready) {
+        emit("convert", 1, "converting " + name + " -> " + container, 0.05);
+        std::error_code ec;
+        fs::create_directories(tools.containers_dir, ec);
+
+        std::string err;
+        const int rc = run_streamed_command(
+            {tools.python, (tools_dir / "convert.py").string(), source, "--out", container,
+             "--quant", tools.quant, "--expert-down", tools.expert_down, "--group",
+             std::to_string(tools.group)},
+            fs::current_path(),
+            [&](const std::string& line, bool) {
+                // convert.py prints "    layer 12/48  3.40 GB" per layer with
+                // flush=True. Parsed rather than counted, so the fraction tracks
+                // the model's real shape instead of an assumed one.
+                const auto pos = line.find("layer ");
+                if (pos != std::string::npos) {
+                    const auto slash = line.find('/', pos);
+                    if (slash != std::string::npos) {
+                        try {
+                            const int done = std::stoi(line.substr(pos + 6, slash - pos - 6));
+                            const int total = std::stoi(line.substr(slash + 1));
+                            if (total > 0) {
+                                // Conversion is the long pole; it owns 5%..70%.
+                                emit("convert", 1, util::trim(line),
+                                     0.05 + 0.65 * static_cast<double>(done) / total);
+                                return;
+                            }
+                        } catch (...) {
+                            // Not the line we thought; fall through and just log it.
+                        }
+                    }
+                }
+                if (!util::trim(line).empty()) emit("convert", 1, util::trim(line), progress.fraction);
+            },
+            canceled, &err);
+        if (canceled()) {
+            progress.canceled = true;
+            fail("canceled during conversion");
+            return;
+        }
+        if (rc != 0) {
+            fail("convert.py failed (exit " + std::to_string(rc) + ")" +
+                 (err.empty() ? "" : ": " + err));
+            return;
+        }
+
+        // ── 2. tokenizer ─────────────────────────────────────────────────────
+        emit("tokenize", 2, "compiling tokenizer", 0.72);
+        const int trc = run_streamed_command(
+            {tools.python, (tools_dir / "compile_tokenizer.py").string(), source, "--out",
+             (fs::path(container) / "tokenizer.soma").string()},
+            fs::current_path(),
+            [&](const std::string& line, bool) {
+                if (!util::trim(line).empty()) emit("tokenize", 2, util::trim(line), 0.72);
+            },
+            canceled, &err);
+        if (canceled()) {
+            progress.canceled = true;
+            fail("canceled during tokenizer compilation");
+            return;
+        }
+        if (trc != 0) {
+            // NOT fatal. A container without a compiled tokenizer serves token
+            // ids rather than text, which is degraded but honest — and refusing
+            // the whole admission over it would discard hours of conversion.
+            MM_WARN("admission {}: tokenizer compilation failed (exit {}); container is "
+                    "usable but will not detokenize", progress.operation_id, trc);
+            emit("tokenize", 2, "tokenizer compilation failed; continuing without it", 0.72);
+        }
+    }
+
+    // ── 3. plan ──────────────────────────────────────────────────────────────
+    //
+    // `soma plan --json` is the verdict. It reads headers only and allocates
+    // nothing, which is why it is safe to run on control rather than requiring a
+    // node that could host the model.
+    emit("profile", 3, "planning", 0.80);
+    std::string plan_json;
+    {
+        std::string err;
+        const int prc = run_streamed_command(
+            {tools.soma_path, "plan", "--model-dir", container_is_ready ? source : container,
+             "--json"},
+            fs::current_path(),
+            [&](const std::string& line, bool is_stderr) {
+                if (!is_stderr) plan_json += line;
+            },
+            canceled, &err);
+        if (canceled()) {
+            progress.canceled = true;
+            fail("canceled during planning");
+            return;
+        }
+        if (prc != 0) {
+            fail("soma plan failed (exit " + std::to_string(prc) + ")" +
+                 (err.empty() ? "" : ": " + err));
+            return;
+        }
+    }
+
+    // ── 4. conformance ───────────────────────────────────────────────────────
+    //
+    // Not run here, and the record says so rather than implying a pass. The
+    // ladder's stages 1-2 run against committed tiny fixtures in CI; stage 3
+    // needs a reference run for THIS model, which is a separate artifact this
+    // pipeline does not have. Writing a `passed` row we did not earn would make
+    // the verdict look validated when it is only computed.
+    emit("conformance", 4, "not run in-process; see tests/soma and stage3", 0.90);
+
+    // ── 5. finalize ──────────────────────────────────────────────────────────
+    emit("finalize", 5, "recording", 0.95);
+    // Keyed on arch_hash below, so a reprofile updates the row it came from
+    // rather than creating a second one for the same weights.
+    AdmittedModel m;
+    m.model_dir = container_is_ready ? source : container;
+    m.name = name;
+    m.source_repo = container_is_ready ? std::string{} : source;
+    try {
+        const auto j = nlohmann::json::parse(plan_json);
+        m.arch_hash = j.value("arch_hash", std::string{});
+        m.attention_family = j.value("attention_family", std::string{"gqa"});
+        m.n_layers = j.value("n_layers", 0u);
+        m.n_moe_layers = j.value("n_moe_layers", 0u);
+        m.n_experts = j.value("n_experts", 0u);
+        m.top_k = j.value("top_k", 0u);
+        m.expert_bytes = j.value("expert_bytes", std::int64_t{0});
+        m.bytes_per_token = j.value("bytes_per_token", std::int64_t{0});
+        m.total_routed_bytes = j.value("total_routed_bytes", std::int64_t{0});
+        m.active_fraction = j.value("active_fraction", 0.0);
+        m.verdict = parse_verdict(j.value("verdict", std::string{"reject"}));
+        m.verdict_reason = j.value("verdict_reason", std::string{});
+        if (const auto planned = j.value("model_name", std::string{}); !planned.empty()) {
+            m.name = planned;
+        }
+        m.verdict_basis = j.dump();
+        m.profiled_at_ms = util::now_ms();
+    } catch (const std::exception& e) {
+        fail(std::string("could not parse `soma plan --json` output: ") + e.what());
+        return;
+    }
+    if (m.arch_hash.empty()) {
+        // Without it there is no identity to key the row on, and re-admitting
+        // would duplicate rather than update.
+        fail("plan produced no arch_hash; the container may predate the field");
+        return;
+    }
+
+    std::string err;
+    if (!upsert(m, err)) {
+        fail("could not record the admission: " + err);
+        return;
+    }
+
+    progress.model_id = m.id;
+    progress.done = true;
+    progress.cancelable = false;
+    progress.finished_at_ms = util::now_ms();
+    emit("finalize", 5, "admitted as model " + std::to_string(m.id) + " (" +
+                            to_string(m.verdict) + ")", 1.0);
+    MM_INFO("admission {}: {} admitted as model {} with verdict {}", progress.operation_id,
+            m.name, m.id, to_string(m.verdict));
 }
 
 bool ControlModelRegistry::plan_for_host(std::int64_t id,

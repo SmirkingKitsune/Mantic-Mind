@@ -1,5 +1,10 @@
 #pragma once
 
+// Moved from node/ to common/: control needs it too, for the admission
+// pipeline. Nothing in it was ever node-specific — a subprocess whose output is
+// streamed line by line is the visible alternative to running something blind,
+// and that is as true of a model conversion as of a llama.cpp build.
+
 #include <filesystem>
 #include <functional>
 #include <string>

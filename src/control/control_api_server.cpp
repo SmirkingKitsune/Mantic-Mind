@@ -18,6 +18,7 @@
 #include "common/logger.hpp"
 #include "common/util.hpp"
 #include "common/sse_infer_ctx.hpp"
+#include <deque>
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -73,6 +74,68 @@ nlohmann::json admitted_model_json(const AdmittedModel& m) {
         {"admitted_at_ms", m.admitted_at_ms},
         {"profiled_at_ms", m.profiled_at_ms},
     };
+}
+
+nlohmann::json admission_progress_json(const AdmissionProgress& p) {
+    return nlohmann::json{
+        {"operation_id", p.operation_id},
+        {"stage", p.stage},
+        {"detail", p.detail},
+        {"step", p.step},
+        {"total_steps", p.total_steps},
+        {"fraction", p.fraction},
+        {"cancelable", p.cancelable},
+        {"done", p.done},
+        {"canceled", p.canceled},
+        {"error", p.last_error},
+        {"model_id", p.model_id},
+        {"source", p.source_ref},
+        {"started_at_ms", p.started_at_ms},
+        {"finished_at_ms", p.finished_at_ms},
+    };
+}
+
+/// Drain an operation's frames to the wire until it ends.
+///
+/// A heartbeat every few seconds, because conversion produces no output for
+/// long stretches while it writes a shard — and a silent connection is one that
+/// proxies and clients time out. An SSE comment is invisible to a parser and
+/// keeps the socket alive, which is exactly what is wanted.
+void stream_admission(httplib::Response& res,
+                      ControlModelRegistry* models,
+                      const std::string& op_id,
+                      const std::shared_ptr<SseInferCtx>& ctx) {
+    res.set_chunked_content_provider(
+        "text/event-stream", [ctx, models, op_id](std::size_t, httplib::DataSink& sink) {
+            std::unique_lock<std::mutex> lk(ctx->mx);
+            const bool have = ctx->cv.wait_for(lk, std::chrono::seconds(5),
+                                               [&] { return !ctx->lines.empty() || ctx->done; });
+            if (!have && !ctx->done) {
+                lk.unlock();
+                static const std::string beat = ": keepalive\n\n";
+                return sink.write(beat.data(), beat.size());
+            }
+            std::deque<std::string> batch;
+            batch.swap(ctx->lines);
+            const bool finished = ctx->done;
+            lk.unlock();
+
+            for (const auto& line : batch) {
+                if (!sink.write(line.data(), line.size())) {
+                    // The client hung up. The admission KEEPS RUNNING: hours of
+                    // conversion must not be discarded because a browser tab
+                    // closed, and /v1/models/admissions/{op} exists to rejoin it.
+                    MM_INFO("admission {}: client disconnected; conversion continues", op_id);
+                    (void)models;
+                    return false;
+                }
+            }
+            if (finished && batch.empty()) {
+                sink.done();
+                return false;
+            }
+            return true;
+        });
 }
 
 std::int64_t parse_model_id(const std::string& raw) {
@@ -1100,7 +1163,12 @@ ControlApiServer::ControlApiServer(AgentManager& agents,
     , tts_(std::move(tts_config))
     , server_(std::make_unique<HttpServer>())
     , openai_server_(std::make_unique<HttpServer>())
-{}
+{
+    // Configured HERE, not only from set_model_registry(): the legacy token is a
+    // constructor argument and the registry is optional, so deferring this left
+    // auth entirely off for any caller that never attached a registry.
+    scopes_.configure(nullptr, external_api_token_);
+}
 
 ControlApiServer::~ControlApiServer() { stop(); }
 
@@ -1112,6 +1180,39 @@ bool ControlApiServer::listen(uint16_t port) {
         return authorize_external_request(req, res);
     });
     register_routes();
+
+    // Every registered handler must have a scope entry, checked HERE against the
+    // actual registrations rather than against a second list someone maintains.
+    // A route with no entry is a startup failure: defaulting it to `read` would
+    // silently under-protect a new mutation, and defaulting to `operator` would
+    // silently break a new GET.
+    //
+    // /api/control/* is excluded — node registration has its own credential and
+    // predates scopes entirely.
+    {
+        std::vector<std::string> scoped;
+        for (const auto& route : server_->registered_routes()) {
+            if (route.find(" /v1/") != std::string::npos) scoped.push_back(route);
+        }
+        std::vector<std::string> missing;
+        if (!require_complete_coverage(scoped, missing)) {
+            for (const auto& m : missing) {
+                MM_ERROR("route has no scope entry: {}", m);
+            }
+            MM_ERROR("{} route(s) are unscoped; refusing to listen. Add them to "
+                     "route_scope_table() in src/control/route_scope.cpp.",
+                     missing.size());
+            return false;
+        }
+    }
+
+    if (!scopes_.auth_enabled()) {
+        // Said out loud, once. A system that is open because nobody configured a
+        // token should announce it rather than look configured.
+        MM_WARN("API authorization is DISABLED: no external_api_token and no rows in "
+                "api_token. Every /v1/* route is open to anyone who can reach this port.");
+    }
+
     MM_INFO("ControlApiServer listening on port {}", port);
     return server_->listen("0.0.0.0", port);
 }
@@ -1173,26 +1274,55 @@ void ControlApiServer::activity_log(int level, const std::string& message) {
     publish_activity(level, message);
 }
 
+std::optional<NodeInfo> ControlApiServer::find_engine_node(const SlotId& engine_id) const {
+    for (const auto& node : registry_.list_nodes()) {
+        if (!node.connected) continue;
+        for (const auto& slot : node.slots) {
+            if (slot.id == engine_id) return node;
+        }
+    }
+    return std::nullopt;
+}
+
+void ControlApiServer::proxy_engine_get(const SlotId& engine_id,
+                                        const std::string& suffix,
+                                        const std::string& query,
+                                        httplib::Response& res) const {
+    const auto node = find_engine_node(engine_id);
+    if (!node) {
+        res.status = 404;
+        res.set_content(nlohmann::json{{"error", "no such engine"}}.dump(), "application/json");
+        return;
+    }
+    httplib::Client cli(node->url);
+    cli.set_read_timeout(15);
+    if (!node->api_key.empty()) cli.set_bearer_token_auth(node->api_key);
+    auto upstream = cli.Get(("/api/node/engines/" + engine_id + suffix + query).c_str());
+    if (!upstream) {
+        // 502, not 500: the failure is upstream, and an operator chasing it
+        // should be pointed at the node rather than at control.
+        res.status = 502;
+        res.set_content(nlohmann::json{{"error", "node unreachable"}, {"node_id", node->id}}.dump(),
+                        "application/json");
+        return;
+    }
+    // Status passed through: a 501 from an engine with no telemetry surface must
+    // stay a 501 rather than becoming a generic control-side error.
+    res.status = upstream->status;
+    res.set_content(upstream->body, "application/json");
+}
+
 bool ControlApiServer::authorize_external_request(const httplib::Request& req,
                                                   httplib::Response& res) const {
-    if (external_api_token_.empty()) return true;
     // external_api_token_ is only for public control clients. Internal node
     // routes under /api/control/* keep their separate registered-node auth.
     if (req.path.rfind("/v1/", 0) != 0 && req.path != "/v1") return true;
 
-    static const std::string kBearer = "Bearer ";
-    const std::string auth = req.get_header_value("Authorization");
-    if (auth.rfind(kBearer, 0) != 0) {
-        res.status = 401;
-        res.set_content(R"({"error":"missing bearer token"})", "application/json");
-        return false;
-    }
-    if (auth.substr(kBearer.size()) != external_api_token_) {
-        res.status = 403;
-        res.set_content(R"({"error":"invalid bearer token"})", "application/json");
-        return false;
-    }
-    return true;
+    // One middleware, REPLACED rather than layered. The flat-token comparison
+    // that lived here is now the legacy path inside ScopeAuthorizer, matched
+    // before the token table and granted every scope — so existing deployments
+    // keep working unchanged while a scoped token can be narrower.
+    return scopes_.authorize_or_reject(req, res);
 }
 
 bool ControlApiServer::authorize_openai_compat_request(const httplib::Request& req,
@@ -2685,6 +2815,83 @@ void ControlApiServer::register_routes() {
         res.set_content(R"({"cleared":true})", "application/json");
     });
 
+    // ── /v1/tokens — the scope store ────────────────────────────────────────
+    //
+    // Operator-only, necessarily: a credential that can mint credentials is the
+    // most powerful one there is.
+    server_->Get("/v1/tokens", [this](const Request& /*req*/, Response& res) {
+        if (models_ == nullptr) { res.status = 503; return; }
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& t : models_->list_api_tokens()) {
+            // The HASH, never the token. There is nothing to leak here, and the
+            // hash is what correlates a row with a log line.
+            arr.push_back(nlohmann::json{{"id", t.id},
+                                         {"label", t.label},
+                                         {"scopes", format_scopes(t.scopes)},
+                                         {"token_sha256", t.token_sha256},
+                                         {"created_at_ms", t.created_at_ms},
+                                         {"last_used_at_ms", t.last_used_at_ms},
+                                         {"revoked", t.revoked}});
+        }
+        res.set_content(nlohmann::json{{"data", arr}}.dump(), "application/json");
+    });
+
+    server_->Post("/v1/tokens", [this](const Request& req, Response& res) {
+        if (models_ == nullptr) { res.status = 503; return; }
+        std::string label, scopes_csv;
+        try {
+            const auto j = nlohmann::json::parse(req.body);
+            label = j.value("label", std::string{});
+            scopes_csv = j.value("scopes", std::string{});
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+            return;
+        }
+        ScopeSet scopes = kScopeNone;
+        if (!parse_scopes(scopes_csv, scopes) || scopes == kScopeNone) {
+            // An unrecognised scope name is REFUSED rather than dropped. Silently
+            // ignoring "opereator" would mint a token that looks right in the
+            // request and cannot do the thing it was minted for.
+            res.status = 400;
+            res.set_content(
+                nlohmann::json{{"error", "scopes must be a comma-separated subset of "
+                                         "read,chat,operator"},
+                               {"got", scopes_csv}}
+                    .dump(),
+                "application/json");
+            return;
+        }
+        std::string err;
+        const auto secret = models_->create_api_token(label, scopes, err);
+        if (secret.empty()) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", err}}.dump(), "application/json");
+            return;
+        }
+        res.status = 201;
+        // SHOWN ONCE. Only the hash is stored, so this response is the only place
+        // the secret exists; a caller that loses it mints another.
+        res.set_content(nlohmann::json{{"token", secret},
+                                       {"label", label},
+                                       {"scopes", format_scopes(scopes)},
+                                       {"note", "stored hashed; this is the only time it is shown"}}
+                            .dump(),
+                        "application/json");
+    });
+
+    server_->Delete("/v1/tokens/:id", [this](const Request& req, Response& res) {
+        if (models_ == nullptr) { res.status = 503; return; }
+        std::string err;
+        if (!models_->revoke_api_token(parse_model_id(req.path_params.at("id")), err)) {
+            res.status = 404;
+            res.set_content(nlohmann::json{{"error", err}}.dump(), "application/json");
+            return;
+        }
+        // Revoked, not deleted: the row is the audit trail.
+        res.set_content(nlohmann::json{{"status", "revoked"}}.dump(), "application/json");
+    });
+
     // ── /v1/models — the ADMISSION REGISTRY ─────────────────────────────────
     //
     // Reclaimed. This route used to return agents wearing model costumes, with
@@ -2820,6 +3027,115 @@ void ControlApiServer::register_routes() {
             return;
         }
         res.set_content(body, "application/json");
+    });
+
+    // ── POST /v1/models/admit ───────────────────────────────────────────────
+    //
+    // Convert, compile the tokenizer, plan, record — as SSE, because it runs for
+    // hours and an operation you cannot watch is an operation you cannot trust.
+    // The response is a stream of AdmissionProgress frames ending in one with
+    // `done: true`; `last_error` distinguishes failure from success there,
+    // because a stream that simply goes quiet is indistinguishable from a
+    // network fault.
+    server_->Post("/v1/models/admit", [this](const Request& req, Response& res) {
+        if (models_ == nullptr) { res.status = 503; return; }
+        std::string source;
+        try {
+            source = nlohmann::json::parse(req.body).value("source", std::string{});
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+            return;
+        }
+
+        auto ctx = std::make_shared<SseInferCtx>();
+        std::string err;
+        // The sink is registered BEFORE admit() returns, so the first frames
+        // cannot be produced before anyone is listening for them.
+        const auto op_id = models_->admit(source, [ctx](const AdmissionProgress& p) {
+            std::lock_guard<std::mutex> lk(ctx->mx);
+            ctx->lines.push_back("data: " + admission_progress_json(p).dump() + "\n\n");
+            if (p.done) ctx->done = true;
+            ctx->cv.notify_one();
+        }, err);
+
+        if (op_id.empty()) {
+            // A bad source is a 400 on the REQUEST, not an error frame inside a
+            // 200 stream: nothing started, so there is nothing to stream about.
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", err}}.dump(), "application/json");
+            return;
+        }
+        stream_admission(res, models_, op_id, ctx);
+    });
+
+    // Watch an admission that is already running, or find out how one ended.
+    server_->Get("/v1/models/admissions", [this](const Request& /*req*/, Response& res) {
+        if (models_ == nullptr) { res.status = 503; return; }
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& p : models_->operations()) arr.push_back(admission_progress_json(p));
+        res.set_content(nlohmann::json{{"data", arr}}.dump(), "application/json");
+    });
+
+    server_->Get("/v1/models/admissions/:op", [this](const Request& req, Response& res) {
+        if (models_ == nullptr) { res.status = 503; return; }
+        const std::string op_id = req.path_params.at("op");
+        auto ctx = std::make_shared<SseInferCtx>();
+        AdmissionProgress current;
+        if (!models_->attach_sink(op_id, [ctx](const AdmissionProgress& p) {
+                std::lock_guard<std::mutex> lk(ctx->mx);
+                ctx->lines.push_back("data: " + admission_progress_json(p).dump() + "\n\n");
+                if (p.done) ctx->done = true;
+                ctx->cv.notify_one();
+            }, current)) {
+            res.status = 404;
+            return;
+        }
+        {
+            // The current state first, so a client joining late is not left
+            // waiting for the next update to learn where things stand — and so a
+            // client joining after the end learns the outcome immediately.
+            std::lock_guard<std::mutex> lk(ctx->mx);
+            ctx->lines.push_back("data: " + admission_progress_json(current).dump() + "\n\n");
+            if (current.done) ctx->done = true;
+        }
+        stream_admission(res, models_, op_id, ctx);
+    });
+
+    server_->Post("/v1/models/admissions/:op/cancel", [this](const Request& req, Response& res) {
+        if (models_ == nullptr) { res.status = 503; return; }
+        const bool ok = models_->cancel(req.path_params.at("op"));
+        if (!ok) {
+            // 409, not 404: the operation may exist and simply be past the point
+            // of cancelling, which is a different thing from never having existed.
+            res.status = 409;
+            res.set_content(
+                nlohmann::json{{"error", "unknown operation, or it already finished"}}.dump(),
+                "application/json");
+            return;
+        }
+        res.set_content(nlohmann::json{{"status", "canceling"}}.dump(), "application/json");
+    });
+
+    server_->Post("/v1/models/:id/reprofile", [this](const Request& req, Response& res) {
+        if (models_ == nullptr) { res.status = 503; return; }
+        auto ctx = std::make_shared<SseInferCtx>();
+        std::string err;
+        const auto op_id = models_->reprofile(
+            parse_model_id(req.path_params.at("id")),
+            [ctx](const AdmissionProgress& p) {
+                std::lock_guard<std::mutex> lk(ctx->mx);
+                ctx->lines.push_back("data: " + admission_progress_json(p).dump() + "\n\n");
+                if (p.done) ctx->done = true;
+                ctx->cv.notify_one();
+            },
+            err);
+        if (op_id.empty()) {
+            res.status = 404;
+            res.set_content(nlohmann::json{{"error", err}}.dump(), "application/json");
+            return;
+        }
+        stream_admission(res, models_, op_id, ctx);
     });
 
     server_->Get("/v1/models/:id/heat", [this](const Request& req, Response& res) {
@@ -3766,6 +4082,87 @@ void ControlApiServer::register_routes() {
                     return true;
                 }
                 return true;
+            });
+    });
+
+    // ── /v1/engines — the cluster's live engines ────────────────────────────
+    //
+    // An "engine" cluster-wide is a (node, slot) pair, so the id is the slot id
+    // and the node is discovered rather than supplied. That keeps a client from
+    // having to know which node holds what — which changes under it on every
+    // eviction.
+    server_->Get("/v1/engines", [this](const Request& /*req*/, Response& res) {
+        nlohmann::json arr = nlohmann::json::array();
+        ResourceFootprint cluster{};
+        for (const auto& node : registry_.list_nodes()) {
+            if (!node.connected) continue;
+            for (const auto& slot : node.slots) {
+                arr.push_back(nlohmann::json{{"id", slot.id},
+                                             {"node_id", node.id},
+                                             {"node_url", node.url},
+                                             {"backend", slot.backend},
+                                             {"state", to_string(slot.state)},
+                                             {"model_path", slot.model_path},
+                                             {"agent_ids", slot.agent_ids},
+                                             {"vram_usage_mb", slot.vram_usage_mb},
+                                             {"effective_ctx_size", slot.effective_ctx_size}});
+                cluster.vram_mb += slot.vram_usage_mb;
+            }
+            cluster.disk_mb += node.disk_free_mb;
+        }
+        res.set_content(nlohmann::json{{"data", arr},
+                                       {"tier_summary",
+                                        {{"engines", arr.size()},
+                                         {"vram_mb", cluster.vram_mb},
+                                         {"node_disk_free_mb", cluster.disk_mb}}}}
+                            .dump(),
+                        "application/json");
+    });
+
+    server_->Get("/v1/engines/:id/slots", [this](const Request& req, Response& res) {
+        proxy_engine_get(req.path_params.at("id"), "/sequences", {}, res);
+    });
+
+    server_->Get("/v1/engines/:id/heat", [this](const Request& req, Response& res) {
+        // Bucketed by DEFAULT all the way down. The opt-in is explicit at every
+        // hop rather than defaulted back to full by a middle layer.
+        const auto query = req.get_param_value("resolution") == "full"
+                               ? std::string("?resolution=full")
+                               : std::string{};
+        proxy_engine_get(req.path_params.at("id"), "/heat", query, res);
+    });
+
+    server_->Get("/v1/engines/:id/telemetry", [this](const Request& req, Response& res) {
+        const auto found = find_engine_node(req.path_params.at("id"));
+        if (!found) {
+            res.status = 404;
+            res.set_content(nlohmann::json{{"error", "no such engine"}}.dump(),
+                            "application/json");
+            return;
+        }
+        // `hz` is forwarded, not re-clamped here. The ceiling is the ENGINE's,
+        // and a second clamp at this layer would be a second number to keep in
+        // step with it.
+        std::string query;
+        if (req.has_param("hz")) query += "?hz=" + req.get_param_value("hz");
+        if (req.get_param_value("resolution") == "full") {
+            query += (query.empty() ? "?" : "&");
+            query += "resolution=full";
+        }
+        const auto url = found->url;
+        const auto key = found->api_key;
+        const auto path = "/api/node/engines/" + req.path_params.at("id") + "/telemetry" + query;
+
+        res.set_chunked_content_provider(
+            "text/event-stream", [url, key, path](std::size_t, httplib::DataSink& sink) {
+                httplib::Client cli(url);
+                cli.set_read_timeout(0, 0);
+                if (!key.empty()) cli.set_bearer_token_auth(key);
+                const bool ok = cli.Get(path.c_str(), [&](const char* data, std::size_t len) {
+                    return sink.write(data, len);
+                });
+                if (!ok) sink.done();
+                return false;
             });
     });
 

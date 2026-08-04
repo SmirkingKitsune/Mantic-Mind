@@ -143,6 +143,19 @@ public:
     std::optional<SlotInfo> find(const SlotId& slot_id) const;
     std::vector<SequenceInfo> sequences(const SlotId& slot_id) const;
 
+    /// Where an engine is listening, and what it publishes. Empty url when the
+    /// slot is unknown or has no live process; empty paths when the engine has
+    /// no telemetry surface.
+    struct EngineEndpoint {
+        std::string base_url;
+        std::string telemetry_path;
+        std::string heat_path;
+
+        bool ok() const { return !base_url.empty(); }
+    };
+
+    EngineEndpoint endpoint(const SlotId& slot_id) const;
+
     int available_slot_count() const;
     int max_slots() const;
     ResourceFootprint total_footprint() const;

@@ -1,12 +1,14 @@
 #pragma once
 
 #include "common/models.hpp"
+#include "control/route_scope.hpp"
 #include "control/performance_tracker.hpp"
 #include "control/tts_service_client.hpp"
 #include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <cstdint>
 #include <vector>
 
@@ -64,7 +66,12 @@ public:
 
     /// The admission registry backing /v1/models. Optional; when unset those
     /// routes answer 503.
-    void set_model_registry(ControlModelRegistry* registry) { models_ = registry; }
+    void set_model_registry(ControlModelRegistry* registry) {
+        models_ = registry;
+        // The authorizer reads api_token from the same database, so it is
+        // configured here rather than by a second call a caller could forget.
+        scopes_.configure(registry, external_api_token_);
+    }
 
 private:
     AgentManager&   agents_;
@@ -75,6 +82,9 @@ private:
     /// pretending an empty registry, because "no models admitted" and "the
     /// registry never opened" are different facts and only one is actionable.
     ControlModelRegistry* models_ = nullptr;
+    /// Scoped authorization for /v1/*. Replaces the flat-token comparison that
+    /// used to live in authorize_external_request().
+    ScopeAuthorizer scopes_;
     std::string     data_dir_;
     std::string     models_dir_;
     std::string     external_api_token_;
@@ -96,6 +106,18 @@ private:
                                     httplib::Response& res) const;
     bool authorize_openai_compat_request(const httplib::Request& req,
                                          httplib::Response& res) const;
+
+    /// Which node holds an engine (slot). Discovered rather than supplied,
+    /// because the answer changes on every eviction and a client should not have
+    /// to track it.
+    std::optional<NodeInfo> find_engine_node(const SlotId& engine_id) const;
+
+    /// Forward a GET to the node that holds `engine_id`. One helper because
+    /// heat and slots differ only in path and query.
+    void proxy_engine_get(const SlotId& engine_id,
+                          const std::string& suffix,
+                          const std::string& query,
+                          httplib::Response& res) const;
 
     // Runs on the AgentQueue worker thread: builds context, routes to node,
     // proxies SSE, persists messages, fires callbacks.

@@ -934,6 +934,91 @@ void NodeApiServer::register_routes() {
         }
     });
 
+    // ── engine telemetry, proxied ───────────────────────────────────────────
+    //
+    // The node forwards whatever the descriptor names and never learns that Soma
+    // calls it /internal/telemetry. An engine with no telemetry surface —
+    // llama.cpp — answers 501 here rather than 404ing halfway down the chain,
+    // because "this engine does not publish that" and "no such slot" are
+    // different facts and only one of them is the caller's mistake.
+    server_->Get("/api/node/engines/:slot/heat", [this](const Request& req, Response& res) {
+        const auto ep = engines_.endpoint(req.path_params.at("slot"));
+        if (!ep.ok()) { res.status = 404; return; }
+        if (ep.heat_path.empty()) {
+            res.status = 501;
+            res.set_content(
+                nlohmann::json{{"error", "this engine publishes no heat map"}}.dump(),
+                "application/json");
+            return;
+        }
+        httplib::Client cli(ep.base_url);
+        cli.set_read_timeout(10);
+        const auto query = req.has_param("resolution")
+                               ? "?resolution=" + req.get_param_value("resolution")
+                               : std::string{};
+        auto upstream = cli.Get((ep.heat_path + query).c_str());
+        if (!upstream) { res.status = 502; return; }
+        res.status = upstream->status;
+        res.set_content(upstream->body, "application/json");
+    });
+
+    server_->Get("/api/node/engines/:slot/sequences", [this](const Request& req, Response& res) {
+        const auto slot = req.path_params.at("slot");
+        if (!engines_.find(slot)) { res.status = 404; return; }
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& s : engines_.sequences(slot)) {
+            arr.push_back(nlohmann::json{{"index", s.index},
+                                         {"agent_id", s.agent_id},
+                                         {"position", s.position},
+                                         {"kv_tokens", s.kv_tokens},
+                                         {"prefilling", s.prefilling},
+                                         {"suspended", s.suspended},
+                                         {"determinism", s.determinism}});
+        }
+        res.set_content(nlohmann::json{{"slot_id", slot}, {"sequences", arr}}.dump(),
+                        "application/json");
+    });
+
+    server_->Get("/api/node/engines/:slot/telemetry", [this](const Request& req, Response& res) {
+        const auto ep = engines_.endpoint(req.path_params.at("slot"));
+        if (!ep.ok()) { res.status = 404; return; }
+        if (ep.telemetry_path.empty()) {
+            res.status = 501;
+            res.set_content(
+                nlohmann::json{{"error", "this engine publishes no telemetry"}}.dump(),
+                "application/json");
+            return;
+        }
+        std::string query;
+        if (req.has_param("hz")) query += "?hz=" + req.get_param_value("hz");
+        if (req.has_param("resolution")) {
+            query += (query.empty() ? "?" : "&");
+            query += "resolution=" + req.get_param_value("resolution");
+        }
+
+        // Streamed through rather than buffered: the upstream feed never ends,
+        // so anything that waits for a complete body waits forever. The engine's
+        // own clamp applies — the node forwards `hz` and does not second-guess a
+        // ceiling that belongs to the engine.
+        res.set_chunked_content_provider(
+            "text/event-stream",
+            [ep, query](std::size_t, httplib::DataSink& sink) {
+                httplib::Client cli(ep.base_url);
+                cli.set_read_timeout(0, 0);
+                const bool ok = cli.Get(
+                    (ep.telemetry_path + query).c_str(),
+                    [&](const char* data, std::size_t len) {
+                        // Returning false when the downstream write fails is what
+                        // tears the upstream connection down: without it a
+                        // departed client leaves the engine feeding a socket
+                        // nobody reads.
+                        return sink.write(data, len);
+                    });
+                if (!ok) sink.done();
+                return false; // one pass; the inner Get blocks for the stream's life
+            });
+    });
+
     // ── POST /api/node/restore-slot ───────────────────────────────────────────
     server_->Post("/api/node/restore-slot", [this](const Request& req, Response& res) {
         if (!check_auth(req.get_header_value("Authorization"))) {
