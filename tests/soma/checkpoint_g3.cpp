@@ -40,11 +40,12 @@ void check(bool ok, const std::string& what, const std::string& detail = {}) {
 
 std::string tok_str(const std::vector<soma::TokenId>& v) {
     std::string s;
-    for (const auto t : v) s += " " + std::to_string(t);
+    for (const auto t : v)
+        s += " " + std::to_string(t);
     return s;
 }
 
-}  // namespace
+} // namespace
 
 int main(int argc, char** argv) {
     const fs::path root = (argc > 1) ? fs::path(argv[1]) : fs::path("tests/fixtures");
@@ -79,8 +80,7 @@ int main(int argc, char** argv) {
         (void)sched.open_f32(model, nullptr, cfg, &store);
 
         std::vector<soma::TokenId> out;
-        sched.set_token_callback(
-            [&](soma::SeqId, soma::TokenId t, bool) { out.push_back(t); });
+        sched.set_token_callback([&](soma::SeqId, soma::TokenId t, bool) { out.push_back(t); });
 
         soma::SeqRequest req;
         req.prompt = prompt;
@@ -114,7 +114,8 @@ int main(int argc, char** argv) {
     std::cout << "== " << name << "\n\n1. baseline, no preemption\n";
     const auto baseline = run_to_completion(0);
     std::cout << "  " << baseline.size() << " tokens:" << tok_str(baseline) << "\n";
-    check(baseline.size() == kMaxTokens, "baseline generated the full continuation",
+    check(baseline.size() == kMaxTokens,
+          "baseline generated the full continuation",
           std::to_string(baseline.size()) + "/" + std::to_string(kMaxTokens));
 
     // ── 2. preempt mid-generation, resume, continue ──────────────────────────
@@ -129,8 +130,124 @@ int main(int argc, char** argv) {
         const bool same = (got == baseline);
         std::cout << "   preempt after step " << std::setw(2) << at << ": " << got.size()
                   << " tokens" << (same ? "" : tok_str(got)) << "\n";
-        check(same, "continuation identical after preempt at step " + std::to_string(at),
+        check(same,
+              "continuation identical after preempt at step " + std::to_string(at),
               same ? "byte-for-byte" : "DIVERGED");
+    }
+
+    // ── 2b. CROSS-PROCESS resume ─────────────────────────────────────────────
+    //
+    // The section above cannot see the bug this guards. preempt() and resume()
+    // run against the same Scheduler, so the sampler object survives in memory
+    // and the continuation matches whether or not the RNG was ever persisted.
+    //
+    // A fresh Scheduler is the honest test: it is what a restarted engine has.
+    // Everything the resumed sequence knows must have come off disk.
+    std::cout << "\n2b. resume into a FRESH scheduler (what a restart has)\n";
+    {
+        constexpr std::uint32_t kTail = 4;
+
+        // One uninterrupted run, checkpointed partway, kept to completion. Its
+        // tail is what every resume below is measured against.
+        soma::Scheduler first;
+        (void)first.open_f32(model, nullptr, cfg, &store);
+        std::vector<soma::TokenId> full;
+        first.set_token_callback([&](soma::SeqId, soma::TokenId t, bool) { full.push_back(t); });
+
+        soma::SeqRequest req;
+        req.prompt = prompt;
+        req.max_tokens = kMaxTokens;
+        soma::SeqId id = 0;
+        soma::AdmitRejection why{};
+        (void)first.admit(std::move(req), id, why);
+        for (int i = 0; i < 6 && !first.idle(); ++i)
+            (void)first.step();
+
+        // Frozen HERE: the callback keeps appending as the run finishes.
+        const std::size_t k = full.size();
+        check(first.checkpoint(id, "cross-process").ok(),
+              "a mid-generation checkpoint saves",
+              std::to_string(k) + " tokens emitted so far");
+        while (!first.idle()) {
+            if (!first.step().ok()) break;
+        }
+        check(full.size() >= k + kTail,
+              "and the original run continues past it",
+              std::to_string(full.size()) + " tokens total");
+
+        // What the original said NEXT. The checkpointed cache holds prompt plus
+        // full[0..k-2] — the k'th token was sampled but never fed back — so a
+        // resume's first output is full[k].
+        std::vector<soma::TokenId> expected(full.begin() + static_cast<std::ptrdiff_t>(k),
+                                            full.begin() + static_cast<std::ptrdiff_t>(k + kTail));
+
+        // Two spellings of the same resume, which must agree:
+        //
+        //   "cached"    prompt == the cached tokens exactly. Nothing to prefill,
+        //               so the next input can only come from `emitted`.
+        //   "extended"  prompt carries the last emitted token too, so it arrives
+        //               as an ordinary prefill row.
+        //
+        // The first is the one that exposes an unrestored next_token; the second
+        // is what a client that appends its own output sends. A resume that only
+        // handles the second looks correct until someone checkpoints at a turn
+        // boundary.
+        const auto resume_with = [&](std::size_t take) {
+            soma::Scheduler s;
+            (void)s.open_f32(model, nullptr, cfg, &store);
+            std::vector<soma::TokenId> out;
+            s.set_token_callback([&](soma::SeqId, soma::TokenId t, bool) { out.push_back(t); });
+
+            soma::SeqRequest r;
+            r.prompt = prompt;
+            r.prompt.insert(
+                r.prompt.end(), full.begin(), full.begin() + static_cast<std::ptrdiff_t>(take));
+            r.max_tokens = kTail;
+            r.resume_key = "cross-process";
+            soma::SeqId rid = 0;
+            soma::AdmitRejection rwhy{};
+            if (!s.admit(std::move(r), rid, rwhy).ok()) return out;
+            while (!s.idle()) {
+                if (!s.step().ok()) break;
+            }
+            return out;
+        };
+
+        for (const auto& form : {std::make_pair(k - 1, "cached prefix exactly"),
+                                 std::make_pair(k, "prompt extends past the cache")}) {
+            const auto got = resume_with(form.first);
+            const bool same = (got == expected);
+            check(same,
+                  std::string("fresh scheduler continues the run — ") + form.second,
+                  same ? "byte-for-byte"
+                       : ("got" + tok_str(got) + "  expected" + tok_str(expected)));
+        }
+
+        // The control. Same prompt, no checkpoint — so the cache is rebuilt by
+        // prefill and is IDENTICAL, but the sampler starts at seed position 0.
+        // If this matched, the checks above would prove nothing: they would pass
+        // for any sampler whose stream did not depend on history, and the whole
+        // point of persisting rng_state is that this one's does.
+        soma::Scheduler cold;
+        (void)cold.open_f32(model, nullptr, cfg, nullptr);
+        std::vector<soma::TokenId> cold_out;
+        cold.set_token_callback([&](soma::SeqId, soma::TokenId t, bool) { cold_out.push_back(t); });
+        soma::SeqRequest fresh_req;
+        fresh_req.prompt = prompt;
+        fresh_req.prompt.insert(
+            fresh_req.prompt.end(), full.begin(), full.begin() + static_cast<std::ptrdiff_t>(k));
+        fresh_req.max_tokens = kTail;
+        soma::SeqId cid = 0;
+        (void)cold.admit(std::move(fresh_req), cid, why);
+        while (!cold.idle()) {
+            if (!cold.step().ok()) break;
+        }
+        std::cout << "   uninterrupted tail:" << tok_str(expected) << "\n";
+        std::cout << "   cold, no rng_state:" << tok_str(cold_out) << "\n";
+        check(cold_out != expected,
+              "a cold start on the same prompt does NOT match",
+              cold_out == expected ? "IDENTICAL — this test cannot detect a lost RNG"
+                                   : "diverges, as it must");
     }
 
     // ── 3. the refusals ──────────────────────────────────────────────────────
@@ -145,17 +262,41 @@ int main(int argc, char** argv) {
         (void)kv.set_length(8);
         // v2 carries the ids occupying the cached positions, so a restore can be
         // checked against the prompt it is about to be attached to.
-        const std::vector<soma::TokenId> probe_tokens{3, 1, 4, 1, 5, 9, 2, 6};
-        check(store.save("gate-probe", kv, probe_tokens).ok(), "a valid checkpoint saves");
+        soma::SeqPersistState probe;
+        probe.tokens = {3, 1, 4, 1, 5, 9, 2, 6};
+        // v3 also carries the sampler's stream position and the penalty history.
+        // Without them a resumed sequence draws from a fresh stream with no
+        // memory of what it has said: correct tokens, wrong continuation.
+        probe.emitted = {9, 2, 6, 5};
+        probe.rng_state = 0x0123456789ABCDEFull;
+        check(store.save("gate-probe", kv, probe).ok(), "a valid checkpoint saves");
         check(store.exists("gate-probe"), "and is visible to exists()");
 
         soma::KvCache dst;
-        std::vector<soma::TokenId> read_back;
+        soma::SeqPersistState read_back;
         (void)dst.open(model.arch, 64);
         check(store.load("gate-probe", dst, read_back).ok(),
               "and loads back into a matching engine");
-        check(read_back == probe_tokens, "the token ids round-trip with the cache",
-              std::to_string(read_back.size()) + " ids");
+        check(read_back.tokens == probe.tokens,
+              "the token ids round-trip with the cache",
+              std::to_string(read_back.tokens.size()) + " ids");
+        check(read_back.emitted == probe.emitted,
+              "the penalty history round-trips",
+              std::to_string(read_back.emitted.size()) + " emitted");
+        check(read_back.rng_state == probe.rng_state, "and so does the RNG stream position");
+
+        // An EMPTY emitted list is distinct from an absent one: a sequence that
+        // has produced nothing yet must not come back with someone else's history.
+        soma::SeqPersistState fresh;
+        fresh.tokens = probe.tokens;
+        fresh.rng_state = 7;
+        check(store.save("fresh", kv, fresh).ok(), "a sequence with no output saves");
+        soma::KvCache d0;
+        soma::SeqPersistState fresh_back;
+        (void)d0.open(model.arch, 64);
+        check(store.load("fresh", d0, fresh_back).ok() && fresh_back.emitted.empty() &&
+                  fresh_back.rng_state == 7,
+              "and comes back with an empty history, not the previous one's");
 
         // A token list that does not line up with the cached positions is refused
         // rather than padded: a prefix check against a misaligned list reads as a
@@ -163,7 +304,9 @@ int main(int argc, char** argv) {
         soma::KvCache short_kv;
         (void)short_kv.open(model.arch, 64);
         (void)short_kv.set_length(8);
-        check(!store.save("bad-count", short_kv, {1, 2, 3}).ok(),
+        soma::SeqPersistState misaligned;
+        misaligned.tokens = {1, 2, 3};
+        check(!store.save("bad-count", short_kv, misaligned).ok(),
               "a token count that disagrees with the cache is refused");
 
         // The gate is only meaningful if the value it compares is real.
@@ -172,7 +315,8 @@ int main(int argc, char** argv) {
         // the checkpoint's arch_hash was the empty string: nothing on the fp32
         // load path computed it, so every comparison was "" against "" and
         // accepted anything. The refusal below would still have gone green.
-        check(model.arch.arch_hash.size() >= 32, "arch_hash is actually populated",
+        check(model.arch.arch_hash.size() >= 32,
+              "arch_hash is actually populated",
               model.arch.arch_hash.empty() ? "EMPTY — the gate would be vacuous"
                                            : model.arch.arch_hash.substr(0, 16) + "...");
 
@@ -182,7 +326,7 @@ int main(int argc, char** argv) {
         soma::KvCheckpointStore other_store;
         if (other_store.open(dir.string(), other).ok()) {
             soma::KvCache d2;
-            std::vector<soma::TokenId> ignored;
+            soma::SeqPersistState ignored;
             (void)d2.open(other, 64);
             const auto st = other_store.load("gate-probe", d2, ignored);
             check(st.code() == soma::StatusCode::ArchMismatch,
@@ -200,7 +344,7 @@ int main(int argc, char** argv) {
             f.write(reinterpret_cast<const char*>(&bogus), 4);
         }
         soma::KvCache d3;
-        std::vector<soma::TokenId> ignored3;
+        soma::SeqPersistState ignored3;
         (void)d3.open(model.arch, 64);
         const auto vst = store.load("gate-probe", d3, ignored3);
         check(vst.code() == soma::StatusCode::VersionMismatch,
@@ -210,7 +354,8 @@ int main(int argc, char** argv) {
         // And sweep must reclaim it, since it can never be loaded again.
         std::uint32_t removed = 0;
         (void)store.sweep(0, removed);
-        check(removed >= 1, "sweep removes checkpoints that can never load",
+        check(removed >= 1,
+              "sweep removes checkpoints that can never load",
               std::to_string(removed) + " removed");
         check(!store.exists("gate-probe"), "the unloadable file is gone");
     }
@@ -226,7 +371,8 @@ int main(int argc, char** argv) {
         soma::SeqId id = 0;
         soma::AdmitRejection why{};
         (void)sched.admit(std::move(req), id, why);
-        for (int i = 0; i < 5; ++i) (void)sched.step();
+        for (int i = 0; i < 5; ++i)
+            (void)sched.step();
 
         const auto before = sched.stats().preemptions;
         check(sched.preempt(id).ok(), "preempt succeeds mid-generation");
@@ -239,7 +385,7 @@ int main(int argc, char** argv) {
     }
 
     fs::remove_all(dir, ec);
-    std::cout << "\n" << (g_failures == 0 ? "OK" : std::to_string(g_failures) + " FAILURES")
-              << "\n";
+    std::cout << "\n"
+              << (g_failures == 0 ? "OK" : std::to_string(g_failures) + " FAILURES") << "\n";
     return g_failures == 0 ? 0 : 1;
 }

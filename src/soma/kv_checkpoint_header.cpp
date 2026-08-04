@@ -77,11 +77,8 @@ const char* kv_checkpoint_extension() noexcept {
     return kExtension;
 }
 
-Status parse_kv_checkpoint_header(const std::byte* data,
-                                  std::size_t size,
-                                  KvCheckpointHeader& out,
-                                  std::size_t& payload_at,
-                                  std::size_t* tokens_at) {
+Status
+parse_kv_checkpoint_header(const std::byte* data, std::size_t size, KvCheckpointHeader& out) {
     if (data == nullptr || size < sizeof(kMagic) ||
         std::memcmp(data, kMagic, sizeof(kMagic)) != 0) {
         return {StatusCode::InvalidArgument, "not a Soma KV checkpoint (bad magic)"};
@@ -94,6 +91,8 @@ Status parse_kv_checkpoint_header(const std::byte* data,
     out.d_model = c.u32();
     out.payload_bytes = c.u64();
     out.written_at_ms = c.u64();
+    out.rng_state = c.u64();
+    out.n_emitted = c.u32();
     if (!c.ok) return {StatusCode::InvalidArgument, "truncated KV checkpoint header"};
 
     // Checked HERE rather than only in the store's gate, because the node reads
@@ -106,10 +105,11 @@ Status parse_kv_checkpoint_header(const std::byte* data,
                     " != " + std::to_string(kKvCheckpointVersion)};
     }
 
-    // Arithmetic, not consumed: stat() reads a bounded prefix and the token array
-    // of a full context does not fit in it.
-    if (tokens_at != nullptr) *tokens_at = c.at;
-    payload_at = c.at + static_cast<std::size_t>(out.length_tokens) * sizeof(std::uint32_t);
+    // Arithmetic, not consumed: stat() reads a bounded prefix and the token
+    // arrays of a full context do not fit in it.
+    out.tokens_at = c.at;
+    out.emitted_at = out.tokens_at + static_cast<std::size_t>(out.length_tokens) * 4;
+    out.payload_at = out.emitted_at + static_cast<std::size_t>(out.n_emitted) * 4;
     return {};
 }
 
@@ -123,9 +123,7 @@ Status read_kv_checkpoint_header(const std::string& path, KvCheckpointHeader& ou
     // buffer, so a short read is normal here rather than an error.
     prefix.resize(static_cast<std::size_t>(in.gcount()));
 
-    std::size_t payload_at = 0;
-    if (auto st = parse_kv_checkpoint_header(prefix.data(), prefix.size(), out, payload_at);
-        !st.ok()) {
+    if (auto st = parse_kv_checkpoint_header(prefix.data(), prefix.size(), out); !st.ok()) {
         return {st.code(), path + ": " + st.message()};
     }
     return {};

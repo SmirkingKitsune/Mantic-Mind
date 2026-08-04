@@ -1107,10 +1107,10 @@ plausible in-vocabulary tokens, favours high-probability ones, and passes every 
 and tight enough that an off-by-one in the cumulative walk (which shifts a whole category's mass) cannot
 hide.
 
-One limitation worth stating: `rng_state` lives in the scheduler's in-memory `Seq`, not in the KV
-checkpoint. In-process preempt/resume preserves it, so the byte-identity gate holds; a cross-process
-restore would resume with a fresh RNG stream. That is a gap in the checkpoint format, not in the
-sampler, and it belongs with the `SeqState` overload at G5.
+One limitation worth stating: `rng_state` lived in the scheduler's in-memory `Seq`, not in the KV
+checkpoint. In-process preempt/resume preserved it, so the byte-identity gate held; a cross-process
+restore resumed with a fresh RNG stream. That was a gap in the checkpoint format, not in the sampler.
+**Closed at G6** by format v3 — see [Checkpoint format v3](#checkpoint-format-v3-carries-the-sampler).
 
 #### The row-tiled expert loop
 
@@ -1741,6 +1741,68 @@ no-tokenizer fallback encoded *every* prompt as the single token 0, so prompt le
 prompt; a session cannot be exercised at all under that. It falls back to bytes now, which is not a
 tokenizer and does not pretend to be one, but makes length real.
 
+#### Checkpoint format v3 carries the sampler
+
+v2 restored a cache and nothing else. A sequence resumed in a **new process** therefore came back with
+the right context and a *fresh draw stream and empty penalty history*: the same prompt resumed twice
+produced different text, and a model that had already said something was free to say it again
+immediately. Neither surfaces as an error. They read as the model being inconsistent, which is the
+category of bug that gets attributed to the weights and never fixed.
+
+v3 adds `rng_state` (u64) and `n_emitted` (u32) to the fixed header, and an emitted-id array after the
+token array. The three growing parameters became one struct, because a five-argument `save()` is where
+the wrong two get swapped:
+
+```cpp
+struct SeqPersistState {
+    std::vector<TokenId> tokens;   // ids occupying the cached positions
+    std::vector<TokenId> emitted;  // penalty history
+    std::uint64_t rng_state = 0;   // splitmix64 position
+};
+```
+
+**The sampling parameters deliberately stay on the request.** Temperature, `top_p` and the rest are not
+persisted and are not restored — a checkpoint that carried them would make a client's change silently
+ineffective after a resume, which is worse than the inconsistency v3 exists to remove. Only the *stream
+position* is state. `Scheduler::resume` restores `rng_state` alone for exactly this reason.
+
+v2 files refuse to load, as v1 did before them. `parse_kv_checkpoint_header` also lost three out-params:
+`tokens_at`, `emitted_at` and `payload_at` are arithmetic from the fixed fields, so they land in the
+header struct and `stat()` still reads a bounded 4096-byte prefix of a multi-gigabyte file.
+
+**The test that mattered was the one the existing suite could not be.** `preempt -> resume` runs against
+the same `Scheduler`, so the sampler object survives in memory and the continuation is byte-identical
+whether or not the RNG was ever written to disk — those four checks would have stayed green through the
+entire v2 era, and did. The honest test is a **second `Scheduler`**, which is what a restarted engine
+has: everything the resumed sequence knows must have come off disk. With a control — a cold start on the
+same prompt, whose cache is identical because prefill rebuilds it — the pair is decisive:
+
+```
+   uninterrupted tail: 489 439 156 275
+   cold, no rng_state: 47 4 268 323
+```
+
+Without the control the check proves nothing; it would pass for any sampler whose stream did not depend
+on history, and the premise is that this one's does.
+
+**A real bug, found by writing that test.** `Seq::next_token` — the last token sampled but never fed
+back, so it holds no cached position — is not in the checkpoint and cannot be, because it is not part of
+the cache. In-process `resume()` never noticed: `next_token` never left memory. `Scheduler::extend()`
+never noticed either, because it refuses a prompt that adds nothing beyond the cached prefix. But
+`admit()` with a `resume_key` accepts exactly that case, and there is no prefill row to supply the next
+input — so the step loop fed a default-constructed **0**, and the conversation continued from a token
+nobody sampled. It is recoverable exactly, from `emitted.back()`. The test covers both spellings of a
+resume, and with the fix reverted they split precisely as the failure predicts:
+
+```
+   fresh scheduler continues the run — cached prefix exactly        FAIL  got 292 137 257 296
+   fresh scheduler continues the run — prompt extends past the cache  OK  byte-for-byte
+```
+
+A resume that handles only the second looks correct until someone checkpoints at a turn boundary — which
+is what cluster suspend/restore does every time. Removed alongside it: `Seq::have_next`, written in two
+places and read in none.
+
 #### Concurrent turns — the union, finally reachable over HTTP
 
 `generate()` held a mutex across the entire turn, so the batch union — the mechanism this whole engine
@@ -2232,6 +2294,10 @@ store; SSE telemetry with throttling; `/v1/models` reclamation.
   at 4096 cells. The latency comparison itself needs a model with tens of thousands of experts, which
   the committed fixtures are three orders of magnitude away from.
 - Image content parts return **422**, not a dropped part.
+- A sequence restored into a **different process** continues its conversation rather than starting a new
+  one that happens to share a cache. **Done** — checkpoint format v3 carries `rng_state` and the emitted
+  history; `soma_checkpoint_g3` §2b resumes into a fresh `Scheduler` and compares against both the
+  uninterrupted tail and a cold start. The cold start must *diverge*, or the check is vacuous.
 
 ---
 

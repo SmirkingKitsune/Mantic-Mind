@@ -65,7 +65,6 @@ struct Seq {
     std::vector<TokenId> prompt;
     std::uint32_t prompt_pos = 0; ///< next prompt token to feed
     TokenId next_token = 0;       ///< the row this sequence contributes when decoding
-    bool have_next = false;
 
     std::uint32_t generated = 0;
     std::uint32_t max_tokens = 0;
@@ -282,13 +281,35 @@ Status Scheduler::admit(SeqRequest request, SeqId& out_id, AdmitRejection& out_r
     // turn all mean "prefill from scratch", and none of them should fail a
     // request the engine can serve correctly.
     if (!request.resume_key.empty() && im.checkpoints != nullptr) {
-        std::vector<TokenId> cached;
+        SeqPersistState cached;
         const auto st = im.checkpoints->load(request.resume_key, s->kv, cached);
-        const bool is_prefix = st.ok() && cached.size() <= s->prompt.size() &&
-                               std::equal(cached.begin(), cached.end(), s->prompt.begin());
-        if (is_prefix && !cached.empty()) {
-            s->history = std::move(cached);
+        const bool is_prefix =
+            st.ok() && cached.tokens.size() <= s->prompt.size() &&
+            std::equal(cached.tokens.begin(), cached.tokens.end(), s->prompt.begin());
+        if (is_prefix && !cached.tokens.empty()) {
+            s->history = std::move(cached.tokens);
             s->prompt_pos = static_cast<std::uint32_t>(s->history.size());
+            // The conversation's own penalty history and draw stream come back
+            // with its cache. A cross-process resume that kept only the KV would
+            // continue the context and restart the sampler, which is half a
+            // resume.
+            s->emitted = std::move(cached.emitted);
+            s->sampler.rng_state = cached.rng_state;
+
+            // The last emitted token was sampled but never fed back, so it has
+            // no cached position. In-process resume() gets away with ignoring
+            // that — `next_token` never left memory. A CROSS-PROCESS resume has
+            // only what is on disk, and if the checkpoint covers the whole
+            // prompt there is no prefill row to supply the next input: the step
+            // loop would feed a default-constructed 0 and the conversation would
+            // continue from a token nobody sampled.
+            //
+            // Recovering it from `emitted` is exact, not a guess. The other
+            // case — a prompt that extends past the cache — prefills the suffix
+            // and reaches the same state, so both forms of resume agree.
+            if (s->prompt_pos >= s->prompt.size() && !s->emitted.empty()) {
+                s->next_token = s->emitted.back();
+            }
         } else {
             // Reopen the cache: load() may have written into it before failing,
             // and a partially populated cache with length 0 is worse than none.
@@ -463,7 +484,6 @@ Status Scheduler::step() {
             s->prompt_pos += count;
             if (!s->prefilling()) {
                 emit();
-                s->have_next = true;
                 produced = true;
             }
         } else {
@@ -544,7 +564,6 @@ Status Scheduler::extend(SeqId id, std::vector<TokenId> prompt, std::uint32_t ma
     s->prompt_pos = static_cast<std::uint32_t>(s->history.size());
     s->max_tokens = max_tokens;
     s->generated = 0;
-    s->have_next = false;
     s->finished = false;
     // `emitted` and `sampler` deliberately survive: the repetition penalties and
     // the RNG stream are properties of the conversation, not of one turn.
@@ -563,7 +582,11 @@ Status Scheduler::checkpoint(SeqId id, const std::string& key) {
     if (it == im.seqs.end()) return {StatusCode::NotFound, "no such sequence"};
     Seq* s = it->second.get();
     if (s->preempted) return {StatusCode::InvalidArgument, "sequence is preempted; nothing live"};
-    return im.checkpoints->save(key, s->kv, s->history);
+    SeqPersistState persist;
+    persist.tokens = s->history;
+    persist.emitted = s->emitted;
+    persist.rng_state = s->sampler.rng_state;
+    return im.checkpoints->save(key, s->kv, persist);
 }
 
 Status Scheduler::sequence_tokens(SeqId id, std::vector<TokenId>& out) const {
@@ -595,7 +618,15 @@ Status Scheduler::preempt(SeqId id) {
     if (it == im.seqs.end()) return {StatusCode::NotFound, "no such sequence"};
     Seq* s = it->second.get();
 
-    if (auto st = im.checkpoints->save(checkpoint_key(id), s->kv, s->history); !st.ok()) return st;
+    // The sampler's stream position and the penalty history go with the cache.
+    // Without them a resumed sequence draws from a fresh stream and with no
+    // memory of what it has said — the tokens are correct and the CONTINUATION
+    // is not, which reads as the model being inconsistent rather than as a bug.
+    SeqPersistState persist;
+    persist.tokens = s->history;
+    persist.emitted = s->emitted;
+    persist.rng_state = s->sampler.rng_state;
+    if (auto st = im.checkpoints->save(checkpoint_key(id), s->kv, persist); !st.ok()) return st;
 
     // The KV buffer is released here — that is the entire point. Preemption that
     // keeps the memory it was called to reclaim is a no-op with extra steps.
@@ -620,7 +651,14 @@ Status Scheduler::resume(SeqId id) {
     if (!s->preempted) return {StatusCode::InvalidArgument, "sequence is not preempted"};
 
     if (auto st = s->kv.open(im.model->arch, im.cfg.ctx_size); !st.ok()) return st;
-    if (auto st = im.checkpoints->load(checkpoint_key(id), s->kv, s->history); !st.ok()) return st;
+    SeqPersistState restored;
+    if (auto st = im.checkpoints->load(checkpoint_key(id), s->kv, restored); !st.ok()) return st;
+    s->history = std::move(restored.tokens);
+    s->emitted = std::move(restored.emitted);
+    // Only the stream position is restored — the sampling PARAMETERS stay as the
+    // caller set them, so a temperature change survives a preempt/resume cycle
+    // rather than being silently reverted to whatever was in flight.
+    s->sampler.rng_state = restored.rng_state;
 
     s->preempted = false;
     im.waiting.erase(std::remove(im.waiting.begin(), im.waiting.end(), id), im.waiting.end());

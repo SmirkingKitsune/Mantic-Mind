@@ -22,9 +22,22 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace soma {
 
+/// v3 carries the SAMPLER's stream position and the penalty history.
+///
+/// v2 restored a cache and nothing else, so a resumed sequence drew from a fresh
+/// RNG stream and with no repetition history. The tokens were correct and the
+/// CONTINUATION was not: the same prompt resumed twice produced different text,
+/// and a model that had already said something was free to say it again
+/// immediately. Neither is visible as an error — they look like the model being
+/// inconsistent.
+///
+/// v2 files refuse to load rather than being reinterpreted, as v1 did before
+/// them.
+///
 /// v2 carries the TOKEN IDS the cached positions correspond to.
 ///
 /// v1 did not, and that made every checkpoint unsafe to replay: a cache of
@@ -36,7 +49,7 @@ namespace soma {
 ///
 /// v1 files refuse to load rather than being reinterpreted, which is the same
 /// rule every other on-disk format here follows.
-inline constexpr std::uint32_t kKvCheckpointVersion = 2;
+inline constexpr std::uint32_t kKvCheckpointVersion = 3;
 
 struct KvCheckpointHeader {
     std::uint32_t version = kKvCheckpointVersion;
@@ -51,26 +64,54 @@ struct KvCheckpointHeader {
     std::uint32_t d_model = 0;
     std::uint64_t payload_bytes = 0;
     std::uint64_t written_at_ms = 0;
+
+    /// The sampler's stream position. Restoring it is what makes a resumed
+    /// conversation continue rather than start a new one that happens to share
+    /// a cache.
+    std::uint64_t rng_state = 0;
+    std::uint32_t n_emitted = 0;
+
+    /// Offsets into the file, COMPUTED by the parser rather than stored. They
+    /// are arithmetic from the fixed fields, which is what lets stat() read a
+    /// bounded prefix of a multi-gigabyte checkpoint and still know where
+    /// everything is.
+    std::size_t tokens_at = 0;
+    std::size_t emitted_at = 0;
+    std::size_t payload_at = 0;
 };
 
-/// Parse a checkpoint header out of raw bytes. `payload_at` receives the offset
-/// the KV payload starts at.
+/// Everything a resume needs beyond the cache itself.
+///
+/// A struct rather than three more parameters: the set grows as the engine gains
+/// per-sequence state, and a five-argument save() is where the wrong two get
+/// swapped.
+struct SeqPersistState {
+    /// The ids occupying the cached positions, in order. Not metadata — it is
+    /// what makes a restore checkable against the prompt it is attached to.
+    std::vector<TokenId> tokens;
+
+    /// What the sequence has produced. Feeds the repetition and presence
+    /// penalties, which is why it is distinct from `tokens`: the last emitted
+    /// token was sampled but never fed back, so it has no cached position.
+    std::vector<TokenId> emitted;
+
+    /// splitmix64 stream position. NOT the sampling parameters — temperature,
+    /// top_p and the rest ride the request, and a checkpoint that restored them
+    /// would make a client's change silently ineffective after a resume.
+    std::uint64_t rng_state = 0;
+};
+
+/// Parse a checkpoint header out of raw bytes.
 ///
 /// Exposed as a free function because the header is a WIRE FORMAT between two
 /// binaries, not an implementation detail of the store. The node has to read it
 /// before spawning an engine — that is the whole point of a pre-spawn resume
 /// check — and a second parser living in the node is how the two would drift.
 /// The store's own load()/stat()/sweep() go through this same function.
-/// `tokens_at`, when given, receives the offset of the token-id array.
-///
-/// Both offsets are computed arithmetically, so neither the tokens nor the
-/// payload need to be present in `data`. That is what lets stat() read a bounded
-/// prefix of a multi-gigabyte checkpoint.
-Status parse_kv_checkpoint_header(const std::byte* data,
-                                  std::size_t size,
-                                  KvCheckpointHeader& out,
-                                  std::size_t& payload_at,
-                                  std::size_t* tokens_at = nullptr);
+/// The offsets land in `out` and are computed arithmetically, so neither the
+/// token arrays nor the payload need to be present in `data`. That is what lets
+/// stat() read a bounded prefix of a multi-gigabyte checkpoint.
+Status parse_kv_checkpoint_header(const std::byte* data, std::size_t size, KvCheckpointHeader& out);
 
 /// Read just the header from a file. Reads a bounded prefix, never the payload —
 /// a checkpoint is gigabytes and the caller only wants to know whether it is
@@ -106,12 +147,11 @@ public:
     /// whole premise of this file: a checkpoint written by the scheduler must be
     /// loadable by warm reopen and by cluster slot restore without translation.
     ///
-    /// `tokens` must be exactly the ids occupying the cached positions, in order.
-    /// It is not metadata: it is what makes a restore checkable, and load()
-    /// returns it so the caller can prove the checkpoint is a prefix of the
-    /// prompt it is about to be attached to.
-    Status save(const std::string& key, const KvCache& kv, const std::vector<TokenId>& tokens);
-    Status load(const std::string& key, KvCache& kv, std::vector<TokenId>& out_tokens);
+    /// `state.tokens` must be exactly the ids occupying the cached positions, in
+    /// order — load() returns them so the caller can prove the checkpoint is a
+    /// prefix of the prompt it is about to be attached to.
+    Status save(const std::string& key, const KvCache& kv, const SeqPersistState& state);
+    Status load(const std::string& key, KvCache& kv, SeqPersistState& out);
 
     Status stat(const std::string& key, KvCheckpointHeader& out) const;
     bool exists(const std::string& key) const noexcept;

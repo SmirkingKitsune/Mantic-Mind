@@ -70,11 +70,8 @@ struct KvCheckpointStore::Impl {
 
     /// Read and validate a header. Shared by load(), stat() and sweep(), so the
     /// gating cannot drift between "what a load checks" and "what a sweep keeps".
-    Status read_header(const fs::path& p,
-                       KvCheckpointHeader& out,
-                       std::vector<std::byte>& raw,
-                       std::size_t& payload_at,
-                       std::size_t* tokens_at = nullptr) const {
+    Status
+    read_header(const fs::path& p, KvCheckpointHeader& out, std::vector<std::byte>& raw) const {
         std::ifstream in(p, std::ios::binary | std::ios::ate);
         if (!in) return {StatusCode::NotFound, "no checkpoint at " + p.string()};
         const auto size = static_cast<std::streamsize>(in.tellg());
@@ -87,9 +84,7 @@ struct KvCheckpointStore::Impl {
         // The parse itself lives in kv_checkpoint_header.cpp, which the node also
         // links: the header is a wire format between two binaries, and two
         // parsers is how it acquires two meanings.
-        if (auto st =
-                parse_kv_checkpoint_header(raw.data(), raw.size(), out, payload_at, tokens_at);
-            !st.ok()) {
+        if (auto st = parse_kv_checkpoint_header(raw.data(), raw.size(), out); !st.ok()) {
             return {st.code(), p.string() + ": " + st.message()};
         }
         return {};
@@ -148,20 +143,19 @@ void KvCheckpointStore::close() {
     impl_ = std::make_unique<Impl>();
 }
 
-Status KvCheckpointStore::save(const std::string& key,
-                               const KvCache& kv,
-                               const std::vector<TokenId>& tokens) {
+Status
+KvCheckpointStore::save(const std::string& key, const KvCache& kv, const SeqPersistState& state) {
     auto& im = *impl_;
     if (!im.open) return {StatusCode::InvalidArgument, "checkpoint store is not open"};
 
     const auto len = kv.length();
-    if (tokens.size() != len) {
+    if (state.tokens.size() != len) {
         // Refused rather than padded or truncated. A token list that does not
         // line up with the cached positions makes the prefix check on the other
         // side meaningless, and a meaningless check is worse than none because
         // it reads as a guarantee.
         return {StatusCode::InvalidArgument,
-                "token count " + std::to_string(tokens.size()) + " != cached positions " +
+                "token count " + std::to_string(state.tokens.size()) + " != cached positions " +
                     std::to_string(len)};
     }
     const auto hkv = kv.hkv();
@@ -179,9 +173,18 @@ Status KvCheckpointStore::save(const std::string& key,
     put_u32(buf, im.arch.topology.d_model);
     put_u64(buf, per_plane * 2 * sizeof(float));
     put_u64(buf, now_ms());
-    // v2: the ids occupying those positions, so a restore can be CHECKED against
-    // the prompt it is attached to rather than trusted.
-    for (const auto t : tokens)
+    // v3: the sampler's stream position, so a resumed sequence continues the
+    // draw it was on rather than starting a fresh one.
+    put_u64(buf, state.rng_state);
+    put_u32(buf, static_cast<std::uint32_t>(state.emitted.size()));
+    // v2: the ids occupying the cached positions, so a restore can be CHECKED
+    // against the prompt it is attached to rather than trusted.
+    for (const auto t : state.tokens)
+        put_u32(buf, static_cast<std::uint32_t>(t));
+    // v3: what the sequence has said. The repetition and presence penalties read
+    // this, so a resume without it lets the model immediately repeat something it
+    // had already been penalised for.
+    for (const auto t : state.emitted)
         put_u32(buf, static_cast<std::uint32_t>(t));
 
     // Live positions only, layer by layer — see the file header for why the raw
@@ -219,28 +222,33 @@ Status KvCheckpointStore::save(const std::string& key,
     return {};
 }
 
-Status
-KvCheckpointStore::load(const std::string& key, KvCache& kv, std::vector<TokenId>& out_tokens) {
+Status KvCheckpointStore::load(const std::string& key, KvCache& kv, SeqPersistState& out) {
     auto& im = *impl_;
     if (!im.open) return {StatusCode::InvalidArgument, "checkpoint store is not open"};
 
     KvCheckpointHeader h;
     std::vector<std::byte> raw;
-    std::size_t at = 0;
-    std::size_t tokens_at = 0;
-    if (auto st = im.read_header(im.path_for(key), h, raw, at, &tokens_at); !st.ok()) return st;
+    if (auto st = im.read_header(im.path_for(key), h, raw); !st.ok()) return st;
     if (auto st = im.gate(h); !st.ok()) return st;
 
-    if (raw.size() < at) return {StatusCode::InvalidArgument, "checkpoint token array is short"};
-    out_tokens.resize(h.length_tokens);
-    for (std::uint32_t i = 0; i < h.length_tokens; ++i) {
-        const auto* p = raw.data() + tokens_at + static_cast<std::size_t>(i) * 4;
-        std::uint32_t v = 0;
-        for (int b = 0; b < 4; ++b) {
-            v |= static_cast<std::uint32_t>(static_cast<unsigned char>(p[b])) << (8 * b);
+    const auto at = h.payload_at;
+    if (raw.size() < at) return {StatusCode::InvalidArgument, "checkpoint token arrays are short"};
+
+    const auto read_ids = [&](std::size_t offset, std::uint32_t count) {
+        std::vector<TokenId> ids(count);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const auto* p = raw.data() + offset + static_cast<std::size_t>(i) * 4;
+            std::uint32_t v = 0;
+            for (int b = 0; b < 4; ++b) {
+                v |= static_cast<std::uint32_t>(static_cast<unsigned char>(p[b])) << (8 * b);
+            }
+            ids[i] = static_cast<TokenId>(v);
         }
-        out_tokens[i] = static_cast<TokenId>(v);
-    }
+        return ids;
+    };
+    out.tokens = read_ids(h.tokens_at, h.length_tokens);
+    out.emitted = read_ids(h.emitted_at, h.n_emitted);
+    out.rng_state = h.rng_state;
 
     const auto hkv = kv.hkv();
     const auto layers = kv.n_layers();
@@ -287,8 +295,7 @@ Status KvCheckpointStore::load(const std::string& key, SeqState& seq) {
 
 Status KvCheckpointStore::stat(const std::string& key, KvCheckpointHeader& out) const {
     std::vector<std::byte> raw;
-    std::size_t at = 0;
-    return impl_->read_header(impl_->path_for(key), out, raw, at);
+    return impl_->read_header(impl_->path_for(key), out, raw);
 }
 
 bool KvCheckpointStore::exists(const std::string& key) const noexcept {
@@ -317,12 +324,11 @@ Status KvCheckpointStore::sweep(std::uint64_t max_age_ms, std::uint32_t& out_rem
 
         KvCheckpointHeader h;
         std::vector<std::byte> raw;
-        std::size_t at = 0;
         // Unreadable, stale-arch and expired all get removed, for one reason:
         // none of them can ever be loaded again, so keeping them only grows the
         // directory. A requantization invalidates every checkpoint at once, and
         // without this they would accumulate forever.
-        const bool bad = !im.read_header(e.path(), h, raw, at).ok() || !im.gate(h).ok();
+        const bool bad = !im.read_header(e.path(), h, raw).ok() || !im.gate(h).ok();
         const bool old =
             (max_age_ms > 0 && h.written_at_ms > 0 && now > h.written_at_ms + max_age_ms);
         if (bad || old) {
