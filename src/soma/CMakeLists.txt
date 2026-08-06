@@ -389,6 +389,17 @@ if(BUILD_TESTING)
     target_link_libraries(soma_telemetry_g6 PRIVATE mm_soma)
     add_test(NAME soma_telemetry_g6 COMMAND soma_telemetry_g6)
 
+    # ── G8 the admission ladder ───────────────────────────────────────────────
+    # Runs the REAL `soma conform` against two half-complete fixtures. The gate is
+    # that a stage which did not run says so, rather than passing by omission.
+    add_executable(soma_conform_g8 ${CMAKE_SOURCE_DIR}/tests/soma/conform_g8.cpp)
+    target_link_libraries(soma_conform_g8 PRIVATE nlohmann_json::nlohmann_json)
+    add_test(NAME soma_conform_g8
+             COMMAND soma_conform_g8
+                     $<TARGET_FILE:soma>
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/containers/Qwen3-30B-A3B"
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/tokenizers/Qwen3-30B-A3B")
+
     # ── G5 verdict routing ────────────────────────────────────────────────────
     # The whole policy table, plus the gate: Mixtral admits resident-only and
     # routes to the fallback with no override and no model-specific special case.

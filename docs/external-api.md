@@ -91,6 +91,11 @@ data: [DONE]
 Stages: `fetch → convert → tokenize → profile → conformance → finalize`. Cancel with
 `POST /v1/models/admit/{operation_id}/cancel` (`operator`).
 
+**The architecture is checked before conversion starts.** A `source` whose config Soma cannot parse
+fails the request in milliseconds rather than after hours of conversion. One whose config parses but
+whose attention family has no backend is admitted as a `reject` record — conversion is skipped, because
+no host will ever read that container.
+
 **`step` and `total_steps` describe THIS run, not a fixed ladder.** A local directory skips `fetch`; an
 already-converted container (`admit_container`, and what `reprofile` runs) skips `fetch`, `convert` and
 `tokenize` and reports 3 total. Read `stage` for what is happening and `fraction` for how far along;
@@ -103,6 +108,17 @@ time is estimable. Zero elsewhere means "not reported", not "nothing to transfer
 `repo@revision`. A repo id becomes a directory under `sources_dir`, so it is validated as one: at most
 one `/`, no `..`, no backslash. Auth is whatever `huggingface_hub` already resolves (`HF_TOKEN` or a
 cached login) — control never reads or stores a credential.
+
+**`quantization` is honoured, and it changes the model's identity.** `expert_gate`, `expert_down` and
+`group` each fall back to the deployment default when omitted. Admitting the same `source` at a
+different quantization produces a **second record with a different `arch_hash`**, in its own container
+directory — not an update of the first. KV checkpoints written against one refuse to load under the
+other. `POST /v1/models/{id}/reprofile` deliberately does none of that: it re-derives a verdict from the
+same bytes and leaves the hash alone.
+
+**Which record an agent gets when several match one name**: a verdict that selects Soma wins, then the
+most recently profiled. Pass an `arch_hash` as the model ref to name a specific variant — it is the only
+identity that cannot be ambiguous.
 
 **A repo with no safetensors is refused unless `admission_allow_pickle` is set.** Converting `.bin`
 weights means unpickling them, which executes code from the repo; that is an operator's decision per
@@ -164,6 +180,18 @@ Note `max_batch: 12` is **derived, not configured** — `cap_per_layer / expecte
 See §5.
 
 ### `GET /v1/models/{id}/conformance` — `read`
+
+Each stage carries `status` ∈ `passed` | `failed` | `skipped`, and `detail` as JSON. **Read `status`,
+not `passed`** — `passed` is a boolean and cannot express "did not run", which is what most of this
+ladder says on a serving host. `fp32_tiny_tf` and `real_logit_kl` need a `transformers` oracle for the
+specific model; they are recorded as `skipped` with what they would need, never as passing.
+
+Stages that DO run at admission: `quant_codec` (the container's declared formats against its own dense
+weights — measured bits/weight versus an independently written formula, plus round-trip relative RMS)
+and `tokenizer_roundtrip` (the compiled tokenizer against HF's own ids, byte-for-byte).
+
+**A failed stage yields `verdict: "reject"`; the admission still succeeds.** A rejected model is a
+successfully admitted *record* meaning "route this to the fallback".
 
 ```jsonc
 { "stages": [

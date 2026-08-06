@@ -4,6 +4,11 @@
 #include "control/agent_manager.hpp"
 #include "control/agent_scheduler.hpp"
 #include "control/agent_config_validator.hpp"
+// The Soma tab, built entirely from /v1/*. Its panels live in their own
+// translation unit precisely so they CANNOT reach the three registries this
+// file holds by reference; tools/ci/check_ui_api.py enforces that.
+#include "control/soma_dashboard.hpp"
+#include "control/soma_panels.hpp"
 #include "common/agent.hpp"
 #include "common/agent_db.hpp"
 #include "common/http_client.hpp"
@@ -194,6 +199,7 @@ void ControlUI::run() {
     //
 
     int tab_index = 0;
+    int soma_selected = 0;
     mm::tui::LayoutStore layout("data/control-tui-layout.json");
     int node_detail_height = layout.get("nodes.detail_height", 20, 12, 40);
     int node_name_width = layout.get("nodes.name_width", 18, 12, 36);
@@ -3062,13 +3068,22 @@ void ControlUI::run() {
         return vbox(std::move(page));
     });
 
+    // Polls on its own thread at the tab's cadence rather than inside a
+    // renderer: an HTTP round trip on the render path stalls every other panel,
+    // and the existing performance tab already shows what that feels like.
+    SomaDashboard soma_dashboard(control_base_url_, control_api_token_);
+    soma_dashboard.start(500);
+    auto soma_renderer = soma_tab(soma_dashboard, soma_selected);
+
     auto main_tabs = Container::Tab({nodes_renderer, agents_renderer, activity_renderer,
-        chat_renderer, curation_renderer, performance_renderer, voice_renderer}, &tab_index);
+        chat_renderer, curation_renderer, performance_renderer, voice_renderer,
+        soma_renderer}, &tab_index);
 
     // Mockup-style header: the tab strip is real Button components (clickable +
     // focusable) rendered as `n Label` chips, the active one inverted.
-    static const std::array<const char*, 7> kTabLabels = {
-        "1 Nodes", "2 Agents", "3 Activity", "4 Chat", "5 Curation", "6 Performance", "7 Voice"};
+    static const std::array<const char*, 8> kTabLabels = {
+        "1 Nodes", "2 Agents", "3 Activity", "4 Chat", "5 Curation", "6 Performance", "7 Voice",
+        "8 Soma"};
     Components tab_buttons;
     for (int i = 0; i < static_cast<int>(kTabLabels.size()); ++i) {
         ButtonOption opt = ButtonOption::Simple();
@@ -3108,7 +3123,7 @@ void ControlUI::run() {
             text(" "),
         });
         auto footer = hbox({
-            text(" 1-7 tabs · ↑/↓ select · click rows · q quit") | dim,
+            text(" 1-8 tabs · ↑/↓ select · click rows · q quit") | dim,
             filler(),
             text("mantic-mind · control ") | dim,
         });
@@ -3134,6 +3149,7 @@ void ControlUI::run() {
             if (ev == Event::Character('4')) { tab_index = 3; return true; }
             if (ev == Event::Character('6')) { tab_index = 5; return true; }
             if (ev == Event::Character('7')) { tab_index = 6; return true; }
+            if (ev == Event::Character('8')) { tab_index = 7; return true; }
             if (ev == Event::Character('5')) { tab_index = 4; return true; }
             if (ev == Event::Character('f') && tab_index == 0) {
                 forget_selected_node();

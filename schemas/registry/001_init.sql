@@ -133,15 +133,25 @@ CREATE TABLE IF NOT EXISTS pilot_profile (
 -- bug: different remediation. The distinction is why `stage` is a column and not
 -- a boolean.
 -- ─────────────────────────────────────────────────────────────────────────────
+-- `status` is the field to read. A boolean cannot say "did not run", and that is
+-- what most of this ladder says on a serving host: fp32_tiny_tf and real_logit_kl
+-- need a `transformers` oracle for the SPECIFIC model. Recording those as failed
+-- would reject every model; recording them as passed would make the verdict look
+-- validated when it was only computed. `passed` is kept for clients written
+-- against the original shape.
 CREATE TABLE IF NOT EXISTS conformance (
     model_id INTEGER NOT NULL REFERENCES model(id) ON DELETE CASCADE,
     stage    TEXT    NOT NULL
              CHECK (stage IN ('fp32_tiny_tf',
                               'quant_tiny_greedy',
                               'real_logit_kl',
-                              'accuracy_floor')),
+                              'accuracy_floor',
+                              'tokenizer_roundtrip',
+                              'quant_codec')),
+    status   TEXT    NOT NULL
+             CHECK (status IN ('passed', 'failed', 'skipped')),
     passed   INTEGER NOT NULL,
-    detail   TEXT,                -- JSON: metrics, first divergence, thresholds
+    detail   TEXT,                -- JSON: metrics, first divergence, or why it was skipped
     ran_at   INTEGER NOT NULL,
     PRIMARY KEY (model_id, stage)
 );

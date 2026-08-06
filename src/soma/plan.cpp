@@ -281,6 +281,7 @@ Status serialize_plan(const PlanDocument& plan, std::string& out_json) {
       << "  \"active_fraction\": " << plan.active_fraction << ",\n"
       << "  \"projected_tok_s\": " << plan.projected_tok_s << ",\n"
       << "  \"prefetch_enabled_layers\": " << plan.prefetch_enabled_layers << ",\n"
+      << "  \"arch_supported\": " << (plan.arch_supported ? "true" : "false") << ",\n"
       << "  \"verdict\": \"" << to_string(plan.verdict) << "\",\n"
       << "  \"verdict_reason\": \"" << plan.verdict_reason << "\"\n"
       << "}\n";
@@ -306,6 +307,26 @@ Status compute_plan(const std::string& model_dir, const HostBudget& budget, Plan
 
     ArchIr arch;
     if (auto st = adapt_hf_config(cfg_text, arch); !st.ok()) return st;
+
+    // A CONTAINER also carries what it was quantized AT, and that is part of the
+    // model's identity — arch_hash covers the quant map precisely so that
+    // re-admitting the same weights at a different quantization is a different
+    // model with its own verdict and its own KV checkpoints.
+    //
+    // Without this the hash covered a quant map nobody ever populated: every
+    // container of a given architecture hashed identically no matter what it was
+    // converted at, the registry could not tell two quantizations apart, and a KV
+    // checkpoint written under q4_g would replay under q8_0 with nothing
+    // detecting it. The field was in the hash and the value never arrived.
+    //
+    // container_meta.json is not a second description of the architecture — it is
+    // the record of a conversion, written by the converter, and it is the only
+    // place the quantization exists at all.
+    if (std::ifstream meta_in(root / "container_meta.json", std::ios::binary); meta_in) {
+        std::string meta_text((std::istreambuf_iterator<char>(meta_in)),
+                              std::istreambuf_iterator<char>());
+        if (auto st = apply_container_quant(meta_text, arch); !st.ok()) return st;
+    }
 
     // Stamped HERE, not left empty.
     //

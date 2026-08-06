@@ -22,6 +22,11 @@
 #include "common/gguf_metadata.hpp"
 #include "common/inference_sizing.hpp"
 #include "control/agent_config_validator.hpp"
+// The requantization gate reaches into the ENGINE's types: arch_hash is
+// computed there, and the KV store is what enforces the invalidation.
+#include "soma/arch_ir.hpp"
+#include "soma/kv_cache.hpp"
+#include "soma/kv_checkpoint.hpp"
 #include "node/runtime_process.hpp"
 #include "node/engine_supervisor.hpp"
 #include "node/llama_runtime.hpp"
@@ -78,6 +83,31 @@ bool check(bool condition, const char* expression, int line) {
     if (condition) return true;
     std::cerr << "CHECK failed at line " << line << ": " << expression << "\n";
     return false;
+}
+
+/// The Windows-loopback transport flake, and the ONE budget for it.
+///
+/// mm::HttpClient opens a fresh connection per request, and rapid sequential
+/// connect/close cycles on Windows loopback occasionally fail before the server
+/// is reached at all: `status` stays 0 and no response is parsed. It is a real
+/// property of the environment, not of the code under test, so every request in
+/// this file retries it.
+///
+/// Stated once because it used to be stated twice, with different numbers:
+/// `with_retry` allowed 8 flat 50 ms attempts (400 ms) and the SSE helper allowed
+/// 3 (150 ms). The SSE path is the one that carries the auth negatives, so the
+/// thinner budget sat under the assertions where a transport failure is hardest
+/// to tell from a wrong verdict — `status == 403` fails identically whether
+/// authorization returned 200 or the request never arrived. That is exactly how
+/// it presented: one intermittent failure, at the auth assertion, in the suite's
+/// most alarming test.
+///
+/// Backoff rather than a flat interval: the failure is a socket in TIME_WAIT or a
+/// listener mid-accept, and both clear on a timescale that a fixed short retry
+/// re-hits every time.
+constexpr int kTransportRetries = 6;
+inline void transport_backoff(int attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50 * (attempt + 1)));
 }
 
 #define CHECK(expr) do { if (!check((expr), #expr, __LINE__)) return false; } while (0)
@@ -1350,15 +1380,14 @@ bool test_control_api_external_token_gate() {
         }
         RECORD(server_ready);
 
-        // mm::HttpClient opens a fresh connection per request; rapid
-        // sequential connect/close cycles on Windows loopback occasionally
-        // fail at the transport level (status == 0). Retry those.
+        // Transport retries: see kTransportRetries. One budget for the whole
+        // file — this test is where two of them diverging did damage.
         auto with_retry = [](auto&& request) {
             mm::HttpResponse resp;
-            for (int attempt = 0; attempt < 8; ++attempt) {
+            for (int attempt = 0; attempt < kTransportRetries; ++attempt) {
                 resp = request();
                 if (resp.status != 0) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                transport_backoff(attempt);
             }
             return resp;
         };
@@ -1460,14 +1489,16 @@ bool test_control_api_external_token_gate() {
             int status = 0;
             std::string body;
             std::vector<std::string> events;
+            int retries = 0;
         };
         auto stream_chat = [&](const std::string& token,
                                const nlohmann::json& body) {
             mm::HttpClient stream_client(base_url);
             if (!token.empty()) stream_client.set_bearer_token(token);
             StreamAttempt attempt;
-            for (int retry = 0; retry < 3; ++retry) {
+            for (int retry = 0; retry < kTransportRetries; ++retry) {
                 attempt = StreamAttempt{};
+                attempt.retries = retry;
                 attempt.ok = stream_client.stream_post(
                     "/v1/agents/agent-a/chat",
                     body,
@@ -1479,24 +1510,46 @@ bool test_control_api_external_token_gate() {
                     &attempt.body);
                 // status stays 0 only on transport failure; retry those.
                 if (attempt.ok || attempt.status != 0) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                transport_backoff(retry);
             }
             return attempt;
         };
 
+        // A transport failure and a wrong status code are DIFFERENT findings,
+        // and the assertions below cannot tell them apart: status stays 0 when
+        // the request never reached the server, and `0 == 403` fails exactly the
+        // way a broken auth gate does. That ambiguity cost a diagnosis once —
+        // one intermittent failure at `status == 403` that said nothing about
+        // whether authorization had been consulted at all.
+        //
+        // Checked first, separately, and loudly.
+        const auto reached_server = [&](const StreamAttempt& a, const char* what) {
+            if (a.status != 0) return;
+            std::cerr << "  TRANSPORT FAILURE on " << what << " after " << (a.retries + 1)
+                      << " attempts: status=0, body=\"" << a.body.substr(0, 120) << "\"\n"
+                      << "  (the auth assertions below are about to fail for a reason that\n"
+                      << "   has nothing to do with auth)\n";
+        };
+
         auto missing_chat = stream_chat("", nlohmann::json{{"message", "hello"}});
+        reached_server(missing_chat, "missing_chat");
+        RECORD(missing_chat.status != 0);
         RECORD(!missing_chat.ok);
         RECORD(missing_chat.status == 401);
         RECORD(missing_chat.body.find("missing bearer token") != std::string::npos);
         RECORD(missing_chat.events.empty());
 
         auto invalid_chat = stream_chat("wrong-secret", nlohmann::json{{"message", "hello"}});
+        reached_server(invalid_chat, "invalid_chat");
+        RECORD(invalid_chat.status != 0);
         RECORD(!invalid_chat.ok);
         RECORD(invalid_chat.status == 403);
         RECORD(invalid_chat.body.find("invalid bearer token") != std::string::npos);
         RECORD(invalid_chat.events.empty());
 
         auto node_chat = stream_chat("node-secret", nlohmann::json{{"message", "hello"}});
+        reached_server(node_chat, "node_chat");
+        RECORD(node_chat.status != 0);
         RECORD(!node_chat.ok);
         RECORD(node_chat.status == 403);
         RECORD(node_chat.body.find("invalid bearer token") != std::string::npos);
@@ -1689,10 +1742,10 @@ bool test_openai_compat_api_listener_and_model_catalog() {
         mm::HttpClient client(base_url);
         auto with_retry = [](auto&& request) {
             mm::HttpResponse resp;
-            for (int attempt = 0; attempt < 3; ++attempt) {
+            for (int attempt = 0; attempt < kTransportRetries; ++attempt) {
                 resp = request();
                 if (resp.status != 0) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                transport_backoff(attempt);
             }
             return resp;
         };
@@ -1910,10 +1963,10 @@ bool test_control_api_agent_api_mode_chat() {
 
         auto with_retry = [](auto&& request) {
             mm::HttpResponse resp;
-            for (int attempt = 0; attempt < 8; ++attempt) {
+            for (int attempt = 0; attempt < kTransportRetries; ++attempt) {
                 resp = request();
                 if (resp.status != 0) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                transport_backoff(attempt);
             }
             return resp;
         };
@@ -1972,7 +2025,9 @@ bool test_control_api_agent_api_mode_chat() {
         };
         auto stream_chat = [&](const nlohmann::json& request_body) {
             StreamAttempt attempt;
-            for (int retry = 0; retry < 3; ++retry) {
+            // Same budget as everywhere else; see kTransportRetries. This loop
+            // was the third copy of the policy and the second one with 3.
+            for (int retry = 0; retry < kTransportRetries; ++retry) {
                 attempt = StreamAttempt{};
                 attempt.ok = client.stream_post(
                     "/v1/agents/api-agent/chat",
@@ -1984,7 +2039,7 @@ bool test_control_api_agent_api_mode_chat() {
                     &attempt.status,
                     &attempt.body);
                 if (attempt.ok || attempt.status != 0) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                transport_backoff(retry);
             }
             return attempt;
         };
@@ -4533,7 +4588,9 @@ bool test_model_registry_makes_soma_routable() {
     mm::ControlModelRegistry reg;
     std::string err;
     CHECK(reg.open(dir.string(), err));
-    CHECK(reg.schema_version() == 1);
+    // v2 added the conformance table's third state. Asserted rather than
+    // ranged: a migration that did not run is the failure this catches.
+    CHECK(reg.schema_version() == 2);
     CHECK(reg.list().empty());
     CHECK(std::filesystem::exists(dir / "control.db"));
 
@@ -4772,9 +4829,13 @@ bool test_admission_fetch_stage() {
 
     const char* python = std::getenv("MM_TEST_PYTHON");
     const char* soma_path = std::getenv("MM_TEST_SOMA_PATH");
-    const char* model_dir = std::getenv("MM_TEST_MODEL_DIR");
+    // The CONTAINER, not the raw checkpoint: the stubbed convert stands in for
+    // the real one, so what it produces has to be what the real one produces.
+    // Otherwise the conformance stage downstream has no container to read, and
+    // skips for a reason the test invented rather than the pipeline.
+    const char* model_dir = std::getenv("MM_TEST_CONTAINER_DIR");
     if (python == nullptr || soma_path == nullptr || model_dir == nullptr) {
-        std::cout << "  (stage skipped: MM_TEST_PYTHON / SOMA_PATH / MODEL_DIR unset)\n";
+        std::cout << "  (stage skipped: MM_TEST_PYTHON / SOMA_PATH / CONTAINER_DIR unset)\n";
         return true;
     }
 
@@ -4800,7 +4861,11 @@ bool test_admission_fetch_stage() {
              "if mode == 'silent':\n"
              "    sys.exit(0)\n"
              "os.makedirs(out, exist_ok=True)\n"
-             "open(os.path.join(out, 'config.json'), 'w').write('{}')\n"
+             // A real config, copied from the fixture: what a fetch produces has
+             // to be plannable, because the architecture check runs on it before
+             // conversion is allowed to start.
+             "import shutil\n"
+             "shutil.copy(os.path.join(os.environ['MM_STUB_CONTAINER'], 'config.json'), out)\n"
              "print('resolved ' + os.path.abspath(out), flush=True)\n";
     }
     // Conversion, stubbed: copy the real fixture so `soma plan` has something
@@ -4934,6 +4999,434 @@ bool test_admission_fetch_stage() {
     // write one, and neither left a half-row behind.
     CHECK(reg.list().size() == 1);
 
+    // ── the ladder ran, and said what it did not do ──────────────────────────
+    //
+    // `soma conform` is invoked for real here — the stubs cover fetch and
+    // convert, not this. What matters is that the SKIPPED stages are recorded as
+    // skipped: a pipeline that wrote `passed` rows for stages needing a
+    // transformers oracle would hand every model a verdict that looks validated.
+    {
+        const auto stages = reg.conformance(done.model_id);
+        CHECK(!stages.empty());
+        std::size_t skipped = 0, passed = 0;
+        bool saw_reason = false;
+        for (const auto& s : stages) {
+            CHECK(s.status == "passed" || s.status == "failed" || s.status == "skipped");
+            CHECK(s.passed == (s.status == "passed"));
+            if (s.status == "skipped") {
+                ++skipped;
+                // A skip without a reason is indistinguishable from a stage
+                // nobody wrote.
+                if (s.detail.find("reason") != std::string::npos) saw_reason = true;
+            }
+            if (s.status == "passed") ++passed;
+        }
+        CHECK(skipped >= 3); // fp32_tiny_tf, real_logit_kl, accuracy_floor
+        CHECK(passed >= 1);  // quant_codec, against the real container
+        CHECK(saw_reason);
+    }
+
+    // ── an unsupported architecture fails BEFORE conversion ─────────────────
+    //
+    // The G8 gate line, and the difference between failing in 200 ms and failing
+    // after six hours. `adapt_hf_config`'s table IS the registry of architectures
+    // this engine understands; an unknown `model_type` stops there, and a
+    // container built from a config Soma cannot parse is gigabytes nothing can
+    // read.
+    //
+    // Proven by the stub convert never running: it writes a container, so if the
+    // check happened afterwards the directory would exist.
+    {
+        const auto weird = dir / "weird-arch";
+        std::filesystem::create_directories(weird);
+        {
+            std::ofstream f(weird / "config.json", std::ios::binary);
+            f << R"({"model_type":"nonexistent_moe","num_hidden_layers":4,"hidden_size":64})";
+        }
+        auto run = std::make_shared<Run>();
+        std::string e;
+        const auto id = reg.admit(weird.string(), [run](const mm::AdmissionProgress& p) {
+            std::lock_guard<std::mutex> lk(run->m);
+            run->frames.push_back(p);
+            if (p.done) {
+                run->finished = true;
+                run->cv.notify_all();
+            }
+        }, e);
+        CHECK(!id.empty()); // it is a real directory, so the operation starts
+        {
+            std::unique_lock<std::mutex> lk(run->m);
+            (void)run->cv.wait_for(lk, std::chrono::seconds(60), [&] { return run->finished; });
+        }
+        CHECK(run->finished);
+        const auto& fin = run->frames.back();
+        CHECK(!fin.last_error.empty());
+        CHECK(fin.last_error.find("not supported") != std::string::npos);
+        CHECK(fin.model_id == 0);
+
+        // Conversion never started. The stub convert copies a whole container, so
+        // its absence is what proves the check ran first rather than after.
+        CHECK(!std::filesystem::exists(dir / "containers" / "weird-arch"));
+        bool converted = false;
+        for (const auto& f : run->frames) {
+            if (f.stage == "tokenize") converted = true;
+        }
+        CHECK(!converted);
+    }
+
+    // ── a failed stage rejects the model rather than the request ─────────────
+    //
+    // The operator asked whether Soma can run this; "no, and here is the stage
+    // that says so" is an answer. A rejected model is a successfully admitted
+    // RECORD meaning "route this to the fallback", so the admission must SUCCEED
+    // and the verdict must be reject — not the other way around.
+    {
+        const auto broken = dir / "broken-container";
+        std::filesystem::copy(model_dir, broken,
+                              std::filesystem::copy_options::recursive |
+                                  std::filesystem::copy_options::overwrite_existing);
+        // A tokenizer paired with ANOTHER model's oracle. Realistic — it is what
+        // a mismatched compile step produces — and it fails one conformance stage
+        // while leaving the container plannable, which is the combination this
+        // case needs.
+        //
+        // Corrupting container_meta.json would not do: the planner reads it now,
+        // because the quantization is part of arch_hash, so an unreadable one
+        // fails the admission outright rather than one stage of the ladder.
+        const auto tok_dir = std::filesystem::path(model_dir).parent_path().parent_path() /
+                             "tokenizers";
+        if (!std::filesystem::exists(tok_dir / "Qwen3-30B-A3B" / "tokenizer.soma") ||
+            !std::filesystem::exists(tok_dir / "OLMoE-1B-7B-0924" / "tokenizer_oracle.bin")) {
+            std::cout << "  (verdict-downgrade case skipped: tokenizer fixtures not found)\n";
+            reg.close();
+            CHECK(remove_tree(dir));
+            return true;
+        }
+        std::filesystem::copy_file(tok_dir / "Qwen3-30B-A3B" / "tokenizer.soma",
+                                   broken / "tokenizer.soma");
+        std::filesystem::copy_file(tok_dir / "OLMoE-1B-7B-0924" / "tokenizer_oracle.bin",
+                                   broken / "tokenizer_oracle.bin");
+
+        auto run = std::make_shared<Run>();
+        std::string e;
+        const auto id = reg.admit_container(broken.string(), [run](const mm::AdmissionProgress& p) {
+            std::lock_guard<std::mutex> lk(run->m);
+            run->frames.push_back(p);
+            if (p.done) {
+                run->finished = true;
+                run->cv.notify_all();
+            }
+        }, e);
+        CHECK(!id.empty());
+        {
+            std::unique_lock<std::mutex> lk(run->m);
+            (void)run->cv.wait_for(lk, std::chrono::seconds(120), [&] { return run->finished; });
+        }
+        CHECK(run->finished);
+        const auto& fin = run->frames.back();
+        CHECK(fin.last_error.empty());  // the REQUEST succeeded
+        CHECK(fin.model_id > 0);
+
+        const auto rec = reg.find_by_id(fin.model_id);
+        CHECK(rec.has_value());
+        CHECK(rec->verdict == mm::ModelVerdict::Reject);
+        CHECK(rec->verdict_reason.find("conformance") != std::string::npos);
+        CHECK(!mm::verdict_selects_soma(rec->verdict)); // so it routes to the fallback
+
+        bool saw_failed = false;
+        for (const auto& s : reg.conformance(fin.model_id)) {
+            if (s.stage == "tokenizer_roundtrip" && s.status == "failed") saw_failed = true;
+        }
+        CHECK(saw_failed);
+    }
+
+    reg.close();
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_requantization_is_a_new_admission() {
+    // The G8 gate line, and it has two halves that pull opposite ways:
+    //
+    //   re-admitting at a different quantization MUST produce a new arch_hash
+    //   and invalidate KV checkpoints;
+    //   re-PROFILING must NOT.
+    //
+    // Getting either one alone is easy. A hash over the whole container makes
+    // the first true and the second false — every reprofile would orphan every
+    // checkpoint. A hash over the architecture only makes the second true and
+    // the first false — two quantizations share one identity and a checkpoint
+    // written under one replays under the other, fluently and wrongly.
+
+    // ── the hash covers the quantization, all of it ──────────────────────────
+    //
+    // Checked on the IR directly rather than only through the pipeline: this is
+    // the property everything else here depends on, and a pipeline test that
+    // happened to pass would not say which field made it pass.
+    soma::ArchIr ir;
+    ir.schema_version = soma::kArchIrSchemaVersion;
+    ir.attention.family = soma::AttentionFamily::Gqa;
+    ir.topology.n_layers = 4;
+    ir.topology.d_model = 64;
+    ir.topology.vocab_size = 512;
+    ir.topology.layer_kinds.assign(4, soma::LayerKind::Moe);
+    ir.attention.n_heads = 4;
+    ir.attention.n_kv_heads = 2;
+    ir.attention.head_dim = 16;
+    ir.router.n_experts = 16;
+    ir.router.top_k = 2;
+    ir.quantization.expert_gate = {soma::DType::Q4_G, 128};
+    ir.quantization.expert_up = {soma::DType::Q4_G, 128};
+    ir.quantization.expert_down = {soma::DType::Q6_G, 128};
+
+    std::string base;
+    CHECK(soma::compute_arch_hash(ir, base).ok());
+    CHECK(base.size() == 64);
+
+    {
+        // Same dtypes, different GROUP. These dequantize to different weights,
+        // and before this they hashed identically — so a KV checkpoint written
+        // at group 128 would replay under group 64 with nothing detecting it.
+        auto other = ir;
+        other.quantization.expert_gate.group = 64;
+        std::string h;
+        CHECK(soma::compute_arch_hash(other, h).ok());
+        CHECK(h != base);
+    }
+    {
+        auto other = ir;
+        other.quantization.expert_down.dtype = soma::DType::Q8_0;
+        std::string h;
+        CHECK(soma::compute_arch_hash(other, h).ok());
+        CHECK(h != base);
+    }
+    {
+        // A role the original hash did not cover at all.
+        auto other = ir;
+        other.quantization.shared_expert = {soma::DType::Q8_0, 32};
+        std::string h;
+        CHECK(soma::compute_arch_hash(other, h).ok());
+        CHECK(h != base);
+    }
+    {
+        // And the other half: a MEASUREMENT changing must not move the hash.
+        // Economics is deliberately outside it — re-profiling on a faster disk
+        // would otherwise orphan every checkpoint written before the upgrade.
+        auto other = ir;
+        other.economics.measured_disk_bw = 4ull * 1000 * 1000 * 1000;
+        other.economics.expert_bytes = 999999;
+        other.economics.measured_at_host = "some-other-box";
+        std::string h;
+        CHECK(soma::compute_arch_hash(other, h).ok());
+        CHECK(h == base);
+    }
+
+    // ── and the pipeline honours it ──────────────────────────────────────────
+    const char* python = std::getenv("MM_TEST_PYTHON");
+    const char* soma_path = std::getenv("MM_TEST_SOMA_PATH");
+    const char* container_dir = std::getenv("MM_TEST_CONTAINER_DIR");
+    if (python == nullptr || soma_path == nullptr || container_dir == nullptr) {
+        std::cout << "  (pipeline half skipped: MM_TEST_PYTHON / SOMA_PATH / CONTAINER_DIR unset)\n";
+        return true;
+    }
+
+    auto dir = temp_test_dir("requant");
+    const auto tools_dir = dir / "tools";
+    std::filesystem::create_directories(tools_dir);
+
+    // A stub convert that RESPECTS --quant, so the two admissions differ in the
+    // way a real conversion would. It copies the fixture and rewrites the
+    // container's declared quantization; that is exactly the field `soma plan`
+    // reads to build the IR the hash is taken over.
+    {
+        std::ofstream f(tools_dir / "convert.py", std::ios::binary);
+        f << "import json, os, shutil, sys\n"
+             "src = os.environ['MM_STUB_CONTAINER']\n"
+             "out = sys.argv[sys.argv.index('--out') + 1]\n"
+             "quant = sys.argv[sys.argv.index('--quant') + 1]\n"
+             "down = sys.argv[sys.argv.index('--expert-down') + 1]\n"
+             "group = int(sys.argv[sys.argv.index('--group') + 1])\n"
+             "shutil.rmtree(out, ignore_errors=True)\n"
+             "shutil.copytree(src, out)\n"
+             "p = os.path.join(out, 'container_meta.json')\n"
+             "m = json.load(open(p))\n"
+             "m['dtype_gate_up'] = quant\n"
+             "m['dtype_down'] = down\n"
+             "m['group'] = group\n"
+             "json.dump(m, open(p, 'w'))\n"
+             "print('    layer 1/1  0.00 GB', flush=True)\n";
+        std::ofstream t(tools_dir / "compile_tokenizer.py", std::ios::binary);
+        t << "print('stub tokenizer', flush=True)\n";
+    }
+
+    mm::ControlModelRegistry reg;
+    std::string err;
+    CHECK(reg.open(dir.string(), err));
+
+    mm::AdmissionTools tools;
+    tools.python = python;
+    tools.soma_path = soma_path;
+    tools.tools_dir = tools_dir.string();
+    tools.containers_dir = (dir / "containers").string();
+    tools.sources_dir = (dir / "sources").string();
+    reg.set_tools(tools);
+
+#ifdef _WIN32
+    _putenv_s("MM_STUB_CONTAINER", container_dir);
+#else
+    setenv("MM_STUB_CONTAINER", container_dir, 1);
+#endif
+
+    // The source is a raw config the architecture check can read.
+    const auto source = dir / "weights";
+    std::filesystem::create_directories(source);
+    std::filesystem::copy_file(std::filesystem::path(container_dir) / "config.json",
+                               source / "config.json");
+
+    struct Run {
+        std::vector<mm::AdmissionProgress> frames;
+        std::mutex m;
+        std::condition_variable cv;
+        bool finished = false;
+    };
+    const auto admit_at = [&](const mm::ControlModelRegistry::QuantOverride& q) {
+        auto run = std::make_shared<Run>();
+        std::string e;
+        const auto id = reg.admit(source.string(), q, [run](const mm::AdmissionProgress& p) {
+            std::lock_guard<std::mutex> lk(run->m);
+            run->frames.push_back(p);
+            if (p.done) {
+                run->finished = true;
+                run->cv.notify_all();
+            }
+        }, e);
+        if (!id.empty()) {
+            std::unique_lock<std::mutex> lk(run->m);
+            (void)run->cv.wait_for(lk, std::chrono::seconds(120), [&] { return run->finished; });
+        }
+        return run;
+    };
+
+    const auto first = admit_at({"q4_g", "q6_g", 128});
+    CHECK(first->finished);
+    CHECK(first->frames.back().last_error.empty());
+    const auto id_a = first->frames.back().model_id;
+    CHECK(id_a > 0);
+
+    const auto second = admit_at({"q8_0", "q8_0", 32});
+    CHECK(second->finished);
+    CHECK(second->frames.back().last_error.empty());
+    const auto id_b = second->frames.back().model_id;
+    CHECK(id_b > 0);
+
+    // TWO rows, not one updated in place. The registry keys on arch_hash, so
+    // this is the observable form of "a different quantization is a different
+    // model".
+    CHECK(id_a != id_b);
+    CHECK(reg.list().size() == 2);
+
+    const auto a = reg.find_by_id(id_a);
+    const auto b = reg.find_by_id(id_b);
+    CHECK(a.has_value() && b.has_value());
+    CHECK(!a->arch_hash.empty());
+    CHECK(a->arch_hash != b->arch_hash);
+
+    // Separate containers. Sharing one directory meant the second conversion
+    // overwrote the first, leaving row A describing bytes that were no longer
+    // its quantization — with nothing to detect it.
+    CHECK(a->model_dir != b->model_dir);
+    CHECK(std::filesystem::exists(a->model_dir));
+    CHECK(std::filesystem::exists(b->model_dir));
+
+    // ── the checkpoint half ──────────────────────────────────────────────────
+    //
+    // "Invalidates KV checkpoints" is the consequence that matters, and it is
+    // checked against the real store rather than inferred from the hashes being
+    // different. A resume gated on a hash nobody compares is not a gate.
+    {
+        auto ckpt_dir = dir / "kv";
+        // The same shape both sides, differing ONLY in arch_hash. That is the
+        // point: the cache geometry is identical, so nothing about the bytes
+        // would stop the load — the hash is the only thing standing between a
+        // q4_g checkpoint and a q8_0 engine.
+        auto arch_a = ir;
+        arch_a.arch_hash = a->arch_hash;
+        auto arch_b = ir;
+        arch_b.arch_hash = b->arch_hash;
+
+        soma::KvCheckpointStore store_a;
+        CHECK(store_a.open(ckpt_dir.string(), arch_a).ok());
+        soma::KvCache kv;
+        CHECK(kv.open(arch_a, 64).ok());
+        CHECK(kv.set_length(4).ok());
+        soma::SeqPersistState st;
+        st.tokens = {1, 2, 3, 4};
+        CHECK(store_a.save("conv-1", kv, st).ok());
+        store_a.close();
+
+        soma::KvCheckpointStore store_b;
+        CHECK(store_b.open(ckpt_dir.string(), arch_b).ok());
+        soma::KvCache kv2;
+        CHECK(kv2.open(arch_b, 64).ok());
+        soma::SeqPersistState out;
+        const auto load = store_b.load("conv-1", kv2, out);
+        CHECK(!load.ok());
+        CHECK(load.code() == soma::StatusCode::ArchMismatch);
+    }
+
+    // ── and re-profiling does NOT ────────────────────────────────────────────
+    //
+    // The other half of the gate. A reprofile re-derives a verdict from the same
+    // bytes; if it moved the hash it would orphan every checkpoint written
+    // against the model, for a request that asked only for a fresh number.
+    {
+        auto run = std::make_shared<Run>();
+        std::string e;
+        const auto id = reg.reprofile(id_a, [run](const mm::AdmissionProgress& p) {
+            std::lock_guard<std::mutex> lk(run->m);
+            run->frames.push_back(p);
+            if (p.done) {
+                run->finished = true;
+                run->cv.notify_all();
+            }
+        }, e);
+        CHECK(!id.empty());
+        {
+            std::unique_lock<std::mutex> lk(run->m);
+            (void)run->cv.wait_for(lk, std::chrono::seconds(120), [&] { return run->finished; });
+        }
+        CHECK(run->finished);
+        CHECK(run->frames.back().last_error.empty());
+
+        const auto again = reg.find_by_id(id_a);
+        CHECK(again.has_value());
+        CHECK(again->arch_hash == a->arch_hash);
+        CHECK(again->model_dir == a->model_dir);
+        // Still two rows: the reprofile updated one, it did not add a third.
+        CHECK(reg.list().size() == 2);
+    }
+
+    // ── which one an agent gets ──────────────────────────────────────────────
+    //
+    // Two rows now match the same name, so "the first row the scan reaches" is
+    // not an answer — it is whichever the b-tree yielded, and it would change
+    // under an unrelated insert. An exact arch_hash is unambiguous and stays so.
+    {
+        const auto by_hash = reg.resolve(a->arch_hash);
+        CHECK(by_hash.has_value());
+        CHECK(by_hash->id == id_a);
+        const auto by_hash_b = reg.resolve(b->arch_hash);
+        CHECK(by_hash_b.has_value());
+        CHECK(by_hash_b->id == id_b);
+
+        // By name it is deterministic rather than arbitrary: repeated calls
+        // agree, which is the property that was missing.
+        const auto once = reg.resolve("weights");
+        const auto twice = reg.resolve("weights");
+        CHECK(once.has_value() && twice.has_value());
+        CHECK(once->id == twice->id);
+    }
+
     reg.close();
     CHECK(remove_tree(dir));
     return true;
@@ -5001,10 +5494,10 @@ bool test_scope_negatives_over_http() {
 
         auto with_retry = [](auto&& request) {
             mm::HttpResponse resp;
-            for (int attempt = 0; attempt < 8; ++attempt) {
+            for (int attempt = 0; attempt < kTransportRetries; ++attempt) {
                 resp = request();
                 if (resp.status != 0) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                transport_backoff(attempt);
             }
             return resp;
         };
@@ -5231,10 +5724,10 @@ bool test_engine_telemetry_republication() {
 
         auto with_retry = [](auto&& request) {
             mm::HttpResponse resp;
-            for (int attempt = 0; attempt < 8; ++attempt) {
+            for (int attempt = 0; attempt < kTransportRetries; ++attempt) {
                 resp = request();
                 if (resp.status != 0) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                transport_backoff(attempt);
             }
             return resp;
         };
@@ -5573,6 +6066,7 @@ int main(int argc, char** argv) {
         {"model_registry_makes_soma_routable", test_model_registry_makes_soma_routable},
         {"admission_pipeline_runs_and_reports", test_admission_pipeline_runs_and_reports},
         {"admission_fetch_stage", test_admission_fetch_stage},
+        {"requantization_is_a_new_admission", test_requantization_is_a_new_admission},
         {"route_scopes_and_token_store", test_route_scopes_and_token_store},
         {"scope_negatives_over_http", test_scope_negatives_over_http},
         {"engine_telemetry_republication", test_engine_telemetry_republication},

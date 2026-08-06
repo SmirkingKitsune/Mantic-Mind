@@ -62,8 +62,18 @@ struct AdmittedModel {
 
 struct ConformanceEntry {
     std::string stage;
+
+    /// `passed` | `failed` | `skipped`.
+    ///
+    /// A third state, because a boolean cannot say "did not run" and that is the
+    /// most common answer here: `fp32_tiny_tf` and `real_logit_kl` need a
+    /// transformers oracle for THIS model, which the serving host does not have.
+    /// Recording those as failures would reject every model; recording them as
+    /// passes would make the verdict look validated when it was only computed.
+    std::string status = "skipped";
+
     bool passed = false;
-    std::string detail;
+    std::string detail; ///< JSON: metrics, first divergence, thresholds, or why it was skipped
     std::int64_t ran_at_ms = 0;
 };
 
@@ -184,6 +194,15 @@ public:
 
     std::vector<ConformanceEntry> conformance(std::int64_t id) const;
 
+    /// Replace this model's conformance rows with `stages`.
+    ///
+    /// Replace rather than append: a reprofile re-runs the ladder against the
+    /// same weights, and its answer supersedes the old one rather than
+    /// accumulating a history nobody reads.
+    bool record_conformance(std::int64_t id,
+                            const std::vector<ConformanceEntry>& stages,
+                            std::string& out_error);
+
     /// Persisted routing histogram. `bucketed` caps the result at the telemetry
     /// grid size so a careless client cannot ask for 60k rows by accident.
     bool heat(std::int64_t id, bool bucketed, std::string& out_json) const;
@@ -198,6 +217,27 @@ public:
     /// client send a chat message.
     std::string
     admit(const std::string& source_ref, AdmissionProgressSink sink, std::string& out_error);
+
+    /// Same, at a quantization other than the deployment's default.
+    ///
+    /// Per REQUEST rather than per deployment, because the same weights at two
+    /// quantizations are two different admissions with two different verdicts —
+    /// that is the premise the registry keys on, and it cannot be exercised at
+    /// all if the quantization is a config file the operator has to edit and
+    /// restart to change.
+    ///
+    /// Empty fields fall back to the deployment default, so a caller changing
+    /// only the group does not have to restate the dtypes.
+    struct QuantOverride {
+        std::string quant;       ///< expert gate/up dtype, e.g. "q4_g"
+        std::string expert_down; ///< expert down dtype, e.g. "q6_g"
+        int group = 0;           ///< 0 = leave the default
+    };
+
+    std::string admit(const std::string& source_ref,
+                      const QuantOverride& quant,
+                      AdmissionProgressSink sink,
+                      std::string& out_error);
 
     /// Admit a container that has ALREADY been converted.
     ///
@@ -292,8 +332,10 @@ private:
     /// Register an operation and start its thread. Shared by admit(),
     /// admit_container() and reprofile(), which differ only in whether
     /// conversion runs and what they validate first.
-    std::string
-    start_operation(const std::string& source, bool container_is_ready, AdmissionProgressSink sink);
+    std::string start_operation(const std::string& source,
+                                bool container_is_ready,
+                                const QuantOverride& quant,
+                                AdmissionProgressSink sink);
     std::mutex& ops_mu_ref() const;
 
     void run_admission(std::shared_ptr<AdmissionOperation> op,

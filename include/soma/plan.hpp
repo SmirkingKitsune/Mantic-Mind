@@ -85,6 +85,16 @@ struct PlanDocument {
     /// fires 6.25%.
     double active_fraction = 0.0;
 
+    /// Is there a backend for this attention family at all?
+    ///
+    /// Distinct from the verdict, which it also forces to Reject. A model
+    /// rejected on ECONOMICS may still be worth converting — the verdict is a
+    /// property of (model, quantization, host), so a beefier node can reach a
+    /// different one from the same container. A model with no backend cannot be
+    /// run by any host, ever, so converting it is pure waste. Admission reads
+    /// this to decide whether to spend the hours.
+    bool arch_supported = true;
+
     /// Effective for THIS host — not necessarily the registry's stored value.
     Verdict verdict = Verdict::Reject;
     std::string verdict_reason;

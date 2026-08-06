@@ -1,5 +1,7 @@
 #include "soma/quant.hpp"
 
+#include <string_view>
+
 namespace soma {
 
 std::size_t dtype_bits(DType dtype) noexcept {
@@ -44,6 +46,23 @@ const char* to_string(DType dtype) noexcept {
         return "q4_0";
     }
     return "unknown";
+}
+
+bool parse_dtype(std::string_view text, DType& out) noexcept {
+    for (const auto d : {DType::F32,
+                         DType::F16,
+                         DType::BF16,
+                         DType::Q8_0,
+                         DType::Q6_G,
+                         DType::Q5_G,
+                         DType::Q4_G,
+                         DType::Q4_0}) {
+        if (text == to_string(d)) {
+            out = d;
+            return true;
+        }
+    }
+    return false;
 }
 
 const char* to_string(TensorRole role) noexcept {

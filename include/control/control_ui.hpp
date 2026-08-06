@@ -15,7 +15,7 @@ class AgentScheduler;
 
 // FTXUI-based terminal UI for mantic-mind-control.
 //
-// Seven tabs (keyboard 1/2/3/4/5/6/7):
+// Eight tabs (keyboard 1-8):
 //   Tab 1 — Nodes:    list + health metrics + add/remove actions
 //   Tab 2 — Agents:   list + full config editor + memories + conversations
 //   Tab 3 — Activity: scrollable system event log with level filter
@@ -24,6 +24,10 @@ class AgentScheduler;
 //
 //   Tab 6 - Performance: rolling request latency and throughput metrics
 //   Tab 7 - Voice: proposal review, synthesis, and local playback
+//   Tab 8 - Soma: engines, the expert-heat brain grid, memory tiers
+//
+// Tab 8 is fed ENTIRELY by /v1/*, in its own translation unit that cannot
+// reach the three references this class holds. See control/soma_panels.hpp.
 // All state mutations come from a thread-safe event queue drained on the
 // FTXUI loop tick to avoid locking inside the renderer.
 class ControlUI {

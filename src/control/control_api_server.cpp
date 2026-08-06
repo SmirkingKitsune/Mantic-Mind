@@ -2923,7 +2923,11 @@ void ControlApiServer::register_routes() {
         auto j = admitted_model_json(*model);
         auto& stages = j["conformance"] = nlohmann::json::array();
         for (const auto& c : models_->conformance(model->id)) {
+            // `status` is the field to read. `passed` stays for clients written
+            // against the old shape, but it cannot express "did not run" — and
+            // that is what most of this ladder says on a serving host.
             stages.push_back(nlohmann::json{{"stage", c.stage},
+                                            {"status", c.status},
                                             {"passed", c.passed},
                                             {"detail", c.detail},
                                             {"ran_at_ms", c.ran_at_ms}});
@@ -3045,8 +3049,19 @@ void ControlApiServer::register_routes() {
     server_->Post("/v1/models/admit", [this](const Request& req, Response& res) {
         if (models_ == nullptr) { res.status = 503; return; }
         std::string source;
+        ControlModelRegistry::QuantOverride quant;
         try {
-            source = nlohmann::json::parse(req.body).value("source", std::string{});
+            const auto body = nlohmann::json::parse(req.body);
+            source = body.value("source", std::string{});
+            // Per request, because the same weights at two quantizations are two
+            // different admissions with two different verdicts — the premise the
+            // registry keys on, and one that cannot be exercised at all if the
+            // quantization is a config file the operator has to edit and restart
+            // to change.
+            const auto q = body.value("quantization", nlohmann::json::object());
+            quant.quant = q.value("expert_gate", std::string{});
+            quant.expert_down = q.value("expert_down", std::string{});
+            quant.group = q.value("group", 0);
         } catch (const std::exception& e) {
             res.status = 400;
             res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
@@ -3057,7 +3072,7 @@ void ControlApiServer::register_routes() {
         std::string err;
         // The sink is registered BEFORE admit() returns, so the first frames
         // cannot be produced before anyone is listening for them.
-        const auto op_id = models_->admit(source, [ctx](const AdmissionProgress& p) {
+        const auto op_id = models_->admit(source, quant, [ctx](const AdmissionProgress& p) {
             std::lock_guard<std::mutex> lk(ctx->mx);
             ctx->lines.push_back("data: " + admission_progress_json(p).dump() + "\n\n");
             if (p.done) ctx->done = true;

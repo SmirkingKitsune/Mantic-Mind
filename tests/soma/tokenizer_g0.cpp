@@ -26,50 +26,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-struct Case {
-    std::string text;
-    std::vector<std::uint32_t> ids;
-};
-
-bool read_oracle(const fs::path& p, std::vector<Case>& out, std::string& err) {
-    std::ifstream in(p, std::ios::binary);
-    if (!in) {
-        err = "cannot open " + p.string();
-        return false;
-    }
-    char magic[8]{};
-    in.read(magic, 8);
-    if (std::memcmp(magic, "SOMATORC", 8) != 0) {
-        err = "bad magic";
-        return false;
-    }
-
-    auto u32 = [&]() -> std::uint32_t {
-        std::uint32_t v = 0;
-        in.read(reinterpret_cast<char*>(&v), 4);
-        return v;
-    };
-    if (u32() != 1) {
-        err = "unsupported oracle version";
-        return false;
-    }
-    const auto n = u32();
-    out.resize(n);
-    for (auto& c : out) {
-        const auto len = u32();
-        c.text.resize(len);
-        if (len > 0) in.read(c.text.data(), len);
-        const auto k = u32();
-        c.ids.resize(k);
-        for (auto& id : c.ids)
-            id = u32();
-    }
-    if (!in) {
-        err = "short read";
-        return false;
-    }
-    return true;
-}
+using Case = soma::TokenizerOracleCase;
 
 std::string escape(const std::string& s, std::size_t cap = 40) {
     std::ostringstream o;
@@ -154,10 +111,13 @@ Report run(const fs::path& dir) {
     }
     rep.loaded = true;
 
+    // The oracle PARSER is the library's — one reader for one format, the same
+    // rule the KV checkpoint header follows. The comparisons below stay here, so
+    // the test still reaches its own verdict.
     std::vector<Case> cases;
-    std::string err;
-    if (!read_oracle(dir / "tokenizer_oracle.bin", cases, err)) {
-        rep.first_failure = err;
+    if (auto st = soma::read_tokenizer_oracle((dir / "tokenizer_oracle.bin").string(), cases);
+        !st.ok()) {
+        rep.first_failure = st.message();
         return rep;
     }
     rep.cases = static_cast<int>(cases.size());
@@ -169,11 +129,7 @@ Report run(const fs::path& dir) {
             if (rep.first_failure.empty()) rep.first_failure = st.message();
             continue;
         }
-        const bool match =
-            ids.size() == c.ids.size() &&
-            std::equal(ids.begin(), ids.end(), c.ids.begin(), [](soma::TokenId a, std::uint32_t b) {
-                return a == b;
-            });
+        const bool match = (ids == c.ids);
         if (match) {
             ++rep.encode_ok;
         } else if (rep.first_failure.empty()) {
@@ -191,7 +147,7 @@ Report run(const fs::path& dir) {
         // decode(oracle ids) must reproduce the source text exactly. Checked
         // against the ORACLE's ids, not ours, so a decode bug cannot be masked
         // by an encode bug that happens to invert it.
-        std::vector<soma::TokenId> golden(c.ids.begin(), c.ids.end());
+        const auto& golden = c.ids;
         const bool decoded = tok.decode(golden, round).ok();
         if (decoded && round == c.text) ++rep.decode_ok;
 

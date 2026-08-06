@@ -94,15 +94,45 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-/// Round-trip a corpus and compare against the reference recorded at admission.
+/// One calibration string and the ids HF's `tokenizers` produced for it.
+struct TokenizerOracleCase {
+    std::string text;
+    std::vector<TokenId> ids;
+};
+
+/// Read a `SOMATORC` oracle, as written by tools/admission/compile_tokenizer.py.
+///
+/// In the library rather than in the test that first needed it, for the same
+/// reason the KV checkpoint header is: it is a FORMAT with more than one reader,
+/// and two parsers that must agree is how they stop agreeing. The comparison
+/// stays with each caller — one parser, independent verdicts.
+Status read_tokenizer_oracle(const std::string& path, std::vector<TokenizerOracleCase>& out);
+
+struct RoundTripResult {
+    std::uint32_t cases = 0;
+    std::uint32_t encode_ok = 0; ///< ids identical to HF's
+    std::uint32_t decode_ok = 0; ///< decode(HF's ids) reproduces the source text
+
+    /// The first case that failed, rendered for a human. Empty when clean —
+    /// "which one and where" is the whole difference between a usable tokenizer
+    /// bug report and "conformance failed".
+    std::string first_failure;
+
+    bool clean() const noexcept { return cases > 0 && encode_ok == cases && decode_ok == cases; }
+};
+
+/// Round-trip the oracle's corpus and compare against HF's own answer.
 ///
 /// ADMISSION IS GATED ON THIS. A tokenizer that does not reproduce HF
 /// `tokenizers` byte-for-byte is the cheapest possible bug to catch here and one
 /// of the most expensive to catch at G2, where it presents as "the model is
 /// subtly stupid" rather than as a tokenizer fault.
+///
+/// Takes the oracle's IDS rather than a digest of them. A hash can only say
+/// "different"; the ids say which case, which position, and what was expected —
+/// and the digest bought nothing, since both sides are on the same host.
 Status verify_roundtrip(const CompiledTokenizer& tokenizer,
-                        std::span<const std::string> corpus,
-                        const std::string& expected_sha,
-                        std::string& out_sha);
+                        std::span<const TokenizerOracleCase> oracle,
+                        RoundTripResult& out);
 
 } // namespace soma

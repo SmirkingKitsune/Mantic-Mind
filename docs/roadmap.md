@@ -20,11 +20,15 @@ ambiguous between the two. Concretely: the harness lands at **G0/G1**, the seam 
 | **G1** | Quantized path, tiny model | Token-exact greedy match |
 | **G2** | Streaming from disk, GQA | Logit-KL under threshold on the real checkpoint; measured economics match the plan |
 | **G3** | Concurrency — batch-union across sequences | Aggregate throughput scales super-linearly in the disk-bound regime **+ tier/heat text dump exists** |
-| **G4** | Second architecture (MLA) through the seam | Full ladder passes on both families with **zero core diffs** |
+| **G4** | Second architecture (MLA) through the seam | Full ladder passes on both families with **zero core diffs** — passed on the ladder, **one core diff** (the router signature); see [G4 status](#g4-status--passed-on-both-families-one-core-diff-and-the-gate-is-what-found-it) |
 | **G5** | Subprocess integration + verdict routing | Mixtral admits `resident-only` and routes to the fallback, unprompted |
 | **G6** | API surface complete | Every capability on `/v1/*`, scope-gated, coverage check green |
 | **G7** | FTXUI dashboards on that API | Panels consume only `/v1/*` |
 | **G8** | Admission self-service | A new HF repo goes end-to-end with no C++ change |
+
+Defects found and not yet fixed are tracked in [Open defects](#open-defects), separately from
+[what is deferred](#what-is-deferred-and-where-it-would-land) — deliberately-not-built and
+known-to-be-wrong are different states and a shared list loses both.
 
 ---
 
@@ -1185,14 +1189,35 @@ yet done, and not claimed:
 
 ## G4 — second architecture through the seam
 
-### G4 status — IR admits DeepSeek; the backend is next
+### G4 status — PASSED on both families; ONE core diff, and the gate is what found it
+
+| Model | Teacher-forced vs the `transformers` oracle | Greedy |
+|---|---|---|
+| DeepSeek-V2-Lite (`deepseek_v2`) | `max=8.34e-07  mean=1.15e-07` | token-exact |
+| Moonlight-16B-A3B (`deepseek_v3`) | `max=7.25e-05  mean=1.06e-05` | token-exact |
+
+`tools/ci/check_seam.py` green. The strictest line of this gate was **zero diffs to `include/soma/*.hpp`
+and `src/soma/*.cpp` outside `arch/` and `arch_registry.cpp`**, and it was not met: `F32Backend::route`
+in `include/soma/f32_model.hpp` gained a `const F32LayerWeights&` parameter for DeepSeek-V3's `noaux_tc`
+scoring, whose per-expert correction bias participates in selection and had nowhere to live in the old
+signature.
+
+**That is the gate working, not failing.** Its purpose was to reveal where the seam had been shaped to
+GQA, and it revealed exactly one place: a router interface that assumed a router's only input is its
+logits. No amount of care inside the backend works around a missing argument. Recorded here rather than
+rounded down to "zero", because a gate whose result is edited to match its target measures nothing —
+and the next architecture will want to know that this is the interface that moved.
+
+Everything else held: no changes to the memory hierarchy, the scheduler, the kernels, the expert store,
+the container, or the forward.
 
 The IR needed **no change at all**. `MlaSpec` (kv_lora_rank, q_lora_rank, qk_nope/rope_head_dim,
 v_head_dim) and the RoPE spec's `mscale`/`mscale_all_dim` were co-designed against DeepSeek during the
 design pass, and DeepSeek-V2-Lite's config maps onto them without a schema extension. That was the
 point of writing `arch.json` for both families on paper before any code existed, and it held.
 
-Three findings so far, all of which the second architecture existed to surface:
+Three findings at the ADAPTER level, all of which the second architecture existed to surface. Four more
+came later, from the activation harness, and are recorded further down:
 
 1. **The MHA-collapse rule misclassified MLA.** The adapter read
    `family = (n_kv_heads == n_heads) ? Mha : traits.attention`. DeepSeek-V2-Lite has
@@ -1218,14 +1243,19 @@ The ladder is green with an accurate status rather than a misleading one: DeepSe
 *"model.layers.0.self_attn.k_proj.weight not in checkpoint"*, which named a symptom and sent the reader
 hunting for a broken checkpoint.
 
-**What remains, and the honest read on the gate.** The G4 gate is *"zero core diffs — only `arch/` TUs
-added."* Strictly, that is already not met: `arch_ir.cpp` gained the DeepSeek mapping (it is the
-allow-listed adapter, so this is expected and the seam check permits it), and the family-guard fix was a
-core correction. Still ahead:
+**The honest read on the gate.** *"Zero core diffs — only `arch/` TUs added"* was not met, and the
+places it was not met are the gate's whole output. Three of them, in increasing order of significance:
 
-- `src/soma/arch/mla.cpp` — compressed KV, partial RoPE, YaRN `mscale` on the softmax scale,
-  `kv_a_layernorm`, shared experts.
-- ~~`F32LayerWeights` is GQA-shaped~~ — **resolved: opaque per-layer payload.**
+- `arch_ir.cpp` gained the DeepSeek mapping. Expected — it is the allow-listed adapter and the seam
+  check permits it by construction.
+- The family-guard fix was a core correction, and a correction of a rule the first family could not
+  have revealed as wrong.
+- **`F32Backend::route` gained a parameter.** The one that matters; see
+  [G4 status](#g4-status--passed-on-both-families-one-core-diff-and-the-gate-is-what-found-it).
+
+Both items once listed here as "still ahead" are done: ~~`src/soma/arch/mla.cpp`~~ is written and
+passing on two families, and ~~`F32LayerWeights` is GQA-shaped~~ resolved into the opaque per-layer
+payload described next.
 
 #### The per-layer payload — the seam's real shape
 
@@ -1252,7 +1282,7 @@ Verified inert: all 14 tests pass and the G0 logit diffs are **unchanged to ever
 1.43e-06, OLMoE 1.07e-06, Qwen3 9.54e-07). A refactor of where weights live should move no numbers, and
 this one moved none.
 
-#### `src/soma/arch/mla.cpp` — running, not yet correct
+#### `src/soma/arch/mla.cpp` — PASSES; the defect was the attention factor
 
 Written and registered: compressed KV through the `kv_lora_rank` latent, `kv_a_layernorm` before
 expansion, per-head K-nope ++ V from `kv_b_proj`, the shared MQA-style RoPE segment, YaRN inverse
@@ -1296,6 +1326,12 @@ cancellation is therefore correct: `kv_a_proj`, `kv_a_layernorm`, `kv_b_proj`, `
 0, and the MoE with shared experts. The error then **grows with position**, which is the signature of a
 positional fault.
 
+> **Everything from here to "What the four rounds established" is a HISTORICAL RECORD of an
+> investigation that has since concluded.** The defect was the attention factor, above. These four
+> hypotheses were all eliminated correctly and none of them was the cause; they are kept because the
+> contrast is the finding — four rounds of plausible reasoning bought nothing, one instrument bought the
+> answer. Read them as a log, not as open questions.
+
 ##### The rope scaling parse was investigated and is NOT the cause
 
 The obvious suspect — `type: "yarn"` failing to reach `RopeScalingKind::Yarn`, which would skip the
@@ -1333,7 +1369,8 @@ showing that applying it to only one operand breaks the result.
 
 **So both positional candidates are eliminated.** Verified correct: the softmax scale, the YaRN
 frequencies, the rotation, and everything non-positional (position 0 is exact to 4.47e-07). The residual
-is real, grows with position, and is not yet explained.
+was real and grew with position, and at the time of writing was unexplained — it was the **attention
+factor**, found later by the activation harness. See the heading above.
 
 ##### The oracle's provenance was checked, and the hypothesis it suggested is FALSIFIED
 
@@ -1359,7 +1396,7 @@ So the pairing is not the remaining fault, or not the only one. Interleaved is k
 closer, **not because it is confirmed** — the file says so at the call site, so the next reader does not
 inherit it as settled.
 
-##### Where this leaves G4, stated plainly
+##### What the four rounds established — all correct eliminations
 
 Four hypotheses raised, four eliminated by measurement: the rope-scaling parse (probe: nine-digit match),
 the YaRN frequencies (same), the rotation equivalence (`mla_g4`: 0.000000), and the rope pairing (worse).
@@ -2362,11 +2399,91 @@ store; SSE telemetry with throttling; `/v1/models` reclamation.
 **Gate:**
 - Every Soma panel's data comes from `/v1/*`. **No panel reaches into in-process engine state.**
   Grep-verifiable, and worth verifying: the existing TUI already mixes direct access and loopback HTTP,
-  so the temptation is live.
-- The brain grid renders a 48×128 model bucketed to ≤4096 cells at 2 Hz without visible cost.
+  so the temptation is live. **Done** — `tools/ci/check_ui_api.py` runs as `mm_ui_api_check`; see
+  [The dashboard's data source](#the-dashboards-data-source).
+- The brain grid renders a 48×128 model bucketed to ≤4096 cells at 2 Hz without visible cost. **Done** —
+  0.017 ms/frame for the layout, against a 500 ms tick, and the panel draws it as tab 8.
 - The tier bar shows the VRAM tier present and empty — the declared-but-stubbed design, visible and
-  honest rather than hidden.
-- Panels degrade gracefully when an engine is a fallback and has no tier/heat data.
+  honest rather than hidden. **Done** — and it splits by backend, which `tier_summary` does not.
+- Panels degrade gracefully when an engine is a fallback and has no tier/heat data. **Done** — four
+  distinct states, each asserted as rendered text.
+
+#### The dashboard's data source
+
+`include/control/soma_dashboard.hpp` + `src/control/soma_dashboard.cpp`. One translation unit that owns
+the polling and the layout, and holds a reference to nothing in-process — its only inputs are a base URL
+and a token.
+
+**The no-reach-through rule is made mechanical rather than aspirational.** `check_ui_api.py` fails the
+build if that TU includes `node_registry.hpp`, `agent_manager.hpp`, `agent_scheduler.hpp`,
+`model_registry.hpp`, any node-side engine header, or anything from `soma/`. It also asserts the TU is
+actually in `CMakeLists.txt`, because a rule guarding a file nobody compiles passes every check while
+shipping nothing. Adding a forbidden include turns it red, which is how it was confirmed.
+
+The reason to bother: a TUI that reads private state is a **second client with privileges no other
+client has**, and P1's claim that the API is the single control plane then becomes untestable — every
+gap in `/v1/*` stays invisible for exactly as long as the only serious consumer does not need the API.
+`ControlUI` already takes `NodeRegistry&`, `AgentManager&` and `AgentScheduler&` by reference, so a panel
+needing one number is four keystrokes from taking it directly. A comment asking nicely would not survive.
+
+**The layout half is pure** — no FTXUI, no HTTP, no clock — so the reduction is checkable as arithmetic
+rather than by looking at a terminal. That matters more here than usual: a grid that is subtly wrong
+looks exactly like a model that routes oddly, and an operator staring at a heat map has no way to tell
+those apart. `mm_dashboard_g7` checks that counts are **conserved** through the reduction (against a
+deliberately non-uniform fixture, since a flat one passes a broken implementation), that the strides use
+ceiling division so a ragged last row is not silently dropped — those are the layers nearest the output,
+where an anomaly is most worth seeing — that the **coldest** tier in a bucket wins, and that "fired
+once" renders differently from "never fired".
+
+Two bugs the tests caught while being written. The tier reduction was `max()` against a `tier` field
+defaulting to `Disk`, so **every** bucket reported Disk — the panel would have said the whole model was
+on disk, and a test that only ever looked at a bucket genuinely containing a disk cell would have passed
+it; the all-Vram case is what catches it. And `layout_heat` indexed `rows*cols` into `counts` without
+checking the frame's arrays matched its dimensions — a segfault on a malformed frame, and on a
+merely-short one, plausible-looking heat read from past the end.
+
+Intensity is relative to the frame's hottest cell rather than absolute, so the same grid is readable
+after ten tokens and after ten million; the test asserts 1000× the traffic renders an identical shape.
+
+#### The panels
+
+`include/control/soma_panels.hpp` + `src/control/soma_panels.cpp`, wired into `ControlUI` as **tab 8**.
+A second guarded TU rather than code in `control_ui.cpp`, for the reason the guard exists: that file
+holds `NodeRegistry&`, `AgentManager&` and `AgentScheduler&`, and a panel written there could read any
+of them without anyone noticing.
+
+**Two channels for two independent facts.** Colour is the memory TIER, brightness is how often the
+expert fired. Collapsing them into one ramp is the obvious simplification and it destroys the panel's
+reason to exist — a hot expert on disk and a hot expert in RAM become the same cell, and the first is
+the one costing throughput.
+
+**Every renderer takes a snapshot, not the dashboard**, so each is a pure function of data it was
+handed. That is what lets the panels be drawn to an off-screen `ftxui::Screen` and asserted as text.
+The states worth checking are the ones nobody opens the app in — a fallback engine, a Soma engine that
+has not routed a token, a selection pointing at an engine that vanished between frames, an empty list
+before the first poll versus after one — and "a human looked at it" checks none of them. Sixteen
+assertions cover them; each degenerate case says *which* it is, because an empty grid and a cold grid
+are pixel-identical and mean completely different things.
+
+**A `--preview` mode on the test binary** draws the whole tab against a synthetic cluster and prints
+it. Assertions prove the panel says the right words; they say nothing about whether the columns line up
+or the grid is legible, and a TUI that cannot be looked at without building a cluster does not get
+looked at. It found three things immediately:
+
+- **The tier bar was reading `tier_summary`, which sums every engine's VRAM.** A fallback's 22 GB
+  appeared under the tier the gate wants shown as declared-and-empty — an operator would have seen Soma
+  using VRAM in a release that is CPU-only by design, which is the exact misreading this panel exists to
+  prevent. It now splits by backend and reports the fallback's separately, labelled as not Soma.
+- The legend truncated mid-word at the width a 64-column grid leaves, and the first thing it lost was
+  **"disk"** — the tier the panel exists to make findable. Two lines now.
+- Letting the tier bar flex gave it half the terminal for four short rows. Fixed at 46 columns, with the
+  grid taking the rest.
+
+The caption reports the model's real shape and the two reductions *separately* — the engine buckets to
+bound its payload, the panel reduces to fit a terminal, and conflating them would tell the operator the
+model is a shape it is not. Staleness is per field rather than one timestamp for the snapshot: engines
+and heat are separate requests, one can fail while the other succeeds, and a single "stale" flag would
+blank a panel that is fine.
 
 ---
 
@@ -2418,6 +2535,101 @@ Still not implemented, and named rather than stubbed: resumption across a *contr
 interrupted transfer restarts the operation, though `snapshot_download` skips what is already on disk),
 and any bandwidth limit.
 
+#### The conformance stage
+
+`soma conform --model-dir DIR --json`, run from `run_admission` and written to the `conformance` table.
+A subcommand of the engine binary for the same reason `plan` is: the codec under test is the one the
+engine uses, and a second implementation living in control is how the two come to disagree.
+
+**The gate is not "does it pass". It is that a stage which did not run says so.** Most of this ladder
+cannot run on a serving host — `fp32_tiny_tf` and `real_logit_kl` need a `transformers` oracle for the
+*specific* model, which is a separate artifact — and the tempting move is to leave them out, since the
+ladder reads as incomplete without them. Leaving them out is indistinguishable from passing them. So
+`ConformanceEntry` gained a third state, `status ∈ passed | failed | skipped`, and each skip carries
+what it would need. `passed` stays as a column for clients written against the old shape, but a boolean
+cannot express "did not run", and that is the most common answer here.
+
+Two stages do run, and both are model-specific rather than fixture-specific:
+
+- **`quant_codec`** quantizes the container's own dense weights with the container's own declared
+  formats, dequantizes, and checks two things: measured bits/weight against a formula written out
+  independently, and round-trip relative RMS against a per-format ceiling. The dense tensors are the
+  right subject — F32 on disk, this model's real weight distribution, and *bounded*, because the experts
+  are the gigabytes and they are already quantized, so there is no fp32 original to compare them
+  against. The bits/weight formula is deliberately not `quantized_tensor_bytes()`: comparing the
+  implementation against itself passes through any packing bug that is consistent about its size. The
+  rel_rms ceilings are generous by ~3× against the G1 table, on purpose — this is a **packing** check,
+  and a mis-packed nibble or wrong group stride lands near 1.0, two orders of magnitude out. A tight
+  bound would fail honest models and catch nothing extra.
+- **`tokenizer_roundtrip`** finally implements `verify_roundtrip()`, which was declared with "ADMISSION
+  IS GATED ON THIS" in its doc comment and had no body. It takes the oracle's **ids** rather than a
+  digest of them: a hash can only say "different", while the ids say which case, which position, and
+  what was expected — and the digest bought nothing, since both sides are on the same host. Decode is
+  checked against HF's ids, not ours, so an encode bug that a decode bug happens to invert cannot pass
+  both halves.
+
+**A failed stage is a `reject` verdict, not a failed request.** The operator asked whether Soma can run
+this model; "no, and here is the stage that says so" is an answer, and a rejected model is a
+successfully admitted record meaning "route this to the fallback". The plan's own reason survives
+alongside it — two different findings, neither erasing the other. `soma conform` exits 0 even when a
+stage fails, reserving non-zero for *could not run*, which the caller has to be able to tell apart.
+
+**A live bug, found while wiring this up.** `compile_tokenizer.py --out` takes a **directory**, and the
+pipeline was handing it `<container>/tokenizer.soma`. The script created a directory of that name and
+wrote the tokenizer inside it; the engine looks for a *file* at that path, found a directory, and
+**every model admitted through this pipeline served raw token ids**. Nothing failed — the tokenizer was
+simply never there. Passing the container directory also puts `tokenizer_oracle.bin` where the
+conformance stage needs it, which is how the bug surfaced at all.
+
+**Schema v2** rebuilds the `conformance` table: SQLite cannot alter a CHECK constraint, and the stage
+list gained two names. Existing rows carry forward with `status` derived from `passed`, which is the
+honest reading of what they meant when they were written.
+
+**Testing it takes two half-complete fixtures**, because neither one alone can show the distinction that
+matters. The container fixture has quantized formats and dense weights but no compiled tokenizer — its
+model's vocabulary is 512 and the committed tokenizer's is 151936, so they are not the same model, and
+copying one in made `soma_engine_g5`'s heat section go to zero. The tokenizer fixture has the reverse.
+Each proves one stage runs and the other reports why it could not. A third case — an empty directory —
+asserts that *every stage skipped* reports `passed: false`, since "nothing was checked" reading as a
+pass is the exact failure this file exists to prevent.
+
+Still not run in-process, and recorded as such rather than stubbed: `fp32_tiny_tf`, `real_logit_kl`, and
+`accuracy_floor` (for which no downstream task harness exists at all).
+
+#### The architecture check
+
+`soma plan --model-dir <source> --json`, run **before** `convert.py` rather than after it. The pipeline
+already planned — it just did so at the end, on the container, which meant an architecture Soma cannot
+read was discovered after six hours of writing one.
+
+There are two distinct failures here and they get different answers:
+
+- **`plan` refuses the source.** `adapt_hf_config`'s table *is* the registry of architectures this engine
+  understands, and an unknown `model_type` stops there. A container built from a config Soma cannot
+  parse is gigabytes nothing can read, so this **fails the admission** with plan's own message. This is
+  the case reachable today.
+- **`plan` succeeds and reports `arch_supported: false`.** The config parsed, but `resolve_f32_backend`
+  has no forward for its attention family — `mla+dsa` is the standing example, deliberately refused
+  rather than silently run as dense MLA. That is not an error: it is a **reject record** meaning "route
+  this to the fallback", which is a successful admission. Conversion is skipped because no host will
+  ever read the container.
+
+`arch_supported` is a new field on `PlanDocument`, checked first in `compute_plan` because it dominates
+every economic branch below it — the alternative is a confident throughput projection for a forward that
+does not exist. It is deliberately **not** the same signal as a reject verdict: a model rejected on
+economics may still be worth converting, since the verdict is a property of `(model, quantization,
+host)` and a node with more RAM can reach a different one from the same container. Throwing away a
+conversion because *this* host said no would be a category error. Only `arch_supported` short-circuits.
+
+A missing `arch_supported` field is read as `true`, so a control talking to an older `soma` degrades to
+the previous behaviour — convert and find out — rather than refusing every model.
+
+**The test asserts the ordering, not just the outcome.** Any check that rejects an unparseable config
+passes an "it failed" assertion; the one that matters is that it failed *first*. The stub convert writes
+a whole container, so `admission_fetch_stage` requires that directory to be absent and the `tokenize`
+stage never to appear. Disabling the check turns both red — the admission succeeds on a nonsense
+architecture and records a model, which is precisely the waste this prevents.
+
 ---
 
 ## G8 — admission pipeline self-service
@@ -2427,10 +2639,75 @@ and any bandwidth limit.
   agent with **no C++ change**. That is the whole gate. **`source` may now be a repo id** — see
   [The fetch stage](#the-fetch-stage) — so the gate no longer presumes an operator downloaded the
   weights by hand first.
-- An architecture with no backend fails at `validate()` with a clear message, before conversion spends
-  hours.
+- An architecture with no backend fails with a clear message, before conversion spends hours. **Done** —
+  see [The architecture check](#the-architecture-check). `soma plan` now runs on the *source* first, and
+  `admission_fetch_stage` proves conversion never started by asserting the container directory does not
+  exist.
+- The ladder records what it ran and what it did not, and a failed stage yields `reject` without failing
+  the request. **Done** — see [The conformance stage](#the-conformance-stage). `quant_codec` and
+  `tokenizer_roundtrip` run at admission; the three that need a `transformers` oracle are recorded as
+  `skipped` with what they would need.
 - Re-admission with different quantization produces a new `arch_hash` and invalidates KV checkpoints;
-  re-profiling does **not**.
+  re-profiling does **not**. **Done** — see [Requantization is a new admission](#requantization-is-a-new-admission).
+  The gate found three real bugs, one of which meant the hash covered a field that was never populated.
+
+#### Requantization is a new admission
+
+The gate line has two halves that pull opposite ways: re-admitting at a different quantization **must**
+produce a new `arch_hash` and invalidate KV checkpoints; re-**profiling** must not. Either alone is
+easy. A hash over the whole container makes the first true and the second false — every reprofile would
+orphan every checkpoint. A hash over the architecture only makes the second true and the first false —
+two quantizations share one identity, and a checkpoint written under one replays under the other,
+fluently and wrongly.
+
+Writing the test found **three** bugs, in increasing order of how quiet they were.
+
+**1. The hash covered four roles and only their dtype.** `q4_g` at group 128 and `q4_g` at group 64
+hashed identically — they dequantize to different weights, so a KV checkpoint written under one and
+replayed under the other resumes a conversation the cache does not describe. `expert_up`,
+`shared_expert`, `norms` and `draft_head` were not covered at all. It is now the whole `QuantMap`,
+every role, dtype **and** group, iterated over a named list so a role added to the struct and forgotten
+here is a compile-time omission rather than a silent one.
+
+**2. Two quantizations of one model wrote to the same container directory.** `containers/<name>` for
+both, so the second conversion overwrote the first — and the first's registry row then described bytes
+that were no longer its quantization, with its verdict, its `expert_bytes` and its KV format all
+recorded against a container that had been replaced underneath them. The directory now carries the
+quantization.
+
+**3. The quant map was in the hash and the value never arrived.** This is the one the first two were
+hiding. `compute_plan` builds the IR from `config.json`, which carries no quantization at all — so for
+every converted container, `arch.quantization` was whatever `adapt_hf_config` defaulted to. The field
+was hashed and the value was never populated, which means **every container of a given architecture
+hashed identically no matter what it was converted at**. Fixing (1) alone would have changed nothing.
+`apply_container_quant` now overlays `container_meta.json` — not a second description of the
+architecture, but the record of a conversion, and the only place the quantization exists.
+
+A consequence worth stating: a container whose `container_meta.json` is unreadable now **fails the
+plan** rather than one stage of the conformance ladder. That is correct — the quantization is
+unknowable, so computing an identity from defaults would assign this container the identity of a
+differently-quantized one, which is precisely the collision above.
+
+**Quantization is per REQUEST**, not per deployment. `POST /v1/models/admit` accepts
+`quantization: {expert_gate, expert_down, group}`, and the override is applied to the *copy* of
+`AdmissionTools` the operation runs with — two admissions of the same model can be in flight at once,
+and a shared field would let the second rewrite the first's conversion arguments mid-run. The premise
+the registry keys on cannot be exercised at all if changing the quantization means editing a config
+file and restarting.
+
+**And `resolve()` had to learn to disambiguate.** Two rows now match one name, so "the first row the
+scan reaches" is not an answer — it is whichever the b-tree yielded, and it would change under an
+unrelated insert. Ranked instead: a verdict that selects Soma first, then more recently profiled. An
+operator who wants a *specific* variant passes its `arch_hash`, which is the only identity that cannot
+be ambiguous.
+
+The test checks the hash property on the IR directly — a pipeline test that happened to pass would not
+say which field made it pass — and then drives the real pipeline twice, asserts two rows with different
+hashes and separate containers, writes a KV checkpoint under one and requires `ArchMismatch` loading it
+under the other, and finally reprofiles and requires the hash, the directory and the row count all
+unchanged. The checkpoint halves use the *same cache geometry* on both sides, differing only in
+`arch_hash`: nothing about the bytes would stop the load, so the hash is demonstrably the only thing
+that does.
 
 ---
 
@@ -2444,6 +2721,7 @@ entry, and **no lint or format job** — there are no format config files in the
 | `soma-header-selftest` | G0 | Every `include/soma/**.hpp` compiles standalone, twice-included, `/W4 /WX` + `-Werror` |
 | `seam-check` | G0 | `tools/ci/check_seam.py` — R1 include discipline, R2 no arch names in core code |
 | `soma-conformance` | G0 | The full ladder on tiny-random fixtures, **per family**, every commit |
+| `ui-api-check` | G7 | `tools/ci/check_ui_api.py` — no Soma panel includes a header carrying in-process state |
 | `format-check` | G0 | `.clang-format` + `.clang-tidy` — neither exists today |
 | `aarch64-cross` | G5 | `vcpkg-aarch64-linux-release` exists as a preset and CI has never used it |
 
@@ -2455,6 +2733,103 @@ Without a per-family ladder on every commit, **the second architecture silently 
 a month.** Kernel-shape sensitivity makes cross-architecture regressions unusually easy to introduce and
 unusually hard to spot — a q4 kernel retuned for MLA's shapes can shift a GQA argmax tie and produce
 output that is different but not obviously wrong.
+
+---
+
+## Open defects
+
+Found and real. Distinct from the table below: that is work deliberately not built, this is work that is
+wrong. A defect leaves this list by being fixed or by being reclassified with a reason — never by going
+quiet, and struck-through rather than deleted, because how a defect was found is usually worth more than
+the fix.
+
+**All three are currently resolved.** Two of them turned out to be worse than logged: D3 was recorded as
+stale documentation and was hiding a false claim about the G4 gate; D1 was recorded as a possible auth
+fault and was a retry budget written six times with three different numbers.
+
+| # | Defect | Found | Severity |
+|---|---|---|---|
+| ~~D1~~ | `control_api_external_token_gate` failed once and passed on re-runs. **Diagnosed and fixed** — not an auth bug; see below. | G8 requantization work | Resolved |
+| ~~D2~~ | The brain grid's tier channel saturated under reduction. **Fixed** — the split now weights by traffic rather than membership; see below. | G7 preview | Resolved |
+| ~~D3~~ | §G4's headings were stale. **Fixed** — and fixing them surfaced a claim that was not merely stale but wrong; see below. | Status review | Resolved |
+
+**D1 — resolved, and it was never an auth bug.** The cause was already written down in the test, three
+lines above the failure:
+
+> `mm::HttpClient` opens a fresh connection per request; rapid sequential connect/close cycles on
+> Windows loopback occasionally fail at the transport level (`status == 0`). Retry those.
+
+A known environment flake with a retry to match — except the retry budget had been written **six times
+with three different numbers**. `with_retry` allowed 8 attempts; two SSE helpers allowed 3; another
+`with_retry` allowed 3. The SSE path is the one carrying the auth negatives, so the thinnest budget sat
+directly under the assertions where a transport failure is hardest to tell from a wrong verdict:
+`status == 403` fails identically whether authorization returned 200 or the request never arrived.
+
+That is precisely how it presented — one intermittent failure, at the auth assertion, in the suite's
+most alarming test. The diagnosis cost more than it should have because **the test could not distinguish
+the two findings**, which is the more interesting defect of the two.
+
+Three changes:
+
+- **One budget, `kTransportRetries`, stated once** with the reason, replacing all six sites. 6 attempts
+  with linear backoff (50, 100, … 300 ms; 1.05 s total) rather than a flat interval — the failure is a
+  socket in TIME_WAIT or a listener mid-accept, and a fixed short retry re-hits the same window every
+  time, which is why the old 3×50 ms "failed" identically three times and read as a verdict.
+- **`status != 0` is asserted before the status is compared**, so a transport failure fails on its own
+  terms rather than as a wrong status code.
+- **A diagnostic that names the cause**: `TRANSPORT FAILURE on invalid_chat after 6 attempts: status=0`
+  followed by "the auth assertions below are about to fail for a reason that has nothing to do with
+  auth". Verified by forcing the condition.
+
+**Not reproduced.** Twelve consecutive full-suite runs after the fix, all clean — and twelve before it
+would likely have been clean too, since the original was one occurrence in many runs. The fix rests on
+the code evidence rather than on a reproduction, and that is worth saying plainly: if the failure
+returns, the new banner will say whether this diagnosis was right.
+
+**D2 — resolved. The channel was measuring membership when the question is traffic.**
+
+`GridCell::tier` held the coldest tier PRESENT in a bucket and ignored counts entirely, so a bucket of
+six experts with one disk-resident expert that never fires reported Disk — identically to a bucket whose
+disk-resident expert is the hot one. On a streamed model, where most experts are on disk by
+construction, the whole grid went one colour the moment any reduction happened and got *more* uniform
+the more it reduced.
+
+**An expert on disk that never fires costs nothing; one that fires constantly costs everything.** The
+single `tier` field is replaced by `tier_count[3]` — routing traffic attributed to each tier — and the
+colour channel carries `cold_fraction()`, the share of a cell's traffic served from disk. At full
+resolution, one expert per cell, that is 0 or 1 and the rendering degenerates exactly to the old
+per-expert tier, which is what makes this a generalisation rather than a different metric.
+
+Colour is now banded by disk share — none / some / most / all — rather than by tier name, because the
+band is what an operator acts on. Brightness still carries volume, so hot-and-streamed remains visually
+distinct from cold-and-streamed; that separation was the one thing the old rule got right.
+
+Measured on a synthetic streamed model (1 expert in 8 cached, carrying most of the traffic) reduced
+16×16 → 4×4: `cold_fraction` spans **0.03 to 1.00**. Under coldest-wins every one of those buckets
+contained a disk expert, so every one reported Disk and the span was exactly **0**. Restoring the old
+rule turns four of the six checks red — and leaves "a disk expert carrying the traffic DOES colour its
+bucket" green, which is precisely why the original looked correct: coldest-wins is right for that one
+case and wrong for every other.
+
+**D3 — resolved, and it was hiding a wrong claim rather than only a stale one.**
+
+The headings were the visible half: "the backend is next" when it is done, "running, not yet correct"
+directly above its own paragraph reading "PASSES the G0 gate", "the residual is not yet explained" for a
+residual explained four subsections later. Retitled, with the gate's actual numbers moved to the top and
+a banner marking the eliminated-hypotheses log as historical. The log itself is kept — the section
+already argued for keeping it, and the contrast is the finding: four rounds of plausible reasoning
+bought nothing, one instrument bought the answer.
+
+The half worth recording: writing an accurate status line meant asserting **"zero core diffs"**, the
+strictest line of the G4 gate — and it is **false**. `F32Backend::route` in `include/soma/f32_model.hpp`
+gained a `const F32LayerWeights&` parameter for DeepSeek-V3's `noaux_tc` scoring. That is a core header,
+changed for the second architecture, which is exactly what the gate was written to detect.
+
+**The gate worked; the summary rounded its result down.** A prior pass had noticed ("strictly, that is
+already not met") and listed two smaller diffs, but not the router signature — the one that matters,
+because it is an interface that assumed a router's only input is its logits. The status section now
+states one core diff and names it. A gate whose result is edited toward its target measures nothing, and
+the next architecture through the seam will want to know which interface moved.
 
 ---
 

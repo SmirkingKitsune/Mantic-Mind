@@ -440,6 +440,32 @@ Status parse_arch_ir(std::string_view text, ArchIr& out) {
             "use adapt_hf_config() to read an upstream config.json"};
 }
 
+Status apply_container_quant(std::string_view meta_json, ArchIr& io) {
+    nlohmann::json j;
+    try {
+        j = nlohmann::json::parse(meta_json);
+    } catch (const std::exception& e) {
+        return {StatusCode::InvalidArgument,
+                std::string("container_meta.json is not valid JSON: ") + e.what()};
+    }
+
+    const auto group = j.value("group", 0u);
+    const auto set = [&](QuantSpec& spec, const std::string& name) {
+        DType d{};
+        if (!name.empty() && parse_dtype(name, d)) spec.dtype = d;
+        if (group > 0) spec.group = group;
+    };
+
+    // gate and up share a dtype because they are converted together, interleaved
+    // into one expert range. Splitting them here would describe a container the
+    // converter cannot produce.
+    const auto gate_up = j.value("dtype_gate_up", std::string{});
+    set(io.quantization.expert_gate, gate_up);
+    set(io.quantization.expert_up, gate_up);
+    set(io.quantization.expert_down, j.value("dtype_down", std::string{}));
+    return {};
+}
+
 Status compute_arch_hash(const ArchIr& ir, std::string& out_hash) {
     // Covers §2–§6 (what the model IS) and deliberately NOT `economics`:
     // re-profiling on faster disks must not invalidate KV checkpoints, while
@@ -460,11 +486,42 @@ Status compute_arch_hash(const ArchIr& ir, std::string& out_hash) {
           << "|bias=" << ir.router.bias_correction << "|g=" << ir.router.n_groups << ':'
           << ir.router.topk_group << "|shared=" << ir.router.n_shared_experts
           << "|act=" << to_string(ir.ffn.activation) << "|fi=" << ir.ffn.expert_intermediate << ':'
-          << ir.ffn.dense_intermediate << ':' << ir.ffn.shared_intermediate
-          << "|q=" << to_string(ir.quantization.expert_gate.dtype) << ':'
-          << to_string(ir.quantization.expert_down.dtype) << ':'
-          << to_string(ir.quantization.attn_proj.dtype) << ':'
-          << to_string(ir.quantization.embed.dtype);
+          << ir.ffn.dense_intermediate << ':' << ir.ffn.shared_intermediate;
+
+    // The WHOLE quant map, every role, dtype AND group.
+    //
+    // It used to be four roles and dtype only. Two consequences, both of which
+    // are the failure this hash exists to prevent:
+    //
+    //   * q4_g at group 128 and q4_g at group 64 hashed IDENTICALLY. They
+    //     dequantize to different weights, so a KV checkpoint written under one
+    //     and replayed under the other resumes a conversation the cache does not
+    //     describe — fluent, wrong, and nothing detects it.
+    //   * expert_up, shared_expert, norms and draft_head were not covered at
+    //     all. Requantizing the shared expert produced the same hash as not
+    //     requantizing it.
+    //
+    // Adding a role here CHANGES every hash, which is correct and is what
+    // "requantization invalidates" means. It is also why the loop is over a
+    // named list rather than an ad-hoc sequence of fields: a role added to
+    // QuantMap and forgotten here is silent, and its symptom is a resumed
+    // conversation that reads as the model being inconsistent.
+    static constexpr TensorRole kRoles[] = {
+        TensorRole::Embed,
+        TensorRole::AttnProj,
+        TensorRole::ExpertGate,
+        TensorRole::ExpertUp,
+        TensorRole::ExpertDown,
+        TensorRole::SharedExpert,
+        TensorRole::Router,
+        TensorRole::DraftHead,
+        TensorRole::Norms,
+    };
+    canon << "|q=";
+    for (const auto role : kRoles) {
+        const auto& spec = ir.quantization.for_role(role);
+        canon << to_string(spec.dtype) << '@' << spec.group << ',';
+    }
 
     const std::string blob = canon.str();
     std::array<unsigned char, SHA256_DIGEST_LENGTH> digest{};

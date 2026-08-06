@@ -8,6 +8,7 @@
 #include "soma/types.hpp"
 
 #include <cstdint>
+#include <string_view>
 
 namespace soma {
 
@@ -67,6 +68,13 @@ Status validate_quant_map(const QuantMap& map);
 
 std::size_t dtype_bits(DType dtype) noexcept;
 const char* to_string(DType dtype) noexcept;
+
+/// Inverse of to_string(). Returns false on an unrecognised name.
+///
+/// A named function rather than a local table in each caller: the container
+/// writes these strings and the plan reads them, so the two directions are a
+/// WIRE FORMAT. Two independent tables agree until one gains a format.
+bool parse_dtype(std::string_view text, DType& out) noexcept;
 const char* to_string(TensorRole role) noexcept;
 
 } // namespace soma

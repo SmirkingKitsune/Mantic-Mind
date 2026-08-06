@@ -216,6 +216,20 @@ Status parse_arch_ir(std::string_view json, ArchIr& out);
 /// guessing defaults and producing a model that runs and is wrong.
 Status adapt_hf_config(std::string_view json, ArchIr& out);
 
+/// Overlay a converted container's `container_meta.json` onto an IR built from
+/// config.json.
+///
+/// The quantization is part of the model's IDENTITY — arch_hash covers the quant
+/// map precisely so that the same weights at two quantizations are two models
+/// with two verdicts and two sets of KV checkpoints. config.json does not carry
+/// it; container_meta.json is the record of the conversion and the only place it
+/// exists.
+///
+/// A missing or unparseable field leaves the IR's default rather than failing:
+/// this runs on the path that plans an UNCONVERTED checkpoint too, where there
+/// is no conversion to describe.
+Status apply_container_quant(std::string_view meta_json, ArchIr& io);
+
 /// Structural validation. Rejects on any condition in schemas/arch-ir.md §9,
 /// including a non-F32 router.
 Status validate_arch_ir(const ArchIr& ir);

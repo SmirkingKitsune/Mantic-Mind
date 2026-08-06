@@ -340,6 +340,46 @@ struct ControlModelRegistry::Impl {
             db->exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (1)");
             tx.commit();
         }
+
+        if (!has_version(2)) {
+            SQLite::Transaction tx(*db);
+            // The conformance table gains a THIRD state and two stage names.
+            //
+            // `passed` as a boolean cannot say "did not run", and the difference
+            // matters more than either value: a stage that needs a transformers
+            // oracle this host does not have is not a failure, and recording it
+            // as one would reject every model. Recording it as a pass would be
+            // worse — the verdict would look validated when it was only computed.
+            //
+            // SQLite cannot alter a CHECK constraint, so the table is rebuilt.
+            // Existing rows carry forward with status derived from `passed`,
+            // which is the honest reading of what they meant when written.
+            db->exec(R"(
+                CREATE TABLE conformance_v2 (
+                    model_id INTEGER NOT NULL REFERENCES model(id) ON DELETE CASCADE,
+                    stage    TEXT    NOT NULL
+                             CHECK (stage IN ('fp32_tiny_tf',
+                                              'quant_tiny_greedy',
+                                              'real_logit_kl',
+                                              'accuracy_floor',
+                                              'tokenizer_roundtrip',
+                                              'quant_codec')),
+                    status   TEXT    NOT NULL
+                             CHECK (status IN ('passed', 'failed', 'skipped')),
+                    passed   INTEGER NOT NULL,
+                    detail   TEXT,
+                    ran_at   INTEGER NOT NULL,
+                    PRIMARY KEY (model_id, stage)
+                ))");
+            db->exec("INSERT INTO conformance_v2(model_id, stage, status, passed, detail, ran_at) "
+                     "SELECT model_id, stage, CASE WHEN passed THEN 'passed' ELSE 'failed' END, "
+                     "       passed, detail, ran_at FROM conformance");
+            db->exec("DROP TABLE conformance");
+            db->exec("ALTER TABLE conformance_v2 RENAME TO conformance");
+
+            db->exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (2)");
+            tx.commit();
+        }
     }
 
     static AdmittedModel read_row(SQLite::Statement& q) {
@@ -489,11 +529,36 @@ std::optional<AdmittedModel> ControlModelRegistry::resolve(const std::string& mo
         // C++ rather than matched in SQL because the comparison strips
         // separators and case, and encoding that in a LIKE would be a second,
         // subtly different implementation of ref_key().
+        // Re-admitting the same weights at a second quantization gives TWO rows
+        // matching one name, so "the first row the scan reaches" is not an
+        // answer — it is whichever the b-tree happened to yield, and it would
+        // change under an unrelated insert. Ranked instead:
+        //
+        //   1. a verdict that selects Soma, because a row that routes to the
+        //      fallback is not what an agent asking for this model wants when a
+        //      streamable variant of the same weights exists;
+        //   2. more recently profiled, so a fresh admission supersedes a stale
+        //      one rather than losing to it on row order.
+        //
+        // An operator who wants a SPECIFIC variant passes its arch_hash, which
+        // the exact match above already handles and which is the only identity
+        // that cannot be ambiguous.
+        std::optional<AdmittedModel> best;
+        const auto better = [](const AdmittedModel& a, const AdmittedModel& b) {
+            const bool as = verdict_selects_soma(a.verdict);
+            const bool bs = verdict_selects_soma(b.verdict);
+            if (as != bs) return as;
+            return a.profiled_at_ms > b.profiled_at_ms;
+        };
+
         SQLite::Statement q(*impl_->db, "SELECT * FROM model");
         while (q.executeStep()) {
             auto m = Impl::read_row(q);
-            if (ref_key(m.name) == key || ref_key(m.model_dir) == key) return m;
+            if (ref_key(m.name) == key || ref_key(m.model_dir) == key) {
+                if (!best || better(m, *best)) best = std::move(m);
+            }
         }
+        if (best) return best;
     } catch (const std::exception& e) {
         MM_WARN("ControlModelRegistry::resolve: {}", e.what());
     }
@@ -506,21 +571,57 @@ std::vector<ConformanceEntry> ControlModelRegistry::conformance(std::int64_t id)
     if (!impl_->db) return out;
     try {
         SQLite::Statement q(*impl_->db,
-                            "SELECT stage, passed, detail, ran_at FROM conformance "
+                            "SELECT stage, status, passed, detail, ran_at FROM conformance "
                             "WHERE model_id = ? ORDER BY stage");
         q.bind(1, id);
         while (q.executeStep()) {
             ConformanceEntry e;
             e.stage = q.getColumn(0).getText();
-            e.passed = q.getColumn(1).getInt() != 0;
-            e.detail = q.getColumn(2).getText();
-            e.ran_at_ms = q.getColumn(3).getInt64();
+            e.status = q.getColumn(1).getText();
+            e.passed = q.getColumn(2).getInt() != 0;
+            e.detail = q.getColumn(3).getText();
+            e.ran_at_ms = q.getColumn(4).getInt64();
             out.push_back(std::move(e));
         }
     } catch (const std::exception& e) {
         MM_WARN("ControlModelRegistry::conformance: {}", e.what());
     }
     return out;
+}
+
+bool ControlModelRegistry::record_conformance(std::int64_t id,
+                                              const std::vector<ConformanceEntry>& stages,
+                                              std::string& out_error) {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    if (!impl_->db) {
+        out_error = "registry is not open";
+        return false;
+    }
+    try {
+        SQLite::Transaction tx(*impl_->db);
+        for (const auto& e : stages) {
+            // REPLACE, not INSERT: a reprofile re-runs the ladder against the
+            // same weights, and the row it produces supersedes the old one rather
+            // than accumulating a history nobody reads.
+            SQLite::Statement q(*impl_->db,
+                                "INSERT OR REPLACE INTO conformance"
+                                "(model_id, stage, status, passed, detail, ran_at) "
+                                "VALUES (?, ?, ?, ?, ?, ?)");
+            q.bind(1, id);
+            q.bind(2, e.stage);
+            q.bind(3, e.status);
+            q.bind(4, e.status == "passed" ? 1 : 0);
+            q.bind(5, e.detail);
+            q.bind(6, e.ran_at_ms != 0 ? e.ran_at_ms : util::now_ms());
+            q.exec();
+        }
+        tx.commit();
+    } catch (const std::exception& ex) {
+        out_error = ex.what();
+        MM_WARN("ControlModelRegistry::record_conformance: {}", out_error);
+        return false;
+    }
+    return true;
 }
 
 bool ControlModelRegistry::heat(std::int64_t id, bool bucketed, std::string& out_json) const {
@@ -923,6 +1024,13 @@ bool ControlModelRegistry::cancel(const std::string& operation_id) {
 std::string ControlModelRegistry::admit(const std::string& source_ref,
                                         AdmissionProgressSink sink,
                                         std::string& out_error) {
+    return admit(source_ref, QuantOverride{}, std::move(sink), out_error);
+}
+
+std::string ControlModelRegistry::admit(const std::string& source_ref,
+                                        const QuantOverride& quant,
+                                        AdmissionProgressSink sink,
+                                        std::string& out_error) {
     if (!impl_->db) {
         out_error = "registry is not open";
         return {};
@@ -937,7 +1045,7 @@ std::string ControlModelRegistry::admit(const std::string& source_ref,
     // fetching. Both are checked BEFORE the operation exists, so a typo is a 400
     // rather than an operation that appears to start and fails a second later.
     if (fs::exists(source, ec)) {
-        return start_operation(source, /*container_is_ready=*/false, std::move(sink));
+        return start_operation(source, /*container_is_ready=*/false, quant, std::move(sink));
     }
     std::string why;
     if (!valid_repo_id(source, why)) {
@@ -947,7 +1055,7 @@ std::string ControlModelRegistry::admit(const std::string& source_ref,
                     "', and it is not a usable repo id (" + why + ")";
         return {};
     }
-    return start_operation(source, /*container_is_ready=*/false, std::move(sink));
+    return start_operation(source, /*container_is_ready=*/false, quant, std::move(sink));
 }
 
 std::string ControlModelRegistry::admit_container(const std::string& container_dir,
@@ -963,7 +1071,7 @@ std::string ControlModelRegistry::admit_container(const std::string& container_d
         out_error = "container directory not found: " + dir;
         return {};
     }
-    return start_operation(dir, /*container_is_ready=*/true, std::move(sink));
+    return start_operation(dir, /*container_is_ready=*/true, QuantOverride{}, std::move(sink));
 }
 
 std::string ControlModelRegistry::reprofile(std::int64_t id,
@@ -982,13 +1090,27 @@ std::string ControlModelRegistry::reprofile(std::int64_t id,
     // re-running it would rewrite gigabytes to reach the same bytes. What gets
     // re-derived is the verdict, which is the part that goes stale — a changed
     // host budget changes it without any weight changing.
-    return start_operation(model->model_dir, /*container_is_ready=*/true, std::move(sink));
+    // No override: re-profiling must not change the bytes. That is the half of
+    // the gate that is easy to get wrong in the other direction — a reprofile
+    // that requantized would produce a new arch_hash and orphan every KV
+    // checkpoint written against the old one, for a request that asked only for
+    // a fresh verdict.
+    return start_operation(model->model_dir, /*container_is_ready=*/true, QuantOverride{},
+                           std::move(sink));
 }
 
 std::string ControlModelRegistry::start_operation(const std::string& source,
                                                  bool container_is_ready,
+                                                 const QuantOverride& quant,
                                                  AdmissionProgressSink sink) {
-    const auto tools_copy = tools();
+    // Applied to the COPY the operation runs with, not to the registry's tools:
+    // two admissions of the same model at different quantizations can be in
+    // flight at once, and a shared field would let the second rewrite the
+    // first's conversion arguments mid-run.
+    auto tools_copy = tools();
+    if (!quant.quant.empty()) tools_copy.quant = quant.quant;
+    if (!quant.expert_down.empty()) tools_copy.expert_down = quant.expert_down;
+    if (quant.group > 0) tools_copy.group = quant.group;
     const auto id = util::generate_uuid();
 
     std::error_code ec;
@@ -1066,7 +1188,17 @@ void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
         const auto slash = id.find_last_of('/');
         name = (slash == std::string::npos) ? id : id.substr(slash + 1);
     }
-    const auto container = (fs::path(tools.containers_dir) / name).string();
+    // The QUANTIZATION is part of the directory name, not just the record.
+    //
+    // Without it, admitting the same weights at q4_g and again at q6_g wrote both
+    // to `containers/<name>` — the second overwrote the first, and the first's
+    // registry row then pointed at bytes that were no longer the quantization it
+    // described. The verdict, the expert_bytes, the KV format: all recorded
+    // against a container that had been replaced underneath them, with nothing
+    // to detect it.
+    const auto variant = name + "-" + tools.quant + "-" + tools.expert_down + "-g" +
+                         std::to_string(tools.group);
+    const auto container = (fs::path(tools.containers_dir) / variant).string();
 
     // What conversion actually reads. For a local source that is the source; for
     // a repo id it is whatever fetch.py resolves to, which is NOT assumed to be
@@ -1152,7 +1284,68 @@ void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
     }
 
     // ── 2. convert ───────────────────────────────────────────────────────────
+    //
+    // Preceded by an architecture check, which is the difference between failing
+    // in 200 ms and failing in six hours. `soma plan` on the SOURCE reads
+    // config.json and allocates nothing; if there is no backend for the attention
+    // family, no host can run this model and the container would be gigabytes
+    // nothing can read.
+    //
+    // Only `arch_supported` short-circuits. A verdict of reject on ECONOMICS does
+    // not: the verdict is a property of (model, quantization, host), so a node
+    // with more RAM can reach a different one from the same container — throwing
+    // away the conversion because THIS host said no would be a category error.
+    std::string plan_json;
+    bool arch_unsupported = false;
     if (!container_is_ready) {
+        std::string probe, err;
+        const int arc = run_streamed_command(
+            {tools.soma_path, "plan", "--model-dir", local_source, "--json"}, fs::current_path(),
+            [&](const std::string& line, bool is_stderr) {
+                if (!is_stderr) probe += line;
+            },
+            canceled, &err);
+        if (canceled()) {
+            progress.canceled = true;
+            fail("canceled during the architecture check");
+            return;
+        }
+        if (arc != 0) {
+            // `plan` refusing the source is the reachable form of "no backend":
+            // adapt_hf_config's table IS the registry of architectures this
+            // engine understands, and an unknown `model_type` stops there. A
+            // container built from a config Soma cannot parse is gigabytes
+            // nothing can read, so this fails the admission rather than
+            // discovering it after conversion.
+            fail("this architecture is not supported: " +
+                 (err.empty() ? "soma plan exited " + std::to_string(arc) : util::trim(err)));
+            return;
+        }
+        try {
+            const auto j = nlohmann::json::parse(probe);
+            // Absent means an older `soma` that does not report it. Treated as
+            // supported, so a version skew degrades to the previous behaviour —
+            // convert and find out — rather than refusing every model.
+            if (!j.value("arch_supported", true)) {
+                // Parsed, but there is no forward for its attention family. Not
+                // an error: it is a REJECT record saying "route this to the
+                // fallback", which is a successful admission. Conversion is
+                // skipped because no host will ever read the container.
+                arch_unsupported = true;
+                plan_json = probe;
+                emit("convert",
+                     "no backend for attention family '" +
+                         j.value("attention_family", std::string{"unknown"}) +
+                         "'; skipping conversion",
+                     0.80);
+            }
+        } catch (const std::exception&) {
+            // Exited 0 with unreadable output. Let convert run and produce the
+            // error; its message names the file.
+        }
+    }
+
+    if (!container_is_ready && !arch_unsupported) {
         const double convert_lo = needs_fetch ? 0.35 : 0.05;
         emit("convert", "converting " + name + " -> " + container, convert_lo);
         std::error_code ec;
@@ -1203,8 +1396,17 @@ void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
         // ── 2. tokenizer ─────────────────────────────────────────────────────
         emit("tokenize", "compiling tokenizer", 0.72);
         const int trc = run_streamed_command(
+            // `--out` is a DIRECTORY. It was being handed
+            // `<container>/tokenizer.soma`, so the script created a directory of
+            // that name and wrote tokenizer.soma inside it — the engine looks for
+            // a FILE at that path, found a directory, and every model admitted
+            // through this pipeline served raw token ids. Nothing failed; the
+            // tokenizer was simply never there.
+            //
+            // The container directory is also where tokenizer_oracle.bin belongs,
+            // which is what the conformance stage checks the tokenizer against.
             {tools.python, (tools_dir / "compile_tokenizer.py").string(), local_source, "--out",
-             (fs::path(container) / "tokenizer.soma").string()},
+             container},
             fs::current_path(),
             [&](const std::string& line, bool) {
                 if (!util::trim(line).empty()) emit("tokenize", util::trim(line), 0.72);
@@ -1230,9 +1432,12 @@ void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
     // `soma plan --json` is the verdict. It reads headers only and allocates
     // nothing, which is why it is safe to run on control rather than requiring a
     // node that could host the model.
-    emit("profile", "planning", 0.80);
-    std::string plan_json;
-    {
+    // Already answered when the architecture check ran: re-planning the same
+    // source would produce the same document and the same verdict.
+    emit("profile", arch_unsupported ? "already planned; no backend for this architecture"
+                                     : "planning",
+         0.80);
+    if (!arch_unsupported) {
         std::string err;
         const int prc = run_streamed_command(
             {tools.soma_path, "plan", "--model-dir", container_is_ready ? local_source : container,
@@ -1256,19 +1461,73 @@ void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
 
     // ── 4. conformance ───────────────────────────────────────────────────────
     //
-    // Not run here, and the record says so rather than implying a pass. The
-    // ladder's stages 1-2 run against committed tiny fixtures in CI; stage 3
-    // needs a reference run for THIS model, which is a separate artifact this
-    // pipeline does not have. Writing a `passed` row we did not earn would make
-    // the verdict look validated when it is only computed.
-    emit("conformance", "not run in-process; see tests/soma and stage3", 0.90);
+    // `soma conform --json`, for the same reason `plan` is a subcommand: the
+    // codec under test is the one the engine uses, and a second implementation
+    // living in control is how the two come to disagree.
+    //
+    // Stages that need a transformers oracle for THIS model do not run here and
+    // are recorded as SKIPPED with what they would need — never as passed.
+    emit("conformance",
+         arch_unsupported ? "not run; there is no container to check" : "running the ladder", 0.90);
+    std::vector<ConformanceEntry> conf;
+    bool conformance_failed = false;
+    if (!arch_unsupported) {
+        std::string conform_json, err;
+        const int crc = run_streamed_command(
+            {tools.soma_path, "conform", "--model-dir", container_is_ready ? local_source : container,
+             "--json"},
+            fs::current_path(),
+            [&](const std::string& line, bool is_stderr) {
+                if (!is_stderr) conform_json += line;
+            },
+            canceled, &err);
+        if (canceled()) {
+            progress.canceled = true;
+            fail("canceled during conformance");
+            return;
+        }
+        if (crc != 0) {
+            // Could-not-run, which is different from a finding. `conform` exits 0
+            // when a stage fails precisely so these stay distinguishable.
+            MM_WARN("admission {}: soma conform exited {}; the ladder was not run",
+                    progress.operation_id, crc);
+            emit("conformance", "could not run the ladder (exit " + std::to_string(crc) + ")", 0.92);
+        } else {
+            try {
+                const auto j = nlohmann::json::parse(conform_json);
+                const auto now = util::now_ms();
+                for (const auto& s : j.value("stages", nlohmann::json::array())) {
+                    ConformanceEntry e;
+                    e.stage = s.value("stage", std::string{});
+                    e.status = s.value("status", std::string{"skipped"});
+                    e.passed = (e.status == "passed");
+                    e.detail = s.value("detail", nlohmann::json::object()).dump();
+                    e.ran_at_ms = now;
+                    if (e.stage.empty()) continue;
+                    if (e.status == "failed") conformance_failed = true;
+                    conf.push_back(std::move(e));
+                }
+                std::size_t ran = 0;
+                for (const auto& e : conf)
+                    if (e.status != "skipped") ++ran;
+                emit("conformance",
+                     std::to_string(ran) + " of " + std::to_string(conf.size()) +
+                         " stages ran; " + (conformance_failed ? "FAILED" : "no failures"),
+                     0.92);
+            } catch (const std::exception& e) {
+                MM_WARN("admission {}: could not parse conform output: {}", progress.operation_id,
+                        e.what());
+                emit("conformance", "conform produced unreadable output", 0.92);
+            }
+        }
+    }
 
     // ── 5. finalize ──────────────────────────────────────────────────────────
     emit("finalize", "recording", 0.95);
     // Keyed on arch_hash below, so a reprofile updates the row it came from
     // rather than creating a second one for the same weights.
     AdmittedModel m;
-    m.model_dir = container_is_ready ? local_source : container;
+    m.model_dir = (container_is_ready || arch_unsupported) ? local_source : container;
     m.name = name;
     m.source_repo = container_is_ready ? std::string{} : source;
     try {
@@ -1301,10 +1560,29 @@ void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
         return;
     }
 
+    // A failed conformance stage is a REJECT verdict, not a failed request.
+    //
+    // The operator asked whether Soma can run this model; "no, and here is the
+    // stage that says so" is an answer, and a rejected model is a successfully
+    // admitted RECORD meaning "route this to the fallback". Applied after the
+    // plan so the plan's own reasoning survives in verdict_basis — the two
+    // reasons are different findings and neither should erase the other.
+    if (conformance_failed) {
+        m.verdict = ModelVerdict::Reject;
+        m.verdict_reason = m.verdict_reason.empty()
+                               ? std::string("conformance failed")
+                               : "conformance failed (plan said: " + m.verdict_reason + ")";
+    }
+
     std::string err;
     if (!upsert(m, err)) {
         fail("could not record the admission: " + err);
         return;
+    }
+    if (!conf.empty() && !record_conformance(m.id, conf, err)) {
+        // Not fatal: the model is admitted and routable, and losing the ladder's
+        // detail is worse reported than pretended away.
+        MM_WARN("admission {}: could not record conformance rows: {}", progress.operation_id, err);
     }
 
     progress.model_id = m.id;

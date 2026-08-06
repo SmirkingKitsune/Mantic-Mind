@@ -67,7 +67,7 @@ find_package(Python3 COMPONENTS Interpreter QUIET)
 # progress parsing, the resolved path, and the two ways a fetch can lie about
 # succeeding.
 set_tests_properties(mm_reliability_tests PROPERTIES
-    ENVIRONMENT "MM_TEST_SOMA_PATH=$<TARGET_FILE:soma>;MM_TEST_MODEL_DIR=${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/Qwen3-30B-A3B;MM_TEST_PYTHON=${Python3_EXECUTABLE}")
+    ENVIRONMENT "MM_TEST_SOMA_PATH=$<TARGET_FILE:soma>;MM_TEST_MODEL_DIR=${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/Qwen3-30B-A3B;MM_TEST_PYTHON=${Python3_EXECUTABLE};MM_TEST_CONTAINER_DIR=${CMAKE_SOURCE_DIR}/tests/fixtures/containers/Qwen3-30B-A3B")
 
 if(Python3_Interpreter_FOUND)
     # Pure, no network, no huggingface_hub: which files a repo transfer takes is

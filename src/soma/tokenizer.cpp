@@ -553,6 +553,87 @@ Status CompiledTokenizer::Streamer::push(TokenId token, std::string& out_delta) 
     return {};
 }
 
+// ── the admission gate ───────────────────────────────────────────────────────
+
+Status read_tokenizer_oracle(const std::string& path, std::vector<TokenizerOracleCase>& out) {
+    out.clear();
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return {StatusCode::NotFound, "no tokenizer oracle at " + path};
+
+    char magic[8]{};
+    in.read(magic, 8);
+    if (std::memcmp(magic, "SOMATORC", 8) != 0) {
+        return {StatusCode::InvalidArgument, path + ": not a tokenizer oracle (bad magic)"};
+    }
+    const auto u32 = [&]() -> std::uint32_t {
+        std::uint32_t v = 0;
+        in.read(reinterpret_cast<char*>(&v), 4);
+        return v;
+    };
+    if (const auto version = u32(); version != 1) {
+        return {StatusCode::VersionMismatch,
+                path + ": oracle version " + std::to_string(version) + " != 1"};
+    }
+    const auto n = u32();
+    out.resize(n);
+    for (auto& c : out) {
+        const auto len = u32();
+        c.text.resize(len);
+        if (len > 0) in.read(c.text.data(), len);
+        const auto k = u32();
+        c.ids.resize(k);
+        for (auto& id : c.ids)
+            id = u32();
+    }
+    if (!in) return {StatusCode::InvalidArgument, path + ": truncated oracle"};
+    return {};
+}
+
+Status verify_roundtrip(const CompiledTokenizer& tokenizer,
+                        std::span<const TokenizerOracleCase> oracle,
+                        RoundTripResult& out) {
+    out = {};
+    out.cases = static_cast<std::uint32_t>(oracle.size());
+    if (oracle.empty()) {
+        // An empty corpus passes every check there is, which is exactly why it
+        // must not be allowed to look like a pass.
+        return {StatusCode::InvalidArgument, "the oracle is empty; there is nothing to verify"};
+    }
+
+    std::vector<TokenId> ids;
+    std::string round;
+    for (const auto& c : oracle) {
+        if (auto st = tokenizer.encode(c.text, ids); st.ok()) {
+            if (ids == c.ids) {
+                ++out.encode_ok;
+            } else if (out.first_failure.empty()) {
+                out.first_failure = "encode \"" + c.text.substr(0, 40) + "\": got " +
+                                    std::to_string(ids.size()) + " ids, want " +
+                                    std::to_string(c.ids.size());
+                for (std::size_t i = 0; i < ids.size() && i < c.ids.size(); ++i) {
+                    if (ids[i] != c.ids[i]) {
+                        out.first_failure += " (first diff at " + std::to_string(i) + ": " +
+                                             std::to_string(ids[i]) + " vs " +
+                                             std::to_string(c.ids[i]) + ")";
+                        break;
+                    }
+                }
+            }
+        } else if (out.first_failure.empty()) {
+            out.first_failure = "encode \"" + c.text.substr(0, 40) + "\": " + st.message();
+        }
+
+        // Decode is checked against HF's ids, not ours: otherwise an encode bug
+        // that a decode bug happens to invert would pass both halves.
+        if (tokenizer.decode(c.ids, round).ok() && round == c.text) {
+            ++out.decode_ok;
+        } else if (out.first_failure.empty()) {
+            out.first_failure = "decode of \"" + c.text.substr(0, 40) + "\" did not round-trip";
+        }
+    }
+    return {};
+}
+
 Status CompiledTokenizer::Streamer::flush(std::string& out_delta) {
     // Unconditional, including a partial codepoint. At end of stream the missing
     // bytes are not late, they are absent — and withholding them would make the

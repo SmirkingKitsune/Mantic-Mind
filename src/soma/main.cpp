@@ -1,7 +1,8 @@
 // Soma — the engine executable.
 //
-//   soma serve  --model-dir DIR [--port N] [--host H] [--ctx-size N] ...
-//   soma plan   --model-dir DIR [--json]
+//   soma serve   --model-dir DIR [--port N] [--host H] [--ctx-size N] ...
+//   soma plan    --model-dir DIR [--json]
+//   soma conform --model-dir DIR [--json]
 //
 // `plan` exists as a subcommand of the same binary rather than a separate tool
 // because the planner it runs is the one the server runs: an operator asking
@@ -10,24 +11,329 @@
 
 #include "soma/arch_ir.hpp"
 #include "soma/plan.hpp"
+#include "soma/quant_format.hpp"
+#include "soma/safetensors.hpp"
 #include "soma/serve.hpp"
+#include "soma/tokenizer.hpp"
 
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <iterator>
 #include <string>
+#include <vector>
 
 namespace {
 
 int usage() {
     std::cerr << "usage:\n"
-                 "  soma serve --model-dir DIR [--host H] [--port N] [--ctx-size N]\n"
-                 "             [--ram-budget BYTES] [--pin BYTES] [--kv-dir DIR]\n"
-                 "             [--served-name NAME]\n"
-                 "  soma plan  --model-dir DIR [--json]\n";
+                 "  soma serve   --model-dir DIR [--host H] [--port N] [--ctx-size N]\n"
+                 "               [--ram-budget BYTES] [--pin BYTES] [--kv-dir DIR]\n"
+                 "               [--served-name NAME]\n"
+                 "  soma plan    --model-dir DIR [--json]\n"
+                 "  soma conform --model-dir DIR [--json]\n";
     return 2;
+}
+
+// ── conform ──────────────────────────────────────────────────────────────────
+//
+// The admission ladder, for the stages that can honestly run against a converted
+// container and nothing else. The rest are REPORTED AS SKIPPED, with what they
+// would need — a `passed` row nobody earned is worse than an absent one, because
+// the verdict then looks validated when it was only computed.
+//
+// Runs here rather than in control for the same reason `plan` does: the codec
+// under test is the one the engine uses, and a second implementation in another
+// process is how they come to disagree.
+
+/// Theoretical bits per weight for a group-scale format.
+///
+/// Written out as a formula rather than taken from quantized_tensor_bytes(),
+/// which IS the implementation — comparing the implementation against itself
+/// would pass through any packing bug that was consistent about its size.
+double theoretical_bpw(soma::DType d, std::uint32_t group) {
+    const double g = static_cast<double>(group);
+    switch (d) {
+    case soma::DType::Q8_0:
+        return 8.0 + 32.0 / g; // one fp32 scale per group
+    case soma::DType::Q4_0:
+        return 4.0 + 32.0 / g;
+    case soma::DType::Q6_G:
+        return 6.0 + 32.0 / g;
+    case soma::DType::Q4_G:
+        return 4.0 + 64.0 / g; // scale AND min
+    default:
+        return 0.0;
+    }
+}
+
+/// Relative-RMS ceiling per format, generous by ~3x against the measured values
+/// in docs/roadmap.md's G1 table.
+///
+/// Generous on purpose: this is not an accuracy metric, it is a PACKING check. A
+/// mis-packed nibble, a wrong group stride or a broken accumulation lands at
+/// rel_rms near 1.0 or above, so the gap between "correct on unfamiliar weights"
+/// and "broken" is two orders of magnitude wide. A tight bound here would fail
+/// honest models and catch nothing extra.
+double rel_rms_ceiling(soma::DType d) {
+    switch (d) {
+    case soma::DType::Q8_0:
+        return 0.02;
+    case soma::DType::Q6_G:
+        return 0.08;
+    case soma::DType::Q4_G:
+    case soma::DType::Q4_0:
+        return 0.30;
+    default:
+        return 1.0;
+    }
+}
+
+bool parse_dtype_name(const std::string& text, soma::DType& out) {
+    for (const auto d : {soma::DType::Q8_0,
+                         soma::DType::Q4_0,
+                         soma::DType::Q4_G,
+                         soma::DType::Q6_G,
+                         soma::DType::F32}) {
+        if (text == soma::to_string(d)) {
+            out = d;
+            return true;
+        }
+    }
+    return false;
+}
+
+struct StageResult {
+    std::string stage;
+    std::string status; ///< passed | failed | skipped
+    nlohmann::json detail = nlohmann::json::object();
+};
+
+/// Quantize the container's own dense weights and measure what came back.
+///
+/// The container's dense tensors are the right subject: they are F32 on disk, they
+/// are THIS model's real weight distribution rather than a synthetic one, and they
+/// are bounded — the experts are the gigabytes, and they are already quantized, so
+/// there is no fp32 original to compare them against anyway.
+StageResult stage_quant_codec(const std::filesystem::path& dir) {
+    StageResult r{"quant_codec", "skipped", {}};
+
+    const auto meta_path = dir / "container_meta.json";
+    std::ifstream meta_in(meta_path, std::ios::binary);
+    if (!meta_in) {
+        r.detail["reason"] = "no container_meta.json; this is not a converted container";
+        return r;
+    }
+    nlohmann::json meta;
+    try {
+        meta_in >> meta;
+    } catch (const std::exception& e) {
+        r.status = "failed";
+        r.detail["reason"] = std::string("container_meta.json is unreadable: ") + e.what();
+        return r;
+    }
+
+    const auto group = meta.value("group", 128u);
+    std::vector<std::pair<std::string, soma::DType>> formats;
+    for (const char* key : {"dtype_gate_up", "dtype_down"}) {
+        const auto name = meta.value(key, std::string{});
+        soma::DType d{};
+        if (!name.empty() && parse_dtype_name(name, d)) {
+            const auto seen = std::find_if(
+                formats.begin(), formats.end(), [&](const auto& p) { return p.second == d; });
+            if (seen == formats.end()) formats.emplace_back(name, d);
+        }
+    }
+    if (formats.empty()) {
+        r.detail["reason"] = "container declares no quantized formats";
+        return r;
+    }
+
+    soma::SafeTensors dense;
+    if (auto st = dense.open((dir / "dense.safetensors").string()); !st.ok()) {
+        r.detail["reason"] = "no dense.safetensors: " + st.message();
+        return r;
+    }
+
+    bool passed = true;
+    auto rows_json = nlohmann::json::array();
+    std::vector<float> back;
+
+    for (const auto& [name, dtype] : formats) {
+        double sum2 = 0.0, ref2 = 0.0, expect_bits = 0.0;
+        std::size_t weights = 0, packed_bytes = 0, tensors = 0;
+        std::uint32_t group_lo = 0, group_hi = 0;
+
+        for (const auto& tname : dense.names()) {
+            const auto* t = dense.find(tname);
+            // Rank 2 and F32 only: quantization is defined along `cols`, and a
+            // 1-D norm weight has no cols to group.
+            if (t == nullptr || t->rank() != 2 || t->dtype != soma::DType::F32) continue;
+            const auto src = t->f32();
+            if (src.empty()) continue;
+
+            const auto rows = static_cast<std::uint32_t>(t->dim(0));
+            const auto cols = static_cast<std::uint32_t>(t->dim(1));
+            soma::QTensor q;
+            if (!soma::quantize_tensor(src, rows, cols, dtype, group, q).ok()) continue;
+            back.resize(src.size());
+            if (!soma::dequantize_tensor(q, back).ok()) continue;
+
+            for (std::size_t i = 0; i < src.size(); ++i) {
+                const double e = static_cast<double>(back[i]) - src[i];
+                sum2 += e * e;
+                ref2 += static_cast<double>(src[i]) * src[i];
+            }
+            weights += src.size();
+            packed_bytes += q.data.size();
+            // Per tensor, against ITS OWN effective group. quantize_tensor
+            // reduces the requested group to the largest divisor of `cols` that
+            // fits, so a container whose tensors have different widths uses
+            // several groups at once — the fixture's dense weights use 64 and 32.
+            // One group in the expectation would fail every tensor that is not
+            // the widest, for being correct.
+            expect_bits += theoretical_bpw(dtype, q.group) * static_cast<double>(src.size());
+            group_lo = (group_lo == 0) ? q.group : std::min(group_lo, q.group);
+            group_hi = std::max(group_hi, q.group);
+            ++tensors;
+        }
+
+        if (weights == 0) {
+            r.detail["reason"] = "dense.safetensors holds no 2-D F32 weights";
+            return r;
+        }
+
+        const double rel = ref2 > 0.0 ? std::sqrt(sum2 / ref2) : 0.0;
+        const double bpw = 8.0 * static_cast<double>(packed_bytes) / static_cast<double>(weights);
+        const double want_bpw = expect_bits / static_cast<double>(weights);
+        const double ceiling = rel_rms_ceiling(dtype);
+
+        const bool bpw_ok = std::fabs(bpw - want_bpw) < 0.02;
+        const bool rel_ok = rel <= ceiling;
+        passed = passed && bpw_ok && rel_ok;
+
+        rows_json.push_back(nlohmann::json{{"dtype", name},
+                                           {"group_min", group_lo},
+                                           {"group_max", group_hi},
+                                           {"tensors", tensors},
+                                           {"weights", weights},
+                                           {"bits_per_weight", bpw},
+                                           {"bits_per_weight_expected", want_bpw},
+                                           {"rel_rms", rel},
+                                           {"rel_rms_ceiling", ceiling},
+                                           {"passed", bpw_ok && rel_ok}});
+    }
+
+    r.status = passed ? "passed" : "failed";
+    r.detail = nlohmann::json{{"formats", rows_json}};
+    return r;
+}
+
+StageResult stage_tokenizer_roundtrip(const std::filesystem::path& dir) {
+    StageResult r{"tokenizer_roundtrip", "skipped", {}};
+
+    if (std::filesystem::exists(dir / "tokenizer.unsupported")) {
+        std::ifstream in(dir / "tokenizer.unsupported");
+        std::string why;
+        std::getline(in, why);
+        // A tokenizer the compiler REFUSED is a known, recorded state — the model
+        // serves token ids. Not a conformance failure, and not a silent pass.
+        r.detail["reason"] = "tokenizer not compiled: " + why;
+        return r;
+    }
+
+    soma::CompiledTokenizer tok;
+    if (auto st = tok.open((dir / "tokenizer.soma").string()); !st.ok()) {
+        r.detail["reason"] = "no compiled tokenizer: " + st.message();
+        return r;
+    }
+    std::vector<soma::TokenizerOracleCase> oracle;
+    if (auto st = soma::read_tokenizer_oracle((dir / "tokenizer_oracle.bin").string(), oracle);
+        !st.ok()) {
+        r.detail["reason"] = st.message();
+        return r;
+    }
+
+    soma::RoundTripResult rt;
+    if (auto st = soma::verify_roundtrip(tok, oracle, rt); !st.ok()) {
+        r.status = "failed";
+        r.detail["reason"] = st.message();
+        return r;
+    }
+    r.status = rt.clean() ? "passed" : "failed";
+    r.detail = nlohmann::json{
+        {"cases", rt.cases}, {"encode_ok", rt.encode_ok}, {"decode_ok", rt.decode_ok}};
+    if (!rt.first_failure.empty()) r.detail["first_failure"] = rt.first_failure;
+    return r;
+}
+
+int cmd_conform(int argc, char** argv) {
+    std::string dir;
+    bool as_json = false;
+    for (int i = 0; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--model-dir" && i + 1 < argc)
+            dir = argv[++i];
+        else if (a == "--json")
+            as_json = true;
+    }
+    if (dir.empty()) return usage();
+    const std::filesystem::path root(dir);
+
+    std::vector<StageResult> stages;
+    stages.push_back(stage_tokenizer_roundtrip(root));
+    stages.push_back(stage_quant_codec(root));
+
+    // The stages that need something this process does not have, named with what
+    // that is. They are recorded as SKIPPED, never as passed.
+    stages.push_back({"fp32_tiny_tf",
+                      "skipped",
+                      {{"reason",
+                        "needs a transformers oracle for this architecture; build one "
+                        "with tools/admission/make_oracle.py and run soma_conformance_g0"}}});
+    stages.push_back({"real_logit_kl",
+                      "skipped",
+                      {{"reason",
+                        "needs an fp16 reference pass over this checkpoint; see "
+                        "tools/admission/make_reference.py and soma_stage3_g2"}}});
+    stages.push_back(
+        {"accuracy_floor", "skipped", {{"reason", "no downstream task harness exists yet"}}});
+
+    // A failed stage is a REJECT verdict, not a failed request: the operator
+    // asked whether Soma can run this model, and "no, here is why" is an answer.
+    bool any_failed = false, any_ran = false;
+    for (const auto& s : stages) {
+        if (s.status == "failed") any_failed = true;
+        if (s.status != "skipped") any_ran = true;
+    }
+
+    if (as_json) {
+        auto out = nlohmann::json::array();
+        for (const auto& s : stages) {
+            out.push_back(
+                nlohmann::json{{"stage", s.stage}, {"status", s.status}, {"detail", s.detail}});
+        }
+        std::cout << nlohmann::json{{"stages", out},
+                                    {"passed", any_ran && !any_failed},
+                                    {"ran", any_ran}}
+                         .dump()
+                  << "\n";
+    } else {
+        for (const auto& s : stages) {
+            std::cout << "  " << std::left << std::setw(22) << s.stage << std::setw(9) << s.status
+                      << s.detail.dump() << "\n";
+        }
+    }
+    // Exit 0 even when a stage fails: the finding is the output. Non-zero is
+    // reserved for "could not run", which is a different thing entirely and the
+    // caller has to tell them apart.
+    return 0;
 }
 
 int cmd_plan(int argc, char** argv) {
@@ -124,6 +430,7 @@ int main(int argc, char** argv) {
     const std::string cmd = argv[1];
     if (cmd == "serve") return cmd_serve(argc - 2, argv + 2);
     if (cmd == "plan") return cmd_plan(argc - 2, argv + 2);
+    if (cmd == "conform") return cmd_conform(argc - 2, argv + 2);
     if (cmd == "--help" || cmd == "-h") {
         usage();
         return 0;
