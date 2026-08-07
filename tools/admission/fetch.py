@@ -143,14 +143,23 @@ def select(files: list[tuple[str, int]], allow_pickle: bool) -> tuple[list[str],
 
 
 def directory_bytes(root: Path) -> int:
-    """Every byte under `root`, partial downloads included.
+    """Every MODEL byte under `root`, partial downloads included.
 
     Partial files are the point — a transfer in progress lives in a temp file
     under the output directory, so counting only finished files would report
     zero for the entire download of a single-shard model.
+
+    `.cache/huggingface/` is skipped. With `local_dir` set, huggingface_hub keeps
+    its per-file `.metadata` bookkeeping in a subdirectory of the very tree we
+    are measuring, so counting it pushes the total PAST the manifest — measured
+    at 1945 bytes over on a 16.9 MB probe, which is small in bytes and not small
+    in meaning: it makes `bytes_done > bytes_total` and drives any progress bar
+    built on the ratio past 100%.
     """
     total = 0
-    for dirpath, _dirs, names in os.walk(root):
+    for dirpath, dirs, names in os.walk(root):
+        # Pruned in-place so os.walk does not descend into it at all.
+        dirs[:] = [d for d in dirs if d != ".cache"]
         for n in names:
             try:
                 total += os.path.getsize(os.path.join(dirpath, n))
@@ -171,6 +180,12 @@ def main() -> int:
 
     repo_id, revision = split_ref(args.repo)
     validate(repo_id, revision)
+
+    # Our `progress` lines ARE the progress report, and they are parsed. A tqdm
+    # bar rewriting itself with carriage returns on top of them is noise at best;
+    # the control side forwards every unrecognised line to the operator as
+    # detail, so each redraw would become a frame saying "Fetching 6 files: 17%".
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
     try:
         from huggingface_hub import HfApi, snapshot_download

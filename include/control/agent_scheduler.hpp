@@ -47,6 +47,18 @@ public:
     /// Falls back to the pure form with no evidence when no registry is set.
     BackendRouting resolve_backend_for(const AgentConfig& cfg) const;
 
+    /// WHERE an agent's model lives, as opposed to what the agent calls it.
+    ///
+    /// `AgentConfig::model_path` is an IDENTITY — it is what the operator typed
+    /// and what the registry is keyed on. It is not a location: an admitted
+    /// model's container directory carries its quantization
+    /// (`<name>-q4_g-q6_g-g128`), so the two strings differ, and handing a node
+    /// the identity makes it look for a directory that does not exist.
+    ///
+    /// Public because it is exactly what a test needs to assert, and because the
+    /// distinction is worth being able to state from outside.
+    std::string model_location(const AgentConfig& cfg) const;
+
     /// Optional. Without it every `auto` agent routes to the fallback, since
     /// absence of a record is not evidence of admissibility.
     void set_model_registry(const ControlModelRegistry* registry);

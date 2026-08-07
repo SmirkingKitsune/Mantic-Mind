@@ -4605,6 +4605,9 @@ bool test_model_registry_makes_soma_routable() {
     // ── before: nothing admitted it, so nothing routes to Soma ───────────────
     scheduler.set_model_registry(&reg);
     CHECK(scheduler.resolve_backend_for(cfg).engine_id == "llama-cpp");
+    // And with no record, the agent's own path IS the location — this is the
+    // fallback's GGUF, and it must keep passing through untouched.
+    CHECK(scheduler.model_location(cfg) == cfg.model_path);
     auto forced = cfg;
     forced.backend_override = "soma";
     CHECK(scheduler.resolve_backend_for(forced).engine_id == "llama-cpp");
@@ -4613,7 +4616,11 @@ bool test_model_registry_makes_soma_routable() {
     mm::AdmittedModel m;
     m.arch_hash = std::string(64, 'a');
     m.name = "Qwen3-30B-A3B";
-    m.model_dir = "/containers/Qwen3-30B-A3B";
+    // The quantization suffix is the POINT, not decoration. With
+    // `model_dir == "/containers/" + name` the record's location and the agent's
+    // model_path are the same string, and every assertion below passes whichever
+    // one the scheduler happens to use — which is exactly how defect D7 hid.
+    m.model_dir = "/containers/Qwen3-30B-A3B-q4_g-q6_g-g128";
     m.attention_family = "gqa";
     m.n_layers = 48; m.n_moe_layers = 48; m.n_experts = 128; m.top_k = 8;
     m.bytes_per_token = 1098ll * 1024 * 1024;
@@ -4630,6 +4637,21 @@ bool test_model_registry_makes_soma_routable() {
     CHECK(reg.resolve("/some/where/qwen3-30b-a3b/").has_value());   // case + trailing slash
     CHECK(!reg.resolve("Mistral-7B").has_value());
     CHECK(!reg.resolve("").has_value());
+
+    // ── the model's LOCATION comes from the record, not the agent ────────────
+    //
+    // Defect D7: placement resolved the record for `arch_hash` and `verdict` and
+    // threw `model_dir` away, then handed the node the agent's model_path. The
+    // node resolves what it is handed against its own models_dir and found no
+    // such directory — `model file not found on this node: OLMoE-1B-7B-0924`
+    // while `OLMoE-1B-7B-0924-q4_g-q6_g-g128` sat right there.
+    CHECK(scheduler.model_location(cfg) == "/containers/Qwen3-30B-A3B-q4_g-q6_g-g128");
+    CHECK(scheduler.model_location(cfg) != cfg.model_path);
+
+    // A model nobody admitted still passes its own path through.
+    auto unknown = cfg;
+    unknown.model_path = "/models/mixtral-8x7b-q4.gguf";
+    CHECK(scheduler.model_location(unknown) == "/models/mixtral-8x7b-q4.gguf");
 
     // ── after: the SAME agent config now routes to Soma, unprompted ──────────
     CHECK(scheduler.resolve_backend_for(cfg).engine_id == "soma");

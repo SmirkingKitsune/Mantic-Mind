@@ -13,6 +13,7 @@
 #include "node/engine_descriptor.hpp"
 
 #include "common/engine_client.hpp"
+#include "common/util.hpp"
 #include "node/engine_process.hpp"
 #include "node/kv_checkpoint_backend.hpp"
 
@@ -225,6 +226,27 @@ EngineDescriptor make_soma_descriptor(const std::string& executable) {
                a.extra_args == b.extra_args; // arbitrary launch flags
     };
 
+    // A CONTAINER, which is a directory. Checking for `container_meta.json`
+    // rather than merely that the directory exists: `soma serve` refuses an
+    // unconverted checkpoint, and refusing it here costs a stat instead of a
+    // process spawn and a startup timeout.
+    d.validate_model_ref = [](const std::string& model_ref, std::string& detail) {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        if (!fs::is_directory(model_ref, ec)) {
+            detail = fs::is_regular_file(model_ref, ec)
+                         ? "soma loads a converted container DIRECTORY, not a file: " + model_ref
+                         : "no such directory on this node: " + model_ref;
+            return false;
+        }
+        if (!fs::is_regular_file(fs::path(model_ref) / "container_meta.json", ec)) {
+            detail = "not a converted container (no container_meta.json): " + model_ref +
+                     "; admit it through POST /v1/models/admit first";
+            return false;
+        }
+        return true;
+    };
+
     return d;
 }
 
@@ -291,6 +313,19 @@ EngineDescriptor make_llama_descriptor(const std::string& executable) {
     // would silently spawn one llama-server per agent.
     d.launch_compatible = [](const RuntimeSettings& a, const RuntimeSettings& b) {
         return llama_launch_compatible(a, b);
+    };
+
+    // A node-local GGUF FILE. This check used to run in the load-model handler
+    // for every backend, which is why a Soma container could never load.
+    d.validate_model_ref = [](const std::string& model_ref, std::string& detail) {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        if (fs::is_regular_file(model_ref, ec)) return true;
+        detail = mm::util::is_hf_repo_id(model_ref)
+                     ? "llama.cpp requires a node-local GGUF file; Hugging Face repository IDs are "
+                       "not loadable"
+                     : "model file not found on this node: " + model_ref;
+        return false;
     };
     return d;
 }

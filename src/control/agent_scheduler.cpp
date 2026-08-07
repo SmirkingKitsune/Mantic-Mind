@@ -256,20 +256,34 @@ struct PreparedModel {
     std::string mmproj_model_id;
 };
 
+/// `model_ref` is WHERE the weights are; `cfg.model_path` is what the agent calls
+/// them. They are not the same string and conflating them is defect D7.
+///
+/// An admitted model lives at the registry's `model_dir` — since the container
+/// directory carries its quantization, `containers/<name>-q4_g-q6_g-g128`, and
+/// the agent asks for `<name>`. The node resolves whatever it is handed against
+/// its OWN models_dir, so handing it the agent's name means handing it a
+/// directory that does not exist. It used to work because containers were
+/// written to `containers/<name>` and the two strings coincided; the coincidence
+/// was the only thing making it work, and it is gone.
+///
+/// A model with no registry record passes its own path through unchanged, which
+/// is the fallback's GGUF path and must keep working.
 std::optional<PreparedModel> prepare_model_for_node(const NodeInfo& node,
                                                     const AgentConfig& cfg,
+                                                    const std::string& model_ref,
                                                     const std::string& models_dir,
                                                     bool pin,
                                                     bool force,
                                                     std::string* error) {
     PreparedModel prepared;
-    prepared.model_path = cfg.model_path;
+    prepared.model_path = model_ref;
     prepared.mmproj_path = cfg.vision_settings.enabled
         ? cfg.vision_settings.mmproj_path
         : std::string{};
 
     if (const auto model_path =
-            util::resolve_existing_local_model_path(cfg.model_path, models_dir)) {
+            util::resolve_existing_local_model_path(model_ref, models_dir)) {
         const std::string cache_id = manifest_cache_id(*model_path);
         auto local = transfer_model_to_node(
             node, *model_path, pin, force, error, cache_id);
@@ -329,6 +343,25 @@ AgentScheduler::BackendRouting AgentScheduler::resolve_backend(
 
 void AgentScheduler::set_model_registry(const ControlModelRegistry* registry) {
     models_ = registry;
+}
+
+std::string AgentScheduler::model_location(const AgentConfig& cfg) const {
+    // The registry is the AUTHORITY on where an admitted model's bytes are, and
+    // until this existed nothing asked it. resolve_backend_for() has always
+    // looked the record up — it took `arch_hash` and `verdict` off it and threw
+    // `model_dir` away, which is the whole of defect D7.
+    //
+    // Absolute, and deliberately so: the node resolves what it is handed against
+    // its own models_dir, and an absolute path that exists short-circuits that
+    // lookup. When control and the node are different machines the path will not
+    // exist locally on control either, and prepare_model_for_node falls through
+    // to passing it along — the same behaviour an unadmitted model gets.
+    if (models_ != nullptr) {
+        if (const auto admitted = models_->resolve(cfg.model_path)) {
+            if (!admitted->model_dir.empty()) return admitted->model_dir;
+        }
+    }
+    return cfg.model_path;
 }
 
 AgentScheduler::BackendRouting
@@ -831,7 +864,7 @@ std::optional<SlotId> AgentScheduler::restore_agent_on_node(
             && cfg.preferred_node_id == node_id;
         std::string prepare_error;
         const auto prepared = prepare_model_for_node(
-            node, cfg, models_dir_, pin, false, &prepare_error);
+            node, cfg, model_location(cfg), models_dir_, pin, false, &prepare_error);
         if (!prepared) {
             set_last_error("failed to prepare model for restore on node " + node_id
                            + ": " + prepare_error);
@@ -898,7 +931,7 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
 
         std::string prepare_error;
         auto prepared = prepare_model_for_node(
-            node, cfg, models_dir_, pin, false, &prepare_error);
+            node, cfg, model_location(cfg), models_dir_, pin, false, &prepare_error);
         if (!prepared) {
             set_last_error("failed to prepare model for node " + node_id
                            + ": " + prepare_error);
@@ -952,7 +985,7 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
                 && !retried_transfer && model_missing) {
                 prepare_error.clear();
                 auto refreshed = prepare_model_for_node(
-                    node, cfg, models_dir_, pin, true, &prepare_error);
+                    node, cfg, model_location(cfg), models_dir_, pin, true, &prepare_error);
                 if (refreshed) {
                     prepared = std::move(refreshed);
                     retried_transfer = true;

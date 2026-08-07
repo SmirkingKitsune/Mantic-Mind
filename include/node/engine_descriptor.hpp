@@ -79,6 +79,26 @@ struct EngineDescriptor {
     /// Whether two agents may share one live engine process.
     std::function<bool(const RuntimeSettings& a, const RuntimeSettings& b)> launch_compatible;
 
+    /// Is this model reference loadable by THIS engine, on THIS node?
+    ///
+    /// llama.cpp wants a node-local GGUF **file**; Soma wants a converted
+    /// container **directory** with a `container_meta.json` in it. Both are real
+    /// preconditions and neither is the other's.
+    ///
+    /// It lives here because it used to live in the handler, ungated: the
+    /// load-model route validated `backend` against this registry at the top and
+    /// dispatched on it at the bottom, and in between ran llama.cpp's
+    /// `is_regular_file` check against every request. A Soma container is a
+    /// directory, so it could never load — the dispatch that would have sent it
+    /// to the right engine sat twenty lines below the check that refused it.
+    /// That was defect D8, and it is the same shape as every other thing this
+    /// descriptor exists to hold: knowledge about one engine, written down where
+    /// only that engine reads it.
+    ///
+    /// Absent means "nothing to verify", which is a legitimate answer for an
+    /// engine that resolves its own references.
+    std::function<bool(const std::string& model_ref, std::string& detail)> validate_model_ref;
+
     /// The engine's own telemetry paths, relative to its base URL.
     ///
     /// DATA, not a code path: the node proxies whatever is here and never learns

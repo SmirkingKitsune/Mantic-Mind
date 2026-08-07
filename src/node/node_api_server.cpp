@@ -501,23 +501,36 @@ void NodeApiServer::register_routes() {
                 return;
             }
 
-            // llama.cpp always loads a local GGUF file.
             const std::string model_path = sanitize_path_for_runtime(model_ref);
             const std::string mmproj_path = sanitize_path_for_runtime(mmproj_ref);
 
-            if (vision_enabled && mmproj_path.empty()) {
+            // ── engine-specific preconditions ────────────────────────────────
+            //
+            // Everything from here to the dispatch below used to run for EVERY
+            // backend: the projector rules, a llama-runtime readiness check, and
+            // `is_regular_file(model_path)`. All three are llama.cpp's. A Soma
+            // container is a directory, so the third refused every Soma load
+            // twenty lines before the dispatch that would have routed it away
+            // from llama.cpp. Defect D8.
+            //
+            // Vision is llama.cpp's alone — Soma answers 422 for image parts by
+            // contract — so the mmproj rules stay gated on the backend here
+            // rather than becoming a descriptor field no other engine would set.
+            const bool is_llama = (backend == "llama-cpp");
+
+            if (is_llama && vision_enabled && mmproj_path.empty()) {
                 res.status = 400;
                 res.set_content(R"({"error":"vision-enabled llama-cpp load requires mmproj_path"})",
                                 "application/json");
                 return;
             }
-            if (!vision_enabled && !mmproj_path.empty()) {
+            if (is_llama && !vision_enabled && !mmproj_path.empty()) {
                 res.status = 400;
                 res.set_content(R"({"error":"llama.cpp mmproj_path requires vision_enabled=true"})",
                                 "application/json");
                 return;
             }
-            if (!mmproj_path.empty()) {
+            if (is_llama && !mmproj_path.empty()) {
                 std::error_code ec;
                 if (!fs::is_regular_file(mmproj_path, ec)) {
                     res.status = 400;
@@ -531,6 +544,10 @@ void NodeApiServer::register_routes() {
             }
 
             // Fail fast rather than spawn an engine without a usable runtime.
+            // This is llama.cpp's PROVISIONED llama-server binary; Soma's runtime
+            // is the `soma` executable the descriptor already knows how to launch,
+            // and it has no equivalent readiness state to consult.
+            if (is_llama)
             if (const auto rt = state_.get_llama_runtime(); !node_llama_runtime_ready(rt)) {
                 res.status = 503;
                 const std::string msg = rt.last_error.empty()
@@ -544,19 +561,24 @@ void NodeApiServer::register_routes() {
                 return;
             }
 
-            // Model references must resolve to local files on this node.
-            std::error_code model_ec;
-            if (!fs::is_regular_file(model_path, model_ec)) {
-                res.status = 400;
-                const std::string msg = mm::util::is_hf_repo_id(model_path)
-                    ? "llama.cpp requires a node-local GGUF file; Hugging Face repository IDs are not loadable"
-                    : "model file not found on this node: " + model_path;
-                state_.set_last_error(msg);
-                res.set_content(nlohmann::json{{"error", "model not found on node"},
-                                               {"detail", msg},
-                                               {"model_path", model_path}}.dump(),
-                                "application/json");
-                return;
+            // What a loadable model reference IS belongs to the engine, not to
+            // this handler: a GGUF file for llama.cpp, a converted container
+            // directory for Soma. The descriptor was already the registry of
+            // per-engine knowledge — this is one more row in it rather than one
+            // more branch here.
+            if (const auto* desc = mm::EngineRegistry::instance().find(backend);
+                desc != nullptr && desc->validate_model_ref) {
+                std::string detail;
+                if (!desc->validate_model_ref(model_path, detail)) {
+                    res.status = 400;
+                    state_.set_last_error(detail);
+                    res.set_content(nlohmann::json{{"error", "model not found on node"},
+                                                   {"detail", detail},
+                                                   {"engine", backend},
+                                                   {"model_path", model_path}}.dump(),
+                                    "application/json");
+                    return;
+                }
             }
             // The engine id travels with the request now. Which engine to launch,
             // what argv it takes and how to probe it are the descriptor's; this
@@ -1057,6 +1079,12 @@ void NodeApiServer::register_routes() {
                 return;
             }
 
+            // Same gating as load-model, and for the same reason: these are
+            // llama.cpp's preconditions. Ungated they made a suspended Soma slot
+            // unrestorable — the second half of defect D8, in the handler that
+            // brings a slot BACK.
+            const bool is_llama = (backend == "llama-cpp");
+
             if (model_path.empty()) {
                 res.status = 400;
                 state_.set_last_error("model_path required");
@@ -1064,6 +1092,7 @@ void NodeApiServer::register_routes() {
                 return;
             }
 
+            if (is_llama)
             if (const auto rt = state_.get_llama_runtime(); !node_llama_runtime_ready(rt)) {
                 res.status = 503;
                 const std::string msg = rt.last_error.empty()
@@ -1077,19 +1106,19 @@ void NodeApiServer::register_routes() {
                 return;
             }
 
-            if (vision_enabled && mmproj_path.empty()) {
+            if (is_llama && vision_enabled && mmproj_path.empty()) {
                 res.status = 400;
                 res.set_content(R"({"error":"vision-enabled llama-cpp restore requires mmproj_path"})",
                                 "application/json");
                 return;
             }
-            if (!vision_enabled && !mmproj_path.empty()) {
+            if (is_llama && !vision_enabled && !mmproj_path.empty()) {
                 res.status = 400;
                 res.set_content(R"({"error":"llama.cpp mmproj_path requires vision_enabled=true"})",
                                 "application/json");
                 return;
             }
-            if (!mmproj_path.empty()) {
+            if (is_llama && !mmproj_path.empty()) {
                 std::error_code ec;
                 if (!fs::is_regular_file(mmproj_path, ec)) {
                     res.status = 400;
@@ -1099,18 +1128,19 @@ void NodeApiServer::register_routes() {
                     return;
                 }
             }
-            std::error_code model_ec;
-            if (!fs::is_regular_file(model_path, model_ec)) {
-                res.status = 400;
-                const std::string detail = mm::util::is_hf_repo_id(model_path)
-                    ? "llama.cpp requires a node-local GGUF file; Hugging Face repository IDs are not loadable"
-                    : "model file not found on this node during restore: " + model_path;
-                res.set_content(nlohmann::json{
-                    {"error", "model not found on node"},
-                    {"detail", detail},
-                    {"model_path", model_path}
-                }.dump(), "application/json");
-                return;
+            if (const auto* desc = mm::EngineRegistry::instance().find(backend);
+                desc != nullptr && desc->validate_model_ref) {
+                std::string detail;
+                if (!desc->validate_model_ref(model_path, detail)) {
+                    res.status = 400;
+                    state_.set_last_error(detail);
+                    res.set_content(nlohmann::json{{"error", "model not found on node"},
+                                                   {"detail", detail},
+                                                   {"engine", backend},
+                                                   {"model_path", model_path}}.dump(),
+                                    "application/json");
+                    return;
+                }
             }
 
             EngineLoadRequest restore_req;

@@ -2639,6 +2639,11 @@ architecture and records a model, which is precisely the waste this prevents.
   agent with **no C++ change**. That is the whole gate. **`source` may now be a repo id** — see
   [The fetch stage](#the-fetch-stage) — so the gate no longer presumes an operator downloaded the
   weights by hand first.
+  **PASSED END TO END** on `allenai/OLMoE-1B-7B-0924`, 2026-08-06 — a real 7B MoE never seen during
+  development, from a bare repo id to generated tokens. Admission: 4m21s, verdict `hybrid`. Serving:
+  `{"backend":"soma","state":"ready"}` on the container, streaming SSE deltas —
+  *"A colour is the colour of a pigment or dye."* No C++ change was needed to ADMIT it; two defects
+  (D7, D8) had to be fixed before it would SERVE, and both were in code paths no fixture exercises.
 - An architecture with no backend fails with a clear message, before conversion spends hours. **Done** —
   see [The architecture check](#the-architecture-check). `soma plan` now runs on the *source* first, and
   `admission_fetch_stage` proves conversion never started by asserting the container directory does not
@@ -2743,15 +2748,23 @@ wrong. A defect leaves this list by being fixed or by being reclassified with a 
 quiet, and struck-through rather than deleted, because how a defect was found is usually worth more than
 the fix.
 
-**All three are currently resolved.** Two of them turned out to be worse than logged: D3 was recorded as
-stale documentation and was hiding a false claim about the G4 gate; D1 was recorded as a possible auth
-fault and was a retry budget written six times with three different numbers.
+**D1–D3, D7 and D8 are resolved; D4–D6 are open.** All of D4–D8 were found by running the G8 gate
+against a real model — five defects that every unit test in the repo passed straight over, and the two
+that blocked serving were each invisible until the one before it was fixed. That is the argument for
+running a gate rather than reasoning about it: D8 could not be seen until D7 stopped hiding it. Two of the resolved ones turned out worse than logged: D3 was
+recorded as stale documentation and was hiding a false claim about the G4 gate; D1 was recorded as a
+possible auth fault and was a retry budget written six times with three different numbers.
 
 | # | Defect | Found | Severity |
 |---|---|---|---|
 | ~~D1~~ | `control_api_external_token_gate` failed once and passed on re-runs. **Diagnosed and fixed** — not an auth bug; see below. | G8 requantization work | Resolved |
 | ~~D2~~ | The brain grid's tier channel saturated under reduction. **Fixed** — the split now weights by traffic rather than membership; see below. | G7 preview | Resolved |
 | ~~D3~~ | §G4's headings were stale. **Fixed** — and fixing them surfaced a claim that was not merely stale but wrong; see below. | Status review | Resolved |
+| ~~D8~~ | `load-model` and `restore` applied llama.cpp's preconditions to every backend. **Fixed** — `EngineDescriptor::validate_model_ref`. | G8 gate run, after D7 | Resolved |
+| ~~D7~~ | Placement sent the agent's `model_path` to the node instead of the registry's `model_dir`. **Fixed** — `AgentScheduler::model_location()`; the node now receives the container path. Serving is still blocked, by D8. | G8 gate run | Resolved |
+| D6 | `GET /v1/models/{id}/conformance` is documented in external-api.md and **does not exist** — it 404s. The rows are embedded in `GET /v1/models/{id}` instead. | G8 gate run | Medium — a documented route that is not registered, and `require_complete_coverage()` cannot catch it: it checks every registered handler has a scope, never that every documented route is registered. |
+| D5 | `fetch.py` reports **decimal GB** and the C++ progress reports **binary GiB labelled "GB"**. The same transfer prints `13.84 GB` then `12.89 GB`. | G8 gate run | Low — cosmetic, but it reads as a GB of the model going missing mid-fetch. |
+| D4 | `convert.py` cannot read transformers' **fused expert layout** — `mlp.experts.gate_up_proj` / `mlp.experts.down_proj` as 3-D `[n_experts, ...]` tensors — and fails with `REFUSED missing model.layers.0.mlp.experts.0.gate_proj.weight`, naming a tensor the checkpoint was never going to have. | G8 gate run | Medium — no model is blocked *today*, but the format is what recent `transformers` emits and it will become common. |
 
 **D1 — resolved, and it was never an auth bug.** The cause was already written down in the test, three
 lines above the failure:
@@ -2785,6 +2798,129 @@ Three changes:
 would likely have been clean too, since the original was one occurrence in many runs. The fix rests on
 the code evidence rather than on a reproduction, and that is worth saying plainly: if the failure
 returns, the new banner will say whether this diagnosis was right.
+
+**D8 — the node validates llama.cpp's preconditions for every engine.**
+
+Found immediately after fixing D7, by the same request. The node now receives the right path and still
+refuses it:
+
+```
+model file not found on this node: Z:/AI/soma-data/containers\OLMoE-1B-7B-0924-q4_g-q6_g-g128
+```
+
+The directory is there. `POST /api/node/load-model` reads `backend`, checks it against the engine
+registry (line 485), and dispatches on it (line 568) — but between those two points it runs the
+llama.cpp runtime-ready check and `fs::is_regular_file(model_path)` for **every** request. The comment
+above that block says "llama.cpp always loads a local GGUF file", which is true and is not a statement
+about Soma. A Soma container is a directory; `is_regular_file` is false; the load is refused before the
+dispatch that would have sent it to the right engine.
+
+This is the same shape as the SlotManager work at G5: a handler written when there was one engine, with
+its assumptions still standing after a second arrived. The registry lookup at 485 was already converted
+from a string literal for exactly this reason — the conversion stopped one check too early.
+
+**Fixed** by `EngineDescriptor::validate_model_ref`. llama.cpp answers "a node-local GGUF file"; Soma
+answers "a directory containing `container_meta.json`" — a stricter check than mere existence, and worth
+making: `soma serve` refuses an unconverted checkpoint, and refusing it here costs a stat instead of a
+process spawn and a 30-second startup timeout. The handler asks the descriptor and no longer knows what
+either answer is.
+
+**The same defect was in the RESTORE handler**, which is how a suspended slot comes back — so a
+suspended Soma slot could never have been restored either. Found by grepping for the check rather than
+by hitting it, since nothing in this run suspended anything. Both handlers now go through the
+descriptor, and `is_regular_file(model_path)` appears nowhere in the file.
+
+The mmproj rules stay gated on `backend` rather than becoming descriptor fields: vision is llama.cpp's
+alone — Soma answers 422 for image parts by contract — and a field only one engine would ever set is
+worse than an `if` that says why.
+
+**D7 — the registry knows where the model is and placement never asks.**
+
+`AgentScheduler::resolve_backend_for` resolves the agent's `model_path` against the registry and takes
+exactly two fields off the record — `arch_hash` and `verdict`. `prepared.model_path` is then set to
+`cfg.model_path`, the agent's own string, and that is what the node receives. The node looks it up by
+name under `models_dir` and does not find it:
+
+```
+model file not found on this node: OLMoE-1B-7B-0924
+container on disk:                 OLMoE-1B-7B-0924-q4_g-q6_g-g128
+```
+
+**This was working by coincidence and today's requantization fix removed the coincidence.** Containers
+used to be written to `containers/<name>`, which happened to equal the agent's `model_path`, so the
+node's own name lookup found them. Putting the quantization in the directory name — necessary, because
+two quantizations of one model were overwriting each other — broke the accident. The fragility was
+always there: the registry has been the authority on where a model's bytes live since control.db
+existed, and placement has never asked it.
+
+**Fixed** by `AgentScheduler::model_location()`, which asks the registry where the bytes are and falls
+back to the agent's own path when nothing admitted the model — the fallback's GGUF path, which must keep
+working. `prepare_model_for_node` now takes the location as an explicit parameter rather than deriving it
+from `cfg`, so the identity/location distinction is visible at every call site.
+
+Proven live: the same chat request that failed with `model file not found: OLMoE-1B-7B-0924` now sends
+`Z:/AI/soma-data/containers\OLMoE-1B-7B-0924-q4_g-q6_g-g128`. It still fails, for a different reason —
+D8.
+
+**The regression test needed its fixture changed to be able to fail.** `model_registry_makes_soma_routable`
+set `model_dir = "/containers/" + name`, which is exactly the coincidence that hid the defect: with those
+two strings equal, every assertion passes whichever one the scheduler uses. The fixture now carries the
+quantization suffix, and reverting the fix turns it red.
+
+**The question this run answered:** `POST /v1/agents` reporting `inference_backend: "llama-cpp"` was a
+red herring. That field is the agent's API-vs-node-local class, not the engine choice;
+`resolve_backend_for` picks the engine at schedule time and the load request carries it. The node
+received `backend: soma` and refused it anyway — see D8.
+
+**D6 — a documented route that was never registered.** `docs/external-api.md` has described
+`GET /v1/models/{id}/conformance` since the API surface was written; the handler does not exist, and the
+rows come back inside `GET /v1/models/{id}` instead. Found by reading the docs and calling what they
+said.
+
+The coverage check cannot catch this by construction: `require_complete_coverage()` asserts that every
+*registered handler* has a scope-table entry — it walks the routes that exist. Nothing walks the other
+direction, from the documentation to the router. Either register the route (it is four lines, the data
+is already assembled) or delete it from the docs; the first is better, because a client written against
+the document should work.
+
+**D5 — two units, one label.** `fetch.py` prints `total / 1e9` and calls it GB; the C++ `bytes_label()`
+divides by 1024³ and also calls it GB. The same OLMoE transfer reported `13.84 GB` in the manifest line
+and `12.89 GB` in every progress line — the same number, and an operator watching a 14 GB download see a
+gigabyte vanish. One of them should say GiB, or both should use the same base.
+
+**D4 — the admission pipeline reads only the per-expert layout.**
+
+Found by pointing the G8 gate at `hf-internal-testing/tiny-random-OlmoeForCausalLM` as a fast rehearsal
+before the 13.84 GB run. Fetch succeeded; convert refused:
+
+```
+REFUSED  missing model.layers.0.mlp.experts.0.gate_proj.weight
+```
+
+The checkpoint has no such tensor and never would. It carries the **fused** layout that recent
+`transformers` produces — one 3-D tensor per role across all experts:
+
+```
+model.layers.0.mlp.experts.gate_up_proj     [n_experts, d_model, 2 * intermediate]
+model.layers.0.mlp.experts.down_proj        [n_experts, intermediate, d_model]
+```
+
+rather than the per-expert `experts.{i}.gate_proj.weight` the converter expects.
+
+**The real `allenai/OLMoE-1B-7B-0924` is not affected** — checked from its
+`model.safetensors.index.json` alone, 0.3 MB rather than 13.84 GB: 3219 tensors, per-expert names, which
+is what a 2024 upload would have. The tiny-random repos are regenerated against current `transformers`,
+so the probe was *newer* than the model it stands in for. That is worth remembering about
+`hf-internal-testing/*` fixtures generally: they track the library, not the era of the model they mimic.
+
+Two things to fix, and they are separable:
+
+1. **The error names the wrong thing.** "missing X" sends a reader looking for a corrupt download. The
+   truth is "this checkpoint uses an expert layout I do not read", and the converter can tell the
+   difference — it can see `experts.gate_up_proj` sitting right there.
+2. **The layout itself.** Reading it is not hard: slice the 3-D tensor per expert and split `gate_up`
+   down the middle. It is strictly a `tools/admission/convert.py` change, so it does not touch the G8
+   gate's "no C++ change" clause.
 
 **D2 — resolved. The channel was measuring membership when the question is traffic.**
 
