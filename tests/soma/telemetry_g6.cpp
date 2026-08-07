@@ -152,6 +152,90 @@ int main() {
     }
 
     std::cout << "\n6. the rate ceiling is the ENGINE's\n";
+    // ── a SPARSE snapshot, which is the only kind a real engine produces ─────
+    //
+    // MemoryHierarchy::heat() skips every expert that has neither fired nor been
+    // made resident, and each cell carries its own (layer, expert). The wire
+    // format has no coordinates — `counts` and `tiers` are flat arrays read
+    // against `rows` and `cols` — so bucket_heat() owes its caller a DENSE grid.
+    //
+    // make_snapshot() above builds every cell, so nothing here ever exercised
+    // that. On a real OLMoE the passthrough branch emitted 878 entries for a
+    // declared 16x64 grid: every count on the wrong expert, and a consumer that
+    // checks lengths rejects the frame outright. Defect D9.
+    std::cout << "\n0. sparse input densifies\n";
+    {
+        const auto sparse = [](std::uint32_t layers, std::uint32_t experts, std::uint32_t nth) {
+            soma::HeatSnapshot s;
+            s.n_layers = layers;
+            s.n_experts = experts;
+            for (std::uint32_t l = 0; l < layers; ++l) {
+                for (std::uint32_t e = 0; e < experts; ++e) {
+                    if ((l * experts + e) % nth != 0) continue; // the rest never fired
+                    soma::HeatCell c;
+                    c.layer = static_cast<soma::LayerIndex>(l);
+                    c.expert = static_cast<soma::ExpertId>(e);
+                    c.count = 1 + l + e;
+                    c.tier = soma::MemoryTier::Ram;
+                    s.cells.push_back(c);
+                }
+            }
+            return s;
+        };
+
+        // Under the cap: the passthrough branch, which is the one that was wrong.
+        {
+            const auto snap = sparse(16, 64, 7);
+            const auto f = soma::bucket_heat(snap, soma::kMaxBucketedCells);
+            check(f.cells.size() == 16u * 64u,
+                  "a 16x64 sparse snapshot densifies to 1024 cells",
+                  std::to_string(snap.cells.size()) + " in -> " + std::to_string(f.cells.size()));
+
+            // The counts have to land where the coordinates said, not in input
+            // order — that is the whole failure.
+            bool placed = true, totals = true;
+            std::uint64_t sum_in = 0, sum_out = 0;
+            for (const auto& c : snap.cells) sum_in += c.count;
+            for (std::uint32_t l = 0; l < 16 && placed; ++l) {
+                for (std::uint32_t e = 0; e < 64; ++e) {
+                    const auto& cell = f.cells[static_cast<std::size_t>(l) * 64 + e];
+                    sum_out += cell.count;
+                    const bool fired = ((l * 64 + e) % 7 == 0);
+                    if (fired && cell.count != 1 + l + e) placed = false;
+                    if (!fired && cell.count != 0) placed = false;
+                }
+            }
+            if (sum_in != sum_out) totals = false;
+            check(placed, "every count sits at its own (layer, expert)");
+            check(totals, "and the total is conserved",
+                  std::to_string(sum_in) + " == " + std::to_string(sum_out));
+
+            // An expert that never fired and is not resident is on DISK. Vram is
+            // the warmest tier and v1 has none of it — reporting it for the cells
+            // we know least about is the worst available answer.
+            check(f.cells[1].count == 0 && f.cells[1].tier == soma::MemoryTier::Disk,
+                  "an untouched cell reads as Disk, not Vram");
+        }
+
+        // Over the cap: the bucketed branch already scattered by coordinate, so
+        // this is a guard against the fix diverging from it.
+        {
+            const auto snap = sparse(128, 512, 11);
+            const auto f = soma::bucket_heat(snap, soma::kMaxBucketedCells);
+            const std::uint32_t rows = (128 + f.layer_bucket - 1) / f.layer_bucket;
+            const std::uint32_t cols = (512 + f.expert_bucket - 1) / f.expert_bucket;
+            check(f.cells.size() == static_cast<std::size_t>(rows) * cols,
+                  "a bucketed sparse snapshot is dense too",
+                  std::to_string(rows) + "x" + std::to_string(cols) + " = " +
+                      std::to_string(f.cells.size()));
+            std::uint64_t sum_in = 0, sum_out = 0;
+            for (const auto& c : snap.cells) sum_in += c.count;
+            for (const auto& c : f.cells) sum_out += c.count;
+            check(sum_in == sum_out, "with the total conserved",
+                  std::to_string(sum_in) + " == " + std::to_string(sum_out));
+        }
+    }
+
     {
         // The constants the HTTP layer clamps against. Asserted here so a change
         // to either is a deliberate edit to a test rather than a silent widening.

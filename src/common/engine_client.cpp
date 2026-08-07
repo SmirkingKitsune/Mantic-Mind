@@ -230,9 +230,15 @@ void SomaEngineClient::stream_telemetry(TelemetryCallback cb, std::atomic<bool>&
     if (!cb) return;
     httplib::Client cli(normalize_base_url(base_url_));
     cli.set_connection_timeout(5);
-    // No read timeout: the feed is long-lived by design, and stop_flag is the
-    // termination signal. A timeout here would look like the engine going quiet.
-    cli.set_read_timeout(0, 0);
+    // The feed is long-lived by design and stop_flag is the termination signal,
+    // so the timeout is an hour rather than a tick interval.
+    //
+    // It was `set_read_timeout(0, 0)`, which cpp-httplib reads as ZERO seconds
+    // rather than as "no limit" — so the comment above it, "a timeout here would
+    // look like the engine going quiet", described exactly what the line did.
+    // Every read timed out immediately and the stream ended before its first
+    // frame. Defect D10, in all three places it was written.
+    cli.set_read_timeout(std::chrono::seconds{3600});
     if (!api_key_.empty()) cli.set_bearer_token_auth(api_key_);
 
     std::string buf;

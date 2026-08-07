@@ -15,6 +15,8 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
+
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
@@ -25,6 +27,15 @@
 #include <utility>
 
 namespace mm {
+
+/// Upstream read timeout for a proxied SSE stream.
+///
+/// Long and FINITE. `set_read_timeout(0, 0)` reads as zero seconds in
+/// cpp-httplib rather than as "no limit", which made every proxied telemetry
+/// stream close instantly with a clean, empty 200 — defect D10. Infinity is not
+/// the right answer either: a wedged engine should eventually release the socket.
+/// An hour is far beyond any tick interval and far short of forever.
+constexpr std::chrono::seconds kSseUpstreamReadTimeout{3600};
 namespace fs = std::filesystem;
 
 namespace {
@@ -1026,7 +1037,15 @@ void NodeApiServer::register_routes() {
             "text/event-stream",
             [ep, query](std::size_t, httplib::DataSink& sink) {
                 httplib::Client cli(ep.base_url);
-                cli.set_read_timeout(0, 0);
+                // cpp-httplib reads this as ZERO seconds, not "no limit": set_read_timeout(0, 0)
+                // makes every read time out immediately. On an SSE proxy that presents as a
+                // clean, empty 200 — headers go out, the inner Get fails at once, and the
+                // client sees a stream that ends without a single frame. Measured against a
+                // live engine that was streaming perfectly one hop upstream.
+                //
+                // A long FINITE timeout instead of trying to express infinity: a wedged
+                // engine should eventually release the socket rather than pin it forever.
+                cli.set_read_timeout(kSseUpstreamReadTimeout);
                 const bool ok = cli.Get(
                     (ep.telemetry_path + query).c_str(),
                     [&](const char* data, std::size_t len) {

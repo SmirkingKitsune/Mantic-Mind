@@ -2377,11 +2377,14 @@ store; SSE telemetry with throttling; `/v1/models` reclamation.
 - `hz` clamps to 10; `resolution=full` requires the explicit parameter. **Done** in the ENGINE —
   measured on the wire, `?hz=1000` produces 15 frames in 1.5 s rather than 1500. Control's
   `/v1/engines/{id}/telemetry` re-publishes it and inherits the ceiling.
-- A client requesting maximum telemetry on a 60k-expert model does not measurably affect chat latency —
-  the aggregation-in-engine claim, verified rather than asserted. **Structurally done, not yet
-  measured**: one channel samples for all watchers, nothing is emitted per token, and the grid is capped
-  at 4096 cells. The latency comparison itself needs a model with tens of thousands of experts, which
-  the committed fixtures are three orders of magnitude away from.
+- A client requesting maximum telemetry does not measurably affect chat latency — the
+  aggregation-in-engine claim, verified rather than asserted. **MEASURED** on the admitted OLMoE
+  (16x64 = 1024 expert cells), 10 order-balanced pairs at the 10 Hz ceiling with `resolution=full`:
+  **median delta -0.74%**, range -4.39% to +2.07%, against baseline noise of 3.05%. Within noise. Not
+  the 60k-expert model the line imagines — see the caveat under
+  [Telemetry against a live model](#telemetry-against-a-live-model).
+- **The converse is badly false and the gate never asked**: a chat COLLAPSES telemetry, 17.3 frames/s
+  idle to 1.3/s during generation. Logged as D11.
 - Image content parts return **422**, not a dropped part.
 - A sequence restored into a **different process** continues its conversation rather than starting a new
   one that happens to share a cache. **Done** — checkpoint format v3 carries `rng_state` and the emitted
@@ -2748,7 +2751,7 @@ wrong. A defect leaves this list by being fixed or by being reclassified with a 
 quiet, and struck-through rather than deleted, because how a defect was found is usually worth more than
 the fix.
 
-**D1–D3, D7 and D8 are resolved; D4–D6 are open.** All of D4–D8 were found by running the G8 gate
+**D1–D3 and D7–D10 are resolved; D4–D6 and D11 are open.** All of D4–D8 were found by running the G8 gate
 against a real model — five defects that every unit test in the repo passed straight over, and the two
 that blocked serving were each invisible until the one before it was fixed. That is the argument for
 running a gate rather than reasoning about it: D8 could not be seen until D7 stopped hiding it. Two of the resolved ones turned out worse than logged: D3 was
@@ -2762,6 +2765,9 @@ possible auth fault and was a retry budget written six times with three differen
 | ~~D3~~ | §G4's headings were stale. **Fixed** — and fixing them surfaced a claim that was not merely stale but wrong; see below. | Status review | Resolved |
 | ~~D8~~ | `load-model` and `restore` applied llama.cpp's preconditions to every backend. **Fixed** — `EngineDescriptor::validate_model_ref`. | G8 gate run, after D7 | Resolved |
 | ~~D7~~ | Placement sent the agent's `model_path` to the node instead of the registry's `model_dir`. **Fixed** — `AgentScheduler::model_location()`; the node now receives the container path. Serving is still blocked, by D8. | G8 gate run | Resolved |
+| D11 | **A chat starves the telemetry feed.** Measured on the live engine: 17.3 frames/s idle, **1.3/s during generation**, 18.7/s after. Fully recovers. The brain grid goes nearly static exactly while the model is working — the one moment an operator is watching it. | #11, on the real OLMoE | Medium — no data is wrong, but the feed is useless when it matters. Suspected lock contention between the telemetry sampler and the step loop. |
+| ~~D10~~ | Every proxied SSE stream closed instantly with a clean, empty 200: `set_read_timeout(0, 0)` is ZERO seconds in cpp-httplib, not "no limit". Three sites. **Fixed**. | #11, on the real OLMoE | Resolved |
+| ~~D9~~ | The heat frame declared a dense `rows x cols` grid and carried a SPARSE array — 878 entries for a 16x64 grid on a real model. **Fixed** — `bucket_heat`'s passthrough branch densifies. | #11, on the real OLMoE | Resolved |
 | D6 | `GET /v1/models/{id}/conformance` is documented in external-api.md and **does not exist** — it 404s. The rows are embedded in `GET /v1/models/{id}` instead. | G8 gate run | Medium — a documented route that is not registered, and `require_complete_coverage()` cannot catch it: it checks every registered handler has a scope, never that every documented route is registered. |
 | D5 | `fetch.py` reports **decimal GB** and the C++ progress reports **binary GiB labelled "GB"**. The same transfer prints `13.84 GB` then `12.89 GB`. | G8 gate run | Low — cosmetic, but it reads as a GB of the model going missing mid-fetch. |
 | D4 | `convert.py` cannot read transformers' **fused expert layout** — `mlp.experts.gate_up_proj` / `mlp.experts.down_proj` as 3-D `[n_experts, ...]` tensors — and fails with `REFUSED missing model.layers.0.mlp.experts.0.gate_proj.weight`, naming a tensor the checkpoint was never going to have. | G8 gate run | Medium — no model is blocked *today*, but the format is what recent `transformers` emits and it will become common. |
@@ -2798,6 +2804,83 @@ Three changes:
 would likely have been clean too, since the original was one occurrence in many runs. The fix rests on
 the code evidence rather than on a reproduction, and that is worth saying plainly: if the failure
 returns, the new banner will say whether this diagnosis was right.
+
+#### Telemetry against a live model
+
+The G6 line asked whether a client at maximum telemetry measurably costs chat latency. Measured on the
+admitted OLMoE — 16 layers x 64 experts, 1024 cells — with a watcher at `hz=10&resolution=full`, ten
+pairs, the order of the two arms alternating so any drift cancels:
+
+```
+baseline median  3.384s   sd 0.103s
+loaded   median  3.314s   sd 0.126s
+per-pair delta   median -0.74%   range -4.39% to +2.07%
+baseline noise   sd is 3.05% of median
+```
+
+**Within noise.** The aggregation-in-engine claim holds at this scale.
+
+**The caveat, stated rather than glossed:** the line says "a 60k-expert model" and this is 1024 cells.
+That is three orders of magnitude closer than the 4x16 fixtures and still not what was asked. What the
+measurement does establish is that the cost is not per-token — it is per-frame and bounded by grid size,
+which is the mechanism the claim rests on. A 6144-cell model is 6x the frame payload at the same tick
+rate, not 6x the interference.
+
+**The converse is what the measurement actually found, and the gate never asked about it.** A chat
+collapses the feed: 17.3 frames/s idle, **1.3/s during generation**, 18.7/s after. Logged as D11.
+Telemetry does not slow chat; chat all but stops telemetry.
+
+**Three attempts, two of them invalid, and the honest part is why.** The first measured baseline against
+baseline — the watcher received zero frames because of D10 — and reported "within noise" from data where
+the treatment was never applied. It also drifted 5.8s to 16.8s as one conversation grew turn by turn.
+The second fixed the drift by passing a fresh `conversation_id`, which is a hint for an EXISTING
+conversation, so every chat answered "conversation not found" in milliseconds and all ten pairs were
+discarded. Only the discard guard — added after the first failure, on the principle that a measurement
+which cannot tell whether its treatment was applied is not a measurement — kept a run of instant
+failures from being reported as a very fast result.
+
+**D9 — a wire format that promised density and delivered a sparse list.**
+
+`MemoryHierarchy::heat()` returns a SPARSE snapshot: it skips every expert that
+has neither fired nor been made resident, and each `HeatCell` carries its own
+`(layer, expert)`. The wire format has no coordinates — `heat_frame_json` emits
+`counts` and `tiers` as flat arrays beside `rows` and `cols`, so a consumer reads
+them as dense and indexes `r * cols + c`.
+
+`bucket_heat` has two branches. The bucketed one always built a dense grid and
+scattered sources into it by coordinate. The passthrough one — taken when the
+grid is already under the 4096 cap — did `out.cells = snapshot.cells`, copying
+the sparse list straight through. On the real OLMoE that produced a frame
+declaring **16x64** and carrying **878** entries: every count on the wrong
+expert, and a length-checking consumer rejecting the frame outright. The G7 brain
+grid would have shown "no heat frame yet" against every real model, forever.
+
+Two branches of one function disagreeing about their own output format, with
+only one of them tested — because `make_snapshot()` in `soma_telemetry_g6` builds
+every cell. A dense fixture cannot exercise a densify step. The regression now
+feeds a deliberately sparse snapshot through BOTH branches and checks that counts
+land at their own coordinates and that totals are conserved.
+
+Fixed alongside it: a bucket that received no sources kept its `Vram` seed and
+reported the WARMEST tier for the cells we know least about — in a CPU-only v1
+where the VRAM tier is always empty. Absent now reads as Disk, which is what
+`heat()` skipping a cell actually means.
+
+**D10 — every proxied SSE stream closed before its first frame.**
+
+`cli.set_read_timeout(0, 0)` reads as ZERO seconds in cpp-httplib, not as "no limit". On an SSE proxy
+that presents as a clean, empty 200: headers go out, the inner `Get` times out immediately, `!ok` fires
+`sink.done()`, and the client sees a stream that ends without a frame. No error anywhere.
+
+Three sites, all with comments stating the opposite intent. The best of them read *"No read timeout: the
+feed is long-lived by design... A timeout here would look like the engine going quiet"* — directly above
+the line that made it go quiet instantly.
+
+Fixed with a long FINITE timeout rather than an attempt at infinity: a wedged engine should eventually
+release the socket. An hour is far beyond any tick interval and far short of forever.
+
+`engine_telemetry_republication` passes and always did — it runs against a stand-in node whose handler
+answers directly, so the proxy path it was written to cover was never executed by it.
 
 **D8 — the node validates llama.cpp's preconditions for every engine.**
 
