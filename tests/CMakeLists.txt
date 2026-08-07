@@ -70,6 +70,15 @@ set_tests_properties(mm_reliability_tests PROPERTIES
     ENVIRONMENT "MM_TEST_SOMA_PATH=$<TARGET_FILE:soma>;MM_TEST_MODEL_DIR=${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/Qwen3-30B-A3B;MM_TEST_PYTHON=${Python3_EXECUTABLE};MM_TEST_CONTAINER_DIR=${CMAKE_SOURCE_DIR}/tests/fixtures/containers/Qwen3-30B-A3B")
 
 if(Python3_Interpreter_FOUND)
+    # The direction require_complete_coverage() cannot walk. It asserts every
+    # REGISTERED handler has a scope; nothing asserted that every DOCUMENTED
+    # route was ever registered, and one sat unbuilt from the day the API
+    # document was written.
+    add_test(NAME mm_api_docs_check
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_SOURCE_DIR}/tools/ci/check_api_docs.py"
+                     "${CMAKE_SOURCE_DIR}")
+
     # Pure, no network, no huggingface_hub: which files a repo transfer takes is
     # both the economic argument for this stage and its safety boundary.
     add_test(NAME mm_fetch_selection

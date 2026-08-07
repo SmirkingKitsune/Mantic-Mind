@@ -85,6 +85,24 @@ nlohmann::json admitted_model_json(const AdmittedModel& m) {
     };
 }
 
+/// The conformance ladder as an array, for the two routes that publish it.
+///
+/// One builder because two would drift, and the thing they would drift about is
+/// which field a client should read. `status` is that field — `passed` stays for
+/// clients written against the original shape, but a boolean cannot express
+/// "did not run", and that is what most of this ladder says on a serving host.
+nlohmann::json conformance_json(const ControlModelRegistry& models, std::int64_t model_id) {
+    auto stages = nlohmann::json::array();
+    for (const auto& c : models.conformance(model_id)) {
+        stages.push_back(nlohmann::json{{"stage", c.stage},
+                                        {"status", c.status},
+                                        {"passed", c.passed},
+                                        {"detail", c.detail},
+                                        {"ran_at_ms", c.ran_at_ms}});
+    }
+    return stages;
+}
+
 nlohmann::json admission_progress_json(const AdmissionProgress& p) {
     return nlohmann::json{
         {"operation_id", p.operation_id},
@@ -2925,22 +2943,28 @@ void ControlApiServer::register_routes() {
                         "application/json");
     });
 
+    // Documented since the API surface was written, and until D10-era testing
+    // nobody called it: the rows came back inside GET /v1/models/{id} and this
+    // path 404'd. Registered rather than struck from the docs, because a client
+    // written against the document should work — and because a caller who wants
+    // only the ladder should not have to fetch the whole record to read it.
+    server_->Get("/v1/models/:id/conformance", [this](const Request& req, Response& res) {
+        if (models_ == nullptr) { res.status = 503; return; }
+        const auto model = models_->find_by_id(parse_model_id(req.path_params.at("id")));
+        if (!model) { res.status = 404; return; }
+        res.set_content(nlohmann::json{{"model_id", model->id},
+                                       {"arch_hash", model->arch_hash},
+                                       {"conformance", conformance_json(*models_, model->id)}}
+                            .dump(),
+                        "application/json");
+    });
+
     server_->Get("/v1/models/:id", [this](const Request& req, Response& res) {
         if (models_ == nullptr) { res.status = 503; return; }
         const auto model = models_->find_by_id(parse_model_id(req.path_params.at("id")));
         if (!model) { res.status = 404; return; }
         auto j = admitted_model_json(*model);
-        auto& stages = j["conformance"] = nlohmann::json::array();
-        for (const auto& c : models_->conformance(model->id)) {
-            // `status` is the field to read. `passed` stays for clients written
-            // against the old shape, but it cannot express "did not run" — and
-            // that is what most of this ladder says on a serving host.
-            stages.push_back(nlohmann::json{{"stage", c.stage},
-                                            {"status", c.status},
-                                            {"passed", c.passed},
-                                            {"detail", c.detail},
-                                            {"ran_at_ms", c.ran_at_ms}});
-        }
+        j["conformance"] = conformance_json(*models_, model->id);
         res.set_content(j.dump(), "application/json");
     });
 

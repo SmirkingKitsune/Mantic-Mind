@@ -2730,6 +2730,7 @@ entry, and **no lint or format job** — there are no format config files in the
 | `seam-check` | G0 | `tools/ci/check_seam.py` — R1 include discipline, R2 no arch names in core code |
 | `soma-conformance` | G0 | The full ladder on tiny-random fixtures, **per family**, every commit |
 | `ui-api-check` | G7 | `tools/ci/check_ui_api.py` — no Soma panel includes a header carrying in-process state |
+| `api-docs-check` | G8 | `tools/ci/check_api_docs.py` — every documented route exists, or is marked `(planned)` |
 | `format-check` | G0 | `.clang-format` + `.clang-tidy` — neither exists today |
 | `aarch64-cross` | G5 | `vcpkg-aarch64-linux-release` exists as a preset and CI has never used it |
 
@@ -2751,9 +2752,8 @@ wrong. A defect leaves this list by being fixed or by being reclassified with a 
 quiet, and struck-through rather than deleted, because how a defect was found is usually worth more than
 the fix.
 
-**D1–D3 and D7–D11 are resolved; D4–D6 are open** — the three remaining are a converter format, a
-units label, and a documented route that was never registered. Every defect that blocked a gate is
-closed. All of D4–D8 were found by running the G8 gate
+**D1–D3 and D6–D11 are resolved; D4 and D5 are open** — a converter format and a units label. Every defect
+that blocked a gate is closed. All of D4–D8 were found by running the G8 gate
 against a real model — five defects that every unit test in the repo passed straight over, and the two
 that blocked serving were each invisible until the one before it was fixed. That is the argument for
 running a gate rather than reasoning about it: D8 could not be seen until D7 stopped hiding it. Two of the resolved ones turned out worse than logged: D3 was
@@ -2770,7 +2770,7 @@ possible auth fault and was a retry budget written six times with three differen
 | ~~D11~~ | A chat starved the telemetry feed — 1.3 frames/s during generation against 17.3 idle. **Fixed** — the sampler no longer waits on the work it measures; **16.1/s** during generation now. | #11, on the real OLMoE | Resolved |
 | ~~D10~~ | Every proxied SSE stream closed instantly with a clean, empty 200: `set_read_timeout(0, 0)` is ZERO seconds in cpp-httplib, not "no limit". Three sites. **Fixed**. | #11, on the real OLMoE | Resolved |
 | ~~D9~~ | The heat frame declared a dense `rows x cols` grid and carried a SPARSE array — 878 entries for a 16x64 grid on a real model. **Fixed** — `bucket_heat`'s passthrough branch densifies. | #11, on the real OLMoE | Resolved |
-| D6 | `GET /v1/models/{id}/conformance` is documented in external-api.md and **does not exist** — it 404s. The rows are embedded in `GET /v1/models/{id}` instead. | G8 gate run | Medium — a documented route that is not registered, and `require_complete_coverage()` cannot catch it: it checks every registered handler has a scope, never that every documented route is registered. |
+| ~~D6~~ | `GET /v1/models/{id}/conformance` was documented and never registered. **Fixed** — registered, plus `check_api_docs.py` walking the direction `require_complete_coverage()` cannot. | G8 gate run | Resolved |
 | D5 | `fetch.py` reports **decimal GB** and the C++ progress reports **binary GiB labelled "GB"**. The same transfer prints `13.84 GB` then `12.89 GB`. | G8 gate run | Low — cosmetic, but it reads as a GB of the model going missing mid-fetch. |
 | D4 | `convert.py` cannot read transformers' **fused expert layout** — `mlp.experts.gate_up_proj` / `mlp.experts.down_proj` as 3-D `[n_experts, ...]` tensors — and fails with `REFUSED missing model.layers.0.mlp.experts.0.gate_proj.weight`, naming a tensor the checkpoint was never going to have. | G8 gate run | Medium — no model is blocked *today*, but the format is what recent `transformers` emits and it will become common. |
 
@@ -3005,16 +3005,35 @@ red herring. That field is the agent's API-vs-node-local class, not the engine c
 `resolve_backend_for` picks the engine at schedule time and the load request carries it. The node
 received `backend: soma` and refused it anyway — see D8.
 
-**D6 — a documented route that was never registered.** `docs/external-api.md` has described
-`GET /v1/models/{id}/conformance` since the API surface was written; the handler does not exist, and the
-rows come back inside `GET /v1/models/{id}` instead. Found by reading the docs and calling what they
-said.
+**D6 — resolved, and the check written for it found a second one.**
 
-The coverage check cannot catch this by construction: `require_complete_coverage()` asserts that every
-*registered handler* has a scope-table entry — it walks the routes that exist. Nothing walks the other
-direction, from the documentation to the router. Either register the route (it is four lines, the data
-is already assembled) or delete it from the docs; the first is better, because a client written against
-the document should work.
+`GET /v1/models/{id}/conformance` was described in `docs/external-api.md` from the day the API surface
+was written and never registered. It answered 404 for its entire life. Found by reading the document and
+calling what it said.
+
+Registered rather than struck from the docs — a client written against the document should work, and a
+caller who wants only the ladder should not have to fetch the whole record to read it. Both routes now
+share one `conformance_json()` builder, because two would drift and the thing they would drift about is
+which field a client should read.
+
+**The structural half matters more.** `require_complete_coverage()` walks REGISTERED handlers and
+asserts each has a scope. Nothing walked from the documentation to the router, so a documented route
+that was never built raised nothing, forever. `tools/ci/check_api_docs.py` closes it:
+
+```
+external-api.md  ->  route_scope.cpp's table   (check_api_docs.py, at build)
+route_scope.cpp  ->  registered handlers       (require_complete_coverage, at startup)
+```
+
+Together those are bidirectional; neither alone is.
+
+**On its first run it found `POST /v1/engines/{id}/slots/{n}/suspend`** — also documented, also
+unregistered. That one is different: its own section says "there is no `/v1/*` route for either.
+Promoted because P1 says a capability the system has is a capability the API exposes." It is a DESIGN
+entry, not a broken promise. But nothing in the heading let a reader tell a shipped route from a
+proposed one without calling it, which is the same ambiguity in a milder form. Headings now carry an
+explicit `(planned)` marker, the check reports those separately rather than failing them, and the
+document opens by saying what the marker means. Anything unmarked must exist.
 
 **D5 — two units, one label.** `fetch.py` prints `total / 1e9` and calls it GB; the C++ `bytes_label()`
 divides by 1024³ and also calls it GB. The same OLMoE transfer reported `13.84 GB` in the manifest line

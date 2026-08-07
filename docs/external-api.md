@@ -1,5 +1,22 @@
 # External Client API — `/v1/*`
 
+## Reading this document
+
+A route heading marked **(planned)** describes a capability that is designed and
+argued for but **not yet registered** — calling it answers 404. Everything else
+describes a route that exists; `tools/ci/check_api_docs.py` fails the build if an
+unmarked heading has no entry in the scope table.
+
+That check exists because `GET /v1/models/{id}/conformance` sat here unmarked and
+unregistered from the day this document was written. `require_complete_coverage()`
+walks registered handlers and asserts each has a scope; nothing walked the other
+way, so a documented route that was never built raised nothing. A documented route
+that does not exist is worse than an undocumented one — it is a promise, and a
+client written against it fails with a 404 that reads as a missing resource
+rather than a missing endpoint.
+
+---
+
 > **P1 — the API is the single control plane.** Every capability Soma introduces is reachable here.
 > The FTXUI TUI is *one client*; a separate SvelteKit debug stack is another. If the TUI can do it, an
 > API client can do it through the same route. There are no TUI-only features and no internal-only
@@ -336,7 +353,7 @@ Nothing like `sequences` exists today: the node keeps one `active_requests` coun
 llama-server assigns its own internal slots invisibly. A stalled sequence and a saturated batch look
 identical from a request counter.
 
-### `POST /v1/engines/{id}/slots/{n}/suspend` | `/restore` — `operator`
+### `POST /v1/engines/{id}/slots/{n}/suspend` | `/restore` — `operator` (planned)
 
 **The first operator-visible suspend/restore.** Both mechanisms exist today but only as internal
 scheduler decisions reachable through the node API; there is no `/v1/*` route for either. Promoted

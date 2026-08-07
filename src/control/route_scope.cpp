@@ -156,6 +156,7 @@ std::vector<RouteScope> route_scope_table() {
         {"GET", "/v1/models/:id", Scope::Read},
         {"GET", "/v1/models/:id/plan", Scope::Read},
         {"GET", "/v1/models/:id/heat", Scope::Read},
+        {"GET", "/v1/models/:id/conformance", Scope::Read},
         {"GET", "/v1/models/admissions", Scope::Read},
         {"GET", "/v1/models/admissions/:op", Scope::Read},
         // THE motivating case. Hours of CPU and tens of GB of disk.
