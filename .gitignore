@@ -19,6 +19,11 @@
 /logs/
 /models/
 *.gguf
+# ...except the test fixture. It is 244 KiB of random weights with a real llama
+# architecture, built by tools/testing/make_tiny_gguf.py, and engine_g5 §12 needs
+# it to start a real llama-server. Excluding it would leave the G8 coexistence
+# criterion covered on exactly one machine.
+!/tests/fixtures/gguf/*.gguf
 
 # Local third-party checkouts
 /external/llama.cpp/

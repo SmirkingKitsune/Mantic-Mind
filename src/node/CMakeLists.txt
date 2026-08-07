@@ -70,11 +70,24 @@ if(BUILD_TESTING)
     # streaming path real: a plain checkpoint is resident, so its expert cache
     # and heat grid are empty by construction. The fixtures carry config.json
     # now, so the engine can open one straight from the repo.
+    # Arguments 4 and 5 are the FALLBACK engine, for §12's coexistence check.
+    # The GGUF is committed — 244 KiB of random weights with a real llama
+    # architecture, built by tools/testing/make_tiny_gguf.py, because nothing
+    # else in the tree is loadable by llama-server (the tiny fixtures carry no
+    # tokenizer and the vocab-only GGUFs carry no weights).
+    #
+    # llama-server itself is NOT committed: it is provisioned per host. Point
+    # MM_LLAMA_SERVER at one to cover the criterion; without it §12 skips and
+    # says so in the verdict line rather than reporting a silent green.
+    set(MM_LLAMA_SERVER "" CACHE FILEPATH
+        "llama-server binary; enables engine_g5 §12 (Soma + llama.cpp coexistence)")
     add_test(NAME soma_engine_g5
              COMMAND soma_engine_g5
                      "$<TARGET_FILE:soma>"
                      "${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/Qwen3-30B-A3B"
-                     "${CMAKE_SOURCE_DIR}/tests/fixtures/containers/Qwen3-30B-A3B")
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/containers/Qwen3-30B-A3B"
+                     "${MM_LLAMA_SERVER}"
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/gguf/tiny-llama-f16.gguf")
 
     # On Windows both binaries resolve OpenSSL/SQLiteCpp/spdlog beside the .exe or
     # from PATH; with neither, the loader fails with 0xC0000135 before main() and

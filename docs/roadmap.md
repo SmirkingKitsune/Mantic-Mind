@@ -2343,15 +2343,30 @@ registry, `EngineClient` with virtual `stream_complete`, `KvCheckpointBackend` �
 **Gate:**
 - The existing `reliability_tests` suite still passes. The fallback must not regress; this is the gate
   where that risk is real.
-- **Mixtral-8x7B admits as `resident-only` and routes to the fallback with no operator action.** The
-  negative fixture is a pass condition, not a footnote — a system that cannot recognize what it is bad
+- **Mixtral-8x7B admits as `resident-only` and routes to the fallback with no operator action.**
+  **Done** — `routing_g5` §4 asserts `mp.verdict == ResidentOnly` and `select_backend(cfg(), …).choice ==
+  Fallback`, where `cfg()` carries no override, which is what "no operator action" means. It also pins
+  the reason: on a tight host Mixtral and Qwen3 get DIFFERENT verdicts, and Mixtral moves >3x the bytes
+  per token despite comparable size — active fraction, not size, is what makes streaming viable.
+  The negative fixture is a pass condition, not a footnote — a system that cannot recognize what it is bad
   at will happily be bad at it.
-- A Soma agent and a fallback agent run **concurrently on the same node**.
+- A Soma agent and a fallback agent run **concurrently on the same node**. **Done** — `engine_g5` §12
+  runs the real `soma` binary and a real `llama-server` under one supervisor: distinct slots, distinct
+  ports (8240/8241), both `Ready` simultaneously, each attributed to its own descriptor, each reachable
+  through its own client, and unloading one leaves the other Ready. See
+  [Two engines, one supervisor](#two-engines-one-supervisor).
 - A converted model directory sizes correctly. Assert the old flat-2048 MB path is gone by checking a
   multi-shard fallback model too. **Done** — `measure_model_bytes()` sizes directories recursively and
   `multi_shard_directory_sizes_correctly` asserts two different directories no longer size identically.
-- Killing a Soma process is detected by the watchdog within one poll interval, and the engine transitions
-  to `Error` rather than advertising `Ready`.
+- Killing a Soma process is detected by the watchdog ~~within one poll interval~~ **immediately**, and the
+  engine transitions to `Error` rather than advertising `Ready`. **Done** — `engine_g5` §6 kills the child
+  by port and asserts `SlotState::Ready` -> `SlotState::Error`, that the slot RECORD survives (a removed
+  record reads as an engine that was never there), and that `acquire()` then refuses it. The original
+  wording described an implementation that was never built: the watchdog is not a poll loop but a blocking
+  `WaitForSingleObject(…, INFINITE)` / `waitpid` on its own thread, so there is no interval to be within.
+  Struck rather than reworded, because a criterion quietly edited to match the code stops being a check on
+  it. §3 asserts the same crash one layer down at `ProcessState::Crashed`; that one is NOT this criterion,
+  and reading it as such is the mistake this pass was looking for.
 - `capacity_pressure` as a structured code drives evict-and-retry, with the substring matcher deleted.
   **Half done, and the second half is now a deployment decision rather than a code one** — the structured
   code drives eviction and is tested; the matcher survives on purpose. See
@@ -2390,7 +2405,10 @@ store; SSE telemetry with throttling; `/v1/models` reclamation.
   [Telemetry against a live model](#telemetry-against-a-live-model).
 - **The converse was badly false and the gate never asked**: a chat COLLAPSED telemetry, 17.3 frames/s
   idle to 1.3/s during generation. Found by this measurement, fixed as D11 — now 16.1/s.
-- Image content parts return **422**, not a dropped part.
+- Image content parts return **422**, not a dropped part. **NOT met as worded — see D12.** The 422 is
+  real and tested (`scope_negatives_over_http`), but it gates on the AGENT PROFILE's
+  `vision_settings.enabled`, never on whether the engine can accept an image. This criterion sits in the
+  Soma section and Soma is text-only, so it is asking a question nothing answers.
 - A sequence restored into a **different process** continues its conversation rather than starting a new
   one that happens to share a cache. **Done** — checkpoint format v3 carries `rng_state` and the emitted
   history; `soma_checkpoint_g3` §2b resumes into a fresh `Scheduler` and compares against both the
@@ -2818,6 +2836,9 @@ possible auth fault and was a retry budget written six times with three differen
 | ~~D9~~ | The heat frame declared a dense `rows x cols` grid and carried a SPARSE array — 878 entries for a 16x64 grid on a real model. **Fixed** — `bucket_heat`'s passthrough branch densifies. | #11, on the real OLMoE | Resolved |
 | ~~D6~~ | `GET /v1/models/{id}/conformance` was documented and never registered. **Fixed** — registered, plus `check_api_docs.py` walking the direction `require_complete_coverage()` cannot. | G8 gate run | Resolved |
 | ~~D5~~ | One transfer reported two sizes: decimal GB in Python, binary GiB labelled "GB" in C++. **Fixed** — one formatter, `util::bytes_label`, binary with binary labels. | G8 gate run | Resolved |
+| ~~D13~~ | No test ran a real Soma engine and a real llama.cpp engine on one supervisor. **Fixed** — `engine_g5` §12, with a committed 244 KiB GGUF fixture. | G8 criteria confirmation | Resolved |
+| D14 | **The descriptor launch path drops `n_gpu_layers`.** `RuntimeSettings::n_gpu_layers` is plumbed through the node and passed to llama-server as `--gpu-layers` by `llama_runtime.cpp:191` — the pre-rebuild path. `make_llama_descriptor`'s `build_launch` never passes it, so an engine started through `EngineSupervisor` always takes llama.cpp's default (all layers on GPU) regardless of the setting. | D13 work | Medium — a configured setting silently ignored, and the wrong direction: it over-commits VRAM rather than under-committing. |
+| D12 | **Nothing stops an image part from being routed to Soma.** `EngineDescriptor::supports_vision` is `false` for Soma and `true` for llama.cpp — and is never read outside the file that defines it. All three 422 gates test `cfg.vision_settings.enabled`; backend selection ignores vision entirely. An agent with vision enabled whose model earns `Streamable` routes to a text-only engine with `vision_enabled: true` in its load request. | G8 criteria confirmation | Medium — a wrong answer rather than a crash, which is the kind that survives. |
 | D4 | `convert.py` cannot read transformers' **fused expert layout**. The misleading error is **fixed** — it now names the layout and shows the shapes. Reading the layout is deliberately NOT implemented; see below. | G8 gate run | Low, and deliberately parked — no oracle exists at the pinned `transformers` to verify an implementation against. |
 
 **D1 — resolved, and it was never an auth bug.** The cause was already written down in the test, three
@@ -2877,6 +2898,56 @@ CHECK failed at line 1411: resp.status != 0
 do not make it impossible. What has changed is only that the next occurrence will say which of the two
 findings it is. That is the whole claim; the earlier "resolved" was stronger than the evidence, which is
 why the recurrence is recorded here rather than quietly re-fixed.
+
+#### Two engines, one supervisor
+
+The coexistence criterion had no test, and the nearest thing to one asserted the opposite arrangement
+(§5: two Soma agents SHARING a process — that is Soma's per-sequence KV slot, not coexistence). So the
+"Soma is a peer, not a replacement" claim rested on code nothing ran.
+
+**The obstacle was a fixture, not a test.** llama-server needs a GGUF and nothing in the tree could
+supply one: `tests/fixtures/tiny/*` are weights+config only, carrying no tokenizer, because the fp32
+oracle feeds raw token ids and never needed one; llama.cpp's own `ggml-vocab-*.gguf` are the mirror
+image, vocab with no weights, and llama-server dies on them with "missing tensor 'token_embd.weight'".
+The real 13 GB source converts, and a multi-gigabyte artifact is not a fixture — a test whose fixture
+cannot be committed is a test that only ever runs on one machine.
+
+So `tools/testing/make_tiny_gguf.py` writes the smallest thing that is still genuinely a llama model:
+2 layers, d=64, a real SPM vocab with byte fallback, random weights. **244 KiB**, committed. Verified
+loadable end to end before being used — llama-server reports `arch = llama`, `n_vocab = 296`, tokenizes
+via byte fallback, and generates from token ids.
+
+Random weights are the point rather than a compromise. §12 asserts that two engine types COEXIST; no
+logit participates in that. What it deliberately does NOT assert is anything llama.cpp generates — random
+logits produce random tokens, which are invalid UTF-8, and llama-server errors building a response string
+from them. That is inherent to a random model, and asserting around it would be asserting noise.
+
+**§12 was already load-bearing before it was written.** `engine_supervisor.cpp` carries the comment
+"From the descriptor, never the literal `llama-cpp`. `make_slot_info()` used to hardcode it, so every
+slot reported the same backend regardless." That was a real bug, and until §12 no test could have caught
+it regressing, because no test ran two different engine types. Re-introducing it — pinning
+`info.backend` to a literal — turns §12 red with `soma + soma`.
+
+**It also destabilised a neighbour, which is worth recording rather than quietly fixing.** With §12 in
+its original position, §10 ("the engine really did batch them") failed 1 run in 3 with
+`max observed batch = 1`; with §12 skipped, and on the commit before it, 4 of 4 passed. llama-server
+loads the CUDA backend at startup, and that plus its teardown closes the timing window §10 needs to
+observe a real batch. The fix is ordering — §12 runs last — rather than a sleep, because coexistence has
+no dependency on running early and a sleep only moves the same race. Measured after the move: 4 of 4,
+batch 3-4.
+
+**The fixture nearly was not committed at all.** `.gitignore` carries a blanket `*.gguf`, which silently
+swallowed it — `git status` simply did not list the new directory. Caught by checking `git check-ignore`
+rather than trusting the claim already written into this document, which at that moment said "committed"
+and was false. A negation rule now keeps exactly this path, and the test distinguishes the two absences:
+a missing llama-server is "not configured on this host", a missing GGUF is "the committed fixture is
+MISSING — build it with make_tiny_gguf.py", because those want different reactions.
+
+**When the binary is absent it skips, loudly.** llama-server is provisioned per host, so CMake passes
+`MM_LLAMA_SERVER` and §12 reports `SKIPPED` plus "the G8 coexistence criterion is NOT covered by this
+run", and the verdict line reads `OK (1 SECTION SKIPPED)`. A criterion that reports green because its
+fixture was missing is worse than one that reports nothing. A path that was GIVEN but does not exist is
+reported as a bad path rather than silently downgraded to "not configured".
 
 #### `capacity_pressure`: the signal with no coverage
 

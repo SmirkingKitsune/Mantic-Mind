@@ -227,7 +227,8 @@ void write_soma_header(const std::string& path,
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::cerr << "usage: engine_g5 <soma_exe> <model_dir> [container_dir]\n";
+        std::cerr << "usage: engine_g5 <soma_exe> <model_dir> [container_dir]"
+                     " [llama_server_exe] [gguf]\n";
         return 2;
     }
     const std::string exe = argv[1];
@@ -236,6 +237,31 @@ int main(int argc, char** argv) {
     // plain checkpoint is resident, so its expert cache and heat grid are empty
     // by construction and every counter reads zero.
     const std::string container = argc > 3 ? argv[3] : std::string{};
+
+    // The fallback engine, for §12. The GGUF is committed; the llama-server
+    // binary is not, because it is provisioned per host — so CMake passes
+    // whatever MM_LLAMA_SERVER points at and §12 skips loudly when it is unset.
+    // Resolved here rather than in §12 so a path that was given but does not
+    // exist is reported as a bad path, not silently downgraded to "not
+    // configured".
+    std::string llama_exe = argc > 4 ? argv[4] : std::string{};
+    std::string gguf = argc > 5 ? argv[5] : std::string{};
+    {
+        std::error_code ec;
+        // Both are checked, and the GGUF especially: it is committed, so a
+        // missing one means .gitignore ate it (`*.gguf` nearly did) rather than
+        // "not configured on this host". Those want different reactions.
+        if (!llama_exe.empty() && !std::filesystem::is_regular_file(llama_exe, ec)) {
+            std::cout << "   note: llama-server not found at " << llama_exe << "\n";
+            llama_exe.clear();
+        }
+        if (!gguf.empty() && !std::filesystem::is_regular_file(gguf, ec)) {
+            std::cout << "   note: the committed GGUF fixture is MISSING at " << gguf
+                      << "\n          (build it with tools/testing/make_tiny_gguf.py)\n";
+            gguf.clear();
+        }
+    }
+    int skipped = 0;
 
     // ── 1. the registry ──────────────────────────────────────────────────────
     std::cout << "1. engines are DATA, not code paths\n";
@@ -1024,7 +1050,111 @@ int main(int argc, char** argv) {
         (void)sup.unload_all(true);
     }
 
+    // ── 12. TWO DIFFERENT ENGINES, ONE SUPERVISOR ────────────────────────────
+    // Deliberately LAST. llama-server loads the CUDA backend at startup, and
+    // that plus its teardown perturbs §10, which asserts the engine actually
+    // BATCHED four concurrent turns — a timing window that a busy machine
+    // closes. Measured, not guessed: with this section running earlier, §10
+    // failed 1 run in 3 with "max observed batch = 1"; with it here, and with
+    // it skipped, 4 of 4 passed. Ordering is the fix rather than a sleep,
+    // because coexistence has no dependency on running early and a sleep would
+    // only move the same race.
+    //
+    // The G8 criterion: "a Soma agent and a fallback agent run concurrently on
+    // the same node." Nothing asserted it. §5 above looks like it does and is the
+    // OPPOSITE arrangement — it loads `soma` twice and proves the two agents
+    // SHARE one process. That is Soma's per-sequence KV slot, not coexistence,
+    // and reading it as this criterion is the mistake that left the peer-engine
+    // claim resting on unexercised code (roadmap D13).
+    //
+    // What only shows up with two DIFFERENT engines: port allocation handing out
+    // two ports from one pool, slot accounting counting heterogeneous engines,
+    // SlotInfo::backend attributing each to the right descriptor, and one
+    // lifecycle not disturbing the other.
+    //
+    // Deliberately NOT asserted: anything llama.cpp generates. The fixture has
+    // random weights, so its logits are noise and its tokens are invalid UTF-8 —
+    // llama-server itself errors building a response string from them. That is
+    // inherent to a random model, not a defect, and this criterion is about
+    // coexistence, which no logit participates in.
+    std::cout << "\n12. Soma and llama.cpp run side by side\n";
+    if (llama_exe.empty() || gguf.empty()) {
+        // Loud, and counted as a skip rather than silently passing. A criterion
+        // that reports green because its fixture was absent is worse than one
+        // that reports nothing.
+        ++skipped;
+        std::cout << "   SKIPPED: no llama-server (arg 4) or gguf (arg 5).\n"
+                  << "   The G8 coexistence criterion is NOT covered by this run.\n";
+    } else {
+        auto& reg = mm::EngineRegistry::instance();
+        reg.register_engine(mm::make_llama_descriptor(llama_exe));
+
+        mm::EngineSupervisor sup(8240, 8250, /*max_slots=*/2);
+
+        mm::EngineLoadRequest soma_req;
+        soma_req.model_path = container;
+        const auto soma_slot = sup.load("soma", soma_req, "agent-soma");
+        check(!soma_slot.empty(), "the Soma engine loads", sup.last_error());
+
+        mm::EngineLoadRequest llama_req;
+        llama_req.model_path = gguf;
+        llama_req.settings.ctx_size = 512;
+        const auto llama_slot = sup.load("llama-cpp", llama_req, "agent-llama");
+        check(!llama_slot.empty(), "the llama.cpp engine loads ALONGSIDE it",
+              sup.last_error());
+
+        if (!soma_slot.empty() && !llama_slot.empty()) {
+            check(soma_slot != llama_slot,
+                  "they are separate slots, not a shared engine");
+            check(sup.slots().size() == 2, "the supervisor holds two processes");
+            check(sup.available_slot_count() == 0, "and the pool is now full");
+
+            const auto si = sup.find(soma_slot);
+            const auto li = sup.find(llama_slot);
+            check(si && si->backend == "soma" && li && li->backend == "llama-cpp",
+                  "each slot is attributed to the engine that actually serves it",
+                  (si ? si->backend : std::string("?")) + " + " +
+                      (li ? li->backend : std::string("?")));
+            check(si && li && si->port != li->port,
+                  "the port pool hands out two distinct ports",
+                  std::to_string(si ? si->port : 0) + " vs " +
+                      std::to_string(li ? li->port : 0));
+            check(si && si->state == mm::SlotState::Ready &&
+                      li && li->state == mm::SlotState::Ready,
+                  "both are Ready at the same time — which is the criterion");
+
+            // Each descriptor's own client reaches its own engine. A shared or
+            // mis-attributed client would still "work" against one of them, so
+            // both are checked.
+            {
+                auto sl = sup.acquire(soma_slot);
+                auto ll = sup.acquire(llama_slot);
+                check(sl && sl.get() != nullptr && sl.get()->health_check(),
+                      "the Soma client reaches the Soma engine");
+                check(ll && ll.get() != nullptr && ll.get()->health_check(),
+                      "the llama.cpp client reaches the llama.cpp engine");
+            }
+
+            // Independent lifecycle: the failure this guards against is a
+            // supervisor keyed on something the two engines share, where
+            // unloading one takes the other down with it.
+            const auto gone = sup.unload(llama_slot);
+            check(gone.ok(), "unloading the fallback succeeds", gone.message);
+            const auto survivor = sup.find(soma_slot);
+            check(survivor && survivor->state == mm::SlotState::Ready,
+                  "and the Soma engine is untouched — still Ready",
+                  survivor ? std::string("Ready") : std::string("(gone)"));
+            check(sup.available_slot_count() == 1, "one slot freed, not two");
+        }
+        (void)sup.unload_all(true);
+    }
+
+
+    // A skip is reported in the SAME line as the verdict. Buried in scrollback it
+    // reads as coverage that ran; here "OK" alone means everything ran.
     std::cout << "\n"
-              << (g_failures == 0 ? "OK" : std::to_string(g_failures) + " FAILURES") << "\n";
+              << (g_failures == 0 ? "OK" : std::to_string(g_failures) + " FAILURES")
+              << (skipped > 0 ? " (" + std::to_string(skipped) + " SECTION SKIPPED)" : "")
+              << "\n";
     return g_failures == 0 ? 0 : 1;
 }
