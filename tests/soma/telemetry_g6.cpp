@@ -11,6 +11,7 @@
 // bucket_heat() is pure, so most of this needs no model at all — which is the
 // point of it being a free function rather than a method on the channel.
 
+#include "soma/scheduler.hpp"
 #include "soma/telemetry.hpp"
 
 #include <cstdint>
@@ -234,6 +235,39 @@ int main() {
             check(sum_in == sum_out, "with the total conserved",
                   std::to_string(sum_in) + " == " + std::to_string(sum_out));
         }
+    }
+
+    // ── the sampler never waits on the work it measures ──────────────────────
+    //
+    // Defect D11. The blocking accessors take locks the step loop holds across a
+    // whole forward, so a sampler calling them goes quiet exactly while the
+    // engine is busy — measured on a live 7B MoE at 17.3 frames/s idle and
+    // 1.3/s during generation. The try_ forms are what the telemetry path uses.
+    //
+    // Checked structurally rather than by racing a thread: a timing test for a
+    // lock is a flaky test. What matters is that a HELD lock produces a refusal
+    // rather than a wait.
+    std::cout << "\n0b. the non-blocking readers refuse rather than wait\n";
+    {
+        soma::MemoryHierarchy mem;
+        soma::CacheStats cs{};
+        soma::TierOccupancy occ{};
+        soma::HeatSnapshot hs;
+        // Uncontended: all three succeed and agree with the blocking forms.
+        check(mem.try_stats(cs), "try_stats succeeds when uncontended");
+        check(mem.try_occupancy(occ), "try_occupancy succeeds when uncontended");
+        check(mem.try_heat(hs), "try_heat succeeds when uncontended");
+
+        soma::Scheduler sched;
+        soma::SchedulerStats ss{};
+        check(sched.try_stats(ss), "Scheduler::try_stats succeeds when uncontended");
+
+        // And the value matches — a non-blocking reader that returned something
+        // different from the blocking one would be a second source of truth.
+        check(mem.stats().hits == cs.hits && mem.stats().misses == cs.misses,
+              "and reports the same numbers as the blocking form");
+        check(sched.stats().steps == ss.steps,
+              "the scheduler's too");
     }
 
     {

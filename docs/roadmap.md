@@ -2383,8 +2383,8 @@ store; SSE telemetry with throttling; `/v1/models` reclamation.
   **median delta -0.74%**, range -4.39% to +2.07%, against baseline noise of 3.05%. Within noise. Not
   the 60k-expert model the line imagines — see the caveat under
   [Telemetry against a live model](#telemetry-against-a-live-model).
-- **The converse is badly false and the gate never asked**: a chat COLLAPSES telemetry, 17.3 frames/s
-  idle to 1.3/s during generation. Logged as D11.
+- **The converse was badly false and the gate never asked**: a chat COLLAPSED telemetry, 17.3 frames/s
+  idle to 1.3/s during generation. Found by this measurement, fixed as D11 — now 16.1/s.
 - Image content parts return **422**, not a dropped part.
 - A sequence restored into a **different process** continues its conversation rather than starting a new
   one that happens to share a cache. **Done** — checkpoint format v3 carries `rng_state` and the emitted
@@ -2751,7 +2751,9 @@ wrong. A defect leaves this list by being fixed or by being reclassified with a 
 quiet, and struck-through rather than deleted, because how a defect was found is usually worth more than
 the fix.
 
-**D1–D3 and D7–D10 are resolved; D4–D6 and D11 are open.** All of D4–D8 were found by running the G8 gate
+**D1–D3 and D7–D11 are resolved; D4–D6 are open** — the three remaining are a converter format, a
+units label, and a documented route that was never registered. Every defect that blocked a gate is
+closed. All of D4–D8 were found by running the G8 gate
 against a real model — five defects that every unit test in the repo passed straight over, and the two
 that blocked serving were each invisible until the one before it was fixed. That is the argument for
 running a gate rather than reasoning about it: D8 could not be seen until D7 stopped hiding it. Two of the resolved ones turned out worse than logged: D3 was
@@ -2765,7 +2767,7 @@ possible auth fault and was a retry budget written six times with three differen
 | ~~D3~~ | §G4's headings were stale. **Fixed** — and fixing them surfaced a claim that was not merely stale but wrong; see below. | Status review | Resolved |
 | ~~D8~~ | `load-model` and `restore` applied llama.cpp's preconditions to every backend. **Fixed** — `EngineDescriptor::validate_model_ref`. | G8 gate run, after D7 | Resolved |
 | ~~D7~~ | Placement sent the agent's `model_path` to the node instead of the registry's `model_dir`. **Fixed** — `AgentScheduler::model_location()`; the node now receives the container path. Serving is still blocked, by D8. | G8 gate run | Resolved |
-| D11 | **A chat starves the telemetry feed.** Measured on the live engine: 17.3 frames/s idle, **1.3/s during generation**, 18.7/s after. Fully recovers. The brain grid goes nearly static exactly while the model is working — the one moment an operator is watching it. | #11, on the real OLMoE | Medium — no data is wrong, but the feed is useless when it matters. Suspected lock contention between the telemetry sampler and the step loop. |
+| ~~D11~~ | A chat starved the telemetry feed — 1.3 frames/s during generation against 17.3 idle. **Fixed** — the sampler no longer waits on the work it measures; **16.1/s** during generation now. | #11, on the real OLMoE | Resolved |
 | ~~D10~~ | Every proxied SSE stream closed instantly with a clean, empty 200: `set_read_timeout(0, 0)` is ZERO seconds in cpp-httplib, not "no limit". Three sites. **Fixed**. | #11, on the real OLMoE | Resolved |
 | ~~D9~~ | The heat frame declared a dense `rows x cols` grid and carried a SPARSE array — 878 entries for a 16x64 grid on a real model. **Fixed** — `bucket_heat`'s passthrough branch densifies. | #11, on the real OLMoE | Resolved |
 | D6 | `GET /v1/models/{id}/conformance` is documented in external-api.md and **does not exist** — it 404s. The rows are embedded in `GET /v1/models/{id}` instead. | G8 gate run | Medium — a documented route that is not registered, and `require_complete_coverage()` cannot catch it: it checks every registered handler has a scope, never that every documented route is registered. |
@@ -2865,6 +2867,54 @@ Fixed alongside it: a bucket that received no sources kept its `Vram` seed and
 reported the WARMEST tier for the cells we know least about — in a CPU-only v1
 where the VRAM tier is always empty. Absent now reads as Disk, which is what
 `heat()` skipping a cell actually means.
+
+**D11 — an observer that waits on what it observes stops being an observer.**
+
+The sampler called `MemoryHierarchy::occupancy()`, `stats()`, `heat()` and
+`Scheduler::stats()`. All four take a mutex; the step loop holds the scheduler's
+across an entire forward and the hierarchy's across expert reads and evictions,
+which is most of what a streamed model does. So the telemetry thread sampled at
+whatever rate the engine happened to be idle:
+
+```
+idle    17.3 frames/s
+during   1.3 frames/s     <- 13x collapse
+after   18.7 frames/s
+```
+
+The feed went quiet at exactly the moment worth watching. Nothing was WRONG — no
+number was wrong, no frame was corrupt — the feed simply was not there.
+
+**The fix is a rule, not a patch.** Each accessor gained a `try_` form that
+returns false instead of waiting, and the telemetry path uses only those. The
+blocking forms stay for callers that genuinely need an exact current value; both
+share one `_locked` body so the two cannot drift.
+
+Counters and grids are then handled DIFFERENTLY, because they are read
+differently:
+
+- **Counters** carry over from the previous tick when contended, and the frame
+  says `stale: true`. A slightly old number labelled old is worth more than a
+  frame that never arrives.
+- **The heat grid** is skipped entirely when contended. A grid is read
+  spatially — republishing the previous one at tick rate would animate a still
+  image, and there is no honest way to shade a cell "this is last tick's".
+
+Measured after, on the same live engine:
+
+```
+idle    18.7 frames/s
+during  16.1 frames/s     <- 86% of idle, 38 of 65 frames marked stale
+after   18.7 frames/s
+```
+
+and chat latency unmoved: -2.20% median across 6 pairs against 0.92% noise. The
+residual 14% is the skipped heat frames, which is the deliberate half of the fix.
+
+The regression test is STRUCTURAL, not timed — a test that races a lock is a
+flaky test. It asserts the `try_` forms exist, succeed uncontended, and report
+the same numbers as the blocking forms, which is what stops a second source of
+truth appearing.
 
 **D10 — every proxied SSE stream closed before its first frame.**
 

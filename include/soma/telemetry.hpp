@@ -46,6 +46,16 @@ struct TelemetryFrame {
     TierOccupancy occupancy{};
     CacheStats cache{};
     SchedulerStats scheduler{};
+
+    /// Some field on this frame was carried over from the previous tick because
+    /// its lock was held by the work being measured.
+    ///
+    /// The sampler never waits: an observer that blocks on the path it observes
+    /// stops being an observer, and going quiet during generation is the one
+    /// failure a monitoring feed cannot have. So a contended tick reuses the
+    /// last value and SAYS SO, rather than either blocking or silently
+    /// presenting a stale number as fresh.
+    bool stale = false;
 };
 
 /// The brain grid. `cells` is bucketed unless resolution == Full.

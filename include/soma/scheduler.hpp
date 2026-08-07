@@ -203,6 +203,20 @@ public:
 
     SchedulerStats stats() const noexcept;
 
+    /// The same values, but NEVER waiting for the work being measured.
+    ///
+    /// An observer that blocks on the path it observes stops being an observer.
+    /// `stats()` takes the lock the step loop holds across an entire forward, so
+    /// a telemetry sampler calling it goes quiet exactly while the engine is
+    /// busy — measured on a live 7B MoE at **17.3 frames/s idle and 1.3/s during
+    /// generation**, a 13x collapse at the one moment an operator is watching.
+    /// Defect D11.
+    ///
+    /// Returns false when the lock was held, leaving `out` untouched so the
+    /// caller can reuse its previous value and SAY that it did. A stale number
+    /// labelled stale is worth more than a frame that never arrives.
+    bool try_stats(SchedulerStats& out) const noexcept;
+
     /// The gate's current value, recomputed as residency changes. Reported on
     /// /v1/engines/{id}/slots so operators can see WHY concurrency is limited
     /// rather than inferring it from throughput.

@@ -170,6 +170,16 @@ public:
     /// throttle undefeatable by a careless client rather than merely advisory.
     HeatSnapshot heat() const;
 
+    /// Non-blocking reads for the telemetry path — see Scheduler::try_stats.
+    ///
+    /// The hierarchy's mutex is held across expert reads and evictions, which is
+    /// most of what a streamed model does. A sampler that waits for it samples
+    /// nothing while the model works. Each returns false without touching `out`
+    /// when the lock was busy.
+    bool try_occupancy(TierOccupancy& out) const noexcept;
+    bool try_stats(CacheStats& out) const noexcept;
+    bool try_heat(HeatSnapshot& out) const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

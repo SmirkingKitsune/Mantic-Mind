@@ -92,6 +92,44 @@ struct MemoryHierarchy::Impl {
     std::uint32_t in_flight = 0;
     bool shutting_down = false;
 
+    /// Both readers of each of these — the blocking one and the try_ one — call
+    /// these. Two copies of the body would be two things to keep in step, and the
+    /// non-blocking path is the one nobody watches.
+    ///
+    /// Callers hold `mutex`.
+    TierOccupancy occupancy_locked() const noexcept {
+        TierOccupancy o;
+        o.vram_experts = 0; // v1: declared, always empty
+        o.vram_bytes = 0;
+        o.ram_experts = resident_count;
+        o.ram_bytes = resident_bytes;
+        o.ram_capacity_bytes = budget.ram_expert_cache_bytes;
+        o.pinned_experts = pinned_count;
+        o.disk_experts = static_cast<std::uint32_t>(slots.size()) - resident_count;
+        return o;
+    }
+
+    HeatSnapshot heat_locked() const {
+        HeatSnapshot snap;
+        snap.n_layers = n_layers;
+        snap.n_experts = n_experts;
+        snap.cells.reserve(slots.size());
+        for (std::uint32_t l = 0; l < n_layers; ++l) {
+            for (std::uint32_t e = 0; e < n_experts; ++e) {
+                const auto& sl = slots[idx(l, e)];
+                if (sl.count == 0 && !sl.resident) continue;
+                HeatCell c;
+                c.layer = l;
+                c.expert = e;
+                c.tier = sl.resident ? MemoryTier::Ram : MemoryTier::Disk;
+                c.count = sl.count;
+                c.decayed = sl.decayed;
+                snap.cells.push_back(c);
+            }
+        }
+        return snap;
+    }
+
     std::size_t idx(LayerIndex layer, ExpertId expert) const noexcept {
         return static_cast<std::size_t>(layer) * n_experts + expert;
     }
@@ -513,15 +551,7 @@ Status MemoryHierarchy::apply_heat_bootstrap(const HeatSnapshot& heat) {
 TierOccupancy MemoryHierarchy::occupancy() const noexcept {
     const auto& impl = *impl_;
     std::lock_guard<std::mutex> g(impl.mutex);
-    TierOccupancy o;
-    o.vram_experts = 0; // v1: declared, always empty
-    o.vram_bytes = 0;
-    o.ram_experts = impl.resident_count;
-    o.ram_bytes = impl.resident_bytes;
-    o.ram_capacity_bytes = impl.budget.ram_expert_cache_bytes;
-    o.pinned_experts = impl.pinned_count;
-    o.disk_experts = static_cast<std::uint32_t>(impl.slots.size()) - impl.resident_count;
-    return o;
+    return impl.occupancy_locked();
 }
 
 CacheStats MemoryHierarchy::stats() const noexcept {
@@ -530,28 +560,41 @@ CacheStats MemoryHierarchy::stats() const noexcept {
     return impl.stats;
 }
 
+// ── the non-blocking readers ─────────────────────────────────────────────────
+//
+// The telemetry sampler uses these and never the blocking forms. This mutex is
+// held across expert reads and evictions — most of what a streamed model does —
+// so a sampler that waits for it samples nothing while the model works. See
+// Scheduler::try_stats for the measurement that made this necessary.
+
+bool MemoryHierarchy::try_occupancy(TierOccupancy& out) const noexcept {
+    const auto& impl = *impl_;
+    std::unique_lock<std::mutex> g(impl.mutex, std::try_to_lock);
+    if (!g.owns_lock()) return false;
+    out = impl.occupancy_locked();
+    return true;
+}
+
+bool MemoryHierarchy::try_stats(CacheStats& out) const noexcept {
+    const auto& impl = *impl_;
+    std::unique_lock<std::mutex> g(impl.mutex, std::try_to_lock);
+    if (!g.owns_lock()) return false;
+    out = impl.stats;
+    return true;
+}
+
+bool MemoryHierarchy::try_heat(HeatSnapshot& out) const {
+    const auto& impl = *impl_;
+    std::unique_lock<std::mutex> g(impl.mutex, std::try_to_lock);
+    if (!g.owns_lock()) return false;
+    out = impl.heat_locked();
+    return true;
+}
+
 HeatSnapshot MemoryHierarchy::heat() const {
     const auto& impl = *impl_;
     std::lock_guard<std::mutex> g(impl.mutex);
-
-    HeatSnapshot snap;
-    snap.n_layers = impl.n_layers;
-    snap.n_experts = impl.n_experts;
-    snap.cells.reserve(impl.slots.size());
-    for (std::uint32_t l = 0; l < impl.n_layers; ++l) {
-        for (std::uint32_t e = 0; e < impl.n_experts; ++e) {
-            const auto& s = impl.slots[impl.idx(l, e)];
-            if (s.count == 0 && !s.resident) continue;
-            HeatCell c;
-            c.layer = l;
-            c.expert = e;
-            c.tier = s.resident ? MemoryTier::Ram : MemoryTier::Disk;
-            c.count = s.count;
-            c.decayed = s.decayed;
-            snap.cells.push_back(c);
-        }
-    }
-    return snap;
+    return impl.heat_locked();
 }
 
 } // namespace soma

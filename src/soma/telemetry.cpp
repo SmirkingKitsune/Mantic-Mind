@@ -180,6 +180,10 @@ struct TelemetryChannel::Impl {
     std::atomic<bool> running{false};
 
     mutable std::mutex mu; ///< guards the sinks only
+
+    /// Carried across ticks so a contended read can reuse its last value rather
+    /// than emit a zero. Touched only by the ticker thread.
+    TelemetryFrame last_frame{};
     TelemetrySink on_frame;
     HeatSink on_heat;
 
@@ -201,17 +205,40 @@ struct TelemetryChannel::Impl {
                     heat_sink = on_heat;
                 }
                 if (frame_sink) {
-                    TelemetryFrame f;
+                    // try_ everywhere, last-good-value on contention. The step
+                    // loop holds the scheduler's mutex across a whole forward and
+                    // the hierarchy's across expert reads, so the blocking forms
+                    // make this thread sample at the rate the engine happens to
+                    // be idle — measured at 1.3 frames/s against 17.3 idle.
+                    TelemetryFrame f = last_frame;
                     f.tick_ms = now_ms();
+                    f.stale = false;
                     if (memory != nullptr) {
-                        f.occupancy = memory->occupancy();
-                        f.cache = memory->stats();
+                        if (!memory->try_occupancy(f.occupancy)) f.stale = true;
+                        if (!memory->try_stats(f.cache)) f.stale = true;
                     }
-                    if (scheduler != nullptr) f.scheduler = scheduler->stats();
+                    if (scheduler != nullptr && !scheduler->try_stats(f.scheduler)) {
+                        f.stale = true;
+                    }
+                    last_frame = f;
                     frame_sink(f);
                 }
                 if (heat_sink && memory != nullptr) {
-                    const auto snap = memory->heat();
+                    // A heat frame is only emitted when it is FRESH. Unlike the
+                    // counters above, a grid is what an operator reads spatially:
+                    // republishing the previous one at tick rate would animate a
+                    // still image, and there is no honest way to shade a cell
+                    // "this is last tick's".
+                    HeatSnapshot snap;
+                    if (!memory->try_heat(snap)) {
+                        std::unique_lock<std::mutex> lk(wake_mu);
+                        wake.wait_for(
+                            lk,
+                            std::chrono::milliseconds(
+                                1000 / std::clamp<std::uint32_t>(hz.load(), 1, kMaxTelemetryHz)),
+                            [&] { return !running.load(); });
+                        continue;
+                    }
                     heat_sink(resolution.load() == HeatResolution::Full
                                   ? [&] {
                                         HeatFrame full;

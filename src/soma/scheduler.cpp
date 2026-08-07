@@ -685,6 +685,13 @@ SchedulerStats Scheduler::stats() const noexcept {
     return impl_->stats;
 }
 
+bool Scheduler::try_stats(SchedulerStats& out) const noexcept {
+    std::unique_lock<std::mutex> lk(impl_->mu, std::try_to_lock);
+    if (!lk.owns_lock()) return false;
+    out = impl_->stats;
+    return true;
+}
+
 std::uint32_t Scheduler::effective_max_batch() const noexcept {
     return impl_->gate;
 }

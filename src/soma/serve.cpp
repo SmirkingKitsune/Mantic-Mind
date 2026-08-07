@@ -134,6 +134,10 @@ json telemetry_frame_json(const TelemetryFrame& f) {
     const auto lookups = f.cache.hits + f.cache.misses;
     return json{
         {"tick_ms", f.tick_ms},
+        // True when a field was carried over because its lock was held by the
+        // work being measured. A client that plots these should know which
+        // samples are repeats rather than a plateau.
+        {"stale", f.stale},
         {"tier",
          {{"vram_experts", f.occupancy.vram_experts},
           {"ram_experts", f.occupancy.ram_experts},
