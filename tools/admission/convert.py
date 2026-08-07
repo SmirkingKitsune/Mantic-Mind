@@ -49,6 +49,40 @@ def align_up(n: int) -> int:
     return (n + ALIGN - 1) & ~(ALIGN - 1)
 
 
+def fused_expert_diagnosis(get, layer: int, moe_block: str) -> str | None:
+    """Is this checkpoint using the FUSED expert layout, rather than missing a tensor?
+
+    "missing model.layers.0.mlp.experts.0.gate_proj.weight" sends a reader
+    looking for a corrupt download. The truth is usually that the checkpoint
+    stacks every expert into one 3-D tensor — a layout recent `transformers`
+    emits and this converter does not read — and the converter can SEE that,
+    because the fused tensor is sitting right there under a different name.
+
+    Naming the real problem is the whole of this function. Reading the layout is
+    deliberately NOT attempted; see the message it produces.
+    """
+    prefix = f"model.layers.{layer}.{moe_block}.experts."
+    fused = [(n, tuple(t.shape))
+             for n in (prefix + "gate_up_proj", prefix + "down_proj",
+                       prefix + "gate_proj", prefix + "up_proj")
+             if (t := get(n)) is not None]
+    if not fused:
+        return None
+    shapes = ", ".join(f"{n.split('.')[-1]}{s}" for n, s in fused)
+    return "\n           ".join([
+        f"{prefix}<i>.* not found, but this checkpoint carries the FUSED expert "
+        f"layout ({shapes}) - every expert stacked into one 3-D tensor. This "
+        f"converter reads the per-expert layout only.",
+        "NOT a corrupt download, and not something to work around by guessing: "
+        "the fused convention is family-specific and the ones in the wild "
+        "disagree. gpt_oss stores [experts, in, 2*inter] and splits gate/up "
+        "INTERLEAVED; this checkpoint is [experts, 2*inter, in]. A wrong guess "
+        "produces a container that loads, runs, and is silently wrong.",
+        "Re-export in the per-expert layout, or add support here together with "
+        "an oracle that can verify it.",
+    ])
+
+
 def layer_kinds(cfg: dict, n_layers: int) -> list[str]:
     """Which layers are MoE. Mirrors resolve_layer_kinds() in src/soma/arch_ir.cpp.
 
@@ -308,8 +342,12 @@ def main(argv: list[str]) -> int:
             for role, dt in (("gate", dt_gate), ("up", dt_up), ("down", dt_down)):
                 t = get(base + names[role])
                 if t is None:
-                    print(f"  REFUSED  missing {base + names[role]}")
                     fh.close()
+                    fused = fused_expert_diagnosis(get, layer, moe_block)
+                    if fused:
+                        print(f"  REFUSED  {fused}")
+                    else:
+                        print(f"  REFUSED  missing {base + names[role]}")
                     return 3
                 packed, g = quantize_rows(t, dt, args.group)
                 groups[dt] = g

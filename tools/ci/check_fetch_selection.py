@@ -86,7 +86,7 @@ def main() -> int:
     total = sum(s for f, s in repo if f in kept)
     everything = sum(s for _, s in repo)
     check(total < everything / 2, "the transfer is less than half the repo",
-          f"{total / 1e9:.1f} GB of {everything / 1e9:.1f} GB")
+          f"{total / 1024**3:.1f} GiB of {everything / 1024**3:.1f} GiB")
     check(len(notes) == 2, "and both skips are reported, not silent", "; ".join(notes))
 
     # ── 2. the pickle boundary ───────────────────────────────────────────────

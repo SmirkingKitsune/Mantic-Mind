@@ -60,6 +60,20 @@ std::optional<std::string> resolve_existing_local_model_path(
 // destination folder and the cache dedup key. Handles '/' and '\\'.
 std::string model_id_from_ref(const std::string& ref);
 
+/// Bytes for a human, in BINARY units with binary LABELS.
+///
+/// One implementation because there were three, and they disagreed with a fourth
+/// in Python. `fetch.py` divided by 1e9 and wrote "GB"; two separate C++
+/// `bytes_label` copies divided by 1024^3 and also wrote "GB". The same OLMoE
+/// transfer therefore announced `13.84 GB` in its manifest line and `12.89 GB`
+/// on every progress line — the same number, and an operator watching a 14 GB
+/// download see a gigabyte go missing.
+///
+/// Binary was chosen because every C++ site was already binary and Windows
+/// reports file sizes the same way; the fix is the LABEL, which now says what
+/// the arithmetic does. Defect D5.
+std::string bytes_label(std::int64_t bytes);
+
 // ── URL / SSE helpers ───────────────────────────────────────────────────────
 // Parse "http://host:port/path" → {host, port}.  Defaults to port 80.
 std::pair<std::string, int> parse_url(const std::string& url);

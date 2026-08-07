@@ -73,21 +73,6 @@ std::vector<std::string> admission_stages(bool container_is_ready, bool needs_fe
     return s;
 }
 
-/// Bytes as an operator reads them. Only ever a `detail` string — the numeric
-/// fields carry the exact values, so rounding here loses nothing.
-std::string bytes_label(std::int64_t n) {
-    static const char* kUnits[] = {"B", "KB", "MB", "GB", "TB"};
-    double v = static_cast<double>(n);
-    int u = 0;
-    while (v >= 1024.0 && u + 1 < 5) {
-        v /= 1024.0;
-        ++u;
-    }
-    char buf[48];
-    std::snprintf(buf, sizeof(buf), u == 0 ? "%.0f %s" : "%.2f %s", v, kUnits[u]);
-    return buf;
-}
-
 /// One component of a repo id: starts alphanumeric, then alphanumeric `.`, `-`, `_`.
 bool valid_repo_component(const std::string& c) {
     if (c.empty() || !std::isalnum(static_cast<unsigned char>(c.front()))) return false;
@@ -1254,7 +1239,7 @@ void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
                         const double f = expect > 0 ? static_cast<double>(seen) /
                                                           static_cast<double>(expect)
                                                     : 0.0;
-                        emit("fetch", bytes_label(seen) + " / " + bytes_label(expect),
+                        emit("fetch", util::bytes_label(seen) + " / " + util::bytes_label(expect),
                              0.01 + 0.34 * f);
                     }
                     return;
@@ -1280,7 +1265,7 @@ void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
         }
         local_source = resolved;
         progress.bytes_done = progress.bytes_total = 0;
-        emit("fetch", "fetched " + bytes_label(seen), 0.35);
+        emit("fetch", "fetched " + util::bytes_label(seen), 0.35);
     }
 
     // ── 2. convert ───────────────────────────────────────────────────────────

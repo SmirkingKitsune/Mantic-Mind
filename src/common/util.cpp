@@ -1,5 +1,7 @@
 #include "common/util.hpp"
 
+#include <cstdio>
+
 #include <openssl/rand.h>
 
 #include <random>
@@ -225,6 +227,26 @@ std::optional<std::string> resolve_existing_local_model_path(
         return resolved.lexically_normal().string();
     }
     return std::nullopt;
+}
+
+std::string bytes_label(std::int64_t bytes) {
+    const double v = static_cast<double>(bytes > 0 ? bytes : 0);
+    struct Unit { double scale; const char* name; int decimals; };
+    static constexpr Unit kUnits[] = {
+        {1024.0 * 1024.0 * 1024.0 * 1024.0, "TiB", 2},
+        {1024.0 * 1024.0 * 1024.0, "GiB", 2},
+        {1024.0 * 1024.0, "MiB", 1},
+        {1024.0, "KiB", 1},
+    };
+    char buf[48];
+    for (const auto& u : kUnits) {
+        if (v >= u.scale) {
+            std::snprintf(buf, sizeof(buf), "%.*f %s", u.decimals, v / u.scale, u.name);
+            return buf;
+        }
+    }
+    std::snprintf(buf, sizeof(buf), "%.0f B", v);
+    return buf;
 }
 
 std::string model_id_from_ref(const std::string& ref) {

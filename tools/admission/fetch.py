@@ -72,6 +72,17 @@ def emit(line: str) -> None:
     print(line, flush=True)
 
 
+def gib(n: int) -> str:
+    """Binary, labelled binary — matching util::bytes_label on the C++ side.
+
+    This used to be `n / 1e9` labelled "GB" while the control side divided the
+    SAME byte count by 1024**3 and also labelled it "GB". One OLMoE transfer
+    therefore announced 13.84 GB and then counted up to 12.89 GB, and an operator
+    watching a 14 GB download see a gigabyte disappear. Defect D5.
+    """
+    return f"{n / (1024 ** 3):.2f} GiB"
+
+
 def split_ref(ref: str) -> tuple[str, str | None]:
     """`org/model@revision` -> (`org/model`, `revision`)."""
     if "@" in ref:
@@ -215,7 +226,7 @@ def main() -> int:
     sizes = dict(files)
     total = sum(sizes.get(p, 0) for p in keep)
     emit(f"manifest {len(keep)} {total}")
-    emit(f"{repo_id}{'@' + revision if revision else ''}: {len(keep)} files, {total / 1e9:.2f} GB")
+    emit(f"{repo_id}{'@' + revision if revision else ''}: {len(keep)} files, {gib(total)}")
 
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)

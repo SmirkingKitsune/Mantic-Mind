@@ -2752,8 +2752,9 @@ wrong. A defect leaves this list by being fixed or by being reclassified with a 
 quiet, and struck-through rather than deleted, because how a defect was found is usually worth more than
 the fix.
 
-**D1–D3 and D6–D11 are resolved; D4 and D5 are open** — a converter format and a units label. Every defect
-that blocked a gate is closed. All of D4–D8 were found by running the G8 gate
+**Every defect is closed except D4, which is parked with its reason recorded and its error message
+fixed.** Eleven found, ten resolved; five of the eleven came from a single run of the G8 gate against a
+real model, and none of those five was reachable by any fixture in the repo. All of D4–D8 were found by running the G8 gate
 against a real model — five defects that every unit test in the repo passed straight over, and the two
 that blocked serving were each invisible until the one before it was fixed. That is the argument for
 running a gate rather than reasoning about it: D8 could not be seen until D7 stopped hiding it. Two of the resolved ones turned out worse than logged: D3 was
@@ -2771,8 +2772,8 @@ possible auth fault and was a retry budget written six times with three differen
 | ~~D10~~ | Every proxied SSE stream closed instantly with a clean, empty 200: `set_read_timeout(0, 0)` is ZERO seconds in cpp-httplib, not "no limit". Three sites. **Fixed**. | #11, on the real OLMoE | Resolved |
 | ~~D9~~ | The heat frame declared a dense `rows x cols` grid and carried a SPARSE array — 878 entries for a 16x64 grid on a real model. **Fixed** — `bucket_heat`'s passthrough branch densifies. | #11, on the real OLMoE | Resolved |
 | ~~D6~~ | `GET /v1/models/{id}/conformance` was documented and never registered. **Fixed** — registered, plus `check_api_docs.py` walking the direction `require_complete_coverage()` cannot. | G8 gate run | Resolved |
-| D5 | `fetch.py` reports **decimal GB** and the C++ progress reports **binary GiB labelled "GB"**. The same transfer prints `13.84 GB` then `12.89 GB`. | G8 gate run | Low — cosmetic, but it reads as a GB of the model going missing mid-fetch. |
-| D4 | `convert.py` cannot read transformers' **fused expert layout** — `mlp.experts.gate_up_proj` / `mlp.experts.down_proj` as 3-D `[n_experts, ...]` tensors — and fails with `REFUSED missing model.layers.0.mlp.experts.0.gate_proj.weight`, naming a tensor the checkpoint was never going to have. | G8 gate run | Medium — no model is blocked *today*, but the format is what recent `transformers` emits and it will become common. |
+| ~~D5~~ | One transfer reported two sizes: decimal GB in Python, binary GiB labelled "GB" in C++. **Fixed** — one formatter, `util::bytes_label`, binary with binary labels. | G8 gate run | Resolved |
+| D4 | `convert.py` cannot read transformers' **fused expert layout**. The misleading error is **fixed** — it now names the layout and shows the shapes. Reading the layout is deliberately NOT implemented; see below. | G8 gate run | Low, and deliberately parked — no oracle exists at the pinned `transformers` to verify an implementation against. |
 
 **D1 — resolved, and it was never an auth bug.** The cause was already written down in the test, three
 lines above the failure:
@@ -3035,10 +3036,21 @@ proposed one without calling it, which is the same ambiguity in a milder form. H
 explicit `(planned)` marker, the check reports those separately rather than failing them, and the
 document opens by saying what the marker means. Anything unmarked must exist.
 
-**D5 — two units, one label.** `fetch.py` prints `total / 1e9` and calls it GB; the C++ `bytes_label()`
-divides by 1024³ and also calls it GB. The same OLMoE transfer reported `13.84 GB` in the manifest line
-and `12.89 GB` in every progress line — the same number, and an operator watching a 14 GB download see a
-gigabyte vanish. One of them should say GiB, or both should use the same base.
+**D5 — resolved, and it was four formatters rather than two.**
+
+`fetch.py` divided by `1e9` and wrote "GB". Two separate C++ functions — both named `bytes_label`, one in
+`model_registry.cpp` and one in `node_ui.cpp` — divided by 1024³ and also wrote "GB". A fourth,
+`tui::mb_str`, divided megabytes by 1024 and suffixed "G". The same OLMoE transfer therefore announced
+**13.84 GB** and then counted up to **12.89 GB**: one number, two units, one label, and an operator
+watching a 14 GB download see a gigabyte disappear.
+
+The same shape as D1's retry budget — one concept written several times, drifting because nothing forced
+them to agree. Now one `util::bytes_label`, binary because every C++ site already was and because
+Windows reports file sizes the same way, with labels that say what the arithmetic does: `GiB`, `MiB`,
+`KiB`. `mb_str` keeps its narrow-column format and gains honest `Gi`/`Mi` suffixes. `fetch.py` matches.
+
+Verified on a live transfer: `6 files, 0.02 GiB` then `16.1 MiB / 16.1 MiB`. Both ends of one download,
+one unit.
 
 **D4 — the admission pipeline reads only the per-expert layout.**
 
@@ -3065,14 +3077,45 @@ is what a 2024 upload would have. The tiny-random repos are regenerated against 
 so the probe was *newer* than the model it stands in for. That is worth remembering about
 `hf-internal-testing/*` fixtures generally: they track the library, not the era of the model they mimic.
 
-Two things to fix, and they are separable:
+**The error is fixed.** `fused_expert_diagnosis()` looks for the fused names before reporting a missing
+one, and the pipeline now says:
 
-1. **The error names the wrong thing.** "missing X" sends a reader looking for a corrupt download. The
-   truth is "this checkpoint uses an expert layout I do not read", and the converter can tell the
-   difference — it can see `experts.gate_up_proj` sitting right there.
-2. **The layout itself.** Reading it is not hard: slice the 3-D tensor per expert and split `gate_up`
-   down the middle. It is strictly a `tools/admission/convert.py` change, so it does not touch the G8
-   gate's "no C++ change" clause.
+```
+REFUSED  model.layers.0.mlp.experts.<i>.* not found, but this checkpoint carries the
+         FUSED expert layout (gate_up_proj(4, 256, 64), down_proj(4, 64, 128)) - every
+         expert stacked into one 3-D tensor. This converter reads the per-expert layout only.
+         ...
+         Re-export in the per-expert layout, or add support here together with an oracle
+         that can verify it.
+```
+
+**Reading the layout is deliberately NOT implemented, and the reason is the interesting part.**
+
+Investigating it to write the fix turned up three things, in order of how much each changed the plan:
+
+1. **The shapes are not what a reasonable person would assume.** I expected `[experts, in, out]` — the
+   ordering a fused matmul wants. The OLMoE checkpoint is `gate_up_proj[E, 2*inter, in]`, out-major,
+   the same convention as `nn.Linear.weight`. Checking rather than assuming caught that.
+2. **There is more than one fused convention, and they disagree on both axes.** `gpt_oss` in the same
+   `transformers` version declares `nn.Parameter(num_experts, hidden_size, 2 * expert_dim)` — in-major,
+   the opposite of this checkpoint — and splits gate from up **interleaved**, `gate_up[..., ::2]` and
+   `[..., 1::2]`, not as blocked halves. Two conventions, differing in axis order AND in split. A
+   converter that picks one and applies it to the other produces a container that loads, runs, and is
+   wrong.
+3. **`transformers` 4.57.6 cannot read this checkpoint either — and does not say so loudly.** Loading
+   `hf-internal-testing/tiny-random-OlmoeForCausalLM` with the pinned version leaves the fused tensors
+   unused and **randomly initialises** every per-expert weight, announcing it in a warning that reads
+   like boilerplate. So the reference implementation this project defines correctness against would, on
+   this class of checkpoint, be comparing against noise.
+
+That is what settles it. The conformance ladder exists to stop "plausible and wrong" from shipping, and
+implementing this layout would mean writing a path that cannot be verified against any oracle available
+here, for a convention that is family-specific and unsettled. The error message costs a reader nothing
+and tells them the truth; a guess would cost them a silently wrong model.
+
+**What would unblock it:** a checkpoint in this layout whose reference output can be produced — either a
+`transformers` new enough to load it, or a per-expert export of the same weights to diff against. Then
+the implementation and its verification land together, which is the only order that is worth anything.
 
 **D2 — resolved. The channel was measuring membership when the question is traffic.**
 

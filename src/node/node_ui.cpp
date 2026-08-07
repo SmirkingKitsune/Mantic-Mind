@@ -212,19 +212,6 @@ std::string clock_hms() {
     return buf;
 }
 
-std::string bytes_label(int64_t bytes) {
-    const double value = static_cast<double>(std::max<int64_t>(0, bytes));
-    char buf[48];
-    if (value >= 1024.0 * 1024.0 * 1024.0)
-        std::snprintf(buf, sizeof(buf), "%.2f GB", value / (1024.0 * 1024.0 * 1024.0));
-    else if (value >= 1024.0 * 1024.0)
-        std::snprintf(buf, sizeof(buf), "%.1f MB", value / (1024.0 * 1024.0));
-    else if (value >= 1024.0)
-        std::snprintf(buf, sizeof(buf), "%.1f KB", value / 1024.0);
-    else
-        std::snprintf(buf, sizeof(buf), "%.0f B", value);
-    return buf;
-}
 
 // Let focused controls handle input before global shortcuts. FTXUI's standard
 // CatchEvent does the reverse, which lets shortcuts steal navigation keys.
@@ -1443,8 +1430,8 @@ void NodeUI::run() {
         }
         if (p.bytes_total > 0) {
             rows.push_back(hbox({text(" data   : ") | dim,
-                                 text(bytes_label(p.bytes_done) + " / " +
-                                      bytes_label(p.bytes_total))}));
+                                 text(mm::util::bytes_label(p.bytes_done) + " / " +
+                                      mm::util::bytes_label(p.bytes_total))}));
         }
         if (!p.detail.empty())
             rows.push_back(paragraph(" " + shorten_middle(p.detail, 80)) | dim);
