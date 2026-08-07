@@ -1016,9 +1016,13 @@ bool AgentScheduler::response_indicates_capacity_pressure(const std::string& bod
     // silently got a hard failure instead — and translating or rewording any of
     // those messages would have broken eviction with nothing to catch it.
     //
-    // Both engines emit {"error":{"code":"capacity_pressure"}} now, and both
-    // paths are exercised because the substring fallback still covers a stale
-    // llama-server on the far side of a rolling upgrade.
+    // Both engines emit {"error":{"code":"capacity_pressure"}} now. The fallback
+    // covers a stale NODE, not a stale llama-server — llama.cpp's prose never
+    // reaches here unlabelled, because the node translates it to a code at the
+    // boundary (`engine_error_code_for`). The only way a body arrives without a
+    // code is a node old enough to predate that, on the far side of a rolling
+    // upgrade. Deleting the fallback is therefore safe exactly when no such node
+    // can still be in the cluster, which is a deployment fact, not a code one.
     // Two shapes, because two producers. `soma serve` and the node's own
     // proxy emit {"error":{"code":...}}; the node's slot handlers keep `error` as
     // a human string and carry the code alongside it, so existing clients are not

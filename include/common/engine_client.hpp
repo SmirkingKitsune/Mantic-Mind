@@ -36,6 +36,19 @@ struct EngineError {
     std::string message;
     int http_status = 0;
 
+    /// Recover a structured error from RuntimeClient's "HTTP {status}: {body}".
+    ///
+    /// Round-tripping through a formatted string is not elegant, and it is still
+    /// the right trade: the alternative is a second copy of the 140-line SSE
+    /// reader, which is where the real bugs live. The CONTRACT survives either
+    /// way — both engines emit {"error":{"code":...}} and the code round-trips.
+    ///
+    /// Reads only the NESTED shape. The node's load handlers emit a top-level
+    /// `code` beside a human-string `error`, and those are recovered from the
+    /// status instead (503 -> capacity_pressure). That recovery is load-bearing;
+    /// `capacity_pressure_is_structured` pins it.
+    static EngineError parse(const std::string& raw);
+
     bool is_capacity_pressure() const;
 };
 

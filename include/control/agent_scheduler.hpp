@@ -72,6 +72,18 @@ public:
     std::string last_error() const;
     void housekeeping(const std::vector<AgentConfig>& active_agents);
 
+    /// Does this engine refusal mean "no capacity right now", i.e. evict and retry?
+    ///
+    /// Pure, and public for the same reason `model_location` is: it decides
+    /// whether a failed placement gets a second chance, and that decision
+    /// deserves to be asserted directly rather than inferred from the outcome of
+    /// a placement. Reaching it through `ensure_agent_running` would need a node
+    /// that can be made to refuse on demand, which tests the harness more than
+    /// the rule.
+    ///
+    /// A structured code is AUTHORITATIVE — see the definition.
+    static bool response_indicates_capacity_pressure(const std::string& body);
+
 private:
     NodeRegistry& registry_;
     const ControlModelRegistry* models_ = nullptr;
@@ -108,7 +120,6 @@ private:
                                                 const NodeId& node_id);
     std::optional<SlotId> load_agent_on_node(const AgentConfig& cfg,
                                              const NodeId& node_id);
-    static bool response_indicates_capacity_pressure(const std::string& body);
     bool evict_slots_on_node(const NodeId& node_id,
                              const AgentId& preserve_agent,
                              int max_to_evict);

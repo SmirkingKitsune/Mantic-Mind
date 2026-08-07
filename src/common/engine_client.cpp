@@ -48,12 +48,6 @@ httplib::Client make_client(const std::string& base_url, const std::string& api_
     return cli;
 }
 
-/// Recover a structured error from RuntimeClient's "HTTP {status}: {body}".
-///
-/// Round-tripping through a formatted string is not elegant, and it is still the
-/// right trade: the alternative is a second copy of the 140-line SSE reader,
-/// which is where the real bugs live. The CONTRACT is preserved either way —
-/// both engines emit {"error":{"code":...}} and the code survives the round trip.
 EngineError parse_engine_error(const std::string& raw) {
     EngineError err;
     err.message = raw;
@@ -106,6 +100,10 @@ EngineError parse_engine_error(const std::string& raw) {
 } // namespace
 
 // ── EngineError ───────────────────────────────────────────────────────────────
+
+EngineError EngineError::parse(const std::string& raw) {
+    return parse_engine_error(raw);
+}
 
 bool EngineError::is_capacity_pressure() const {
     return code == "capacity_pressure";

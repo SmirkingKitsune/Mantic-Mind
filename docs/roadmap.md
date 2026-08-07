@@ -2353,6 +2353,9 @@ registry, `EngineClient` with virtual `stream_complete`, `KvCheckpointBackend` �
 - Killing a Soma process is detected by the watchdog within one poll interval, and the engine transitions
   to `Error` rather than advertising `Ready`.
 - `capacity_pressure` as a structured code drives evict-and-retry, with the substring matcher deleted.
+  **Half done, and the second half is now a deployment decision rather than a code one** — the structured
+  code drives eviction and is tested; the matcher survives on purpose. See
+  [capacity_pressure](#capacity_pressure-the-signal-with-no-coverage).
 - Suspend on a multi-sequence llama.cpp slot returns 409 rather than silently saving sequence 0.
   **Done** — `LlamaKvBackend::supports_multi_sequence()` is false and `EngineSupervisor::suspend`
   refuses with `Unsupported` / `unsupported_content`. The HTTP status mapping lands with the route at G6.
@@ -2874,6 +2877,58 @@ CHECK failed at line 1411: resp.status != 0
 do not make it impossible. What has changed is only that the next occurrence will say which of the two
 findings it is. That is the whole claim; the earlier "resolved" was stronger than the evidence, which is
 why the recurrence is recorded here rather than quietly re-fixed.
+
+#### `capacity_pressure`: the signal with no coverage
+
+This is the code that decides whether a failed placement gets a second chance, and it had **no test at
+all** — implemented across both engines, the node proxy and the scheduler, asserted nowhere. It was found
+by checking the G8 criteria against the suite rather than against their names, which is the same check
+that should have caught the half-applied D1 fix.
+
+`capacity_pressure_is_structured` now covers it. The happy path is one string compare and is not the
+point; the rule worth pinning is **precedence**, and three mutations confirm the assertions are
+load-bearing rather than decorative:
+
+| Mutation | Caught by |
+|---|---|
+| Structured code no longer authoritative (fall through to prose when the code isn't capacity) | the three authoritative-negative assertions |
+| Drop the top-level `{"code":…}` branch | a positive AND a negative, in opposite directions |
+| Drop the 503 status-derived fallback in `EngineError::parse` | both `through_client(503, …)` assertions |
+
+The middle one is the instructive failure. Deleting one branch simultaneously stopped the node's real
+wire shape from earning a retry **and** stopped the code from overriding "out of memory" prose — a hard
+failure where a retry was correct, and a spurious eviction where it was not, from a single deletion.
+
+**Three things the test found that reading the code did not.**
+
+*The wire shape is neither of the two you would guess.* The node's load handlers emit
+`{"error":"<prose>","code":"capacity_pressure",…}` — `error` is a STRING with the code beside it, not the
+nested object `soma serve` produces. Both shapes are real and both are now asserted.
+
+*The matcher cannot be deleted yet, and the reason in the comment was wrong.* It claimed to cover "a
+stale llama-server on the far side of a rolling upgrade". llama.cpp's prose never arrives unlabelled —
+the node translates it to a code at the boundary in `engine_error_code_for`. The fallback covers a stale
+**node**, which is a different component and a different upgrade story. Corrected in place. Deleting it is
+safe exactly when no pre-code node can still be in the cluster: a deployment fact, so the criterion stays
+open rather than being quietly reworded.
+
+*The two coded responses are exactly the two endpoints the scheduler reads.* Only 2 of the node's 28
+error responses carry a structured code — which looks alarming until you check which two: `load-model`
+and `restore-slot`, and those are precisely the two the scheduler calls
+`response_indicates_capacity_pressure` on. That is coherent, not accidental, and the 26 uncoded responses
+are on paths this function never sees. Worth writing down because the raw ratio invites the wrong fix.
+
+**One honest limit.** `EngineError::is_capacity_pressure()` has **no production consumer** — the
+scheduler uses its own matcher, and the only callers of the `EngineClient` parser are these new
+assertions. That section pins the path `EngineClient` is being built toward, not a live one, and the test
+says so rather than implying coverage it does not have. The shape divergence between the two parsers is
+free to fix now and expensive to discover once something depends on it, which is why it is pinned early.
+
+Two small structural changes fell out: `EngineError::parse` is now a static member rather than a function
+hidden in a translation unit — it constructs an `EngineError`, so it belongs on the type — and
+`response_indicates_capacity_pressure` is public, for the reason `model_location` already is. Reaching it
+through `ensure_agent_running` would need a node that refuses on demand, which tests the harness more
+than the rule.
 
 #### Telemetry against a live model
 

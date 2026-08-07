@@ -11,6 +11,7 @@
 #include "common/util.hpp"
 #include "control/agent_manager.hpp"
 #include "control/agent_queue.hpp"
+#include "common/engine_client.hpp"
 #include "control/agent_scheduler.hpp"
 #include "control/control_api_server.hpp"
 #include "common/pairing.hpp"
@@ -5656,6 +5657,108 @@ bool test_scope_negatives_over_http() {
     return ok;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// capacity_pressure: the signal that earns a failed placement a second chance.
+//
+// This is a G8 criterion that had NO coverage at all — the code was implemented
+// across both engines, the node proxy and the scheduler, and nothing asserted
+// any of it. What makes that worth fixing is not the happy path, which is one
+// string compare, but the PRECEDENCE rule underneath it: a structured code is
+// authoritative, so an engine that says `model_not_found` in prose containing
+// "out of memory" must NOT be retried. Swap the two blocks in the definition
+// and every obvious test still passes.
+//
+// Also pinned here: the wire shape the node actually emits, which is neither of
+// the shapes you would guess. See below.
+// ─────────────────────────────────────────────────────────────────────────────
+bool test_capacity_pressure_is_structured() {
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    const auto pressure = &mm::AgentScheduler::response_indicates_capacity_pressure;
+
+    // ── 1. the two structured shapes, because there are two producers ────────
+    // `soma serve` and the node's inference proxy nest it under `error`.
+    RECORD(pressure(R"({"error":{"code":"capacity_pressure","message":"no free sequence"}})"));
+    // The node's LOAD handlers keep `error` as a human string and carry the code
+    // beside it, so existing clients are not broken by the addition. `error` is
+    // therefore a STRING here, not an object — a parser that only checks the
+    // nested shape misses this entirely.
+    RECORD(pressure(
+        R"({"error":"failed to load model","code":"capacity_pressure","engine":"soma"})"));
+
+    // ── 2. a structured code is AUTHORITATIVE ────────────────────────────────
+    // The whole point of the rewrite. The engine has decided this is not
+    // capacity; reading its prose for a contradicting hint would undo that, and
+    // an evict-and-retry here would destroy a healthy resident agent to make
+    // room for a model that is never going to be found.
+    RECORD(!pressure(
+        R"({"error":{"code":"model_not_found","message":"ran out of memory looking"}})"));
+    RECORD(!pressure(
+        R"({"error":"out of memory","code":"model_not_found","engine":"llama-cpp"})"));
+    // Same rule, stated for a code nobody has defined yet: unrecognised is not
+    // capacity. A future engine inventing `quota_exceeded` gets a hard failure
+    // rather than an eviction storm, until someone decides otherwise.
+    RECORD(!pressure(R"({"error":{"code":"quota_exceeded","message":"insufficient vram"}})"));
+
+    // ── 3. the legacy substring fallback ─────────────────────────────────────
+    // Retained deliberately for a node that predates the code. It is reachable
+    // ONLY when no structured code was found — never as a tiebreak.
+    RECORD(pressure("max slots reached"));
+    RECORD(pressure("llama-server: out of memory"));
+    RECORD(pressure("INSUFFICIENT VRAM"));           // matched case-insensitively
+    RECORD(pressure(R"({"error":"no available ports"})")); // JSON, but no code
+    RECORD(!pressure("model architecture is not supported"));
+    RECORD(!pressure(""));
+
+    // ── 4. an unparseable body is not a guess ────────────────────────────────
+    // Truncated JSON falls through to the substring match rather than throwing,
+    // and answers on the prose alone.
+    RECORD(pressure(R"({"error":"out of memory while loa)"));
+    // A truncated body whose only capacity evidence is the CODE stays false —
+    // the six legacy phrases are llama.cpp's prose, and "capacity_pressure" is
+    // deliberately not among them. So a half-written structured body is not
+    // silently rescued by the matcher underneath it, which is the right answer:
+    // a response that arrived incomplete has not told us what went wrong.
+    RECORD(!pressure(R"({"error":{"code":"capacity_pre)"));
+    RECORD(!pressure("<html><body>502 Bad Gateway</body></html>"));
+
+    // ── 5. the same refusal, through EngineClient's parser ───────────────────
+    // Two parsers exist for one code and they cover different shapes: this one
+    // reads only the NESTED form, so the node's load-handler shape above leaves
+    // its code empty — and is rescued by the status-derived fallback, since the
+    // node answers 503 for capacity. That recovery is load-bearing and entirely
+    // implicit, so it is pinned here: if either the node's status or this
+    // fallback changes, this is the assertion that objects.
+    //
+    // Stated plainly, because the section reads like it guards something live:
+    // `EngineError::is_capacity_pressure()` has NO production consumer today.
+    // The scheduler uses its own matcher; these assertions describe the path
+    // EngineClient is being built toward. They are worth having early — the
+    // shape divergence above is exactly the kind that is free to fix now and
+    // expensive to discover the first time something depends on it — but they
+    // are not evidence that this parser is in the eviction path. It is not.
+    const auto through_client = [](int status, const std::string& body) {
+        return mm::EngineError::parse("HTTP " + std::to_string(status) + ": " + body);
+    };
+    RECORD(through_client(503, R"({"error":"failed to load model","code":"capacity_pressure"})")
+               .is_capacity_pressure());
+    RECORD(through_client(503, "").is_capacity_pressure());
+    RECORD(through_client(500, R"({"error":{"code":"capacity_pressure"}})")
+               .is_capacity_pressure());
+    // 500 with no code is internal, not capacity: retrying it evicts a live
+    // agent to re-run a request that will fail again the same way.
+    RECORD(!through_client(500, R"({"error":"segfault in expert routing"})")
+                .is_capacity_pressure());
+    RECORD(!through_client(404, R"({"error":"no such model"})").is_capacity_pressure());
+
+#undef RECORD
+    return ok;
+}
+
 bool test_engine_telemetry_republication() {
     // Control's half of the chain, against a node that answers. What is under
     // test is the ROUTING: finding which node holds an engine, passing the
@@ -6130,6 +6233,7 @@ int main(int argc, char** argv) {
         {"requantization_is_a_new_admission", test_requantization_is_a_new_admission},
         {"route_scopes_and_token_store", test_route_scopes_and_token_store},
         {"scope_negatives_over_http", test_scope_negatives_over_http},
+        {"capacity_pressure_is_structured", test_capacity_pressure_is_structured},
         {"engine_telemetry_republication", test_engine_telemetry_republication},
     };
 
