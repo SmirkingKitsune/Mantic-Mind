@@ -10,6 +10,7 @@
 // be able to disagree.
 
 #include "soma/arch_ir.hpp"
+#include "soma/conformance.hpp"
 #include "soma/plan.hpp"
 #include "soma/quant_format.hpp"
 #include "soma/safetensors.hpp"
@@ -235,6 +236,51 @@ StageResult stage_quant_codec(const std::filesystem::path& dir) {
     return r;
 }
 
+/// Admission ladder stage 1: the engine's forward against a `transformers`
+/// oracle, on a tiny-random model carrying THIS architecture.
+///
+/// The fixture is a SUBDIRECTORY of the container, not the container itself, and
+/// the distinction is the point: the oracle is built from RANDOM weights with the
+/// real config, so this validates the ARCHITECTURE rather than the admitted
+/// checkpoint. A real checkpoint can be approximately right in ways that hide a
+/// bug for weeks; a tiny-random one is either exactly right or obviously wrong.
+StageResult stage_fp32_tiny_tf(const std::filesystem::path& dir) {
+    StageResult r{"fp32_tiny_tf", "skipped", {}};
+
+    const auto fixture = dir / "conformance";
+    if (!std::filesystem::exists(fixture / "oracle.bin")) {
+        r.detail["reason"] = "no conformance fixture in this container; admission builds one with "
+                             "tools/admission/make_oracle.py when transformers is available";
+        return r;
+    }
+
+    const auto c = soma::run_fp32_conformance(fixture.string());
+    if (c.skipped) {
+        // No backend for this attention family. A gap in coverage rather than a
+        // failure — reporting it red would make the ladder permanently red, and
+        // a permanently red ladder is an ignored one.
+        r.detail["reason"] = "no fp32 backend for this architecture: " + c.detail;
+        return r;
+    }
+
+    r.status = c.passed() ? "passed" : "failed";
+    r.detail = nlohmann::json{{"logits_pass", c.logits_pass},
+                              {"greedy_pass", c.greedy_pass},
+                              {"max_abs", c.max_abs},
+                              {"max_abs_at_position", c.max_at_pos},
+                              // Always reported, because it BISECTS a failure:
+                              // clean at 0 and growing with t is positional;
+                              // already wrong at 0 is not.
+                              {"max_abs_pos0", c.max_abs_pos0},
+                              {"mean_abs", c.mean_abs},
+                              {"tolerance_max_abs", soma::kConformanceMaxAbsDiff},
+                              {"tolerance_mean_abs", soma::kConformanceMaxMeanDiff},
+                              {"greedy_tokens_matched", c.matched_tokens}};
+    if (!c.detail.empty()) r.detail["error"] = c.detail;
+    if (!c.greedy_pass) r.detail["first_bad_token"] = c.first_bad_token;
+    return r;
+}
+
 StageResult stage_tokenizer_roundtrip(const std::filesystem::path& dir) {
     StageResult r{"tokenizer_roundtrip", "skipped", {}};
 
@@ -292,11 +338,7 @@ int cmd_conform(int argc, char** argv) {
 
     // The stages that need something this process does not have, named with what
     // that is. They are recorded as SKIPPED, never as passed.
-    stages.push_back({"fp32_tiny_tf",
-                      "skipped",
-                      {{"reason",
-                        "needs a transformers oracle for this architecture; build one "
-                        "with tools/admission/make_oracle.py and run soma_conformance_g0"}}});
+    stages.push_back(stage_fp32_tiny_tf(root));
     stages.push_back({"real_logit_kl",
                       "skipped",
                       {{"reason",

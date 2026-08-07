@@ -69,7 +69,7 @@ std::vector<std::string> admission_stages(bool container_is_ready, bool needs_fe
     if (container_is_ready) return {"profile", "conformance", "finalize"};
     std::vector<std::string> s;
     if (needs_fetch) s.push_back("fetch");
-    s.insert(s.end(), {"convert", "tokenize", "profile", "conformance", "finalize"});
+    s.insert(s.end(), {"convert", "tokenize", "oracle", "profile", "conformance", "finalize"});
     return s;
 }
 
@@ -1409,6 +1409,62 @@ void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
             MM_WARN("admission {}: tokenizer compilation failed (exit {}); container is "
                     "usable but will not detokenize", progress.operation_id, trc);
             emit("tokenize", "tokenizer compilation failed; continuing without it", 0.72);
+        }
+    }
+
+    // ── 2b. the conformance oracle ───────────────────────────────────────────
+    //
+    // A tiny-random model carrying THIS architecture, plus the logits
+    // `transformers` produces for it. That is what turns ladder stage 1 from
+    // "skipped, needs an oracle" into an answer.
+    //
+    // Built from the SOURCE, not the container: make_oracle.py shrinks the real
+    // config and keeps every semantic field, so the fixture validates the
+    // architecture rather than the admitted weights. Random weights are the
+    // point — a real checkpoint can be approximately right in ways that hide a
+    // bug for weeks.
+    //
+    // NOT fatal when it fails, for the same reason the tokenizer compile is not:
+    // the model is still admissible and still routable, and discarding hours of
+    // conversion over a missing fixture would be the wrong trade. The ladder
+    // then reports stage 1 as skipped, which is the honest result.
+    if (!container_is_ready) {
+        emit("oracle", "building the conformance fixture", 0.74);
+        std::string err;
+        const auto fixture = (fs::path(container) / "conformance").string();
+        const int orc = run_streamed_command(
+            {tools.python, (tools_dir / "make_oracle.py").string(), local_source, "--out",
+             (fs::path(container) / "conformance-build").string()},
+            fs::current_path(),
+            [&](const std::string& line, bool) {
+                if (!util::trim(line).empty()) emit("oracle", util::trim(line), 0.76);
+            },
+            canceled, &err);
+        if (canceled()) {
+            progress.canceled = true;
+            fail("canceled while building the oracle");
+            return;
+        }
+        if (orc == 0) {
+            // make_oracle.py writes <out>/<model-name>/; lift it to a fixed path
+            // so `soma conform` does not have to guess the model's name.
+            std::error_code ec;
+            fs::remove_all(fixture, ec);
+            const fs::path built((fs::path(container) / "conformance-build"));
+            for (const auto& e : fs::directory_iterator(built, ec)) {
+                if (e.is_directory(ec)) {
+                    fs::rename(e.path(), fixture, ec);
+                    break;
+                }
+            }
+            fs::remove_all(built, ec);
+            emit("oracle", ec ? "built, but could not be placed: " + ec.message() : "built",
+                 0.78);
+        } else {
+            MM_WARN("admission {}: make_oracle.py exited {}; ladder stage 1 will report "
+                    "skipped", progress.operation_id, orc);
+            emit("oracle", "not built (exit " + std::to_string(orc) +
+                               "); conformance stage 1 will report skipped", 0.78);
         }
     }
 

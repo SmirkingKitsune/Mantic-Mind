@@ -2377,6 +2377,8 @@ store; SSE telemetry with throttling; `/v1/models` reclamation.
 - `hz` clamps to 10; `resolution=full` requires the explicit parameter. **Done** in the ENGINE —
   measured on the wire, `?hz=1000` produces 15 frames in 1.5 s rather than 1500. Control's
   `/v1/engines/{id}/telemetry` re-publishes it and inherits the ceiling.
+- The ladder's stage 1 runs at admission rather than reporting `skipped`. **Done** — the pipeline builds
+  the oracle itself; `fp32_tiny_tf` passed on OLMoE at `max_abs=1.07e-06` against a `2e-03` tolerance.
 - A client requesting maximum telemetry does not measurably affect chat latency — the
   aggregation-in-engine claim, verified rather than asserted. **MEASURED** on the admitted OLMoE
   (16x64 = 1024 expert cells), 10 order-balanced pairs at the 10 Hz ceiling with `resolution=full`:
@@ -2596,8 +2598,48 @@ Each proves one stage runs and the other reports why it could not. A third case 
 asserts that *every stage skipped* reports `passed: false`, since "nothing was checked" reading as a
 pass is the exact failure this file exists to prevent.
 
-Still not run in-process, and recorded as such rather than stubbed: `fp32_tiny_tf`, `real_logit_kl`, and
-`accuracy_floor` (for which no downstream task harness exists at all).
+**`fp32_tiny_tf` now runs too — see [The conformance oracle](#the-conformance-oracle).** Still recorded
+as skipped rather than stubbed: `real_logit_kl`, and `accuracy_floor` (for which no downstream task
+harness exists at all).
+
+#### The conformance oracle
+
+Ladder stage 1 — teacher-forced logits against `transformers`, plus greedy token-exactness — was
+reported as `skipped` because it needs an oracle for the SPECIFIC architecture and the pipeline had no
+way to make one. It does now: a new `oracle` stage runs `make_oracle.py` on the source and lifts the
+result into `<container>/conformance/`, so the fixture travels with the admission record.
+
+**What it validates, stated precisely, because the obvious reading is wrong.** The fixture is
+tiny-RANDOM weights with the real config — every dimensional field shrunk, every semantic field
+preserved verbatim. So this says nothing about the admitted checkpoint. It says the engine implements
+this ARCHITECTURE the way `transformers` does. That is the more valuable claim: a real checkpoint can be
+approximately right in ways that hide a bug for weeks, while a tiny-random one is either exactly right
+or obviously wrong.
+
+Measured on OLMoE-1B-7B-0924, admitted end to end with the pipeline building its own fixture
+(16 layers → 4, 64 experts → 16, vocab 50304 → 512):
+
+```
+fp32_tiny_tf   passed   max_abs=1.07e-06 (tol 2e-03)  pos0=5.81e-07  greedy=256 exact
+```
+
+Six orders of magnitude inside tolerance, and 256 greedy tokens matching exactly. The ladder now reports
+**3 of 5 stages ran** for a model admitted from scratch, against 2 before.
+
+**The comparison moved into the library** — `soma/conformance.hpp`, `run_fp32_conformance()`. It had two
+callers the moment `soma conform` needed it, and two implementations would have meant two sets of
+tolerances, two oracle parsers, and two opinions about what "passes" means. `soma_conformance_g0` keeps
+the fixture walk and the reporting, which is what a test is for.
+
+`max_abs_pos0` is reported on every result, pass or fail, because it BISECTS a failure rather than
+merely describing one: at t=0 RoPE is the identity and attention is a softmax over one element, so a
+divergence already present at 0 cannot be either — it is projection, qk-norm, routing, or the expert
+MLP. One clean at 0 and growing with t is the opposite. That single number is what turned four rounds of
+failed reasoning about MLA into one afternoon; see G4.
+
+**Failing to build the oracle is not fatal**, for the same reason a failed tokenizer compile is not: the
+model is still admissible and still routable, and discarding hours of conversion over a missing fixture
+would be the wrong trade. Stage 1 then reports `skipped`, which is the honest result.
 
 #### The architecture check
 
@@ -2763,7 +2805,7 @@ possible auth fault and was a retry budget written six times with three differen
 
 | # | Defect | Found | Severity |
 |---|---|---|---|
-| ~~D1~~ | `control_api_external_token_gate` failed once and passed on re-runs. **Diagnosed and fixed** — not an auth bug; see below. | G8 requantization work | Resolved |
+| D1 | `control_api_external_token_gate` fails intermittently at the transport layer, not the auth gate. **Recurred after the first fix**, which had been applied to only half the file; disambiguation now covers both paths. The flake itself is environmental and remains open. | G8 requantization work | Low — diagnosable now rather than eliminated; see below. |
 | ~~D2~~ | The brain grid's tier channel saturated under reduction. **Fixed** — the split now weights by traffic rather than membership; see below. | G7 preview | Resolved |
 | ~~D3~~ | §G4's headings were stale. **Fixed** — and fixing them surfaced a claim that was not merely stale but wrong; see below. | Status review | Resolved |
 | ~~D8~~ | `load-model` and `restore` applied llama.cpp's preconditions to every backend. **Fixed** — `EngineDescriptor::validate_model_ref`. | G8 gate run, after D7 | Resolved |
@@ -2803,10 +2845,35 @@ Three changes:
   followed by "the auth assertions below are about to fail for a reason that has nothing to do with
   auth". Verified by forcing the condition.
 
-**Not reproduced.** Twelve consecutive full-suite runs after the fix, all clean — and twelve before it
-would likely have been clean too, since the original was one occurrence in many runs. The fix rests on
-the code evidence rather than on a reproduction, and that is worth saying plainly: if the failure
-returns, the new banner will say whether this diagnosis was right.
+**It returned — and the banner did not fire, because the fix had only been applied to half the file.**
+
+The recurrence came during the conformance-oracle increment: one failure at `reliability_tests.cpp:1407`,
+clean on re-run. Line 1407 is inside the shared `expect_error` lambda, so the report named the assertion
+helper rather than the call, and it printed a bare status mismatch — precisely the ambiguity D1 was
+supposed to have removed.
+
+The reason is worth recording, because it is a failure mode of the fix rather than of the diagnosis.
+`kTransportRetries` was unified across all six sites, but the other two changes — the loud banner and
+**asserting `status != 0` before comparing the status** — were only made on the SSE helper
+(`reached_server`). The plain-request path got the shared budget and none of the disambiguation. So a
+fix written to make transport failures self-identifying left the other half of the file exactly as
+misleading as before, while the roadmap recorded it as done.
+
+Both are now on both paths. `expect_error` checks `status == 0` first, prints the same banner naming the
+**call site** via `__LINE__` rather than the lambda, and records `status != 0` as its own assertion.
+Verified by forcing the condition — pointing one request at a dead port:
+
+```
+  TRANSPORT FAILURE at line 1426 after 6 attempts: status=0
+  (the assertion below is about to fail for a reason that
+   has nothing to do with authorization)
+CHECK failed at line 1411: resp.status != 0
+```
+
+**Still not reproduced deliberately**, and the underlying flake is not fixed — retries make it rare, they
+do not make it impossible. What has changed is only that the next occurrence will say which of the two
+findings it is. That is the whole claim; the earlier "resolved" was stronger than the evidence, which is
+why the recurrence is recorded here rather than quietly re-fixed.
 
 #### Telemetry against a live model
 

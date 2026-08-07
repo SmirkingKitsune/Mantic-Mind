@@ -1396,6 +1396,19 @@ bool test_control_api_external_token_gate() {
                                 int expected_status,
                                 const std::string& expected_text,
                                 int call_line) {
+            // Same ambiguity `reached_server` exists to remove, on the non-SSE
+            // path: status stays 0 when the request never arrived, and `0 !=
+            // 401` fails exactly the way a broken auth gate does. This half of
+            // the file was left without the guard when D1 was fixed, so the
+            // recurrence reported a bare status mismatch and said nothing about
+            // which of the two findings it was. Checked first, and loudly.
+            if (resp.status == 0) {
+                std::cerr << "  TRANSPORT FAILURE at line " << call_line << " after "
+                          << kTransportRetries << " attempts: status=0\n"
+                          << "  (the assertion below is about to fail for a reason that\n"
+                          << "   has nothing to do with authorization)\n";
+            }
+            RECORD(resp.status != 0);
             if (resp.status != expected_status ||
                 resp.body.find(expected_text) == std::string::npos) {
                 std::cerr << "expect_error (call at line " << call_line
@@ -4902,6 +4915,18 @@ bool test_admission_fetch_stage() {
              "print('    layer 1/1  0.00 GB', flush=True)\n";
         std::ofstream t(tools_dir / "compile_tokenizer.py", std::ios::binary);
         t << "print('stub tokenizer', flush=True)\n";
+        // Stands in for the real oracle builder, which needs torch and must not
+        // become a dependency of this suite. It writes the directory SHAPE
+        // make_oracle.py produces — <out>/<model-name>/ — so the pipeline's
+        // lift-into-place step is exercised rather than silently skipped by a
+        // missing script.
+        std::ofstream o(tools_dir / "make_oracle.py", std::ios::binary);
+        o << "import os, sys\n"
+             "out = sys.argv[sys.argv.index('--out') + 1]\n"
+             "d = os.path.join(out, 'stub-fixture')\n"
+             "os.makedirs(d, exist_ok=True)\n"
+             "open(os.path.join(d, 'oracle.bin'), 'wb').write(b'SOMAORCL')\n"
+             "print('stub oracle', flush=True)\n";
     }
 
     mm::ControlModelRegistry reg;
@@ -4967,7 +4992,9 @@ bool test_admission_fetch_stage() {
     // Every stage, in order, and `step` consistent with `total_steps`. Those two
     // used to be written independently: a container admission advertised 2 total
     // steps and then emitted step 5, which renders as 250%.
-    const std::vector<std::string> want{"fetch",   "convert",    "tokenize",
+    //  builds the tiny-random conformance fixture that turns ladder
+    // stage 1 from "skipped" into an answer.
+    const std::vector<std::string> want{"fetch",   "convert",     "tokenize", "oracle",
                                         "profile", "conformance", "finalize"};
     std::size_t at = 0;
     std::int64_t peak_bytes = 0, peak_total = 0;
@@ -5279,6 +5306,18 @@ bool test_requantization_is_a_new_admission() {
              "print('    layer 1/1  0.00 GB', flush=True)\n";
         std::ofstream t(tools_dir / "compile_tokenizer.py", std::ios::binary);
         t << "print('stub tokenizer', flush=True)\n";
+        // Stands in for the real oracle builder, which needs torch and must not
+        // become a dependency of this suite. It writes the directory SHAPE
+        // make_oracle.py produces — <out>/<model-name>/ — so the pipeline's
+        // lift-into-place step is exercised rather than silently skipped by a
+        // missing script.
+        std::ofstream o(tools_dir / "make_oracle.py", std::ios::binary);
+        o << "import os, sys\n"
+             "out = sys.argv[sys.argv.index('--out') + 1]\n"
+             "d = os.path.join(out, 'stub-fixture')\n"
+             "os.makedirs(d, exist_ok=True)\n"
+             "open(os.path.join(d, 'oracle.bin'), 'wb').write(b'SOMAORCL')\n"
+             "print('stub oracle', flush=True)\n";
     }
 
     mm::ControlModelRegistry reg;

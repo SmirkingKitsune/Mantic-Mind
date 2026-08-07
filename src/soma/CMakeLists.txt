@@ -25,6 +25,7 @@ set(SOMA_CORE_HEADERS
     soma/kernels.hpp
     soma/scheduler.hpp
     soma/kv_checkpoint.hpp
+    soma/conformance.hpp
     soma/tokenizer.hpp
     soma/plan.hpp
     soma/routing.hpp
@@ -62,6 +63,7 @@ set(MM_SOMA_SOURCES
     quant.cpp
     arch_ir.cpp
     safetensors.cpp
+    conformance.cpp
     kernels_f32.cpp
     quant_format.cpp
     kernels_quant.cpp

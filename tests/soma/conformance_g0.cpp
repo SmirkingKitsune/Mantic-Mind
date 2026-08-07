@@ -10,6 +10,7 @@
 // Usage: conformance_g0 <fixtures_dir> [fixture_name ...]
 
 #include "soma/f32_model.hpp"
+#include "soma/conformance.hpp"
 #include "soma/kernels_f32.hpp"
 
 #include <algorithm>
@@ -28,148 +29,14 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// Tolerances.
-//
-// The engine and torch accumulate the same sums in different orders, so exact
-// bit-equality is not a reasonable bar for fp32 — but the bar still has to be
-// tight enough to catch a wrong RoPE pairing or a mis-scaled expert, both of
-// which move logits far more than reassociation does.
-constexpr float kMaxAbsDiff  = 2e-3f;
-constexpr float kMaxMeanDiff = 2e-4f;
-
-struct Oracle {
-    std::uint32_t positions = 0;
-    std::uint32_t vocab = 0;
-    std::vector<std::int32_t> input_ids;
-    std::vector<float>        tf_logits;
-    std::vector<std::int32_t> greedy_prefix;
-    std::vector<std::int32_t> greedy_tokens;
-};
-
-bool read_oracle(const fs::path& path, Oracle& out, std::string& err) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) { err = "cannot open " + path.string(); return false; }
-
-    char magic[8]{};
-    in.read(magic, 8);
-    if (std::memcmp(magic, "SOMAORCL", 8) != 0) { err = "bad magic in " + path.string(); return false; }
-
-    std::uint32_t hdr[5]{};
-    in.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
-    if (hdr[0] != 1) { err = "unsupported oracle version " + std::to_string(hdr[0]); return false; }
-
-    out.positions = hdr[1];
-    out.vocab     = hdr[2];
-    const std::uint32_t n_prefix = hdr[3];
-    const std::uint32_t n_greedy = hdr[4];
-
-    out.input_ids.resize(out.positions);
-    out.tf_logits.resize(static_cast<std::size_t>(out.positions) * out.vocab);
-    out.greedy_prefix.resize(n_prefix);
-    out.greedy_tokens.resize(n_greedy);
-
-    in.read(reinterpret_cast<char*>(out.input_ids.data()),
-            static_cast<std::streamsize>(out.input_ids.size() * 4));
-    in.read(reinterpret_cast<char*>(out.tf_logits.data()),
-            static_cast<std::streamsize>(out.tf_logits.size() * 4));
-    in.read(reinterpret_cast<char*>(out.greedy_prefix.data()),
-            static_cast<std::streamsize>(out.greedy_prefix.size() * 4));
-    in.read(reinterpret_cast<char*>(out.greedy_tokens.data()),
-            static_cast<std::streamsize>(out.greedy_tokens.size() * 4));
-    if (!in) { err = "short read on " + path.string(); return false; }
-    return true;
-}
-
-struct Result {
-    bool  loaded = false;
-    bool  logits_pass = false;
-    bool  greedy_pass = false;
-    bool  skipped = false;
-    std::string detail;
-    float max_abs = 0.0f;
-    float max_abs_pos0 = 0.0f;
-    std::uint32_t max_at_pos = 0;
-    float mean_abs = 0.0f;
-    std::uint32_t first_bad_token = 0;
-    std::uint32_t matched_tokens = 0;
-};
+// The comparison itself lives in the LIBRARY now — `soma conform` runs the same
+// stage from the admission pipeline, and two implementations would be two sets
+// of tolerances and two opinions about what passes. This file keeps the fixture
+// walk and the reporting, which is what a test is for.
+using Result = soma::Fp32ConformanceResult;
 
 Result run_fixture(const fs::path& dir) {
-    Result r;
-
-    soma::F32Model model;
-    if (auto st = soma::load_f32_model(dir.string(), model); !st.ok()) {
-        r.detail = st.message();
-        // An unsupported family is a gap in coverage, not a failure of the
-        // engine. G4 adds MLA; reporting it as a failure until then would make
-        // the suite permanently red and therefore ignored.
-        r.skipped = (st.code() == soma::StatusCode::Unsupported);
-        return r;
-    }
-    r.loaded = true;
-
-    Oracle oracle;
-    std::string err;
-    if (!read_oracle(dir / "oracle.bin", oracle, err)) { r.detail = err; return r; }
-
-    if (oracle.vocab != model.vocab()) {
-        r.detail = "oracle vocab " + std::to_string(oracle.vocab) + " != model vocab " +
-                   std::to_string(model.vocab());
-        return r;
-    }
-
-    // ── teacher forcing ──────────────────────────────────────────────────────
-    std::vector<soma::TokenId> tokens(oracle.input_ids.begin(), oracle.input_ids.end());
-    soma::F32Workspace ws;
-    std::vector<float> logits;
-    if (auto st = soma::forward_f32(model, tokens, ws, logits); !st.ok()) {
-        r.detail = st.message();
-        return r;
-    }
-    if (logits.size() != oracle.tf_logits.size()) {
-        r.detail = "logit count mismatch";
-        return r;
-    }
-
-    double sum_abs = 0.0;
-    for (std::size_t i = 0; i < logits.size(); ++i) {
-        const float d = std::fabs(logits[i] - oracle.tf_logits[i]);
-        if (d > r.max_abs) { r.max_abs = d; r.max_at_pos = static_cast<std::uint32_t>(i / oracle.vocab); }
-        sum_abs += d;
-    }
-    r.mean_abs = static_cast<float>(sum_abs / static_cast<double>(logits.size()));
-
-    // Position 0 is a natural bisection point and costs nothing to report.
-    //
-    // At t=0 RoPE is the identity (angle 0 -> cos 1, sin 0) and attention is
-    // trivial (one visible key, softmax of a single element = 1). So a
-    // divergence that is ALREADY present at position 0 cannot be RoPE or the
-    // attention reduction — it is projection, qk-norm, routing, or the expert
-    // MLP. A divergence that is clean at 0 and grows with t is the opposite.
-    for (std::uint32_t i = 0; i < oracle.vocab; ++i) {
-        r.max_abs_pos0 = std::max(r.max_abs_pos0, std::fabs(logits[i] - oracle.tf_logits[i]));
-    }
-    r.logits_pass = (r.max_abs <= kMaxAbsDiff) && (r.mean_abs <= kMaxMeanDiff);
-
-    // ── greedy ───────────────────────────────────────────────────────────────
-    std::vector<soma::TokenId> prefix(oracle.greedy_prefix.begin(), oracle.greedy_prefix.end());
-    std::vector<soma::TokenId> generated;
-    const auto want = static_cast<std::uint32_t>(oracle.greedy_tokens.size());
-    if (auto st = soma::generate_greedy_f32(model, prefix, want, ws, generated); !st.ok()) {
-        r.detail = st.message();
-        return r;
-    }
-
-    r.greedy_pass = true;
-    for (std::uint32_t i = 0; i < want; ++i) {
-        if (static_cast<std::int32_t>(generated[i]) != oracle.greedy_tokens[i]) {
-            r.greedy_pass = false;
-            r.first_bad_token = i;
-            break;
-        }
-        r.matched_tokens = i + 1;
-    }
-    return r;
+    return soma::run_fp32_conformance(dir.string());
 }
 
 }  // namespace
