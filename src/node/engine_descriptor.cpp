@@ -11,6 +11,7 @@
 // literal, so it stayed accurate only as long as nothing else was ever added.
 
 #include "common/engine_capabilities.hpp"
+#include "node/llama_runtime.hpp"
 #include "node/engine_descriptor.hpp"
 
 #include "common/engine_client.hpp"
@@ -276,20 +277,23 @@ EngineDescriptor make_llama_descriptor(const std::string& executable) {
         spec.port = req.port;
         spec.readiness.kind = ReadinessProbe::Kind::HttpHealth;
         spec.readiness.http_path = "/health";
-        spec.args = {
-            "-m", req.model_path, "--port", std::to_string(req.port), "--host", "127.0.0.1"};
-        if (!req.mmproj_path.empty()) {
-            spec.args.push_back("--mmproj");
-            spec.args.push_back(req.mmproj_path);
-        }
-        // Without this llama-server resolves the basename in POST
-        // /slots/0?action=save against its own default, so the node writes a
-        // checkpoint it will never find again. LlamaKvBackend::save verifies the
-        // file appeared for exactly this reason.
-        if (!req.kv_checkpoint_dir.empty()) {
-            spec.args.push_back("--slot-save-path");
-            spec.args.push_back(req.kv_checkpoint_dir);
-        }
+        // THE existing builder, which is what this callback's documentation has
+        // always claimed it called. It hand-rolled its own argv instead — model,
+        // port, host, mmproj, slot-save-path — and silently dropped everything
+        // else in RuntimeSettings: ctx_size, n_gpu_layers, threads, threads_http,
+        // parallel, batch_size, ubatch_size, flash_attn and extra_args
+        // (roadmap D14). An engine started through EngineSupervisor therefore ran
+        // on llama.cpp's defaults no matter what the operator configured, and
+        // n_gpu_layers defaulting to -1 means ALL layers on GPU — so the drop
+        // over-committed VRAM rather than under-committing it.
+        //
+        // It also carries the rule that user-supplied extra_args win over
+        // computed defaults, which a second argv builder had no way to honour.
+        spec.args = build_llama_server_args(req.model_path,
+                                            req.mmproj_path,
+                                            req.settings,
+                                            req.port,
+                                            req.kv_checkpoint_dir);
         return spec;
     };
 

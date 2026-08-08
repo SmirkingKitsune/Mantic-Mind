@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -298,6 +299,45 @@ int main(int argc, char** argv) {
               "build_launch emits a runnable argv");
         check(spec.readiness.kind == mm::ReadinessProbe::Kind::HttpHealth,
               "readiness is an HTTP probe, not a stdout sentinel");
+
+        // The FALLBACK's argv, which nothing asserted — and that is exactly how
+        // it came to drop nine settings while its own documentation said it
+        // wrapped build_llama_server_args() (roadmap D14). An engine started
+        // through EngineSupervisor ran on llama.cpp's defaults regardless of what
+        // the operator configured.
+        //
+        // Every value below is deliberately distinctive, so a match cannot be a
+        // coincidence of some other flag carrying the same number.
+        mm::EngineLoadRequest lreq;
+        lreq.model_path = "/models/m.gguf";
+        lreq.port = 8124;
+        lreq.settings.ctx_size = 1536;
+        lreq.settings.n_gpu_layers = 17;
+        lreq.settings.n_threads = 5;
+        lreq.settings.batch_size = 384;
+        lreq.settings.ubatch_size = 96;
+        lreq.settings.parallel = 3;
+        lreq.settings.extra_args = {"--no-warmup"};
+        const auto lspec = l->build_launch(lreq);
+
+        const auto argv_has = [&](const std::string& flag, const std::string& value) {
+            for (std::size_t i = 0; i + 1 < lspec.args.size(); ++i) {
+                if (lspec.args[i] == flag && lspec.args[i + 1] == value) return true;
+            }
+            return false;
+        };
+        check(argv_has("--gpu-layers", "17"), "n_gpu_layers reaches the process");
+        check(argv_has("--threads", "5"), "n_threads reaches the process");
+        check(argv_has("--batch-size", "384"), "batch_size reaches the process");
+        check(argv_has("--ubatch-size", "96"), "ubatch_size reaches the process");
+        check(argv_has("--parallel", "3"), "parallel reaches the process");
+        // llama-server hosts ONE shared context of ctx_size*parallel, so the
+        // value on the wire is not the value in the settings. Asserted at the
+        // product rather than at 1536, because a builder that passed the raw
+        // ctx_size would under-provision every slot but three.
+        check(argv_has("--ctx-size", "4608"), "ctx_size is scaled by parallel, not passed raw");
+        check(std::find(lspec.args.begin(), lspec.args.end(), "--no-warmup") != lspec.args.end(),
+              "operator extra_args survive");
     }
 
     // ── 2. launch, become ready, stop cleanly ────────────────────────────────

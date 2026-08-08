@@ -2838,7 +2838,7 @@ possible auth fault and was a retry budget written six times with three differen
 | ~~D6~~ | `GET /v1/models/{id}/conformance` was documented and never registered. **Fixed** — registered, plus `check_api_docs.py` walking the direction `require_complete_coverage()` cannot. | G8 gate run | Resolved |
 | ~~D5~~ | One transfer reported two sizes: decimal GB in Python, binary GiB labelled "GB" in C++. **Fixed** — one formatter, `util::bytes_label`, binary with binary labels. | G8 gate run | Resolved |
 | ~~D13~~ | No test ran a real Soma engine and a real llama.cpp engine on one supervisor. **Fixed** — `engine_g5` §12, with a committed 244 KiB GGUF fixture. | G8 criteria confirmation | Resolved |
-| D14 | **The descriptor launch path drops `n_gpu_layers`.** `RuntimeSettings::n_gpu_layers` is plumbed through the node and passed to llama-server as `--gpu-layers` by `llama_runtime.cpp:191` — the pre-rebuild path. `make_llama_descriptor`'s `build_launch` never passes it, so an engine started through `EngineSupervisor` always takes llama.cpp's default (all layers on GPU) regardless of the setting. | D13 work | Medium — a configured setting silently ignored, and the wrong direction: it over-commits VRAM rather than under-committing. |
+| ~~D14~~ | The descriptor launch path dropped `n_gpu_layers` — and, on inspection, eight more settings. **Fixed** — `build_launch` now calls `build_llama_server_args()`, which its own documentation always claimed it called. | D13 work | Resolved |
 | ~~D12~~ | Nothing stopped an image part from being routed to Soma; the 422 gates tested only the agent profile. **Fixed** — one shared capability table, four gates routed through one rule, verified live. | G8 criteria confirmation | Resolved |
 | D15 | **`BackendDecision::explain()` stutters.** It renders as `soma (verdict, verdict=hybrid)`, which now reaches users inside the D12 refusal message. Cosmetic, and deliberately not fixed here: `explain()` also feeds `GET /v1/agents/{id}`, so reformatting it is an API-visible change that wants its own increment rather than riding along with a correctness fix. | D12 work | Low — confusing, not wrong. |
 | D4 | `convert.py` cannot read transformers' **fused expert layout**. The misleading error is **fixed** — it now names the layout and shows the shapes. Reading the layout is deliberately NOT implemented; see below. | G8 gate run | Low, and deliberately parked — no oracle exists at the pinned `transformers` to verify an implementation against. |
@@ -2900,6 +2900,46 @@ CHECK failed at line 1411: resp.status != 0
 do not make it impossible. What has changed is only that the next occurrence will say which of the two
 findings it is. That is the whole claim; the earlier "resolved" was stronger than the evidence, which is
 why the recurrence is recorded here rather than quietly re-fixed.
+
+#### The launch path that ignored its settings
+
+Logged as "`n_gpu_layers` is dropped". It was nine settings: **ctx_size, n_gpu_layers, n_threads,
+n_threads_http, parallel, batch_size, ubatch_size, flash_attn, and the operator's `extra_args`**. An
+engine started through `EngineSupervisor` ran on llama.cpp's defaults no matter what was configured.
+
+The sharpest way to state it is that the code contradicted its own documentation.
+`EngineDescriptor::build_launch` is declared with:
+
+> "For llama.cpp this wraps the existing, unit-tested `build_llama_server_args()`"
+
+It did not. It hand-rolled a five-flag argv — model, port, host, mmproj, slot-save-path — beside a pure,
+already-unit-tested builder that produced the full one. The doc comment was right and the implementation
+was wrong, which is the failure mode a doc comment is worst at surviving.
+
+**Why nothing caught it.** `engine_g5` §1 asserted `build_launch`'s argv for **soma** and never for
+llama.cpp — so the one descriptor that had a rich argv to get wrong was the one not checked. Fixed by
+asserting the fallback's argv with deliberately distinctive values, so a match cannot be a coincidence of
+some other flag carrying the same number. Reverting to the hand-rolled argv fails all seven.
+
+One of those assertions is not about a value surviving but about it being TRANSFORMED: llama-server hosts
+a single shared context of `ctx_size * parallel`, so the number on the wire is not the number in the
+settings. It is asserted at 4608 (1536 x 3) rather than 1536, because a builder that passed the raw
+ctx_size would under-provision every slot but one and still look correct to a naive check.
+
+**The severity is the direction.** `n_gpu_layers` defaults to `-1`, meaning *all layers on GPU*. So the
+dropped setting did not fall back to something conservative — it fell back to the most aggressive
+possible value, and an operator who had turned layers DOWN to fit a busy host got them turned back up.
+That fails worst exactly when the host is most loaded.
+
+Confirmed on a live llama-server that the flags change behaviour rather than merely appearing in argv:
+no flags gives `n_ctx=512, n_parallel=4`; with the computed flags, `n_ctx=256`. The old descriptor sent
+no flags.
+
+**Structural note.** `llama_runtime.cpp` moved from the `mantic-mind` executable into `mm_node_engine`
+so the descriptor can reach the builder — the same move `kv_checkpoint_header.cpp` already makes for the
+KV codec, and for the same reason: a wire format, or an argv contract, should not acquire a second
+definition because of a link boundary. It is a light TU (util + filesystem, no HTTP), and static-library
+linkage pulls only what is referenced.
 
 #### Images and the engine that serves them
 

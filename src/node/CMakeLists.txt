@@ -10,6 +10,11 @@ add_library(mm_node_engine STATIC
     engine_descriptor.cpp
     engine_supervisor.cpp
     kv_checkpoint_backend.cpp
+    # Here, not in the executable, because make_llama_descriptor's build_launch
+    # has to call build_llama_server_args(). Its header already SAID it wrapped
+    # that function; it hand-rolled a thinner argv instead and dropped nine
+    # settings on the floor (roadmap D14). Light TU — util + filesystem, no HTTP.
+    llama_runtime.cpp
 )
 
 # mm_soma is here for ONE object: the KV checkpoint header codec. The node must
@@ -31,7 +36,6 @@ target_include_directories(mm_node_engine PUBLIC
 add_executable(mantic-mind
     main.cpp
     runtime_process.cpp
-    llama_runtime.cpp
     llama_cpp_provisioner.cpp
     model_store.cpp
     node_api_server.cpp
