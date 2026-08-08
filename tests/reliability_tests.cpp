@@ -5745,14 +5745,22 @@ bool test_images_refused_by_engine_capability() {
     RECORD(refusal(true, "llama-cpp").empty());
 
     // THE DEFECT. Profile on, engine cannot, and this used to be allowed.
-    const auto blocked = refusal(true, "soma", "streamable verdict; soma selected");
+    const auto blocked = refusal(true, "soma", "soma (verdict=hybrid)");
     RECORD(!blocked.empty());
-    RECORD(blocked.find("'soma'") != std::string::npos);
+    RECORD(blocked.find("soma") != std::string::npos);
     RECORD(blocked.find("does not accept images") != std::string::npos);
+    // The reason already names the engine, so the message must not ALSO quote
+    // the id — that produced "the 'soma' engine ... (soma (verdict=hybrid))",
+    // saying it twice inside nested parens (D15's residue).
+    RECORD(blocked.find("'soma'") == std::string::npos);
+    RECORD(blocked.find("((") == std::string::npos);
+    // With no reason to carry the name, the id is quoted — otherwise the message
+    // would not say WHICH engine at all.
+    RECORD(refusal(true, "soma").find("'soma'") != std::string::npos);
     // The routing reason rides along, so the message says why THAT engine is
     // serving. Without it the text reads as a profile problem and the operator
     // goes to switch on a setting that is already on.
-    RECORD(blocked.find("streamable verdict") != std::string::npos);
+    RECORD(blocked.find("verdict=hybrid") != std::string::npos);
     // An unknown engine is refused on the same rule, not a separate branch.
     RECORD(!refusal(true, "vllm").empty());
 

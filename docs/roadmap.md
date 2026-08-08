@@ -2840,8 +2840,8 @@ possible auth fault and was a retry budget written six times with three differen
 | ~~D13~~ | No test ran a real Soma engine and a real llama.cpp engine on one supervisor. **Fixed** — `engine_g5` §12, with a committed 244 KiB GGUF fixture. | G8 criteria confirmation | Resolved |
 | ~~D14~~ | The descriptor launch path dropped `n_gpu_layers` — and, on inspection, eight more settings. **Fixed** — `build_launch` now calls `build_llama_server_args()`, which its own documentation always claimed it called. | D13 work | Resolved |
 | ~~D12~~ | Nothing stopped an image part from being routed to Soma; the 422 gates tested only the agent profile. **Fixed** — one shared capability table, four gates routed through one rule, verified live. | G8 criteria confirmation | Resolved |
-| D15 | **`BackendDecision::explain()` stutters.** It renders as `soma (verdict, verdict=hybrid)`, which now reaches users inside the D12 refusal message. Cosmetic, and deliberately not fixed here: `explain()` also feeds `GET /v1/agents/{id}`, so reformatting it is an API-visible change that wants its own increment rather than riding along with a correctness fix. | D12 work | Low — confusing, not wrong. |
-| D4 | `convert.py` cannot read transformers' **fused expert layout**. The misleading error is **fixed** — it now names the layout and shows the shapes. Reading the layout is deliberately NOT implemented; see below. | G8 gate run | Low, and deliberately parked — no oracle exists at the pinned `transformers` to verify an implementation against. |
+| ~~D15~~ | `BackendDecision::explain()` stuttered — `soma (verdict, verdict=hybrid)`. **Fixed**, along with the doubled name it produced in the D12 refusal, and pinned by whole-string assertions. | D12 work | Resolved |
+| D4 | Corroborated 2026-08-07: **llama.cpp's own converter cannot read the layout either** — `convert_hf_to_gguf.py` on `tiny-random-OlmoeForCausalLM` fails with `Unprocessed experts: [...mlp.experts.gate_up_proj, ...mlp.experts.down_proj]`. A mature, widely-exercised converter hitting the same wall supports the read that the layout is newer than the ecosystem, rather than that something obvious is being missed here. Parking stands. `convert.py` cannot read transformers' **fused expert layout**. The misleading error is **fixed** — it now names the layout and shows the shapes. Reading the layout is deliberately NOT implemented; see below. | G8 gate run | Low, and deliberately parked — no oracle exists at the pinned `transformers` to verify an implementation against. |
 
 **D1 — resolved, and it was never an auth bug.** The cause was already written down in the test, three
 lines above the failure:
@@ -2900,6 +2900,41 @@ CHECK failed at line 1411: resp.status != 0
 do not make it impossible. What has changed is only that the next occurrence will say which of the two
 findings it is. That is the whole claim; the earlier "resolved" was stronger than the evidence, which is
 why the recurrence is recorded here rather than quietly re-fixed.
+
+#### A string nobody asserted
+
+`BackendDecision::explain()` rendered `soma (verdict, verdict=hybrid)`. The reason enum's name and the
+field it qualifies are the same word, so naming both said it twice.
+
+It survived because **nothing asserted its text**. `routing_g5` called `explain()` nine times — every one
+as the `detail` argument of `check()`, which prints but does not compare. The function was exercised
+constantly and verified never. It only became worth fixing when D12 started quoting it inside a 422, at
+which point a wart in a log line became a sentence users read.
+
+`Verdict` now renders as `verdict=hybrid` alone. Every other reason keeps both halves, because they are a
+DIFFERENT fact from the verdict — `fallback (override_refused_conformance, verdict=reject)` says what was
+asked for and why it was refused, and collapsing that would lose one of them.
+
+Pinned by whole-string equality rather than substring. A `contains` check would have passed the stutter
+too, which is presumably how nine call sites managed to look like coverage.
+
+**The composite had a second copy of the same problem.** With the stutter gone the refusal read
+`the 'soma' engine serving this agent does not accept images (soma (verdict=hybrid))` — the reason
+already names the engine, so quoting the id as well said "soma" twice inside nested parens. Colon form
+now, and the reason carries the name:
+
+```
+the engine serving this agent does not accept images: soma (verdict=hybrid)
+```
+
+The id is still quoted when there is no reason to carry it, because otherwise the message would not say
+WHICH engine at all. Both shapes asserted, including the negatives — no `'soma'` when a reason is
+present, and no `((` in any form.
+
+A footnote on layering that the assertions made explicit: `explain()` says `fallback`, not `llama-cpp`.
+The choice is a ROLE, and `AgentScheduler::resolve_backend` maps it to an engine id one layer up. My
+first draft of the test asserted `llama-cpp` and failed — correctly, and the expectation was what was
+wrong, not the code.
 
 #### The stage that looks at the weights
 

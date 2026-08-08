@@ -78,6 +78,36 @@ int main() {
                   std::string("verdict ") + soma::to_string(c.v) + " -> " + soma::to_string(c.want),
                   d.explain());
         }
+
+        // explain() is USER-VISIBLE — it is the `reason` on GET /v1/agents/{id}
+        // and it is quoted verbatim inside the 422 that refuses an image to a
+        // text-only engine. Until now nothing asserted its text, which is how it
+        // shipped reading `soma (verdict, verdict=hybrid)`: the reason name and
+        // the field name are the same word (D15).
+        //
+        // Pinned as a whole string rather than by substring. A contains-check
+        // would have passed the stutter too.
+        const auto v = soma::select_backend(cfg(), rec(Verdict::Hybrid));
+        check(v.explain() == "soma (verdict=hybrid)",
+              "a verdict decision names the verdict once",
+              v.explain());
+
+        // The other reasons are a DIFFERENT fact from the verdict, so they keep
+        // both halves — dropping either would lose what was asked for or why it
+        // was refused.
+        const auto refused = soma::select_backend(cfg(BackendOverride::Soma), rec(Verdict::Reject));
+        check(refused.explain() == "fallback (override_refused_conformance, verdict=reject)",
+              "a refused override still says what it refused and why",
+              refused.explain());
+
+        // "fallback", not "llama-cpp": explain() names the ROLE, and
+        // AgentScheduler::resolve_backend maps that role to an engine id one
+        // layer up. Asserting the engine id here would bake a mapping this
+        // function does not own.
+        soma::AdmissionRecord absent;
+        check(soma::select_backend(cfg(), absent).explain() == "fallback (no_admission_record)",
+              "and with no record there is no verdict to name",
+              soma::select_backend(cfg(), absent).explain());
     }
 
     std::cout << "\n2. absence and staleness are not admissibility\n";

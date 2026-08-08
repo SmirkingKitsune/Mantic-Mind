@@ -43,10 +43,27 @@ const char* to_string(BackendReason reason) noexcept {
 }
 
 std::string BackendDecision::explain() const {
-    std::string s = std::string(to_string(choice)) + " (" + to_string(reason);
-    if (record_used) {
-        s += ", verdict=";
+    std::string s = std::string(to_string(choice)) + " (";
+
+    // `Verdict` means "the admission record decided this", and the verdict value
+    // says which — so naming the reason AND the field stutters: the old form
+    // rendered `soma (verdict, verdict=hybrid)`. It reached users when the D12
+    // refusal began quoting this string, which is what made a cosmetic wart worth
+    // a change to an API-visible field.
+    //
+    // Every other reason is a DIFFERENT fact from the verdict and still wants
+    // both: `llama-cpp (override_refused_conformance, verdict=reject)` says what
+    // was asked for and why it was refused, and collapsing that would lose half
+    // of it.
+    if (record_used && reason == BackendReason::Verdict) {
+        s += "verdict=";
         s += to_string(considered);
+    } else {
+        s += to_string(reason);
+        if (record_used) {
+            s += ", verdict=";
+            s += to_string(considered);
+        }
     }
     return s + ")";
 }

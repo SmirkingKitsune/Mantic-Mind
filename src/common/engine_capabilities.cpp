@@ -25,8 +25,13 @@ std::string image_refusal_for(bool profile_vision_enabled,
         return {}; // API-backed; not ours to refuse
     }
     if (!engine_supports_vision(engine_id)) {
-        return "the '" + engine_id + "' engine serving this agent does not accept images" +
-               (routing_reason.empty() ? std::string{} : " (" + routing_reason + ")");
+        // The reason already NAMES the engine — it renders as
+        // `soma (verdict=hybrid)` — so a message that also quotes the id says
+        // "soma" twice inside nested parentheses. Colon form, and let the reason
+        // carry the name; the id is still there for anyone scanning.
+        return routing_reason.empty()
+                   ? "the '" + engine_id + "' engine serving this agent does not accept images"
+                   : "the engine serving this agent does not accept images: " + routing_reason;
     }
     return {};
 }
