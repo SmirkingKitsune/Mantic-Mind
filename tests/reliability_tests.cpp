@@ -11,8 +11,10 @@
 #include "common/util.hpp"
 #include "control/agent_manager.hpp"
 #include "control/agent_queue.hpp"
+#include "common/engine_capabilities.hpp"
 #include "common/engine_client.hpp"
 #include "control/agent_scheduler.hpp"
+#include "node/engine_descriptor.hpp"
 #include "control/control_api_server.hpp"
 #include "common/pairing.hpp"
 #include "control/model_registry.hpp"
@@ -5671,6 +5673,79 @@ bool test_scope_negatives_over_http() {
 // Also pinned here: the wire shape the node actually emits, which is neither of
 // the shapes you would guess. See below.
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Images are refused by the ENGINE's capability, not only the agent's profile.
+//
+// The G8 criterion is "image content parts return 422, not a dropped part", and
+// it was half-implemented in a way that read as done: all four gates tested
+// `vision_settings.enabled` — the operator's INTENT — and none tested whether
+// the engine on the far end could accept an image at all. So an agent with
+// vision switched on, serving a model that earned a streamable verdict, sent
+// image parts to Soma, which is text-only by construction (roadmap D12).
+//
+// That failure is the bad kind: not a crash, a silently text-only answer to a
+// question about a picture.
+// ─────────────────────────────────────────────────────────────────────────────
+bool test_images_refused_by_engine_capability() {
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    // ── the capability table ─────────────────────────────────────────────────
+    RECORD(mm::engine_supports_vision("llama-cpp"));
+    RECORD(!mm::engine_supports_vision("soma"));
+    // Unknown engines refuse. A new engine that has said nothing about vision
+    // gets a clear refusal the operator can act on; the other default silently
+    // drops the image and answers as though it had been read.
+    RECORD(!mm::engine_supports_vision("vllm"));
+    RECORD(!mm::engine_supports_vision(""));
+
+    // ── the rule ─────────────────────────────────────────────────────────────
+    const auto refusal = [](bool enabled, const char* engine, const char* why = "") {
+        return mm::image_refusal_for(enabled, engine, why);
+    };
+
+    // Profile off is the whole answer, whatever the engine. Naming an engine
+    // here would misdirect: the operator's own setting is what to change.
+    RECORD(refusal(false, "llama-cpp") == "this agent profile does not accept images");
+    RECORD(refusal(false, "soma") == "this agent profile does not accept images");
+
+    // Profile on + an engine that can: allowed. This is the case that must keep
+    // working — a capability check that refuses everything would also "fix" D12.
+    RECORD(refusal(true, "llama-cpp").empty());
+
+    // THE DEFECT. Profile on, engine cannot, and this used to be allowed.
+    const auto blocked = refusal(true, "soma", "streamable verdict; soma selected");
+    RECORD(!blocked.empty());
+    RECORD(blocked.find("'soma'") != std::string::npos);
+    RECORD(blocked.find("does not accept images") != std::string::npos);
+    // The routing reason rides along, so the message says why THAT engine is
+    // serving. Without it the text reads as a profile problem and the operator
+    // goes to switch on a setting that is already on.
+    RECORD(blocked.find("streamable verdict") != std::string::npos);
+    // An unknown engine is refused on the same rule, not a separate branch.
+    RECORD(!refusal(true, "vllm").empty());
+
+    // API-backed agents own no node-local engine; the remote provider's own
+    // capabilities govern and control has no business refusing on its behalf.
+    RECORD(refusal(true, "").empty());
+
+    // ── the descriptors read the SAME table ──────────────────────────────────
+    // This is what keeps the two sides from drifting. Before, `supports_vision`
+    // was a literal in each descriptor and control could not see it at all;
+    // asserting the node's view against the shared function is what makes the
+    // single-source claim true rather than merely intended.
+    RECORD(mm::make_soma_descriptor("soma").supports_vision ==
+           mm::engine_supports_vision("soma"));
+    RECORD(mm::make_llama_descriptor("llama-server").supports_vision ==
+           mm::engine_supports_vision("llama-cpp"));
+
+#undef RECORD
+    return ok;
+}
+
 bool test_capacity_pressure_is_structured() {
     bool ok = true;
     auto record = [&](bool condition, const char* expression, int line) {
@@ -6233,6 +6308,7 @@ int main(int argc, char** argv) {
         {"requantization_is_a_new_admission", test_requantization_is_a_new_admission},
         {"route_scopes_and_token_store", test_route_scopes_and_token_store},
         {"scope_negatives_over_http", test_scope_negatives_over_http},
+        {"images_refused_by_engine_capability", test_images_refused_by_engine_capability},
         {"capacity_pressure_is_structured", test_capacity_pressure_is_structured},
         {"engine_telemetry_republication", test_engine_telemetry_republication},
     };

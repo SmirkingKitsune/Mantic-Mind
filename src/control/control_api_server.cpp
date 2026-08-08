@@ -1,3 +1,4 @@
+#include "common/engine_capabilities.hpp"
 #include "control/control_api_server.hpp"
 #include "control/model_registry.hpp"
 #include "control/agent_manager.hpp"
@@ -1177,6 +1178,16 @@ PreparedChatTurn ingest_openai_messages(AgentDB& db,
 
 // ── Constructor / destructor ───────────────────────────────────────────────────
 
+std::string ControlApiServer::image_refusal(const AgentConfig& cfg) const {
+    // The LOOKUP. The rule itself is pure and lives in common/, so it can be
+    // asserted without a server; this half only answers "which engine".
+    //
+    // resolve_backend_for does no placement, so asking is free and cannot start
+    // an engine as a side effect of validating a request.
+    const auto routing = scheduler_.resolve_backend_for(cfg);
+    return image_refusal_for(cfg.vision_settings.enabled, routing.engine_id, routing.reason);
+}
+
 ControlApiServer::ControlApiServer(AgentManager& agents,
                                    AgentQueue& queue,
                                    NodeRegistry& registry,
@@ -1446,10 +1457,11 @@ void ControlApiServer::register_openai_compat_routes() {
             set_openai_error(res, 400, e.what());
             return;
         }
-        if (prepared.image_count > 0 && !cfg->vision_settings.enabled) {
-            set_openai_error(res, 422, "this agent profile does not accept images",
-                             "invalid_request_error");
-            return;
+        if (prepared.image_count > 0) {
+            if (const auto refusal = image_refusal(*cfg); !refusal.empty()) {
+                set_openai_error(res, 422, refusal, "invalid_request_error");
+                return;
+            }
         }
 
         const std::string response_id = "chatcmpl-" + util::generate_uuid();
@@ -1620,8 +1632,8 @@ ControlApiServer::LocalChatResult ControlApiServer::chat_local(
             result.error = "agent not found";
             return result;
         }
-        if (!agent->get_config().vision_settings.enabled) {
-            result.error = "this agent profile does not accept images";
+        if (const auto refusal = image_refusal(agent->get_config()); !refusal.empty()) {
+            result.error = refusal;
             return result;
         }
         try {
@@ -1758,9 +1770,11 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
         content_parts.begin(), content_parts.end(), [](const MessageContentPart& part) {
             return part.type == "image_attachment" || part.type == "image_url";
         });
-    if (has_images && !cfg.vision_settings.enabled) {
-        done_cb({}, false, "this agent profile does not accept images");
-        return;
+    if (has_images) {
+        if (const auto refusal = image_refusal(cfg); !refusal.empty()) {
+            done_cb({}, false, refusal);
+            return;
+        }
     }
     PerformanceSample perf;
     perf.request_id = util::generate_uuid();
@@ -4021,11 +4035,12 @@ void ControlApiServer::register_routes() {
             res.set_content(R"({"error":"message required unless attachment_ids are supplied"})", "application/json");
             return;
         }
-        if (!attachment_ids.empty() && !agent->get_config().vision_settings.enabled) {
-            res.status = 422;
-            res.set_content(R"({"error":"this agent profile does not accept images"})",
-                            "application/json");
-            return;
+        if (!attachment_ids.empty()) {
+            if (const auto refusal = image_refusal(agent->get_config()); !refusal.empty()) {
+                res.status = 422;
+                res.set_content(nlohmann::json{{"error", refusal}}.dump(), "application/json");
+                return;
+            }
         }
 
         // Shared context between worker thread and SSE content provider.

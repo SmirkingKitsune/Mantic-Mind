@@ -74,6 +74,21 @@ public:
     }
 
 private:
+    /// Why this agent cannot be sent an image, or empty if it can.
+    ///
+    /// TWO conditions, and only one of them used to be checked. The profile's
+    /// `vision_settings.enabled` is the operator's intent; whether the ENGINE
+    /// that will serve the agent can accept an image is a separate fact, and an
+    /// agent with vision switched on whose model earned a streamable verdict
+    /// routes to Soma, which is text-only. Nothing caught that, so the image
+    /// part travelled to an engine that would never look at it (roadmap D12).
+    ///
+    /// One function because there are four call sites — the OpenAI-compat route,
+    /// the SSE chat route, its attachment path, and the local chat helper — and
+    /// four copies of a two-part rule is how the first part came to be checked
+    /// everywhere and the second part nowhere.
+    std::string image_refusal(const AgentConfig& cfg) const;
+
     AgentManager&   agents_;
     AgentQueue&     queue_;
     NodeRegistry&   registry_;

@@ -4,6 +4,7 @@ set(MM_COMMON_SOURCES
     agent.cpp
     agent_db.cpp
     runtime_client.cpp
+    engine_capabilities.cpp
     engine_client.cpp
     conversation_manager.cpp
     memory_manager.cpp

@@ -10,6 +10,7 @@
 // the registry's ACTUAL contents. The old 400 named "llama-cpp" from a string
 // literal, so it stayed accurate only as long as nothing else was ever added.
 
+#include "common/engine_capabilities.hpp"
 #include "node/engine_descriptor.hpp"
 
 #include "common/engine_client.hpp"
@@ -137,7 +138,10 @@ EngineDescriptor make_soma_descriptor(const std::string& executable) {
     EngineDescriptor d;
     d.id = "soma";
     d.display_name = "Soma (MoE streaming)";
-    d.supports_vision = false;
+    // From the shared table, not a literal — control has to answer the same
+    // question at the request boundary and cannot reach this file. See
+    // common/engine_capabilities.hpp.
+    d.supports_vision = engine_supports_vision(d.id);
     d.supports_suspend = true;
     // The one capability that distinguishes it from the fallback at this layer:
     // real per-sequence state, so several agents share one engine rather than
@@ -254,7 +258,7 @@ EngineDescriptor make_llama_descriptor(const std::string& executable) {
     EngineDescriptor d;
     d.id = "llama-cpp";
     d.display_name = "llama.cpp";
-    d.supports_vision = true;
+    d.supports_vision = engine_supports_vision(d.id);
     d.supports_suspend = true;
     // llama-server's slot state is per-process in practice; the existing
     // checkpoint path hardcodes sequence 0, so a --parallel > 1 slot only ever

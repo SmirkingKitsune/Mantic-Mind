@@ -2405,10 +2405,11 @@ store; SSE telemetry with throttling; `/v1/models` reclamation.
   [Telemetry against a live model](#telemetry-against-a-live-model).
 - **The converse was badly false and the gate never asked**: a chat COLLAPSED telemetry, 17.3 frames/s
   idle to 1.3/s during generation. Found by this measurement, fixed as D11 — now 16.1/s.
-- Image content parts return **422**, not a dropped part. **NOT met as worded — see D12.** The 422 is
-  real and tested (`scope_negatives_over_http`), but it gates on the AGENT PROFILE's
-  `vision_settings.enabled`, never on whether the engine can accept an image. This criterion sits in the
-  Soma section and Soma is text-only, so it is asking a question nothing answers.
+- Image content parts return **422**, not a dropped part. **Done** — the refusal now consults the ENGINE
+  that will serve the agent, not only the agent's profile. Verified live: an image sent to a
+  vision-enabled agent whose model routes to Soma answers
+  `422 {"error":"the 'soma' engine serving this agent does not accept images (…verdict=hybrid)"}`.
+  See [Images and the engine that serves them](#images-and-the-engine-that-serves-them).
 - A sequence restored into a **different process** continues its conversation rather than starting a new
   one that happens to share a cache. **Done** — checkpoint format v3 carries `rng_state` and the emitted
   history; `soma_checkpoint_g3` §2b resumes into a fresh `Scheduler` and compares against both the
@@ -2838,7 +2839,8 @@ possible auth fault and was a retry budget written six times with three differen
 | ~~D5~~ | One transfer reported two sizes: decimal GB in Python, binary GiB labelled "GB" in C++. **Fixed** — one formatter, `util::bytes_label`, binary with binary labels. | G8 gate run | Resolved |
 | ~~D13~~ | No test ran a real Soma engine and a real llama.cpp engine on one supervisor. **Fixed** — `engine_g5` §12, with a committed 244 KiB GGUF fixture. | G8 criteria confirmation | Resolved |
 | D14 | **The descriptor launch path drops `n_gpu_layers`.** `RuntimeSettings::n_gpu_layers` is plumbed through the node and passed to llama-server as `--gpu-layers` by `llama_runtime.cpp:191` — the pre-rebuild path. `make_llama_descriptor`'s `build_launch` never passes it, so an engine started through `EngineSupervisor` always takes llama.cpp's default (all layers on GPU) regardless of the setting. | D13 work | Medium — a configured setting silently ignored, and the wrong direction: it over-commits VRAM rather than under-committing. |
-| D12 | **Nothing stops an image part from being routed to Soma.** `EngineDescriptor::supports_vision` is `false` for Soma and `true` for llama.cpp — and is never read outside the file that defines it. All three 422 gates test `cfg.vision_settings.enabled`; backend selection ignores vision entirely. An agent with vision enabled whose model earns `Streamable` routes to a text-only engine with `vision_enabled: true` in its load request. | G8 criteria confirmation | Medium — a wrong answer rather than a crash, which is the kind that survives. |
+| ~~D12~~ | Nothing stopped an image part from being routed to Soma; the 422 gates tested only the agent profile. **Fixed** — one shared capability table, four gates routed through one rule, verified live. | G8 criteria confirmation | Resolved |
+| D15 | **`BackendDecision::explain()` stutters.** It renders as `soma (verdict, verdict=hybrid)`, which now reaches users inside the D12 refusal message. Cosmetic, and deliberately not fixed here: `explain()` also feeds `GET /v1/agents/{id}`, so reformatting it is an API-visible change that wants its own increment rather than riding along with a correctness fix. | D12 work | Low — confusing, not wrong. |
 | D4 | `convert.py` cannot read transformers' **fused expert layout**. The misleading error is **fixed** — it now names the layout and shows the shapes. Reading the layout is deliberately NOT implemented; see below. | G8 gate run | Low, and deliberately parked — no oracle exists at the pinned `transformers` to verify an implementation against. |
 
 **D1 — resolved, and it was never an auth bug.** The cause was already written down in the test, three
@@ -2898,6 +2900,55 @@ CHECK failed at line 1411: resp.status != 0
 do not make it impossible. What has changed is only that the next occurrence will say which of the two
 findings it is. That is the whole claim; the earlier "resolved" was stronger than the evidence, which is
 why the recurrence is recorded here rather than quietly re-fixed.
+
+#### Images and the engine that serves them
+
+The criterion — "image content parts return 422, not a dropped part" — read as done because a 422 existed
+and was tested. What it tested was the AGENT PROFILE's `vision_settings.enabled`, the operator's intent.
+Whether the engine on the far end could accept an image was never asked, and Soma is text-only by
+construction. So an agent with vision switched on, serving a model that earned a streamable verdict, sent
+image parts to an engine that would never look at them.
+
+That is the failure mode worth naming: not a crash, a silently text-only answer to a question about a
+picture. The request succeeds, the model responds, and nothing anywhere says the image was discarded.
+
+**Why it could not be fixed where it was found.** `EngineDescriptor::supports_vision` already held the
+right values — `false` for Soma, `true` for llama.cpp — and was never read outside the file that set
+them. Control, which is where a request carrying an image actually arrives, cannot reach the node's
+descriptors. The tempting fix is a literal `engine_id == "soma"` in control, which is precisely what the
+descriptor pattern exists to prevent and exactly how the backend-attribution bug got in.
+
+So the fact moved to `common/engine_capabilities.hpp`, where the node descriptors and the control API both
+read it and neither owns it. The descriptors now derive `supports_vision` from it rather than asserting
+it, and a test asserts the node's view EQUALS the shared function — which is what makes "single source"
+true rather than merely intended. Host-level facts deliberately stay out: whether a machine has a GPU is
+`NodeCapabilities` and varies per host; this is what the engine SOFTWARE can do.
+
+**One rule, four gates.** The OpenAI-compat route, the SSE chat route, its attachment path, and the local
+chat helper each carried their own copy of a one-condition check — which is how the first condition came
+to be checked everywhere and the second nowhere. All four now call `image_refusal()`. The rule itself is
+pure and lives in `common/`, so it is asserted without standing up a server, a registry and an admitted
+record just to discover what a two-condition predicate does; the server method is only the lookup.
+
+An unknown engine refuses. A new engine that has said nothing about vision gets a clear refusal an
+operator can act on, where the other default silently drops the image and answers as though it had been
+read. API-backed agents are exempt — they own no node-local engine and the remote provider's own
+capabilities govern.
+
+**Verified live, all three cases**, against the admitted OLMoE:
+
+| Agent | Result |
+|---|---|
+| vision on, model routes to **Soma** | `422 the 'soma' engine serving this agent does not accept images` |
+| vision on, model routes to **llama.cpp** | `200` — no regression |
+| vision **off** | `422 this agent profile does not accept images` — unchanged |
+
+The middle row is the one that had to keep working: a capability check that refused everything would also
+have "closed" D12.
+
+Two mutations confirm the assertions hold it. Restoring the old profile-only rule fails five of them,
+including every message-content check; letting a descriptor drift back to a literal fails the
+equality assertion and nothing else, which is the drift it exists to catch.
 
 #### Two engines, one supervisor
 
