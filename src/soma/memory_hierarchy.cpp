@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -390,8 +391,34 @@ MemoryHierarchy::ExpertRef MemoryHierarchy::acquire(LayerIndex layer, ExpertId e
     // racing it. This is where prefetching actually pays when the estimate of
     // "how far ahead" was slightly short — the caller still waits, but for the
     // remainder of a read that started earlier, not for a whole new one.
+    // io_wait_ns: the time the CALLER spends blocked on bytes.
+    //
+    // Declared in CacheStats from the beginning and never populated, which is
+    // not a cosmetic gap — without it, "reads are ~44% of wall time" is an
+    // inference from throughput rather than a measurement, and nothing can say
+    // whether prefetching is covering the reads or merely running alongside
+    // them. That gap is how a stale claim about serial reads survived long
+    // enough to have a gate written around it (see G9).
+    //
+    // Both blocking sites are counted, and they mean different things:
+    //   * this wait  — a read was ALREADY in flight, so prefetch fired but not
+    //                  far enough ahead. Time here is a depth problem.
+    //   * the miss   — nothing was in flight at all. Time there is a coverage
+    //                  problem, and no amount of extra depth fixes it.
+    // Summing them into one counter would hide exactly the distinction that
+    // decides what to do next, so they are timed together and attributed apart.
+    const auto wait_t0 = std::chrono::steady_clock::now();
+    bool waited_on_inflight = false;
     while (s.loading) {
+        waited_on_inflight = true;
         impl.slot_cv.wait(lk);
+    }
+    if (waited_on_inflight) {
+        impl.stats.io_wait_ns +=
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now() - wait_t0)
+                                           .count());
+        ++impl.stats.inflight_waits;
     }
 
     if (s.resident) {
@@ -404,7 +431,16 @@ MemoryHierarchy::ExpertRef MemoryHierarchy::acquire(LayerIndex layer, ExpertId e
     }
 
     ++impl.stats.misses;
+    const auto miss_t0 = std::chrono::steady_clock::now();
     const auto rc = impl.fetch_locked(i, layer, expert, lk);
+    const auto miss_ns =
+        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - miss_t0)
+                                       .count());
+    // Counted in both: io_wait_ns is the total a caller spent blocked, and
+    // miss_wait_ns is the part of it prefetching never had a chance at.
+    impl.stats.io_wait_ns += miss_ns;
+    impl.stats.miss_wait_ns += miss_ns;
     if (rc != StatusCode::Ok) {
         if (s.refs > 0) --s.refs;
         return {};

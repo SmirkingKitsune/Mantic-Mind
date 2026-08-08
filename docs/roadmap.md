@@ -25,7 +25,7 @@ ambiguous between the two. Concretely: the harness lands at **G0/G1**, the seam 
 | **G6** | API surface complete | Every capability on `/v1/*`, scope-gated, coverage check green |
 | **G7** | FTXUI dashboards on that API | Panels consume only `/v1/*` |
 | **G8** | Admission self-service | A new HF repo goes end-to-end with no C++ change |
-| **G9** | The read overlaps the compute | Union conversion rises from 55% toward 80%+ **with bytes/token unchanged** |
+| ~~**G9**~~ | ~~The read overlaps the compute~~ | **RETIRED** — specified on a false premise; the reads were already overlapped. See [G9](#g9--retired-the-gate-that-was-already-passed) |
 
 Defects found and not yet fixed are tracked in [Open defects](#open-defects), separately from
 [what is deferred](#what-is-deferred-and-where-it-would-land) — deliberately-not-built and
@@ -1172,7 +1172,7 @@ being evidence of anything. Verified against the code before striking, not assum
 - ~~**`effective_max_batch` under a deliberately small `ram_budget`**~~ — **built**, covered in
   `scheduler_g3`.
 - **The last stretch into the disk-bound regime** — still live, and now the whole of what remains here.
-  It is what [G9](#g9--the-read-overlaps-the-compute) is about.
+  It is what [G9](#g9--retired-the-gate-that-was-already-passed) is about.
 - **The last stretch into the disk-bound regime.** Reads sit at ~44% of wall time after vectorising both
   kernel families, threading the forward, and adding the AVX-512 tier. Each pass has bought less than
   the one before, and AVX-512 — expected to be the big mechanical win — returned ~6%. The remaining
@@ -1180,10 +1180,12 @@ being evidence of anything. Verified against the code before striking, not assum
   - **MoE width**, which is the scheduler's job: batching across sequences is what supplies rows per
     expert, and that is the same axis that makes the union save more. It is the one lever that improves
     both halves of the gate at once.
-  - **Overlapping I/O with compute.** Expert reads are currently issued serially inside the union loop,
-    so the ~44% is *waiting*, not throughput. Prefetching the next unique expert while the current one
-    is being applied would convert most of it — and would make the engine read-bound in the useful
-    sense rather than the idle one.
+  - ~~**Overlapping I/O with compute.**~~ **Built, and measured — see
+    [G9](#g9--retired-the-gate-that-was-already-passed).** Expert reads are NOT issued serially; the
+    union loop queues `prefetch_ahead` and loader threads read while the current expert is applied.
+    With it on, `io_wait` is **6.9% of wall at nseq=8** (737 prefetch hits, 0 wasted). The ~44% figure
+    below describes the engine with prefetch DISABLED, which is what this bullet was written against and
+    never revised.
   - A **vectorised `exp`** for softmax, which needs its own oracle measurement since it changes values
     rather than their order.
 
@@ -2791,69 +2793,77 @@ that does.
 
 ---
 
-## G9 — the read overlaps the compute
+## G9 — RETIRED: the gate that was already passed
 
-**The gate: union conversion rises from 55% toward 80%+, and bytes/token does not move.**
+**This gate was specified on a false premise and is retired rather than deleted.** It asked for expert
+reads to be overlapped with compute. They already were, and had been for some time.
 
-The second clause is the whole gate. A change that improves wall time by reading *more*, or by warming
-the page cache, has not overlapped anything — it has bought speed with I/O, which is the opposite of what
-the streaming engine is for. `scaling_g3` already reports both columns, so the anti-cheat is a column
-comparison rather than a new harness.
+The premise came from G3's outstanding list — "expert reads are currently issued serially inside the
+union loop, so the ~44% is *waiting*" — which was written before prefetching was built and never revised
+after. I read that line, took a throughput measurement that seemed consistent with it, and wrote a gate
+around it **without checking whether the mechanism existed**. It did: `prefetch_ahead()` on the
+`MemoryHierarchy`, queued from the union loop, depth derived from the per-layer cache cap, loader threads
+doing the reads, on by default with `SOMA_PREFETCH_DEPTH` only as an override. The determinism hazard it
+introduces — concurrent reads on a shared `ifstream` returning another expert's bytes — had already been
+found and fixed with positional reads, and `streamed_determinism_g3` already guards it.
 
-### The measurement that motivates it
+This is the same failure this document has been catching all along, committed here rather than found:
+a description that drifted from the code, believed because it was written down.
 
-Taken on the admitted OLMoE container (16 layers x 64 experts, q4_g/q6_g/g128):
+### What the measurement actually says
+
+`io_wait_ns` had been DECLARED in `CacheStats` since the beginning and never populated, so every claim
+about waiting was an inference from throughput. It is populated now, split by cause, and the answer is
+unambiguous:
 
 ```
-nseq   rows    MiB read     KiB/token   unique     union    sec       tok/s
-1      8       1669         213744.0    438        2.3      0.7       11.75
-2      16      2207         141276.0    579        3.5      1.1       14.94
-4      32      2600          83204.0    682        6.0      1.5       21.97
-8      64      2870          45933.0    753       10.9      2.1       30.14
+prefetch ON (default)
+  nseq=1  io_wait 0.23s = 39.5% of wall  [miss  7.9%, depth 92.1%]  427 hit / 0 wasted
+  nseq=8  io_wait 0.12s =  6.9% of wall  [miss 27.2%, depth 72.8%]  737 hit / 0 wasted
 
-bytes/token fell 4.65x from nseq=1 to nseq=8
-aggregate tok/s  11.75 -> 30.14  (2.56x for 8x the rows)
-read bandwidth   1352 MB/s of 1230 MB/s device (110% - saturates)
-conversion       realised / available = 2.56x of 4.65x = 55%
+prefetch OFF (SOMA_PREFETCH_DEPTH=0)
+  nseq=1  io_wait 0.50s = 64.9% of wall  [miss 100%, depth 0%]        0 hit / 0 wasted
+  nseq=8  io_wait 0.93s = 40.7% of wall  [miss 100%, depth 0%]        0 hit / 0 wasted
 ```
 
-The union makes **4.65x fewer bytes** available as speedup and **2.56x** is realised. The missing 45% is
-not compute and not bandwidth — the device is already at 110% of its rated figure. Expert reads are
-issued serially inside the union loop, so that 45% is the engine WAITING. G3 predicted "~44%" from a
-different direction and the number has not moved, which is what makes this a standing debt rather than a
-measurement artefact.
+**The "~44% of wall time is reads" figure describes the prefetch-OFF engine.** With prefetch on it is
+6.9% at the widest batch. There is no 45% of waiting to reclaim, and a gate to reclaim it cannot pass
+because it is already passed. Throughput at nseq=8 confirms it from the other side: 28.1 tok/s with
+prefetch against 18.3 without, a 1.54x standing win.
 
-That framing matters for what counts as done. The available multiple (4.65x) is set by the union and is
-already earned; G9 is entirely about converting it, so the gate is stated as a ratio between the two
-rather than as a throughput target that a faster disk would satisfy on its own.
+The split is what makes this actionable rather than merely reassuring. At nseq=8, 72.8% of the remaining
+wait is *depth* — finishing a read prefetch had already started — and 27.2% is *miss*, where no prefetch
+was attempted. Only the first responds to queueing further ahead, and it is 5% of wall time. That is the
+size of the prize, and it is small.
 
-### Criteria
+### Why the metric I chose would not have shown it either
 
-- **Prefetch the next unique expert while the current one is applied.** `scaling_g3`'s conversion figure
-  is the number that says whether it worked, and it is the headline.
-- **bytes/token unchanged to within noise at every nseq.** The anti-cheat, stated as its own criterion so
-  it cannot be waived as a detail of the first one.
-- **Read bandwidth stays saturated.** If it drops, the win came from doing less I/O — a different and
-  lesser claim, and one that would make the conversion ratio meaningless because the denominator moved.
-- **`streamed_determinism_g3` still byte-identical.** Prefetching reorders READS; it must not reorder
-  accumulation. This is the criterion most likely to fail first and the cheapest to check.
-- **Cold-cache and warm-cache runs reported separately, both stated.** Non-negotiable for an I/O gate:
-  this repo's own stage-2 run hit 98.4% cache with 16 misses, and warm numbers prove nothing about
-  overlap. A prefetch gate that passes on warm numbers has passed without prefetching.
-- **`reliability_tests` green.** The fallback shares the node; a change to how the engine reads must not
-  reach it at all, and if it does, that is the finding.
+G9 was gated on "union conversion rises from 55% toward 80%". Conversion measures realised throughput
+scaling against available byte savings — a SCALING ratio. Prefetching speeds up every batch width by
+roughly the same factor, so it barely moves: **57% with prefetch and 57% without**. A gate on that number
+would have been insensitive to the very mechanism it named.
 
-### Not in this gate, and why
+It is also noisier than the movement it was written to detect. Six runs of the same binary on the same
+container: **45, 50, 50, 52, 53, 57%**. The 55% the gate anchored to was near the top of that band, not a
+baseline.
 
-- **GPU kernels and the VRAM tier.** v1 is CPU-only by decision; the tier stays declared-and-empty and
-  reported as such. Nothing in G9 depends on it, and folding it in would put a migration inside a
-  measurement.
-- **Paged KV, speculation under batching.** Both post-G4-eligible, neither on the critical path of the
-  ratio that is currently pinned at 55%.
-- **`accuracy_floor`.** Deliberately kept out rather than bundled: it needs a task set, a scorer, and a
-  decision about what a floor MEANS, which is a judgement project rather than an engineering one.
-  Bundling it would let a soft target ride along inside a gate that otherwise has a hard number, and the
-  soft one always wins that argument. It wants its own small gate.
+### What a successor gate would need first
+
+The conversion gap is real — 2.63x realised of 4.65x available — but it is not I/O wait, which is 6.9%.
+It is compute or memory, and this document should not name a mechanism again without evidence.
+
+The blocker is methodological, and `scaling_g3`'s own header already says it: wall-clock here measures
+**the page cache, not the device**. The runs above read at 1632 MB/s against a G2-measured NVMe figure of
+1230 MB/s — 133%, which is only possible if the OS is serving from RAM. Every number on this page is
+warm. Before any performance gate is written:
+
+- A cold-cache measurement, which on this host needs a way to drop the standby list. Until then
+  `bytes/token` stays the primary gate, exactly as `scaling_g3` was designed to insist.
+- An attribution of the non-wait 93%, which `io_wait_ns` now makes possible for the I/O half and which
+  nothing yet does for compute.
+
+`accuracy_floor` remains unclaimed and is unaffected by any of this; it wants its own small gate, for the
+reasons recorded when G9 was first drafted.
 
 ## Cross-cutting: CI from day one
 

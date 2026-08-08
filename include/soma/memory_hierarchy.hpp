@@ -41,7 +41,21 @@ struct CacheStats {
     std::uint64_t prefetch_hits = 0;
     std::uint64_t prefetch_wasted = 0; ///< prefetched, then evicted unused
     std::uint64_t bytes_read = 0;
+
+    /// Time a caller spent BLOCKED on bytes, and the split that says what to do
+    /// about it.
+    ///
+    /// `io_wait_ns` is the total. `miss_wait_ns` is the part where nothing was
+    /// in flight when the expert was wanted — a COVERAGE problem, which more
+    /// prefetch depth cannot fix. The remainder (`io_wait_ns - miss_wait_ns`) is
+    /// time spent finishing a read that prefetch had already started: a DEPTH
+    /// problem, and the one that responds to queueing further ahead.
+    ///
+    /// Split because the two prescribe opposite actions and a single number
+    /// hides which applies. Populated together in acquire().
     std::uint64_t io_wait_ns = 0;
+    std::uint64_t miss_wait_ns = 0;
+    std::uint64_t inflight_waits = 0;
 };
 
 /// One cell of the heat map / brain grid.

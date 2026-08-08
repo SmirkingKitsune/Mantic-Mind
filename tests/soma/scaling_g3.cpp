@@ -126,8 +126,30 @@ int main(int argc, char** argv) {
 
         rows.push_back({nseq, mem.stats().bytes_read, ws.unique_expert_reads,
                         ws.naive_expert_reads, secs});
+
+        // WHERE the time went, not just how much of it there was.
+        //
+        // io_wait_ns as a fraction of wall time is the only direct statement
+        // this harness makes about whether the engine is waiting on bytes. It
+        // was inferred from throughput before, and an inference is what let
+        // "reads are issued serially inside the union loop" survive in the
+        // roadmap long after prefetching had been built and turned on.
+        //
+        // The split is the actionable half. `miss` is time no prefetch was even
+        // attempted for — a COVERAGE gap, immune to more depth. `depth` is time
+        // spent finishing a read prefetch had already started, and is the only
+        // part that queueing further ahead can shrink.
+        const auto cs = mem.stats();
+        const double wait_s = static_cast<double>(cs.io_wait_ns) / 1e9;
+        const double miss_s = static_cast<double>(cs.miss_wait_ns) / 1e9;
+        const double denom = std::max(wait_s, 1e-9);
         std::cout << "  nseq=" << nseq << " done (" << std::fixed << std::setprecision(1)
-                  << secs << "s)\n" << std::flush;
+                  << secs << "s)  io_wait " << std::setprecision(2) << wait_s << "s = "
+                  << std::setprecision(1) << (100.0 * wait_s / secs) << "% of wall  [miss "
+                  << (100.0 * miss_s / denom) << "%, depth "
+                  << (100.0 * (wait_s - miss_s) / denom) << "%]  prefetch "
+                  << cs.prefetch_hits << " hit / " << cs.prefetch_wasted << " wasted\n"
+                  << std::flush;
     }
 
     std::cout << "\n"
