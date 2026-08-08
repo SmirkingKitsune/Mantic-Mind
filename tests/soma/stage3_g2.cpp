@@ -9,86 +9,24 @@
 // role or raising a group-scale granularity, not debugging a kernel. Reporting
 // them as the same failure costs days.
 //
+// The COMPARISON now lives in soma/conformance.hpp, because `soma conform` runs
+// it too and two implementations would mean two thresholds and two opinions
+// about what passes. What stays here is the reporting and the remediation
+// guidance, which is what a harness is for.
+//
 // Usage: stage3_g2 <container_dir> <reference_dir> [--cache-gib N] [--positions N]
 
-#include "soma/expert_store.hpp"
-#include "soma/f32_model.hpp"
-#include "soma/memory_hierarchy.hpp"
-#include "soma/plan.hpp"
+#include "soma/conformance.hpp"
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <string>
-#include <vector>
 
 namespace fs = std::filesystem;
-
-namespace {
-
-/// Mean KL(reference || engine) in nats, over the softmax of each position.
-///
-/// Asymmetric on purpose and in this direction: it penalizes the engine for
-/// putting low probability where the reference puts high probability, which is
-/// the failure that matters. The reverse direction would tolerate the engine
-/// dropping a mode the reference is confident about.
-double logit_kl(const float* ref, const float* eng, std::uint32_t vocab) {
-    double rmax = -1e30, emax = -1e30;
-    for (std::uint32_t i = 0; i < vocab; ++i) {
-        rmax = std::max(rmax, static_cast<double>(ref[i]));
-        emax = std::max(emax, static_cast<double>(eng[i]));
-    }
-    double rsum = 0.0, esum = 0.0;
-    for (std::uint32_t i = 0; i < vocab; ++i) {
-        rsum += std::exp(static_cast<double>(ref[i]) - rmax);
-        esum += std::exp(static_cast<double>(eng[i]) - emax);
-    }
-    const double rlog = rmax + std::log(rsum);
-    const double elog = emax + std::log(esum);
-
-    double kl = 0.0;
-    for (std::uint32_t i = 0; i < vocab; ++i) {
-        const double lp = static_cast<double>(ref[i]) - rlog;
-        const double lq = static_cast<double>(eng[i]) - elog;
-        const double p = std::exp(lp);
-        if (p > 1e-12) kl += p * (lp - lq);
-    }
-    return kl;
-}
-
-struct Reference {
-    std::uint32_t positions = 0, vocab = 0;
-    std::vector<std::int32_t> ids;
-    std::vector<float> logits;
-};
-
-bool read_reference(const fs::path& p, Reference& out, std::string& err) {
-    std::ifstream in(p, std::ios::binary);
-    if (!in) { err = "cannot open " + p.string(); return false; }
-    char magic[8]{};
-    in.read(magic, 8);
-    if (std::memcmp(magic, "SOMAORCL", 8) != 0) { err = "bad magic"; return false; }
-    std::uint32_t hdr[5]{};
-    in.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
-    out.positions = hdr[1];
-    out.vocab = hdr[2];
-    out.ids.resize(out.positions);
-    out.logits.resize(static_cast<std::size_t>(out.positions) * out.vocab);
-    in.read(reinterpret_cast<char*>(out.ids.data()),
-            static_cast<std::streamsize>(out.ids.size() * 4));
-    in.read(reinterpret_cast<char*>(out.logits.data()),
-            static_cast<std::streamsize>(out.logits.size() * 4));
-    if (!in) { err = "short read"; return false; }
-    return true;
-}
-
-}  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 3) {
@@ -105,176 +43,89 @@ int main(int argc, char** argv) {
         if (std::string(argv[i]) == "--positions") want_positions = std::stoul(argv[i + 1]);
     }
 
-    Reference ref;
-    std::string err;
-    if (!read_reference(rdir / "oracle.bin", ref, err)) {
-        std::cerr << "reference: " << err << "\n";
+    std::cout << "loading container and streaming forward ...\n" << std::flush;
+    const auto r = soma::run_real_logit_kl(cdir.string(), (rdir / "oracle.bin").string(),
+                                           cache_gib, want_positions);
+    if (r.skipped) {
+        std::cerr << "SKIPPED: " << r.detail << "\n";
+        return 2;
+    }
+    if (!r.loaded || r.positions == 0) {
+        std::cerr << "failed: " << r.detail << "\n";
         return 2;
     }
 
-    soma::QuantMap qm;
-    qm.expert_gate = {soma::DType::Q4_G, 128};
-    qm.expert_up = {soma::DType::Q4_G, 128};
-    qm.expert_down = {soma::DType::Q6_G, 128};
-
-    std::cout << "loading dense half from container ...\n" << std::flush;
-    auto t0 = std::chrono::steady_clock::now();
-    soma::F32Model model;
-    if (auto st = soma::load_f32_model(cdir.string(), model, qm); !st.ok()) {
-        std::cerr << "load failed: " << st.message() << "\n";
-        return 2;
-    }
-    std::cout << "  " << std::chrono::duration<double>(
-                            std::chrono::steady_clock::now() - t0).count()
-              << "s, streamed=" << (model.experts_are_streamed ? "yes" : "no") << "\n";
-
-    soma::ExpertStore store;
-    if (auto st = store.open(cdir.string(), model.arch); !st.ok()) {
-        std::cerr << "container open failed: " << st.message() << "\n";
-        return 2;
-    }
-    const auto& h = store.header();
-
-    soma::MemoryBudget budget;
-    budget.ram_expert_cache_bytes = cache_gib * 1024ull * 1024 * 1024;
-    budget.pin_bytes = budget.ram_expert_cache_bytes / 8;
-
-    soma::MemoryHierarchy mem;
-    if (auto st = mem.open(model.arch, store, budget); !st.ok()) {
-        std::cerr << "hierarchy open failed: " << st.message() << "\n";
-        return 2;
-    }
-    model.streamed_experts = &mem;
-
-    const auto n = want_positions ? std::min(want_positions, ref.positions) : ref.positions;
-    if (ref.vocab != model.vocab()) {
-        std::cerr << "vocab mismatch: reference " << ref.vocab << " vs model " << model.vocab()
-                  << "\n";
-        return 2;
-    }
-
-    std::cout << "container   " << h.n_layers << "L x " << h.n_experts << "E, expert="
-              << (h.expert_bytes / 1024) << " KiB\n"
-              << "cache       " << cache_gib << " GiB  (cap_per_layer="
-              << mem.cap_per_layer() << ")\n"
-              << "positions   " << n << " of " << ref.positions << "\n\n"
-              << "streaming forward ...\n" << std::flush;
-
-    std::vector<soma::TokenId> toks(ref.ids.begin(), ref.ids.begin() + n);
-    soma::F32Workspace ws;
-    std::vector<float> logits;
-    t0 = std::chrono::steady_clock::now();
-    if (auto st = soma::forward_f32(model, toks, ws, logits); !st.ok()) {
-        std::cerr << "forward failed: " << st.message() << "\n";
-        return 1;
-    }
-    const auto secs = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - t0).count();
-
-    // ── KL ───────────────────────────────────────────────────────────────────
-    std::vector<double> per_pos(n);
-    double sum = 0.0, worst = 0.0;
-    std::uint32_t worst_at = 0;
-    std::uint32_t top1_agree = 0;
-    for (std::uint32_t t = 0; t < n; ++t) {
-        const float* r = ref.logits.data() + static_cast<std::size_t>(t) * ref.vocab;
-        const float* e = logits.data() + static_cast<std::size_t>(t) * ref.vocab;
-        const double kl = logit_kl(r, e, ref.vocab);
-        per_pos[t] = kl;
-        sum += kl;
-        if (kl > worst) { worst = kl; worst_at = t; }
-
-        std::uint32_t ra = 0, ea = 0;
-        for (std::uint32_t i = 1; i < ref.vocab; ++i) {
-            if (r[i] > r[ra]) ra = i;
-            if (e[i] > e[ea]) ea = i;
-        }
-        if (ra == ea) ++top1_agree;
-    }
-    const double mean = sum / n;
-    std::sort(per_pos.begin(), per_pos.end());
-    const double median = per_pos[n / 2];
-    const double p95 = per_pos[static_cast<std::size_t>(n * 0.95)];
-
-    const auto cs = mem.stats();
-    const double hit_rate = 100.0 * static_cast<double>(cs.hits) /
-                            static_cast<double>(std::max<std::uint64_t>(1, cs.hits + cs.misses));
-
+    const auto n = r.positions;
     std::cout << std::fixed
-              << "  forward       " << std::setprecision(1) << secs << "s ("
-              << (secs / n * 1000.0) << " ms/token)\n"
-              << "  cache         " << std::setprecision(1) << hit_rate << "% hit, "
-              << cs.misses << " misses, " << cs.evictions << " evictions, "
-              << (cs.bytes_read / 1048576) << " MiB read\n"
-              << "  bytes/token   " << (cs.bytes_read / n / 1024) << " KiB\n"
+              << "  forward       " << std::setprecision(1) << r.forward_seconds << "s ("
+              << (r.forward_seconds / n * 1000.0) << " ms/token)\n"
+              << "  cache         " << std::setprecision(1) << r.cache_hit_rate_pct
+              << "% hit, " << r.cache_misses << " misses, " << r.cache_evictions
+              << " evictions, " << (r.bytes_read / 1048576) << " MiB read\n"
+              << "  bytes/token   " << (r.bytes_read / n / 1024) << " KiB\n"
               // The batch union, on a real checkpoint. Reported next to
               // bytes/token because they are the same claim measured twice: the
               // union is what makes the read cost per-expert rather than
               // per-row, and the ratio is how far that got.
-              << "  expert reads  " << ws.unique_expert_reads << " unique of "
-              << ws.naive_expert_reads << " naive  ("
-              << std::setprecision(1)
-              << (static_cast<double>(ws.naive_expert_reads) /
-                  static_cast<double>(std::max<std::uint64_t>(1, ws.unique_expert_reads)))
+              << "  expert reads  " << r.unique_expert_reads << " unique of "
+              << r.naive_expert_reads << " naive  (" << std::setprecision(1)
+              << (static_cast<double>(r.naive_expert_reads) /
+                  static_cast<double>(std::max<std::uint64_t>(1, r.unique_expert_reads)))
               << "x union saving)\n\n"
               << "logit-KL(reference || engine), nats\n"
-              << "  mean          " << std::setprecision(5) << mean << "\n"
-              << "  median        " << median << "\n"
-              << "  p95           " << p95 << "\n"
-              << "  max           " << worst << "  (position " << worst_at << ")\n"
-              << "  top-1 agree   " << std::setprecision(1)
-              << (100.0 * top1_agree / n) << "%  (" << top1_agree << "/" << n << ")\n\n";
+              << "  mean          " << std::setprecision(5) << r.mean_kl << "\n"
+              << "  median        " << r.median_kl << "\n"
+              << "  p95           " << r.p95_kl << "\n"
+              << "  max           " << r.worst_kl << "  (position " << r.worst_at << ")\n"
+              << "  top-1 agree   " << std::setprecision(1) << r.top1_agreement_pct << "%\n\n";
 
-    // Threshold.
-    //
-    // 0.05 nats mean is a distribution the engine reproduces closely — for
-    // reference, that is roughly the KL between a distribution and itself with
-    // one logit perturbed by a few percent. Chosen against the measured
-    // quantization error rather than as a round number: G1 showed q4_g moving
-    // logits by ~16% relative, and the mean KL that induces is what this bounds.
-    constexpr double kMeanKlThreshold = 0.05;
-    constexpr double kP95KlThreshold = 0.25;
-
-    const bool pass = (mean <= kMeanKlThreshold) && (p95 <= kP95KlThreshold);
     // Explicit precision: the stream is still carrying setprecision(1) from the
     // top-1 line above, which printed the real 0.05/0.25 gate as "0.1/0.2" —
     // looser on the mean, tighter on p95. The comparison was always against the
     // constants, but a gate that misreports its own threshold is a gate nobody
     // can check.
-    std::cout << "stage 3: " << (pass ? "PASS" : "FAIL") << "  (mean <= "
-              << std::setprecision(3) << kMeanKlThreshold << ", p95 <= "
-              << kP95KlThreshold << ")\n";
+    std::cout << "stage 3: " << (r.passed ? "PASS" : "FAIL") << "  (mean <= "
+              << std::setprecision(3) << soma::kRealLogitKlMeanMax
+              << ", p95 <= " << soma::kRealLogitKlP95Max << ")\n";
 
-    if (!pass) {
+    if (!r.passed) {
         // A failure is only a QUANTIZATION finding if the output is degraded but
         // still related to the reference. Two signatures say otherwise, and
         // calling them "quantization" sends the reader to remediate the quant map
-        // while the real fault is elsewhere:
-        //
-        //   KL ~ ln(vocab)      the engine is emitting a UNIFORM distribution.
-        //                       Quantization does not flatten a distribution to
-        //                       maximum entropy; zeroed or unloaded weights do.
-        //   top-1 agree ~ 0%    the outputs are unrelated, not merely blurred.
-        //                       q4_g moves logits ~16% relative, which keeps the
-        //                       argmax most of the time.
-        const double uniform_kl = std::log(static_cast<double>(ref.vocab));
-        const double top1_pct = 100.0 * top1_agree / n;
-        const bool degenerate = (mean > 0.8 * uniform_kl) || (top1_pct < 5.0);
-
-        if (degenerate) {
+        // while the real fault is elsewhere. run_real_logit_kl decides which; the
+        // wording is here, because a remediation hint is a harness concern.
+        if (r.degenerate) {
+            const double uniform_kl = std::log(static_cast<double>(r.vocab));
             std::cout << "\nThis is NOT a quantization finding.\n\n"
-                      << "  mean KL " << std::setprecision(3) << mean << " vs ln(vocab) = "
-                      << uniform_kl << ", and top-1 agreement " << std::setprecision(1)
-                      << top1_pct << "%.\n"
-                      << "  The engine is producing an essentially uniform distribution, which\n"
-                      << "  quantization does not do at any precision. Look for weights that are\n"
-                      << "  zero or never loaded — check the container's dense tensors before\n"
-                      << "  touching the quant map.\n";
+                      << "  mean KL " << std::setprecision(3) << r.mean_kl
+                      << " vs ln(vocab) = " << uniform_kl << ", and top-1 agreement "
+                      << std::setprecision(1) << r.top1_agreement_pct << "%.\n";
+            // Two different faults, and the difference is a hard bound rather
+            // than a judgement call: KL(ref||uniform) = ln(vocab) - H(ref), so it
+            // can never EXCEED ln(vocab). A mean above that is arithmetically not
+            // a flat engine — it is a confident one pointing somewhere else,
+            // which is what a shuffled vocab or a mismatched tokenizer looks
+            // like. Saying "essentially uniform" there sends the reader to
+            // inspect weights that are fine.
+            if (r.mean_kl > uniform_kl) {
+                std::cout
+                    << "  KL above ln(vocab) is not a flat distribution — it cannot be. The\n"
+                    << "  engine is confidently placing mass where the reference has almost\n"
+                    << "  none, which means the two are not describing the same model: check\n"
+                    << "  that the reference was built from THIS checkpoint and that the\n"
+                    << "  tokenizer and vocab ordering match before touching the quant map.\n";
+            } else {
+                std::cout
+                    << "  The engine is producing an essentially uniform distribution, which\n"
+                    << "  quantization does not do at any precision. Look for weights that are\n"
+                    << "  zero or never loaded — check the container's dense tensors before\n"
+                    << "  touching the quant map.\n";
+            }
         } else {
             std::cout << "\nThis is a QUANTIZATION finding, not a correctness bug: stages 1 and 2\n"
                          "pass token-exact on the same code. Remediation is the quant map — raise\n"
                          "expert_down, or tighten the group — not the kernels.\n";
         }
     }
-    return pass ? 0 : 1;
+    return r.passed ? 0 : 1;
 }

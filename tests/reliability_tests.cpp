@@ -4930,6 +4930,17 @@ bool test_admission_fetch_stage() {
              "os.makedirs(d, exist_ok=True)\n"
              "open(os.path.join(d, 'oracle.bin'), 'wb').write(b'SOMAORCL')\n"
              "print('stub oracle', flush=True)\n";
+        // Same reasoning for the bf16 reference, which needs torch AND enough
+        // RAM to hold a real checkpoint. It writes <out>/oracle.bin flat, which
+        // is the shape make_reference.py produces, so the pipeline's
+        // rename-to-reference.bin step is exercised rather than skipped by a
+        // missing script.
+        std::ofstream mr(tools_dir / "make_reference.py", std::ios::binary);
+        mr << "import os, sys\n"
+              "out = sys.argv[sys.argv.index('--out') + 1]\n"
+              "os.makedirs(out, exist_ok=True)\n"
+              "open(os.path.join(out, 'oracle.bin'), 'wb').write(b'SOMAORCL')\n"
+              "print('stub reference', flush=True)\n";
     }
 
     mm::ControlModelRegistry reg;
@@ -4997,8 +5008,14 @@ bool test_admission_fetch_stage() {
     // steps and then emitted step 5, which renders as 250%.
     //  builds the tiny-random conformance fixture that turns ladder
     // stage 1 from "skipped" into an answer.
-    const std::vector<std::string> want{"fetch",   "convert",     "tokenize", "oracle",
-                                        "profile", "conformance", "finalize"};
+    // "reference" is the bf16 pass over the REAL checkpoint — the counterpart to
+    // "oracle", and the stage that turns ladder stage 2 from "skipped" into an
+    // answer. Both are here because a pipeline that silently stopped running
+    // either would leave the ladder reporting fewer stages while still saying
+    // "no failures", which reads as a pass.
+    const std::vector<std::string> want{"fetch",     "convert",     "tokenize",
+                                        "oracle",    "reference",   "profile",
+                                        "conformance", "finalize"};
     std::size_t at = 0;
     std::int64_t peak_bytes = 0, peak_total = 0;
     for (const auto& f : good->frames) {
@@ -5321,6 +5338,17 @@ bool test_requantization_is_a_new_admission() {
              "os.makedirs(d, exist_ok=True)\n"
              "open(os.path.join(d, 'oracle.bin'), 'wb').write(b'SOMAORCL')\n"
              "print('stub oracle', flush=True)\n";
+        // Same reasoning for the bf16 reference, which needs torch AND enough
+        // RAM to hold a real checkpoint. It writes <out>/oracle.bin flat, which
+        // is the shape make_reference.py produces, so the pipeline's
+        // rename-to-reference.bin step is exercised rather than skipped by a
+        // missing script.
+        std::ofstream mr(tools_dir / "make_reference.py", std::ios::binary);
+        mr << "import os, sys\n"
+              "out = sys.argv[sys.argv.index('--out') + 1]\n"
+              "os.makedirs(out, exist_ok=True)\n"
+              "open(os.path.join(out, 'oracle.bin'), 'wb').write(b'SOMAORCL')\n"
+              "print('stub reference', flush=True)\n";
     }
 
     mm::ControlModelRegistry reg;

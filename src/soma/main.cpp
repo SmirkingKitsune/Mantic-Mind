@@ -281,6 +281,61 @@ StageResult stage_fp32_tiny_tf(const std::filesystem::path& dir) {
     return r;
 }
 
+/// Ladder stage 2. The one that looks at the weights an operator will ship.
+///
+/// Stage 1 runs tiny-RANDOM weights and proves the architecture. This runs the
+/// container as it will actually be served — same quant map, same streaming
+/// expert cache — against a bf16 pass over the real checkpoint. It is the only
+/// stage whose failure can mean "this quantization of this model is not good
+/// enough", which is what `reject` is supposed to encode.
+StageResult stage_real_logit_kl(const std::filesystem::path& dir) {
+    StageResult r{"real_logit_kl", "skipped", {}};
+
+    const auto reference = dir / "conformance" / "reference.bin";
+    if (!std::filesystem::exists(reference)) {
+        r.detail["reason"] = "no bf16 reference in this container; admission builds one with "
+                             "tools/admission/make_reference.py when transformers is available";
+        return r;
+    }
+
+    // Bounded on purpose. The reference carries 512 positions and the streaming
+    // forward is the expensive part of admission; the cap keeps a stage that
+    // reports a distribution from dominating a pipeline that also has to convert
+    // weights. Raising it tightens the p95 estimate, nothing else.
+    const auto c = soma::run_real_logit_kl(dir.string(),
+                                           reference.string(),
+                                           /*cache_gib=*/4,
+                                           /*max_positions=*/256);
+    if (c.skipped) {
+        r.detail["reason"] = c.detail;
+        return r;
+    }
+
+    r.status = c.passed ? "passed" : "failed";
+    r.detail = nlohmann::json{{"mean_kl", c.mean_kl},
+                              {"median_kl", c.median_kl},
+                              {"p95_kl", c.p95_kl},
+                              {"max_kl", c.worst_kl},
+                              {"max_kl_at_position", c.worst_at},
+                              {"top1_agreement_pct", c.top1_agreement_pct},
+                              {"positions", c.positions},
+                              {"tolerance_mean_kl", soma::kRealLogitKlMeanMax},
+                              {"tolerance_p95_kl", soma::kRealLogitKlP95Max},
+                              // Measured on real weights rather than estimated
+                              // from headers — the quantity the streamable
+                              // verdict rests on.
+                              {"bytes_per_token", c.positions ? c.bytes_read / c.positions : 0},
+                              {"cache_hit_rate_pct", c.cache_hit_rate_pct}};
+    if (!c.detail.empty()) r.detail["error"] = c.detail;
+    // Says which remedy applies. A degenerate result is not a quant-map problem,
+    // and an operator who requantizes in response to one burns an hour re-running
+    // conversion to reach the same place.
+    if (!c.passed) {
+        r.detail["finding"] = c.degenerate ? "not_quantization" : "quantization";
+    }
+    return r;
+}
+
 StageResult stage_tokenizer_roundtrip(const std::filesystem::path& dir) {
     StageResult r{"tokenizer_roundtrip", "skipped", {}};
 
@@ -339,11 +394,7 @@ int cmd_conform(int argc, char** argv) {
     // The stages that need something this process does not have, named with what
     // that is. They are recorded as SKIPPED, never as passed.
     stages.push_back(stage_fp32_tiny_tf(root));
-    stages.push_back({"real_logit_kl",
-                      "skipped",
-                      {{"reason",
-                        "needs an fp16 reference pass over this checkpoint; see "
-                        "tools/admission/make_reference.py and soma_stage3_g2"}}});
+    stages.push_back(stage_real_logit_kl(root));
     stages.push_back(
         {"accuracy_floor", "skipped", {{"reason", "no downstream task harness exists yet"}}});
 

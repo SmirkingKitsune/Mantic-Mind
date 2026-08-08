@@ -2620,9 +2620,9 @@ Each proves one stage runs and the other reports why it could not. A third case 
 asserts that *every stage skipped* reports `passed: false`, since "nothing was checked" reading as a
 pass is the exact failure this file exists to prevent.
 
-**`fp32_tiny_tf` now runs too — see [The conformance oracle](#the-conformance-oracle).** Still recorded
-as skipped rather than stubbed: `real_logit_kl`, and `accuracy_floor` (for which no downstream task
-harness exists at all).
+**`fp32_tiny_tf` and `real_logit_kl` both run now** — see [The conformance oracle](#the-conformance-oracle)
+and [The stage that looks at the weights](#the-stage-that-looks-at-the-weights). Still recorded as
+skipped rather than stubbed: `accuracy_floor`, for which no downstream task harness exists at all.
 
 #### The conformance oracle
 
@@ -2900,6 +2900,64 @@ CHECK failed at line 1411: resp.status != 0
 do not make it impossible. What has changed is only that the next occurrence will say which of the two
 findings it is. That is the whole claim; the earlier "resolved" was stronger than the evidence, which is
 why the recurrence is recorded here rather than quietly re-fixed.
+
+#### The stage that looks at the weights
+
+Stage 1 proves the ARCHITECTURE against tiny-random weights and says nothing about the checkpoint an
+operator ships. Stage 2 is the other half, and until now it reported `skipped` — which meant the strongest
+guarantee in the routing system was unreachable. `reject` is the one verdict that overrides an explicit
+`backend_override: soma`, precisely because it means conformance failed; with stage 2 never running,
+nothing could produce it from real weights. The interlock existed and had no way to trip.
+
+Both halves already existed and had never been connected: `tools/admission/make_reference.py` writes a
+bf16 forward over the real checkpoint into the same `SOMAORCL` container the tiny oracles use, and
+`tests/soma/stage3_g2.cpp` had the KL comparison. Neither was reachable from `soma conform` or the
+pipeline.
+
+**Measured on OLMoE-1B-7B-0924 at q4_g/q6_g/g128**, admitted end to end with the pipeline building its
+own reference:
+
+```
+real_logit_kl  passed   mean=0.0367 (tol 0.05)   p95=0.1435 (tol 0.25)   top-1 94.1%
+```
+
+The ladder now reports **4 of 5 stages ran**, against 3.
+
+**Why two metrics rather than one.** The perturbation tests make the case better than argument does. A
+reference sharpened 3x — identical ranking, wrong distribution shape — fails at p95 0.99 while top-1
+agreement is **95.8%, HIGHER than the passing run's 94.1%**. A gate on argmax alone would have called
+that a pass. Conversely KL can stay small while top-1 drifts on near-ties. They fail differently, so both
+are reported.
+
+**The failure path is real, and classified.** Two deliberate corruptions, both caught:
+
+| Perturbed reference | Result | Classified |
+|---|---|---|
+| vocab axis shuffled — unrelated | FAIL, mean KL 19.0, top-1 0.0% | not a quantization finding |
+| logits sharpened 3x — same ranking | FAIL, p95 0.99, top-1 95.8% | quantization finding |
+
+That distinction is the point of the stage. A quantization finding says requantize a role or tighten a
+group; a degenerate one says the container or the reference is wrong and the quant map is innocent.
+Sending an operator to re-run conversion for the second costs an hour and arrives back in the same place.
+
+**And the degenerate message was wrong, which the measurement showed.** It said "essentially uniform" for
+a case scoring mean KL 19.0 against `ln(vocab) = 10.8`. That is arithmetically impossible for a flat
+engine: `KL(ref||uniform) = ln(vocab) - H(ref)`, so it can never EXCEED `ln(vocab)`. A mean above that is
+a CONFIDENT engine pointing somewhere else — a mismatched checkpoint or vocab ordering, not dead weights.
+The two now say different things, split on a hard bound rather than a judgement call.
+
+**One real defect fixed on the way.** The harness hardcoded `q4_g/q4_g/q6_g@128` instead of reading the
+container's own map — so a model admitted through `QuantOverride` would have been dequantized with the
+wrong map and scored as a different model than the one anyone would run. It now reads
+`container_meta.json`. A mismatched map is caught before the forward, by a size check:
+`container experts are 3997696 B but the IR's quantization map implies 3538944 B`.
+
+**Cost, stated plainly.** The reference pass is the slowest thing in admission — it loads the source at
+bf16 — and it is bounded to 256 positions in-pipeline so a distributional check does not dominate a
+pipeline that also converts weights. It is non-fatal, like the oracle: on a host that cannot hold the
+checkpoint it fails and stage 2 reports `skipped`. That distinction is load-bearing in the other
+direction too, and the header says so — no evidence must never read as adverse evidence, because only one
+of those should ever become a `reject`.
 
 #### The launch path that ignored its settings
 

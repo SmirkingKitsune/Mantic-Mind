@@ -69,7 +69,7 @@ std::vector<std::string> admission_stages(bool container_is_ready, bool needs_fe
     if (container_is_ready) return {"profile", "conformance", "finalize"};
     std::vector<std::string> s;
     if (needs_fetch) s.push_back("fetch");
-    s.insert(s.end(), {"convert", "tokenize", "oracle", "profile", "conformance", "finalize"});
+    s.insert(s.end(), {"convert", "tokenize", "oracle", "reference", "profile", "conformance", "finalize"});
     return s;
 }
 
@@ -1466,6 +1466,59 @@ void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
             emit("oracle", "not built (exit " + std::to_string(orc) +
                                "); conformance stage 1 will report skipped", 0.78);
         }
+    }
+
+    // The bf16 REFERENCE, for ladder stage 2.
+    //
+    // The counterpart to the oracle above, and the opposite trade: that fixture
+    // is tiny-random and validates the architecture; this is a forward pass over
+    // the REAL checkpoint at bf16, and it is the only evidence that this
+    // quantization of these weights is faithful. Without it `reject` is
+    // unreachable for a real model — the verdict exists and nothing can produce
+    // it.
+    //
+    // Also not fatal, on the same reasoning. The cost is real: loading the source
+    // at bf16 is the slowest thing in admission, and on a host that cannot hold
+    // it this will fail rather than swap the machine to death. Stage 2 then
+    // reports skipped, which distinguishes "no evidence" from "bad model" — and
+    // only one of those should ever read as a reject.
+    if (!container_is_ready) {
+        emit("reference", "bf16 reference pass over the real checkpoint", 0.79);
+        std::string err;
+        const auto ref_build = (fs::path(container) / "reference-build").string();
+        const int rc = run_streamed_command(
+            {tools.python, (tools_dir / "make_reference.py").string(), local_source, "--out",
+             ref_build},
+            fs::current_path(),
+            [&](const std::string& line, bool) {
+                if (!util::trim(line).empty()) emit("reference", util::trim(line), 0.80);
+            },
+            canceled, &err);
+        if (canceled()) {
+            progress.canceled = true;
+            fail("canceled while building the reference");
+            return;
+        }
+        std::error_code ec;
+        const fs::path produced = fs::path(ref_build) / "oracle.bin";
+        if (rc == 0 && fs::exists(produced, ec)) {
+            // Beside the stage-1 fixture, under a name that says which it is.
+            // Both are SOMAORCL and a single `oracle.bin` for two stages is how
+            // one would silently be scored against the other's model.
+            const fs::path dest = fs::path(container) / "conformance" / "reference.bin";
+            fs::create_directories(dest.parent_path(), ec);
+            fs::remove(dest, ec);
+            fs::rename(produced, dest, ec);
+            if (ec) fs::copy_file(produced, dest, fs::copy_options::overwrite_existing, ec);
+            emit("reference", ec ? "built, but could not be placed: " + ec.message() : "built",
+                 0.81);
+        } else {
+            MM_WARN("admission {}: make_reference.py exited {}; ladder stage 2 will report "
+                    "skipped", progress.operation_id, rc);
+            emit("reference", "not built (exit " + std::to_string(rc) +
+                                  "); conformance stage 2 will report skipped", 0.81);
+        }
+        fs::remove_all(ref_build, ec);
     }
 
     // ── 3. plan ──────────────────────────────────────────────────────────────

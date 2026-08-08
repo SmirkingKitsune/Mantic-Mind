@@ -86,4 +86,85 @@ struct Fp32ConformanceResult {
 /// the oracle — not a converted container.
 Fp32ConformanceResult run_fp32_conformance(const std::string& model_dir);
 
+// ── stage 2: real_logit_kl ───────────────────────────────────────────────────
+//
+// Stage 1 demands token-exactness on a tiny-RANDOM model, which validates the
+// architecture and says nothing about the weights an operator ships. Stage 2 is
+// the other half: the REAL checkpoint, quantized, against a bf16 reference pass
+// over the same checkpoint.
+//
+// It cannot demand exactness — a quantized engine does not reproduce a bf16
+// reference bit-for-bit — so the bar is DISTRIBUTIONAL. That separation is
+// load-bearing: failing stage 2 while stage 1 passes is a QUANTIZATION finding,
+// and the remedy is to requantize a role or raise group granularity, not to
+// debug a kernel. Reporting them as one failure costs days.
+
+/// Mean and p95 KL, in nats.
+///
+/// 0.05 mean is a distribution the engine reproduces closely enough that
+/// sampling from it is not meaningfully different. The p95 exists because a mean
+/// alone hides a handful of catastrophic positions among many good ones, and a
+/// model that is confidently wrong twenty times in five hundred is not usable
+/// even with a flattering average.
+inline constexpr double kRealLogitKlMeanMax = 0.05;
+inline constexpr double kRealLogitKlP95Max = 0.25;
+
+struct RealLogitKlResult {
+    bool loaded = false;
+    bool passed = false;
+    /// Distinguished from a failure: no reference fixture is missing EVIDENCE,
+    /// not evidence of a bad model, and must never read as a reject.
+    bool skipped = false;
+    std::string detail;
+
+    std::uint32_t positions = 0;
+    std::uint32_t vocab = 0;
+    double mean_kl = 0.0;
+    double median_kl = 0.0;
+    double p95_kl = 0.0;
+    double worst_kl = 0.0;
+    std::uint32_t worst_at = 0;
+
+    /// How often the engine's argmax equals the reference's. Reported alongside
+    /// KL because they fail differently: KL can be small while top-1 drifts on
+    /// near-ties, and top-1 can look fine while the tail is badly mis-shaped.
+    double top1_agreement_pct = 0.0;
+
+    /// Set when the output is not merely degraded but broken — KL near what a
+    /// UNIFORM distribution would score, or top-1 agreement at chance. Worth its
+    /// own flag because the remedy differs: a degenerate result usually means a
+    /// wrong quant map or a corrupt container, not a granularity that needs
+    /// raising.
+    bool degenerate = false;
+
+    double cache_hit_rate_pct = 0.0;
+    double forward_seconds = 0.0;
+
+    /// Streaming cost on a REAL checkpoint. Not part of the pass rule — a model
+    /// can be faithful and slow — but reported because bytes/token is the
+    /// quantity the streamable verdict rests on, and this is the only place it
+    /// is measured against real weights rather than estimated from headers.
+    std::uint64_t cache_misses = 0;
+    std::uint64_t cache_evictions = 0;
+    std::uint64_t bytes_read = 0;
+    /// The batch union: how many distinct experts were actually read versus how
+    /// many a per-row loop would have. Same claim as bytes/token, measured twice.
+    std::uint64_t unique_expert_reads = 0;
+    std::uint64_t naive_expert_reads = 0;
+};
+
+/// Run the QUANTIZED container against a bf16 reference fixture.
+///
+/// `container_dir` is a converted container; the quant map is read from its own
+/// `container_meta.json` rather than assumed, because admission accepts a
+/// `QuantOverride` and a hardcoded map would silently dequantize with the wrong
+/// one — measuring a model nobody is going to run.
+///
+/// `reference_path` is a `SOMAORCL` file from tools/admission/make_reference.py.
+/// Same format as the tiny oracles, so there is one reader.
+RealLogitKlResult run_real_logit_kl(const std::string& container_dir,
+                                    const std::string& reference_path,
+                                    std::uint64_t cache_gib = 8,
+                                    std::uint32_t max_positions = 0);
+
 } // namespace soma
