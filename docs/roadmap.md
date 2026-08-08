@@ -25,6 +25,7 @@ ambiguous between the two. Concretely: the harness lands at **G0/G1**, the seam 
 | **G6** | API surface complete | Every capability on `/v1/*`, scope-gated, coverage check green |
 | **G7** | FTXUI dashboards on that API | Panels consume only `/v1/*` |
 | **G8** | Admission self-service | A new HF repo goes end-to-end with no C++ change |
+| **G9** | The read overlaps the compute | Union conversion rises from 55% toward 80%+ **with bytes/token unchanged** |
 
 Defects found and not yet fixed are tracked in [Open defects](#open-defects), separately from
 [what is deferred](#what-is-deferred-and-where-it-would-land) — deliberately-not-built and
@@ -1157,17 +1158,21 @@ grid — and asserts its contents rather than merely printing them.
 
 #### Still outstanding at G3
 
-The union and the telemetry dump are the measurable core; the scheduler around them is not built. Not
-yet done, and not claimed:
+Four of the five entries below were written when the union and the telemetry dump were the measurable
+core and the scheduler around them did not exist. They have been built since and the section was never
+revisited — struck rather than deleted, because a list that quietly loses its completed items stops
+being evidence of anything. Verified against the code before striking, not assumed:
 
-- **The scheduler itself** — step-major loop over ready sequences, ragged batch assembly, the three
-  state tiers as separate types. The union is currently exercised through the teacher-forced forward,
-  where the "batch" is one sequence's tokens rather than rows drawn from several sequences. The
-  arithmetic is identical; the multi-sequence plumbing is not there.
-- **KV checkpoint store and preemption** — so the preempt → resume byte-identity gate is untested.
-- **Chunked prefill and the fairness cap** — untested.
-- **`effective_max_batch` under a deliberately small `ram_budget`** — the formula is validated above, but
-  the "throttles instead of collapsing" behaviour needs the scheduler to demonstrate.
+- ~~**The scheduler itself**~~ — **built**. `src/soma/scheduler.cpp`, step-major over ready sequences
+  with ragged batch assembly; rows are drawn from independent sequences rather than from one prompt's
+  tokens, which is the case the union was always for.
+- ~~**KV checkpoint store and preemption**~~ — **built**, and the byte-identity gate is no longer
+  untested: `checkpoint_g3` asserts "continuation identical after preempt at step N".
+- ~~**Chunked prefill and the fairness cap**~~ — **built**, both exercised by `scheduler_g3`.
+- ~~**`effective_max_batch` under a deliberately small `ram_budget`**~~ — **built**, covered in
+  `scheduler_g3`.
+- **The last stretch into the disk-bound regime** — still live, and now the whole of what remains here.
+  It is what [G9](#g9--the-read-overlaps-the-compute) is about.
 - **The last stretch into the disk-bound regime.** Reads sit at ~44% of wall time after vectorising both
   kernel families, threading the forward, and adding the AVX-512 tier. Each pass has bought less than
   the one before, and AVX-512 — expected to be the big mechanical win — returned ~6%. The remaining
@@ -2342,7 +2347,9 @@ registry, `EngineClient` with virtual `stream_complete`, `KvCheckpointBackend` �
 
 **Gate:**
 - The existing `reliability_tests` suite still passes. The fallback must not regress; this is the gate
-  where that risk is real.
+  where that risk is real. **Done, continuously** — 24/24 on every run through G8. Marked explicitly
+  because a criterion satisfied on every commit and never recorded reads, on a count, exactly like one
+  that was never met.
 - **Mixtral-8x7B admits as `resident-only` and routes to the fallback with no operator action.**
   **Done** — `routing_g5` §4 asserts `mp.verdict == ResidentOnly` and `select_backend(cfg(), …).choice ==
   Fallback`, where `cfg()` carries no override, which is what "no operator action" means. It also pins
@@ -2404,7 +2411,8 @@ store; SSE telemetry with throttling; `/v1/models` reclamation.
   the 60k-expert model the line imagines — see the caveat under
   [Telemetry against a live model](#telemetry-against-a-live-model).
 - **The converse was badly false and the gate never asked**: a chat COLLAPSED telemetry, 17.3 frames/s
-  idle to 1.3/s during generation. Found by this measurement, fixed as D11 — now 16.1/s.
+  idle to 1.3/s during generation. Found by this measurement, **fixed** as D11 — now 16.1/s. (A finding
+  rather than a criterion; it sits in this list because it is the other half of the line above it.)
 - Image content parts return **422**, not a dropped part. **Done** — the refusal now consults the ENGINE
   that will serve the agent, not only the agent's profile. Verified live: an image sent to a
   vision-enabled agent whose model routes to Soma answers
@@ -2782,6 +2790,70 @@ unchanged. The checkpoint halves use the *same cache geometry* on both sides, di
 that does.
 
 ---
+
+## G9 — the read overlaps the compute
+
+**The gate: union conversion rises from 55% toward 80%+, and bytes/token does not move.**
+
+The second clause is the whole gate. A change that improves wall time by reading *more*, or by warming
+the page cache, has not overlapped anything — it has bought speed with I/O, which is the opposite of what
+the streaming engine is for. `scaling_g3` already reports both columns, so the anti-cheat is a column
+comparison rather than a new harness.
+
+### The measurement that motivates it
+
+Taken on the admitted OLMoE container (16 layers x 64 experts, q4_g/q6_g/g128):
+
+```
+nseq   rows    MiB read     KiB/token   unique     union    sec       tok/s
+1      8       1669         213744.0    438        2.3      0.7       11.75
+2      16      2207         141276.0    579        3.5      1.1       14.94
+4      32      2600          83204.0    682        6.0      1.5       21.97
+8      64      2870          45933.0    753       10.9      2.1       30.14
+
+bytes/token fell 4.65x from nseq=1 to nseq=8
+aggregate tok/s  11.75 -> 30.14  (2.56x for 8x the rows)
+read bandwidth   1352 MB/s of 1230 MB/s device (110% - saturates)
+conversion       realised / available = 2.56x of 4.65x = 55%
+```
+
+The union makes **4.65x fewer bytes** available as speedup and **2.56x** is realised. The missing 45% is
+not compute and not bandwidth — the device is already at 110% of its rated figure. Expert reads are
+issued serially inside the union loop, so that 45% is the engine WAITING. G3 predicted "~44%" from a
+different direction and the number has not moved, which is what makes this a standing debt rather than a
+measurement artefact.
+
+That framing matters for what counts as done. The available multiple (4.65x) is set by the union and is
+already earned; G9 is entirely about converting it, so the gate is stated as a ratio between the two
+rather than as a throughput target that a faster disk would satisfy on its own.
+
+### Criteria
+
+- **Prefetch the next unique expert while the current one is applied.** `scaling_g3`'s conversion figure
+  is the number that says whether it worked, and it is the headline.
+- **bytes/token unchanged to within noise at every nseq.** The anti-cheat, stated as its own criterion so
+  it cannot be waived as a detail of the first one.
+- **Read bandwidth stays saturated.** If it drops, the win came from doing less I/O — a different and
+  lesser claim, and one that would make the conversion ratio meaningless because the denominator moved.
+- **`streamed_determinism_g3` still byte-identical.** Prefetching reorders READS; it must not reorder
+  accumulation. This is the criterion most likely to fail first and the cheapest to check.
+- **Cold-cache and warm-cache runs reported separately, both stated.** Non-negotiable for an I/O gate:
+  this repo's own stage-2 run hit 98.4% cache with 16 misses, and warm numbers prove nothing about
+  overlap. A prefetch gate that passes on warm numbers has passed without prefetching.
+- **`reliability_tests` green.** The fallback shares the node; a change to how the engine reads must not
+  reach it at all, and if it does, that is the finding.
+
+### Not in this gate, and why
+
+- **GPU kernels and the VRAM tier.** v1 is CPU-only by decision; the tier stays declared-and-empty and
+  reported as such. Nothing in G9 depends on it, and folding it in would put a migration inside a
+  measurement.
+- **Paged KV, speculation under batching.** Both post-G4-eligible, neither on the critical path of the
+  ratio that is currently pinned at 55%.
+- **`accuracy_floor`.** Deliberately kept out rather than bundled: it needs a task set, a scorer, and a
+  decision about what a floor MEANS, which is a judgement project rather than an engineering one.
+  Bundling it would let a soft target ride along inside a gate that otherwise has a hard number, and the
+  soft one always wins that argument. It wants its own small gate.
 
 ## Cross-cutting: CI from day one
 
