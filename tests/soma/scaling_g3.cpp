@@ -143,11 +143,21 @@ int main(int argc, char** argv) {
         const double wait_s = static_cast<double>(cs.io_wait_ns) / 1e9;
         const double miss_s = static_cast<double>(cs.miss_wait_ns) / 1e9;
         const double denom = std::max(wait_s, 1e-9);
+        // Mean time per in-flight wait, which is what makes the `depth` figure
+        // interpretable: the same total splits into many short waits (prefetch
+        // is slightly behind and queueing further ahead would close it) or a few
+        // long ones (one read is an outlier and depth is not the lever). Without
+        // it `inflight_waits` would be a counter nobody reads — the exact defect
+        // io_wait_ns itself was.
+        const double per_wait_ms =
+            cs.inflight_waits ? 1000.0 * (wait_s - miss_s) / static_cast<double>(cs.inflight_waits)
+                              : 0.0;
         std::cout << "  nseq=" << nseq << " done (" << std::fixed << std::setprecision(1)
                   << secs << "s)  io_wait " << std::setprecision(2) << wait_s << "s = "
                   << std::setprecision(1) << (100.0 * wait_s / secs) << "% of wall  [miss "
                   << (100.0 * miss_s / denom) << "%, depth "
-                  << (100.0 * (wait_s - miss_s) / denom) << "%]  prefetch "
+                  << (100.0 * (wait_s - miss_s) / denom) << "% over " << cs.inflight_waits
+                  << " waits = " << std::setprecision(2) << per_wait_ms << " ms each]  prefetch "
                   << cs.prefetch_hits << " hit / " << cs.prefetch_wasted << " wasted\n"
                   << std::flush;
     }

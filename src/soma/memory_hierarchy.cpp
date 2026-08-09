@@ -407,13 +407,21 @@ MemoryHierarchy::ExpertRef MemoryHierarchy::acquire(LayerIndex layer, ExpertId e
     //                  problem, and no amount of extra depth fixes it.
     // Summing them into one counter would hide exactly the distinction that
     // decides what to do next, so they are timed together and attributed apart.
-    const auto wait_t0 = std::chrono::steady_clock::now();
-    bool waited_on_inflight = false;
-    while (s.loading) {
-        waited_on_inflight = true;
-        impl.slot_cv.wait(lk);
-    }
-    if (waited_on_inflight) {
+    // The clock is read only when there is something to wait for.
+    //
+    // The first version timed unconditionally, so every acquire paid a
+    // QueryPerformanceCounter under this mutex — including cache HITS, which are
+    // the overwhelming majority and the one path that has to stay cheap. The
+    // cost was almost certainly negligible: one read per unique expert, a few
+    // hundred per forward, microseconds against seconds. But this instrument is
+    // what the engine's own performance claims are measured with, and one that
+    // perturbs what it measures has to be argued about rather than trusted.
+    // Zero reads on the hit path is not an argument anyone has to check.
+    if (s.loading) {
+        const auto wait_t0 = std::chrono::steady_clock::now();
+        do {
+            impl.slot_cv.wait(lk);
+        } while (s.loading);
         impl.stats.io_wait_ns +=
             static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                            std::chrono::steady_clock::now() - wait_t0)
