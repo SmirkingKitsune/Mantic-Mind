@@ -156,6 +156,61 @@ def shrink_mla(cfg: dict[str, Any]) -> None:
     cfg["hidden_size"] = 64
     cfg.pop("head_dim", None)
 
+    # `qk_head_dim` is DERIVED — it is nope ++ rope — and some families state it
+    # explicitly rather than leaving it implied. GLM-5.2 does. Left at its
+    # original value it disagrees with the shrunken halves and the forward dies
+    # inside torch.split: "expects split_sizes to sum exactly to 256 ... but got
+    # [16, 8]". Recomputed rather than popped, because a family that states it
+    # presumably reads it.
+    if "qk_head_dim" in cfg:
+        cfg["qk_head_dim"] = MLA_KEYS["qk_nope_head_dim"] + MLA_KEYS["qk_rope_head_dim"]
+
+
+def shrink_dsa(cfg: dict[str, Any]) -> None:
+    """Shrink DeepSeek Sparse Attention. No-op for families without an indexer.
+
+    `index_topk` is the one that matters, and for the same reason
+    `sliding_window` is clamped below: with fewer tokens than `index_topk`, the
+    top-k selects EVERYTHING and the sparse path becomes bit-identical to dense
+    attention. A fixture built without shrinking it would pass whether or not the
+    indexer works at all.
+
+    That is measured rather than assumed. On a shrunk GLM-5.2 at `index_topk=8`
+    against a 40-token prompt, positions 0-7 match a dense run to 0.0 while
+    positions 20-39 differ by 0.48 max|logit|. 64 against the default 512
+    evaluated positions leaves seven eighths of the sequence exercising real
+    selection.
+
+    IndexShare is the other half: `indexer_types` names which layers own an
+    indexer (`full`) and which borrow the previous one's (`shared`). It is
+    TRUNCATED, never regenerated — the pattern is the semantics, and a shrink
+    that preserved only the list's length would silently change which layers
+    carry indexer weights, which is the single property this fixture exists to
+    exercise.
+    """
+    if "index_topk" not in cfg and "indexer_types" not in cfg:
+        return
+
+    _shrink(cfg, "index_n_heads", 4)
+    _shrink(cfg, "index_head_dim", 32)
+    _shrink(cfg, "index_topk", 64)
+
+    n = int(cfg["num_hidden_layers"])
+    for key in ("indexer_types", "mlp_layer_types"):
+        val = cfg.get(key)
+        if isinstance(val, list) and len(val) > n:
+            cfg[key] = val[:n]
+
+    # A shrunk `indexer_types` must still contain at least one `shared` layer, or
+    # IndexShare is not represented and the fixture cannot fail on it.
+    types = cfg.get("indexer_types")
+    if isinstance(types, list) and types and "shared" not in types:
+        raise SystemExit(
+            f"  REFUSED: indexer_types[:{n}] = {types} contains no 'shared' layer, so this "
+            f"fixture cannot exercise IndexShare at all. Raise --layers past the first "
+            f"'shared' entry."
+        )
+
 
 def shrink_moe(cfg: dict[str, Any]) -> None:
     """Shrink expert counts and widths, preserving every routing semantic."""
@@ -201,8 +256,18 @@ def shrink_config(raw: dict[str, Any], layers: int, experts: int) -> dict[str, A
 
     cfg["num_hidden_layers"] = layers
 
+    # Fixtures are initialized, executed and saved as fp32 below. Transformers
+    # 5.x treats `dtype` as authoritative when reloading, so leaving a source
+    # checkpoint's bf16 declaration here casts the saved fp32 tensors back to
+    # bf16 and makes a clean reload disagree with the oracle that produced them.
+    # Keep both spellings aligned because older families still serialize the
+    # deprecated `torch_dtype` key while newer ones use `dtype`.
+    cfg["dtype"] = "float32"
+    cfg["torch_dtype"] = "float32"
+
     shrink_attention(cfg)
     shrink_mla(cfg)
+    shrink_dsa(cfg)  # after shrink_mla: DSA is MLA plus an indexer
     shrink_moe(cfg)
 
     _shrink(cfg, "vocab_size", TARGET_VOCAB)
@@ -253,6 +318,17 @@ def layer_kinds(cfg: dict[str, Any]) -> list[str]:
     """
     n = int(cfg["num_hidden_layers"])
     kinds = ["moe"] * n
+
+    # `mlp_layer_types` states it OUTRIGHT, so believe it rather than re-deriving.
+    #
+    # GLM-5.2 ships this list, and the derivation below happens to agree with it
+    # — first_k_dense_replace=3 with moe_layer_freq=1 gives the same answer. That
+    # coincidence is exactly why an explicit list should win: a family with an
+    # irregular pattern would be silently mis-derived, and there would be nothing
+    # to notice it.
+    explicit = cfg.get("mlp_layer_types")
+    if isinstance(explicit, list) and len(explicit) >= n:
+        return ["moe" if str(t) == "sparse" else "dense" for t in explicit[:n]]
 
     first_dense = int(cfg.get("first_k_dense_replace", 0) or 0)
     for i in range(min(first_dense, n)):

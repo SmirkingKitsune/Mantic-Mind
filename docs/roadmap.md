@@ -3317,9 +3317,36 @@ project, and it will not resolve D21: GLM-5.2 projects 0.79 tok/s at 128 GiB wit
 
 ### Work breakdown
 
-1. **The oracle.** Parallel venv on `transformers` 5.12+, confirm it loads `GlmMoeDsaForCausalLM`, extend
-   `make_oracle.py` to shrink it (every dimensional field down, every semantic field verbatim — including
-   `indexer_types`, which must keep its full/shared PATTERN, not just its length).
+1. ~~**The oracle.**~~ **DONE, and the fixture is committed.** `tests/fixtures/tiny/GLM-5.2`, 5.3 MB,
+   built from the real 1.4 TB checkpoint by `make_oracle.py` under the oracle venv: 78 -> 8 layers, 256 ->
+   16 experts, vocab 154880 -> 512, 849,856 params, 512 teacher-forced positions and 256 greedy tokens.
+   `conformance_g0` already lists it and reports `SKIP: no fp32 backend for attention family mla+dsa` —
+   waiting rather than failing, so it starts checking the day step 5 lands.
+
+   Its `indexer_types` is `full,full,full,shared,shared,shared,full,shared`: a full->shared borrow AND a
+   second group boundary at layer 6, which is where the `index_topk_freq` off-by-one named below would
+   show. `index_topk` is 64 against 512 evaluated positions, so 87.5% of the sequence exercises real
+   selection.
+
+   Four shrink bugs surfaced doing it, all versions of the generated fixture disagreeing with the model
+   that produced its oracle:
+   * `dtype` must be normalized to `float32` alongside `torch_dtype`. The generator initializes, runs and
+     saves F32 weights, but Transformers 5.x treats `dtype` as authoritative on reload; leaving the source
+     checkpoint's BF16 declaration silently cast the saved file and moved logits by 0.51. A clean reload
+     now reproduces the committed oracle at max absolute difference 0.0.
+   * `qk_head_dim` is stated explicitly by GLM (most MLA families leave it implied) and must be recomputed
+     as nope ++ rope, or the forward dies in `torch.split` with "expects split_sizes to sum exactly to 256
+     ... but got [16, 8]".
+   * `indexer_types` / `mlp_layer_types` must be TRUNCATED, never regenerated, and the shrink now refuses
+     outright if the truncation leaves no `shared` layer — a fixture that cannot exercise IndexShare
+     should not be written at all.
+   * `layer_kinds()` now believes `mlp_layer_types` when a family states it, rather than re-deriving from
+     `first_k_dense_replace` + `moe_layer_freq`. Those agree for GLM-5.2, and that coincidence is the
+     argument: an irregular pattern would be silently mis-derived with nothing to catch it.
+
+   One honest weakness: the fixture's greedy sequence is `[378] * 8` — a tiny-random model repeating one
+   token. Greedy token-exactness is therefore a WEAK check here and the teacher-forced logit comparison is
+   the real one. Worth knowing before anyone reads a green greedy row as meaningful.
 2. **Conversion.** Indexer tensors into `DENSE_SUFFIXES`, plus a rank-1 binding path for `k_norm.bias`.
    D18's enforcement means conversion REFUSES until this is done and names the tensors, which is the
    desired behaviour rather than an obstacle.
@@ -3410,10 +3437,11 @@ possible auth fault and was a retry budget written six times with three differen
 | ~~D16~~ | `compute_plan` sized MLA attention with the GQA formula, and shared experts were counted `n_shared^2`. **Both fixed**, behind `AttentionBackend::weight_bytes_per_layer`; all five families now size to 1.00x of the real tensors. A third bug fell out: `arch::mla::attention_backend()` was declared and never defined, so `kv_bytes_at_ctx` was **zero** for every MLA model. | GLM-5.2 planning | Resolved |
 | ~~D18~~ | `convert.py`'s `DENSE_SUFFIXES` was a GQA-shaped allow-list, silently dropping MLA attention, dense-layer MLPs and the `noaux_tc` router bias. **Fixed**, and the "everything must be accounted for" rule the comment always claimed is now enforced as a refusal. All five container fixtures rebuilt and verified to serve. | GLM-5.2 planning | Resolved |
 | ~~D19~~ | Container-served models with SHARED EXPERTS silently dropped the shared expert's contribution: `if (out.experts_are_streamed) continue;` skipped the rest of the MoE-layer binding, and the shared-expert binding sat below it. **Fixed** — a guard rather than a `continue`. Also closed the coverage gap that hid it: nothing had ever compared a container's OUTPUT to anything. | MLA container conformance | Resolved |
+| D22 | **DSA's indexer is not sized by the planner.** `arch::mla::weight_bytes_per_layer` serves both `Mla` and `MlaDsa` and returns MLA's answer; DSA adds `indexer.{wk, wq_b, weights_proj, k_norm.weight, k_norm.bias}` on every `full` layer, which is unmodelled. Measured the moment the GLM-5.2 fixture landed: `dense_resident_bytes` is **0.90x** of the real tensors, a 10% under-count. Sizing it needs `indexer_types` in `ArchIr` — the IR has no field for which layers own an indexer — and the DSA backend needs that field anyway, so it belongs with scope steps 3-5 rather than as a standalone fix. `container_g2` reports it as KNOWN-PARTIAL with the number rather than failing, since the gap is recorded. | GLM-5.2 oracle fixture | Low — under-counts, so it makes the model look MORE servable than it is; the opposite direction from D16 and caught immediately by the check D16 added. |
 | D21 | **The throughput floor rejects the model the concept was proven on.** With D17's dense quantization GLM-5.2 fits a 24 GiB host with an 11.2 GiB expert cache, and it is STILL `reject` — projected 0.10 tok/s against `kMinProjectedTokS = 1.0`. At 128 GiB with a 7 GB/s disk it reaches 0.79 tok/s and is still refused. Colibri served these weights on 16-24 GB and the result was considered useful, so the constant and the proof disagree. The constant's reasoning is sound as written ("a model that streams correctly but at 0.2 tok/s is not usefully served"); what it does not model is that for a 744B model on a workstation, 0.2 tok/s may be the whole point. A POLICY question, deliberately not decided here. | D17 | Medium — it is one constant, and it currently makes the flagship case unservable by definition. |
 | ~~D20~~ | A node could not be brought up from its config file alone, and the refusal was invisible: the node's warning died in a buffer (spdlog flushed only on `err`) and CLI mode has the console sink off. **Fixed** — `flush_on(warn)`, a once-only console diagnostic naming the remedy, and the pairing path documented in `tools/mantic-mind.toml`. The refusal itself is unchanged; only its discoverability was wrong. | deployment test | Resolved |
 | ~~D17~~ | The dense half was F32 by omission, not by design — the loader could always quantize it, and only the three EXPERT roles were settable. **Fixed** with `dtype_dense` / `--quant-dense`. GLM-5.2's resident half falls 68.6 -> 10.0 GiB and it now fits a 24 GiB host. | GLM-5.2 planning | Resolved |
-| D4 | Corroborated 2026-08-07: **llama.cpp's own converter cannot read the layout either** — `convert_hf_to_gguf.py` on `tiny-random-OlmoeForCausalLM` fails with `Unprocessed experts: [...mlp.experts.gate_up_proj, ...mlp.experts.down_proj]`. A mature, widely-exercised converter hitting the same wall supports the read that the layout is newer than the ecosystem, rather than that something obvious is being missed here. Parking stands. `convert.py` cannot read transformers' **fused expert layout**. The misleading error is **fixed** — it now names the layout and shows the shapes. Reading the layout is deliberately NOT implemented; see below. | G8 gate run | Low, and deliberately parked — no oracle exists at the pinned `transformers` to verify an implementation against. |
+| D4 | **UNPARKED 2026-08-10 — an oracle now exists.** `transformers` 5.12.1 reads the fused expert layout CORRECTLY: `tiny-random-OlmoeForCausalLM` loads with `max|disk - loaded| = 0.0` and exposes `model.layers.N.mlp.experts.{gate_up_proj,down_proj}` as real 3-D parameters. The parking reason — "no oracle exists to verify an implementation, and a wrong guess yields a model that runs and is silently wrong" — no longer holds. The layout is now pinned by measurement rather than inference: `gate_up_proj` is `(experts, 2*intermediate, hidden)` and `down_proj` is `(experts, hidden, intermediate)`, which is what `convert.py`'s own error message already claimed. The one remaining unknown, whether the `2*intermediate` axis is concatenated `[gate; up]` or interleaved, is now DETERMINABLE empirically — build the tiny fused model, run it, and test each hypothesis against its output. `convert.py` still cannot read the layout; what changed is that writing that reader is no longer a guess. | G8 gate run | Medium — was parked for want of a reference, and the reference arrived with the DSA oracle venv. |
 
 **D1 — resolved, and it was never an auth bug.** The cause was already written down in the test, three
 lines above the failure:
