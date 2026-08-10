@@ -3217,6 +3217,115 @@ problem was arithmetic. The remaining 66 GiB is D17: dense tensors are F32 in a 
 of MLA plus a 155k-token embedding table at fp32 is simply that big. Colibri served this model in 16-24
 GB, so it quantized the dense half; Soma cannot yet express that.
 
+## Scoping: DSA and IndexShare
+
+Not a gate yet. This is what serving GLM-5.2 would require, with the facts checked against the real
+1.4 TB checkpoint rather than inferred from its config.
+
+### Step zero is an oracle, and it is a dependency upgrade
+
+The installed `transformers` is **4.57.6** and does not know `glm_moe_dsa`; the checkpoint declares
+`transformers_version: 5.12.0`. So there is no reference implementation available to check an
+implementation against — the same position D4 is parked in.
+
+The difference is decisive: D4 has no version of anything that reads the fused expert layout, whereas
+this oracle merely needs a newer dependency. That makes it obtainable rather than absent.
+
+**It must be obtained first.** Implementing sparse attention without a reference repeats precisely the
+mistake D4 exists to avoid: a plausible implementation that runs, produces finite numbers, and is silently
+wrong. DSA is exactly the shape of algorithm where that happens — pick the wrong 2048 keys and the output
+is fluent and incorrect.
+
+Upgrading is not free: 4.57 -> 5.x is a major bump under `make_oracle.py`, `make_reference.py`,
+`convert.py` and the tokenizer compile, all of which currently work. A parallel venv is the obvious
+hedge, so the existing pipeline keeps running while the oracle is stood up.
+
+### What the checkpoint actually contains
+
+Verified from `model.safetensors.index.json`, not from the config:
+
+| layer | attention tensors |
+|---|---|
+| 0 (`full`) | `q_a_proj`, `q_b_proj`, `q_a_layernorm`, `kv_a_proj_with_mqa`, `kv_b_proj`, `kv_a_layernorm`, `o_proj` **+ `indexer.wk`, `indexer.wq_b`, `indexer.weights_proj`, `indexer.k_norm.{weight,bias}`** |
+| 3 (`shared`) | the same MLA set, and **no indexer tensors at all** |
+
+That is the cross-layer dependency as a fact about the weights: 57 of 78 layers have nothing to compute an
+index with. `indexer_types` is 21 `full` and 57 `shared` — one `full` every four layers after the first
+three — with 32 index heads of 128 dims and `index_topk = 2048`.
+
+Note `indexer.k_norm.bias`: a rank-1 bias, and the only bias anywhere in this attention block.
+`bind_layer_weight` requires rank 2 and rejects anything else, so biases need the rank-1 path that
+`bind_layer_f32` already provides for norms.
+
+### The interface question is smaller than previously claimed
+
+Earlier notes on this page said `AttentionBackend` "has no channel for cross-layer state, so it is an
+interface question before an implementation one." Half right, and the conclusion was too strong.
+
+The index is per-(row, step): each new token has a new query, so a new top-k selection. It is therefore
+recomputed every forward pass and **never has to persist between steps**. Its natural home is
+`ExecScratch`, which is per-step, sized for `max_batch`, and already passed to every `prefill`/`decode`
+call across every layer. A `full` layer writes it; the next three `shared` layers read it.
+
+`ExecScratch` has no backend-private slot today — but the project already has the exact idiom for one.
+`ArchLayerPayload` is an opaque `void*` plus deleter with `adopt()` / `as<T>()`, which is how
+`f32_bind_layer` stores `F32AttnWeights` where the core cannot inspect it. One member of that shape on
+`ExecScratch` is a small, precedented addition rather than a redesign.
+
+**What this consequently does NOT touch**, each of which would have been expensive:
+
+- **The KV checkpoint format.** The index is not state, so no `persist_format_id` bump, no version
+  migration, no effect on cross-process resume.
+- **`kv_bytes_per_token`.** DSA selects among cached tokens; it does not shrink the cache. MLA's compressed
+  latent is still what gets stored, so the planner's KV arithmetic is already right.
+- **`SeqState`.** Nothing per-sequence is added.
+
+### The part worth being blunt about
+
+**DSA will not make this engine faster.** Its published win is ~2.9x fewer attention FLOPs at full
+context. Soma at q4_g reads **11.9 GiB of expert weights per token**, and `io_wait` measurements put the
+engine at the disk. Attention FLOPs are not the constraint and cutting them will not move
+`projected_tok_s` meaningfully.
+
+So implementing DSA is a CORRECTNESS requirement — it is how this model computes attention, and running it
+as dense MLA would be a different model that happens to produce plausible text. It is not a throughput
+project, and it will not resolve D21: GLM-5.2 projects 0.79 tok/s at 128 GiB with a 7 GB/s disk against a
+1.0 floor, and none of that is attention.
+
+### Work breakdown
+
+1. **The oracle.** Parallel venv on `transformers` 5.12+, confirm it loads `GlmMoeDsaForCausalLM`, extend
+   `make_oracle.py` to shrink it (every dimensional field down, every semantic field verbatim — including
+   `indexer_types`, which must keep its full/shared PATTERN, not just its length).
+2. **Conversion.** Indexer tensors into `DENSE_SUFFIXES`, plus a rank-1 binding path for `k_norm.bias`.
+   D18's enforcement means conversion REFUSES until this is done and names the tensors, which is the
+   desired behaviour rather than an obstacle.
+3. **`ExecScratch` payload.** One opaque member, `adopt`/`as<T>` idiom.
+4. **The indexer.** `wq_b`/`wk` projections, `k_norm`, `weights_proj`, top-k selection at 2048. Per-`full`
+   layer, writing the shared payload.
+5. **Sparse attention in `arch/mla.cpp`.** MLA's algebra restricted to the selected keys. The existing MLA
+   path is the dense special case, which makes it the natural fallback for A/B.
+6. **Registry.** `resolve_f32_backend(MlaDsa)` stops returning nullptr; `arch_supported` then flips to true
+   on its own, since it is derived rather than declared.
+7. **Conformance.** Stage 1 token-exact against the tiny-random oracle. `max_abs_pos0` is the bisection
+   tool that matters here — at t=0 there is one key, so top-2048 selection is trivially the identity, and a
+   divergence at 0 is NOT the indexer.
+
+Steps 1-2 are prerequisites and independently useful. Steps 3-5 are the actual work. Step 7 is what makes
+any of it believable.
+
+### Two risks worth naming now
+
+**The sparse path can be right on average and wrong at the boundary.** `index_skip_topk_offset = 3` and
+`index_topk_freq = 4` are off-by-one hazards, and a selection that is correct for most positions and wrong
+at layer-group boundaries would pass a mean-error check while failing token-exactness. Stage 1's
+token-exact bar is the right gate precisely because it does not average.
+
+**Contexts below 2048 make the sparse path unobservable.** With fewer tokens than `index_topk`, top-k
+selects everything and DSA degenerates to dense MLA — so a tiny fixture will pass whether or not the
+indexer works. The oracle needs a prompt longer than 2048 tokens, or a shrunk `index_topk`, and shrinking
+it is the better choice since a tiny-random model with a 4k prompt is otherwise cheap to run.
+
 ## Cross-cutting: CI from day one
 
 Established at G0, extended each gate. Current CI is 3 Release jobs invoking raw `cmake`, one CTest
@@ -3279,7 +3388,7 @@ possible auth fault and was a retry budget written six times with three differen
 | ~~D18~~ | `convert.py`'s `DENSE_SUFFIXES` was a GQA-shaped allow-list, silently dropping MLA attention, dense-layer MLPs and the `noaux_tc` router bias. **Fixed**, and the "everything must be accounted for" rule the comment always claimed is now enforced as a refusal. All five container fixtures rebuilt and verified to serve. | GLM-5.2 planning | Resolved |
 | ~~D19~~ | Container-served models with SHARED EXPERTS silently dropped the shared expert's contribution: `if (out.experts_are_streamed) continue;` skipped the rest of the MoE-layer binding, and the shared-expert binding sat below it. **Fixed** — a guard rather than a `continue`. Also closed the coverage gap that hid it: nothing had ever compared a container's OUTPUT to anything. | MLA container conformance | Resolved |
 | D21 | **The throughput floor rejects the model the concept was proven on.** With D17's dense quantization GLM-5.2 fits a 24 GiB host with an 11.2 GiB expert cache, and it is STILL `reject` — projected 0.10 tok/s against `kMinProjectedTokS = 1.0`. At 128 GiB with a 7 GB/s disk it reaches 0.79 tok/s and is still refused. Colibri served these weights on 16-24 GB and the result was considered useful, so the constant and the proof disagree. The constant's reasoning is sound as written ("a model that streams correctly but at 0.2 tok/s is not usefully served"); what it does not model is that for a 744B model on a workstation, 0.2 tok/s may be the whole point. A POLICY question, deliberately not decided here. | D17 | Medium — it is one constant, and it currently makes the flagship case unservable by definition. |
-| D20 | **A node cannot be brought up from its config file alone.** `control_url` in `mantic-mind.toml` starts the node and it self-registers; control refuses, because a new node may only self-register when control already knows its `api_key` or the request carries control's external bearer token — which is empty by default. The node generates an ephemeral key and does not persist it, so there is nothing to pair with. Working path: set `MM_API_KEY` and call `POST /v1/nodes`. The refusal is correct; its DISCOVERABILITY is not — the node logs nothing about it in CLI mode, and the operator sees a node that runs, serves its own health endpoint, and reads `offline` forever. | deployment test | Low severity, high friction — nothing is wrong, and nobody could work it out from the config. |
+| ~~D20~~ | A node could not be brought up from its config file alone, and the refusal was invisible: the node's warning died in a buffer (spdlog flushed only on `err`) and CLI mode has the console sink off. **Fixed** — `flush_on(warn)`, a once-only console diagnostic naming the remedy, and the pairing path documented in `tools/mantic-mind.toml`. The refusal itself is unchanged; only its discoverability was wrong. | deployment test | Resolved |
 | ~~D17~~ | The dense half was F32 by omission, not by design — the loader could always quantize it, and only the three EXPERT roles were settable. **Fixed** with `dtype_dense` / `--quant-dense`. GLM-5.2's resident half falls 68.6 -> 10.0 GiB and it now fits a 24 GiB host. | GLM-5.2 planning | Resolved |
 | D4 | Corroborated 2026-08-07: **llama.cpp's own converter cannot read the layout either** — `convert_hf_to_gguf.py` on `tiny-random-OlmoeForCausalLM` fails with `Unprocessed experts: [...mlp.experts.gate_up_proj, ...mlp.experts.down_proj]`. A mature, widely-exercised converter hitting the same wall supports the read that the layout is newer than the ecosystem, rather than that something obvious is being missed here. Parking stands. `convert.py` cannot read transformers' **fused expert layout**. The misleading error is **fixed** — it now names the layout and shows the shapes. Reading the layout is deliberately NOT implemented; see below. | G8 gate run | Low, and deliberately parked — no oracle exists at the pinned `transformers` to verify an implementation against. |
 
