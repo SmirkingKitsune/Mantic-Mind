@@ -16,6 +16,7 @@
 
 #include "soma/expert_store.hpp"
 #include "soma/f32_model.hpp"
+#include "soma/memory_hierarchy.hpp"
 #include "soma/plan.hpp"
 #include "soma/safetensors.hpp"
 #include "soma/quant_format.hpp"
@@ -99,6 +100,11 @@ int check_container(const fs::path& fixture, const fs::path& container) {
 
     std::vector<std::byte> buf(h.expert_bytes > 0 ? h.expert_bytes : 1u << 20);
     int mismatches = 0, compared = 0;
+    // Separate from `mismatches`, which the byte-comparison summary reports.
+    // Sharing one counter made that line print "MISMATCH" when the BYTES were
+    // fine and the forward had diverged — a passing check labelled with another
+    // check's failure.
+    bool forward_diverged = false;
     std::size_t first_bad_byte = 0;
 
     for (std::uint32_t l = 0; l < h.n_layers && mismatches == 0; ++l) {
@@ -145,6 +151,56 @@ int check_container(const fs::path& fixture, const fs::path& container) {
         }
     }
 
+    // ── the container's OUTPUT, which nothing had ever checked ───────────────
+    //
+    // Everything above compares BYTES. `streaming_g2` compares a streamed
+    // forward against a resident one and finds them bit-identical — but it loads
+    // the model from `tiny/` in BOTH cases and only attaches the container's
+    // experts, so the container's dense half has never participated in a forward
+    // that anyone checked (roadmap D19).
+    //
+    // Same tokens, same quantization, same expert bytes (proven byte-identical
+    // just above). The ONLY difference is where the dense half came from, so any
+    // divergence isolates the container's dense load.
+    {
+        soma::F32Workspace fws;
+        std::vector<soma::TokenId> toks;
+        for (std::uint32_t i = 0; i < 24; ++i) toks.push_back((i * 37 + 5) % qmodel.vocab());
+
+        // A container-loaded model has no resident experts by construction —
+        // that IS the container. Cache generously: this is an output comparison,
+        // not a paging test, and streaming_g2 already covers eviction.
+        soma::MemoryHierarchy mem;
+        soma::MemoryBudget mb;
+        mb.ram_expert_cache_bytes = 256ull * 1024 * 1024;
+        if (auto st = mem.open(from_container.arch, store, mb); !st.ok()) {
+            std::cout << "   hierarchy open failed: " << st.message() << "\n";
+            return 1;
+        }
+        from_container.streamed_experts = &mem;
+
+        std::vector<float> from_source_logits, from_container_logits;
+        const auto a = soma::forward_f32(qmodel, toks, fws, from_source_logits);
+        const auto b = soma::forward_f32(from_container, toks, fws, from_container_logits);
+        if (!a.ok() || !b.ok()) {
+            std::cout << "   forward failed: " << (a.ok() ? b.message() : a.message()) << "\n";
+            return 1;
+        }
+        float worst = 0.0f;
+        for (std::size_t i = 0;
+             i < std::min(from_source_logits.size(), from_container_logits.size()); ++i) {
+            worst = std::max(worst, std::fabs(from_source_logits[i] - from_container_logits[i]));
+        }
+        std::cout << "   container-loaded forward vs source-loaded: " << std::scientific
+                  << std::setprecision(2) << worst << " max|diff|"
+                  << (worst == 0.0f ? "  OK" : "  DIVERGES") << std::fixed << "\n";
+        // Counted separately from `mismatches`, which the round-trip summary
+        // below reports. Sharing the counter made the byte-comparison line print
+        // "MISMATCH" for a forward divergence — labelling a passing check with
+        // another check's failure.
+        forward_diverged = (worst != 0.0f);
+    }
+
     std::uint64_t bw = 0;
     const auto bw_st = store.measure_bandwidth(bw);
 
@@ -159,7 +215,7 @@ int check_container(const fs::path& fixture, const fs::path& container) {
     }
     (void)d;
     (void)fi;
-    return mismatches;
+    return mismatches + (forward_diverged ? 1 : 0);
 }
 
 // ── 2. verdict function vs the documented table ──────────────────────────────

@@ -315,25 +315,39 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
             // Binding them here would fail, and skipping silently would leave the
             // resident table empty in a way only visible as wrong output — so the
             // presence of soma.container is what decides, explicitly.
-            if (out.experts_are_streamed) continue;
-
-            lw.expert_gate.resize(arch.router.n_experts);
-            lw.expert_up.resize(arch.router.n_experts);
-            lw.expert_down.resize(arch.router.n_experts);
-            for (std::uint32_t e = 0; e < arch.router.n_experts; ++e) {
-                const auto ep = p + nm.moe_block + ".experts." + std::to_string(e) + '.';
-                if (auto s = bind_weight(
-                        out, ep + nm.expert_gate, TensorRole::ExpertGate, lw.expert_gate[e]);
-                    !s.ok())
-                    return s;
-                if (auto s =
-                        bind_weight(out, ep + nm.expert_up, TensorRole::ExpertUp, lw.expert_up[e]);
-                    !s.ok())
-                    return s;
-                if (auto s = bind_weight(
-                        out, ep + nm.expert_down, TensorRole::ExpertDown, lw.expert_down[e]);
-                    !s.ok())
-                    return s;
+            //
+            // A GUARD, not a `continue`. It used to be `if
+            // (out.experts_are_streamed) continue;`, which skipped the rest of
+            // this branch — and the SHARED experts are bound below it. So every
+            // container-served MoE model with shared experts silently dropped
+            // their contribution: bound optionally, left empty, and the forward's
+            // `if (!lw.shared_gate.empty())` then skipped them without a word.
+            //
+            // Precisely the failure the comment above warns about, one scope
+            // further down. Measured as 5.7e-01 max|logit| between a
+            // container-loaded and a source-loaded forward on DeepSeek-V2-Lite,
+            // and it vanishes when n_shared_experts is set to 0 — which is what
+            // identified it (roadmap D19). Affects DeepSeek, Moonlight, Qwen2-MoE
+            // and GLM-5.2; every family whose shared expert fires on every token.
+            if (!out.experts_are_streamed) {
+                lw.expert_gate.resize(arch.router.n_experts);
+                lw.expert_up.resize(arch.router.n_experts);
+                lw.expert_down.resize(arch.router.n_experts);
+                for (std::uint32_t e = 0; e < arch.router.n_experts; ++e) {
+                    const auto ep = p + nm.moe_block + ".experts." + std::to_string(e) + '.';
+                    if (auto s = bind_weight(
+                            out, ep + nm.expert_gate, TensorRole::ExpertGate, lw.expert_gate[e]);
+                        !s.ok())
+                        return s;
+                    if (auto s = bind_weight(
+                            out, ep + nm.expert_up, TensorRole::ExpertUp, lw.expert_up[e]);
+                        !s.ok())
+                        return s;
+                    if (auto s = bind_weight(
+                            out, ep + nm.expert_down, TensorRole::ExpertDown, lw.expert_down[e]);
+                        !s.ok())
+                        return s;
+                }
             }
             if (arch.router.n_shared_experts > 0) {
                 if (auto s =
@@ -358,21 +372,40 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
                     return s;
             }
         } else {
+            // SharedExpert, NOT the Expert* roles.
+            //
+            // A `first_k_dense_replace` layer's FFN is not a routed expert: the
+            // converter writes it into dense.safetensors as F32 and never
+            // quantizes it, exactly as it treats a shared expert. Binding it with
+            // ExpertGate/Up/Down made the quant map apply to it, so loading the
+            // SOURCE with a container's map quantized a tensor the CONTAINER
+            // keeps at F32 — two paths, two precisions, same weights.
+            //
+            // Measured before the fix: a container-loaded forward diverged from a
+            // source-loaded one by 5.6e-01 max|logit| on DeepSeek-V2-Lite and
+            // 5.4e-01 on Moonlight, and by exactly 0.0 on the three fixtures with
+            // no dense layer. That is the whole of roadmap D19, and nothing saw
+            // it because no test had ever compared a container's OUTPUT to
+            // anything (roadmap D19).
+            //
+            // The container is the authority here: it is what production serves.
+            // These two roles are the "always-active FFN, resident, F32" family,
+            // and the loader agreeing with the converter about that is the point.
             if (auto s = bind_weight(out,
                                      p + arch.naming.dense_block + ".gate_proj.weight",
-                                     TensorRole::ExpertGate,
+                                     TensorRole::SharedExpert,
                                      lw.dense_gate);
                 !s.ok())
                 return s;
             if (auto s = bind_weight(out,
                                      p + arch.naming.dense_block + ".up_proj.weight",
-                                     TensorRole::ExpertUp,
+                                     TensorRole::SharedExpert,
                                      lw.dense_up);
                 !s.ok())
                 return s;
             if (auto s = bind_weight(out,
                                      p + arch.naming.dense_block + ".down_proj.weight",
-                                     TensorRole::ExpertDown,
+                                     TensorRole::SharedExpert,
                                      lw.dense_down);
                 !s.ok())
                 return s;

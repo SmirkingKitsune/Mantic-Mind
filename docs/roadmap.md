@@ -3076,6 +3076,56 @@ That gap is the reason to qualify G4: the ladder passes for MLA on the fp32 SOUR
 `conformance_g0` reads. The CONTAINER path — the one production serves — had never worked for that
 family, and every G4 claim on this page was true about the half that was tested.
 
+### The shared expert that was never bound
+
+Pointing the ladder at an MLA container for the first time (possible only after D18) showed all five
+containers passing the stage-3 threshold — but not alike. The two MLA fixtures scored mean KL 0.0092 and
+0.0111 with top-1 agreement of 35% and 42%, against 0.00000 / 99.6% for the GQA ones.
+
+**Three hypotheses died before the right one.** Quantization: an f32-expert container gave DeepSeek
+0.00929 — unchanged — and `conformance_g1` showed source-path sensitivity is uniform across all five
+families (max\|dlog\| 0.30-0.43). The converter: container dense tensors are byte-identical to the source,
+no source tensor is missing, and the expert round-trip is 48/48. The dense-layer FFN's role: real bug,
+fixed below, but not this one.
+
+**What found it was a new measurement**, not more reasoning: load the same model from the source and from
+the container, same quantization, same expert bytes, and compare logits. Bit-identical for the three GQA
+fixtures; **5.7e-01 max\|logit\|** for the two MLA ones. Then setting `n_shared_experts = 0` on both sides
+dropped it to exactly zero, which named the culprit.
+
+```cpp
+if (out.experts_are_streamed) continue;   // skips the REST of the MoE branch
+```
+
+A container holds no routed experts, so that `continue` is right about them and wrong about everything
+after it — and the SHARED expert binding is fifteen lines below. So for every container-served model,
+`lw.shared_gate` stayed empty, and the forward's `if (!lw.shared_gate.empty())` skipped the shared expert
+without a word. Bound optionally, left empty, silently ignored.
+
+The comment immediately above that line warns that skipping silently "would leave the resident table
+empty in a way only visible as wrong output." It was right, one scope further down than it was looking.
+
+**Affects every family whose shared expert fires on every token** — DeepSeek, Moonlight, Qwen2-MoE and
+GLM-5.2 — and only when served from a CONTAINER, which is to say only in production.
+
+| | before | after |
+|---|---|---|
+| DeepSeek-V2-Lite | KL 0.00916, top-1 35.0% | **KL 0.00000, top-1 97.5%** |
+| Moonlight-16B-A3B | KL 0.01109, top-1 42.4% | **KL 0.00022, top-1 92.0%** |
+| Qwen3-30B-A3B (control) | KL 0.00000, top-1 99.6% | unchanged |
+
+**The coverage gap that allowed it, now closed.** `streaming_g2` compares a streamed forward against a
+resident one and finds them bit-identical — while loading the model from `tiny/` in BOTH cases and
+attaching only the container's experts. It compares the source path to itself. `container_g2` now loads
+the container as a model and compares its output against the source's, which is the check that would have
+caught this the day the container format was written.
+
+**One more mis-assignment, found on the way and fixed.** A `first_k_dense_replace` layer's FFN was bound
+AND sized with `TensorRole::ExpertGate/Up/Down`, so a quant map applied to it — while `convert.py` writes
+it to `dense.safetensors` at F32 and never quantizes it. Loader and planner both now use `SharedExpert`,
+the role for "always-active FFN, resident, F32", which is how the converter already treats it. Not the
+cause of the divergence above, and a real defect either way.
+
 ### GLM-5.2, re-measured
 
 ```
@@ -3150,6 +3200,7 @@ possible auth fault and was a retry budget written six times with three differen
 | ~~D15~~ | `BackendDecision::explain()` stuttered — `soma (verdict, verdict=hybrid)`. **Fixed**, along with the doubled name it produced in the D12 refusal, and pinned by whole-string assertions. | D12 work | Resolved |
 | ~~D16~~ | `compute_plan` sized MLA attention with the GQA formula, and shared experts were counted `n_shared^2`. **Both fixed**, behind `AttentionBackend::weight_bytes_per_layer`; all five families now size to 1.00x of the real tensors. A third bug fell out: `arch::mla::attention_backend()` was declared and never defined, so `kv_bytes_at_ctx` was **zero** for every MLA model. | GLM-5.2 planning | Resolved |
 | ~~D18~~ | `convert.py`'s `DENSE_SUFFIXES` was a GQA-shaped allow-list, silently dropping MLA attention, dense-layer MLPs and the `noaux_tc` router bias. **Fixed**, and the "everything must be accounted for" rule the comment always claimed is now enforced as a refusal. All five container fixtures rebuilt and verified to serve. | GLM-5.2 planning | Resolved |
+| ~~D19~~ | Container-served models with SHARED EXPERTS silently dropped the shared expert's contribution: `if (out.experts_are_streamed) continue;` skipped the rest of the MoE-layer binding, and the shared-expert binding sat below it. **Fixed** — a guard rather than a `continue`. Also closed the coverage gap that hid it: nothing had ever compared a container's OUTPUT to anything. | MLA container conformance | Resolved |
 | D17 | **Dense tensors are F32-only in a container.** `--quant` covers expert gate/up/down; embeddings, attention projections and the router stay F32 by construction. For GLM-5.2 that is a floor of tens of GiB before a single expert is streamed, and Colibri served the same model in 16-24 GB — so quantizing the dense half is not optional at this scale. | GLM-5.2 planning | Medium — a design gap rather than a bug, but it bounds which models can ever be served. |
 | D4 | Corroborated 2026-08-07: **llama.cpp's own converter cannot read the layout either** — `convert_hf_to_gguf.py` on `tiny-random-OlmoeForCausalLM` fails with `Unprocessed experts: [...mlp.experts.gate_up_proj, ...mlp.experts.down_proj]`. A mature, widely-exercised converter hitting the same wall supports the read that the layout is newer than the ecosystem, rather than that something obvious is being missed here. Parking stands. `convert.py` cannot read transformers' **fused expert layout**. The misleading error is **fixed** — it now names the layout and shows the shapes. Reading the layout is deliberately NOT implemented; see below. | G8 gate run | Low, and deliberately parked — no oracle exists at the pinned `transformers` to verify an implementation against. |
 

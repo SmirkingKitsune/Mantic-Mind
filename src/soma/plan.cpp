@@ -129,9 +129,16 @@ Status compute_plan(const ArchIr& arch, const HostBudget& budget, PlanDocument& 
                          bytes_for(arch, d, si, TensorRole::SharedExpert);
             }
         } else {
+            // SharedExpert, matching how the loader binds these and how the
+            // converter stores them — F32 in dense.safetensors, never quantized.
+            // Sizing them with the EXPERT roles charged q4 for tensors that are
+            // f32 on disk, so the resident half was under-estimated for every
+            // model with a dense layer. Same mis-assignment as the loader's, and
+            // it had to be fixed in both or the plan and the load would disagree
+            // about the same bytes.
             const auto di = arch.ffn.dense_intermediate;
-            dense += 2 * bytes_for(arch, di, d, TensorRole::ExpertGate);
-            dense += bytes_for(arch, d, di, TensorRole::ExpertDown);
+            dense += 2 * bytes_for(arch, di, d, TensorRole::SharedExpert);
+            dense += bytes_for(arch, d, di, TensorRole::SharedExpert);
         }
     }
     out.dense_resident_bytes = dense;
