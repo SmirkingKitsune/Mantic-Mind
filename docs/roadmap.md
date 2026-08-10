@@ -3076,6 +3076,47 @@ That gap is the reason to qualify G4: the ladder passes for MLA on the fp32 SOUR
 `conformance_g0` reads. The CONTAINER path — the one production serves — had never worked for that
 family, and every G4 claim on this page was true about the half that was tested.
 
+### The deployment test
+
+Thirteen commits had landed since the last time the full stack ran, four of them on paths unit tests
+cannot reach: the production argv (D14), the node's link structure (D13), an added call on every
+image-bearing request (D12), and — by the end — the served output itself (D19). This ran node + control
++ both engines, driven over HTTP.
+
+**Result: passed, and it verified the two things that most needed it.**
+
+`llama-server`'s actual command line, read from the live process:
+
+```
+--ctx-size 384  --gpu-layers 0  --threads 3  --batch-size 96
+--ubatch-size 48  --flash-attn on  --slot-save-path data/kv_cache
+```
+
+Every setting D14 restored, on a real process, from an agent's configured `runtime_settings`. Before that
+fix the line was `-m … --port … --host …` and nothing else. `--gpu-layers 0` is the one worth pointing at:
+it is the setting whose absence defaulted to *all layers on GPU*, and it is now there because it was
+asked for.
+
+Both engines ran **concurrently on one node** — `soma.exe` at 5.1 GB serving the admitted OLMoE,
+`llama-server.exe` at 396 MB serving the committed GGUF fixture — launched by the real node binary rather
+than by `engine_g5`'s harness. Two concurrent chats both returned `success`, the Soma agent producing
+3744 characters of real text, and both engines survived the exchange. The model transfer also worked
+unprompted: control copied the GGUF into the node's cache at
+`models/tiny-llama-f16.gguf-bdc6021a8bf022ed68c3cf43/`.
+
+**The friction is worth recording, because it is an operator-facing finding rather than a bug.** Standing
+a node up from the documented config alone does not work. `control_url` in `mantic-mind.toml` gets the
+node running and self-registering, and control refuses it: a new node may only self-register if control
+already knows its `api_key`, or if the request carries control's external bearer token — and that token
+is empty by default. The node then generates an ephemeral key and does not persist it, so there is
+nothing to hand over. What worked was setting `MM_API_KEY` to a known value and calling
+`POST /v1/nodes` with it.
+
+That is defensible security — an unpaired node cannot join by asking — but the config file gives no hint
+of it, the node logs nothing about the rejection in CLI mode, and control's rejection appears only in its
+own log. The symptom an operator sees is a node that runs, answers its own health endpoint, and shows as
+`offline` forever.
+
 ### The shared expert that was never bound
 
 Pointing the ladder at an MLA container for the first time (possible only after D18) showed all five
@@ -3201,6 +3242,7 @@ possible auth fault and was a retry budget written six times with three differen
 | ~~D16~~ | `compute_plan` sized MLA attention with the GQA formula, and shared experts were counted `n_shared^2`. **Both fixed**, behind `AttentionBackend::weight_bytes_per_layer`; all five families now size to 1.00x of the real tensors. A third bug fell out: `arch::mla::attention_backend()` was declared and never defined, so `kv_bytes_at_ctx` was **zero** for every MLA model. | GLM-5.2 planning | Resolved |
 | ~~D18~~ | `convert.py`'s `DENSE_SUFFIXES` was a GQA-shaped allow-list, silently dropping MLA attention, dense-layer MLPs and the `noaux_tc` router bias. **Fixed**, and the "everything must be accounted for" rule the comment always claimed is now enforced as a refusal. All five container fixtures rebuilt and verified to serve. | GLM-5.2 planning | Resolved |
 | ~~D19~~ | Container-served models with SHARED EXPERTS silently dropped the shared expert's contribution: `if (out.experts_are_streamed) continue;` skipped the rest of the MoE-layer binding, and the shared-expert binding sat below it. **Fixed** — a guard rather than a `continue`. Also closed the coverage gap that hid it: nothing had ever compared a container's OUTPUT to anything. | MLA container conformance | Resolved |
+| D20 | **A node cannot be brought up from its config file alone.** `control_url` in `mantic-mind.toml` starts the node and it self-registers; control refuses, because a new node may only self-register when control already knows its `api_key` or the request carries control's external bearer token — which is empty by default. The node generates an ephemeral key and does not persist it, so there is nothing to pair with. Working path: set `MM_API_KEY` and call `POST /v1/nodes`. The refusal is correct; its DISCOVERABILITY is not — the node logs nothing about it in CLI mode, and the operator sees a node that runs, serves its own health endpoint, and reads `offline` forever. | deployment test | Low severity, high friction — nothing is wrong, and nobody could work it out from the config. |
 | D17 | **Dense tensors are F32-only in a container.** `--quant` covers expert gate/up/down; embeddings, attention projections and the router stay F32 by construction. For GLM-5.2 that is a floor of tens of GiB before a single expert is streamed, and Colibri served the same model in 16-24 GB — so quantizing the dense half is not optional at this scale. | GLM-5.2 planning | Medium — a design gap rather than a bug, but it bounds which models can ever be served. |
 | D4 | Corroborated 2026-08-07: **llama.cpp's own converter cannot read the layout either** — `convert_hf_to_gguf.py` on `tiny-random-OlmoeForCausalLM` fails with `Unprocessed experts: [...mlp.experts.gate_up_proj, ...mlp.experts.down_proj]`. A mature, widely-exercised converter hitting the same wall supports the read that the layout is newer than the ecosystem, rather than that something obvious is being missed here. Parking stands. `convert.py` cannot read transformers' **fused expert layout**. The misleading error is **fixed** — it now names the layout and shows the shapes. Reading the layout is deliberately NOT implemented; see below. | G8 gate run | Low, and deliberately parked — no oracle exists at the pinned `transformers` to verify an implementation against. |
 
