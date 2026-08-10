@@ -170,6 +170,14 @@ int main() {
         // but only 8 experts per layer, so 25% of them fire on every token.
         // Streaming that buys nothing a resident copy would not.
         soma::ArchIr mixtral{};
+        // Both fixtures declare their attention family, which they did not need
+        // to before compute_plan began asking whether a backend exists. An
+        // ArchIr that does not say what attention it uses cannot be served by
+        // anything, so it now plans as reject — correctly. These are GQA models
+        // in reality and the fixture was simply incomplete; leaving the field at
+        // Unknown would have been testing the verdict function against a
+        // description of no real model.
+        mixtral.attention.family = soma::AttentionFamily::Gqa;
         mixtral.topology.n_layers = 32;
         mixtral.topology.d_model = 4096;
         mixtral.topology.vocab_size = 32000;
@@ -182,6 +190,7 @@ int main() {
         mixtral.quantization.expert_down = {soma::DType::Q4_G, 128};
 
         soma::ArchIr qwen{};
+        qwen.attention.family = soma::AttentionFamily::Gqa;
         qwen.topology.n_layers = 48;
         qwen.topology.d_model = 2048;
         qwen.topology.vocab_size = 151936;

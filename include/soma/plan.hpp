@@ -99,6 +99,20 @@ struct PlanDocument {
     Verdict verdict = Verdict::Reject;
     std::string verdict_reason;
 
+    /// What the ECONOMICS alone say, before `arch_supported` is consulted.
+    ///
+    /// Equal to `verdict` whenever a backend exists, which is every model but
+    /// one today. It differs only when the engine cannot run the family at all,
+    /// and then it answers the question the forced Reject would otherwise hide:
+    /// *would* this model stream, if something could serve it?
+    ///
+    /// That is not idle curiosity — it is the whole reason to plan an
+    /// unsupported architecture. GLM-5.2 is the case: `verdict` is reject
+    /// because nothing implements DSA, while `economic_verdict` says whether
+    /// implementing it would buy a streamable model or a resident one, which is
+    /// what decides whether the backend is worth writing.
+    Verdict economic_verdict = Verdict::Reject;
+
     /// Layers whose measured router-lookahead recall clears the threshold.
     /// Prefetch is enabled per layer; a wrong prefetch evicts something useful,
     /// so a poor-recall layer gets none.
@@ -107,7 +121,23 @@ struct PlanDocument {
 
 /// Reads the container header and arch.json. Allocates no model memory, loads no
 /// weights, and is safe to call on a node that could not host the model.
-Status compute_plan(const std::string& model_dir, const HostBudget& budget, PlanDocument& out);
+/// `quant_overlay_json` states a HYPOTHETICAL quantization, in the same shape a
+/// container's `container_meta.json` uses — `{"dtype_gate_up", "dtype_down",
+/// "group"}` — and is applied AFTER the container's own map, so it wins.
+///
+/// It exists because the verdict is a property of (model, quantization, host)
+/// and, without it, the only quantization askable was the one the model had
+/// already been converted at. That made "should I convert this at q4?" a
+/// question you could only answer by converting it at q4 — which for a 744B
+/// model is hours and hundreds of gigabytes, and inverts the entire reason this
+/// function reads headers only.
+///
+/// Empty means "whatever the model already says", which is every existing
+/// caller's behaviour unchanged.
+Status compute_plan(const std::string& model_dir,
+                    const HostBudget& budget,
+                    PlanDocument& out,
+                    const std::string& quant_overlay_json = {});
 
 /// Same, when the IR is already parsed.
 Status compute_plan(const ArchIr& arch, const HostBudget& budget, PlanDocument& out);

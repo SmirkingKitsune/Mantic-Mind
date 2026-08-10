@@ -11,6 +11,7 @@
 
 #include "soma/arch_ir.hpp"
 #include "soma/attention_backend.hpp"
+#include "soma/f32_model.hpp"
 #include "soma/quant_format.hpp"
 
 #include <algorithm>
@@ -92,26 +93,40 @@ Status compute_plan(const ArchIr& arch, const HostBudget& budget, PlanDocument& 
     out.disk_footprint_bytes = out.total_routed_bytes;
 
     // ── the resident half ────────────────────────────────────────────────────
-    const auto hq = arch.attention.n_heads * arch.attention.head_dim;
-    const auto hkv = arch.attention.n_kv_heads * arch.attention.head_dim;
-
     std::uint64_t dense = 0;
     dense += bytes_for(arch, arch.topology.vocab_size, d, TensorRole::Embed);
     if (!arch.topology.tie_word_embeddings) {
         dense += bytes_for(arch, arch.topology.vocab_size, d, TensorRole::Embed);
     }
+    // Asked of the BACKEND, not computed here. The formula differs by family
+    // and the planner must not know how — a core-side branch on the family is
+    // exactly what tools/ci/check_seam.py refuses, and it was right to.
+    const auto* attn = resolve_attention_backend(arch.attention.family);
+    const std::uint64_t attn_bytes = (attn != nullptr && attn->weight_bytes_per_layer != nullptr)
+                                         ? attn->weight_bytes_per_layer(arch, &bytes_for)
+                                         : 0;
     for (std::uint32_t l = 0; l < n_layers; ++l) {
-        dense += bytes_for(arch, hq, d, TensorRole::AttnProj);
-        dense += 2 * bytes_for(arch, hkv, d, TensorRole::AttnProj);
-        dense += bytes_for(arch, d, hq, TensorRole::AttnProj);
+        dense += attn_bytes;
         dense += 2ull * d * sizeof(float); // input + post-attn norms, always f32
         if (arch.is_moe_layer(l)) {
             dense += static_cast<std::uint64_t>(n_experts) * d * sizeof(float); // router, f32
             if (arch.router.n_shared_experts > 0) {
+                // `shared_intermediate` ALREADY carries the count.
+                //
+                // Shared experts are fused into one set of tensors of width
+                // `moe_intermediate x n_shared`, and when config.json omits
+                // `shared_expert_intermediate_size` the adapter derives exactly
+                // that product. Multiplying by `n_shared_experts` here charged it
+                // twice — n_shared^2 — so DeepSeek-V2-Lite and Moonlight (2
+                // shared) were 2x over on every MoE layer, and it was invisible
+                // on GLM-5.2 and Qwen (1 shared) where squaring one is one.
+                //
+                // Verified against the real tensors: DeepSeek-V2-Lite's
+                // shared_experts gate/up/down are each [64,64] at
+                // moe_intermediate 32 and n_shared 2 — one fused set, not two.
                 const auto si = arch.ffn.shared_intermediate ? arch.ffn.shared_intermediate : fi;
-                dense += arch.router.n_shared_experts *
-                         (2 * bytes_for(arch, si, d, TensorRole::SharedExpert) +
-                          bytes_for(arch, d, si, TensorRole::SharedExpert));
+                dense += 2 * bytes_for(arch, si, d, TensorRole::SharedExpert) +
+                         bytes_for(arch, d, si, TensorRole::SharedExpert);
             }
         } else {
             const auto di = arch.ffn.dense_intermediate;
@@ -127,7 +142,6 @@ Status compute_plan(const ArchIr& arch, const HostBudget& budget, PlanDocument& 
     // the memory the expert cache wants. Sizing the expert cache first and
     // letting KV take the remainder thrashes on long contexts and presents as an
     // unrelated bug.
-    const auto* attn = resolve_attention_backend(arch.attention.family);
     std::uint64_t kv_per_token = 0;
     if (attn != nullptr && attn->kv_bytes_per_token != nullptr) {
         kv_per_token = attn->kv_bytes_per_token(arch);
@@ -243,6 +257,39 @@ Status compute_plan(const ArchIr& arch, const HostBudget& budget, PlanDocument& 
             << " MiB) exceeds the cache (" << out.expert_cache_bytes / (1024 * 1024) << " MiB)";
     }
     out.verdict_reason = why.str();
+
+    // ── can this build actually RUN it? ──────────────────────────────────────
+    //
+    // Asked LAST, and asked of the registry rather than of a table, so it cannot
+    // drift from what the engine will really resolve at load. `arch_supported`
+    // had a reader in admission and no producer at all before this: it defaulted
+    // to true and nothing ever set it, because an unadaptable model failed
+    // earlier in adapt_hf_config and never reached a plan.
+    //
+    // glm_moe_dsa is the case that needed the distinction. Its expert economics
+    // are perfectly computable — that is everything above this line — while
+    // `resolve_f32_backend` returns nullptr for MlaDsa because serving it through
+    // the MLA backend would run it as DENSE attention.
+    //
+    // The verdict is forced to Reject deliberately, per this field's contract: a
+    // verdict is a ROUTING decision, and routing an agent to an engine that
+    // cannot execute the model correctly is worse than refusing. The economics
+    // above are still reported — total_routed_bytes, active_fraction,
+    // bytes_per_token — so "does this model need streaming at all" is answered
+    // even though "can we serve it" is no.
+    // Captured BEFORE the backend check can overwrite it.
+    out.economic_verdict = out.verdict;
+
+    out.arch_supported = (resolve_f32_backend(arch) != nullptr);
+    if (!out.arch_supported) {
+        out.verdict = Verdict::Reject;
+        // The reason distinguishes THIS reject from an economic one. They call
+        // for opposite responses: economics can change on a bigger host, a
+        // missing backend cannot change on any host.
+        out.verdict_reason = std::string("no backend for ") + to_string(arch.attention.family) +
+                             " attention in this build; the economics above are computed and "
+                             "valid, but nothing can serve this model until one exists";
+    }
     return {};
 }
 
@@ -282,6 +329,7 @@ Status serialize_plan(const PlanDocument& plan, std::string& out_json) {
       << "  \"projected_tok_s\": " << plan.projected_tok_s << ",\n"
       << "  \"prefetch_enabled_layers\": " << plan.prefetch_enabled_layers << ",\n"
       << "  \"arch_supported\": " << (plan.arch_supported ? "true" : "false") << ",\n"
+      << "  \"economic_verdict\": \"" << to_string(plan.economic_verdict) << "\",\n"
       << "  \"verdict\": \"" << to_string(plan.verdict) << "\",\n"
       << "  \"verdict_reason\": \"" << plan.verdict_reason << "\"\n"
       << "}\n";
@@ -289,7 +337,10 @@ Status serialize_plan(const PlanDocument& plan, std::string& out_json) {
     return {};
 }
 
-Status compute_plan(const std::string& model_dir, const HostBudget& budget, PlanDocument& out) {
+Status compute_plan(const std::string& model_dir,
+                    const HostBudget& budget,
+                    PlanDocument& out,
+                    const std::string& quant_overlay_json) {
     // Reads config.json only — no weights, no container payload. That is what
     // makes the call safe on a host that could not possibly load the model, and
     // it is the reason admission can plan before it has anywhere to run.
@@ -326,6 +377,20 @@ Status compute_plan(const std::string& model_dir, const HostBudget& budget, Plan
         std::string meta_text((std::istreambuf_iterator<char>(meta_in)),
                               std::istreambuf_iterator<char>());
         if (auto st = apply_container_quant(meta_text, arch); !st.ok()) return st;
+    }
+
+    // The caller's HYPOTHETICAL map, applied last so it wins over whatever the
+    // model was actually converted at. Same function as the container path, so a
+    // plan asked at q4_g and a container built at q4_g cannot disagree about
+    // what q4_g means — including the rule that gate and up share a dtype
+    // because the converter interleaves them into one range.
+    //
+    // The resulting plan describes a model that may not exist yet. arch_hash
+    // covers the quant map, so it differs from the container's — which is the
+    // guard that stops a hypothetical being mistaken for a record of what was
+    // built.
+    if (!quant_overlay_json.empty()) {
+        if (auto st = apply_container_quant(quant_overlay_json, arch); !st.ok()) return st;
     }
 
     // Stamped HERE, not left empty.

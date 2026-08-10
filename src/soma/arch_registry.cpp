@@ -49,7 +49,18 @@ const AttentionBackend* resolve_attention_backend(AttentionFamily family) noexce
     case AttentionFamily::Gqa:
         return &arch::gqa::attention_backend();
     case AttentionFamily::Mla:
+        return &arch::mla::attention_backend();
+
     case AttentionFamily::MlaDsa:
+        // DSA's attention IS MLA plus a learned sparse key indexer, so MLA's
+        // SIZING is the right answer minus the indexer's own weights, which are
+        // not modelled. Returning it is deliberate and this instance carries no
+        // execution members: whether a DSA model can be RUN is answered by
+        // resolve_f32_backend, which still says no. Reporting nothing here would
+        // size every DSA model's attention at zero, which is a worse lie than
+        // an under-count with a reason attached.
+        return &arch::mla::attention_backend();
+
     case AttentionFamily::Unknown:
         return nullptr;
     }

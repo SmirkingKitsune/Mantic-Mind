@@ -172,6 +172,25 @@ FamilyTraits traits_for(const std::string& model_type) {
         // the degenerate case.
         return {AttentionFamily::Mla, QkNormKind::None, true, false, 1e-6f, {}};
     }
+    if (model_type == "glm_moe_dsa") {
+        // DESCRIBABLE, not servable — and those are different questions.
+        //
+        // GLM-5.2's expert half is ordinary: 256 routed experts, top-8, one
+        // shared, sigmoid + noaux_tc routing, dense-then-sparse layers. Every one
+        // of those keys is already read below. Its attention is MLA with a sparse
+        // key indexer on top (DSA), and `resolve_f32_backend` returns nullptr for
+        // MlaDsa on purpose — running it through the MLA backend would serve it
+        // as DENSE attention, which is a different model that happens to produce
+        // finite numbers.
+        //
+        // Adapting it anyway is the point. The verdict is a property of expert
+        // ECONOMICS — bytes/token, active fraction, routed set against a host
+        // budget — and none of that depends on how attention selects keys. So a
+        // plan is honest and useful before a backend exists, and `arch_supported`
+        // is what carries "cannot be run" to admission so it never spends hours
+        // converting 1.4 TB it could not serve.
+        return {AttentionFamily::MlaDsa, QkNormKind::None, true, false, 1e-5f, {}};
+    }
     return {};
 }
 
@@ -240,8 +259,9 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
     if (!traits.supported) {
         return {StatusCode::Unsupported,
                 "no adapter for model_type '" + model_type +
-                    "'; supported: olmoe, qwen3_moe, qwen2_moe, mixtral "
-                    "(deepseek_v2/deepseek_v3 land with the MLA backend at G4)"};
+                    "'; supported: olmoe, qwen3_moe, qwen2_moe, mixtral, deepseek_v2, "
+                    "deepseek_v3, glm_moe_dsa (glm_moe_dsa can be PLANNED but not served — "
+                    "see arch_supported in the plan document)"};
     }
 
     out = ArchIr{};

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import struct
 import sys
 from pathlib import Path
@@ -38,10 +39,51 @@ DTYPE_ID = {"f32": 0, "f16": 1, "bf16": 2, "q8_0": 3, "q6_g": 4, "q5_g": 5,
 # model that loads and is wrong.
 DENSE_SUFFIXES = (
     "input_layernorm.weight", "post_attention_layernorm.weight",
+    # ── GQA / MHA attention ──
     "self_attn.q_proj.weight", "self_attn.k_proj.weight",
     "self_attn.v_proj.weight", "self_attn.o_proj.weight",
     "self_attn.q_norm.weight", "self_attn.k_norm.weight",
+    # ── MLA attention ──
+    #
+    # Absent until now, so every MLA container was written without the tensors
+    # that actually do its attention and died at load with "binding attention
+    # weights failed at layer 0". G4 passed because conformance runs against the
+    # fp32 SOURCE, which has them; nothing ever served an MLA container.
+    #
+    # q_a/q_b appear only when q_lora_rank > 0 — V2-Lite projects Q directly and
+    # uses q_proj above, the full V2 and GLM-5.2 compress it. Both are listed
+    # because a suffix that is absent from a checkpoint costs nothing.
+    "self_attn.q_a_proj.weight", "self_attn.q_b_proj.weight",
+    "self_attn.q_a_layernorm.weight",
+    "self_attn.kv_a_proj_with_mqa.weight", "self_attn.kv_b_proj.weight",
+    "self_attn.kv_a_layernorm.weight",
+    # ── routers ──
     "mlp.gate.weight", "block_sparse_moe.gate.weight",
+    # The per-expert selection bias of `noaux_tc` routing. Dropping it does not
+    # fail to load — it routes to the wrong experts, quietly, which is strictly
+    # worse. DeepSeek-V3, Moonlight and GLM-5.2 all use it.
+    "mlp.gate.e_score_correction_bias",
+    # ── dense-layer FFN ──
+    #
+    # `first_k_dense_replace` layers carry a plain MLP instead of experts. Also
+    # absent until now, so the leading layers of every DeepSeek-family model were
+    # dropped along with the attention.
+    "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight",
+)
+
+# Named exclusions, so "unclaimed" below means genuinely unaccounted for.
+#
+# Anything matching these is deliberately not copied; everything else that is
+# neither dense nor a routed expert stops the conversion. That is what the
+# comment above DENSE_SUFFIXES has always claimed and never enforced — the list
+# only ever covered the tensors the first three models happened to have, and a
+# fourth architecture's weights vanished without a word.
+IGNORED_PATTERNS = (
+    ".experts.",              # routed experts: written to the expert payload
+    "shared_experts.",        # copied separately, below
+    "rotary_emb.inv_freq",    # derived at load, not a weight
+    ".mtp",                   # multi-token-prediction heads; not served
+    "num_nextn_predict",
 )
 
 
@@ -396,6 +438,35 @@ def main(argv: list[str]) -> int:
             t = get(name)
             if t is not None:
                 dense[name] = t
+
+    # ── every source tensor must be accounted for ────────────────────────────
+    #
+    # The rule DENSE_SUFFIXES has always claimed and never enforced. Without it
+    # the allow-list silently covered only what the first three models happened
+    # to carry: MLA's attention, the dense-layer MLPs and the noaux_tc router
+    # bias were all dropped without a word, and the result was a container that
+    # either failed to load or — worse — loaded and routed wrongly.
+    #
+    # A REFUSAL, not a warning. A conversion takes hours and produces hundreds of
+    # gigabytes; discovering afterwards that a tensor family went missing is the
+    # expensive way to learn it, and a warning in that much output is not read.
+    unclaimed = sorted(
+        n for n in owner
+        if n not in dense and not any(p in n for p in IGNORED_PATTERNS)
+    )
+    if unclaimed:
+        kinds = sorted({re.sub(r"^model\.layers\.\d+\.", "", n) for n in unclaimed})
+        print(f"  REFUSED  {src.name}: {len(unclaimed)} source tensor(s) match no known role.")
+        print("           A dropped tensor produces a model that loads and is wrong, so this")
+        print("           stops rather than writing a container that is quietly incomplete.")
+        print("           Unhandled kinds:")
+        for k in kinds[:12]:
+            print(f"             {k}")
+        if len(kinds) > 12:
+            print(f"             ... and {len(kinds) - 12} more")
+        print("           Add them to DENSE_SUFFIXES, or to IGNORED_PATTERNS with a reason.")
+        return 3
+
     save_file(dense, str(out_dir / "dense.safetensors"))
 
     # ── index ────────────────────────────────────────────────────────────────

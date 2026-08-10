@@ -541,4 +541,85 @@ const soma::F32Backend& f32_backend() noexcept {
     return kBackend;
 }
 
+// ── sizing ───────────────────────────────────────────────────────────────────
+//
+// `attention_backend()` was DECLARED in mla.hpp and never defined, so
+// `resolve_attention_backend` had to return nullptr for this family and the
+// planner sized MLA with GQA's formula. Two consequences, both silent:
+// kv_bytes_at_ctx came out ZERO for every MLA model, and the resident half was
+// inflated by the K/V projections MLA does not have.
+
+std::size_t kv_bytes_per_token(const ArchIr& arch) noexcept {
+    // The whole reason MLA exists. The cache holds a `kv_lora_rank`-wide latent
+    // plus ONE shared RoPE segment per token per layer — not per-head K and V.
+    // Against GQA's `2 * n_kv_heads * head_dim` that is roughly two orders of
+    // magnitude less on comparable configs, which is why it can afford a long
+    // context beside a big expert cache.
+    //
+    // fp32 to match the GQA implementation's G0 cache dtype; the planner scales
+    // by the configured KV dtype.
+    const auto& m = arch.attention.mla;
+    const std::size_t per_layer =
+        static_cast<std::size_t>(m.kv_lora_rank + m.qk_rope_head_dim) * sizeof(float);
+    return per_layer * arch.topology.n_layers;
+}
+
+std::uint64_t weight_bytes_per_layer(const ArchIr& arch,
+                                     AttentionBackend::ByteSizer sizer) noexcept {
+    // Shapes verified against tests/fixtures/tiny/DeepSeek-V2-Lite, which
+    // carries the real tensors: q_proj [96,64], kv_a_proj_with_mqa [40,64],
+    // kv_b_proj [128,32], o_proj [64,64] at d=64, n_heads=4, kv_lora=32,
+    // qk_nope=16, qk_rope=8, v_head=16.
+    const auto d = arch.topology.d_model;
+    const auto& a = arch.attention;
+    const auto& m = a.mla;
+    const auto qk = m.qk_nope_head_dim + m.qk_rope_head_dim;
+
+    std::uint64_t bytes = 0;
+
+    // q_lora_rank is absent (0) on V2-Lite, which projects Q directly; the full
+    // V2 and GLM-5.2 compress it through two matrices. Both shapes are real and
+    // the difference is large, so it branches rather than assuming either.
+    if (m.q_lora_rank > 0) {
+        bytes += sizer(arch, m.q_lora_rank, d, TensorRole::AttnProj);
+        bytes += sizer(arch, a.n_heads * qk, m.q_lora_rank, TensorRole::AttnProj);
+        bytes += static_cast<std::uint64_t>(m.q_lora_rank) * sizeof(float); // q_a_layernorm
+    } else {
+        bytes += sizer(arch, a.n_heads * qk, d, TensorRole::AttnProj);
+    }
+
+    // One down-projection carrying the latent plus the shared RoPE slice, and
+    // one up-projection back to per-head nope ++ value. There is no per-head K
+    // or V projection anywhere in this family, which is the entire point of it
+    // and precisely what the GQA formula used to invent.
+    bytes += sizer(arch, m.kv_lora_rank + m.qk_rope_head_dim, d, TensorRole::AttnProj);
+    bytes += sizer(arch,
+                   a.n_heads * (m.qk_nope_head_dim + m.v_head_dim),
+                   m.kv_lora_rank,
+                   TensorRole::AttnProj);
+    bytes += static_cast<std::uint64_t>(m.kv_lora_rank) * sizeof(float); // kv_a_layernorm
+
+    // o_proj is sized on v_head_dim, NOT head_dim: a query head is nope ++ rope
+    // and the value head is a different width entirely. They coincide on
+    // GLM-5.2 (both 256) and differ on V2-Lite (16 vs 24), so assuming either
+    // is right half the time.
+    bytes += sizer(arch, d, a.n_heads * m.v_head_dim, TensorRole::AttnProj);
+    return bytes;
+}
+
+const AttentionBackend& attention_backend() noexcept {
+    static const AttentionBackend kBackend = [] {
+        AttentionBackend b{};
+        b.name = "mla";
+        b.family = AttentionFamily::Mla;
+        b.kv_bytes_per_token = &kv_bytes_per_token;
+        b.weight_bytes_per_layer = &weight_bytes_per_layer;
+        // Execution members stay null. This instance exists for the planner's
+        // DESCRIPTION questions; whether MLA can actually be run is answered by
+        // resolve_f32_backend, which has its own opinion and its own reasons.
+        return b;
+    }();
+    return kBackend;
+}
+
 } // namespace soma::arch::mla

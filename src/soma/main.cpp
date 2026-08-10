@@ -38,6 +38,10 @@ int usage() {
                  "               [--ram-budget BYTES] [--pin BYTES] [--kv-dir DIR]\n"
                  "               [--served-name NAME]\n"
                  "  soma plan    --model-dir DIR [--json]\n"
+                 "               [--quant DTYPE] [--expert-down DTYPE] [--group N]\n"
+                 "               [--ram SIZE] [--ram-free SIZE] [--disk-bw SIZE] [--ctx N]\n"
+                 "               the verdict is a property of (model, quantization, host);\n"
+                 "               these ASK about a quantization and a host, and convert nothing\n"
                  "  soma conform --model-dir DIR [--json]\n";
     return 2;
 }
@@ -429,17 +433,116 @@ int cmd_conform(int argc, char** argv) {
     return 0;
 }
 
+/// Parse "24GiB", "16G", "8192MB", "1073741824".
+///
+/// Strict: an unparseable size is an ERROR, not a fallback to the default. A
+/// typo'd budget that silently plans against 16 GiB answers a question nobody
+/// asked, and the answer looks exactly like a real one.
+bool parse_size(const std::string& text, std::uint64_t& out) {
+    if (text.empty()) return false;
+    std::size_t i = 0;
+    std::uint64_t n = 0;
+    while (i < text.size() && std::isdigit(static_cast<unsigned char>(text[i]))) {
+        n = n * 10 + static_cast<std::uint64_t>(text[i] - '0');
+        ++i;
+    }
+    if (i == 0) return false;
+
+    std::string suffix;
+    for (; i < text.size(); ++i)
+        suffix += static_cast<char>(std::tolower(text[i]));
+
+    // KiB/MiB/GiB/TiB are 1024-based; KB/MB/GB/TB are 1000-based. Both spellings
+    // appear in this codebase's own docs, and quietly treating GB as GiB is a 7%
+    // error on the one number the verdict divides by.
+    std::uint64_t mul = 1;
+    if (suffix.empty() || suffix == "b")
+        mul = 1;
+    else if (suffix == "k" || suffix == "kib")
+        mul = 1024ull;
+    else if (suffix == "kb")
+        mul = 1000ull;
+    else if (suffix == "m" || suffix == "mib")
+        mul = 1024ull * 1024;
+    else if (suffix == "mb")
+        mul = 1000ull * 1000;
+    else if (suffix == "g" || suffix == "gib")
+        mul = 1024ull * 1024 * 1024;
+    else if (suffix == "gb")
+        mul = 1000ull * 1000 * 1000;
+    else if (suffix == "t" || suffix == "tib")
+        mul = 1024ull * 1024 * 1024 * 1024;
+    else if (suffix == "tb")
+        mul = 1000ull * 1000 * 1000 * 1000;
+    else
+        return false;
+
+    out = n * mul;
+    return true;
+}
+
 int cmd_plan(int argc, char** argv) {
     std::string dir;
     bool as_json = false;
+
+    // The verdict is a property of (model, quantization, HOST). `--model-dir`
+    // varies the first; these vary the other two, which until now were fixed
+    // constants — so `plan` could only ever evaluate that function at one point.
+    //
+    // Both are HYPOTHETICAL. Nothing here converts a weight or reserves a byte:
+    // the point of a headers-only planner is to answer "would this be worth
+    // converting?" before spending the hours, and for any quantization but the
+    // default that question could not be asked at all.
+    std::string q_gate_up, q_down;
+    std::uint32_t q_group = 0;
+    std::uint64_t ram_total = 0, ram_free = 0, disk_bw = 0;
+    std::uint32_t ctx = 0;
+
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
+        const auto next = [&]() -> std::string {
+            return (i + 1 < argc) ? argv[++i] : std::string{};
+        };
         if (a == "--model-dir" && i + 1 < argc)
-            dir = argv[++i];
+            dir = next();
         else if (a == "--json")
             as_json = true;
+        else if (a == "--quant" && i + 1 < argc)
+            q_gate_up = next();
+        else if (a == "--expert-down" && i + 1 < argc)
+            q_down = next();
+        else if (a == "--group" && i + 1 < argc)
+            q_group = static_cast<std::uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
+        else if (a == "--ram" && i + 1 < argc) {
+            if (!parse_size(next(), ram_total)) {
+                std::cerr << "plan: --ram wants a size like 24GiB\n";
+                return 2;
+            }
+        } else if (a == "--ram-free" && i + 1 < argc) {
+            if (!parse_size(next(), ram_free)) {
+                std::cerr << "plan: --ram-free wants a size like 20GiB\n";
+                return 2;
+            }
+        } else if (a == "--disk-bw" && i + 1 < argc) {
+            if (!parse_size(next(), disk_bw)) {
+                std::cerr << "plan: --disk-bw wants a size like 3GB (per second)\n";
+                return 2;
+            }
+        } else if (a == "--ctx" && i + 1 < argc) {
+            ctx = static_cast<std::uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
+        }
     }
     if (dir.empty()) return usage();
+
+    // Reject a dtype we cannot honour rather than planning at the default and
+    // reporting a number for a quantization nobody asked for.
+    for (const auto* name : {&q_gate_up, &q_down}) {
+        soma::DType parsed{};
+        if (!name->empty() && !parse_dtype_name(*name, parsed)) {
+            std::cerr << "plan: unknown dtype '" << *name << "'\n";
+            return 2;
+        }
+    }
 
     // Host budget from the machine this runs on. The verdict is a property of
     // (model, quantization, HOST) — running `plan` on a different box than the
@@ -451,13 +554,41 @@ int cmd_plan(int argc, char** argv) {
     host.ram_free_bytes = 8ull << 30;
     host.disk_bandwidth = 1230ull * 1000 * 1000;
 
+    // An EXPLICIT budget is a statement about what the engine may have, so
+    // `--ram 24GiB` alone means 24 GiB of budget rather than 24 with half
+    // reserved. The 16/8 default keeps modelling a real machine with an OS on
+    // it; silently halving a number the operator typed would answer a different
+    // question and look identical. `--ram-free` states the split when it
+    // matters — it is what compute_plan actually divides by.
+    if (ram_total > 0) {
+        host.ram_total_bytes = ram_total;
+        host.ram_free_bytes = ram_total;
+    }
+    if (ram_free > 0) host.ram_free_bytes = ram_free;
+    if (disk_bw > 0) host.disk_bandwidth = disk_bw;
+    if (ctx > 0) host.ctx_size = ctx;
+
     soma::PlanDocument doc;
     // Try the container path first (a converted model carries arch.json), and
     // fall back to adapting the upstream config.json. Both are legitimate inputs:
     // an operator asking "what will this do here?" usually has the HF checkpoint,
     // not a container, and refusing them would make `plan` useless exactly when
     // it is most wanted — before conversion.
-    if (auto st = soma::compute_plan(dir, host, doc); !st.ok()) {
+    // Built in the SHAPE a container_meta.json uses and handed to the same
+    // applier, rather than mapping dtype names to roles a second time here.
+    // That mapping carries a rule — gate and up must share a dtype, because the
+    // converter interleaves them into one range — and a second copy of it would
+    // let `plan --quant` describe a container the converter cannot produce.
+    std::string overlay;
+    if (!q_gate_up.empty() || !q_down.empty() || q_group > 0) {
+        nlohmann::json o = nlohmann::json::object();
+        if (!q_gate_up.empty()) o["dtype_gate_up"] = q_gate_up;
+        if (!q_down.empty()) o["dtype_down"] = q_down;
+        if (q_group > 0) o["group"] = q_group;
+        overlay = o.dump();
+    }
+
+    if (auto st = soma::compute_plan(dir, host, doc, overlay); !st.ok()) {
         std::string cfg_text;
         soma::ArchIr arch;
         std::ifstream in(std::filesystem::path(dir) / "config.json", std::ios::binary);
@@ -470,6 +601,15 @@ int cmd_plan(int argc, char** argv) {
             std::cerr << "plan failed: " << a.message() << "\n";
             return 1;
         }
+        // The same overlay. Without this the fallback silently ignores --quant
+        // and reports default-quantization numbers for a flag the operator set —
+        // which is worse than refusing, because the output looks like an answer.
+        if (!overlay.empty()) {
+            if (auto q = soma::apply_container_quant(overlay, arch); !q.ok()) {
+                std::cerr << "plan failed: " << q.message() << "\n";
+                return 1;
+            }
+        }
         if (auto p = soma::compute_plan(arch, host, doc); !p.ok()) {
             std::cerr << "plan failed: " << p.message() << "\n";
             return 1;
@@ -480,8 +620,16 @@ int cmd_plan(int argc, char** argv) {
         (void)soma::serialize_plan(doc, js);
         std::cout << js << "\n";
     } else {
-        std::cout << "verdict      " << soma::to_string(doc.verdict) << "\n"
-                  << "reason       " << doc.verdict_reason << "\n"
+        // Both, when they differ. A reader who sees only "reject" cannot tell
+        // whether the model is uneconomic or merely unimplemented, and those
+        // lead to completely different next actions — requantize on a bigger
+        // host, versus write a backend.
+        std::cout << "verdict      " << soma::to_string(doc.verdict) << "\n";
+        if (doc.economic_verdict != doc.verdict) {
+            std::cout << "economics    " << soma::to_string(doc.economic_verdict)
+                      << "   (what the economics alone say; see reason)\n";
+        }
+        std::cout << "reason       " << doc.verdict_reason << "\n"
                   << "routed       " << (doc.total_routed_bytes >> 20) << " MiB\n"
                   << "bytes/token  " << (doc.bytes_per_token >> 20) << " MiB\n"
                   << "max_batch    " << doc.max_batch << "\n";

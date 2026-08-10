@@ -17,14 +17,18 @@
 #include "soma/expert_store.hpp"
 #include "soma/f32_model.hpp"
 #include "soma/plan.hpp"
+#include "soma/safetensors.hpp"
 #include "soma/quant_format.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <sstream>
+#include <string>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -60,6 +64,26 @@ int check_container(const fs::path& fixture, const fs::path& container) {
     soma::F32Model qmodel;
     if (auto st = soma::load_f32_model(fixture.string(), qmodel, container_map()); !st.ok()) {
         std::cout << "   quantized load failed: " << st.message() << "\n";
+        return 1;
+    }
+
+    // Can the CONTAINER be loaded as a model at all?
+    //
+    // Everything below opens the expert store and compares payload bytes, which
+    // says nothing about the dense half — so a container missing its attention
+    // weights passed this test for as long as it existed. `convert.py`'s
+    // allow-list was GQA-shaped and silently dropped MLA's kv_a/kv_b, the
+    // dense-layer MLPs and the noaux_tc router bias; `soma serve` on a DeepSeek
+    // container died with "binding attention weights failed at layer 0", and
+    // nothing here noticed because nothing here ever tried (roadmap D18).
+    //
+    // G4 passed on the fp32 SOURCE path, which has the tensors. The container
+    // path is the one production serves.
+    soma::F32Model from_container;
+    if (auto st = soma::load_f32_model(container.string(), from_container, container_map());
+        !st.ok()) {
+        std::cout << "   CONTAINER WILL NOT LOAD: " << st.message() << "\n"
+                  << "   (the round-trip below only checks experts; this is the dense half)\n";
         return 1;
     }
 
@@ -253,6 +277,280 @@ int check_verdicts() {
 
 }  // namespace
 
+/// DESCRIBABLE is not SERVABLE, and the plan has to say which.
+///
+/// Before GLM-5.2 those were the same question: a model_type with no adapter
+/// failed in adapt_hf_config and never reached a plan, so `arch_supported`
+/// defaulted to true and nothing ever set it — a field with a reader in
+/// admission and no producer anywhere.
+///
+/// `glm_moe_dsa` separates them. Its expert half is ordinary and its economics
+/// compute exactly like any other MoE; its attention is MLA with a sparse key
+/// indexer, and `resolve_f32_backend` returns nullptr for MlaDsa because serving
+/// it through the plain MLA backend would run it as DENSE attention — finite,
+/// plausible, wrong.
+///
+/// Both directions are asserted. A check that only proved the refusal would pass
+/// just as well if `arch_supported` were hardcoded false.
+int check_plan_vs_serve() {
+    int bad = 0;
+    const auto check = [&](bool ok, const char* what, const std::string& detail = {}) {
+        std::cout << "   " << std::left << std::setw(58) << what << (ok ? "OK" : "FAIL");
+        if (!detail.empty()) std::cout << "   " << detail;
+        std::cout << "\n";
+        if (!ok) ++bad;
+    };
+
+    // Minimal, and deliberately NOT read from the checkpoint on disk: a test that
+    // needs 1.4 TB present is a test that runs on one machine. These are the real
+    // GLM-5.2 values, just without the weights.
+    const std::string glm = R"({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 78, "hidden_size": 6144,
+        "vocab_size": 154880, "first_k_dense_replace": 3, "moe_layer_freq": 1,
+        "n_routed_experts": 256, "num_experts_per_tok": 8, "n_shared_experts": 1,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "num_attention_heads": 64, "num_key_value_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048, "qk_nope_head_dim": 192,
+        "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "scoring_func": "sigmoid", "topk_method": "noaux_tc", "norm_topk_prob": true,
+        "routed_scaling_factor": 2.5, "rms_norm_eps": 1e-5, "hidden_act": "silu"
+    })";
+
+    soma::ArchIr arch;
+    const auto st = soma::adapt_hf_config(glm, arch);
+    check(st.ok(), "glm_moe_dsa ADAPTS rather than erroring", st.ok() ? "" : st.message());
+    if (!st.ok()) return bad;
+
+    check(arch.attention.family == soma::AttentionFamily::MlaDsa,
+          "and is classified mla+dsa, not plain mla",
+          soma::to_string(arch.attention.family));
+    // The expert half is ordinary. If these drift, the economics below are
+    // meaningless and the verdict would be wrong for a reason unrelated to DSA.
+    check(arch.router.n_experts == 256 && arch.router.top_k == 8 &&
+              arch.router.n_shared_experts == 1,
+          "the router reads through unchanged (256 experts, top-8, 1 shared)");
+    check(arch.n_moe_layers() == 75, "3 dense + 75 MoE layers",
+          std::to_string(arch.n_moe_layers()) + " moe");
+    check(arch.attention.mla.kv_lora_rank == 512 && arch.attention.mla.v_head_dim == 256,
+          "MLA dims survive the DSA classification");
+
+    soma::HostBudget b;
+    b.ram_total_bytes = 24ull * kGiB; // Colibri's "comfortable" figure
+    b.ram_free_bytes = 24ull * kGiB;
+    b.ctx_size = 4096;
+    b.kv_slots = 1;
+    b.disk_bandwidth = 3ull * 1000 * 1000 * 1000;
+
+    soma::PlanDocument plan;
+    const auto pst = soma::compute_plan(arch, b, plan);
+    check(pst.ok(), "and it PLANS", pst.ok() ? "" : pst.message());
+    if (!pst.ok()) return bad;
+
+    // The economics are the point of planning it at all, and they are computed
+    // whether or not a backend exists. active_fraction is quantization- and
+    // host-independent — 8/256 — which is what makes it comparable across the
+    // table above.
+    check(plan.active_fraction > 0.03 && plan.active_fraction < 0.032,
+          "economics are computed: active fraction 8/256",
+          std::to_string(plan.active_fraction));
+    check(plan.total_routed_bytes > 0 && plan.bytes_per_token > 0,
+          "routed set and bytes/token are real numbers");
+
+    check(!plan.arch_supported, "arch_supported is FALSE — nothing can serve MlaDsa");
+    check(plan.verdict == soma::Verdict::Reject,
+          "so the verdict is reject regardless of economics",
+          soma::to_string(plan.verdict));
+    // The two rejects call for opposite responses — economics can change on a
+    // bigger host, a missing backend cannot change on any host — so the reason
+    // has to distinguish them.
+    check(plan.verdict_reason.find("no backend") != std::string::npos,
+          "and says WHY, so it is not read as an economic reject",
+          plan.verdict_reason.substr(0, 46));
+
+    // The control. Without it, hardcoding arch_supported=false would pass
+    // everything above.
+    const std::string olmoe = R"({
+        "model_type": "olmoe", "num_hidden_layers": 16, "hidden_size": 2048,
+        "vocab_size": 50304, "num_experts": 64, "num_experts_per_tok": 8,
+        "intermediate_size": 1024, "num_attention_heads": 16,
+        "num_key_value_heads": 16, "hidden_act": "silu"
+    })";
+    soma::ArchIr ok_arch;
+    soma::PlanDocument ok_plan;
+    if (soma::adapt_hf_config(olmoe, ok_arch).ok() &&
+        soma::compute_plan(ok_arch, b, ok_plan).ok()) {
+        check(ok_plan.arch_supported, "and a GQA model still reports arch_supported TRUE");
+    } else {
+        check(false, "and a GQA model still reports arch_supported TRUE", "control failed to plan");
+    }
+    return bad;
+}
+
+/// The verdict is a function of THREE arguments, and now all three can be varied.
+///
+/// This document says "the verdict is a property of (model, quantization, host)"
+/// in a dozen places, and until `soma plan` grew `--quant` and `--ram` nothing
+/// could demonstrate it: the CLI fixed two of the three, so the function could
+/// only ever be evaluated at one point. One model reaching all three verdicts is
+/// the claim made executable.
+int check_verdict_varies_by_host_and_quant() {
+    int bad = 0;
+    const auto check = [&](bool ok, const char* what, const std::string& detail = {}) {
+        std::cout << "   " << std::left << std::setw(58) << what << (ok ? "OK" : "FAIL");
+        if (!detail.empty()) std::cout << "   " << detail;
+        std::cout << "\n";
+        if (!ok) ++bad;
+    };
+
+    // OLMoE-1B-7B's real shape, GQA so a backend exists and the verdict is not
+    // short-circuited by arch_supported.
+    const std::string cfg = R"({
+        "model_type": "olmoe", "num_hidden_layers": 16, "hidden_size": 2048,
+        "vocab_size": 50304, "num_experts": 64, "num_experts_per_tok": 8,
+        "intermediate_size": 1024, "num_attention_heads": 16,
+        "num_key_value_heads": 16, "hidden_act": "silu"
+    })";
+
+    const auto plan_at = [&](const char* overlay, std::uint64_t ram_gib, soma::PlanDocument& out) {
+        soma::ArchIr a;
+        if (!soma::adapt_hf_config(cfg, a).ok()) return false;
+        if (overlay != nullptr && *overlay != '\0' &&
+            !soma::apply_container_quant(overlay, a).ok()) {
+            return false;
+        }
+        soma::HostBudget b;
+        b.ram_total_bytes = ram_gib * kGiB;
+        b.ram_free_bytes = ram_gib * kGiB;
+        b.ctx_size = 4096;
+        b.kv_slots = 1;
+        b.disk_bandwidth = 3ull * 1000 * 1000 * 1000;
+        return soma::compute_plan(a, b, out).ok();
+    };
+
+    // Same model, same quantization, only the HOST changes.
+    soma::PlanDocument tight, mid, roomy;
+    const bool ran = plan_at(R"({"dtype_gate_up":"q4_g","dtype_down":"q4_g","group":128})", 2, tight) &&
+                     plan_at(R"({"dtype_gate_up":"q4_g","dtype_down":"q4_g","group":128})", 8, mid) &&
+                     plan_at(R"({"dtype_gate_up":"q4_g","dtype_down":"q4_g","group":128})", 64, roomy);
+    check(ran, "three hosts plan");
+    if (!ran) return bad;
+
+    check(tight.verdict == soma::Verdict::Stream,
+          "a 2 GiB host STREAMS it (routed set exceeds the cache)",
+          soma::to_string(tight.verdict));
+    check(roomy.verdict == soma::Verdict::ResidentOnly,
+          "a 64 GiB host says resident-only (streaming buys nothing)",
+          soma::to_string(roomy.verdict));
+    check(tight.verdict != roomy.verdict,
+          "-> the HOST alone moves the verdict, model and quant fixed");
+
+    // Same model, same host, only the QUANTIZATION changes. The routed set has
+    // to grow: q8_0 is ~2x q4_g per weight, and that is the quantity the verdict
+    // divides by.
+    soma::PlanDocument q4, q8;
+    const bool ran2 = plan_at(R"({"dtype_gate_up":"q4_g","dtype_down":"q4_g","group":128})", 8, q4) &&
+                      plan_at(R"({"dtype_gate_up":"q8_0","dtype_down":"q8_0","group":128})", 8, q8);
+    check(ran2, "two quantizations plan");
+    if (!ran2) return bad;
+    check(q8.total_routed_bytes > q4.total_routed_bytes,
+          "-> and the QUANT alone moves the routed set",
+          std::to_string(q4.total_routed_bytes >> 20) + " -> " +
+              std::to_string(q8.total_routed_bytes >> 20) + " MiB");
+
+    // An overlay must never be able to describe a container the converter cannot
+    // produce: gate and up are interleaved into one range, so they share a dtype
+    // whatever the caller asked for.
+    soma::ArchIr split;
+    (void)soma::adapt_hf_config(cfg, split);
+    (void)soma::apply_container_quant(R"({"dtype_gate_up":"q8_0","dtype_down":"q4_g"})", split);
+    check(split.quantization.expert_gate.dtype == split.quantization.expert_up.dtype,
+          "gate and up always share a dtype, whatever was asked for");
+    check(split.quantization.expert_down.dtype != split.quantization.expert_gate.dtype,
+          "but down is independent, which is the whole point of expert_down");
+    return bad;
+}
+
+/// `dense_resident_bytes` against the tensors that actually exist.
+///
+/// The plan's resident half was never checked against anything. It was derived
+/// from a formula, the formula was written against GQA, and two errors lived in
+/// it undetected:
+///
+///   * MLA was charged `q + 2*(n_kv_heads x head_dim) + o` — the GQA shape. MLA
+///     has no per-head K or V projection at all, which is the entire point of
+///     it. 1.66x over.
+///   * Shared experts were multiplied by `n_shared_experts` when
+///     `shared_intermediate` already carries that factor: n_shared^2. Invisible
+///     at n_shared = 1 (GLM-5.2, Qwen) and 2x over at 2 (DeepSeek, Moonlight).
+///
+/// Both inflated the RESIDENT half, which is what decides whether a model can be
+/// hosted at all — so the errors ran in the direction that makes models look
+/// unservable, and MLA's whole reason for existing is a smaller resident half.
+///
+/// Checked against real bytes rather than a second formula. A formula compared
+/// to a formula agrees with itself; these fixtures carry the actual tensors, and
+/// summing them is the only independent statement available.
+int check_dense_sizing(const fs::path& tiny_root) {
+    int bad = 0;
+    if (!fs::is_directory(tiny_root)) {
+        std::cout << "   (no tiny fixtures)\n";
+        return 0;
+    }
+
+    for (const auto& e : fs::directory_iterator(tiny_root)) {
+        if (!e.is_directory()) continue;
+        const auto name = e.path().filename().string();
+        const auto weights = e.path() / "model.safetensors";
+        if (!fs::is_regular_file(weights)) continue;
+
+        soma::ArchIr arch;
+        std::ifstream cfg(e.path() / "config.json", std::ios::binary);
+        if (!cfg) continue;
+        const std::string text((std::istreambuf_iterator<char>(cfg)),
+                               std::istreambuf_iterator<char>());
+        // An unadapted family is a coverage gap, not a sizing failure. granitemoe
+        // has no adapter and must not read as a broken estimate.
+        if (!soma::adapt_hf_config(text, arch).ok()) continue;
+
+        soma::SafeTensors st;
+        if (!st.open(weights.string()).ok()) continue;
+
+        // Everything that is not a ROUTED expert is resident by definition —
+        // the same split the container makes when it separates dense.safetensors
+        // from the expert payload.
+        std::uint64_t actual = 0;
+        for (const auto& tn : st.names()) {
+            if (tn.find(".experts.") != std::string::npos) continue;
+            const auto* t = st.find(tn);
+            if (t == nullptr) continue;
+            std::uint64_t n = 1;
+            for (std::size_t i = 0; i < t->rank(); ++i) n *= static_cast<std::uint64_t>(t->dim(i));
+            actual += n * 4; // fixtures are f32
+        }
+        if (actual == 0) continue;
+
+        soma::HostBudget b;
+        b.ram_total_bytes = 8 * kGiB;
+        b.ram_free_bytes = 8 * kGiB;
+        soma::PlanDocument plan;
+        if (!soma::compute_plan(arch, b, plan).ok()) continue;
+
+        const double ratio =
+            static_cast<double>(plan.dense_resident_bytes) / static_cast<double>(actual);
+        // 3% covers the norms and the odd f32-vs-quantized rounding; it does not
+        // cover a missing tensor family or a squared count, which is what this
+        // is for.
+        const bool ok = (ratio > 0.97 && ratio < 1.03);
+        if (!ok) ++bad;
+        std::ostringstream d;
+        d << std::fixed << std::setprecision(2) << ratio << "x";
+        std::cout << "   " << std::left << std::setw(34) << name << std::setw(9)
+                  << soma::to_string(arch.attention.family) << (ok ? "OK" : "FAIL") << "   "
+                  << d.str() << "\n";
+    }
+    return bad;
+}
+
 int main(int argc, char** argv) {
     const fs::path root = (argc > 1) ? fs::path(argv[1]) : fs::path("tests/fixtures");
     int failures = 0;
@@ -272,6 +570,15 @@ int main(int argc, char** argv) {
 
     std::cout << "\nverdict function vs schemas/arch-ir.md §8\n";
     failures += check_verdicts();
+
+    std::cout << "\ndescribable is not servable (glm_moe_dsa)\n";
+    failures += check_plan_vs_serve();
+
+    std::cout << "\nthe verdict varies by host AND quantization\n";
+    failures += check_verdict_varies_by_host_and_quant();
+
+    std::cout << "\ndense_resident_bytes vs the tensors that exist\n";
+    failures += check_dense_sizing(root / "tiny");
 
     std::cout << "\n" << (failures == 0 ? "OK" : std::to_string(failures) + " FAILURES") << "\n";
     return failures == 0 ? 0 : 1;

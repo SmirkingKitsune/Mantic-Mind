@@ -2865,6 +2865,231 @@ warm. Before any performance gate is written:
 `accuracy_floor` remains unclaimed and is unaffected by any of this; it wants its own small gate, for the
 reasons recorded when G9 was first drafted.
 
+## GLM-5.2: describable, not servable
+
+The concept this engine implements was originally proven by **Colibri**, on **GLM-5.2** — 744B
+parameters, ~372 GB of weights at q4, served from disk with 16 GB of RAM minimum and 24 GB comfortable.
+That is a 16x oversubscription, and it is the regime this repository has never once entered.
+
+Worth stating plainly, because the test suite reads as if it had: **no real container has ever earned a
+`stream` verdict.** Every committed fixture is shrunk, so all five plan `resident-only`. The single real
+admission, OLMoE-1B-7B, earned `hybrid`. Streaming has only ever been reached through synthetic `ArchIr`
+in `routing_g5` and `container_g2` — hand-built topologies against a deliberately tight host.
+
+### The adapter needed almost nothing
+
+`adapt_hf_config` already read every key GLM-5.2 has: `first_k_dense_replace`, sigmoid scoring,
+`noaux_tc` bias correction, `norm_topk_prob`, `routed_scaling_factor`, `n_shared_experts`, and the whole
+MLA block — which already branched on `MlaDsa` because the enum anticipated DSA. The adapter is one
+`traits_for` entry. The economics fall out:
+
+```
+attention_family  mla+dsa        n_layers 78 (3 dense + 75 MoE)
+n_experts         256            top_k 8      shared 1
+active_fraction   0.03125        <- 8/256
+arch_supported    false
+verdict           reject   "no backend for mla+dsa attention in this build"
+```
+
+**3.1% active fraction is the lowest of any model this project has measured** — against Qwen3's 6.3%,
+DeepSeek-V2-Lite's 9.4%, and Mixtral's 25%, with the streamability ceiling at 15%. By the verdict
+function's own criterion GLM-5.2 is the most streamable architecture yet seen, which is what one would
+hope given it is the model the concept was proven on. That number is also quantization- and
+host-independent, so it is the one part of this answer that needs no further work to trust.
+
+### `arch_supported` finally has a producer
+
+The field had a reader in admission and **nothing that ever set it**. It defaulted to true because an
+unadaptable `model_type` failed earlier in `adapt_hf_config` and never reached a plan, so "describable"
+and "servable" were the same question and neither needed the distinction.
+
+`glm_moe_dsa` separates them, and the answer is now DERIVED rather than declared:
+`arch_supported = (resolve_f32_backend(arch) != nullptr)`. Asking the registry means it cannot drift from
+what the engine really resolves at load; a second table would be one more thing to keep in step. The
+registry already returned `nullptr` for `MlaDsa` with the reason written down — serving it through the
+plain MLA backend would run it as DENSE attention, "finite, plausible, and not the model that was asked
+for."
+
+The verdict is forced to `reject`, per the field's own contract, because a verdict is a ROUTING decision
+and routing an agent to an engine that cannot execute the model is worse than refusing. `verdict_reason`
+distinguishes this from an economic reject, and the distinction is not cosmetic: economics change on a
+bigger host, a missing backend does not change on any host. Admission reads `arch_supported` and **skips
+conversion entirely** — which is what stops 1.4 TB being converted into a container nothing can read.
+
+### What it caught on the way in
+
+`routing_g5`'s synthetic Mixtral and Qwen3 never set `attention.family`, so both defaulted to `Unknown`
+and — once the plan started asking whether a backend exists — planned as `reject`. The fixtures were
+describing no real model, and it had not mattered until something read the field. Both now declare GQA,
+which is what they are.
+
+### Asking the other two arguments
+
+`soma plan` took `--model-dir` and `--json`. The verdict is a property of **(model, quantization, host)**
+— a phrase this document repeats a dozen times and which drives `arch_hash`, staleness detection and
+re-admission — and the CLI could vary exactly one of the three. It evaluated that function at one fixed
+point: f32 on a hardcoded 16 GiB / 8 GiB, with this box's NVMe figure.
+
+Now: `--quant`, `--expert-down`, `--group`, `--ram`, `--ram-free`, `--disk-bw`, `--ctx`.
+
+Both groups are HYPOTHETICAL and convert nothing. `--quant` mirrors the three fields
+`ControlModelRegistry::QuantOverride` already accepts on `POST /v1/models/admit`, so the same values that
+DECIDE a conversion can now ASK about one first — which is what a headers-only planner is for. The
+overlay is built in `container_meta.json`'s shape and handed to `apply_container_quant`, the same
+function the container path uses, rather than mapping dtype names to roles a second time. That mapping
+carries a rule — gate and up must share a dtype, because the converter interleaves them into one range —
+and a second copy would let `plan` describe a container the converter cannot produce. Asserted directly.
+
+`--ram` alone sets total AND free, because an explicit budget is a statement about what the engine may
+have; silently reserving half of a number the operator typed would answer a different question and look
+identical. The 16/8 default still models a real machine with an OS on it. Sizes parse `24GiB`/`24G`
+(1024-based) and `24GB` (1000-based) distinctly, and an unparseable size is an error rather than a
+fallback — a typo'd budget that quietly plans against the default produces an answer indistinguishable
+from a real one.
+
+**The claim is now executable.** One model, three verdicts, varying only the arguments:
+
+| OLMoE-1B-7B @ q4_g | verdict |
+|---|---|
+| `--ram 2GiB` | `stream` — routed set exceeds the cache |
+| default 16/8 GiB | `hybrid` |
+| `--ram 64GiB` | `resident-only` — streaming buys nothing |
+
+and `--quant q8_0` moves the routed set 3456 -> 6336 MiB at a fixed host. `container_g2` pins both axes.
+
+**`economic_verdict` came out of using them.** With `arch_supported` forcing Reject, GLM-5.2's headline
+verdict said nothing about whether it would stream — which is the only reason to plan an unsupported
+architecture at all. The plan now reports what the economics alone say, beside what the engine can
+actually do. They differ for exactly one model today.
+
+### What the flags found
+
+Asking the Colibri question — q4_g on 24 GiB — produced this:
+
+```
+routed        379.7 GiB      (~2% off Colibri's ~372 GB, so the same regime)
+bytes/token    11.9 GiB
+dense_resident 135.4 GiB     <- and this is what rejects it
+expert_cache     0.0 GiB
+economic_verdict reject       ("hybrid" only once the host reaches ~512 GiB)
+```
+
+The experts are not the problem. **The dense half is 135 GiB at q4**, so no host under ~150 GB can serve
+this model whatever the expert streaming does — and Colibri ran it on 16-24 GB. Two separate causes, both
+now logged as defects:
+
+- **D16** — the plan's dense sizing, now **fixed**; see below.
+- **D17** — dense tensors are F32 in the container by construction, which puts a hard floor under any
+  large model regardless of expert quantization.
+- **D18** — MLA containers are missing their attention weights entirely, found while checking D16.
+
+None were visible before, because nothing had ever planned a model big enough for the dense half to
+matter.
+
+### Fixing the dense estimate found two more bugs
+
+D16 was logged as one error and was three.
+
+**1. MLA sized as GQA.** The planner charged `q + 2*(n_kv_heads x head_dim) + o` for every family. MLA
+has no per-head K or V projection — it compresses through `kv_lora_rank` and reconstructs — so two of the
+largest tensors in the layer were invented.
+
+**2. Shared experts counted `n_shared^2`.** `shared_intermediate` already carries the count (the adapter
+derives `moe_intermediate x n_shared` when config.json omits it, and the tensors really are fused:
+DeepSeek-V2-Lite's `shared_experts.gate_proj` is `[64,64]` at moe_intermediate 32 and n_shared 2 — ONE
+set, not two). The planner then multiplied by `n_shared_experts` again. Invisible at 1 shared expert
+(GLM-5.2, Qwen), 2x over at 2 (DeepSeek, Moonlight) — which is why it hid behind the MLA error for so
+long, since the same two models carry both.
+
+**3. `arch::mla::attention_backend()` was declared and never defined.** Found only because fixing (1)
+required somewhere to put the formula. `resolve_attention_backend` therefore returned nullptr for MLA,
+and `kv_bytes_per_token` — the thing that stops the KV cache and the expert cache fighting over the same
+RAM — silently returned **zero for every MLA model**. Now real: DeepSeek-V2-Lite reports 10.5 MB at ctx
+4096 x 4 slots against 0 before.
+
+**Corrected measurement, and a correction to what was claimed.** The original "MLA 1.66x" was taken
+against the DeepSeek CONTAINER, which turns out to be missing tensors (D18) — so it conflated a formula
+error with a conversion bug. Re-measured against the source fixtures, which carry the real tensors, and
+now checked in `container_g2` on every commit:
+
+| fixture | family | ratio |
+|---|---|---|
+| DeepSeek-V2-Lite | mla | 1.00x |
+| Moonlight-16B-A3B | mla | 1.00x |
+| Qwen3-30B-A3B | gqa | 1.00x |
+| Mixtral-8x7B-v0.1 | gqa | 1.00x |
+| OLMoE-1B-7B-0924 | mha | 1.00x |
+
+Checked against real BYTES rather than a second formula, because a formula compared to a formula agrees
+with itself. Reverting either fix independently turns the two MLA rows red and leaves GQA/MHA at 1.00x.
+
+**The seam check refused the first attempt, correctly.** Branching on `AttentionFamily` inside plan.cpp
+tripped R2 — `kv_lora_rank` is architecture knowledge, and core is not allowed to hold it. The error
+message named the remedy: express it through the backend pointers. So the formula moved to
+`AttentionBackend::weight_bytes_per_layer`, beside `kv_bytes_per_token`, which is the same shape of
+question and was already there.
+
+**And the second attempt was wrong in a way only the verdict table caught.** The backend initially
+returned bytes and hardcoded `sizeof(float)`. That agrees with the old code on the f32 fixtures — every
+dense-sizing row still read 1.00x — and disagrees by ~8x on any quantized plan. `check_verdicts` flipped
+Mixtral from `resident-only` to `reject` and said so. The fix is a division of labour worth stating: the
+BACKEND owns the shapes, the PLANNER owns the quantization, and the sizer is passed in rather than
+assumed.
+
+### The container that could not be served
+
+Found while checking D16's evidence: the ratio had been measured against the DeepSeek CONTAINER, and the
+container turned out to be missing tensors. `soma serve` on it dies with `binding attention weights
+failed at layer 0`.
+
+`convert.py`'s `DENSE_SUFFIXES` is an allow-list, and it only ever covered what the first three models
+happened to carry. Enumerating every source tensor against it found **three** families silently dropped,
+which fail in three different ways:
+
+| Dropped | Affects | How it fails |
+|---|---|---|
+| `kv_a_proj_with_mqa`, `kv_b_proj`, `kv_a_layernorm` | every MLA model | fails to load — loud |
+| `mlp.gate_proj/up_proj/down_proj` | any model with `first_k_dense_replace > 0` | fails to load — loud |
+| `mlp.gate.e_score_correction_bias` | `noaux_tc` routing: DeepSeek-V3, Moonlight, **GLM-5.2** | **loads and routes to the wrong experts** — silent |
+
+The third is the one worth pausing on. It is the per-expert selection bias, and without it the router
+still produces a top-k — just the wrong one. That is the failure mode this whole document keeps trying to
+design out, and it was one line from shipping on the model the project was built for.
+
+**The rule was already written down.** The comment above `DENSE_SUFFIXES` says a dropped tensor "is an
+error rather than a silent omission — a dropped tensor produces a model that loads and is wrong." It was
+never enforced. Now it is: every source tensor must match the allow-list, an explicit `IGNORED_PATTERNS`
+entry (routed experts, shared experts, `rotary_emb.inv_freq`, MTP heads), or the conversion REFUSES and
+names the unhandled kinds. A refusal rather than a warning, because a conversion costs hours and hundreds
+of gigabytes and a warning in that much output is not read.
+
+**Rebuilt and verified.** All five container fixtures reconverted; only the two MLA ones changed, which
+is itself the check that the fix added what was missing and disturbed nothing else — Moonlight's dense
+half grew 35%, the three GQA containers are byte-identical. All five now start under `soma serve`.
+
+**And the test gap that allowed it.** `container_g2` opened the expert store and compared payload bytes;
+it never loaded the container AS A MODEL, so the dense half was unexamined. It does now, and reverting
+`convert.py` reproduces the original failure through the test rather than through a server that happens
+to be started by hand.
+
+That gap is the reason to qualify G4: the ladder passes for MLA on the fp32 SOURCE path, which is what
+`conformance_g0` reads. The CONTAINER path — the one production serves — had never worked for that
+family, and every G4 claim on this page was true about the half that was tested.
+
+### GLM-5.2, re-measured
+
+```
+dense_resident   66.4 GiB   (was 135.4 GiB before the fix - 2.0x over)
+routed          379.7 GiB   @ q4_g
+bytes/token      11.9 GiB
+```
+
+Still `reject` on economics at any host under ~128 GiB, and still 0.1 tok/s where it does fit, so the
+conclusion has not changed — but the number that drives it is now the right one, and half the apparent
+problem was arithmetic. The remaining 66 GiB is D17: dense tensors are F32 in a container, and 78 layers
+of MLA plus a 155k-token embedding table at fp32 is simply that big. Colibri served this model in 16-24
+GB, so it quantized the dense half; Soma cannot yet express that.
+
 ## Cross-cutting: CI from day one
 
 Established at G0, extended each gate. Current CI is 3 Release jobs invoking raw `cmake`, one CTest
@@ -2923,6 +3148,9 @@ possible auth fault and was a retry budget written six times with three differen
 | ~~D14~~ | The descriptor launch path dropped `n_gpu_layers` — and, on inspection, eight more settings. **Fixed** — `build_launch` now calls `build_llama_server_args()`, which its own documentation always claimed it called. | D13 work | Resolved |
 | ~~D12~~ | Nothing stopped an image part from being routed to Soma; the 422 gates tested only the agent profile. **Fixed** — one shared capability table, four gates routed through one rule, verified live. | G8 criteria confirmation | Resolved |
 | ~~D15~~ | `BackendDecision::explain()` stuttered — `soma (verdict, verdict=hybrid)`. **Fixed**, along with the doubled name it produced in the D12 refusal, and pinned by whole-string assertions. | D12 work | Resolved |
+| ~~D16~~ | `compute_plan` sized MLA attention with the GQA formula, and shared experts were counted `n_shared^2`. **Both fixed**, behind `AttentionBackend::weight_bytes_per_layer`; all five families now size to 1.00x of the real tensors. A third bug fell out: `arch::mla::attention_backend()` was declared and never defined, so `kv_bytes_at_ctx` was **zero** for every MLA model. | GLM-5.2 planning | Resolved |
+| ~~D18~~ | `convert.py`'s `DENSE_SUFFIXES` was a GQA-shaped allow-list, silently dropping MLA attention, dense-layer MLPs and the `noaux_tc` router bias. **Fixed**, and the "everything must be accounted for" rule the comment always claimed is now enforced as a refusal. All five container fixtures rebuilt and verified to serve. | GLM-5.2 planning | Resolved |
+| D17 | **Dense tensors are F32-only in a container.** `--quant` covers expert gate/up/down; embeddings, attention projections and the router stay F32 by construction. For GLM-5.2 that is a floor of tens of GiB before a single expert is streamed, and Colibri served the same model in 16-24 GB — so quantizing the dense half is not optional at this scale. | GLM-5.2 planning | Medium — a design gap rather than a bug, but it bounds which models can ever be served. |
 | D4 | Corroborated 2026-08-07: **llama.cpp's own converter cannot read the layout either** — `convert_hf_to_gguf.py` on `tiny-random-OlmoeForCausalLM` fails with `Unprocessed experts: [...mlp.experts.gate_up_proj, ...mlp.experts.down_proj]`. A mature, widely-exercised converter hitting the same wall supports the read that the layout is newer than the ecosystem, rather than that something obvious is being missed here. Parking stands. `convert.py` cannot read transformers' **fused expert layout**. The misleading error is **fixed** — it now names the layout and shows the shapes. Reading the layout is deliberately NOT implemented; see below. | G8 gate run | Low, and deliberately parked — no oracle exists at the pinned `transformers` to verify an implementation against. |
 
 **D1 — resolved, and it was never an auth bug.** The cause was already written down in the test, three
@@ -3630,5 +3858,6 @@ the next architecture through the seam will want to know which interface moved.
 | GPU tier residency + GPU kernels | Post-G4. The tier is declared and reported throughout, so this is an implementation, not a migration. |
 | Paged KV with a block table | Post-G4. `AttentionBackend` already takes a batch, so it lands without an interface change. |
 | Speculation under batching | Post-G4 |
+| **DSA + IndexShare attention** (GLM-5.2) | Not scoped. DSA is MLA plus a learned sparse key indexer; **IndexShare** reuses one index across every four layers — 57 of GLM-5.2's 78 layers depend on state computed at a DIFFERENT layer, and `AttentionBackend` is per-layer function pointers with no channel for it. The seam was co-designed against GQA and MLA, both per-layer; this is a third shape neither anticipated. Planning works today, serving does not. |
 | Multimodal | Not planned. 422 is the contract. |
 | Distributed / multi-node single model | Not planned for v1 |

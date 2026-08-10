@@ -416,6 +416,18 @@ std::size_t kv_bytes_per_token(const ArchIr& arch) noexcept {
     return per_layer * arch.topology.n_layers;
 }
 
+std::uint64_t weight_bytes_per_layer(const ArchIr& arch,
+                                     AttentionBackend::ByteSizer sizer) noexcept {
+    // q + k + v + o. MHA is the n_kv_heads == n_heads case of this, which is why
+    // one function serves both and the collapse happens in the adapter.
+    const auto d = arch.topology.d_model;
+    const auto& a = arch.attention;
+    const auto hq = a.n_heads * a.head_dim;
+    const auto hkv = a.n_kv_heads * a.head_dim;
+    return sizer(arch, hq, d, TensorRole::AttnProj) +
+           2 * sizer(arch, hkv, d, TensorRole::AttnProj) + sizer(arch, d, hq, TensorRole::AttnProj);
+}
+
 Status prepare_weights(ModelState& model) {
     // No weight absorption in this family. The hook exists because MLA needs
     // it; saying so explicitly is better than the interface not having it.
@@ -460,6 +472,7 @@ const AttentionBackend& attention_backend() noexcept {
         b.family = AttentionFamily::Gqa;
         b.persist_format_id = kKvFormat;
         b.kv_bytes_per_token = &kv_bytes_per_token;
+        b.weight_bytes_per_layer = &weight_bytes_per_layer;
         b.prepare_weights = &prepare_weights;
         return b;
     }();

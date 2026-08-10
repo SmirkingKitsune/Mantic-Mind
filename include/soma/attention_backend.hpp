@@ -70,6 +70,35 @@ struct AttentionBackend {
     /// like an unrelated bug.
     std::size_t (*kv_bytes_per_token)(const ArchIr& arch) noexcept = nullptr;
 
+    /// How many bytes one (rows x cols) tensor of `role` occupies under the
+    /// model's quantization. Supplied BY the planner TO the backend below.
+    ///
+    /// Row-aware, because the effective group is the largest divisor of `cols`
+    /// not exceeding the requested one — a flat element count disagrees for any
+    /// tensor narrower than the group.
+    using ByteSizer = std::uint64_t (*)(const ArchIr&,
+                                        std::uint32_t rows,
+                                        std::uint32_t cols,
+                                        TensorRole role);
+
+    /// Attention WEIGHT bytes for one layer — the resident cost, as opposed to
+    /// the per-token cache cost above.
+    ///
+    /// Here for the same reason `kv_bytes_per_token` is: the shapes differ by
+    /// family and the planner must not know how. It was a formula in plan.cpp,
+    /// written against GQA (`q + 2*(n_kv_heads x head_dim) + o`) and applied to
+    /// everything, which charged MLA for two per-head projections it does not
+    /// have — 1.66x over on real containers, ~2.4x on GLM-5.2. The seam check
+    /// refused the obvious fix of branching on the family in core, correctly:
+    /// that is exactly the knowledge this pointer exists to hold.
+    ///
+    /// The backend owns the SHAPES and the caller owns the QUANTIZATION, which
+    /// is why `sizer` is passed in rather than the backend assuming a dtype. A
+    /// first version returned bytes and hardcoded fp32; it agreed with the old
+    /// formula on the f32 fixtures and silently disagreed by ~8x on every
+    /// quantized plan, which the verdict table caught.
+    std::uint64_t (*weight_bytes_per_layer)(const ArchIr& arch, ByteSizer sizer) noexcept = nullptr;
+
     /// Called exactly once, at load, from load_model().
     ///
     /// MLA folds up-projections into Q here so decode never materializes full
