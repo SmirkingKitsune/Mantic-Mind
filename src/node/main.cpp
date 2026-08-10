@@ -330,6 +330,33 @@ bool save_remembered_api_keys(const std::filesystem::path& path,
 
 // ── Registration helper ────────────────────────────────────────────────────────
 
+/// Tell the OPERATOR, once, on the console, what a 401 from control means.
+///
+/// This failure is the one that cannot be diagnosed from outside: the node
+/// starts, binds its port, answers its own health endpoint, and shows as
+/// `offline` in control forever. In CLI mode the console sink is off, so the
+/// warning beside this call goes only to a file, and control's half of the story
+/// is in control's log on a possibly different machine (roadmap D20).
+///
+/// Once, not per retry: the loop runs every 30 s and a repeating wall of text is
+/// its own kind of silence.
+void warn_unpaired_once(const mm::NodeConfig& cfg, const std::string& body) {
+    static std::once_flag told;
+    std::call_once(told, [&] {
+        std::cerr << "\n  registration REFUSED by control at " << cfg.control_url << "\n"
+                  << "  " << body << "\n\n"
+                  << "  A new node cannot self-register. Control accepts it only if it already\n"
+                  << "  knows this node's api_key, or if the request carries control's external\n"
+                  << "  bearer token (unset by default). The key this node generated is not\n"
+                  << "  persisted, so there is nothing for control to have been told.\n\n"
+                  << "  Either:\n"
+                  << "    - choose the key yourself and hand it over:\n"
+                  << "        MM_API_KEY=<key>   on this node, then on control\n"
+                  << "        POST /v1/nodes {\"url\":\"<this node>\",\"api_key\":\"<key>\"}\n"
+                  << "    - or pair through control's pairing flow.\n\n";
+    });
+}
+
 static bool try_register(const mm::NodeConfig& cfg,
                           mm::NodeState& state,
                           const std::string& api_key) {
@@ -356,6 +383,9 @@ static bool try_register(const mm::NodeConfig& cfg,
     auto resp = ctrl.post("/api/control/register-node", body);
     if (!resp.ok()) {
         MM_WARN("Registration failed (HTTP {}): {}", resp.status, resp.body);
+        // 401 ONLY. A refused connection or a 500 is a different problem and this
+        // advice would send the reader down the wrong path.
+        if (resp.status == 401) warn_unpaired_once(cfg, resp.body);
         return false;
     }
 

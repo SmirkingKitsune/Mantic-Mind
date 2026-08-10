@@ -483,6 +483,29 @@ Status apply_container_quant(std::string_view meta_json, ArchIr& io) {
     set(io.quantization.expert_gate, gate_up);
     set(io.quantization.expert_up, gate_up);
     set(io.quantization.expert_down, j.value("dtype_down", std::string{}));
+
+    // The DENSE half, which nothing could previously ask about.
+    //
+    // The loader has always been able to quantize these — bind_weight reads the
+    // role's spec and quantizes at load — but only the three expert roles were
+    // ever settable, so embeddings, attention projections and shared experts
+    // stayed F32 by omission rather than by decision. For a 744B model with 78
+    // MLA layers and a 155k-token vocabulary that omission is tens of gigabytes
+    // of resident memory (roadmap D17).
+    //
+    // DISK stays F32 either way: dense.safetensors holds full precision and the
+    // loader quantizes into RAM. That is a feature rather than a compromise —
+    // the resident precision can be changed without reconverting a single byte,
+    // which is exactly what the expert half cannot do.
+    //
+    // Router is deliberately absent. `TensorRole::Router` "MUST be F32.
+    // Enforced at admission, not by convention" — one f32 matrix per layer is
+    // negligible next to the embeddings, and a quantized router changes which
+    // experts fire.
+    const auto dense = j.value("dtype_dense", std::string{});
+    set(io.quantization.embed, dense);
+    set(io.quantization.attn_proj, dense);
+    set(io.quantization.shared_expert, dense);
     return {};
 }
 

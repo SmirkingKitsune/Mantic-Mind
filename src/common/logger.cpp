@@ -42,7 +42,19 @@ void init_logger(
     auto logger = std::make_shared<spdlog::logger>(
         logger_name, sinks.begin(), sinks.end());
     logger->set_level(spdlog::level::trace);  // let individual sinks filter
-    logger->flush_on(spdlog::level::err);
+    // Flush on WARN, not just ERR.
+    //
+    // A warning that is still in a buffer when the process is killed did not
+    // happen, as far as anyone reading the log is concerned. That is not
+    // hypothetical: the node warns "Control rejected registration" and, in CLI
+    // mode where the console sink is off, the message existed only in a buffer —
+    // so an operator whose node would not pair saw a 0-byte log file and no
+    // explanation anywhere (roadmap D20).
+    //
+    // Warnings are rare by construction, so flushing them costs nothing that
+    // matters and buys the property that the last thing a dying process
+    // complained about is on disk.
+    logger->flush_on(spdlog::level::warn);
 
     spdlog::register_logger(logger);
     spdlog::set_default_logger(logger);

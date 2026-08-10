@@ -513,6 +513,38 @@ int check_verdict_varies_by_host_and_quant() {
           std::to_string(q4.total_routed_bytes >> 20) + " -> " +
               std::to_string(q8.total_routed_bytes >> 20) + " MiB");
 
+    // The DENSE half is settable too, and it is the only lever on the resident
+    // footprint. The loader has always quantized these at load — bind_weight
+    // reads the role's spec — but nothing could ask, so embeddings, attention
+    // projections and shared experts stayed F32 by omission (roadmap D17). On
+    // GLM-5.2 that omission was 58 GiB of RAM.
+    soma::PlanDocument dense_f32, dense_q4;
+    const bool ran3 =
+        plan_at(R"({"dtype_gate_up":"q4_g","dtype_down":"q4_g","group":128})", 8, dense_f32) &&
+        plan_at(
+            R"({"dtype_gate_up":"q4_g","dtype_down":"q4_g","dtype_dense":"q4_g","group":128})", 8,
+            dense_q4);
+    check(ran3, "a dense-quantized plan runs");
+    if (ran3) {
+        check(dense_q4.dense_resident_bytes < dense_f32.dense_resident_bytes,
+              "-> dtype_dense shrinks the RESIDENT half",
+              std::to_string(dense_f32.dense_resident_bytes >> 10) + " -> " +
+                  std::to_string(dense_q4.dense_resident_bytes >> 10) + " KiB");
+        // Disk is unchanged: dense.safetensors keeps full precision and the
+        // loader quantizes into RAM, so resident precision is changeable without
+        // reconverting a byte. Asserted so that property is not lost by someone
+        // "helpfully" quantizing the file.
+        check(dense_q4.disk_footprint_bytes == dense_f32.disk_footprint_bytes,
+              "-> and leaves the DISK footprint alone");
+        // The router stays F32 whatever was asked for: a quantized router changes
+        // which experts fire, and TensorRole::Router is documented as MUST be F32.
+        soma::ArchIr r;
+        (void)soma::adapt_hf_config(cfg, r);
+        (void)soma::apply_container_quant(R"({"dtype_dense":"q4_g"})", r);
+        check(r.quantization.router.dtype == soma::DType::F32,
+              "-> and never touches the router");
+    }
+
     // An overlay must never be able to describe a container the converter cannot
     // produce: gate and up are interleaved into one range, so they share a dtype
     // whatever the caller asked for.

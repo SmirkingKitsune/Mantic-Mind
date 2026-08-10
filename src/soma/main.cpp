@@ -38,7 +38,8 @@ int usage() {
                  "               [--ram-budget BYTES] [--pin BYTES] [--kv-dir DIR]\n"
                  "               [--served-name NAME]\n"
                  "  soma plan    --model-dir DIR [--json]\n"
-                 "               [--quant DTYPE] [--expert-down DTYPE] [--group N]\n"
+                 "               [--quant DTYPE] [--expert-down DTYPE] [--quant-dense DTYPE]\n"
+                 "               [--group N]\n"
                  "               [--ram SIZE] [--ram-free SIZE] [--disk-bw SIZE] [--ctx N]\n"
                  "               the verdict is a property of (model, quantization, host);\n"
                  "               these ASK about a quantization and a host, and convert nothing\n"
@@ -493,7 +494,7 @@ int cmd_plan(int argc, char** argv) {
     // the point of a headers-only planner is to answer "would this be worth
     // converting?" before spending the hours, and for any quantization but the
     // default that question could not be asked at all.
-    std::string q_gate_up, q_down;
+    std::string q_gate_up, q_down, q_dense;
     std::uint32_t q_group = 0;
     std::uint64_t ram_total = 0, ram_free = 0, disk_bw = 0;
     std::uint32_t ctx = 0;
@@ -511,6 +512,8 @@ int cmd_plan(int argc, char** argv) {
             q_gate_up = next();
         else if (a == "--expert-down" && i + 1 < argc)
             q_down = next();
+        else if (a == "--quant-dense" && i + 1 < argc)
+            q_dense = next();
         else if (a == "--group" && i + 1 < argc)
             q_group = static_cast<std::uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
         else if (a == "--ram" && i + 1 < argc) {
@@ -536,7 +539,7 @@ int cmd_plan(int argc, char** argv) {
 
     // Reject a dtype we cannot honour rather than planning at the default and
     // reporting a number for a quantization nobody asked for.
-    for (const auto* name : {&q_gate_up, &q_down}) {
+    for (const auto* name : {&q_gate_up, &q_down, &q_dense}) {
         soma::DType parsed{};
         if (!name->empty() && !parse_dtype_name(*name, parsed)) {
             std::cerr << "plan: unknown dtype '" << *name << "'\n";
@@ -580,10 +583,14 @@ int cmd_plan(int argc, char** argv) {
     // converter interleaves them into one range — and a second copy of it would
     // let `plan --quant` describe a container the converter cannot produce.
     std::string overlay;
-    if (!q_gate_up.empty() || !q_down.empty() || q_group > 0) {
+    if (!q_gate_up.empty() || !q_down.empty() || !q_dense.empty() || q_group > 0) {
         nlohmann::json o = nlohmann::json::object();
         if (!q_gate_up.empty()) o["dtype_gate_up"] = q_gate_up;
         if (!q_down.empty()) o["dtype_down"] = q_down;
+        // Embeddings, attention projections and shared experts. One flag rather
+        // than three: they are the "resident, not routed" family, and the reason
+        // to quantize any of them is the same one.
+        if (!q_dense.empty()) o["dtype_dense"] = q_dense;
         if (q_group > 0) o["group"] = q_group;
         overlay = o.dump();
     }

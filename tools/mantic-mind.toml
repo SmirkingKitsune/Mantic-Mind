@@ -7,9 +7,34 @@
 listen_port = 7070
 
 # URL of the mantic-mind-control process. Leave empty for standalone mode.
+#
+# SETTING THIS ALONE IS NOT ENOUGH TO JOIN A CLUSTER, and the failure is quiet.
+#
+# Control refuses a node it has never heard of: self-registration succeeds only
+# if control already knows this node's api_key, or if the request carries
+# control's external bearer token (which is unset by default). The node
+# generates an ephemeral key at startup and does not persist it, so there is
+# nothing for control to have been told.
+#
+# The symptom is a node that starts, binds its port, answers its own
+# /api/node/health, and shows as `offline` in control indefinitely. Two ways
+# out — pick one:
+#
+#   1. Choose the key yourself and hand it to control:
+#        MM_API_KEY=<key>   (env, on this node)
+#        POST /v1/nodes  {"url": "http://<this node>:7070", "api_key": "<key>"}
+#
+#   2. Pair through control's pairing flow, with `pairing_key` below matching
+#      control's own.
+#
+# The refusal is deliberate — an unpaired node must not be able to join by
+# asking. Only its discoverability was the problem; see roadmap D20.
 control_url = ""
 
 # Bearer token used to authenticate with control.
+#
+# If control has an external API token configured, putting it here lets this
+# node self-register on first contact and skips the two-step above entirely.
 control_api_key = ""
 
 # The public node URL is configured with MM_SELF_URL and defaults to
