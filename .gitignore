@@ -65,6 +65,10 @@ __pycache__/
 # Admission tooling virtualenv. Offline-only and never a runtime dependency;
 # reproducible from tools/admission/requirements.txt.
 /tools/admission/.venv/
+# The oracle venv: a SECOND interpreter on transformers 5.x, because the pinned
+# 4.57 cannot load glm_moe_dsa and upgrading in place would put the working
+# admission pipeline behind a major version bump.
+/tools/admission/.venv-oracle/
 
 # OS
 .DS_Store

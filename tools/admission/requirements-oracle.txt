@@ -1,0 +1,37 @@
+# The ORACLE interpreter — a second venv, deliberately not the admission one.
+#
+#   python -m venv tools/admission/.venv-oracle
+#   .venv-oracle/Scripts/python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   .venv-oracle/Scripts/python -m pip install -r tools/admission/requirements-oracle.txt
+#
+# Why a second venv rather than upgrading the first: the admission pipeline runs
+# on transformers 4.57 and works — convert.py, make_oracle.py, make_reference.py
+# and the tokenizer compile all pass. 4.57 cannot load `glm_moe_dsa` (the config
+# is not in its CONFIG_MAPPING at all), and 4.57 -> 5.x is a major bump under all
+# four. Upgrading in place trades a working pipeline for an unproven one.
+#
+# Pinned to 5.12.x because that is the version GLM-5.2's own config declares
+# under `transformers_version`, i.e. the implementation its weights were exported
+# against. Later 5.x releases exist (5.15 at time of writing) and may well work;
+# an oracle should be the reference the checkpoint names, and a patch pin keeps
+# bug fixes without inviting a semantic change.
+#
+# Verified with this pin, 2026-08-10:
+#   * glm_moe_dsa is in CONFIG_MAPPING_NAMES
+#   * GLM-5.2's real config loads as GlmMoeDsaConfig (78 layers, 256 experts,
+#     index_topk 2048, indexer_types 21 full / 57 shared)
+#   * a shrunk 1.78M-param instance carries indexer.{wk,wq_b,weights_proj,
+#     k_norm.weight,k_norm.bias} on `full` layers and NONE on `shared` ones
+#   * forward is finite, and the sparse path is observable: at index_topk=8 with
+#     40 tokens, positions 0-7 are BIT-IDENTICAL to dense while positions 20-39
+#     differ by 0.48 max|logit|. Below index_topk the two paths cannot be told
+#     apart, which is why an oracle fixture must shrink index_topk and not only
+#     the model.
+
+transformers==5.12.1
+numpy
+safetensors
+
+# torch is installed separately from the CPU index above: the default wheel
+# pulls a CUDA runtime this never uses, and the oracle is a correctness
+# reference rather than a throughput one.

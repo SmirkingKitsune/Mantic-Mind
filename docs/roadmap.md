@@ -3222,23 +3222,46 @@ GB, so it quantized the dense half; Soma cannot yet express that.
 Not a gate yet. This is what serving GLM-5.2 would require, with the facts checked against the real
 1.4 TB checkpoint rather than inferred from its config.
 
-### Step zero is an oracle, and it is a dependency upgrade
+### Step zero — the oracle — is DONE
 
-The installed `transformers` is **4.57.6** and does not know `glm_moe_dsa`; the checkpoint declares
-`transformers_version: 5.12.0`. So there is no reference implementation available to check an
-implementation against — the same position D4 is parked in.
+The admission venv runs `transformers` 4.57.6, which does not know `glm_moe_dsa` at all (the config is
+absent from `CONFIG_MAPPING_NAMES`). The checkpoint declares 5.12.0. That was the same position D4 is
+parked in, with one decisive difference: D4 has no version of anything that reads the fused expert layout,
+while this needed only a newer dependency.
 
-The difference is decisive: D4 has no version of anything that reads the fused expert layout, whereas
-this oracle merely needs a newer dependency. That makes it obtainable rather than absent.
+**A second venv, not an upgrade.** `tools/admission/.venv-oracle`, pinned via
+`requirements-oracle.txt` to `transformers==5.12.1` — the version GLM-5.2's own config names, i.e. the
+implementation its weights were exported against. The admission pipeline stays on 4.57 because it WORKS;
+4.57 -> 5.x is a major bump under `convert.py`, `make_oracle.py`, `make_reference.py` and the tokenizer
+compile, and trading four working tools for an unproven upgrade buys nothing here. CPU-only torch, since
+an oracle is a correctness reference and not a throughput one.
 
-**It must be obtained first.** Implementing sparse attention without a reference repeats precisely the
-mistake D4 exists to avoid: a plausible implementation that runs, produces finite numbers, and is silently
-wrong. DSA is exactly the shape of algorithm where that happens — pick the wrong 2048 keys and the output
-is fluent and incorrect.
+**Verified, in this order:**
 
-Upgrading is not free: 4.57 -> 5.x is a major bump under `make_oracle.py`, `make_reference.py`,
-`convert.py` and the tokenizer compile, all of which currently work. A parallel venv is the obvious
-hedge, so the existing pipeline keeps running while the oracle is stood up.
+1. `glm_moe_dsa` is in `CONFIG_MAPPING_NAMES`.
+2. GLM-5.2's real config loads as `GlmMoeDsaConfig` — 78 layers, 256 experts, `index_topk` 2048,
+   `indexer_types` 21 `full` / 57 `shared`.
+3. A shrunk instance (8 layers, d=128, 8 experts, **1.78M params**) builds and forwards finite logits.
+4. Its `full` layers carry `indexer.{wk, wq_b, weights_proj, k_norm.weight, k_norm.bias}` and its `shared`
+   layers carry **none** — the cross-layer dependency reproduces in the tiny model, which is what makes it
+   usable as a fixture rather than merely loadable.
+
+**And the sparsity risk from the section below is now measured, not predicted.** With `index_topk = 8`
+against a 40-token prompt, comparing that model to the same weights at `index_topk = 512`:
+
+| positions | max abs logit diff |
+|---|---|
+| 0-7 (at or below `index_topk`) | **0.0** — bit-identical to dense |
+| 20-39 (above it) | **0.484**, greedy agreement 35% |
+
+So below `index_topk` the sparse and dense paths cannot be told apart AT ALL, and an oracle fixture must
+shrink `index_topk` as well as the model or it will pass a broken indexer. That was a hypothesis when this
+section was written; it is now a number.
+
+Two smaller findings for whoever extends `make_oracle.py`: token ids must be shrunk alongside the vocab
+(`pad_token_id` 154820 against a 256-token vocab asserts inside `nn.Embedding`), and `indexer_types` /
+`mlp_layer_types` must be TRUNCATED to the new layer count while keeping their pattern — a shrink that
+preserves only their length would silently change which layers own an indexer.
 
 ### What the checkpoint actually contains
 
