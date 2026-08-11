@@ -545,6 +545,35 @@ int check_verdict_varies_by_host_and_quant() {
               "-> and never touches the router");
     }
 
+    // An overlay must not perturb a role it was not asked about.
+    //
+    // arch_hash covers dtype AND group for EVERY role, so touching an unnamed
+    // role changes the hash of models that have nothing to do with the change —
+    // and a changed hash means the registry reads its own records as
+    // StaleRecord and KV checkpoints keyed on it stop loading. That happened:
+    // adding `dtype_dense` made three dense roles settable, and the setter was
+    // still applying `group` unconditionally, so every admitted container's hash
+    // moved. Found by comparing a real model's stored hash to a fresh one.
+    {
+        soma::ArchIr before, after;
+        (void)soma::adapt_hf_config(cfg, before);
+        (void)soma::adapt_hf_config(cfg, after);
+        // An expert-only overlay, exactly as a pre-dtype_dense container carries.
+        (void)soma::apply_container_quant(
+            R"({"dtype_gate_up":"q4_g","dtype_down":"q6_g","group":128})", after);
+        const auto& b = before.quantization;
+        const auto& a = after.quantization;
+        check(a.embed.dtype == b.embed.dtype && a.embed.group == b.embed.group &&
+                  a.attn_proj.dtype == b.attn_proj.dtype &&
+                  a.attn_proj.group == b.attn_proj.group &&
+                  a.shared_expert.group == b.shared_expert.group,
+              "an expert-only overlay leaves the DENSE roles untouched",
+              "embed group " + std::to_string(b.embed.group) + " -> " +
+                  std::to_string(a.embed.group));
+        check(a.expert_gate.group == 128 && a.expert_down.dtype == soma::DType::Q6_G,
+              "-> while still applying to the roles it DID name");
+    }
+
     // An overlay must never be able to describe a container the converter cannot
     // produce: gate and up are interleaved into one range, so they share a dtype
     // whatever the caller asked for.
@@ -630,25 +659,16 @@ int check_dense_sizing(const fs::path& tiny_root) {
         // is for.
         const bool ok = (ratio > 0.97 && ratio < 1.03);
 
-        // A family the engine cannot SERVE has, by definition, sizing nobody has
-        // finished. GLM-5.2 is the case: `arch::mla::weight_bytes_per_layer`
-        // gives MLA's answer, and DSA adds a per-`full`-layer indexer that the
-        // IR does not yet describe — `indexer_types` is not an ArchIr field, so
-        // there is no way to know which layers carry one. That shows up here as
-        // 0.90x (roadmap D22).
-        //
-        // Reported with its number and NOT counted as a failure, the same way the
-        // conformance ladder reports `skipped` rather than `passed`. Widening the
-        // tolerance to 10% would hide it; calling it a failure would make the
-        // suite permanently red for a gap that is already written down.
-        const bool servable = (soma::resolve_f32_backend(arch) != nullptr);
-        if (!ok && servable) ++bad;
+        // Sizing is an admission property, independent of whether a serving
+        // backend exists. DSA used to be exempt here because its indexer was not
+        // represented in the IR; now that it is, GLM-5.2's 1.00x result must be
+        // held to the same regression gate as every servable family.
+        if (!ok) ++bad;
         std::ostringstream d;
         d << std::fixed << std::setprecision(2) << ratio << "x";
-        const char* verdict = ok ? "OK" : (servable ? "FAIL" : "KNOWN-PARTIAL");
+        const char* verdict = ok ? "OK" : "FAIL";
         std::cout << "   " << std::left << std::setw(34) << name << std::setw(9)
-                  << soma::to_string(arch.attention.family) << verdict << "   " << d.str()
-                  << (ok || servable ? "" : "   (no backend; indexer not sized — D22)") << "\n";
+                  << soma::to_string(arch.attention.family) << verdict << "   " << d.str() << "\n";
     }
     return bad;
 }

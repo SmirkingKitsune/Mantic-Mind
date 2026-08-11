@@ -333,6 +333,50 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
         attn.rope.partial_dim = m.qk_rope_head_dim;
     }
 
+    // ── DSA ──────────────────────────────────────────────────────────────────
+    //
+    // Read from `indexer_types` rather than derived from `index_topk_freq`, and
+    // that is the whole point. The stride would give the right answer for
+    // GLM-5.2 — one `full` every four after the first three — and the weights are
+    // what actually decide: 57 of its 78 layers ship no indexer tensors, and a
+    // layer the IR called `Full` without the weights to back it would fail at
+    // bind time or, worse, silently borrow nothing.
+    //
+    // Same argument as `Topology::layer_kinds`, which resolves three different
+    // upstream spellings of "which layers are MoE" once, here, so the core never
+    // re-derives it.
+    if (attn.family == AttentionFamily::MlaDsa) {
+        auto& dsa = attn.dsa;
+        dsa.index_topk = get_or<std::uint32_t>(j, "index_topk", 0);
+        dsa.n_index_heads = get_or<std::uint32_t>(j, "index_n_heads", 0);
+        dsa.index_head_dim = get_or<std::uint32_t>(j, "index_head_dim", 0);
+        dsa.index_freq = get_or<std::uint32_t>(j, "index_topk_freq", 0);
+
+        if (const auto it = j.find("indexer_types"); it != j.end() && it->is_array()) {
+            dsa.layer_kinds.reserve(it->size());
+            for (const auto& v : *it) {
+                const auto name = v.is_string() ? v.get<std::string>() : std::string{};
+                dsa.layer_kinds.push_back(name == "full"     ? IndexerKind::Full
+                                          : name == "shared" ? IndexerKind::Shared
+                                                             : IndexerKind::None);
+            }
+        }
+        // Length must match, or every downstream layer lookup is off. A config
+        // that disagrees with itself is not something to paper over.
+        if (!dsa.layer_kinds.empty() && dsa.layer_kinds.size() != out.topology.layer_kinds.size()) {
+            return {StatusCode::InvalidArgument,
+                    "indexer_types has " + std::to_string(dsa.layer_kinds.size()) +
+                        " entries for " + std::to_string(out.topology.layer_kinds.size()) +
+                        " layers"};
+        }
+        // An all-`Shared` stack has nothing to share FROM. Caught here rather
+        // than at bind time, where it would present as a missing tensor.
+        if (!dsa.layer_kinds.empty() && dsa.n_full_layers() == 0) {
+            return {StatusCode::InvalidArgument,
+                    "indexer_types contains no 'full' layer, so no layer can compute an index"};
+        }
+    }
+
     if (get_or<bool>(j, "use_sliding_window", false)) {
         attn.sliding_window = get_or<std::uint32_t>(j, "sliding_window", 0);
     }
@@ -470,9 +514,24 @@ Status apply_container_quant(std::string_view meta_json, ArchIr& io) {
     }
 
     const auto group = j.value("group", 0u);
+    // An UNNAMED role is left entirely alone — dtype and group.
+    //
+    // The group used to be applied unconditionally, which was harmless while only
+    // the three expert roles were settable: a real container_meta always carries
+    // `group` alongside `dtype_gate_up`, so the two arrived together. The moment
+    // `dtype_dense` made embed/attn_proj/shared_expert settable, the same line
+    // began stamping `group` onto them even when no dense dtype was asked for.
+    //
+    // That is not cosmetic. arch_hash covers dtype AND group for EVERY role, so
+    // it silently changed the hash of every already-admitted container — the
+    // registry would read them as StaleRecord and route to the fallback, and KV
+    // checkpoints keyed on the hash would stop loading. Caught by comparing a
+    // real admitted model's stored hash against a freshly computed one, which is
+    // the only check that could have caught it.
     const auto set = [&](QuantSpec& spec, const std::string& name) {
+        if (name.empty()) return;
         DType d{};
-        if (!name.empty() && parse_dtype(name, d)) spec.dtype = d;
+        if (parse_dtype(name, d)) spec.dtype = d;
         if (group > 0) spec.group = group;
     };
 
@@ -530,6 +589,25 @@ Status compute_arch_hash(const ArchIr& ir, std::string& out_hash) {
           << ir.router.topk_group << "|shared=" << ir.router.n_shared_experts
           << "|act=" << to_string(ir.ffn.activation) << "|fi=" << ir.ffn.expert_intermediate << ':'
           << ir.ffn.dense_intermediate << ':' << ir.ffn.shared_intermediate;
+
+    // DSA, emitted ONLY when present.
+    //
+    // It belongs in the hash: which layers own an indexer and how many keys
+    // survive selection are facts about what the model IS, and a KV checkpoint
+    // written under one selection must not replay under another.
+    //
+    // Conditional, though, so that adding this field does not change the hash of
+    // any model that has no indexer. An unconditional `|dsa=` would invalidate
+    // every existing container's arch_hash and every KV checkpoint keyed on it —
+    // a migration to describe an architecture none of them use. The five families
+    // already admitted hash exactly as before; verified rather than assumed.
+    if (ir.attention.family == AttentionFamily::MlaDsa) {
+        canon << "|dsa=" << ir.attention.dsa.index_topk << ':' << ir.attention.dsa.n_index_heads
+              << ':' << ir.attention.dsa.index_head_dim << ':';
+        for (const auto k : ir.attention.dsa.layer_kinds) {
+            canon << (k == IndexerKind::Full ? 'f' : k == IndexerKind::Shared ? 's' : '-');
+        }
+    }
 
     // The WHOLE quant map, every role, dtype AND group.
     //

@@ -3112,6 +3112,42 @@ more — on throughput: 0.10 tok/s at 24 GiB, and 0.79 tok/s even at 128 GiB wit
 as D21 rather than adjusted, because it is a judgement about what "usefully served" means and that is not
 a decision to slip into a defect fix.
 
+### `indexer_types` in the IR, and a hash that moved
+
+Adding `AttentionSpec::dsa` — index_topk, the index head geometry, and a per-layer
+`vector<IndexerKind>` of Full/Shared — was the small enabling step both remaining consumers needed. It is
+read from `indexer_types` rather than derived from `index_topk_freq`, for the same reason
+`Topology::layer_kinds` resolves three upstream spellings once: the stride happens to give the right
+answer for GLM-5.2, and the WEIGHTS are what decide. A layer the IR called `Full` without the tensors to
+back it would fail at bind time, or worse, borrow nothing. Two malformed configs are refused outright —
+a length that disagrees with the layer count, and an all-`Shared` stack with nothing to share from.
+
+That closed D22 immediately: the planner can now amortise the indexer across the stack (`idx * n_full /
+n_layers`, which gives the correct total from a per-layer function that has no layer index to consult),
+and GLM-5.2's resident half went 0.90x -> **1.00x**. Shapes taken from the committed fixture rather than
+inferred — including that `wk` is ONE shared K across index heads, MQA-style, not one per head.
+
+**And then a claim I wrote turned out to be false, which is the part worth recording.** The hash comment
+said DSA was emitted conditionally so that "the five families already admitted hash exactly as before;
+verified rather than assumed." Checking it — comparing the admitted OLMoE's stored `arch_hash` against a
+fresh computation — showed the hash HAD changed, and not because of DSA.
+
+The cause was D17, several increments earlier. `apply_container_quant`'s setter applied `group`
+unconditionally, which was harmless while only the three expert roles were settable: a real
+`container_meta` always carries `group` beside `dtype_gate_up`, so they arrived together. The moment
+`dtype_dense` made embed/attn_proj/shared_expert settable, that same line began stamping `group` onto them
+with no dense dtype asked for. `arch_hash` covers dtype AND group for every role, so every admitted
+container's hash moved — the registry would have read its own records as `StaleRecord` and routed
+everything to the fallback, and KV checkpoints keyed on the hash would have stopped loading. Logged as
+D23 and fixed: an unnamed role is left entirely alone.
+
+Nothing would have caught it. No test asserted hash stability across a quant-map change, and the symptom
+in production is not a crash but a cluster that quietly stops using Soma. `container_g2` now asserts that
+an expert-only overlay leaves the dense roles untouched while still applying to the roles it named.
+
+Worth stating why it surfaced at all: not from a test, but from writing "verified rather than assumed" in
+a comment and then going to verify it. The claim was the only reason to look.
+
 ### The deployment test
 
 Thirteen commits had landed since the last time the full stack ran, four of them on paths unit tests
@@ -3462,7 +3498,8 @@ possible auth fault and was a retry budget written six times with three differen
 | ~~D16~~ | `compute_plan` sized MLA attention with the GQA formula, and shared experts were counted `n_shared^2`. **Both fixed**, behind `AttentionBackend::weight_bytes_per_layer`; all five families now size to 1.00x of the real tensors. A third bug fell out: `arch::mla::attention_backend()` was declared and never defined, so `kv_bytes_at_ctx` was **zero** for every MLA model. | GLM-5.2 planning | Resolved |
 | ~~D18~~ | `convert.py`'s `DENSE_SUFFIXES` was a GQA-shaped allow-list, silently dropping MLA attention, dense-layer MLPs and the `noaux_tc` router bias. **Fixed**, and the "everything must be accounted for" rule the comment always claimed is now enforced as a refusal. All five container fixtures rebuilt and verified to serve. | GLM-5.2 planning | Resolved |
 | ~~D19~~ | Container-served models with SHARED EXPERTS silently dropped the shared expert's contribution: `if (out.experts_are_streamed) continue;` skipped the rest of the MoE-layer binding, and the shared-expert binding sat below it. **Fixed** — a guard rather than a `continue`. Also closed the coverage gap that hid it: nothing had ever compared a container's OUTPUT to anything. | MLA container conformance | Resolved |
-| D22 | **DSA's indexer is not sized by the planner.** `arch::mla::weight_bytes_per_layer` serves both `Mla` and `MlaDsa` and returns MLA's answer; DSA adds `indexer.{wk, wq_b, weights_proj, k_norm.weight, k_norm.bias}` on every `full` layer, which is unmodelled. Measured the moment the GLM-5.2 fixture landed: `dense_resident_bytes` is **0.90x** of the real tensors, a 10% under-count. Sizing it needs `indexer_types` in `ArchIr` — the IR has no field for which layers own an indexer — and the DSA backend needs that field anyway, so it belongs with scope steps 3-5 rather than as a standalone fix. `container_g2` reports it as KNOWN-PARTIAL with the number rather than failing, since the gap is recorded. | GLM-5.2 oracle fixture | Low — under-counts, so it makes the model look MORE servable than it is; the opposite direction from D16 and caught immediately by the check D16 added. |
+| ~~D22~~ | The planner did not size DSA's indexer — 0.90x of the real tensors. **Fixed** with `AttentionSpec::dsa`, which gives the IR the per-layer indexer map it lacked; GLM-5.2 now sizes at 1.00x. | GLM-5.2 oracle fixture | Resolved |
+| ~~D23~~ | **`apply_container_quant` stamped `group` onto roles nobody asked about**, so D17's three new dense roles began receiving it — and `arch_hash` covers dtype AND group for every role, which silently changed the hash of every already-admitted container. The registry would have read its own records as `StaleRecord` and routed everything to the fallback, and KV checkpoints keyed on the hash would have stopped loading. **Fixed** — an unnamed role is left entirely alone. Found by checking a claim rather than by a test: the comment asserted existing hashes were untouched, and comparing a real admitted model's stored hash to a freshly computed one showed they were not. | D17 | Resolved |
 | D21 | **The throughput floor rejects the model the concept was proven on.** With D17's dense quantization GLM-5.2 fits a 24 GiB host with an 11.2 GiB expert cache, and it is STILL `reject` — projected 0.10 tok/s against `kMinProjectedTokS = 1.0`. At 128 GiB with a 7 GB/s disk it reaches 0.79 tok/s and is still refused. Colibri served these weights on 16-24 GB and the result was considered useful, so the constant and the proof disagree. The constant's reasoning is sound as written ("a model that streams correctly but at 0.2 tok/s is not usefully served"); what it does not model is that for a 744B model on a workstation, 0.2 tok/s may be the whole point. A POLICY question, deliberately not decided here. | D17 | Medium — it is one constant, and it currently makes the flagship case unservable by definition. |
 | ~~D20~~ | A node could not be brought up from its config file alone, and the refusal was invisible: the node's warning died in a buffer (spdlog flushed only on `err`) and CLI mode has the console sink off. **Fixed** — `flush_on(warn)`, a once-only console diagnostic naming the remedy, and the pairing path documented in `tools/mantic-mind.toml`. The refusal itself is unchanged; only its discoverability was wrong. | deployment test | Resolved |
 | ~~D17~~ | The dense half was F32 by omission, not by design — the loader could always quantize it, and only the three EXPERT roles were settable. **Fixed** with `dtype_dense` / `--quant-dense`. GLM-5.2's resident half falls 68.6 -> 10.0 GiB and it now fits a 24 GiB host. | GLM-5.2 planning | Resolved |

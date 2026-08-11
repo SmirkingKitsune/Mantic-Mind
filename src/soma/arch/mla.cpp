@@ -604,6 +604,40 @@ std::uint64_t weight_bytes_per_layer(const ArchIr& arch,
     // GLM-5.2 (both 256) and differ on V2-Lite (16 vs 24), so assuming either
     // is right half the time.
     bytes += sizer(arch, d, a.n_heads * m.v_head_dim, TensorRole::AttnProj);
+
+    // ── DSA's indexer, AMORTISED over the stack ──────────────────────────────
+    //
+    // Only `Full` layers carry one — 21 of GLM-5.2's 78 — and this function
+    // returns a PER-LAYER figure that the planner multiplies by n_layers. So the
+    // honest thing it can express is the average, which gives the correct TOTAL
+    // even though no individual layer costs exactly this.
+    //
+    // Without it the resident half came out at 0.90x of the real tensors: an
+    // under-count, so the model looked more servable than it is, which is the
+    // worse direction (roadmap D22). Shapes read from the committed fixture
+    // rather than inferred — at hidden 64, q_lora 48, 4 index heads of 32:
+    // wq_b (128, 48), wk (32, 64), weights_proj (4, 64), k_norm (32,) twice.
+    const auto& dsa = a.dsa;
+    const auto n_layers = static_cast<std::uint64_t>(arch.topology.n_layers);
+    const auto n_full = static_cast<std::uint64_t>(dsa.n_full_layers());
+    if (n_full > 0 && n_layers > 0 && dsa.index_head_dim > 0) {
+        const std::uint64_t heads_dim =
+            static_cast<std::uint64_t>(dsa.n_index_heads) * dsa.index_head_dim;
+        std::uint64_t idx = 0;
+        // wq_b projects the Q latent when there is one, the hidden state when not.
+        idx += sizer(arch,
+                     static_cast<std::uint32_t>(heads_dim),
+                     m.q_lora_rank > 0 ? m.q_lora_rank : d,
+                     TensorRole::AttnProj);
+        // ONE shared K across index heads, MQA-style — not one per head.
+        idx += sizer(arch, dsa.index_head_dim, d, TensorRole::AttnProj);
+        idx += sizer(arch, dsa.n_index_heads, d, TensorRole::AttnProj);
+        // k_norm weight AND bias: rank-1, always f32, and the only bias in this
+        // attention block.
+        idx += 2ull * dsa.index_head_dim * sizeof(float);
+
+        bytes += (idx * n_full + n_layers - 1) / n_layers; // round up
+    }
     return bytes;
 }
 

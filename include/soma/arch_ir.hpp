@@ -79,6 +79,50 @@ struct MlaSpec {
     bool absorb_weights = true;
 };
 
+/// Which layers own a sparse-attention indexer.
+///
+/// `Full` computes an index; `Shared` reuses the one the nearest preceding
+/// `Full` layer produced. That reuse is IndexShare, and it is the reason this has
+/// to be described per layer rather than as a single flag: on GLM-5.2, 57 of 78
+/// layers carry no indexer weights at all and cannot compute attention without
+/// state from a different layer.
+enum class IndexerKind : std::uint8_t { None = 0, Full, Shared };
+
+/// Present iff `AttentionSpec::family` is MlaDsa.
+///
+/// DSA is MLA plus a learned sparse key selector: instead of attending to every
+/// cached token, each query attends to the `top_k` keys an indexer scores highest.
+/// The KV cache is unaffected — every token is still stored, and `MlaSpec`
+/// still describes it — so this adds no cache arithmetic, only selection.
+struct DsaSpec {
+    /// How many keys survive selection. **The number that decides whether a test
+    /// means anything**: with fewer tokens in context than this, top-k selects
+    /// everything and the sparse path is bit-identical to dense attention.
+    /// Measured on the tiny fixture — positions below it match dense to 0.0 while
+    /// positions above differ by 0.48 max|logit|.
+    std::uint32_t index_topk = 0;
+
+    std::uint32_t n_index_heads = 0;
+    std::uint32_t index_head_dim = 0;
+
+    /// How often a `Full` layer recurs. Informational — `layer_kinds` below is
+    /// authoritative, for the same reason `Topology::layer_kinds` is: a stride
+    /// plus an offset is a re-derivation waiting to disagree with the weights.
+    std::uint32_t index_freq = 0;
+
+    /// Length == n_layers when non-empty. Empty for every family but DSA.
+    std::vector<IndexerKind> layer_kinds;
+
+    /// Layers that own an indexer, i.e. `Full` count. Needed by the planner,
+    /// which sizes a per-layer average and has no layer index to consult.
+    std::uint32_t n_full_layers() const noexcept {
+        std::uint32_t n = 0;
+        for (const auto k : layer_kinds)
+            if (k == IndexerKind::Full) ++n;
+        return n;
+    }
+};
+
 struct Topology {
     std::uint32_t n_layers = 0;
     std::uint32_t d_model = 0;
@@ -105,6 +149,7 @@ struct AttentionSpec {
     bool bias = false;
     RopeConfig rope{};
     MlaSpec mla{}; ///< meaningful only for Mla/MlaDsa
+    DsaSpec dsa{}; ///< meaningful only for MlaDsa
 };
 
 struct RouterSpec {
