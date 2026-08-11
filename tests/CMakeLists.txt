@@ -85,4 +85,14 @@ if(Python3_Interpreter_FOUND)
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_SOURCE_DIR}/tools/ci/check_fetch_selection.py"
                      "${CMAKE_SOURCE_DIR}")
+
+    # The fused expert layout must convert byte-identically to the per-expert
+    # one. The gate/up split is contiguous here and INTERLEAVED in gpt_oss, and
+    # both readings produce a container that loads and runs — so this compares
+    # the two readers against each other on the same weights rather than
+    # trusting either. Skips itself when numpy/safetensors are absent.
+    add_test(NAME mm_fused_experts
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_SOURCE_DIR}/tools/ci/check_fused_experts.py"
+                     "${CMAKE_SOURCE_DIR}")
 endif()

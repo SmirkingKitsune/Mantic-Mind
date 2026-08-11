@@ -3347,9 +3347,34 @@ project, and it will not resolve D21: GLM-5.2 projects 0.79 tok/s at 128 GiB wit
    One honest weakness: the fixture's greedy sequence is `[378] * 8` — a tiny-random model repeating one
    token. Greedy token-exactness is therefore a WEAK check here and the teacher-forced logit comparison is
    the real one. Worth knowing before anyone reads a green greedy row as meaningful.
-2. **Conversion.** Indexer tensors into `DENSE_SUFFIXES`, plus a rank-1 binding path for `k_norm.bias`.
-   D18's enforcement means conversion REFUSES until this is done and names the tensors, which is the
-   desired behaviour rather than an obstacle.
+2. ~~**Conversion.**~~ **DONE, and it turned out to depend on D4.** Attempting it produced the first real
+   test of D18's enforcement against a genuinely new family, and the answer was not the indexer: the
+   conversion refused on the FUSED expert layout, because anything `make_oracle.py` writes for this family
+   carries it. So step 2 could not be finished without D4, and D4 had just become finishable.
+
+   The gate/up split was settled by measurement rather than reading. `modeling_glm_moe_dsa.py` applies the
+   parameter as `linear(x, gate_up_proj[e]).chunk(2, dim=-1)` — contiguous halves of the output, hence
+   contiguous ROWS, gate first. Confirmed against the real fixture: reconstructing from rows `[0:inter]`
+   and `[inter:]` reproduces that `chunk` at **0.00e+00**, while the interleaved reading is off by
+   **1.35**. gpt_oss stores the same concept interleaved, which is exactly why guessing was refused.
+
+   `convert.py` now reads both layouts, resolving which once per layer rather than per expert.
+   `DENSE_SUFFIXES` gained the five indexer tensors — `wk`, `wq_b`, `weights_proj`, `k_norm.weight` and
+   `k_norm.bias`. GLM-5.2's fixture converts: 8 layers, 5 MoE, 129 dense tensors, `expert layout: fused`.
+
+   **And the correctness check is independent of the engine, which it had to be.** GLM-5.2 cannot be
+   loaded — no backend for `mla+dsa` — so `container_g2`'s round-trip skips it and would never have
+   verified the new reader. Instead `tools/ci/check_fused_experts.py` (ctest `mm_fused_experts`) rewrites a
+   committed PER-EXPERT fixture into the fused layout, converts both, and requires the expert payloads to
+   be BYTE-IDENTICAL. The per-expert container is already checked against the engine's own quantizer, so
+   byte-equality inherits that transitively. Reversing the split makes it fail, with a message naming the
+   contiguous-vs-interleaved hazard.
+
+   It also refuses to pass vacuously: it asserts each run REPORTED the layout it was supposed to take, so
+   a fixture that quietly stopped being fused cannot satisfy the check by converting the same way twice.
+
+   No rank-1 binding path was needed after all. `k_norm.bias` is rank 1 and `bind_weight` requires rank 2,
+   but `bind_layer_f32` already handles rank-1 tensors for norms and is what the backend will use at step 4.
 3. **`ExecScratch` payload.** One opaque member, `adopt`/`as<T>` idiom.
 4. **The indexer.** `wq_b`/`wk` projections, `k_norm`, `weights_proj`, top-k selection at 2048. Per-`full`
    layer, writing the shared payload.
@@ -3441,7 +3466,7 @@ possible auth fault and was a retry budget written six times with three differen
 | D21 | **The throughput floor rejects the model the concept was proven on.** With D17's dense quantization GLM-5.2 fits a 24 GiB host with an 11.2 GiB expert cache, and it is STILL `reject` — projected 0.10 tok/s against `kMinProjectedTokS = 1.0`. At 128 GiB with a 7 GB/s disk it reaches 0.79 tok/s and is still refused. Colibri served these weights on 16-24 GB and the result was considered useful, so the constant and the proof disagree. The constant's reasoning is sound as written ("a model that streams correctly but at 0.2 tok/s is not usefully served"); what it does not model is that for a 744B model on a workstation, 0.2 tok/s may be the whole point. A POLICY question, deliberately not decided here. | D17 | Medium — it is one constant, and it currently makes the flagship case unservable by definition. |
 | ~~D20~~ | A node could not be brought up from its config file alone, and the refusal was invisible: the node's warning died in a buffer (spdlog flushed only on `err`) and CLI mode has the console sink off. **Fixed** — `flush_on(warn)`, a once-only console diagnostic naming the remedy, and the pairing path documented in `tools/mantic-mind.toml`. The refusal itself is unchanged; only its discoverability was wrong. | deployment test | Resolved |
 | ~~D17~~ | The dense half was F32 by omission, not by design — the loader could always quantize it, and only the three EXPERT roles were settable. **Fixed** with `dtype_dense` / `--quant-dense`. GLM-5.2's resident half falls 68.6 -> 10.0 GiB and it now fits a 24 GiB host. | GLM-5.2 planning | Resolved |
-| D4 | **UNPARKED 2026-08-10 — an oracle now exists.** `transformers` 5.12.1 reads the fused expert layout CORRECTLY: `tiny-random-OlmoeForCausalLM` loads with `max|disk - loaded| = 0.0` and exposes `model.layers.N.mlp.experts.{gate_up_proj,down_proj}` as real 3-D parameters. The parking reason — "no oracle exists to verify an implementation, and a wrong guess yields a model that runs and is silently wrong" — no longer holds. The layout is now pinned by measurement rather than inference: `gate_up_proj` is `(experts, 2*intermediate, hidden)` and `down_proj` is `(experts, hidden, intermediate)`, which is what `convert.py`'s own error message already claimed. The one remaining unknown, whether the `2*intermediate` axis is concatenated `[gate; up]` or interleaved, is now DETERMINABLE empirically — build the tiny fused model, run it, and test each hypothesis against its output. `convert.py` still cannot read the layout; what changed is that writing that reader is no longer a guess. | G8 gate run | Medium — was parked for want of a reference, and the reference arrived with the DSA oracle venv. |
+| ~~D4~~ | `convert.py` could not read the FUSED expert layout, and was parked because no oracle could verify an implementation. **Fixed** — transformers 5.12.1 supplied the reference, the split was settled by measurement (CONTIGUOUS, not interleaved), and `mm_fused_experts` now requires the two readers to agree byte-for-byte. | G8 gate run | Resolved |
 
 **D1 — resolved, and it was never an auth bug.** The cause was already written down in the test, three
 lines above the failure:

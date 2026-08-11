@@ -63,6 +63,16 @@ DENSE_SUFFIXES = (
     # fail to load — it routes to the wrong experts, quietly, which is strictly
     # worse. DeepSeek-V3, Moonlight and GLM-5.2 all use it.
     "mlp.gate.e_score_correction_bias",
+    # ── DSA indexer ──
+    #
+    # Only `full` layers carry these; `shared` layers borrow the index computed
+    # by the preceding full one, so their absence is correct rather than missing.
+    # `k_norm.bias` is rank 1 and the only bias in this attention block — the
+    # loader binds it through the rank-1 path that norms already use, not
+    # bind_weight, which requires rank 2.
+    "self_attn.indexer.wk.weight", "self_attn.indexer.wq_b.weight",
+    "self_attn.indexer.weights_proj.weight",
+    "self_attn.indexer.k_norm.weight", "self_attn.indexer.k_norm.bias",
     # ── dense-layer FFN ──
     #
     # `first_k_dense_replace` layers carry a plain MLP instead of experts. Also
@@ -123,6 +133,57 @@ def fused_expert_diagnosis(get, layer: int, moe_block: str) -> str | None:
         "Re-export in the per-expert layout, or add support here together with "
         "an oracle that can verify it.",
     ])
+
+
+def expert_reader(get, layer: int, moe_block: str, names: dict):
+    """Return `(read(expert, role) -> tensor | None, layout_name)` for one layer.
+
+    Two layouts exist in the wild and this reads both.
+
+    PER-EXPERT: `experts.<i>.{gate,up,down}_proj.weight`, one tensor each.
+
+    FUSED: `experts.gate_up_proj` of shape `(experts, 2*intermediate, hidden)` and
+    `experts.down_proj` of shape `(experts, hidden, intermediate)` — every expert
+    stacked into one 3-D tensor. Recent `transformers` emits this, and anything
+    `make_oracle.py` produces for such a family carries it.
+
+    **The gate/up split is CONTIGUOUS, and that was measured rather than assumed.**
+    `modeling_glm_moe_dsa.py` declares the parameter as
+    `(num_experts, 2 * intermediate_dim, hidden_dim)` and applies it as
+    `linear(x, gate_up_proj[e]).chunk(2, dim=-1)` — contiguous halves of the
+    OUTPUT, hence contiguous ROWS of the weight, gate first. Verified against the
+    real fixture: reconstructing gate/up from rows `[0:inter]` and `[inter:]`
+    reproduces that `chunk` exactly (max diff 0.00e+00), while the interleaved
+    reading is off by 1.35. This matters because gpt_oss stores the same
+    conceptual thing INTERLEAVED — guessing would have produced a container that
+    loads, runs, and is quietly wrong, which is why this was left unimplemented
+    until an oracle existed to settle it (roadmap D4).
+
+    Resolved once per layer, not per expert: the fused tensor covers all of them,
+    and `get()` copies plus dtype-converts on every call.
+    """
+    prefix = f"model.layers.{layer}.{moe_block}.experts."
+
+    if get(prefix + "0." + names["gate"]) is not None:
+        def read_per_expert(e: int, role: str):
+            return get(f"{prefix}{e}.{names[role]}")
+        return read_per_expert, "per-expert"
+
+    gate_up = get(prefix + "gate_up_proj")
+    down = get(prefix + "down_proj")
+    if gate_up is None or down is None:
+        return None, None
+    if gate_up.ndim != 3 or down.ndim != 3:
+        return None, None
+
+    inter = gate_up.shape[1] // 2
+
+    def read_fused(e: int, role: str):
+        if role == "down":
+            return down[e]
+        return gate_up[e][:inter] if role == "gate" else gate_up[e][inter:]
+
+    return read_fused, "fused"
 
 
 def layer_kinds(cfg: dict, n_layers: int) -> list[str]:
@@ -373,23 +434,30 @@ def main(argv: list[str]) -> int:
     print(f"  {src.name}: {n_layers} layers ({n_moe} MoE) x {n_experts} experts, "
           f"gate/up={dt_gate} down={dt_down} group={args.group}")
 
+    first_moe_layer = next((i for i, k in enumerate(kinds) if k == "moe"), -1)
     for layer in range(n_layers):
         if kinds[layer] == "dense":
             # Zero-length slots keep the (layer, expert) index arithmetic intact.
             index.extend((shard_idx, shard_off, 0) for _ in range(n_experts))
             continue
+        read, layout = expert_reader(get, layer, moe_block, names)
+        if read is None:
+            fh.close()
+            fused = fused_expert_diagnosis(get, layer, moe_block)
+            print(f"  REFUSED  {fused}" if fused else
+                  f"  REFUSED  no expert tensors at model.layers.{layer}.{moe_block}.experts.*")
+            return 3
+        if layer == first_moe_layer:
+            print(f"    expert layout: {layout}")
+
         for e in range(n_experts):
             base = f"model.layers.{layer}.{moe_block}.experts.{e}."
             blob = bytearray()
             for role, dt in (("gate", dt_gate), ("up", dt_up), ("down", dt_down)):
-                t = get(base + names[role])
+                t = read(e, role)
                 if t is None:
                     fh.close()
-                    fused = fused_expert_diagnosis(get, layer, moe_block)
-                    if fused:
-                        print(f"  REFUSED  {fused}")
-                    else:
-                        print(f"  REFUSED  missing {base + names[role]}")
+                    print(f"  REFUSED  missing {base + names[role]} ({layout} layout)")
                     return 3
                 packed, g = quantize_rows(t, dt, args.group)
                 groups[dt] = g
