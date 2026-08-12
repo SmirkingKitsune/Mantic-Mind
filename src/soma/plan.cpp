@@ -360,10 +360,8 @@ Status serialize_plan(const PlanDocument& plan, std::string& out_json) {
     return {};
 }
 
-Status compute_plan(const std::string& model_dir,
-                    const HostBudget& budget,
-                    PlanDocument& out,
-                    const std::string& quant_overlay_json) {
+Status
+resolve_arch(const std::string& model_dir, const std::string& quant_overlay_json, ArchIr& arch) {
     // Reads config.json only — no weights, no container payload. That is what
     // makes the call safe on a host that could not possibly load the model, and
     // it is the reason admission can plan before it has anywhere to run.
@@ -379,7 +377,7 @@ Status compute_plan(const std::string& model_dir,
     }
     std::string cfg_text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 
-    ArchIr arch;
+    arch = ArchIr{};
     if (auto st = adapt_hf_config(cfg_text, arch); !st.ok()) return st;
 
     // A CONTAINER also carries what it was quantized AT, and that is part of the
@@ -423,7 +421,15 @@ Status compute_plan(const std::string& model_dir,
     // A plan that omitted it left admission with nothing to record a model
     // under, so every unconverted model would have collided on the empty string.
     if (auto st = compute_arch_hash(arch, arch.arch_hash); !st.ok()) return st;
+    return {};
+}
 
+Status compute_plan(const std::string& model_dir,
+                    const HostBudget& budget,
+                    PlanDocument& out,
+                    const std::string& quant_overlay_json) {
+    ArchIr arch;
+    if (auto st = resolve_arch(model_dir, quant_overlay_json, arch); !st.ok()) return st;
     return compute_plan(arch, budget, out);
 }
 

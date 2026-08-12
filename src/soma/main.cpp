@@ -38,6 +38,7 @@ int usage() {
     std::cerr << "usage:\n"
                  "  soma serve   --model-dir DIR [--host H] [--port N] [--ctx-size N]\n"
                  "               [--ram-budget BYTES] [--pin BYTES] [--kv-dir DIR]\n"
+                 "               [--quant-dense DTYPE]  quantize the RESIDENT half at load\n"
                  "               [--served-name NAME]\n"
                  "  soma plan    --model-dir DIR [--json]\n"
                  "               [--quant DTYPE] [--expert-down DTYPE] [--quant-dense DTYPE]\n"

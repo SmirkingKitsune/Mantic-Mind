@@ -44,6 +44,19 @@ struct ServeConfig {
     std::uint64_t vram_expert_bytes = 0; // --vram-expert   SOMA_VRAM_EXPERT  (v1: 0)
     std::uint64_t pin_bytes = 0;         // --pin           SOMA_PIN
 
+    /// Precision for the RESIDENT half at load: embeddings, attention
+    /// projections, shared experts. Empty means whatever the container says,
+    /// which is F32 — the converter stores the dense half at full precision
+    /// deliberately, so this can be chosen per host without reconverting.
+    ///
+    /// The routed experts are NOT settable here and must not be: they are
+    /// quantized on disk by the converter, and the map that describes them is read
+    /// from container_meta.json. Serve used to hardcode `q4_g/q4_g/q6_g @128`
+    /// instead, which meant it could only open containers matching that guess and
+    /// had no way to express the quantized dense half `plan --quant-dense` was
+    /// already reporting (roadmap D41).
+    std::string quant_dense; // --quant-dense SOMA_QUANT_DENSE
+
     std::uint32_t ctx_size = 4096; // --ctx-size    SOMA_CTX_SIZE
     std::uint32_t kv_slots = 4;    // --kv-slots    SOMA_KV_SLOTS
     std::uint32_t max_batch = 0;   // --max-batch   SOMA_MAX_BATCH (0 = gate decides)

@@ -843,11 +843,40 @@ Status ServeServer::open(const ServeConfig& config) {
         return {StatusCode::InvalidArgument, "--model-dir is required"};
     }
 
-    QuantMap qm;
-    qm.expert_gate = {DType::Q4_G, 128};
-    qm.expert_up = {DType::Q4_G, 128};
-    qm.expert_down = {DType::Q6_G, 128};
-    if (auto st = load_f32_model(config.model_dir, im.model, qm); !st.ok()) return st;
+    // What this model IS, resolved the same way `soma plan` resolves it.
+    //
+    // This used to be three hardcoded lines — q4_g/q4_g/q6_g at group 128 — which
+    // is not a fact about the model but a guess about the converter's defaults.
+    // Two consequences, both real: a container converted at any other group was
+    // refused with "container experts are N B but the IR's quantization map
+    // implies M B", which reads as a corrupt container rather than a wrong
+    // assumption; and the resident half could only ever be F32, so the
+    // configuration `plan --quant-dense q4_g` blesses as `stream` was not
+    // reachable through `serve` at all. main.cpp says the planner and the server
+    // "must not be able to disagree" (roadmap D41).
+    //
+    // `--quant-dense` is expressed as an overlay in container_meta.json's shape
+    // and applied by the same function the converter's own record goes through, so
+    // there is no second dtype-to-role mapping to drift.
+    std::string overlay;
+    if (!config.quant_dense.empty()) {
+        DType dense{};
+        if (!parse_dtype(config.quant_dense, dense)) {
+            return {StatusCode::InvalidArgument,
+                    "unknown --quant-dense dtype '" + config.quant_dense + "'"};
+        }
+        if (dense != DType::F32 && !is_quantized(dense)) {
+            return {StatusCode::Unsupported,
+                    "--quant-dense " + config.quant_dense +
+                        " is not implemented by the resident-weight loader"};
+        }
+        overlay = json{{"dtype_dense", config.quant_dense}}.dump();
+    }
+    ArchIr resolved;
+    if (auto st = resolve_arch(config.model_dir, overlay, resolved); !st.ok()) return st;
+    if (auto st = load_f32_model(config.model_dir, im.model, resolved.quantization); !st.ok()) {
+        return st;
+    }
 
     // A container directory streams; a plain checkpoint is resident. Both are
     // legitimate residency modes — `resident-only` is a verdict, not a failure —
@@ -865,6 +894,7 @@ Status ServeServer::open(const ServeConfig& config) {
     host.ram_total_bytes = config.ram_budget_bytes ? config.ram_budget_bytes * 2 : (8ull << 30);
     host.ram_free_bytes = config.ram_budget_bytes ? config.ram_budget_bytes : (4ull << 30);
     host.ctx_size = config.ctx_size;
+    host.kv_slots = config.kv_slots;
     (void)compute_plan(im.model.arch, host, im.plan_doc);
 
     const auto tok = fs::path(config.model_dir) / "tokenizer.soma";
@@ -1238,6 +1268,7 @@ Status parse_serve_config(int argc, const char* const* argv, ServeConfig& out) {
     if (const auto r = env_or("SOMA_RAM_BUDGET", ""); !r.empty()) {
         out.ram_budget_bytes = std::stoull(r);
     }
+    out.quant_dense = env_or("SOMA_QUANT_DENSE", out.quant_dense);
 
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1260,6 +1291,12 @@ Status parse_serve_config(int argc, const char* const* argv, ServeConfig& out) {
             out.ram_budget_bytes = std::stoull(argv[++i]);
         else if (a == "--pin" && i + 1 < argc)
             out.pin_bytes = std::stoull(argv[++i]);
+        else if (a == "--quant-dense") {
+            if (i + 1 >= argc) {
+                return {StatusCode::InvalidArgument, "--quant-dense requires a dtype"};
+            }
+            out.quant_dense = argv[++i];
+        }
     }
     if (out.model_dir.empty()) {
         return {StatusCode::InvalidArgument, "--model-dir (or SOMA_MODEL_DIR) is required"};

@@ -18,8 +18,9 @@
 #include "soma/f32_model.hpp"
 #include "soma/memory_hierarchy.hpp"
 #include "soma/plan.hpp"
-#include "soma/safetensors.hpp"
 #include "soma/quant_format.hpp"
+#include "soma/safetensors.hpp"
+#include "soma/serve.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -682,6 +683,84 @@ int check_verdict_varies_by_host_and_quant() {
     return bad;
 }
 
+/// The CLI planner and the serving loader must resolve one model identity.
+///
+/// This reaches ServeServer::open rather than comparing resolve_arch with itself:
+/// D42 was precisely a case where the resolved bytes agreed but load_f32_model
+/// stamped the hash before installing the effective quant map.
+int check_plan_matches_serve(const fs::path& containers) {
+    int bad = 0;
+    const auto check = [&](bool ok, const char* what, const std::string& detail = {}) {
+        std::cout << "   " << std::left << std::setw(58) << what << (ok ? "OK" : "FAIL");
+        if (!detail.empty()) std::cout << "   " << detail;
+        std::cout << "\n";
+        if (!ok) ++bad;
+    };
+
+    const auto dir = containers / "DeepSeek-V2-Lite";
+    if (!fs::is_directory(dir)) {
+        std::cout << "   (DeepSeek container absent; plan/serve identity skipped)\n";
+        return 0;
+    }
+
+    constexpr auto kOverlay = R"({"dtype_dense":"q4_g"})";
+    soma::ArchIr resolved;
+    const auto rst = soma::resolve_arch(dir.string(), kOverlay, resolved);
+    check(rst.ok(), "container plus dense overlay resolves", rst.ok() ? "" : rst.message());
+    if (!rst.ok()) return bad;
+
+    soma::HostBudget host;
+    host.ram_total_bytes = 8 * kGiB;
+    host.ram_free_bytes = 4 * kGiB;
+    host.ctx_size = 4096;
+    host.kv_slots = 2; // non-default, so serve must propagate it into its plan
+    soma::PlanDocument planned;
+    const auto pst = soma::compute_plan(resolved, host, planned);
+    check(pst.ok(), "resolved model plans", pst.ok() ? "" : pst.message());
+    if (!pst.ok()) return bad;
+
+    soma::ServeConfig cfg;
+    cfg.model_dir = dir.string();
+    cfg.quant_dense = "q4_g";
+    cfg.kv_slots = host.kv_slots;
+    soma::ServeServer server;
+    const auto sst = server.open(cfg);
+    check(sst.ok(), "the same container opens for serving", sst.ok() ? "" : sst.message());
+    if (sst.ok()) {
+        check(server.plan().dense_resident_bytes == planned.dense_resident_bytes,
+              "plan and serve agree on resident bytes",
+              std::to_string(planned.dense_resident_bytes));
+        check(server.plan().arch_hash == planned.arch_hash,
+              "plan and serve agree on arch_hash",
+              planned.arch_hash.substr(0, 16) + "...");
+        server.stop();
+    }
+
+    soma::ServeConfig invalid = cfg;
+    invalid.quant_dense = "not_a_dtype";
+    soma::ServeServer refused;
+    const auto ist = refused.open(invalid);
+    check(!ist.ok() && ist.code() == soma::StatusCode::InvalidArgument,
+          "an unknown dense dtype is refused instead of ignored",
+          ist.message());
+
+    soma::ServeConfig unsupported = cfg;
+    unsupported.quant_dense = "bf16";
+    soma::ServeServer unsupported_server;
+    const auto ust = unsupported_server.open(unsupported);
+    check(!ust.ok() && ust.code() == soma::StatusCode::Unsupported,
+          "an unimplemented resident dtype is refused instead of loaded as f32",
+          ust.message());
+
+    const char* missing_argv[] = {"--model-dir", "fixture", "--quant-dense"};
+    soma::ServeConfig parsed;
+    const auto mst = soma::parse_serve_config(3, missing_argv, parsed);
+    check(!mst.ok() && mst.code() == soma::StatusCode::InvalidArgument,
+          "--quant-dense without a value is refused",
+          mst.message());
+    return bad;
+}
+
 /// `dense_resident_bytes` against the tensors that actually exist.
 ///
 /// The plan's resident half was never checked against anything. It was derived
@@ -793,6 +872,9 @@ int main(int argc, char** argv) {
 
     std::cout << "\nthe verdict varies by host AND quantization\n";
     failures += check_verdict_varies_by_host_and_quant();
+
+    std::cout << "\nplan and serve resolve one model identity\n";
+    failures += check_plan_matches_serve(cdir);
 
     std::cout << "\ndense_resident_bytes vs the tensors that exist\n";
     failures += check_dense_sizing(root / "tiny");

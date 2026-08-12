@@ -332,20 +332,6 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
     out.quant_map = quant;
     if (auto s = validate_quant_map(out.quant_map); !s.ok()) return s;
 
-    // Stamp the arch hash at load, not at admission.
-    //
-    // Every format that gates on it — KV checkpoints, containers, the registry —
-    // compares against `arch.arch_hash`, and until now nothing populated it on
-    // this path. The comparisons all still ran; they compared "" against "" and
-    // accepted everything. A gate that is structurally present and vacuous in
-    // practice is worse than an absent one, because it reads as covered.
-    if (auto s = compute_arch_hash(out.arch, out.arch.arch_hash); !s.ok()) return s;
-
-    // A container directory carries the dense half in dense.safetensors and the
-    // routed experts in experts-*.bin. Detected here so expert binding can be
-    // skipped consistently rather than failing halfway through the layer loop.
-    out.experts_are_streamed = fs::exists(root / "soma.container");
-
     // The IR describes what was actually loaded, not what the config said.
     //
     // Leaving arch.quantization at its all-f32 default while the weights are q4_g
@@ -353,6 +339,32 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
     // and the container's expert-size check compares against the wrong number.
     // Both were observed before this line existed.
     out.arch.quantization = quant;
+
+    // A container directory carries the dense half in dense.safetensors and the
+    // routed experts in experts-*.bin. Detected here so expert binding can be
+    // skipped consistently rather than failing halfway through the layer loop.
+    out.experts_are_streamed = fs::exists(root / "soma.container");
+
+    // Stamp the arch hash at load, not at admission — and AFTER the quant map,
+    // which is the part that was wrong.
+    //
+    // Every format that gates on it — KV checkpoints, containers, the registry —
+    // compares against `arch.arch_hash`, and until this was populated the
+    // comparisons all still ran, comparing "" against "" and accepting
+    // everything. Fixing that left a subtler version of the same fault: the hash
+    // was computed three lines ABOVE the assignment below, so it covered the
+    // all-f32 DEFAULT map rather than the map actually loaded. Every
+    // quantization of one architecture therefore hashed identically at load,
+    // which defeats the reason QuantMap is inside the hash at all — that the same
+    // weights at two quantizations are two models, with two verdicts and two sets
+    // of KV checkpoints. A checkpoint written under q4_g would replay under q8_0
+    // with nothing detecting it, which is the exact failure the plan-side comment
+    // in plan.cpp says this hash exists to prevent.
+    //
+    // Found by comparing `soma plan --quant-dense q4_g` against the same
+    // container's own /internal/plan: `dense_resident_bytes` agreed to the byte
+    // and the hashes did not (roadmap D42).
+    if (auto s = compute_arch_hash(out.arch, out.arch.arch_hash); !s.ok()) return s;
 
     if (auto s = out.weights.open_dir(dir); !s.ok()) return s;
 

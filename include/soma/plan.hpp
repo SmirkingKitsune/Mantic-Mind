@@ -167,6 +167,25 @@ Status compute_plan(const std::string& model_dir,
                     PlanDocument& out,
                     const std::string& quant_overlay_json = {});
 
+/// Resolve what a model in `model_dir` IS: adapt config.json, apply the
+/// container's own recorded quantization, then apply the caller's overlay, then
+/// stamp arch_hash.
+///
+/// Extracted so `plan` and `serve` share it rather than each deciding what a model
+/// is. main.cpp says the two "must not be able to disagree", and they did: serve
+/// hardcoded `q4_g/q4_g/q6_g @128` and never read container_meta.json at all, so
+/// it could only load containers that happened to match that guess — a container
+/// converted at any other group was refused with an expert-size mismatch that
+/// looked like a corrupt container — and it had no way to express a quantized
+/// dense half, which is the one thing `plan --quant-dense` had been describing all
+/// along (roadmap D41).
+///
+/// `quant_overlay_json` is in container_meta.json's shape and goes through the
+/// same applier, so an overlay cannot mean something a container could not be.
+/// Empty means "whatever the model already says".
+Status
+resolve_arch(const std::string& model_dir, const std::string& quant_overlay_json, ArchIr& out);
+
 /// Same, when the IR is already parsed.
 Status compute_plan(const ArchIr& arch, const HostBudget& budget, PlanDocument& out);
 

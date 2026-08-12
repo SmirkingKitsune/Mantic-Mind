@@ -115,7 +115,12 @@ Outcome check_fixture(const fs::path& dir, std::uint32_t n_tokens, bool absorb) 
         soma::KvRow row;
         row.k_base = kv.k_at(0, 0);
         row.v_base = kv.v_at(0, 0);
-        row.stride = n_tokens * kv.hkv();
+        // FROM the cache, not recomputed. `n_tokens * kv.hkv()` was right here
+        // only because this test opens the cache at exactly n_tokens — the same
+        // reasoning that made the scheduler's copy right for GQA and catastrophic
+        // for MLA (roadmap D40). A test that duplicates the formula it exists to
+        // protect cannot catch the formula drifting.
+        row.stride = kv.stride();
         row.hkv = kv.hkv();
         row.pos = p;
         row.len = p + 1; // visible history INCLUDING this position
