@@ -20,7 +20,9 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -41,6 +43,8 @@ int usage() {
                  "               [--quant DTYPE] [--expert-down DTYPE] [--quant-dense DTYPE]\n"
                  "               [--group N]\n"
                  "               [--ram SIZE] [--ram-free SIZE] [--disk-bw SIZE] [--ctx N]\n"
+                 "               [--min-tok-s RATE]   slowest generation you will accept "
+                 "(default 1.0)\n"
                  "               the verdict is a property of (model, quantization, host);\n"
                  "               these ASK about a quantization and a host, and convert nothing\n"
                  "  soma conform --model-dir DIR [--json]\n";
@@ -498,6 +502,7 @@ int cmd_plan(int argc, char** argv) {
     std::uint32_t q_group = 0;
     std::uint64_t ram_total = 0, ram_free = 0, disk_bw = 0;
     std::uint32_t ctx = 0;
+    float min_tok_s = 0.0f; ///< 0 = unstated; compute_plan applies the default
 
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
@@ -533,6 +538,16 @@ int cmd_plan(int argc, char** argv) {
             }
         } else if (a == "--ctx" && i + 1 < argc) {
             ctx = static_cast<std::uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
+        } else if (a == "--min-tok-s") {
+            const auto text = next();
+            char* end = nullptr;
+            errno = 0;
+            min_tok_s = std::strtof(text.c_str(), &end);
+            if (errno == ERANGE || end == text.c_str() || *end != '\0' ||
+                !std::isfinite(min_tok_s) || !(min_tok_s > 0.0f)) {
+                std::cerr << "plan: --min-tok-s wants a positive rate like 0.1\n";
+                return 2;
+            }
         }
     }
     if (dir.empty()) return usage();
@@ -570,6 +585,10 @@ int cmd_plan(int argc, char** argv) {
     if (ram_free > 0) host.ram_free_bytes = ram_free;
     if (disk_bw > 0) host.disk_bandwidth = disk_bw;
     if (ctx > 0) host.ctx_size = ctx;
+    // Left at 0 when unstated, which compute_plan reads as "use the default" —
+    // see HostBudget::min_tok_s. Passing 1.0 here instead would erase the
+    // distinction between a floor someone chose and one they inherited.
+    host.min_tok_s = min_tok_s;
 
     soma::PlanDocument doc;
     // Try the container path first (a converted model carries arch.json), and

@@ -507,6 +507,77 @@ int check_verdict_varies_by_host_and_quant() {
         return soma::compute_plan(a, b, out).ok();
     };
 
+    // ── the throughput floor is a HOST input, not a constant (roadmap D21) ───
+    //
+    // Nothing else in the suite covers this: after the change, `soma plan`
+    // behaved correctly by hand and all 27 tests still passed, which means the
+    // wiring could be deleted and the suite would not notice.
+    //
+    // GLM-5.2's real shape, because it is the case the floor was refusing. The
+    // documented 1.23 GB/s workstation projects 0.087 tok/s; this test uses
+    // 3 GB/s and projects 0.215 so strict, default and lenient floors all remain
+    // comfortably separated.
+    {
+        const std::string glm = R"({
+            "model_type": "glm_moe_dsa", "num_hidden_layers": 78, "hidden_size": 6144,
+            "vocab_size": 154880, "first_k_dense_replace": 3, "moe_layer_freq": 1,
+            "n_routed_experts": 256, "num_experts_per_tok": 8, "n_shared_experts": 1,
+            "moe_intermediate_size": 2048, "intermediate_size": 12288,
+            "num_attention_heads": 64, "num_key_value_heads": 64,
+            "kv_lora_rank": 512, "q_lora_rank": 2048, "qk_nope_head_dim": 192,
+            "qk_rope_head_dim": 64, "v_head_dim": 256,
+            "scoring_func": "sigmoid", "topk_method": "noaux_tc", "norm_topk_prob": true,
+            "routed_scaling_factor": 2.5, "rms_norm_eps": 1e-5, "hidden_act": "silu"
+        })";
+        const auto plan_floor = [&](float floor, soma::PlanDocument& out) {
+            soma::ArchIr a;
+            if (!soma::adapt_hf_config(glm, a).ok()) return false;
+            if (!soma::apply_container_quant(
+                     R"({"dtype_gate_up":"q4_g","dtype_down":"q6_g","dtype_dense":"q4_g",)"
+                     R"("group":128})",
+                     a)
+                     .ok()) {
+                return false;
+            }
+            soma::HostBudget b;
+            b.ram_total_bytes = 24ull * kGiB;
+            b.ram_free_bytes = 24ull * kGiB;
+            b.ctx_size = 4096;
+            b.kv_slots = 1;
+            b.disk_bandwidth = 3ull * 1000 * 1000 * 1000;
+            b.min_tok_s = floor; // 0 = unstated
+            return soma::compute_plan(a, b, out).ok();
+        };
+
+        soma::PlanDocument unstated, strict, lenient;
+        const bool ok = plan_floor(0.0f, unstated) && plan_floor(0.5f, strict) &&
+                        plan_floor(0.05f, lenient);
+        check(ok, "GLM-5.2 plans at three floors");
+        if (ok) {
+            // An UNSTATED floor must guard exactly as the old constant did. If a
+            // default-constructed budget meant "accept anything", forgetting to
+            // set the field would silently admit every slow model.
+            check(unstated.verdict == soma::Verdict::Reject &&
+                      unstated.verdict_reason.find("default") != std::string::npos,
+                  "unstated floor still refuses, and says it was the DEFAULT",
+                  unstated.verdict_reason.substr(0, 52));
+            check(strict.verdict == soma::Verdict::Reject &&
+                      strict.verdict_reason.find("requested") != std::string::npos,
+                  "a stated 0.5 refuses, and says the floor was REQUESTED",
+                  strict.verdict_reason.substr(0, 52));
+            check(lenient.verdict == soma::Verdict::Stream,
+                  "a stated 0.05 admits it as stream",
+                  soma::to_string(lenient.verdict));
+            // The economics must be IDENTICAL across all three: the floor decides
+            // what is acceptable, it does not change what the model costs. If it
+            // moved these, it would be a second knob on the plan rather than a
+            // policy bar.
+            check(unstated.projected_tok_s == lenient.projected_tok_s &&
+                      unstated.bytes_per_token == lenient.bytes_per_token,
+                  "-> the floor moves the VERDICT and nothing it is computed from");
+        }
+    }
+
     // Same model, same quantization, only the HOST changes.
     soma::PlanDocument tight, mid, roomy;
     const bool ran = plan_at(R"({"dtype_gate_up":"q4_g","dtype_down":"q4_g","group":128})", 2, tight) &&

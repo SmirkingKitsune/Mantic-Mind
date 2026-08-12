@@ -31,6 +31,34 @@ struct HostBudget {
     std::uint64_t disk_bandwidth = 0; ///< bytes/sec, measured at expert size
     std::uint32_t ctx_size = 4096;
     std::uint32_t kv_slots = 4;
+
+    /// Slowest generation the DEPLOYER will accept, tok/s. Below it the verdict
+    /// is Reject.
+    ///
+    /// A host property, not a model one, and that is the whole argument for it
+    /// living here. This was `kMinProjectedTokS`, a constant in plan.cpp, and its
+    /// reasoning was sound as written — "a model that streams correctly but at
+    /// 0.2 tok/s is not usefully served". What a global constant cannot express
+    /// is that the answer depends on who is asking: GLM-5.2 projects 0.087 tok/s
+    /// on a 24 GiB workstation, and Colibri served those same 744B weights on
+    /// 16-24 GB to someone who found the result useful. For a model of that size
+    /// on that hardware, 0.1 tok/s may be the entire point.
+    ///
+    /// The verdict is already documented as a property of (model, quantization,
+    /// host budget). "How slow is too slow" belongs in the third of those, beside
+    /// `ram_total_bytes` and `disk_bandwidth`, rather than being decided once for
+    /// every deployment that will ever exist.
+    ///
+    /// 0 means UNSTATED, and resolves to the engine's default of 1.0 — not to
+    /// "no floor". A default-constructed budget therefore guards exactly as it
+    /// did before this field existed, so nothing admits that did not admit
+    /// before; lowering the bar takes a deliberate statement by whoever runs the
+    /// host (roadmap D21).
+    ///
+    /// The sentinel earns its keep in the refusal message, which says whether the
+    /// figure was chosen or inherited. "Too slow against a number you picked" and
+    /// "too slow against our default" call for different responses.
+    float min_tok_s = 0.0f;
 };
 
 /// The footprint, in the shape placement actually needs.

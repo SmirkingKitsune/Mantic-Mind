@@ -41,10 +41,16 @@ constexpr float kMaxStreamableActiveFraction = 0.15f;
 /// for the opposite extreme (very many very small experts).
 constexpr std::uint64_t kMinStreamableExpertBytes = 64ull * 1024;
 
-/// Floor on projected throughput. A model that streams correctly but at 0.2
-/// tok/s is not usefully served, and admitting it as `stream` would produce a
-/// technically-working deployment nobody can use.
-constexpr float kMinProjectedTokS = 1.0f;
+/// Default floor on projected throughput, when the caller states none.
+///
+/// The reasoning it was written with still holds — a model that streams correctly
+/// but at 0.2 tok/s is not usefully served, and admitting it as `stream` would
+/// produce a technically-working deployment nobody can use. What it could not
+/// express as a CONSTANT is that "usefully" depends on the deployer: GLM-5.2 at
+/// 0.087 tok/s on a workstation is the case Colibri proved useful. It moved to
+/// `HostBudget::min_tok_s`, which defaults to exactly this, so the guard is
+/// unchanged for anyone who does not deliberately lower it (roadmap D21).
+constexpr float kDefaultMinProjectedTokS = 1.0f;
 
 std::uint64_t
 bytes_for(const ArchIr& arch, std::uint32_t rows, std::uint32_t cols, TensorRole role) {
@@ -227,6 +233,11 @@ Status compute_plan(const ArchIr& arch, const HostBudget& budget, PlanDocument& 
     const float active_fraction =
         (n_experts > 0) ? static_cast<float>(top_k) / static_cast<float>(n_experts) : 1.0f;
 
+    // A zero or negative budget means "unstated", not "accept anything" — a
+    // default-constructed HostBudget must keep the guard, or forgetting to set
+    // the field would silently admit every slow model.
+    const float min_tok_s = (budget.min_tok_s > 0.0f) ? budget.min_tok_s : kDefaultMinProjectedTokS;
+
     std::ostringstream why;
     if (n_moe == 0 || n_experts == 0) {
         out.verdict = Verdict::ResidentOnly;
@@ -248,10 +259,15 @@ Status compute_plan(const ArchIr& arch, const HostBudget& budget, PlanDocument& 
         out.verdict = Verdict::Reject;
         why << "expert size " << expert_bytes << " B is below the " << kMinStreamableExpertBytes
             << " B floor; per-read overhead would dominate";
-    } else if (out.projected_tok_s > 0.0f && out.projected_tok_s < kMinProjectedTokS) {
+    } else if (out.projected_tok_s > 0.0f && out.projected_tok_s < min_tok_s) {
         out.verdict = Verdict::Reject;
-        why << "projected " << out.projected_tok_s << " tok/s is below the " << kMinProjectedTokS
-            << " floor";
+        // Names the floor AND where it came from. A refusal against a default is
+        // a different situation from a refusal against a figure the operator
+        // chose, and telling them apart is the difference between "raise your
+        // tolerance" and "this host is too small".
+        why << "projected " << out.projected_tok_s << " tok/s is below the " << min_tok_s
+            << " tok/s floor"
+            << (budget.min_tok_s > 0.0f ? " requested for this host" : " default");
     } else if (hit_rate > 0.5) {
         out.verdict = Verdict::Hybrid;
         why << "active fraction " << active_fraction * 100.0f << "% with " << expert_bytes / 1024
