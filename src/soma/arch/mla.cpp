@@ -674,6 +674,126 @@ StatusCode f32_attention(const ArchIr& arch,
     return StatusCode::Ok;
 }
 
+StatusCode f32_index_select_kv(const ArchIr& arch,
+                               const F32AttnWeights& w,
+                               const float* x,
+                               const float* q_resid,
+                               std::uint32_t n_rows,
+                               LayerIndex layer,
+                               const KvRow* rows,
+                               DsaSelection& out) noexcept {
+    // The indexer's KEYS have to be cached, and noticing that corrected the
+    // scoping note on this page.
+    //
+    // `k = k_norm(wk(hidden))` depends on the hidden state of a past token AT
+    // THIS LAYER. At step t those hidden states are gone — that is what a KV
+    // cache is for — so the key cannot be recomputed and must have been stored.
+    // The scope said DSA adds nothing per-sequence because the INDICES are
+    // recomputed every step, which is true and was the wrong noun: the indices
+    // are per-step, the keys behind them are per-sequence.
+    //
+    // They live in the second cache plane, which MLA leaves empty.
+    if (!w.has_indexer) return StatusCode::InvalidArgument;
+
+    const auto& m = arch.attention.mla;
+    const auto& dsa = arch.attention.dsa;
+    const auto d = arch.topology.d_model;
+    const auto H = dsa.n_index_heads;
+    const auto D = dsa.index_head_dim;
+    const auto R = m.qk_rope_head_dim;
+    if (H == 0 || D == 0 || R > D) return StatusCode::InvalidArgument;
+
+    const std::span<const float> xs(x, static_cast<std::size_t>(n_rows) * d);
+    const std::span<const float> qr =
+        m.q_lora_rank > 0
+            ? std::span<const float>(q_resid, static_cast<std::size_t>(n_rows) * m.q_lora_rank)
+            : xs;
+
+    std::vector<float> iq(static_cast<std::size_t>(n_rows) * H * D);
+    std::vector<float> ik(static_cast<std::size_t>(n_rows) * D);
+    std::vector<float> mix(static_cast<std::size_t>(n_rows) * H);
+    soma::matmul(w.idx.wq_b, qr, n_rows, iq);
+    soma::matmul(w.idx.wk, xs, n_rows, ik);
+    soma::matmul(w.idx.weights_proj, xs, n_rows, mix);
+
+    std::vector<float> inv_freq;
+    yarn_inv_freq(arch.attention.rope, R, inv_freq);
+
+    // This step's key into the cache, before anything reads — same ordering rule
+    // as the latent above, and for the same reason.
+    for (std::uint32_t r = 0; r < n_rows; ++r) {
+        const auto p = rows[r].pos;
+        float* slot = rows[r].v_at(layer, p);
+        std::copy_n(ik.data() + static_cast<std::size_t>(r) * D, D, slot);
+        layernorm(slot, D, w.idx.k_norm_w, w.idx.k_norm_b);
+        rope_half_split(slot, R, p, inv_freq);
+        for (std::uint32_t h = 0; h < H; ++h) {
+            rope_half_split(iq.data() + (static_cast<std::size_t>(r) * H + h) * D, R, p, inv_freq);
+        }
+    }
+
+    const float softmax_scale = 1.0f / std::sqrt(static_cast<float>(D));
+    const float head_scale = 1.0f / std::sqrt(static_cast<float>(H));
+
+    std::uint32_t widest = 1;
+    for (std::uint32_t r = 0; r < n_rows; ++r) {
+        const auto avail = rows[r].len;
+        widest = std::max(widest, dsa.index_topk == 0 ? avail : std::min(dsa.index_topk, avail));
+    }
+
+    out.n_tokens = n_rows;
+    out.stride = widest;
+    out.keys.assign(static_cast<std::size_t>(n_rows) * widest, 0u);
+    out.counts.assign(n_rows, 0u);
+    out.dense_equivalent = true;
+
+    std::vector<float> score;
+    std::vector<std::uint32_t> order;
+    for (std::uint32_t r = 0; r < n_rows; ++r) {
+        const auto avail = rows[r].len;
+        score.assign(avail, 0.0f);
+        for (std::uint32_t h = 0; h < H; ++h) {
+            const float* qh = iq.data() + (static_cast<std::size_t>(r) * H + h) * D;
+            const float wgt = mix[static_cast<std::size_t>(r) * H + h] * head_scale;
+            for (std::uint32_t j = 0; j < avail; ++j) {
+                const float* kj = rows[r].v_at(layer, j);
+                const float dot =
+                    f32::dot(std::span<const float>(qh, D), std::span<const float>(kj, D), D) *
+                    softmax_scale;
+                score[j] += wgt * (dot > 0.0f ? dot : 0.0f);
+            }
+        }
+
+        const auto keep =
+            std::min<std::uint32_t>(dsa.index_topk == 0 ? avail : dsa.index_topk, avail);
+        order.resize(avail);
+        for (std::uint32_t j = 0; j < avail; ++j)
+            order[j] = j;
+        std::partial_sort(order.begin(),
+                          order.begin() + keep,
+                          order.end(),
+                          [&](std::uint32_t a, std::uint32_t b) {
+                              if (score[a] != score[b]) return score[a] > score[b];
+                              return a < b;
+                          });
+        std::sort(order.begin(), order.begin() + keep);
+        std::copy_n(order.begin(), keep, out.keys.begin() + static_cast<std::size_t>(r) * widest);
+        out.counts[r] = keep;
+        if (keep < avail) out.dense_equivalent = false;
+    }
+    return StatusCode::Ok;
+}
+
+std::uint32_t f32_kv_floats_per_layer(const ArchIr& arch) noexcept {
+    const auto& m = arch.attention.mla;
+    const auto latent = m.kv_lora_rank + m.qk_rope_head_dim;
+    // Both planes are allocated at one width, so the second plane's tenant has to
+    // fit too. On GLM-5.2 that is 128 against 576 and the max is a formality —
+    // stated anyway, because a family with a wide indexer and a narrow latent
+    // would otherwise silently write past its plane.
+    return std::max(latent, arch.attention.dsa.index_head_dim);
+}
+
 StatusCode f32_attention_kv(const ArchIr& arch,
                             const soma::F32LayerWeights& lw,
                             const float* x,
@@ -682,20 +802,180 @@ StatusCode f32_attention_kv(const ArchIr& arch,
                             const KvRow* rows,
                             soma::F32Workspace& ws,
                             float* out) noexcept {
-    (void)arch;
-    (void)lw;
-    (void)x;
-    (void)n_rows;
-    (void)layer;
-    (void)rows;
-    (void)ws;
-    (void)out;
-    // The cached path needs a KvRow whose stride is the LATENT width, not
-    // n_kv_heads * head_dim — MLA's cache is a different shape, which is the
-    // entire reason the architecture exists. Wiring that is the next step;
-    // returning Unsupported keeps the scheduler honest rather than letting it
-    // attend over a mis-shaped buffer.
-    return StatusCode::Unsupported;
+    // Decode against the compressed cache. The same arithmetic as f32_attention;
+    // what differs is entirely where the keys come from and that each row carries
+    // its own position and its own visible length.
+    if (lw.attn.empty()) return StatusCode::InvalidArgument;
+    const auto& w = *lw.attn.as<F32AttnWeights>();
+
+    const auto& m = arch.attention.mla;
+    const auto d = arch.topology.d_model;
+    const auto H = arch.attention.n_heads;
+    const auto nope = m.qk_nope_head_dim;
+    const auto rope_d = m.qk_rope_head_dim;
+    const auto qk = nope + rope_d;
+    const auto vd = m.v_head_dim;
+    const auto lora = m.kv_lora_rank;
+    const bool is_dsa = arch.attention.family == AttentionFamily::MlaDsa;
+
+    // Deliberately the same constant, and the same reason, as the prefill path:
+    // the latent norms take the RMSNorm class default, not the model's
+    // rms_norm_eps (roadmap D29).
+    constexpr float kLatentNormEps = 1e-6f;
+
+    float scale = 1.0f / std::sqrt(static_cast<float>(qk));
+    const auto& rope = arch.attention.rope;
+    float cs_scale = 1.0f;
+    if (rope.scaling.kind == RopeScalingKind::Yarn) {
+        const float num = yarn_mscale(rope.scaling.factor, rope.scaling.mscale);
+        const float den = yarn_mscale(rope.scaling.factor, rope.scaling.mscale_all_dim);
+        if (den != 0.0f) {
+            scale *= num / den;
+            cs_scale = num / den;
+        }
+    }
+    std::vector<float> inv_freq;
+    yarn_inv_freq(rope, rope_d, inv_freq);
+
+    const std::span<const float> xs(x, static_cast<std::size_t>(n_rows) * d);
+
+    // ── queries, and the residual the indexer shares ─────────────────────────
+    std::vector<float> q(static_cast<std::size_t>(n_rows) * H * qk);
+    std::vector<float> qa;
+    if (m.q_lora_rank == 0) {
+        soma::matmul(w.q_proj, xs, n_rows, q);
+    } else {
+        qa.assign(static_cast<std::size_t>(n_rows) * m.q_lora_rank, 0.0f);
+        soma::matmul(w.q_a_proj, xs, n_rows, qa);
+        for (std::uint32_t r = 0; r < n_rows; ++r) {
+            f32::rmsnorm(std::span<float>(qa).subspan(static_cast<std::size_t>(r) * m.q_lora_rank,
+                                                      m.q_lora_rank),
+                         w.q_a_norm,
+                         m.q_lora_rank,
+                         kLatentNormEps);
+        }
+        soma::matmul(w.q_b_proj, qa, n_rows, q);
+    }
+
+    std::vector<float> ckv(static_cast<std::size_t>(n_rows) * (lora + rope_d));
+    soma::matmul(w.kv_a_proj, xs, n_rows, ckv);
+
+    // ── write this step's latent into every row's own cache ──────────────────
+    //
+    // Before any row READS, so a row attending over its own position sees the
+    // value it just produced.
+    for (std::uint32_t r = 0; r < n_rows; ++r) {
+        const auto p = rows[r].pos;
+        float* slot = rows[r].k_at(layer, p);
+        float* src = ckv.data() + static_cast<std::size_t>(r) * (lora + rope_d);
+
+        std::copy_n(src, lora, slot);
+        f32::rmsnorm(std::span<float>(slot, lora), w.kv_a_norm, lora, kLatentNormEps);
+        std::copy_n(src + lora, rope_d, slot + lora);
+        rope_at(slot + lora, rope_d, p, inv_freq, cs_scale);
+
+        for (std::uint32_t h = 0; h < H; ++h) {
+            rope_at(q.data() + (static_cast<std::size_t>(r) * H + h) * qk + nope,
+                    rope_d,
+                    p,
+                    inv_freq,
+                    cs_scale);
+        }
+    }
+
+    // ── DSA: this step's key selection, per row ──────────────────────────────
+    const DsaSelection* sel = nullptr;
+    if (is_dsa) {
+        if (w.has_indexer) {
+            auto* fresh = new DsaSelection();
+            ws.arch_state.adopt(fresh, [](void* p) { delete static_cast<DsaSelection*>(p); });
+            if (const auto rc =
+                    f32_index_select_kv(arch, w, x, qa.data(), n_rows, layer, rows, *fresh);
+                rc != StatusCode::Ok) {
+                return rc;
+            }
+            sel = fresh;
+        } else {
+            sel = ws.arch_state.as<DsaSelection>();
+            if (sel == nullptr) return StatusCode::InvalidArgument;
+        }
+        if (sel->n_tokens != n_rows) return StatusCode::InvalidArgument;
+    }
+
+    // ── attention ────────────────────────────────────────────────────────────
+    //
+    // The cache holds latents, so the keys and values this needs do not exist
+    // until kv_b expands them. Expanding ONLY the keys this row will actually
+    // attend to is where DSA pays for itself here: at GLM-5.2's index_topk of
+    // 2048 against a 32k context that is a sixteenth of the work, and the saving
+    // grows with context rather than shrinking.
+    //
+    // NOT the absorbed form. Folding kv_b into Q would let scoring happen in
+    // latent space and skip the expansion entirely, which is what
+    // `MlaSpec::absorb_weights` and `prepare_weights` exist for on the production
+    // path. This is the fp32 REFERENCE, and its job is to be obviously the same
+    // arithmetic as prefill so the two can be compared; a faster formulation that
+    // has never been checked against a slower one is how a decode path ends up
+    // subtly disagreeing with its own prefill.
+    std::vector<float> heads(static_cast<std::size_t>(n_rows) * H * vd, 0.0f);
+    std::vector<float> latents;
+    std::vector<float> kv;
+    std::vector<float> scores;
+    std::vector<std::uint32_t> keys;
+
+    for (std::uint32_t r = 0; r < n_rows; ++r) {
+        const auto& kvr = rows[r];
+        if (kvr.len == 0) return StatusCode::InvalidArgument;
+
+        keys.clear();
+        if (sel != nullptr) {
+            const auto picked = sel->for_query(r);
+            keys.assign(picked.begin(), picked.end());
+        } else {
+            keys.resize(kvr.len);
+            for (std::uint32_t j = 0; j < kvr.len; ++j)
+                keys[j] = j;
+        }
+        const auto n_sel = static_cast<std::uint32_t>(keys.size());
+        if (n_sel == 0) return StatusCode::InvalidArgument;
+
+        latents.resize(static_cast<std::size_t>(n_sel) * lora);
+        for (std::uint32_t i = 0; i < n_sel; ++i) {
+            std::copy_n(kvr.k_at(layer, keys[i]),
+                        lora,
+                        latents.data() + static_cast<std::size_t>(i) * lora);
+        }
+        kv.assign(static_cast<std::size_t>(n_sel) * H * (nope + vd), 0.0f);
+        soma::matmul(w.kv_b_proj, latents, n_sel, kv);
+
+        scores.resize(n_sel);
+        for (std::uint32_t h = 0; h < H; ++h) {
+            const float* qh = q.data() + (static_cast<std::size_t>(r) * H + h) * qk;
+            for (std::uint32_t i = 0; i < n_sel; ++i) {
+                const float* k_nope =
+                    kv.data() + (static_cast<std::size_t>(i) * H + h) * (nope + vd);
+                const float* kpe = kvr.k_at(layer, keys[i]) + lora;
+                float acc = f32::dot(
+                    std::span<const float>(qh, nope), std::span<const float>(k_nope, nope), nope);
+                acc += f32::dot(std::span<const float>(qh + nope, rope_d),
+                                std::span<const float>(kpe, rope_d),
+                                rope_d);
+                scores[i] = acc * scale;
+            }
+            f32::softmax(std::span<float>(scores.data(), n_sel), n_sel);
+
+            float* dst = heads.data() + (static_cast<std::size_t>(r) * H + h) * vd;
+            for (std::uint32_t i = 0; i < n_sel; ++i) {
+                const float* vv =
+                    kv.data() + (static_cast<std::size_t>(i) * H + h) * (nope + vd) + nope;
+                f32::axpy(scores[i], std::span<const float>(vv, vd), vd, std::span<float>(dst, vd));
+            }
+        }
+    }
+
+    soma::matmul(
+        w.o_proj, heads, n_rows, std::span<float>(out, static_cast<std::size_t>(n_rows) * d));
+    return StatusCode::Ok;
 }
 
 StatusCode f32_route(const ArchIr& arch,
@@ -810,8 +1090,16 @@ StatusCode f32_route(const ArchIr& arch,
 }
 
 const soma::F32Backend& f32_backend() noexcept {
-    static const soma::F32Backend kBackend{
-        "mla", &f32_bind_layer, &f32_attention, &f32_attention_kv, &f32_route};
+    static const soma::F32Backend kBackend = [] {
+        soma::F32Backend b{};
+        b.name = "mla";
+        b.bind_layer = &f32_bind_layer;
+        b.attention = &f32_attention;
+        b.kv_floats_per_layer = &f32_kv_floats_per_layer;
+        b.attention_kv = &f32_attention_kv;
+        b.route = &f32_route;
+        return b;
+    }();
     return kBackend;
 }
 
@@ -832,9 +1120,25 @@ std::size_t kv_bytes_per_token(const ArchIr& arch) noexcept {
     //
     // fp32 to match the GQA implementation's G0 cache dtype; the planner scales
     // by the configured KV dtype.
-    const auto& m = arch.attention.mla;
-    const std::size_t per_layer =
-        static_cast<std::size_t>(m.kv_lora_rank + m.qk_rope_head_dim) * sizeof(float);
+    //
+    // TWO PLANES, because two planes are what gets allocated.
+    //
+    // This counted one and was therefore wrong by exactly 2x — in the optimistic
+    // direction, like D26 — for the whole life of the backend. `KvCache::open`
+    // allocates a K and a V plane of equal width for EVERY family; GQA's
+    // kv_bytes_per_token says `2 * n_kv_heads * head_dim` and matches, MLA's said
+    // `kv_lora_rank + qk_rope_head_dim` and did not. Nothing caught it because
+    // nothing could: the cached path was a stub, so no MLA model ever allocated a
+    // cache it then had to fit in.
+    //
+    // What the second plane holds is DSA's indexer key — needed at every later
+    // step and impossible to recompute, since it depends on a past token's hidden
+    // state at this layer. For plain MLA it is allocated and unused, which is
+    // waste rather than an error; see the deferred table.
+    //
+    // On GLM-5.2 at 4096 context this is the difference between a reported 2.94 GB
+    // and a real 5.89 GB, against an 11.2 GiB expert cache on a 24 GiB host.
+    const std::size_t per_layer = 2ull * f32_kv_floats_per_layer(arch) * sizeof(float);
     return per_layer * arch.topology.n_layers;
 }
 

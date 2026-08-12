@@ -378,6 +378,15 @@ if(BUILD_TESTING)
     add_test(NAME soma_sampler_g3 COMMAND soma_sampler_g3)
 
     # ── G4 MLA positional path ────────────────────────────────────────────────
+    # The cached-decode path agrees with the teacher-forced one, for every family.
+    # Conformance cannot cover this: generate_greedy_f32 re-runs the PREFILL each
+    # step, so `attention_kv` never executes there — which is how MLA's could stay
+    # a stub returning Unsupported with every gate green.
+    add_executable(soma_decode_kv_g4 ${CMAKE_SOURCE_DIR}/tests/soma/decode_kv_g4.cpp)
+    target_link_libraries(soma_decode_kv_g4 PRIVATE mm_soma)
+    add_test(NAME soma_decode_kv_g4
+             COMMAND soma_decode_kv_g4 "${CMAKE_SOURCE_DIR}/tests/fixtures/tiny")
+
     add_executable(soma_mla_g4 ${CMAKE_SOURCE_DIR}/tests/soma/mla_g4.cpp)
     target_link_libraries(soma_mla_g4 PRIVATE mm_soma)
     add_test(NAME soma_mla_g4 COMMAND soma_mla_g4)

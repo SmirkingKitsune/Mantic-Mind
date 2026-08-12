@@ -8,9 +8,10 @@
 // from each of N sequences requires each row to attend over ITS OWN history, so
 // the history has to be stored per sequence rather than recomputed per call.
 //
-// Layout is [layer][position][kv_head * head_dim] — position-major within a
+// Layout is [layer][position][backend cache width] — position-major within a
 // layer, because a decode row appends exactly one position and then reads the
-// contiguous run [0, len). Head-major would scatter that read.
+// contiguous run [0, len). For GQA the width is kv_head * head_dim; MLA supplies
+// its compressed latent width through the resolved backend.
 
 #include "soma/arch_ir.hpp"
 #include "soma/types.hpp"
@@ -68,7 +69,7 @@ public:
 private:
     std::vector<float> k_, v_;
     std::uint32_t max_ctx_ = 0;
-    std::uint32_t hkv_ = 0; ///< n_kv_heads * head_dim
+    std::uint32_t hkv_ = 0; ///< backend cache width in floats, per plane
     std::uint32_t length_ = 0;
 };
 

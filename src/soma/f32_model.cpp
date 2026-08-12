@@ -720,7 +720,15 @@ void apply_glu_expert(const ArchIr& arch,
 Status KvCache::open(const ArchIr& arch, std::uint32_t max_ctx) {
     if (max_ctx == 0) return {StatusCode::InvalidArgument, "kv cache of zero context"};
     max_ctx_ = max_ctx;
-    hkv_ = arch.attention.n_kv_heads * arch.attention.head_dim;
+
+    // The width comes FROM the backend. `n_kv_heads * head_dim` is GQA's shape,
+    // and it was applied to every family — including one whose cache holds a
+    // compressed latent and no per-head K or V at all.
+    const auto* backend = resolve_f32_backend(arch);
+    hkv_ = (backend != nullptr && backend->kv_floats_per_layer != nullptr)
+               ? backend->kv_floats_per_layer(arch)
+               : arch.attention.n_kv_heads * arch.attention.head_dim;
+    if (hkv_ == 0) return {StatusCode::InvalidArgument, "kv cache of zero width"};
     const auto per_layer = static_cast<std::size_t>(max_ctx_) * hkv_;
     const auto total = per_layer * arch.topology.n_layers;
     k_.assign(total, 0.0f);

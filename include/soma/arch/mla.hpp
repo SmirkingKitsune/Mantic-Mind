@@ -241,6 +241,33 @@ StatusCode f32_attention(const ArchIr& arch,
                          soma::F32Workspace& ws,
                          float* out) noexcept;
 
+/// The decode-side selection: same scoring, keys read from the cache.
+///
+/// Separate from `f32_index_select` rather than a flag on it, for the reason the
+/// two attention entry points are separate — prefill owns the whole sequence and
+/// computes every key; this owns one position per row and must read the rest.
+StatusCode f32_index_select_kv(const ArchIr& arch,
+                               const F32AttnWeights& w,
+                               const float* x,
+                               const float* q_resid,
+                               std::uint32_t n_rows,
+                               LayerIndex layer,
+                               const soma::KvRow* rows,
+                               DsaSelection& out) noexcept;
+
+/// Floats per position per layer in one cache plane.
+///
+/// `kv_lora_rank + qk_rope_head_dim` — the compressed latent plus the single
+/// shared RoPE segment. Independent of head count, which is the point.
+///
+/// DSA needs a second thing cached and the SECOND PLANE is where it goes. The
+/// two planes are called K and V by GQA's convention; MLA's V is derived from the
+/// latent rather than stored, so that plane would otherwise sit allocated and
+/// unused. The indexer's key is what fills it: `k_norm(wk(x))` roped, one vector
+/// per token, needed at every later step and impossible to recompute then because
+/// it depends on that token's hidden state at that layer.
+std::uint32_t f32_kv_floats_per_layer(const ArchIr& arch) noexcept;
+
 StatusCode f32_attention_kv(const ArchIr& arch,
                             const soma::F32LayerWeights& lw,
                             const float* x,

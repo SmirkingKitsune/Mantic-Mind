@@ -349,6 +349,22 @@ struct F32Backend {
                             F32Workspace& ws,
                             float* out) noexcept = nullptr;
 
+    /// Floats per position per layer in ONE cache plane.
+    ///
+    /// The cache's SHAPE is the backend's knowledge, and core had it hardcoded as
+    /// `n_kv_heads * head_dim` — GQA's formula, applied to every family. MLA does
+    /// not store per-head K and V at all; it stores a `kv_lora_rank` latent plus
+    /// one shared RoPE segment, which is the entire reason the architecture
+    /// exists. That mismatch is why the cached-decode path was a stub: there was
+    /// no width it could have been correct at.
+    ///
+    /// Same argument as `AttentionBackend::weight_bytes_per_layer` (roadmap D16),
+    /// and the seam check would refuse the alternative — a family branch in core.
+    ///
+    /// Null means "use the GQA default", so existing backends need not implement
+    /// it to keep working.
+    std::uint32_t (*kv_floats_per_layer)(const ArchIr& arch) noexcept = nullptr;
+
     /// The batched-decode form: one KvRow per row, each with its own cache,
     /// position and visible length.
     ///
