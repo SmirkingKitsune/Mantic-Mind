@@ -372,8 +372,17 @@ Status Scheduler::step() {
     }
 
     std::uint32_t prefill_rows = 0, decode_rows = 0;
-    const auto hkv = im.model->arch.attention.n_kv_heads * im.model->arch.attention.head_dim;
-    const auto stride = im.cfg.ctx_size * hkv;
+    // The row geometry comes FROM each sequence's cache, below. It used to be
+    // computed here as `n_kv_heads * head_dim` — GQA's formula, and a second copy
+    // of the one D36 moved behind `F32Backend::kv_floats_per_layer`. The
+    // allocation followed the backend and the addressing did not, so every
+    // MLA-family model indexed a buffer it was not shaped like. Writes and reads
+    // used the SAME wrong formula, so while the offsets stayed inside the
+    // allocation the arithmetic was still self-consistent and the output correct —
+    // which is why DeepSeek-V2-Lite served an unchanged token before and after
+    // this fix. Past the end of the allocation it is heap corruption: GLM-5.2's
+    // 78 layers reached 2.1x beyond it and segfaulted on the first request
+    // (roadmap D40).
 
     // ── chunked prefill, with two independent fairness limits ────────────────
     //
@@ -425,8 +434,8 @@ Status Scheduler::step() {
             KvRow r{};
             r.k_base = s->kv.k_at(0, 0);
             r.v_base = s->kv.v_at(0, 0);
-            r.stride = stride;
-            r.hkv = hkv;
+            r.stride = s->kv.stride();
+            r.hkv = s->kv.hkv();
             r.pos = s->kv.length() + j;
             // Attends over everything before it in this sequence INCLUDING the
             // earlier rows of this same chunk. That is sound because

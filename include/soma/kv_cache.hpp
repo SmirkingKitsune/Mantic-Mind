@@ -16,6 +16,7 @@
 #include "soma/arch_ir.hpp"
 #include "soma/types.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -52,6 +53,15 @@ public:
     /// walk live positions layer by layer.
     std::uint32_t hkv() const noexcept { return hkv_; }
 
+    /// Floats per layer in ONE plane — exactly `KvRow::stride`.
+    ///
+    /// Exposed so a caller building a KvRow takes the geometry FROM the buffer it
+    /// is about to point into, rather than recomputing it. Recomputing is how
+    /// `n_kv_heads * head_dim` ended up in the scheduler as well: correct for GQA,
+    /// and for MLA a width that has nothing to do with what was allocated
+    /// (roadmap D40).
+    std::size_t stride() const noexcept { return static_cast<std::size_t>(max_ctx_) * hkv_; }
+
     std::uint32_t n_layers() const noexcept {
         return hkv_ && max_ctx_ ? static_cast<std::uint32_t>(
                                       k_.size() / (static_cast<std::size_t>(max_ctx_) * hkv_))
@@ -82,7 +92,7 @@ private:
 struct KvRow {
     float* k_base = nullptr; ///< this sequence's K, layer 0
     float* v_base = nullptr;
-    std::uint32_t stride = 0; ///< floats per layer (max_ctx * hkv)
+    std::size_t stride = 0; ///< floats per layer (max_ctx * hkv)
     std::uint32_t hkv = 0;
     std::uint32_t pos = 0; ///< this row's absolute position (RoPE + write slot)
     std::uint32_t len = 0; ///< positions visible to it, INCLUDING pos

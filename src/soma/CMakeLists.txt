@@ -357,6 +357,10 @@ if(BUILD_TESTING)
 
     add_test(NAME soma_scheduler_g3
              COMMAND soma_scheduler_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures")
+    add_test(NAME soma_scheduler_mla_g3
+             COMMAND soma_scheduler_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "DeepSeek-V2-Lite")
+    add_test(NAME soma_scheduler_dsa_g3
+             COMMAND soma_scheduler_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "GLM-5.2")
 
     # ── G3 KV checkpoints and preemption ──────────────────────────────────────
     # preempt -> resume must reproduce the continuation byte-for-byte, and every
