@@ -180,6 +180,14 @@ def dump_reference(fixture: Path, out: Path, positions: int) -> None:
     # layer, in order, which is the only reason this is sound.
     import importlib
 
+    def _reinterleave(t):
+        """cat(rot(even), rot(odd)) -> interleaved (even, odd, even, odd, ...)."""
+        half = t.shape[-1] // 2
+        out = t.new_empty(t.shape)
+        out[..., 0::2] = t[..., :half]
+        out[..., 1::2] = t[..., half:]
+        return out
+
     mod = importlib.import_module(type(model.model.layers[0]).__module__)
     patched: list[tuple[str, object]] = []
     call_count = {"n": 0}
@@ -198,9 +206,38 @@ def dump_reference(fixture: Path, out: Path, positions: int) -> None:
         def make(orig_fn, label):
             def wrapper(q, k, *a, **kw):
                 out = orig_fn(q, k, *a, **kw)
+                qe, ke = out[0], out[1]
+
+                # DSA calls rope TWICE per `full` layer — once for the main
+                # attention (the interleave variant) and once for the indexer
+                # (the half-split one). A single shared counter therefore stopped
+                # meaning "layer" at GLM-5.2's very first layer, and every tap
+                # after it was filed against the wrong layer: q_pe_rot alternated
+                # between 4096 and 32768 elements, which is 4 attention heads and
+                # 32 INDEXER heads.
+                #
+                # The indexer's rotation is not one of these taps, so it is
+                # counted separately and not recorded. The counter that matters
+                # advances once per layer again.
+                if label == "apply_rotary_pos_emb" and "apply_rotary_pos_emb_interleave" in {
+                        f for f, _ in patched}:
+                    call_count["indexer"] = call_count.get("indexer", 0) + 1
+                    return out
+
                 idx = call_count["n"]
                 call_count["n"] += 1
-                qe, ke = out[0], out[1]
+
+                # The interleave variant READS interleaved pairs and WRITES them
+                # concatenated: out = cat(rot(even), rot(odd)). Same values, a
+                # permuted layout — which is invisible to attention, because q and
+                # k are permuted identically and their dot product is unchanged,
+                # and highly visible to a tap. The engine keeps the interleaved
+                # layout, so undo the permutation here rather than report a
+                # divergence of 1.6 that no amount of reading the rotation code
+                # explains.
+                if label == "apply_rotary_pos_emb_interleave":
+                    qe, ke = _reinterleave(qe), _reinterleave(ke)
+
                 records.append((idx, "q_pe_rot", qe.detach().float().numpy()))
                 records.append((idx, "k_pe_rot", ke.detach().float().numpy()))
                 return out

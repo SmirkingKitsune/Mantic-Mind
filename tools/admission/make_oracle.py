@@ -191,7 +191,31 @@ def shrink_dsa(cfg: dict[str, Any]) -> None:
     if "index_topk" not in cfg and "indexer_types" not in cfg:
         return
 
-    _shrink(cfg, "index_n_heads", 4)
+    # `index_n_heads` is deliberately NOT shrunk, and that is a correctness
+    # requirement rather than a size preference.
+    #
+    # An index score is `sum_h w[h] * relu(q[h].k)`, so it is EXACTLY 0.0 only
+    # when ReLU zeroes every head at once. The probability of that is ~2^-H, and
+    # ties at exactly the top-k cut are then resolved by whatever `torch.topk`
+    # does internally — which is neither ascending nor descending index and is not
+    # a property of the architecture at all.
+    #
+    # Measured on this fixture, scores that are exactly 0.0:
+    #
+    #     1 head  50.69%      3 heads 13.52%
+    #     2 heads 27.12%      4 heads  6.99%
+    #
+    # a clean halving per head, extrapolating to ~2e-8% at GLM-5.2's real 32.
+    # Shrinking to 4 therefore MANUFACTURED a tie in 47 of 768 selective queries.
+    # Soma reproduced the reference's selection on 721 of 721 queries where the
+    # cut was untied and on 7 of 47 where it was tied, which is exactly the
+    # signature of a correct implementation being graded on a coin flip: the
+    # fixture made token-exactness untestable at the only positions that exercise
+    # sparse selection.
+    #
+    # Keeping 32 heads costs a [1024, 48] wq_b — about 49k parameters, or 6% of
+    # the fixture. `index_head_dim` still shrinks, because head WIDTH does not
+    # affect the sign statistics that produce ties.
     _shrink(cfg, "index_head_dim", 32)
     _shrink(cfg, "index_topk", 64)
 

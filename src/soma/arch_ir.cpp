@@ -88,6 +88,24 @@ Status parse_rope(const json& j, RopeConfig& out) {
     }
     if (!scaling) return {};
 
+    // `rope_theta` MOVED INTO that block in the same migration, and reading only
+    // the top level is how this silently used 10000 for a model that says
+    // 8000000. GLM-5.2 states it nowhere else, so nothing was missing and nothing
+    // was malformed — the default simply applied.
+    //
+    // The failure is quiet in the worst way: every projection, norm and shape
+    // stays correct and only the rotation angles are wrong, so the model loads,
+    // runs, produces finite logits, and matches its reference EXACTLY at position
+    // 0 — where the rotation is the identity for any theta. It first appeared as
+    // a 1.8 max|diff| on the `k_pe_rot` tap with everything feeding it clean.
+    //
+    // Nested wins when present: transformers' `standardize_rope_params` writes the
+    // authoritative value there, and a config carrying both is a config mid-
+    // migration rather than a config with two opinions.
+    if (const auto it = scaling->find("rope_theta"); it != scaling->end() && it->is_number()) {
+        out.theta = it->get<float>();
+    }
+
     const auto kind = get_or<std::string>(
         *scaling, "rope_type", get_or<std::string>(*scaling, "type", "default"));
     if (kind == "yarn") {
@@ -260,8 +278,7 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
         return {StatusCode::Unsupported,
                 "no adapter for model_type '" + model_type +
                     "'; supported: olmoe, qwen3_moe, qwen2_moe, mixtral, deepseek_v2, "
-                    "deepseek_v3, glm_moe_dsa (glm_moe_dsa can be PLANNED but not served — "
-                    "see arch_supported in the plan document)"};
+                    "deepseek_v3, glm_moe_dsa"};
     }
 
     out = ArchIr{};

@@ -266,6 +266,32 @@ struct F32Workspace {
     /// that only debug builds would use.
     std::uint32_t current_layer = 0;
 
+    /// Backend-private state that outlives ONE layer but not one forward pass.
+    ///
+    /// The same opaque idiom `F32LayerWeights::attn` already uses, for the same
+    /// reason: the core must not learn what is inside. `ArchLayerPayload` holds a
+    /// void* and a deleter, and nothing here inspects it.
+    ///
+    /// DSA is what needs it. IndexShare means a `full` layer computes a top-k key
+    /// selection and the following `shared` layers REUSE it — on GLM-5.2, 57 of 78
+    /// layers own no indexer weights and cannot compute attention without a
+    /// selection produced by a different layer. That is cross-layer state, and the
+    /// workspace is where it belongs: it is per-forward, already threaded through
+    /// every layer, and the selection is recomputed each pass rather than carried
+    /// between steps, so nothing about it is per-sequence.
+    ///
+    /// A backend that needs no such state never touches it and pays a null
+    /// pointer. Deliberately NOT reset per layer — outliving the layer is the
+    /// entire point — but see `reset_arch_state()` for the per-forward boundary,
+    /// which matters because a stale selection from a previous prompt would be
+    /// silently wrong rather than an error.
+    ArchLayerPayload arch_state;
+
+    /// Called by the forward before layer 0. A selection computed for a different
+    /// prompt has the wrong length and the wrong contents, and reusing it would
+    /// produce plausible logits rather than a failure.
+    void reset_arch_state() noexcept { arch_state.reset(); }
+
     void reserve(const ArchIr& arch, std::uint32_t max_tokens);
 };
 

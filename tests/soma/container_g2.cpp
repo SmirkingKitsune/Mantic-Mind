@@ -333,18 +333,17 @@ int check_verdicts() {
 
 }  // namespace
 
-/// DESCRIBABLE is not SERVABLE, and the plan has to say which.
+/// Architecture support is derived from the backend registry, not hardcoded.
 ///
 /// Before GLM-5.2 those were the same question: a model_type with no adapter
 /// failed in adapt_hf_config and never reached a plan, so `arch_supported`
 /// defaulted to true and nothing ever set it — a field with a reader in
 /// admission and no producer anywhere.
 ///
-/// `glm_moe_dsa` separates them. Its expert half is ordinary and its economics
-/// compute exactly like any other MoE; its attention is MLA with a sparse key
-/// indexer, and `resolve_f32_backend` returns nullptr for MlaDsa because serving
-/// it through the plain MLA backend would run it as DENSE attention — finite,
-/// plausible, wrong.
+/// `glm_moe_dsa` used to separate them while its sparse key indexer was absent.
+/// It is now the positive case: the registry resolves the MLA backend, whose DSA
+/// branch selects keys before softmax. A synthetic unknown family below keeps the
+/// unsupported branch covered independently.
 ///
 /// Both directions are asserted. A check that only proved the refusal would pass
 /// just as well if `arch_supported` were hardcoded false.
@@ -412,16 +411,41 @@ int check_plan_vs_serve() {
     check(plan.total_routed_bytes > 0 && plan.bytes_per_token > 0,
           "routed set and bytes/token are real numbers");
 
-    check(!plan.arch_supported, "arch_supported is FALSE — nothing can serve MlaDsa");
-    check(plan.verdict == soma::Verdict::Reject,
-          "so the verdict is reject regardless of economics",
-          soma::to_string(plan.verdict));
+    // This case used to assert the opposite — "arch_supported is FALSE, nothing
+    // can serve MlaDsa" — which was true and was the whole point of the DSA work
+    // to change. It is kept, inverted, rather than deleted: `arch_supported` is
+    // DERIVED from resolve_f32_backend rather than declared anywhere, so this is
+    // what catches the family being silently dropped from the registry.
+    check(plan.arch_supported, "arch_supported is TRUE — the DSA backend serves MlaDsa");
+
     // The two rejects call for opposite responses — economics can change on a
     // bigger host, a missing backend cannot change on any host — so the reason
-    // has to distinguish them.
-    check(plan.verdict_reason.find("no backend") != std::string::npos,
-          "and says WHY, so it is not read as an economic reject",
+    // still has to distinguish them, now in the other direction. GLM-5.2 at 24 GiB
+    // is refused on THROUGHPUT (roadmap D21), and reading that as "unsupported"
+    // would send someone looking for a backend that is already there.
+    check(plan.verdict_reason.find("no backend") == std::string::npos,
+          "and is no longer refused for want of a backend",
           plan.verdict_reason.substr(0, 46));
+
+    // The "describable but not servable" branch itself, exercised directly.
+    //
+    // Every family the adapter can describe can now also be served, so no config
+    // reaches that branch any more — and a branch with no test is a branch that
+    // rots. Forcing the family is honest here: it is precisely the state a new
+    // architecture lands in the day its adapter is written and its backend is not.
+    {
+        soma::ArchIr unserved = arch;
+        unserved.attention.family = soma::AttentionFamily::Unknown;
+        soma::PlanDocument up;
+        const auto ust = soma::compute_plan(unserved, b, up);
+        check(ust.ok() && !up.arch_supported,
+              "an adapted-but-unbacked family still plans, unsupported",
+              ust.ok() ? "" : ust.message());
+        check(up.verdict == soma::Verdict::Reject &&
+                  up.verdict_reason.find("no backend") != std::string::npos,
+              "and says WHY, so it is not read as an economic reject",
+              up.verdict_reason.substr(0, 46));
+    }
 
     // The control. Without it, hardcoding arch_supported=false would pass
     // everything above.
@@ -693,7 +717,7 @@ int main(int argc, char** argv) {
     std::cout << "\nverdict function vs schemas/arch-ir.md §8\n";
     failures += check_verdicts();
 
-    std::cout << "\ndescribable is not servable (glm_moe_dsa)\n";
+    std::cout << "\nbackend-derived architecture support (glm_moe_dsa)\n";
     failures += check_plan_vs_serve();
 
     std::cout << "\nthe verdict varies by host AND quantization\n";

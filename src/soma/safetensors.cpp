@@ -7,6 +7,22 @@
 #include <filesystem>
 #include <fstream>
 #include <unordered_map>
+#include <utility>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -16,6 +32,134 @@ namespace soma {
 namespace {
 
 constexpr std::uint64_t kMaxHeaderBytes = 256ull * 1024 * 1024;
+
+/// A read-only view of a file's bytes, WITHOUT committing them to the process.
+///
+/// This used to be `read_whole_file` into a `std::vector<std::byte>`, and for the
+/// four-megabyte fixtures that was indistinguishable from what it is now. On
+/// GLM-5.2 it was the difference between loading and not: the F32 dense half is
+/// 69.3 GiB, `conform` was measured peaking at 73.54 GiB of PRIVATE memory, and
+/// the plan for that same container promises a 24 GiB host (roadmap D26).
+///
+/// Committing was never necessary. Quantized roles read each tensor ONCE, convert
+/// it, and never look at the source again; roles that stay F32 — the router, by
+/// deliberate design — keep a `WeightRef` pointing at these bytes for the model's
+/// lifetime. A mapping serves both: pages arrive on demand, the pages consumed by
+/// quantization are clean and reclaimable the moment the OS wants them back, and
+/// the handful still referenced stay because they are still referenced.
+///
+/// What this does NOT do is change what a TensorView is. `bytes` is still a span
+/// over a stable address range for the reader's lifetime, so every caller is
+/// unaffected — which is the reason this fix is a file-mapping swap rather than a
+/// redesign of the loader.
+class MappedFile {
+public:
+    MappedFile() = default;
+    MappedFile(const MappedFile&) = delete;
+    MappedFile& operator=(const MappedFile&) = delete;
+
+    MappedFile(MappedFile&& o) noexcept { swap(o); }
+
+    MappedFile& operator=(MappedFile&& o) noexcept {
+        if (this != &o) {
+            reset();
+            swap(o);
+        }
+        return *this;
+    }
+
+    ~MappedFile() { reset(); }
+
+    Status open(const fs::path& path) {
+        reset();
+        std::error_code ec;
+        const auto file_size = fs::file_size(path, ec);
+        if (ec) {
+            return {StatusCode::IoError, "cannot stat " + path.string() + ": " + ec.message()};
+        }
+        size_ = static_cast<std::size_t>(file_size);
+        if (size_ == 0) return {};
+
+#ifdef _WIN32
+        file_ = ::CreateFileW(path.wstring().c_str(),
+                              GENERIC_READ,
+                              FILE_SHARE_READ,
+                              nullptr,
+                              OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL,
+                              nullptr);
+        if (file_ == INVALID_HANDLE_VALUE) {
+            return {StatusCode::IoError,
+                    "cannot open " + path.string() + ": error " + std::to_string(::GetLastError())};
+        }
+        mapping_ = ::CreateFileMappingW(file_, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (mapping_ == nullptr) {
+            const auto err = ::GetLastError();
+            reset();
+            return {StatusCode::IoError,
+                    "cannot map " + path.string() + ": error " + std::to_string(err)};
+        }
+        data_ = ::MapViewOfFile(mapping_, FILE_MAP_READ, 0, 0, 0);
+        if (data_ == nullptr) {
+            const auto err = ::GetLastError();
+            reset();
+            return {StatusCode::IoError,
+                    "cannot view " + path.string() + ": error " + std::to_string(err)};
+        }
+#else
+        fd_ = ::open(path.c_str(), O_RDONLY);
+        if (fd_ < 0) return {StatusCode::IoError, "cannot open " + path.string()};
+        void* p = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0);
+        if (p == MAP_FAILED) {
+            reset();
+            return {StatusCode::IoError, "cannot map " + path.string()};
+        }
+        data_ = p;
+#endif
+        return {};
+    }
+
+    const std::byte* data() const noexcept { return static_cast<const std::byte*>(data_); }
+
+    std::size_t size() const noexcept { return size_; }
+
+private:
+    void swap(MappedFile& o) noexcept {
+        std::swap(data_, o.data_);
+        std::swap(size_, o.size_);
+#ifdef _WIN32
+        std::swap(file_, o.file_);
+        std::swap(mapping_, o.mapping_);
+#else
+        std::swap(fd_, o.fd_);
+#endif
+    }
+
+    void reset() noexcept {
+#ifdef _WIN32
+        if (data_ != nullptr) ::UnmapViewOfFile(data_);
+        if (mapping_ != nullptr) ::CloseHandle(mapping_);
+        if (file_ != INVALID_HANDLE_VALUE) ::CloseHandle(file_);
+        mapping_ = nullptr;
+        file_ = INVALID_HANDLE_VALUE;
+#else
+        if (data_ != nullptr && size_ > 0) ::munmap(const_cast<void*>(data_), size_);
+        if (fd_ >= 0) ::close(fd_);
+        fd_ = -1;
+#endif
+        data_ = nullptr;
+        size_ = 0;
+    }
+
+    const void* data_ = nullptr;
+    std::size_t size_ = 0;
+#ifdef _WIN32
+    HANDLE file_ = INVALID_HANDLE_VALUE;
+    HANDLE mapping_ = nullptr;
+#else
+    int fd_ = -1;
+#endif
+};
 
 Status read_whole_file(const fs::path& path, std::vector<std::byte>& out) {
     std::error_code ec;
@@ -72,15 +216,17 @@ Status parse_safetensors_dtype(std::string_view text, DType& out) {
 }
 
 struct SafeTensors::Impl {
-    // One buffer per shard, kept alive because TensorView::bytes points into it.
-    std::vector<std::vector<std::byte>> buffers;
+    // One mapping per shard, kept alive because TensorView::bytes points into it.
+    // Reallocation is safe: moving a MappedFile transfers the mapping's ADDRESS
+    // rather than the bytes, so spans handed out earlier stay valid — the same
+    // property the vector-of-vector this replaced relied on.
+    std::vector<MappedFile> buffers;
     std::unordered_map<std::string, TensorView> tensors;
     std::uint64_t bytes_loaded = 0;
 
     Status ingest(const fs::path& path) {
-        buffers.emplace_back();
-        auto& buf = buffers.back();
-        if (auto st = read_whole_file(path, buf); !st.ok()) return st;
+        auto& buf = buffers.emplace_back();
+        if (auto st = buf.open(path); !st.ok()) return st;
 
         if (buf.size() < sizeof(std::uint64_t)) {
             return {StatusCode::InvalidArgument, path.string() + ": too small for a header"};

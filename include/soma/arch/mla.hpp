@@ -175,7 +175,60 @@ struct F32AttnWeights {
     /// until you notice the payload is the backend's per-layer state and not
     /// specifically its attention weights. Empty on V2 and on dense layers.
     std::span<const float> e_score_bias;
+
+    /// DSA's indexer. Bound only on `full` layers — `shared` layers own NO
+    /// indexer tensors at all (57 of GLM-5.2's 78), so absence here is the
+    /// architecture rather than a missing weight.
+    ///
+    /// `wq_b` reads the SAME `q_resid` the main query path produces when query
+    /// LoRA is present, or the hidden state for a direct-query MLA variant.
+    /// Either way there is no second down-projection.
+    struct Indexer {
+        soma::WeightRef wq_b;         ///< [n_index_heads*index_head_dim, q_lora_rank or d_model]
+        soma::WeightRef wk;           ///< [index_head_dim, d_model] — ONE head, shared
+        soma::WeightRef weights_proj; ///< [n_index_heads, d_model] — per-head mixing
+
+        /// A true LayerNorm: mean-centred, with a BIAS. Not the RMSNorm used
+        /// everywhere else in this model, and `k_norm.bias` is the only bias in
+        /// the entire attention block — which is the tell that it is not an RMS.
+        std::span<const float> k_norm_w, k_norm_b;
+    };
+
+    bool has_indexer = false;
+    Indexer idx;
 };
+
+/// One `full` layer's key selection, reused by the `shared` layers after it.
+///
+/// Lives in `F32Workspace::arch_state`, so the core never sees this type. The
+/// entries are KEY POSITIONS, which is what makes sharing sound: a position means
+/// the same thing in every layer even though each layer's keys differ.
+struct DsaSelection {
+    std::uint32_t n_tokens = 0;
+    std::uint32_t stride = 0;          ///< allocated top-k slots per query
+    std::vector<std::uint32_t> keys;   ///< [n_tokens * stride]
+    std::vector<std::uint32_t> counts; ///< selected count per query (<= stride)
+
+    /// True when every query kept every key it was allowed to attend. Recorded
+    /// rather than inferred because it is the condition under which DSA is
+    /// bit-identical to dense MLA — a test run entirely inside it proves nothing
+    /// about the indexer, and the harness needs to be able to SAY so.
+    bool dense_equivalent = false;
+
+    std::span<const std::uint32_t> for_query(std::uint32_t t) const noexcept {
+        return {keys.data() + static_cast<std::size_t>(t) * stride, counts[t]};
+    }
+};
+
+/// Compute one `full` layer's selection. Exposed rather than kept internal so the
+/// conformance harness can check the SELECTION, not only the logits it leads to.
+StatusCode f32_index_select(const ArchIr& arch,
+                            const F32AttnWeights& w,
+                            const float* x,
+                            const float* q_resid,
+                            std::uint32_t n_tokens,
+                            std::uint32_t pos_base,
+                            DsaSelection& out) noexcept;
 
 StatusCode f32_bind_layer(const ArchIr& arch,
                           const soma::LayerBindCtx& ctx,

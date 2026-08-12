@@ -2,22 +2,22 @@
   "fixture_version": 1,
   "generate": 256,
   "greedy_first_16": [
-    378,
-    378,
-    378,
-    378,
-    378,
-    378,
-    378,
-    378,
-    378,
-    378,
-    378,
-    378,
-    378,
-    378,
-    378,
-    378
+    198,
+    455,
+    198,
+    455,
+    455,
+    455,
+    455,
+    54,
+    455,
+    274,
+    198,
+    216,
+    455,
+    274,
+    198,
+    216
   ],
   "implementation": "native",
   "layer_kinds": [
@@ -30,18 +30,18 @@
     "moe",
     "moe"
   ],
-  "n_params": 849856,
+  "n_params": 1029056,
   "numpy_version": "2.4.6",
   "positions": 512,
   "seed": 20260727,
   "slug": "GLM-5.2",
-  "source": "models/zai-org/GLM-5.2",
+  "source": "Z:/AI/Ubiquitious-Memories/Mantic-Mind/models/zai-org/GLM-5.2",
   "source_architectures": [
     "GlmMoeDsaForCausalLM"
   ],
   "source_model_type": "glm_moe_dsa",
-  "tf_logits_sha256": "d5da799516a25da3fbc0f93d1decb4f04144492d5ec4ecaaa6d728c70b8685e2",
+  "tf_logits_sha256": "bc2ec3a9531b8909198f4e1303a33646060982ebf36204b9e4ecc1638416a660",
   "torch_version": "2.13.0+cpu",
   "transformers_version": "5.12.1",
-  "weights_sha256": "318e1118ab5686e9e01a233b4166814c9112416aeb7d669520725a40d6daabe0"
+  "weights_sha256": "97327977c124a7594adb17467268d33483fa26d5102c5407ddc6510296cf225f"
 }

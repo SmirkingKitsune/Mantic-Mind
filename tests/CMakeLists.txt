@@ -60,6 +60,28 @@ add_test(NAME mm_reliability_tests COMMAND mm_reliability_tests)
 # scope that ran them, and src/soma is a sibling, not a parent.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 
+# Prefer the admission venv, because the interpreter decides whether these tests
+# TEST anything.
+#
+# find_package returns the system interpreter, which has no numpy. The two tests
+# that convert fixtures skip on ImportError and return 0, so ctest printed
+# "mm_fused_experts ... Passed" in 0.11 s while running nothing at all — D4's
+# byte-identity check has never once executed in the suite. A green run that
+# proves nothing is worse than a red one (roadmap D28).
+#
+# Two changes: look here first, and — below — make a skip REPORT as skipped so
+# the next missing dependency is visible instead of silently green.
+set(MM_ADMISSION_PY "${Python3_EXECUTABLE}")
+foreach(candidate
+        "${CMAKE_SOURCE_DIR}/tools/admission/.venv/Scripts/python.exe"
+        "${CMAKE_SOURCE_DIR}/tools/admission/.venv/bin/python")
+    if(EXISTS "${candidate}")
+        set(MM_ADMISSION_PY "${candidate}")
+        break()
+    endif()
+endforeach()
+message(STATUS "admission tests will run under: ${MM_ADMISSION_PY}")
+
 #
 # MM_TEST_PYTHON drives the fetch stage against a STUB fetch.py. The stage is
 # the only one that touches the network, so it is the only one that cannot be
@@ -92,7 +114,25 @@ if(Python3_Interpreter_FOUND)
     # the two readers against each other on the same weights rather than
     # trusting either. Skips itself when numpy/safetensors are absent.
     add_test(NAME mm_fused_experts
-             COMMAND "${Python3_EXECUTABLE}"
+             COMMAND "${MM_ADMISSION_PY}"
                      "${CMAKE_SOURCE_DIR}/tools/ci/check_fused_experts.py"
                      "${CMAKE_SOURCE_DIR}")
+
+    # verify_payload.py is what stands between a 460 GB expert payload and an
+    # admission that never read it (roadmap D27). A checker nobody has broken on
+    # purpose reports "OK" for reasons unknown, so this damages a good container
+    # five ways and requires the RIGHT pass to catch each — including a two-expert
+    # swap, which leaves every offset and length perfect and is visible only to
+    # the decode pass's decoy margin. Skips itself when numpy/safetensors/torch
+    # are absent.
+    add_test(NAME mm_verify_payload
+             COMMAND "${MM_ADMISSION_PY}"
+                     "${CMAKE_SOURCE_DIR}/tools/ci/check_verify_payload.py"
+                     "${CMAKE_CURRENT_BINARY_DIR}/verify_payload_tmp")
+
+    # 77 is ctest's conventional "skipped". Without this a missing dependency
+    # exits 0 and reads as Passed, which is how mm_fused_experts ran nothing for
+    # its whole existence while showing green.
+    set_tests_properties(mm_fused_experts mm_verify_payload PROPERTIES
+                         SKIP_RETURN_CODE 77)
 endif()

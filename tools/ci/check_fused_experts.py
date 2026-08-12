@@ -49,15 +49,18 @@ def refuse(msg: str) -> int:
 def main(argv: list[str]) -> int:
     root = Path(argv[1] if len(argv) > 1 else ".").resolve()
     src = root / FIXTURE
+    # 77, not 0: ctest is configured with SKIP_RETURN_CODE 77, so a skip prints
+    # as "Skipped". Returning 0 is what let this test report Passed in 0.11 s
+    # without importing numpy, for its whole existence (roadmap D28).
     if not (src / "model.safetensors").is_file():
         print(f"check_fused_experts: SKIP — no {FIXTURE}")
-        return 0
+        return 77
     try:
         import numpy as np
         from safetensors.numpy import load_file, save_file
     except ImportError as e:
         print(f"check_fused_experts: SKIP — {e}")
-        return 0
+        return 77
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)

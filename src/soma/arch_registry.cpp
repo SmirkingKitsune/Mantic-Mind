@@ -32,10 +32,15 @@ const F32Backend* resolve_f32_backend(const ArchIr& arch) noexcept {
         return &arch::mla::f32_backend();
 
     case AttentionFamily::MlaDsa:
-        // DSA adds a sparse key indexer on top of MLA. Sharing the MLA
-        // backend would run it as dense attention: finite, plausible, and
-        // not the model that was asked for.
-        return nullptr;
+        // DSA is MLA plus a sparse key indexer, so it IS the MLA backend — which
+        // branches on the family internally to select keys before the softmax.
+        //
+        // This returned nullptr until the indexer existed, and that was the right
+        // answer while it did not: sharing the backend then would have run GLM-5.2
+        // as dense attention — finite, plausible, and not the model that was
+        // asked for. `arch_supported` is derived from this function rather than
+        // declared, so flipping this line is what makes the plan's verdict change.
+        return &arch::mla::f32_backend();
 
     case AttentionFamily::Unknown:
         return nullptr;

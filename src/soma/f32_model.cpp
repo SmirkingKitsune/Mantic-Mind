@@ -94,6 +94,109 @@ std::string layer_prefix(std::uint32_t layer) {
     return "model.layers." + std::to_string(layer) + '.';
 }
 
+/// Bind one already-located [rows, cols] block of f32, quantizing per the role.
+///
+/// The tail of `bind_weight`, split out so the fused expert reader can reuse it
+/// on a SLICE of a rank-3 tensor. Duplicating those six lines instead would mean
+/// the two paths could drift on which spec they consult.
+Status bind_block(F32Model& model,
+                  std::span<const float> src,
+                  std::uint32_t rows,
+                  std::uint32_t cols,
+                  TensorRole role,
+                  WeightRef& out) {
+    const QuantSpec& spec = model.quant_map.for_role(role);
+    if (!is_quantized(spec.dtype)) {
+        out = WeightRef::from_f32(src, rows, cols);
+        return {};
+    }
+    model.quantized.emplace_back();
+    if (auto s = quantize_tensor(src,
+                                 rows,
+                                 cols,
+                                 spec.dtype,
+                                 spec.group ? spec.group : kDefaultGroup,
+                                 model.quantized.back());
+        !s.ok()) {
+        return s;
+    }
+    out = WeightRef::from_q(model.quantized.back());
+    return {};
+}
+
+/// The FUSED expert layout: every expert stacked into one rank-3 tensor.
+///
+/// Shapes are checked against the IR rather than inferred from the tensor, so a
+/// checkpoint whose intermediate size disagrees with its config fails here
+/// instead of producing a container that loads and computes nonsense.
+Status bind_fused_experts(F32Model& model,
+                          const TensorView& gate_up,
+                          const TensorView& down,
+                          std::uint32_t layer,
+                          F32LayerWeights& lw) {
+    const auto& arch = model.arch;
+    const auto E = arch.router.n_experts;
+    const auto d = arch.topology.d_model;
+    const auto inter = arch.ffn.expert_intermediate;
+    const auto where = "layer " + std::to_string(layer) + " fused experts: ";
+
+    if (gate_up.rank() != 3 || down.rank() != 3) {
+        return {StatusCode::InvalidArgument, where + "expected rank-3 gate_up_proj and down_proj"};
+    }
+    if (gate_up.dtype != DType::F32 || down.dtype != DType::F32) {
+        return {StatusCode::Unsupported, where + "not fp32 in the checkpoint"};
+    }
+    const auto want_gu = std::array<std::int64_t, 3>{E, 2 * static_cast<std::int64_t>(inter), d};
+    const auto want_dn = std::array<std::int64_t, 3>{E, d, inter};
+    for (std::size_t i = 0; i < 3; ++i) {
+        if (gate_up.dim(i) != want_gu[i] || down.dim(i) != want_dn[i]) {
+            return {StatusCode::InvalidArgument,
+                    where + "shapes [" + std::to_string(gate_up.dim(0)) + "," +
+                        std::to_string(gate_up.dim(1)) + "," + std::to_string(gate_up.dim(2)) +
+                        "] / [" + std::to_string(down.dim(0)) + "," + std::to_string(down.dim(1)) +
+                        "," + std::to_string(down.dim(2)) + "] disagree with the IR's " +
+                        std::to_string(E) + " experts x " + std::to_string(inter) +
+                        " intermediate x " + std::to_string(d) + " d_model"};
+        }
+    }
+
+    const auto gu = gate_up.f32();
+    const auto dn = down.f32();
+    const auto gu_stride = static_cast<std::size_t>(2) * inter * d;
+    const auto dn_stride = static_cast<std::size_t>(d) * inter;
+    const auto half = static_cast<std::size_t>(inter) * d;
+
+    for (std::uint32_t e = 0; e < E; ++e) {
+        // gate = rows [0, inter), up = rows [inter, 2*inter). CONTIGUOUS, not
+        // interleaved — see the caller.
+        if (auto s = bind_block(model,
+                                gu.subspan(e * gu_stride, half),
+                                inter,
+                                d,
+                                TensorRole::ExpertGate,
+                                lw.expert_gate[e]);
+            !s.ok())
+            return s;
+        if (auto s = bind_block(model,
+                                gu.subspan(e * gu_stride + half, half),
+                                inter,
+                                d,
+                                TensorRole::ExpertUp,
+                                lw.expert_up[e]);
+            !s.ok())
+            return s;
+        if (auto s = bind_block(model,
+                                dn.subspan(e * dn_stride, dn_stride),
+                                d,
+                                inter,
+                                TensorRole::ExpertDown,
+                                lw.expert_down[e]);
+            !s.ok())
+            return s;
+    }
+    return {};
+}
+
 } // namespace
 
 // ── the loader half of the bind seam ─────────────────────────────────────────
@@ -257,8 +360,22 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
 
     // Reserve BEFORE any WeightRef is taken: every ref points into this vector
     // and a reallocation would dangle all of them at once.
+    //
+    // Counted rather than guessed, because the cost of being one short is not a
+    // slow path, it is every previously-bound weight pointing at freed memory.
+    // Worst case for ONE layer, quantized roles only (Router is F32 by rule and
+    // never lands here):
+    //
+    //   attention   5  q_a + q_b (or q_proj) + kv_a + kv_b + o
+    //   indexer     3  wq_b + wk + weights_proj      — DSA `full` layers
+    //   routed    3*E  when the experts are not streamed
+    //   shared      3  gate + up + down
+    //   dense FFN   3  on `first_k_dense_replace` layers
+    //
+    // = 3*E + 14. The previous budget was 3*E + 10, which predates the indexer and
+    // was already exactly at the limit for a shared-expert MoE layer.
     out.quantized.reserve(static_cast<std::size_t>(arch.topology.n_layers) *
-                              (4 + 3 * static_cast<std::size_t>(arch.router.n_experts) + 6) +
+                              (3 * static_cast<std::size_t>(arch.router.n_experts) + 14) +
                           2);
     if (auto s = bind_tensor(out.weights, "model.embed_tokens.weight", out.embed); !s.ok())
         return s;
@@ -333,20 +450,51 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
                 lw.expert_gate.resize(arch.router.n_experts);
                 lw.expert_up.resize(arch.router.n_experts);
                 lw.expert_down.resize(arch.router.n_experts);
-                for (std::uint32_t e = 0; e < arch.router.n_experts; ++e) {
-                    const auto ep = p + nm.moe_block + ".experts." + std::to_string(e) + '.';
-                    if (auto s = bind_weight(
-                            out, ep + nm.expert_gate, TensorRole::ExpertGate, lw.expert_gate[e]);
-                        !s.ok())
+
+                // Two layouts exist upstream and this reads both, exactly as
+                // convert.py does (roadmap D4).
+                //
+                //   per-expert  experts.<i>.{gate,up,down}_proj.weight
+                //   fused       experts.gate_up_proj [E, 2*inter, d_model]
+                //               experts.down_proj    [E, d_model, inter]
+                //
+                // The converter learned the fused layout first, which left the
+                // engine able to CONVERT GLM-5.2 and unable to load the source it
+                // was converted from — so conformance, which runs against the fp32
+                // source, could not run at all.
+                //
+                // The gate/up split is CONTIGUOUS rows, gate first, and that was
+                // settled by measurement rather than by reading: reconstructing
+                // from rows [0:inter] and [inter:] reproduces the reference's
+                // `chunk(2, dim=-1)` at 0.0e+00 while the interleaved reading is
+                // off by 1.35. gpt_oss stores the same concept interleaved, which
+                // is why guessing was refused.
+                const auto ep = p + nm.moe_block + ".experts.";
+                const auto* fused_gu = out.weights.find(ep + "gate_up_proj");
+                const auto* fused_dn = out.weights.find(ep + "down_proj");
+                if (fused_gu != nullptr && fused_dn != nullptr) {
+                    if (auto s = bind_fused_experts(out, *fused_gu, *fused_dn, l, lw); !s.ok())
                         return s;
-                    if (auto s = bind_weight(
-                            out, ep + nm.expert_up, TensorRole::ExpertUp, lw.expert_up[e]);
-                        !s.ok())
-                        return s;
-                    if (auto s = bind_weight(
-                            out, ep + nm.expert_down, TensorRole::ExpertDown, lw.expert_down[e]);
-                        !s.ok())
-                        return s;
+                } else {
+                    for (std::uint32_t e = 0; e < arch.router.n_experts; ++e) {
+                        const auto pe = ep + std::to_string(e) + '.';
+                        if (auto s = bind_weight(out,
+                                                 pe + nm.expert_gate,
+                                                 TensorRole::ExpertGate,
+                                                 lw.expert_gate[e]);
+                            !s.ok())
+                            return s;
+                        if (auto s = bind_weight(
+                                out, pe + nm.expert_up, TensorRole::ExpertUp, lw.expert_up[e]);
+                            !s.ok())
+                            return s;
+                        if (auto s = bind_weight(out,
+                                                 pe + nm.expert_down,
+                                                 TensorRole::ExpertDown,
+                                                 lw.expert_down[e]);
+                            !s.ok())
+                            return s;
+                    }
                 }
             }
             if (arch.router.n_shared_experts > 0) {
@@ -762,6 +910,11 @@ Status forward_impl(const F32Model& model,
                     d,
                     ws.hidden.begin() + static_cast<std::size_t>(t) * d);
     }
+
+    // A selection computed for a previous prompt has the wrong length and the
+    // wrong contents. Dropping it here means a backend that forgets to publish one
+    // fails on the next forward instead of silently reusing the last.
+    ws.reset_arch_state();
 
     for (std::uint32_t l = 0; l < arch.topology.n_layers; ++l) {
         const auto& lw = model.layers[l];

@@ -142,6 +142,63 @@ void rope_at(float* v,
     }
 }
 
+/// The OTHER convention, in the same attention block.
+///
+/// `rotate_half` above: pairs (i, i + R/2), which is what `apply_rotary_pos_emb`
+/// computes as `v*cos + rotate_half(v)*sin` with `cos = cat(freqs, freqs)`. The
+/// MLA path a few lines up rotates INTERLEAVED pairs off the identical
+/// frequencies, and GLM-5.2's indexer uses this one — the reference documents the
+/// split explicitly ("the indexer uses NON-interleaved (half-split) RoPE — unlike
+/// the main MLA attention") and it is worth restating here, because the two
+/// differ only in which elements pair up. Choosing wrong leaves every norm,
+/// projection and score finite and plausible, and reorders the top-k.
+///
+/// Only the leading `dim` elements rotate; anything past that is the pass-through
+/// remainder (index_head_dim 32 vs qk_rope_head_dim 8 on the fixture) and must be
+/// left alone.
+void rope_half_split(float* v,
+                     std::uint32_t dim,
+                     std::uint32_t pos,
+                     const std::vector<float>& inv_freq) noexcept {
+    const auto half = dim / 2;
+    for (std::uint32_t i = 0; i < half; ++i) {
+        const float angle = static_cast<float>(pos) * inv_freq[i];
+        const float c = std::cos(angle);
+        const float s = std::sin(angle);
+        const float a = v[i];
+        const float b = v[i + half];
+        v[i] = a * c - b * s;
+        v[i + half] = b * c + a * s;
+    }
+}
+
+/// True LayerNorm — mean-centred, with a shift.
+///
+/// Written out rather than routed through `f32::rmsnorm` because they are not the
+/// same function: RMSNorm skips the mean and has no bias. This model uses RMSNorm
+/// everywhere EXCEPT here, and `indexer.k_norm.bias` — the only bias in the
+/// attention block — is the evidence that the exception is real.
+void layernorm(float* v,
+               std::uint32_t n,
+               std::span<const float> weight,
+               std::span<const float> bias) noexcept {
+    constexpr float kEps = 1e-6f; ///< nn.LayerNorm(head_dim, eps=1e-6)
+    float mean = 0.0f;
+    for (std::uint32_t i = 0; i < n; ++i)
+        mean += v[i];
+    mean /= static_cast<float>(n);
+    float var = 0.0f;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const float dv = v[i] - mean;
+        var += dv * dv;
+    }
+    var /= static_cast<float>(n);
+    const float inv = 1.0f / std::sqrt(var + kEps);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        v[i] = (v[i] - mean) * inv * weight[i] + bias[i];
+    }
+}
+
 } // namespace
 
 StatusCode f32_bind_layer(const ArchIr& arch,
@@ -192,6 +249,156 @@ StatusCode f32_bind_layer(const ArchIr& arch,
                                "mlp.gate.e_score_correction_bias",
                                w->e_score_bias,
                                /*optional=*/true);
+
+    // ── DSA indexer, on `full` layers only ───────────────────────────────────
+    //
+    // Which layers own one is read from the IR's per-layer map rather than
+    // re-derived from index_topk_freq + index_skip_topk_offset. Those two are in
+    // the config and they do reproduce GLM-5.2's pattern, but a stride plus an
+    // offset is a re-derivation waiting to disagree with the weights — the same
+    // argument Topology::layer_kinds settled, and the reason DsaSpec carries the
+    // map at all.
+    //
+    // ALL-OR-NOTHING is enforced. A `full` layer missing one of its five tensors
+    // is a broken conversion, and the alternative — quietly running it as
+    // `shared` — produces a model that loads and attends to the wrong keys.
+    const auto& dsa = arch.attention.dsa;
+    if (arch.attention.family == AttentionFamily::MlaDsa) {
+        if (ctx.layer >= dsa.layer_kinds.size()) return StatusCode::InvalidArgument;
+        if (dsa.layer_kinds[ctx.layer] == IndexerKind::Full) {
+            using soma::TensorRole;
+            if (!soma::bind_layer_weight(
+                     ctx, "self_attn.indexer.wq_b.weight", TensorRole::AttnProj, w->idx.wq_b)
+                     .ok() ||
+                !soma::bind_layer_weight(
+                     ctx, "self_attn.indexer.wk.weight", TensorRole::AttnProj, w->idx.wk)
+                     .ok() ||
+                !soma::bind_layer_weight(ctx,
+                                         "self_attn.indexer.weights_proj.weight",
+                                         TensorRole::AttnProj,
+                                         w->idx.weights_proj)
+                     .ok() ||
+                !soma::bind_layer_f32(ctx, "self_attn.indexer.k_norm.weight", w->idx.k_norm_w)
+                     .ok() ||
+                !soma::bind_layer_f32(ctx, "self_attn.indexer.k_norm.bias", w->idx.k_norm_b).ok()) {
+                return StatusCode::NotFound;
+            }
+            w->has_indexer = true;
+        }
+    }
+    return StatusCode::Ok;
+}
+
+StatusCode f32_index_select(const ArchIr& arch,
+                            const F32AttnWeights& w,
+                            const float* x,
+                            const float* q_resid,
+                            std::uint32_t n_tokens,
+                            std::uint32_t pos_base,
+                            DsaSelection& out) noexcept {
+    if (!w.has_indexer) return StatusCode::InvalidArgument;
+
+    const auto& m = arch.attention.mla;
+    const auto& dsa = arch.attention.dsa;
+    const auto d = arch.topology.d_model;
+    const auto H = dsa.n_index_heads;
+    const auto D = dsa.index_head_dim;
+    const auto R = m.qk_rope_head_dim; ///< rotated prefix; D - R passes through
+    if (H == 0 || D == 0 || R > D) return StatusCode::InvalidArgument;
+
+    const std::span<const float> xs(x, static_cast<std::size_t>(n_tokens) * d);
+    const std::span<const float> qr =
+        m.q_lora_rank > 0
+            ? std::span<const float>(q_resid, static_cast<std::size_t>(n_tokens) * m.q_lora_rank)
+            : xs;
+
+    // q from the SHARED residual, k from the hidden states. One k per token: the
+    // indexer is single-headed on the key side and mixes per-head on the query
+    // side instead, which is where its 2.9x comes from.
+    std::vector<float> iq(static_cast<std::size_t>(n_tokens) * H * D);
+    std::vector<float> ik(static_cast<std::size_t>(n_tokens) * D);
+    std::vector<float> mix(static_cast<std::size_t>(n_tokens) * H);
+    soma::matmul(w.idx.wq_b, qr, n_tokens, iq);
+    soma::matmul(w.idx.wk, xs, n_tokens, ik);
+    soma::matmul(w.idx.weights_proj, xs, n_tokens, mix);
+
+    std::vector<float> inv_freq;
+    yarn_inv_freq(arch.attention.rope, R, inv_freq);
+
+    for (std::uint32_t t = 0; t < n_tokens; ++t) {
+        // LayerNorm, NOT RMSNorm: mean-centred, unit-variance, then scale AND
+        // shift. Substituting the RMSNorm used everywhere else in this model
+        // leaves the keys plausible and the ordering wrong, which is invisible in
+        // every metric except the selection itself.
+        layernorm(ik.data() + static_cast<std::size_t>(t) * D, D, w.idx.k_norm_w, w.idx.k_norm_b);
+
+        // Half-split RoPE — pairs (i, i+R/2) — where the MLA path above rotates
+        // INTERLEAVED pairs (2i, 2i+1) off the same frequencies. Both conventions
+        // in one attention block, and the reference calls it out precisely
+        // because nothing downstream distinguishes them: wrong pairing yields
+        // finite, plausible scores and a differently-ordered top-k.
+        rope_half_split(ik.data() + static_cast<std::size_t>(t) * D, R, pos_base + t, inv_freq);
+        for (std::uint32_t h = 0; h < H; ++h) {
+            rope_half_split(
+                iq.data() + (static_cast<std::size_t>(t) * H + h) * D, R, pos_base + t, inv_freq);
+        }
+    }
+
+    const float softmax_scale = 1.0f / std::sqrt(static_cast<float>(D));
+    const float head_scale = 1.0f / std::sqrt(static_cast<float>(H));
+    const auto n_keys = pos_base + n_tokens;
+    const auto want =
+        dsa.index_topk == 0 ? n_keys : std::min<std::uint32_t>(dsa.index_topk, n_keys);
+
+    out.n_tokens = n_tokens;
+    out.stride = want;
+    out.keys.assign(static_cast<std::size_t>(n_tokens) * want, 0u);
+    out.counts.assign(n_tokens, 0u);
+    out.dense_equivalent = true;
+
+    std::vector<float> score;
+    std::vector<std::uint32_t> order;
+    for (std::uint32_t t = 0; t < n_tokens; ++t) {
+        const auto avail = pos_base + t + 1; // causal: keys 0..pos_base+t
+        score.assign(avail, 0.0f);
+
+        for (std::uint32_t h = 0; h < H; ++h) {
+            const float* qh = iq.data() + (static_cast<std::size_t>(t) * H + h) * D;
+            const float wgt = mix[static_cast<std::size_t>(t) * H + h] * head_scale;
+            for (std::uint32_t j = 0; j < avail; ++j) {
+                const float* kj = ik.data() + static_cast<std::size_t>(j) * D;
+                const float dot =
+                    f32::dot(std::span<const float>(qh, D), std::span<const float>(kj, D), D) *
+                    softmax_scale;
+                // ReLU BEFORE the head mix, not after. Clamping the mixed score
+                // instead would let a negative head cancel a positive one, and
+                // the whole point of the non-linearity is that it cannot.
+                score[j] += wgt * (dot > 0.0f ? dot : 0.0f);
+            }
+        }
+
+        const auto keep = std::min<std::uint32_t>(want, avail);
+        order.resize(avail);
+        for (std::uint32_t j = 0; j < avail; ++j)
+            order[j] = j;
+
+        // Keep ties deterministic by index. torch.topk does not promise the same
+        // tie-break, which is why the oracle preserves the real 32 index heads:
+        // shrinking that count manufactured exact-zero ties at the top-k cut and
+        // made token-exactness grade an implementation detail rather than DSA.
+        std::partial_sort(order.begin(),
+                          order.begin() + keep,
+                          order.end(),
+                          [&](std::uint32_t a, std::uint32_t b) {
+                              if (score[a] != score[b]) return score[a] > score[b];
+                              return a < b;
+                          });
+
+        std::sort(order.begin(), order.begin() + keep);
+        std::copy_n(order.begin(), keep, out.keys.begin() + static_cast<std::size_t>(t) * want);
+        out.counts[t] = keep;
+        if (keep < avail) out.dense_equivalent = false;
+    }
     return StatusCode::Ok;
 }
 
@@ -212,7 +419,24 @@ StatusCode f32_attention(const ArchIr& arch,
     const auto qk = nope + rope_d; // one query/key head
     const auto vd = m.v_head_dim;  // a DIFFERENT width
     const auto lora = m.kv_lora_rank;
-    const auto eps = arch.rms_norm_eps;
+    // MLA's two LATENT norms do NOT use the model's rms_norm_eps.
+    //
+    // `arch_ir.hpp` says the epsilon "applies to attention q/k norms, layer norms,
+    // and the output norm alike". That is false for this family, in BOTH of its
+    // reference implementations:
+    //
+    //   q_a_layernorm  = RMSNorm(config.q_lora_rank)                  <- default eps
+    //   kv_a_layernorm = RMSNorm(config.kv_lora_rank)                 <- default eps
+    //   input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+    //
+    // and the class default is 1e-6. DeepSeek-V2-Lite hid this for the whole life
+    // of the backend because its rms_norm_eps IS 1e-6, so the two agreed by
+    // coincidence. Moonlight and GLM-5.2 set 1e-5, and Moonlight's conformance
+    // error sat at 7.25e-05 — seventy times every other fixture, under the
+    // threshold, and unexplained — which is what this line was costing before
+    // GLM-5.2 made it fail outright.
+    constexpr float kLatentNormEps = 1e-6f;
+    const auto eps = kLatentNormEps;
 
     // ── the softmax scale, with YaRN's correction squared into it ────────────
     float scale = 1.0f / std::sqrt(static_cast<float>(qk));
@@ -264,10 +488,14 @@ StatusCode f32_attention(const ArchIr& arch,
 
     // ── queries ──────────────────────────────────────────────────────────────
     std::vector<float> q(static_cast<std::size_t>(n_tokens) * H * qk);
+    // Hoisted out of the branch below because DSA's indexer reads THIS tensor:
+    // its query is `wq_b(q_resid)` off the same normalised residual the main
+    // query path uses, not a projection of its own.
+    std::vector<float> qa;
     if (m.q_lora_rank == 0) {
         soma::matmul(w.q_proj, xs, n_tokens, q);
     } else {
-        std::vector<float> qa(static_cast<std::size_t>(n_tokens) * m.q_lora_rank);
+        qa.assign(static_cast<std::size_t>(n_tokens) * m.q_lora_rank, 0.0f);
         soma::matmul(w.q_a_proj, xs, n_tokens, qa);
         for (std::uint32_t t = 0; t < n_tokens; ++t) {
             f32::rmsnorm(std::span<float>(qa).subspan(static_cast<std::size_t>(t) * m.q_lora_rank,
@@ -355,15 +583,57 @@ StatusCode f32_attention(const ArchIr& arch,
         ws.sink(ws.current_layer, "q_pe_rot", qpe.data(), qpe.size());
     }
 
+    // ── DSA: which keys may this query attend to? ────────────────────────────
+    //
+    // A `full` layer computes the selection and publishes it; the `shared` layers
+    // after it reuse that one. IndexShare is not an optimisation applied on top of
+    // a working layer — 57 of GLM-5.2's 78 layers own no indexer weights and
+    // CANNOT produce a selection, so a missing one is a hard error rather than a
+    // reason to fall back to dense.
+    const DsaSelection* sel = nullptr;
+    if (arch.attention.family == AttentionFamily::MlaDsa) {
+        if (w.has_indexer) {
+            auto* fresh = new DsaSelection();
+            ws.arch_state.adopt(fresh, [](void* p) { delete static_cast<DsaSelection*>(p); });
+            if (const auto rc =
+                    f32_index_select(arch, w, x, qa.data(), n_tokens, /*pos_base=*/0, *fresh);
+                rc != StatusCode::Ok) {
+                return rc;
+            }
+            sel = fresh;
+        } else {
+            sel = ws.arch_state.as<DsaSelection>();
+            // Not a fallback to dense. A shared layer with nothing to share from
+            // means the layer map and the weights disagree, and attending to
+            // everything would be a different model that still produces text.
+            if (sel == nullptr) return StatusCode::InvalidArgument;
+        }
+        if (sel->n_tokens != n_tokens) return StatusCode::InvalidArgument;
+    }
+
     // ── attention ────────────────────────────────────────────────────────────
     std::vector<float> heads(static_cast<std::size_t>(n_tokens) * H * vd, 0.0f);
     std::vector<float> scores(n_tokens);
 
+    // The dense key list, built once. With no selection every query attends
+    // 0..t, which is both the non-DSA path and — when the context is shorter than
+    // index_topk — exactly what DSA itself degenerates to.
+    std::vector<std::uint32_t> dense_keys(n_tokens);
+    for (std::uint32_t j = 0; j < n_tokens; ++j)
+        dense_keys[j] = j;
+
     for (std::uint32_t t = 0; t < n_tokens; ++t) {
+        const std::span<const std::uint32_t> keys =
+            sel != nullptr ? sel->for_query(t)
+                           : std::span<const std::uint32_t>(dense_keys.data(), t + 1);
+        const auto n_sel = static_cast<std::uint32_t>(keys.size());
+        if (n_sel == 0) return StatusCode::InvalidArgument;
+
         for (std::uint32_t h = 0; h < H; ++h) {
             const float* qh = q.data() + (static_cast<std::size_t>(t) * H + h) * qk;
 
-            for (std::uint32_t j = 0; j <= t; ++j) {
+            for (std::uint32_t i = 0; i < n_sel; ++i) {
+                const auto j = keys[i];
                 // K is assembled per (head, key) rather than materialised: nope
                 // from this head's slice of kv_b's output, rope from the single
                 // shared segment.
@@ -376,15 +646,19 @@ StatusCode f32_attention(const ArchIr& arch,
                 acc += f32::dot(std::span<const float>(qh + nope, rope_d),
                                 std::span<const float>(kpe, rope_d),
                                 rope_d);
-                scores[j] = acc * scale;
+                scores[i] = acc * scale;
             }
-            f32::softmax(std::span<float>(scores.data(), t + 1), t + 1);
+            // Over the SELECTED keys only. This is the whole of what DSA changes
+            // about attention: the unselected keys are not scored down, they are
+            // absent from the normalisation — which is why a selection that is
+            // merely reordered still produces a different distribution.
+            f32::softmax(std::span<float>(scores.data(), n_sel), n_sel);
 
             float* dst = heads.data() + (static_cast<std::size_t>(t) * H + h) * vd;
-            for (std::uint32_t j = 0; j <= t; ++j) {
+            for (std::uint32_t i = 0; i < n_sel; ++i) {
                 const float* vv =
-                    kv.data() + (static_cast<std::size_t>(j) * H + h) * (nope + vd) + nope;
-                f32::axpy(scores[j], std::span<const float>(vv, vd), vd, std::span<float>(dst, vd));
+                    kv.data() + (static_cast<std::size_t>(keys[i]) * H + h) * (nope + vd) + nope;
+                f32::axpy(scores[i], std::span<const float>(vv, vd), vd, std::span<float>(dst, vd));
             }
         }
     }

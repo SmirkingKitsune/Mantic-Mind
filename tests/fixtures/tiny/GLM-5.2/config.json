@@ -15,7 +15,7 @@
   "hidden_act": "silu",
   "hidden_size": 64,
   "index_head_dim": 32,
-  "index_n_heads": 4,
+  "index_n_heads": 32,
   "index_share_for_mtp_iteration": true,
   "index_skip_topk_offset": 3,
   "index_topk": 64,

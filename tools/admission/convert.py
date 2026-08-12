@@ -23,6 +23,7 @@ import re
 import struct
 import sys
 from pathlib import Path
+from typing import Any
 
 MAGIC = b"SOMACTNR"
 FORMAT_VERSION = 1
@@ -88,12 +89,18 @@ DENSE_SUFFIXES = (
 # comment above DENSE_SUFFIXES has always claimed and never enforced — the list
 # only ever covered the tensors the first three models happened to have, and a
 # fourth architecture's weights vanished without a word.
+# Non-layer tensors, named once so the completeness check and the copy loop
+# below cannot disagree about what counts as claimed.
+TOP_LEVEL_TENSORS = ("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight")
+
 IGNORED_PATTERNS = (
     ".experts.",              # routed experts: written to the expert payload
     "shared_experts.",        # copied separately, below
     "rotary_emb.inv_freq",    # derived at load, not a weight
-    ".mtp",                   # multi-token-prediction heads; not served
-    "num_nextn_predict",
+    # NOTE: multi-token-prediction heads are excluded by LAYER INDEX in
+    # is_ignored() below, not here. They are ordinary `model.layers.<N>.*` names
+    # with N >= num_hidden_layers, so no substring identifies them — a ".mtp"
+    # entry sat here matching nothing until GLM-5.2's layer 78 proved it.
 )
 
 
@@ -392,15 +399,67 @@ def main(argv: list[str]) -> int:
     # Real checkpoints are bf16 and numpy has no bfloat16 dtype, so the numpy
     # backend simply cannot represent them. torch can, and .float() is an exact
     # widening — bf16 is the top 16 bits of an f32, so nothing is lost.
-    handles = [safe_open(str(f), framework="pt") for f in shard_files]
-    owner: dict[str, int] = {}
-    for i, h in enumerate(handles):
-        for k in h.keys():
-            owner[k] = i
+    # Shard handles are opened ON DEMAND, with a small cache. They used to be
+    # opened all at once:
+    #
+    #     handles = [safe_open(str(f), framework="pt") for f in shard_files]
+    #
+    # which is fine for a 5-shard model and SEGFAULTS on a 282-shard one. GLM-5.2
+    # has 282 shards; that line mapped all 1.4 TB, indexed 59,585 tensors, read
+    # six expert tensors, and died on the seventh. Reading the same tensors with
+    # one handle open at a time works indefinitely, which is what identifies the
+    # handle count rather than any particular tensor as the cause.
+    #
+    # Worth stating how it presented, because it nearly passed for success: the
+    # crash left a 46 MB partial container behind, and a shell `&&` chain reported
+    # exit 0 from the command that followed it. A conversion that dies 0.01% in
+    # and looks like it worked is the worst available outcome.
+    #
+    # The tensor->shard map comes from `model.safetensors.index.json` when the
+    # checkpoint ships one, so the common case never opens a shard just to
+    # enumerate its keys.
+    owner: dict[str, str] = {}
+    index_json = src / "model.safetensors.index.json"
+    if index_json.is_file():
+        try:
+            wm = json.loads(index_json.read_text(encoding="utf-8")).get("weight_map", {})
+            owner = {name: str(src / shard) for name, shard in wm.items()}
+        except Exception:
+            owner = {}
+    if not owner:
+        # No index (single-shard, or a hand-assembled directory): enumerate each
+        # shard's keys and close it again immediately.
+        for f in shard_files:
+            with safe_open(str(f), framework="pt") as h:
+                for k in h.keys():
+                    owner[k] = str(f)
+
+    # A handful of handles, because consecutive reads are overwhelmingly from the
+    # same shard — experts are stored in order. Small enough that the crash above
+    # cannot recur, large enough that a tensor family straddling a boundary does
+    # not reopen per read.
+    open_handles: dict[str, Any] = {}
+    HANDLE_CACHE = 4
+
+    def handle_for(path: str):
+        h = open_handles.get(path)
+        if h is not None:
+            return h
+        if len(open_handles) >= HANDLE_CACHE:
+            victim, vh = next(iter(open_handles.items()))
+            del open_handles[victim]
+            try:
+                vh.__exit__(None, None, None)
+            except Exception:
+                pass
+        h = safe_open(path, framework="pt")
+        h.__enter__()
+        open_handles[path] = h
+        return h
 
     def get(name: str):
-        i = owner.get(name)
-        if i is None:
+        path = owner.get(name)
+        if path is None:
             return None
         # .copy() is NOT optional, and its absence is invisible on f32 inputs.
         #
@@ -418,14 +477,13 @@ def main(argv: list[str]) -> int:
         # and lm_head (1.2 GB each) were correct while every per-layer tensor was
         # all zeros. The engine then emitted a uniform distribution — KL 11.93
         # nats against a reference, which is ln(151936) to five figures.
-        return handles[i].get_tensor(name).to(torch.float32).numpy().copy()
+        return handle_for(path).get_tensor(name).to(torch.float32).numpy().copy()
 
     # ── experts ──────────────────────────────────────────────────────────────
     index: list[tuple[int, int, int]] = []
     shard_idx = 0
     shard_off = 0
     total = 0
-    fh = open(out_dir / f"experts-{shard_idx:05d}.bin", "wb")
     uniform_len = -1
     groups: dict[str, int] = {}
 
@@ -433,6 +491,65 @@ def main(argv: list[str]) -> int:
     n_moe = sum(1 for k in kinds if k == "moe")
     print(f"  {src.name}: {n_layers} layers ({n_moe} MoE) x {n_experts} experts, "
           f"gate/up={dt_gate} down={dt_down} group={args.group}")
+
+    # ── every source tensor must be accounted for — CHECKED FIRST ────────────
+    #
+    # The rule DENSE_SUFFIXES has always claimed. Without it the allow-list
+    # silently covered only what the first three models happened to carry: MLA's
+    # attention, the dense-layer MLPs and the noaux_tc router bias were all
+    # dropped without a word, producing a container that either failed to load
+    # or — worse — loaded and routed wrongly.
+    #
+    # This used to run AFTER the expert payload was written, and GLM-5.2 showed
+    # what that costs: 4.5 hours and 439 GiB to discover an unhandled tensor
+    # family that is pure NAME arithmetic, knowable before a single byte is read.
+    # Nothing here opens a tensor — it compares the shard index's key list against
+    # the names this converter will claim — so it belongs before the work, not
+    # after it.
+    #
+    # A REFUSAL, not a warning: a warning inside hours of output is not read.
+    #
+    # Built once, as an ordered list, and used for BOTH this check and the dense
+    # copy loop below. Two transcriptions of one allow-list is how the check ends
+    # up asserting something the copy loop does not do. Ordered rather than a set
+    # so dense.safetensors is byte-reproducible — mm_fused_experts compares two
+    # conversions byte for byte and set iteration order would break it.
+    claimed: list[str] = list(TOP_LEVEL_TENSORS)
+    for layer in range(n_layers):
+        claimed += [f"model.layers.{layer}.{suf}" for suf in DENSE_SUFFIXES]
+        claimed += [f"model.layers.{layer}.{moe_block}.shared_experts.{s}.weight"
+                    for s in ("gate_proj", "up_proj", "down_proj")]
+    claimed_set = set(claimed)
+
+    def is_ignored(name: str) -> bool:
+        if any(p in name for p in IGNORED_PATTERNS):
+            return True
+        # Layers at or beyond num_hidden_layers are MULTI-TOKEN-PREDICTION heads,
+        # not part of the served stack. GLM-5.2 declares
+        # num_nextn_predict_layers=1 and ships layer 78 with a complete attention
+        # block, its own experts, and the MTP-specific eh_proj/enorm/hnorm — 791
+        # tensors in all. It is identified by its layer INDEX, which is why a
+        # substring rule like ".mtp" matched none of it.
+        m = re.match(r"model\.layers\.(\d+)\.", name)
+        return m is not None and int(m.group(1)) >= n_layers
+
+    unclaimed = sorted(n for n in owner if n not in claimed_set and not is_ignored(n))
+    if unclaimed:
+        kind_names = sorted({re.sub(r"^model\.layers\.\d+\.", "", n) for n in unclaimed})
+        print(f"  REFUSED  {src.name}: {len(unclaimed)} source tensor(s) match no known role.")
+        print("           A dropped tensor produces a model that loads and is wrong, so this")
+        print("           stops BEFORE the expert payload rather than after it.")
+        print("           Unhandled kinds:")
+        for k in kind_names[:12]:
+            print(f"             {k}")
+        if len(kind_names) > 12:
+            print(f"             ... and {len(kind_names) - 12} more")
+        print("           Add them to DENSE_SUFFIXES, or to IGNORED_PATTERNS with a reason.")
+        return 3
+
+    # Opened only now: a refusal above must leave no output behind, or a failed
+    # run looks from the outside like a partial success.
+    fh = open(out_dir / f"experts-{shard_idx:05d}.bin", "wb")
 
     first_moe_layer = next((i for i, k in enumerate(kinds) if k == "moe"), -1)
     for layer in range(n_layers):
@@ -490,50 +607,13 @@ def main(argv: list[str]) -> int:
     # ── dense half ───────────────────────────────────────────────────────────
     from safetensors.numpy import save_file
 
+    # Iterates the SAME list the completeness check was built from, so "claimed"
+    # and "copied" cannot drift into disagreement.
     dense: dict[str, "np.ndarray"] = {}
-    for name in ("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"):
+    for name in claimed:
         t = get(name)
         if t is not None:
             dense[name] = t
-    for layer in range(n_layers):
-        for suf in DENSE_SUFFIXES:
-            name = f"model.layers.{layer}.{suf}"
-            t = get(name)
-            if t is not None:
-                dense[name] = t
-        for shared in ("gate_proj", "up_proj", "down_proj"):
-            name = f"model.layers.{layer}.{moe_block}.shared_experts.{shared}.weight"
-            t = get(name)
-            if t is not None:
-                dense[name] = t
-
-    # ── every source tensor must be accounted for ────────────────────────────
-    #
-    # The rule DENSE_SUFFIXES has always claimed and never enforced. Without it
-    # the allow-list silently covered only what the first three models happened
-    # to carry: MLA's attention, the dense-layer MLPs and the noaux_tc router
-    # bias were all dropped without a word, and the result was a container that
-    # either failed to load or — worse — loaded and routed wrongly.
-    #
-    # A REFUSAL, not a warning. A conversion takes hours and produces hundreds of
-    # gigabytes; discovering afterwards that a tensor family went missing is the
-    # expensive way to learn it, and a warning in that much output is not read.
-    unclaimed = sorted(
-        n for n in owner
-        if n not in dense and not any(p in n for p in IGNORED_PATTERNS)
-    )
-    if unclaimed:
-        kinds = sorted({re.sub(r"^model\.layers\.\d+\.", "", n) for n in unclaimed})
-        print(f"  REFUSED  {src.name}: {len(unclaimed)} source tensor(s) match no known role.")
-        print("           A dropped tensor produces a model that loads and is wrong, so this")
-        print("           stops rather than writing a container that is quietly incomplete.")
-        print("           Unhandled kinds:")
-        for k in kinds[:12]:
-            print(f"             {k}")
-        if len(kinds) > 12:
-            print(f"             ... and {len(kinds) - 12} more")
-        print("           Add them to DENSE_SUFFIXES, or to IGNORED_PATTERNS with a reason.")
-        return 3
 
     save_file(dense, str(out_dir / "dense.safetensors"))
 
