@@ -784,6 +784,18 @@ StatusCode f32_index_select_kv(const ArchIr& arch,
     return StatusCode::Ok;
 }
 
+Status prepare_weights(ModelState& model) {
+    // Nothing to fold. Absorption lives in f32_attention_kv and applies the
+    // up-projection to the query side per step; the reasoning for not doing it
+    // here — memory, not arithmetic — is in mla.hpp.
+    //
+    // Defined rather than left as a bare declaration. It was declared and never
+    // defined, which is exactly how `attention_backend()` went missing in D16 and
+    // took the planner's MLA sizing with it.
+    (void)model;
+    return {};
+}
+
 std::uint32_t f32_kv_floats_per_layer(const ArchIr& arch) noexcept {
     const auto& m = arch.attention.mla;
     const auto latent = m.kv_lora_rank + m.qk_rope_head_dim;
@@ -1304,6 +1316,7 @@ const AttentionBackend& attention_backend() noexcept {
         b.family = AttentionFamily::Mla;
         b.kv_bytes_per_token = &kv_bytes_per_token;
         b.weight_bytes_per_layer = &weight_bytes_per_layer;
+        b.prepare_weights = &prepare_weights;
         // Execution members stay null. This instance exists for the planner's
         // DESCRIPTION questions; whether MLA can actually be run is answered by
         // resolve_f32_backend, which has its own opinion and its own reasons.

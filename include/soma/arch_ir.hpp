@@ -73,9 +73,17 @@ struct MlaSpec {
     std::uint32_t qk_rope_head_dim = 0;
     std::uint32_t v_head_dim = 0;
 
-    /// Fold up-projections into Q at load so decode never materializes full K/V.
-    /// There is no GQA analogue, which is why this lives here and why
-    /// AttentionBackend exposes prepare_weights() as a hook.
+    /// Move the KV up-projection to the query side, so decode never materializes
+    /// full K/V. There is no GQA analogue, which is why this lives here.
+    ///
+    /// PER STEP, not at load. This said "at load", which was the intent when the
+    /// field was written and not what absorption wanted once measured: folding at
+    /// load means keeping a transposed fp32 copy of the up-projection resident —
+    /// 1.96 GB on GLM-5.2 — to save arithmetic that was never the bottleneck. See
+    /// `arch::mla::prepare_weights`.
+    ///
+    /// False selects the expanded form, which is kept as the reference the
+    /// absorbed one is checked against; `soma_decode_kv_g4` runs both.
     bool absorb_weights = true;
 };
 

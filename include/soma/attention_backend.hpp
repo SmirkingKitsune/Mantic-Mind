@@ -99,12 +99,13 @@ struct AttentionBackend {
     /// quantized plan, which the verdict table caught.
     std::uint64_t (*weight_bytes_per_layer)(const ArchIr& arch, ByteSizer sizer) noexcept = nullptr;
 
-    /// Called exactly once, at load, from load_model().
+    /// Intended to be called exactly once from load_model() when the production
+    /// loader lands.
     ///
-    /// MLA folds up-projections into Q here so decode never materializes full
-    /// K/V. GQA's implementation is a no-op. This hook exists BECAUSE weight
-    /// absorption has no GQA analogue — putting it in the loader or in admission
-    /// would leak MLA into the core.
+    /// Both current families implement this as a no-op. MLA absorption moves the
+    /// up-projection to the query side per decode step; folding at load would keep
+    /// a prohibitively large transposed fp32 copy resident. The hook remains the
+    /// architecture-owned seam for any future load-time weight transformation.
     Status (*prepare_weights)(ModelState& model) = nullptr;
 
     /// Both take the WHOLE batch and loop per-sequence internally.

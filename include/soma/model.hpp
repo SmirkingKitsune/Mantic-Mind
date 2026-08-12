@@ -91,8 +91,10 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-/// Load a converted model directory. Runs the backend's prepare_weights() hook
-/// (MLA absorption; no-op for GQA) exactly once, here.
+/// Load a converted model directory. Its production implementation will run the
+/// backend's prepare_weights() hook exactly once here; both current families'
+/// hooks are no-ops. The production ArchBackend execution path is tracked in the
+/// roadmap.
 Status load_model(const std::string& model_dir, std::unique_ptr<ModelState>& out);
 
 // ─────────────────────────────────────────────────────────────────────────────

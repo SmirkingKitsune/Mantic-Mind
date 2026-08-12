@@ -14,6 +14,7 @@
 //
 // Usage: mla_g4
 
+#include "soma/arch/mla.hpp"
 #include "soma/kernels_f32.hpp"
 
 #include <cmath>
@@ -96,6 +97,11 @@ float dot(const std::vector<float>& a, const std::vector<float>& b) {
 }  // namespace
 
 int main() {
+    std::cout << "0. MLA load hook is defined and wired\n";
+    const auto& backend = soma::arch::mla::attention_backend();
+    check(backend.prepare_weights == &soma::arch::mla::prepare_weights,
+          "prepare_weights points at MLA's explicit no-op");
+
     // DeepSeek-V2-Lite's rope segment.
     constexpr std::uint32_t kDim = 8;
     const std::vector<float> inv_freq{1.0f, 0.1f, 0.005125f, 0.000025f};

@@ -53,20 +53,26 @@ inline constexpr KvFormatId kKvFormat = kv_format_id("soma.kv.mla.latent.v1");
 /// than treated as an optimization.
 std::size_t kv_bytes_per_token(const ArchIr& arch) noexcept;
 
-/// Weight absorption. THE reason AttentionBackend has this hook.
+/// Weight absorption's load-time hook — DELIBERATELY A NO-OP, because absorption
+/// turned out not to want load time.
 ///
-/// Folds the KV up-projections into Q (and into the output projection) at load,
-/// so decode operates in latent space and never materializes full K/V. There is
-/// no GQA analogue — it is not a faster path to the same intermediate, it
-/// removes the intermediate.
+/// The absorption itself is real and is in `f32_attention_kv`: `(W_k^T q) . c`
+/// rather than `q . (W_k c)`, and one projection of the accumulated latent rather
+/// than one per attended key. What it does NOT need is a folded copy of the
+/// weights sitting in memory.
 ///
-/// Runs exactly once, from load_model(), and mutates ModelState BEFORE the model
-/// tier becomes visible to any worker thread. That ordering is load-bearing:
-/// tier 1's lock-free read depends on nothing mutating it after publication
-/// (model.hpp).
+/// Folding at load means materializing `W_k^T` per layer as fp32 — on GLM-5.2
+/// that is `n_heads * qk_nope * kv_lora_rank * 4` bytes per layer, 1.96 GB across
+/// the stack, against a plan that fits a 24 GiB host by 3 GB. Transposing per step
+/// instead costs `n_heads * qk_nope * kv_lora_rank` element reads per layer per
+/// step: 6.3e6, next to the 1.5e8 the absorbed attention already does and the
+/// 3.0e10 it replaced. The memory was the scarce thing; the arithmetic was not.
 ///
-/// Skipped when MlaSpec::absorb_weights is false, which the conformance harness
-/// uses to check the absorbed and unabsorbed paths against each other.
+/// This declaration previously described the load-time fold in detail and was
+/// never defined at all — the same shape as the `attention_backend()` bug in D16,
+/// where a declared-never-defined function meant the planner silently used GQA's
+/// formula for MLA. Defined here so the description and the code agree, and so a
+/// future caller gets a no-op rather than a link error (roadmap D39).
 Status prepare_weights(ModelState& model);
 
 StatusCode prefill(const ModelState& model,
