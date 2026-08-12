@@ -122,6 +122,16 @@ def main(argv: list[str]) -> int:
             payload = out_dir / "experts-00000.bin"
             if not payload.is_file():
                 return refuse(f"{label} produced no expert payload")
+            meta = json.loads((out_dir / "container_meta.json").read_text(encoding="utf-8"))
+            if meta.get("tokenizer") != "unsupported":
+                return refuse(f"{label} did not record its missing tokenizer as unsupported")
+            partial = [name for name in
+                       ("tokenizer.soma", "tokenizer_oracle.bin", "tokenizer_meta.json")
+                       if (out_dir / name).exists()]
+            if partial:
+                return refuse(f"{label} left partial tokenizer artifacts: {', '.join(partial)}")
+            if not (out_dir / "tokenizer.unsupported").is_file():
+                return refuse(f"{label} omitted the tokenizer refusal reason")
             made[label] = payload
 
         if not filecmp.cmp(made["perexpert"], made["fused"], shallow=False):

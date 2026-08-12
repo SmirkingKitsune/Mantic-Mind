@@ -25,6 +25,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 MAGIC = b"SOMACTNR"
 FORMAT_VERSION = 1
 ALIGN = 4096
@@ -547,6 +549,66 @@ def main(argv: list[str]) -> int:
         print("           Add them to DENSE_SUFFIXES, or to IGNORED_PATTERNS with a reason.")
         return 3
 
+    # ── the tokenizer, compiled INTO the container ────────────────────────────
+    #
+    # A container without one is not servable as text. `soma serve` falls back to
+    # one-token-per-byte, which produces real tokens from real weights and
+    # meaningless output; `conform`'s tokenizer_roundtrip stage reports skipped.
+    # GLM-5.2 was converted, verified, planned and served before anyone noticed,
+    # because every one of those steps works on token IDS.
+    #
+    # Compiled HERE rather than left to the operator so a container is
+    # self-sufficient by construction — the alternative is remembering three files
+    # by hand, which is exactly what was done once and got two of the three.
+    #
+    # NON-FATAL, deliberately. Most families' pretokenizers are not compiled yet
+    # (DeepSeek's multi-Split chain, Mixtral's SentencePiece, granite's legacy
+    # vocab.json) and aborting a multi-hour conversion over a tokenizer would be a
+    # disproportionate response to a gap the container can be used without. The
+    # outcome is recorded in container_meta.json and repeated in the final summary
+    # line, because an early message is invisible after four hours of layer output.
+    #
+    # Run BEFORE the expert loop for the same reason the completeness check is:
+    # it costs seconds and it is better known now than at the end.
+    tokenizer_status = "skipped"
+    tokenizer_outputs = tuple(out_dir / name for name in (
+        "tokenizer.soma", "tokenizer_oracle.bin", "tokenizer_meta.json"))
+    tokenizer_unsupported = out_dir / "tokenizer.unsupported"
+
+    # Conversion directories are variant-stable and may already exist after a
+    # refused or interrupted attempt. Never let that attempt's tokenizer make a
+    # new conversion look text-capable. `compile_tokenizer` also writes
+    # tokenizer.soma before it asks HF tokenizers for the oracle, so an exception
+    # after that point would otherwise leave a plausible, incomplete artifact.
+    for path in (*tokenizer_outputs, tokenizer_unsupported):
+        path.unlink(missing_ok=True)
+    try:
+        import compile_tokenizer
+
+        rc = compile_tokenizer.main(["compile_tokenizer", str(src), "--out", str(out_dir)])
+        if rc == 0:
+            missing = [path.name for path in tokenizer_outputs if not path.is_file()]
+            if missing:
+                raise RuntimeError(
+                    "tokenizer compiler returned success without " + ", ".join(missing))
+            tokenizer_unsupported.unlink(missing_ok=True)
+            tokenizer_status = "compiled"
+        else:
+            tokenizer_status = "unsupported"
+            for path in tokenizer_outputs:
+                path.unlink(missing_ok=True)
+            if not tokenizer_unsupported.exists():
+                tokenizer_unsupported.write_text(
+                    f"tokenizer compiler returned {rc}\n", encoding="utf-8")
+    except Exception as e:  # a missing dep must not cost the conversion
+        tokenizer_status = "unsupported"
+        for path in tokenizer_outputs:
+            path.unlink(missing_ok=True)
+        if not tokenizer_unsupported.exists():
+            tokenizer_unsupported.write_text(
+                f"{type(e).__name__}: {e}\n", encoding="utf-8")
+        print(f"  tokenizer: not compiled ({type(e).__name__}: {e})")
+
     # Opened only now: a refusal above must leave no output behind, or a failed
     # run looks from the outside like a partial success.
     fh = open(out_dir / f"experts-{shard_idx:05d}.bin", "wb")
@@ -656,6 +718,10 @@ def main(argv: list[str]) -> int:
         "effective_groups": groups,
         "dense_tensors": len(dense),
         "align": ALIGN,
+        # Whether this container can be served as TEXT. Recorded rather than left
+        # to be inferred from which files happen to exist, so a consumer can tell
+        # "no tokenizer was possible for this family" from "someone deleted one".
+        "tokenizer": tokenizer_status,
     }
     (out_dir / "container_meta.json").write_text(
         json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -663,7 +729,8 @@ def main(argv: list[str]) -> int:
     padded = sum(align_up(l) for _, _, l in index)
     print(f"  OK       {len(index)} experts, {total / 1e9:.3f} GB payload, "
           f"{(padded - total) / 1e6:.1f} MB padding ({100.0 * (padded - total) / max(total, 1):.3f}%), "
-          f"{shard_idx + 1} shard(s), dense {len(dense)} tensors")
+          f"{shard_idx + 1} shard(s), dense {len(dense)} tensors, "
+          f"tokenizer {tokenizer_status}")
     return 0
 
 
