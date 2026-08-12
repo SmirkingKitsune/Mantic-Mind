@@ -374,7 +374,7 @@ Status Scheduler::step() {
     std::uint32_t prefill_rows = 0, decode_rows = 0;
     // The row geometry comes FROM each sequence's cache, below. It used to be
     // computed here as `n_kv_heads * head_dim` — GQA's formula, and a second copy
-    // of the one D36 moved behind `F32Backend::kv_floats_per_layer`. The
+    // of the one D36 moved behind `F32Backend::kv_geometry`. The
     // allocation followed the backend and the addressing did not, so every
     // MLA-family model indexed a buffer it was not shaped like. Writes and reads
     // used the SAME wrong formula, so while the offsets stayed inside the
@@ -434,8 +434,10 @@ Status Scheduler::step() {
             KvRow r{};
             r.k_base = s->kv.k_at(0, 0);
             r.v_base = s->kv.v_at(0, 0);
-            r.stride = s->kv.stride();
-            r.hkv = s->kv.hkv();
+            r.k_stride = s->kv.k_stride();
+            r.v_stride = s->kv.v_stride();
+            r.k_hkv = s->kv.k_hkv();
+            r.v_hkv = s->kv.v_hkv();
             r.pos = s->kv.length() + j;
             // Attends over everything before it in this sequence INCLUDING the
             // earlier rows of this same chunk. That is sound because

@@ -57,7 +57,34 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    const auto dir = fs::temp_directory_path() / "soma_ckpt_g3";
+    // The three CTest registrations deliberately cover all cache shapes: GQA's
+    // equal K/V planes, plain MLA's absent V plane, and MLA+DSA's narrower V
+    // plane. Without running checkpointing on the latter two, the save/load
+    // loops could keep assuming the old shared width while decode stayed green.
+    {
+        soma::KvCache probe;
+        if (auto st = probe.open(model.arch, 8); !st.ok()) {
+            std::cerr << "cache open failed: " << st.message() << "\n";
+            return 2;
+        }
+        if (model.arch.attention.family == soma::AttentionFamily::Mla) {
+            check(probe.v_hkv() == 0 && probe.v_at(0, 0) == nullptr,
+                  "plain MLA allocates no V plane",
+                  std::to_string(probe.v_hkv()) + " floats/position");
+        } else if (model.arch.attention.family == soma::AttentionFamily::MlaDsa) {
+            check(probe.v_hkv() == model.arch.attention.dsa.index_head_dim &&
+                      probe.v_hkv() < probe.k_hkv(),
+                  "MLA+DSA gives the index key its own narrower V plane",
+                  std::to_string(probe.k_hkv()) + "/" + std::to_string(probe.v_hkv()) +
+                      " K/V floats");
+        } else {
+            check(probe.k_hkv() == probe.v_hkv(),
+                  "GQA keeps equal K and V planes",
+                  std::to_string(probe.k_hkv()) + " floats each");
+        }
+    }
+
+    const auto dir = fs::temp_directory_path() / ("soma_ckpt_g3_" + name);
     std::error_code ec;
     fs::remove_all(dir, ec);
 

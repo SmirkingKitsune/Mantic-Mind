@@ -349,7 +349,7 @@ struct F32Backend {
                             F32Workspace& ws,
                             float* out) noexcept = nullptr;
 
-    /// Floats per position per layer in ONE cache plane.
+    /// The shape of both cache planes.
     ///
     /// The cache's SHAPE is the backend's knowledge, and core had it hardcoded as
     /// `n_kv_heads * head_dim` — GQA's formula, applied to every family. MLA does
@@ -361,9 +361,13 @@ struct F32Backend {
     /// Same argument as `AttentionBackend::weight_bytes_per_layer` (roadmap D16),
     /// and the seam check would refuse the alternative — a family branch in core.
     ///
-    /// Null means "use the GQA default", so existing backends need not implement
-    /// it to keep working.
-    std::uint32_t (*kv_floats_per_layer)(const ArchIr& arch) noexcept = nullptr;
+    /// Returns BOTH widths, so a family that stores no V plane can say so — one
+    /// number could not express it, and the cache allocated a full second plane
+    /// for MLA on the strength of that silence.
+    ///
+    /// Null means "use the GQA default" (both planes `n_kv_heads * head_dim`), so
+    /// a backend need not implement it to keep working.
+    KvGeometry (*kv_geometry)(const ArchIr& arch) noexcept = nullptr;
 
     /// The batched-decode form: one KvRow per row, each with its own cache,
     /// position and visible length.

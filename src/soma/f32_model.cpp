@@ -737,14 +737,16 @@ Status KvCache::open(const ArchIr& arch, std::uint32_t max_ctx) {
     // and it was applied to every family — including one whose cache holds a
     // compressed latent and no per-head K or V at all.
     const auto* backend = resolve_f32_backend(arch);
-    hkv_ = (backend != nullptr && backend->kv_floats_per_layer != nullptr)
-               ? backend->kv_floats_per_layer(arch)
-               : arch.attention.n_kv_heads * arch.attention.head_dim;
-    if (hkv_ == 0) return {StatusCode::InvalidArgument, "kv cache of zero width"};
-    const auto per_layer = static_cast<std::size_t>(max_ctx_) * hkv_;
-    const auto total = per_layer * arch.topology.n_layers;
-    k_.assign(total, 0.0f);
-    v_.assign(total, 0.0f);
+    const auto geom = (backend != nullptr && backend->kv_geometry != nullptr)
+                          ? backend->kv_geometry(arch)
+                          : KvGeometry{arch.attention.n_kv_heads * arch.attention.head_dim,
+                                       arch.attention.n_kv_heads * arch.attention.head_dim};
+    k_hkv_ = geom.k_floats;
+    v_hkv_ = geom.v_floats; // 0 is legitimate: the family stores no second plane
+    if (k_hkv_ == 0) return {StatusCode::InvalidArgument, "kv cache of zero width"};
+    const auto layers = static_cast<std::size_t>(arch.topology.n_layers);
+    k_.assign(static_cast<std::size_t>(max_ctx_) * k_hkv_ * layers, 0.0f);
+    v_.assign(static_cast<std::size_t>(max_ctx_) * v_hkv_ * layers, 0.0f);
     length_ = 0;
     return {};
 }

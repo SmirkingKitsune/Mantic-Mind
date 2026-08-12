@@ -22,6 +22,22 @@
 
 namespace soma {
 
+/// Floats per position per layer, per plane.
+///
+/// TWO numbers because the planes are not the same size for every family, and
+/// assuming they were cost 2.94 GB on GLM-5.2 at 4k context. GQA stores per-head
+/// K and V, so both planes are `n_kv_heads * head_dim`. MLA stores a compressed
+/// latent and DERIVES V from it, so its V plane held nothing at all — and the
+/// cache allocated it anyway, at the K plane's width, for every layer.
+///
+/// `v_floats == 0` is a real answer meaning "this family stores no second plane",
+/// not a missing value. DSA is why MLA's is not always zero: its indexer key must
+/// be cached, and the otherwise-dead plane is where it goes.
+struct KvGeometry {
+    std::uint32_t k_floats = 0;
+    std::uint32_t v_floats = 0;
+};
+
 /// One sequence's K/V across all layers. Sized once at admission.
 class KvCache {
 public:
@@ -40,32 +56,41 @@ public:
     void commit(std::uint32_t n = 1) noexcept { length_ += n; }
 
     float* k_at(std::uint32_t layer, std::uint32_t pos) noexcept {
-        return k_.data() + (static_cast<std::size_t>(layer) * max_ctx_ + pos) * hkv_;
+        return k_.data() + (static_cast<std::size_t>(layer) * max_ctx_ + pos) * k_hkv_;
     }
 
+    /// Null when this family stores no second plane. A caller that does not check
+    /// is a caller writing where nothing was allocated — which is why the DSA
+    /// indexer, the only user, reaches it through `has_indexer`.
     float* v_at(std::uint32_t layer, std::uint32_t pos) noexcept {
-        return v_.data() + (static_cast<std::size_t>(layer) * max_ctx_ + pos) * hkv_;
+        if (v_hkv_ == 0) return nullptr;
+        return v_.data() + (static_cast<std::size_t>(layer) * max_ctx_ + pos) * v_hkv_;
     }
 
     std::uint64_t bytes() const noexcept { return (k_.size() + v_.size()) * sizeof(float); }
 
-    /// Floats per layer in ONE of the two planes. Checkpointing needs this to
-    /// walk live positions layer by layer.
-    std::uint32_t hkv() const noexcept { return hkv_; }
+    /// Floats per position, per plane. Checkpointing needs both to walk live
+    /// positions layer by layer, and they are no longer the same number.
+    std::uint32_t k_hkv() const noexcept { return k_hkv_; }
 
-    /// Floats per layer in ONE plane — exactly `KvRow::stride`.
+    std::uint32_t v_hkv() const noexcept { return v_hkv_; }
+
+    /// Floats per layer in each plane — exactly `KvRow::k_stride` and
+    /// `KvRow::v_stride`.
     ///
     /// Exposed so a caller building a KvRow takes the geometry FROM the buffer it
     /// is about to point into, rather than recomputing it. Recomputing is how
     /// `n_kv_heads * head_dim` ended up in the scheduler as well: correct for GQA,
     /// and for MLA a width that has nothing to do with what was allocated
     /// (roadmap D40).
-    std::size_t stride() const noexcept { return static_cast<std::size_t>(max_ctx_) * hkv_; }
+    std::size_t k_stride() const noexcept { return static_cast<std::size_t>(max_ctx_) * k_hkv_; }
+
+    std::size_t v_stride() const noexcept { return static_cast<std::size_t>(max_ctx_) * v_hkv_; }
 
     std::uint32_t n_layers() const noexcept {
-        return hkv_ && max_ctx_ ? static_cast<std::uint32_t>(
-                                      k_.size() / (static_cast<std::size_t>(max_ctx_) * hkv_))
-                                : 0;
+        return k_hkv_ && max_ctx_ ? static_cast<std::uint32_t>(
+                                        k_.size() / (static_cast<std::size_t>(max_ctx_) * k_hkv_))
+                                  : 0;
     }
 
     /// Set the live length directly. Restore-only: `commit` is the forward's
@@ -79,7 +104,8 @@ public:
 private:
     std::vector<float> k_, v_;
     std::uint32_t max_ctx_ = 0;
-    std::uint32_t hkv_ = 0; ///< backend cache width in floats, per plane
+    std::uint32_t k_hkv_ = 0; ///< backend K width in floats
+    std::uint32_t v_hkv_ = 0; ///< backend V width; 0 when the family stores none
     std::uint32_t length_ = 0;
 };
 
@@ -90,21 +116,29 @@ private:
 /// lengths, sit side by side in one forward; only this struct differs between
 /// them. Prefill rows and decode rows are the same type.
 struct KvRow {
-    float* k_base = nullptr; ///< this sequence's K, layer 0
-    float* v_base = nullptr;
-    std::size_t stride = 0; ///< floats per layer (max_ctx * hkv)
-    std::uint32_t hkv = 0;
-    std::uint32_t pos = 0; ///< this row's absolute position (RoPE + write slot)
-    std::uint32_t len = 0; ///< positions visible to it, INCLUDING pos
+    float* k_base = nullptr;  ///< this sequence's K, layer 0
+    float* v_base = nullptr;  ///< null when the family stores no V plane
+    std::size_t k_stride = 0; ///< floats per layer (max_ctx * k_hkv)
+    std::size_t v_stride = 0;
+    std::uint32_t k_hkv = 0;
+    std::uint32_t v_hkv = 0; ///< 0 when the family stores no V plane
+    std::uint32_t pos = 0;   ///< this row's absolute position (RoPE + write slot)
+    std::uint32_t len = 0;   ///< positions visible to it, INCLUDING pos
 
+    // Named per plane rather than sharing one `stride`/`hkv` pair. The shared
+    // pair was correct only while both planes had the same shape, and it made the
+    // asymmetry inexpressible — so MLA's empty V plane was allocated at the K
+    // plane's width for every layer. Renaming forces every caller to say which
+    // plane it means instead of inheriting an assumption.
     float* k_at(std::uint32_t layer, std::uint32_t p) const noexcept {
-        return k_base + static_cast<std::size_t>(layer) * stride +
-               static_cast<std::size_t>(p) * hkv;
+        return k_base + static_cast<std::size_t>(layer) * k_stride +
+               static_cast<std::size_t>(p) * k_hkv;
     }
 
     float* v_at(std::uint32_t layer, std::uint32_t p) const noexcept {
-        return v_base + static_cast<std::size_t>(layer) * stride +
-               static_cast<std::size_t>(p) * hkv;
+        if (v_base == nullptr || v_hkv == 0) return nullptr;
+        return v_base + static_cast<std::size_t>(layer) * v_stride +
+               static_cast<std::size_t>(p) * v_hkv;
     }
 };
 

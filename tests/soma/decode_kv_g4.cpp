@@ -26,9 +26,9 @@
 #include "soma/kv_cache.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <chrono>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -115,13 +115,15 @@ Outcome check_fixture(const fs::path& dir, std::uint32_t n_tokens, bool absorb) 
         soma::KvRow row;
         row.k_base = kv.k_at(0, 0);
         row.v_base = kv.v_at(0, 0);
-        // FROM the cache, not recomputed. `n_tokens * kv.hkv()` was right here
+        // FROM the cache, not recomputed. `n_tokens * kv.k_hkv()` was right here
         // only because this test opens the cache at exactly n_tokens — the same
         // reasoning that made the scheduler's copy right for GQA and catastrophic
         // for MLA (roadmap D40). A test that duplicates the formula it exists to
         // protect cannot catch the formula drifting.
-        row.stride = kv.stride();
-        row.hkv = kv.hkv();
+        row.k_stride = kv.k_stride();
+        row.v_stride = kv.v_stride();
+        row.k_hkv = kv.k_hkv();
+        row.v_hkv = kv.v_hkv();
         row.pos = p;
         row.len = p + 1; // visible history INCLUDING this position
 

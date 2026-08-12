@@ -158,7 +158,7 @@ StatusCode f32_attention_kv(const ArchIr& arch,
 
         // Append this row's K/V to its own cache before any row reads, so a row
         // that attends over its own position sees the value it just produced.
-        std::copy_n(k_r.data(), hkv, rows[r].k_at(layer, p));
+        std::copy_n(k_r.data(), hkv, rows[r].k_at(layer, p)); // both planes are hkv wide here
         std::copy_n(ws.v.data() + static_cast<std::size_t>(r) * hkv, hkv, rows[r].v_at(layer, p));
     }
 
@@ -390,12 +390,12 @@ StatusCode f32_route(const ArchIr& arch,
 }
 
 const soma::F32Backend& f32_backend() noexcept {
-    // Named rather than positional. Adding `kv_floats_per_layer` to F32Backend
+    // Named rather than positional. Adding `kv_geometry` to F32Backend
     // shifted every later member, and the compiler caught it only because the
     // types happened to disagree — an aggregate initialiser that still lined up
     // by type would have bound the wrong pointers in silence.
     //
-    // `kv_floats_per_layer` is deliberately left null: null means the GQA default,
+    // `kv_geometry` is deliberately left null: null means the GQA default,
     // and this IS the GQA backend, so stating it would be a second copy of the
     // same formula waiting to disagree with the first.
     static const soma::F32Backend kBackend = [] {

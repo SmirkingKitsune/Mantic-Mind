@@ -371,6 +371,10 @@ if(BUILD_TESTING)
 
     add_test(NAME soma_checkpoint_g3
              COMMAND soma_checkpoint_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures")
+    add_test(NAME soma_checkpoint_mla_g3
+             COMMAND soma_checkpoint_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "DeepSeek-V2-Lite")
+    add_test(NAME soma_checkpoint_dsa_g3
+             COMMAND soma_checkpoint_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "GLM-5.2")
 
     # ── G3 sampling ───────────────────────────────────────────────────────────
     # Structural checks plus an empirical frequency test: a sampler drawing from

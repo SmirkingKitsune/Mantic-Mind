@@ -847,14 +847,17 @@ Status prepare_weights(ModelState& model) {
     return {};
 }
 
-std::uint32_t f32_kv_floats_per_layer(const ArchIr& arch) noexcept {
+KvGeometry f32_kv_geometry(const ArchIr& arch) noexcept {
     const auto& m = arch.attention.mla;
-    const auto latent = m.kv_lora_rank + m.qk_rope_head_dim;
-    // Both planes are allocated at one width, so the second plane's tenant has to
-    // fit too. On GLM-5.2 that is 128 against 576 and the max is a formality —
-    // stated anyway, because a family with a wide indexer and a narrow latent
-    // would otherwise silently write past its plane.
-    return std::max(latent, arch.attention.dsa.index_head_dim);
+    KvGeometry g;
+    g.k_floats = m.kv_lora_rank + m.qk_rope_head_dim;
+    // ZERO for plain MLA. V is expanded from the latent on demand, so there has
+    // never been anything to store; the plane was allocated because one width
+    // described both. DSA is the exception and the only one — its indexer key
+    // cannot be recomputed from a later step's hidden state, so it must be kept.
+    g.v_floats =
+        (arch.attention.family == AttentionFamily::MlaDsa) ? arch.attention.dsa.index_head_dim : 0u;
+    return g;
 }
 
 StatusCode f32_attention_kv(const ArchIr& arch,
@@ -1236,7 +1239,7 @@ const soma::F32Backend& f32_backend() noexcept {
         b.name = "mla";
         b.bind_layer = &f32_bind_layer;
         b.attention = &f32_attention;
-        b.kv_floats_per_layer = &f32_kv_floats_per_layer;
+        b.kv_geometry = &f32_kv_geometry;
         b.attention_kv = &f32_attention_kv;
         b.route = &f32_route;
         return b;
@@ -1262,24 +1265,20 @@ std::size_t kv_bytes_per_token(const ArchIr& arch) noexcept {
     // fp32 to match the GQA implementation's G0 cache dtype; the planner scales
     // by the configured KV dtype.
     //
-    // TWO PLANES, because two planes are what gets allocated.
+    // BOTH PLANES, each at its own width — which for plain MLA means the K plane
+    // and nothing else.
     //
-    // This counted one and was therefore wrong by exactly 2x — in the optimistic
-    // direction, like D26 — for the whole life of the backend. `KvCache::open`
-    // allocates a K and a V plane of equal width for EVERY family; GQA's
-    // kv_bytes_per_token says `2 * n_kv_heads * head_dim` and matches, MLA's said
-    // `kv_lora_rank + qk_rope_head_dim` and did not. Nothing caught it because
-    // nothing could: the cached path was a stub, so no MLA model ever allocated a
-    // cache it then had to fit in.
+    // This counted one plane at a time when two were always allocated (2x under,
+    // in the optimistic direction, like D26), then two when the second was often
+    // empty. Asking the geometry removes the arithmetic entirely: there is one
+    // description of what the cache holds and both the allocation and this
+    // estimate read it.
     //
-    // What the second plane holds is DSA's indexer key — needed at every later
-    // step and impossible to recompute, since it depends on a past token's hidden
-    // state at this layer. For plain MLA it is allocated and unused, which is
-    // waste rather than an error; see the deferred table.
-    //
-    // On GLM-5.2 at 4096 context this is the difference between a reported 2.94 GB
-    // and a real 5.89 GB, against an 11.2 GiB expert cache on a 24 GiB host.
-    const std::size_t per_layer = 2ull * f32_kv_floats_per_layer(arch) * sizeof(float);
+    // GLM-5.2 at 4096 x 4 slots: the V plane falls from 2.94 GB to 653 MB, and for
+    // DeepSeek-V2-Lite and Moonlight it disappears.
+    const auto g = f32_kv_geometry(arch);
+    const std::size_t per_layer =
+        (static_cast<std::size_t>(g.k_floats) + g.v_floats) * sizeof(float);
     return per_layer * arch.topology.n_layers;
 }
 
@@ -1365,6 +1364,7 @@ const AttentionBackend& attention_backend() noexcept {
         AttentionBackend b{};
         b.name = "mla";
         b.family = AttentionFamily::Mla;
+        b.persist_format_id = kKvFormat;
         b.kv_bytes_per_token = &kv_bytes_per_token;
         b.weight_bytes_per_layer = &weight_bytes_per_layer;
         b.prepare_weights = &prepare_weights;

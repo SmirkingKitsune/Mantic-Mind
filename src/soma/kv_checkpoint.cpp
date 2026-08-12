@@ -123,11 +123,11 @@ Status KvCheckpointStore::open(const std::string& checkpoint_dir, const ArchIr& 
 
     // The format tag is BACKEND-OWNED and reached through the registry, so this
     // core TU never names an architecture. tools/ci/check_seam.py enforces that.
-    const auto* backend = resolve_arch_backend(arch);
-    if (backend == nullptr || backend->attention == nullptr) {
+    const auto* attention = resolve_attention_backend(arch.attention.family);
+    if (attention == nullptr) {
         return {StatusCode::Unsupported, "no attention backend for this architecture"};
     }
-    im.format_id = backend->attention->persist_format_id;
+    im.format_id = attention->persist_format_id;
     if (im.format_id == kKvFormatInvalid) {
         return {StatusCode::Unsupported, "attention backend declares no KV persist format"};
     }
@@ -158,12 +158,16 @@ KvCheckpointStore::save(const std::string& key, const KvCache& kv, const SeqPers
                 "token count " + std::to_string(state.tokens.size()) + " != cached positions " +
                     std::to_string(len)};
     }
-    const auto hkv = kv.hkv();
+    // Each plane at ITS width. They were the same number until MLA's V plane
+    // stopped existing.
+    const auto k_hkv = kv.k_hkv();
+    const auto v_hkv = kv.v_hkv();
     const auto layers = kv.n_layers();
-    const auto per_plane = static_cast<std::uint64_t>(len) * hkv * layers;
+    const auto payload_floats =
+        static_cast<std::uint64_t>(len) * (static_cast<std::uint64_t>(k_hkv) + v_hkv) * layers;
 
     std::vector<std::byte> buf;
-    buf.reserve(static_cast<std::size_t>(per_plane) * 2 * sizeof(float) + 256);
+    buf.reserve(static_cast<std::size_t>(payload_floats) * sizeof(float) + 256);
     for (const char c : kMagic)
         buf.push_back(static_cast<std::byte>(c));
     put_u32(buf, kKvCheckpointVersion);
@@ -171,7 +175,7 @@ KvCheckpointStore::save(const std::string& key, const KvCache& kv, const SeqPers
     put_u32(buf, im.format_id);
     put_u32(buf, len);
     put_u32(buf, im.arch.topology.d_model);
-    put_u64(buf, per_plane * 2 * sizeof(float));
+    put_u64(buf, payload_floats * sizeof(float));
     put_u64(buf, now_ms());
     // v3: the sampler's stream position, so a resumed sequence continues the
     // draw it was on rather than starting a fresh one.
@@ -195,10 +199,10 @@ KvCheckpointStore::save(const std::string& key, const KvCache& kv, const SeqPers
         buf.insert(buf.end(), b, b + n_floats * sizeof(float));
     };
     for (std::uint32_t l = 0; l < layers; ++l) {
-        append(mut.k_at(l, 0), static_cast<std::size_t>(len) * hkv);
+        append(mut.k_at(l, 0), static_cast<std::size_t>(len) * k_hkv);
     }
-    for (std::uint32_t l = 0; l < layers; ++l) {
-        append(mut.v_at(l, 0), static_cast<std::size_t>(len) * hkv);
+    for (std::uint32_t l = 0; l < layers && v_hkv > 0; ++l) {
+        append(mut.v_at(l, 0), static_cast<std::size_t>(len) * v_hkv);
     }
 
     // Write to a temporary and rename. A checkpoint is written under memory
@@ -250,9 +254,10 @@ Status KvCheckpointStore::load(const std::string& key, KvCache& kv, SeqPersistSt
     out.emitted = read_ids(h.emitted_at, h.n_emitted);
     out.rng_state = h.rng_state;
 
-    const auto hkv = kv.hkv();
+    const auto k_hkv = kv.k_hkv();
+    const auto v_hkv = kv.v_hkv();
     const auto layers = kv.n_layers();
-    if (hkv == 0 || layers == 0) {
+    if (k_hkv == 0 || layers == 0) {
         return {StatusCode::InvalidArgument, "destination cache is not open"};
     }
     if (h.length_tokens > kv.capacity()) {
@@ -260,19 +265,32 @@ Status KvCheckpointStore::load(const std::string& key, KvCache& kv, SeqPersistSt
                 "checkpoint holds " + std::to_string(h.length_tokens) +
                     " tokens, destination capacity is " + std::to_string(kv.capacity())};
     }
-    const auto per_plane = static_cast<std::uint64_t>(h.length_tokens) * hkv * layers;
-    if (raw.size() - at < per_plane * 2 * sizeof(float)) {
+    const auto payload_floats = static_cast<std::uint64_t>(h.length_tokens) *
+                                (static_cast<std::uint64_t>(k_hkv) + v_hkv) * layers;
+    const auto payload_bytes = payload_floats * sizeof(float);
+    if (h.payload_bytes != payload_bytes) {
+        return {StatusCode::InvalidArgument,
+                "checkpoint declares " + std::to_string(h.payload_bytes) +
+                    " payload bytes, destination geometry requires " +
+                    std::to_string(payload_bytes)};
+    }
+    if (raw.size() - at < payload_bytes) {
         return {StatusCode::InvalidArgument, "checkpoint payload is short"};
     }
 
     const auto* src = reinterpret_cast<const float*>(raw.data() + at);
-    const auto run = static_cast<std::size_t>(h.length_tokens) * hkv;
+    const auto k_run = static_cast<std::size_t>(h.length_tokens) * k_hkv;
     for (std::uint32_t l = 0; l < layers; ++l) {
-        std::copy_n(src + static_cast<std::size_t>(l) * run, run, kv.k_at(l, 0));
+        std::copy_n(src + static_cast<std::size_t>(l) * k_run, k_run, kv.k_at(l, 0));
     }
-    src += static_cast<std::size_t>(layers) * run;
-    for (std::uint32_t l = 0; l < layers; ++l) {
-        std::copy_n(src + static_cast<std::size_t>(l) * run, run, kv.v_at(l, 0));
+    // The V plane may not exist. `format_id` is what stops a v1 checkpoint — which
+    // always had one — reaching this code with a cache that does not.
+    if (v_hkv > 0) {
+        src += static_cast<std::size_t>(layers) * k_run;
+        const auto v_run = static_cast<std::size_t>(h.length_tokens) * v_hkv;
+        for (std::uint32_t l = 0; l < layers; ++l) {
+            std::copy_n(src + static_cast<std::size_t>(l) * v_run, v_run, kv.v_at(l, 0));
+        }
     }
     return kv.set_length(h.length_tokens);
 }

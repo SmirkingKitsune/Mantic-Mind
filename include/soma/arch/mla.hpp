@@ -39,7 +39,12 @@
 namespace soma::arch::mla {
 
 /// This backend's KV checkpoint tag. Owned here, not in a core enum.
-inline constexpr KvFormatId kKvFormat = kv_format_id("soma.kv.mla.latent.v1");
+/// v2: the V plane changed shape. It was the K plane's width for every layer and
+/// is now `index_head_dim` for DSA and ABSENT for plain MLA, so a checkpoint
+/// written under v1 has a different layout and must be refused rather than
+/// replayed into a cache shaped differently. That refusal is the entire reason
+/// this id is per-backend and not a global version.
+inline constexpr KvFormatId kKvFormat = kv_format_id("soma.kv.mla.latent.v2");
 
 /// Compressed latent + RoPE slice: kv_lora_rank + qk_rope_head_dim elements per
 /// token per layer. Note this is independent of head count — the whole point.
@@ -261,18 +266,19 @@ StatusCode f32_index_select_kv(const ArchIr& arch,
                                const soma::KvRow* rows,
                                DsaSelection& out) noexcept;
 
-/// Floats per position per layer in one cache plane.
+/// K is `kv_lora_rank + qk_rope_head_dim` — the compressed latent plus the single
+/// shared RoPE segment, independent of head count, which is the point.
 ///
-/// `kv_lora_rank + qk_rope_head_dim` — the compressed latent plus the single
-/// shared RoPE segment. Independent of head count, which is the point.
+/// V is `index_head_dim` for DSA and **zero** for plain MLA, because MLA derives
+/// V from the latent rather than storing it. Reporting the K width for both, as
+/// this did, allocated a full second plane that nothing ever read: 2.94 GB on
+/// GLM-5.2 at 4k x 4 slots, and every byte of it dead for DeepSeek-V2-Lite and
+/// Moonlight.
 ///
-/// DSA needs a second thing cached and the SECOND PLANE is where it goes. The
-/// two planes are called K and V by GQA's convention; MLA's V is derived from the
-/// latent rather than stored, so that plane would otherwise sit allocated and
-/// unused. The indexer's key is what fills it: `k_norm(wk(x))` roped, one vector
-/// per token, needed at every later step and impossible to recompute then because
-/// it depends on that token's hidden state at that layer.
-std::uint32_t f32_kv_floats_per_layer(const ArchIr& arch) noexcept;
+/// DSA's indexer key is the one thing that legitimately lives there: `k_norm(wk(x))`
+/// roped, one vector per token, needed at every later step and impossible to
+/// recompute then because it depends on that token's hidden state at that layer.
+KvGeometry f32_kv_geometry(const ArchIr& arch) noexcept;
 
 StatusCode f32_attention_kv(const ArchIr& arch,
                             const soma::F32LayerWeights& lw,
