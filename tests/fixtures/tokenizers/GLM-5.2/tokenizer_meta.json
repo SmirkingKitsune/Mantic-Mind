@@ -1,0 +1,14 @@
+{
+  "add_prefix_space": false,
+  "corpus_size": 36,
+  "n_added": 36,
+  "n_classes": 7,
+  "n_merges": 321649,
+  "n_vocab": 154856,
+  "nfc_implemented_in_engine": false,
+  "nfc_unstable_dropped": 1,
+  "normalizer": null,
+  "program": "glm",
+  "source": "Z:\\AI\\Ubiquitious-Memories\\Mantic-Mind\\models\\zai-org\\GLM-5.2",
+  "total_oracle_tokens": 328
+}

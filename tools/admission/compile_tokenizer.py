@@ -19,6 +19,8 @@ presents at G2 as "the model is subtly stupid" rather than as a tokenizer fault.
 Supported today:
   * ByteLevel BPE, GPT-2 default pattern      (OLMoE)
   * ByteLevel BPE, Qwen3 Split pattern        (Qwen3-MoE, Qwen2-MoE)
+  * ByteLevel BPE, GLM Split pattern          (GLM-5.2) — Qwen3's, with digits
+    grouped in runs of up to three instead of one at a time
 
 Refused, with the reason, until their families land:
   * multi-Split chains with explicit CJK/Latin ranges   (DeepSeek — G4)
@@ -57,6 +59,13 @@ ALT_WS_THEN_NEWLINES = 2             # \s*[\r\n]+
 GPT2_PATTERN = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
 QWEN_PATTERN = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+
+# GLM-5.2. Identical to Qwen3 except `\p{N}{1,3}` for `\p{N}` — digits group in
+# runs of up to three instead of one at a time, the GPT-4/cl100k convention.
+GLM_PATTERN = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*"
     r"|\s*[\r\n]+|\s+(?!\S)|\s+"
 )
 
@@ -169,11 +178,28 @@ def program_gpt2(c: dict[str, int]) -> list:
     ]
 
 
-def program_qwen(c: dict[str, int]) -> list:
+def program_qwen(c: dict[str, int], digit_run: int = 1) -> list:
+    """Qwen3's alternation, parameterized on the DIGIT RUN only.
+
+    `digit_run` is the `{1,n}` bound on `\\p{N}`: 1 for Qwen3, 3 for GLM-5.2. That
+    single number is the entire difference between the two patterns —
+
+        Qwen3    ...|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|...
+        GLM-5.2  ...|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|...
+
+    — and it changes tokenization materially rather than cosmetically: "2024"
+    becomes ["2024"]-ish groupings of up to three digits instead of four separate
+    tokens, so a model trained one way and pretokenized the other is being fed
+    numbers it has never seen. It is the GPT-4/cl100k convention.
+
+    Parameterized rather than copied, because a second near-identical program is
+    how the two drift: a fix to the whitespace or contraction alternatives would
+    have to be made twice, and the compiler would keep passing either way.
+    """
     return [
         (ALT_PLAIN, [(ITEM_LITERAL_CI, CONTRACTIONS, 0, 0)]),
         (ALT_PLAIN, [(ITEM_CLASS, c["NOT_CRLF_LN"], 0, 1), (ITEM_CLASS, c["L"], 1, INF)]),
-        (ALT_PLAIN, [(ITEM_CLASS, c["N"], 1, 1)]),
+        (ALT_PLAIN, [(ITEM_CLASS, c["N"], 1, digit_run)]),
         (ALT_PLAIN, [(ITEM_CLASS, c["SPACE_LITERAL"], 0, 1),
                      (ITEM_CLASS, c["NOT_SLN"], 1, INF),
                      (ITEM_CLASS, c["CRLF"], 0, INF)]),
@@ -296,6 +322,8 @@ def recognize(tj: dict) -> tuple[str, bool]:
         add_prefix = bool(bl[0].get("add_prefix_space", False)) if bl else False
         if pattern == QWEN_PATTERN:
             return "qwen", add_prefix
+        if pattern == GLM_PATTERN:
+            return "glm", add_prefix
         if pattern == GPT2_PATTERN:
             return "gpt2", add_prefix
         raise Unsupported("unrecognized Split pattern:\n    " + str(pattern))
@@ -395,7 +423,12 @@ def main(argv: list[str]) -> int:
 
     pool = ClassTable()
     classes = build_classes(pool)
-    program = program_gpt2(classes) if program_name == "gpt2" else program_qwen(classes)
+    if program_name == "gpt2":
+        program = program_gpt2(classes)
+    else:
+        # The digit run is the only thing that differs, so it is the only thing
+        # selected here. See program_qwen.
+        program = program_qwen(classes, digit_run=3 if program_name == "glm" else 1)
 
     flags = 0
     if norm_type == "NFC":
