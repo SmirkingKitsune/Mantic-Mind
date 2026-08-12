@@ -362,19 +362,31 @@ StatusCode f32_index_select(const ArchIr& arch,
         const auto avail = pos_base + t + 1; // causal: keys 0..pos_base+t
         score.assign(avail, 0.0f);
 
-        for (std::uint32_t h = 0; h < H; ++h) {
-            const float* qh = iq.data() + (static_cast<std::size_t>(t) * H + h) * D;
-            const float wgt = mix[static_cast<std::size_t>(t) * H + h] * head_scale;
-            for (std::uint32_t j = 0; j < avail; ++j) {
-                const float* kj = ik.data() + static_cast<std::size_t>(j) * D;
+        // KEY-OUTER, head-inner. The transposed nesting reads each key ONCE and
+        // applies every head to it, where head-outer walks the whole key array
+        // once per head — H passes over a buffer that grows with context. On
+        // GLM-5.2 at 32k that is 32 passes over 16.8 MB rather than one.
+        //
+        // Bit-identical, not merely equivalent: `score[j]` still accumulates over
+        // h in ascending order, and each `dot` is the same call on the same
+        // operands. That matters more here than in most loops — this score feeds
+        // a top-k, and a reordering that perturbed the low bits could flip a
+        // near-tie and change which keys the model attends to.
+        for (std::uint32_t j = 0; j < avail; ++j) {
+            const float* kj = ik.data() + static_cast<std::size_t>(j) * D;
+            float acc = 0.0f;
+            for (std::uint32_t h = 0; h < H; ++h) {
+                const float* qh = iq.data() + (static_cast<std::size_t>(t) * H + h) * D;
+                const float wgt = mix[static_cast<std::size_t>(t) * H + h] * head_scale;
                 const float dot =
                     f32::dot(std::span<const float>(qh, D), std::span<const float>(kj, D), D) *
                     softmax_scale;
                 // ReLU BEFORE the head mix, not after. Clamping the mixed score
                 // instead would let a negative head cancel a positive one, and
                 // the whole point of the non-linearity is that it cannot.
-                score[j] += wgt * (dot > 0.0f ? dot : 0.0f);
+                acc += wgt * (dot > 0.0f ? dot : 0.0f);
             }
+            score[j] = acc;
         }
 
         const auto keep = std::min<std::uint32_t>(want, avail);
@@ -752,16 +764,55 @@ StatusCode f32_index_select_kv(const ArchIr& arch,
     for (std::uint32_t r = 0; r < n_rows; ++r) {
         const auto avail = rows[r].len;
         score.assign(avail, 0.0f);
-        for (std::uint32_t h = 0; h < H; ++h) {
-            const float* qh = iq.data() + (static_cast<std::size_t>(r) * H + h) * D;
-            const float wgt = mix[static_cast<std::size_t>(r) * H + h] * head_scale;
-            for (std::uint32_t j = 0; j < avail; ++j) {
-                const float* kj = rows[r].v_at(layer, j);
-                const float dot =
-                    f32::dot(std::span<const float>(qh, D), std::span<const float>(kj, D), D) *
-                    softmax_scale;
-                score[j] += wgt * (dot > 0.0f ? dot : 0.0f);
+        // KEY-OUTER, head-inner — see the prefill path for why, and why it is
+        // bit-identical rather than merely equivalent.
+        //
+        // Parallel over KEYS, which the transposed nesting is what makes possible:
+        // each iteration writes exactly one `score[j]` and reads shared,
+        // immutable q/weights, so there is nothing to synchronise. Head-outer
+        // could not be split this way — every head accumulates into every score.
+        //
+        // Keys are the right axis for DECODE specifically: `avail` grows with the
+        // conversation while `n_rows` is usually 1, so parallelising over rows
+        // would leave the work single-threaded exactly when it is largest.
+        const float* qrow = iq.data() + static_cast<std::size_t>(r) * H * D;
+        const float* wrow = mix.data() + static_cast<std::size_t>(r) * H;
+        float* out_score = score.data();
+        const auto* row = &rows[r];
+        const auto score_keys = [&](std::uint32_t j0, std::uint32_t j1) {
+            for (std::uint32_t j = j0; j < j1; ++j) {
+                const float* kj = row->v_at(layer, j);
+                float acc = 0.0f;
+                for (std::uint32_t h = 0; h < H; ++h) {
+                    const float dot =
+                        f32::dot(std::span<const float>(qrow + static_cast<std::size_t>(h) * D, D),
+                                 std::span<const float>(kj, D),
+                                 D) *
+                        softmax_scale;
+                    acc += (wrow[h] * head_scale) * (dot > 0.0f ? dot : 0.0f);
+                }
+                out_score[j] = acc;
             }
+        };
+
+        // Below this, dispatching costs more than it saves.
+        //
+        // Measured, not assumed, and the first version had no threshold and was
+        // SLOWER than the serial loop it replaced at 256 and 512 keys — a
+        // "parallel" optimisation that lost to sequential code at the sizes most
+        // requests actually use. The scoring is one dot product per (key, head);
+        // when there are few keys, the per-chunk handoff dominates it.
+        //
+        // One implementation, called two ways, so the serial and parallel paths
+        // cannot compute different things.
+        constexpr std::uint32_t kParallelKeyFloor = 1024;
+        if (avail < kParallelKeyFloor) {
+            score_keys(0, avail);
+        } else {
+            ThreadPool::global().parallel_for(
+                avail, 256, [&](std::uint32_t j0, std::uint32_t j1, std::uint32_t) {
+                    score_keys(j0, j1);
+                });
         }
 
         const auto keep =
