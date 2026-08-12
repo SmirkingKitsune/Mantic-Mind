@@ -910,18 +910,47 @@ StatusCode f32_attention_kv(const ArchIr& arch,
     // 2048 against a 32k context that is a sixteenth of the work, and the saving
     // grows with context rather than shrinking.
     //
-    // NOT the absorbed form. Folding kv_b into Q would let scoring happen in
-    // latent space and skip the expansion entirely, which is what
-    // `MlaSpec::absorb_weights` and `prepare_weights` exist for on the production
-    // path. This is the fp32 REFERENCE, and its job is to be obviously the same
-    // arithmetic as prefill so the two can be compared; a faster formulation that
-    // has never been checked against a slower one is how a decode path ends up
-    // subtly disagreeing with its own prefill.
+    // ABSORPTION, which is what `MlaSpec::absorb_weights` has always described and
+    // nothing implemented. The identity is two lines:
+    //
+    //   q_nope . (W_k c_j)        =  (W_k^T q_nope) . c_j
+    //   sum_j a_j (W_v c_j)       =  W_v (sum_j a_j c_j)
+    //
+    // Both move kv_b to the side of the expression that does NOT depend on j. The
+    // unabsorbed form expands every attended latent into per-head K and V — the
+    // full-size K and V that MLA exists to avoid storing — and then throws them
+    // away. Absorbed, kv_b is touched once per head per step regardless of how
+    // many keys are attended, and everything inside the j loop is a `lora`-wide
+    // dot or axpy.
+    //
+    // Per layer per step, GLM-5.2 at index_topk 2048:
+    //   unabsorbed  n_sel * lora * H * (nope+vd)  = 3.0e10
+    //   absorbed    H*lora*(nope+vd) + 2*n_sel*H*lora = 1.5e8      (~200x)
+    //
+    // `absorb_weights` selects between them, which is exactly the A/B the flag was
+    // documented for. The unabsorbed path STAYS — it is the reference the fast one
+    // is checked against, and `soma_decode_kv_g4` runs both.
+    const bool absorb = m.absorb_weights;
+
     std::vector<float> heads(static_cast<std::size_t>(n_rows) * H * vd, 0.0f);
     std::vector<float> latents;
     std::vector<float> kv;
     std::vector<float> scores;
     std::vector<std::uint32_t> keys;
+
+    // Absorbed-only scratch.
+    const auto kvb_row = nope + vd; ///< kv_b rows belonging to one head
+    std::vector<float> wk_head;     ///< [nope, lora], this head's K up-projection
+    std::vector<float> q_lat;       ///< [lora], W_k^T q_nope
+    std::vector<float> z_lat;       ///< [lora], sum_j a_j c_j
+    if (absorb) {
+        wk_head.assign(static_cast<std::size_t>(nope) * lora, 0.0f);
+        q_lat.assign(lora, 0.0f);
+        z_lat.assign(lora, 0.0f);
+        if (w.kv_b_proj.rows != H * kvb_row || w.kv_b_proj.cols != lora) {
+            return StatusCode::InvalidArgument;
+        }
+    }
 
     for (std::uint32_t r = 0; r < n_rows; ++r) {
         const auto& kvr = rows[r];
@@ -939,24 +968,55 @@ StatusCode f32_attention_kv(const ArchIr& arch,
         const auto n_sel = static_cast<std::uint32_t>(keys.size());
         if (n_sel == 0) return StatusCode::InvalidArgument;
 
-        latents.resize(static_cast<std::size_t>(n_sel) * lora);
-        for (std::uint32_t i = 0; i < n_sel; ++i) {
-            std::copy_n(kvr.k_at(layer, keys[i]),
-                        lora,
-                        latents.data() + static_cast<std::size_t>(i) * lora);
+        if (!absorb) {
+            latents.resize(static_cast<std::size_t>(n_sel) * lora);
+            for (std::uint32_t i = 0; i < n_sel; ++i) {
+                std::copy_n(kvr.k_at(layer, keys[i]),
+                            lora,
+                            latents.data() + static_cast<std::size_t>(i) * lora);
+            }
+            kv.assign(static_cast<std::size_t>(n_sel) * H * kvb_row, 0.0f);
+            soma::matmul(w.kv_b_proj, latents, n_sel, kv);
         }
-        kv.assign(static_cast<std::size_t>(n_sel) * H * (nope + vd), 0.0f);
-        soma::matmul(w.kv_b_proj, latents, n_sel, kv);
 
         scores.resize(n_sel);
         for (std::uint32_t h = 0; h < H; ++h) {
             const float* qh = q.data() + (static_cast<std::size_t>(r) * H + h) * qk;
+
+            if (absorb) {
+                // W_k^T q_nope, as a row-scaled accumulation. The transpose is why
+                // this needs the weight materialized rather than fused: a kernel
+                // walks ROWS, and the sum here runs down COLUMNS. Once per head
+                // per step, against a j loop that may be thousands long.
+                const auto k_rows = soma::row_block(w.kv_b_proj, h * kvb_row, nope);
+                if (k_rows.empty()) return StatusCode::InvalidArgument;
+                if (const auto st = soma::dequantize(k_rows, wk_head); !st.ok()) {
+                    return st.code();
+                }
+                std::fill(q_lat.begin(), q_lat.end(), 0.0f);
+                for (std::uint32_t i = 0; i < nope; ++i) {
+                    f32::axpy(qh[i],
+                              std::span<const float>(
+                                  wk_head.data() + static_cast<std::size_t>(i) * lora, lora),
+                              lora,
+                              std::span<float>(q_lat));
+                }
+            }
+
             for (std::uint32_t i = 0; i < n_sel; ++i) {
-                const float* k_nope =
-                    kv.data() + (static_cast<std::size_t>(i) * H + h) * (nope + vd);
-                const float* kpe = kvr.k_at(layer, keys[i]) + lora;
-                float acc = f32::dot(
-                    std::span<const float>(qh, nope), std::span<const float>(k_nope, nope), nope);
+                const float* c_j = kvr.k_at(layer, keys[i]);
+                const float* kpe = c_j + lora;
+                float acc;
+                if (absorb) {
+                    acc = f32::dot(
+                        std::span<const float>(q_lat), std::span<const float>(c_j, lora), lora);
+                } else {
+                    const float* k_nope =
+                        kv.data() + (static_cast<std::size_t>(i) * H + h) * kvb_row;
+                    acc = f32::dot(std::span<const float>(qh, nope),
+                                   std::span<const float>(k_nope, nope),
+                                   nope);
+                }
                 acc += f32::dot(std::span<const float>(qh + nope, rope_d),
                                 std::span<const float>(kpe, rope_d),
                                 rope_d);
@@ -965,10 +1025,28 @@ StatusCode f32_attention_kv(const ArchIr& arch,
             f32::softmax(std::span<float>(scores.data(), n_sel), n_sel);
 
             float* dst = heads.data() + (static_cast<std::size_t>(r) * H + h) * vd;
-            for (std::uint32_t i = 0; i < n_sel; ++i) {
-                const float* vv =
-                    kv.data() + (static_cast<std::size_t>(i) * H + h) * (nope + vd) + nope;
-                f32::axpy(scores[i], std::span<const float>(vv, vd), vd, std::span<float>(dst, vd));
+            if (absorb) {
+                // Accumulate in LATENT space, then project once. The unabsorbed
+                // loop below does `n_sel` axpys of width vd against expanded
+                // values; this does `n_sel` of width lora against cached ones and
+                // one matvec at the end.
+                std::fill(z_lat.begin(), z_lat.end(), 0.0f);
+                for (std::uint32_t i = 0; i < n_sel; ++i) {
+                    f32::axpy(scores[i],
+                              std::span<const float>(kvr.k_at(layer, keys[i]), lora),
+                              lora,
+                              std::span<float>(z_lat));
+                }
+                const auto v_rows = soma::row_block(w.kv_b_proj, h * kvb_row + nope, vd);
+                if (v_rows.empty()) return StatusCode::InvalidArgument;
+                soma::matvec(v_rows, std::span<const float>(z_lat), std::span<float>(dst, vd));
+            } else {
+                for (std::uint32_t i = 0; i < n_sel; ++i) {
+                    const float* vv =
+                        kv.data() + (static_cast<std::size_t>(i) * H + h) * kvb_row + nope;
+                    f32::axpy(
+                        scores[i], std::span<const float>(vv, vd), vd, std::span<float>(dst, vd));
+                }
             }
         }
     }

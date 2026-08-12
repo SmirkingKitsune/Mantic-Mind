@@ -138,6 +138,25 @@ struct WeightRef {
 };
 
 std::size_t quantized_footprint(const QTensor& t) noexcept;
+/// A contiguous range of ROWS of `w`, as a weight in its own right.
+///
+/// Sound because of the layout guarantee at the top of this file: every format is
+/// a flat sequence of independent groups, so a row can be decoded without
+/// touching its neighbours and a run of rows is itself a valid tensor. That is
+/// what lets MLA address one head's slice of `kv_b_proj` — which is stored as one
+/// matrix of `n_heads * (qk_nope + v_head_dim)` rows — without copying it.
+///
+/// Returns an empty ref if the range is out of bounds, so a caller that does not
+/// check gets a loud failure rather than a view over someone else's rows.
+WeightRef row_block(const WeightRef& w, std::uint32_t first_row, std::uint32_t n_rows) noexcept;
+
+/// Materialize a weight as fp32, whatever precision it is held at.
+///
+/// The kernels deliberately fuse dequantization into the accumulation, because
+/// materializing a row costs scratch and defeats storing it small. This is for
+/// the case they cannot serve: reading a weight by COLUMN. MLA's absorbed decode
+/// needs `W_k^T q`, and a transposed access has no row to fuse into.
+Status dequantize(const WeightRef& w, std::span<float> out);
 
 // ── Dispatching kernels ──────────────────────────────────────────────────────
 //

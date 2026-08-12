@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <chrono>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -49,10 +50,11 @@ struct Outcome {
     bool passed = false;
     float max_abs = 0.0f;
     std::uint32_t worst_pos = 0;
+    double decode_ms = 0.0; ///< the cached loop ONLY; the teacher-forced run is shared
     std::string note;
 };
 
-Outcome check_fixture(const fs::path& dir, std::uint32_t n_tokens) {
+Outcome check_fixture(const fs::path& dir, std::uint32_t n_tokens, bool absorb) {
     Outcome r;
 
     soma::F32Model model;
@@ -62,6 +64,18 @@ Outcome check_fixture(const fs::path& dir, std::uint32_t n_tokens) {
         r.ran = !r.skipped;
         return r;
     }
+
+    // MLA's absorbed decode reaches the same numbers by different arithmetic:
+    // `(W_k^T q) . c` instead of `q . (W_k c)`, and one projection of the
+    // accumulated latent instead of a projection per attended key. Both must
+    // agree with the teacher-forced path, which is precisely the A/B
+    // `MlaSpec::absorb_weights` was documented for and never used for.
+    //
+    // Running only the default would leave the OTHER path untested — and the
+    // unabsorbed one is the reference the fast one was checked against, so
+    // letting it rot would quietly remove the thing that makes absorption
+    // believable.
+    model.arch.attention.mla.absorb_weights = absorb;
     // From this point on, every failure belongs to a family the engine claims to
     // support and must fail the gate. The original draft treated all early
     // returns as skips, which would have let MLA regress back to Unsupported while
@@ -95,6 +109,7 @@ Outcome check_fixture(const fs::path& dir, std::uint32_t n_tokens) {
 
     std::vector<float> step_logits;
     r.passed = true;
+    const auto t0 = std::chrono::steady_clock::now();
 
     for (std::uint32_t p = 0; p < n_tokens; ++p) {
         soma::KvRow row;
@@ -123,6 +138,8 @@ Outcome check_fixture(const fs::path& dir, std::uint32_t n_tokens) {
         }
     }
 
+    r.decode_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     r.passed = r.max_abs <= kTol;
     return r;
 }
@@ -138,7 +155,13 @@ int main(int argc, char** argv) {
     // the cached path without ever exercising the SELECTION in it, and pass for a
     // reason that has nothing to do with what was implemented. The first version
     // of this test used 24 and did exactly that.
-    constexpr std::uint32_t kTokens = 128;
+    // Overridable so the absorbed-vs-expanded ratio can be measured against
+    // CONTEXT LENGTH, which is the axis it scales on: the expanded form costs
+    // O(n_sel * lora * H * (nope+vd)) and the absorbed one O(n_sel * H * lora),
+    // so their ratio approaches (nope+vd) as the j loop grows and the fixed
+    // per-step costs stop dominating.
+    const std::uint32_t kTokens =
+        (argc > 2) ? static_cast<std::uint32_t>(std::stoul(argv[2])) : 128u;
 
     std::cout << "cached decode vs teacher-forced forward (" << kTokens << " positions)\n";
     std::cout << std::left << std::setw(34) << "fixture" << std::setw(10) << "result"
@@ -156,22 +179,26 @@ int main(int argc, char** argv) {
 
     for (const auto& dir : dirs) {
         const auto name = dir.filename().string();
-        const auto r = check_fixture(dir, kTokens);
-        std::cout << std::left << std::setw(34) << name;
-        if (r.skipped) {
-            // Only a family with no adapter is a skip. Once load succeeds, a
-            // missing cached path is a regression and is reported as FAIL.
-            std::cout << std::setw(10) << "-"
-                      << "SKIP: " << r.note << "\n";
-            continue;
+        for (const bool absorb : {false, true}) {
+            const auto r = check_fixture(dir, kTokens, absorb);
+            const auto label = name + (absorb ? "  [absorbed]" : "  [expanded]");
+            std::cout << std::left << std::setw(34) << label;
+            if (r.skipped) {
+                // Only a family with no adapter is a skip. Once load succeeds, a
+                // missing cached path is a regression and is reported as FAIL.
+                std::cout << std::setw(10) << "-"
+                          << "SKIP: " << r.note << "\n";
+                break; // the same skip both ways; saying it twice adds nothing
+            }
+            ++ran;
+            std::cout << std::setw(10) << (r.passed ? "PASS" : "FAIL")
+                      << "max|dlogit|=" << std::scientific << std::setprecision(2) << r.max_abs
+                      << " @pos" << r.worst_pos << std::defaultfloat << "  " << std::fixed
+                      << std::setprecision(0) << r.decode_ms << " ms" << std::defaultfloat;
+            if (!r.note.empty()) std::cout << "  " << r.note;
+            std::cout << "\n";
+            if (!r.passed) ++failures;
         }
-        ++ran;
-        std::cout << std::setw(10) << (r.passed ? "PASS" : "FAIL")
-                  << "max|dlogit|=" << std::scientific << std::setprecision(2) << r.max_abs
-                  << " @pos" << r.worst_pos << std::defaultfloat;
-        if (!r.note.empty()) std::cout << "  " << r.note;
-        std::cout << "\n";
-        if (!r.passed) ++failures;
     }
 
     std::cout << std::string(86, '-') << "\n";

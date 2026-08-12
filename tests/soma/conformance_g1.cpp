@@ -34,10 +34,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <sstream>
 #include <string>
@@ -112,6 +114,25 @@ bool codec_check(std::ostream& os) {
     os << "  codec round-trip (sigma=0.05, 8x256)\n";
     bool ok = true;
     std::vector<float> back(src.size());
+    constexpr std::uint32_t first_row = 2, row_count = 3;
+    std::vector<float> row_back(static_cast<std::size_t>(row_count) * cols);
+
+    const auto f32 = soma::WeightRef::from_f32(src, rows, cols);
+    const auto f32_rows = soma::row_block(f32, first_row, row_count);
+    if (auto st = soma::dequantize(f32_rows, row_back); !st.ok()) {
+        os << "    fp32 row view: FAILED " << st.message() << "\n";
+        ok = false;
+    } else if (!std::equal(row_back.begin(), row_back.end(),
+                           src.begin() + static_cast<std::size_t>(first_row) * cols)) {
+        os << "    fp32 row view: FAILED values differ\n";
+        ok = false;
+    }
+    if (!soma::row_block(f32, rows - 1, 2).empty() ||
+        !soma::row_block(f32, std::numeric_limits<std::uint32_t>::max(), 2).empty()) {
+        os << "    fp32 row view: FAILED out-of-range slice accepted\n";
+        ok = false;
+    }
+
     for (const auto& r : rows_to_try) {
         soma::QTensor t;
         if (auto st = soma::quantize_tensor(src, rows, cols, r.d, r.group, t); !st.ok()) {
@@ -121,6 +142,18 @@ bool codec_check(std::ostream& os) {
         }
         if (auto st = soma::dequantize_tensor(t, back); !st.ok()) {
             os << "    " << soma::to_string(r.d) << ": dequant FAILED " << st.message() << "\n";
+            ok = false;
+            continue;
+        }
+        const auto q_rows = soma::row_block(soma::WeightRef::from_q(t), first_row, row_count);
+        if (auto st = soma::dequantize(q_rows, row_back); !st.ok()) {
+            os << "    " << soma::to_string(r.d) << " row view: FAILED " << st.message() << "\n";
+            ok = false;
+            continue;
+        }
+        if (!std::equal(row_back.begin(), row_back.end(),
+                        back.begin() + static_cast<std::size_t>(first_row) * cols)) {
+            os << "    " << soma::to_string(r.d) << " row view: FAILED values differ\n";
             ok = false;
             continue;
         }
@@ -141,6 +174,16 @@ bool codec_check(std::ostream& os) {
            << "  rel_rms=" << std::scientific << std::setprecision(2) << rel
            << "  max=" << maxe << "\n";
     }
+
+    std::byte bogus{};
+    const auto malformed = soma::WeightRef::from_quantized_bytes(
+        soma::CByteSpan(&bogus, 1), soma::DType::F32, 32, 1, 32);
+    std::vector<float> malformed_out(32);
+    if (soma::dequantize(malformed, malformed_out).code() != soma::StatusCode::Unsupported) {
+        os << "    malformed quantized view: FAILED unsupported dtype accepted\n";
+        ok = false;
+    }
+    os << "    row views and validation: " << (ok ? "OK" : "FAILED") << "\n";
     return ok;
 }
 
