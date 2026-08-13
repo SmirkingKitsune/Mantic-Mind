@@ -108,6 +108,22 @@ if(Python3_Interpreter_FOUND)
                      "${CMAKE_SOURCE_DIR}/tools/ci/check_fetch_selection.py"
                      "${CMAKE_SOURCE_DIR}")
 
+    # The suite must run every test it declares.
+    #
+    # ctest reads the build directory's GENERATED test list, and that copy can go
+    # stale against CMakeLists.txt — which it did, hiding the MLA and DSA
+    # checkpoint round-trips while "29/29 passed" looked like a full green run
+    # (roadmap D44). The count is the only outward signal and nobody remembers
+    # last week's count.
+    #
+    # Self-checking is sound here because staleness only ever HIDES NEW tests: a
+    # stale file is an older complete one, so this check keeps running and keeps
+    # seeing what was added after it.
+    add_test(NAME mm_test_registry
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_SOURCE_DIR}/tools/ci/check_test_registry.py"
+                     "${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}")
+
     # The fused expert layout must convert byte-identically to the per-expert
     # one. The gate/up split is contiguous here and INTERLEAVED in gpt_oss, and
     # both readings produce a container that loads and runs — so this compares
