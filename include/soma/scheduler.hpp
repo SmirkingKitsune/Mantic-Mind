@@ -92,6 +92,19 @@ struct SchedulerStats {
     std::uint32_t active_sequences = 0;
     std::uint32_t queued_sequences = 0;
     std::uint32_t current_batch = 0;
+
+    /// High-water mark of `current_batch` since the engine started.
+    ///
+    /// `current_batch` is an INSTANT. Asking whether the engine ever batched by
+    /// sampling it is a race the observer usually wins and sometimes loses: the
+    /// sampler is an HTTP round-trip, so its real interval is milliseconds, and a
+    /// batch that forms and drains between two samples leaves no trace. That is
+    /// what D43 was — `soma_engine_g5` failing roughly 1 run in 25 on "the engine
+    /// really did batch them", with the engine having done nothing wrong.
+    ///
+    /// Monotonic, so one read after the fact answers the question the sampling
+    /// was approximating.
+    std::uint32_t max_batch_seen = 0;
     std::uint32_t effective_max_batch = 0; ///< after the cache-aware gate
     std::uint32_t prefill_rows_last_step = 0;
     std::uint32_t decode_rows_last_step = 0;

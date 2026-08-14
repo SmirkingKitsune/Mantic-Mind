@@ -158,6 +158,7 @@ json telemetry_frame_json(const TelemetryFrame& f) {
          {{"active_sequences", f.scheduler.active_sequences},
           {"queued_sequences", f.scheduler.queued_sequences},
           {"current_batch", f.scheduler.current_batch},
+          {"max_batch_seen", f.scheduler.max_batch_seen},
           {"effective_max_batch", f.scheduler.effective_max_batch},
           {"prefill_rows", f.scheduler.prefill_rows_last_step},
           {"decode_rows", f.scheduler.decode_rows_last_step},
@@ -780,6 +781,9 @@ struct ServeServer::Impl {
         j["effective_max_batch"] = st.effective_max_batch;
         j["active_sequences"] = st.active_sequences;
         j["current_batch"] = st.current_batch;
+        // The high-water mark, so a caller asking "did it ever batch?" reads a
+        // fact instead of racing a sampler.
+        j["max_batch_seen"] = st.max_batch_seen;
         // The payoff, made visible on the wire: unique experts read per step vs.
         // rows x top_k. A ratio near 1.0 means the union is buying nothing.
         j["unique_experts_last_step"] = st.unique_experts_last_step;

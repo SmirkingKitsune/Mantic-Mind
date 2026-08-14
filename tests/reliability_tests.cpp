@@ -125,32 +125,82 @@ std::filesystem::path temp_test_dir(const std::string& name) {
 // can land inside one after a reboot and the server under test silently fails
 // to bind. Probe for a port we can actually bind. Socket headers/WSA init come
 // with <httplib.h>.
+/// A port no OTHER TEST PROCESS will also pick.
+///
+/// The probe below binds, closes, and returns the number, so the caller binds it
+/// a moment later — a window in which anything may take it. Within one process
+/// the monotonic counter makes that harmless. ACROSS processes it was not: every
+/// process started at 42800 and marched upward in lockstep, so two of them
+/// racing picked the same ports in the same order.
+///
+/// The failure that produces is worse than a refused connection. The loser's
+/// `listen()` fails, the winner's server answers the readiness poll, and the test
+/// proceeds to assert against A DIFFERENT PROCESS'S SERVER — which replies with
+/// plausible, wrong statuses. That is what D1 had been reporting as an
+/// intermittent transport flake: measured here at roughly 80% failure with eight
+/// concurrent copies, and the failing checks were content assertions, not
+/// connection errors.
+///
+/// An atomic directory per port is the cross-process lease. The process keeps
+/// every lease until exit, so another copy of this test cannot select the same
+/// port during the probe-to-listen gap. A hard-killed process can leave stale
+/// leases, but the 22k-port range makes those skips harmless and normal teardown
+/// removes them. Unrelated processes do not honor the lease, so callers still
+/// assert that THEIR listen succeeded; see RECORD(listen_ok) in each test.
+struct TestPortLeases {
+    std::filesystem::path root =
+        std::filesystem::temp_directory_path() / "mantic-mind-test-port-leases";
+    std::vector<std::filesystem::path> held;
+
+    TestPortLeases() {
+        std::error_code ec;
+        std::filesystem::create_directories(root, ec);
+    }
+
+    ~TestPortLeases() {
+        std::error_code ec;
+        for (const auto& lease : held) {
+            std::filesystem::remove(lease, ec);
+            ec.clear();
+        }
+        std::filesystem::remove(root, ec); // succeeds only for the last process
+    }
+};
+
 uint16_t find_free_test_port() {
     static uint16_t next_candidate = 42800;
+    static TestPortLeases leases;
     for (int p = next_candidate; p < 65000; ++p) {
+        std::error_code lease_ec;
+        const auto lease = leases.root / ("port-" + std::to_string(p));
+        if (!std::filesystem::create_directory(lease, lease_ec)) continue;
+
         sockaddr_in addr{};
         addr.sin_family      = AF_INET;
         addr.sin_port        = htons(static_cast<uint16_t>(p));
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        bool ok = false;
 #ifdef _WIN32
         SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (s == INVALID_SOCKET) continue;
-        const bool ok =
-            bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
-        closesocket(s);
+        if (s != INVALID_SOCKET) {
+            ok = bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
+            closesocket(s);
+        }
 #else
         int s = socket(AF_INET, SOCK_STREAM, 0);
-        if (s < 0) continue;
-        int opt = 1;
-        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-        const bool ok =
-            ::bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
-        ::close(s);
+        if (s >= 0) {
+            int opt = 1;
+            setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+            ok = ::bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
+            ::close(s);
+        }
 #endif
         if (ok) {
+            leases.held.push_back(lease);
             next_candidate = static_cast<uint16_t>(p + 1);
             return static_cast<uint16_t>(p);
         }
+        std::filesystem::remove(lease, lease_ec);
     }
     return 0;
 }
@@ -1382,6 +1432,22 @@ bool test_control_api_external_token_gate() {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
         RECORD(server_ready);
+
+        // Is the server that answered OURS?
+        //
+        // `listen()` blocks while serving, so `listen_ok` cannot be read until
+        // teardown — which is where it IS asserted, ~350 lines below. That is too
+        // late to be useful: if another process holds this port, our bind fails,
+        // the readiness poll above is satisfied by THEIR server, and every
+        // assertion in between fails against a stranger returning plausible wrong
+        // statuses. The teardown check then reports the cause after twenty
+        // confusing symptoms.
+        //
+        // `listen_returned` is readable now and says the same thing early: our
+        // listen() has only returned if it FAILED, because a serving one does not
+        // return. A ready server plus a returned listen means the responder is
+        // not ours.
+        RECORD(!listen_returned);
 
         // Transport retries: see kTransportRetries. One budget for the whole
         // file — this test is where two of them diverging did damage.
@@ -4341,6 +4407,10 @@ bool test_runtime_client_health_empty_body_ok() {
     }
     srv.stop();
     th.join();
+    // Every other server in this file asserts its own listen; this one did not,
+    // so a stolen port would have been probed, answered by a stranger, and
+    // reported as a health-check result.
+    CHECK(listen_ok);
     CHECK(reachable);
     CHECK(healthy);
     return true;

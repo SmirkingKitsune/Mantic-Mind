@@ -529,6 +529,7 @@ Status Scheduler::step() {
 
     ++im.stats.steps;
     im.stats.current_batch = static_cast<std::uint32_t>(batch.size());
+    im.stats.max_batch_seen = std::max(im.stats.max_batch_seen, im.stats.current_batch);
     im.stats.prefill_rows_last_step = prefill_rows;
     im.stats.decode_rows_last_step = decode_rows;
     im.stats.active_sequences = static_cast<std::uint32_t>(im.seqs.size());

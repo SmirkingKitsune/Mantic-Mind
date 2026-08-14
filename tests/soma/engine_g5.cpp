@@ -905,53 +905,102 @@ int main(int argc, char** argv) {
 
         // Then the same turn alongside three others. A poller samples the
         // engine's own step statistics while they run.
-        std::atomic<bool> polling{true};
+        // Up to three attempts at OBSERVING a batch.
+        //
+        // The property under test is that the engine CAN batch concurrent turns,
+        // and demonstrating it requires four requests to coincide — which the test
+        // issues simultaneously but cannot force, since whether they overlap
+        // depends on connection setup and generation speed. One non-overlapping
+        // trial disproves nothing, and treating it as a failure is what made this
+        // flaky at roughly 1 run in 20 even after the starts were synchronised.
+        //
+        // NOT a weakened assertion: `>= 2` still has to be reached, and the
+        // correctness checks below (identical output solo vs batched, distinct
+        // answers, no splicing) run on EVERY attempt, and any failure remains
+        // recorded even if a later attempt observes a batch.
+        std::uint32_t reported = 0;
+        nlohmann::json final_stats;
+        // Outside the loop: they accumulate across attempts, and the report below
+        // reads them after it.
         std::atomic<std::uint32_t> max_batch{0};
         std::atomic<std::uint32_t> max_unique{0}, max_naive{0};
-        std::thread poller([&] {
-            while (polling.load()) {
-                const auto s = sessions(port);
-                const auto b = s.value("current_batch", 0u);
-                if (b > max_batch.load()) max_batch.store(b);
-                const auto u = s.value("unique_experts_last_step", 0u);
-                const auto n = s.value("naive_expert_reads_last_step", 0u);
-                if (n > max_naive.load()) {
-                    max_naive.store(n);
-                    max_unique.store(u);
+        for (int attempt = 0; attempt < 3 && reported < 2; ++attempt) {
+            std::atomic<bool> polling{true};
+            std::thread poller([&] {
+                while (polling.load()) {
+                    const auto s = sessions(port);
+                    const auto b = s.value("current_batch", 0u);
+                    if (b > max_batch.load()) max_batch.store(b);
+                    const auto u = s.value("unique_experts_last_step", 0u);
+                    const auto n = s.value("naive_expert_reads_last_step", 0u);
+                    if (n > max_naive.load()) {
+                        max_naive.store(n);
+                        max_unique.store(u);
+                    }
+                    std::this_thread::sleep_for(std::chrono::microseconds(200));
                 }
-                std::this_thread::sleep_for(std::chrono::microseconds(200));
-            }
-        });
-
-        std::vector<std::string> results(4);
-        std::vector<std::thread> callers;
-        for (int i = 0; i < 4; ++i) {
-            callers.emplace_back([&, i] {
-                const auto text = (i == 0) ? probe : probe + " variant " + std::to_string(i);
-                results[static_cast<std::size_t>(i)] =
-                    chat(port, json::array({user_msg(text)}), "", tokens);
             });
-        }
-        for (auto& t : callers)
-            t.join();
-        polling.store(false);
-        poller.join();
 
-        // THE gate. Batching sequences together must not change what any of them
-        // says — the same property G3 asserts inside the scheduler, now asserted
-        // through the HTTP boundary where the batch is actually assembled.
-        check(results[0] == solo,
-              "a turn's output is IDENTICAL whether it ran alone or in a batch",
-              results[0] == solo ? "byte-for-byte" : "DIVERGED");
-        check(!results[1].empty() && !results[2].empty() && !results[3].empty(),
-              "and every concurrent turn gets its own answer");
-        check(results[1] != results[0] && results[2] != results[1],
-              "which are not spliced into each other",
-              "distinct prompts gave distinct answers");
+            // All four issue TOGETHER.
+            //
+            // Spawning them in a loop staggers the starts by however long thread
+            // creation and connection setup take, and against a 48-token generation on
+            // a tiny model that is enough for the first to finish before the last
+            // arrives — no overlap, no batch, and a failing assertion about an engine
+            // that did nothing wrong. Measured at roughly 1 run in 8 with the engine's
+            // own high-water mark reporting 1 (roadmap D43).
+            //
+            // The gate is not the constraint here: it reported 4 in every run,
+            // failing ones included. What varied was whether the requests coincided.
+            std::atomic<bool> go{false};
+            std::vector<std::string> results(4);
+            std::vector<std::thread> callers;
+            for (int i = 0; i < 4; ++i) {
+                callers.emplace_back([&, i] {
+                    while (!go.load(std::memory_order_acquire))
+                        std::this_thread::yield();
+                    const auto text = (i == 0) ? probe : probe + " variant " + std::to_string(i);
+                    results[static_cast<std::size_t>(i)] =
+                        chat(port, json::array({user_msg(text)}), "", tokens);
+                });
+            }
+            go.store(true, std::memory_order_release);
+            for (auto& t : callers)
+                t.join();
+            polling.store(false);
+            poller.join();
 
-        check(max_batch.load() >= 2,
+            // THE gate. Batching sequences together must not change what any of them
+            // says — the same property G3 asserts inside the scheduler, now asserted
+            // through the HTTP boundary where the batch is actually assembled.
+            check(results[0] == solo,
+                  "a turn's output is IDENTICAL whether it ran alone or in a batch",
+                  results[0] == solo ? "byte-for-byte" : "DIVERGED");
+            check(!results[1].empty() && !results[2].empty() && !results[3].empty(),
+                  "and every concurrent turn gets its own answer");
+            check(results[1] != results[0] && results[2] != results[1],
+                  "which are not spliced into each other",
+                  "distinct prompts gave distinct answers");
+
+            // The engine's own high-water mark, not the poller's.
+            //
+            // `current_batch` is an instant and the poller reads it over HTTP, so its
+            // effective interval is milliseconds — a batch that forms and drains in
+            // between leaves no trace and this check failed with the engine behaving
+            // perfectly. Measured at roughly 1 run in 25 (roadmap D43).
+            //
+            // The sampled value is still reported, because a disagreement between the
+            // two is worth seeing: it means batching happened too briefly to observe,
+            // which is a fact about the workload rather than a fault.
+            final_stats = sessions(port);
+            reported = final_stats.value("max_batch_seen", 0u);
+        } // attempts
+        check(reported >= 2,
               "the engine really did batch them",
-              "max observed batch = " + std::to_string(max_batch.load()));
+              "engine max_batch_seen = " + std::to_string(reported) + ", sampler saw " +
+                  std::to_string(max_batch.load()) + ", gate allowed " +
+                  std::to_string(final_stats.value("effective_max_batch", 0u)) + ", steps " +
+                  std::to_string(final_stats.value("steps", 0u)));
         if (max_naive.load() > 0) {
             const double ratio =
                 static_cast<double>(max_naive.load()) / std::max(1u, max_unique.load());
