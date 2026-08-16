@@ -1,6 +1,6 @@
 #pragma once
 
-// Soma — the in-memory form of arch.json.
+// Soma — the normalized in-memory architecture description.
 //
 // This is a DESCRIPTION of an architecture, not an implementation of one. It is
 // plain data: the core reads it to size buffers and select a backend, and the
@@ -80,7 +80,7 @@ struct MlaSpec {
     /// field was written and not what absorption wanted once measured: folding at
     /// load means keeping a transposed fp32 copy of the up-projection resident —
     /// 1.96 GB on GLM-5.2 — to save arithmetic that was never the bottleneck. See
-    /// `arch::mla::prepare_weights`.
+    /// `arch::mla::f32_attention_kv`.
     ///
     /// False selects the expanded form, which is kept as the reference the
     /// absorbed one is checked against; `soma_decode_kv_g4` runs both.
@@ -255,7 +255,7 @@ struct ArchIr {
     bool is_moe_layer(LayerIndex layer) const noexcept;
 };
 
-/// Parse + validate our own canonical arch.json.
+/// Parse + validate the registry's canonical architecture JSON.
 Status parse_arch_ir(std::string_view json, ArchIr& out);
 
 /// Adapt an upstream HuggingFace config.json into the IR.

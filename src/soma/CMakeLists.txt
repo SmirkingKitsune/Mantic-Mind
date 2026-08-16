@@ -19,7 +19,6 @@ set(SOMA_CORE_HEADERS
     soma/arch_ir.hpp
     soma/model.hpp
     soma/attention_backend.hpp
-    soma/arch_backend.hpp
     soma/memory_hierarchy.hpp
     soma/expert_store.hpp
     soma/kernels.hpp
@@ -456,4 +455,4 @@ endif()
 #   G5  soma executable — serve | plan --json | admit-verify
 #
 # src/soma/arch_registry.cpp is the ONE core TU permitted to include soma/arch/;
-# it holds resolve_arch_backend() and resolve_attention_backend().
+# it holds resolve_f32_backend() and resolve_attention_backend().

@@ -30,14 +30,44 @@ expert miss:
 
 ```
 <model_dir>/
-  arch.json               the IR (schemas/arch-ir.md)
+  config.json             the SOURCE config, copied verbatim
+  container_meta.json     the record of this conversion — see below
   soma.container          header + sidecar index — small, read once, fully
   experts-00000.bin       shard: 4 KB-aligned expert ranges
   experts-00001.bin       …
   dense.safetensors       the resident half: attn projections, norms, embeddings,
                           router weights, shared experts
-  tokenizer.soma          compiled tokenizer
+  tokenizer.soma          compiled tokenizer      ) all three, or
+  tokenizer_oracle.bin    golden ids for the gate ) tokenizer.unsupported
+  tokenizer_meta.json                             ) with the reason
 ```
+
+**There is no `arch.json` FILE in a container.** This listing named one and no converter has ever
+written it. The IR is ADAPTED from `config.json` at load, by the same `resolve_arch()` that
+`soma plan` uses, so a container and a plain HF checkpoint go down one path — a second description
+file that had to agree with the first is how the two drift.
+
+The IR is still a real persisted artifact elsewhere: admission stores it in the registry's `arch_json`
+column, and `GET /v1/models/{id}` returns it. What does not exist is a copy of it sitting beside the
+weights.
+
+`container_meta.json` is not a second description of the architecture. It records what the CONVERSION
+did, and it is the only place the quantization exists at all: `dtype_gate_up`, `dtype_down`, `group`,
+`effective_groups`, `expert_bytes`, `total_expert_bytes`, `n_shards`, `layer_kinds`, `dense_tensors`,
+and `tokenizer` (`compiled` | `unsupported`). `arch_hash` covers the quant map precisely so that the
+same weights at two quantizations are two models, with two verdicts and two sets of KV checkpoints.
+
+The dense half is stored **F32 regardless of `--quant-dense`**, and that is deliberate: the loader
+quantizes it into RAM per the role's spec, so the resident precision can be changed without
+reconverting a byte — which is exactly what the expert half cannot do. `--quant-dense` is therefore a
+flag on `plan` and `serve`, not on the converter.
+
+The tokenizer is compiled INTO the container, before the expert loop, and the outcome is recorded in
+`container_meta.json` and repeated in the converter's final summary. It is NON-FATAL: most families'
+pretokenizers are not compiled yet, and aborting a multi-hour conversion over a tokenizer would be
+disproportionate to a gap the container can be used without. A container without one still serves —
+`soma serve` falls back to one token per byte, which produces real tokens from real weights and
+meaningless text, and `conform` reports `tokenizer_roundtrip` as skipped rather than passed.
 
 The **dense half stays in safetensors** deliberately. It is loaded once, in full, at startup — none of
 the four requirements above apply to it, and keeping a standard format means it stays inspectable with
@@ -89,7 +119,8 @@ Concatenated expert ranges, each padded to a 4 KB boundary. Within one expert:
 
 each already quantized per its tensor role. Gate and up share a dtype in every map seen so far; down is
 commonly higher precision (`schemas/arch-ir.md` §5), so the three sections may differ in bytes-per-row.
-The section sizes are derivable from `arch.json` and are not repeated per expert.
+The section sizes are derivable from the IR — and from `container_meta.json`, which records the
+dtypes and the effective group this conversion actually used — so they are not repeated per expert.
 
 Shards are capped (default 4 GiB) so the format works on filesystems without large-file support and so a
 partial conversion can be resumed at shard granularity.

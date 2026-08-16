@@ -14,7 +14,7 @@ Two rules shape this tree:
 ## Tree
 
 ```
-include/soma/            invariant core — 16 headers, flat
+include/soma/            invariant core — flat, no subdirectories
 include/soma/arch/       per-architecture backends (gqa.hpp, mla.hpp)
 src/soma/                mm_soma static lib + the header self-test
 src/soma/arch/           per-architecture translation units
@@ -29,6 +29,7 @@ tools/ci/                check_seam.py and friends
 tools/*.toml             config templates (existing convention)
 
 schemas/arch-ir.md       the architecture IR spec
+schemas/container.md     the on-disk container format
 schemas/registry/*.sql   versioned migrations
 
 docs/architecture.md            the seam, tiers, scheduler, before/after
@@ -56,8 +57,8 @@ Both are enforced by [`tools/ci/check_seam.py`](../tools/ci/check_seam.py) on ev
 [architecture.md §11](architecture.md).
 
 `arch_registry.cpp` is the single exception, and it is a small one by design: it holds
-`resolve_arch_backend()` and `resolve_attention_backend()` and nothing else. Those are the only two
-places in the system that switch on `AttentionFamily`, and they run once per model load. A switch on
+`resolve_f32_backend()` and `resolve_attention_backend()` and nothing else. Those are the only two
+resolution functions that switch on `AttentionFamily`, and they run once per model load. A switch on
 family anywhere in a loop is a seam violation regardless of which file it is in.
 
 ---
@@ -66,7 +67,7 @@ family anywhere in a loop is a seam violation regardless of which file it is in.
 
 | Script | Purpose |
 |---|---|
-| `convert.py` | HF checkpoint → canonical container + sidecar index + `arch.json` |
+| `convert.py` | HF checkpoint → canonical container + sidecar index + conversion metadata |
 | `make_oracle.py` | Tiny-random model with the **real** arch config + `transformers` teacher-forcing oracle |
 | `compile_tokenizer.py` | `tokenizer.json` → the normalized C++-side format |
 | `profile_streaming.py` | Streaming economics → the verdict |

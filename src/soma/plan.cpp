@@ -340,7 +340,7 @@ Status serialize_plan(const PlanDocument& plan, std::string& out_json) {
       << "  \"bytes_per_token\": " << plan.bytes_per_token
       << ",\n"
       // Topology and per-expert economics, so a consumer of the plan does not
-      // have to parse arch.json to learn what it is looking at. Control's
+      // have to inspect the architecture IR to learn what it is looking at. Control's
       // registry denormalizes exactly these, and the plan is its only view.
       << "  \"attention_family\": \"" << plan.attention_family << "\",\n"
       << "  \"n_layers\": " << plan.n_layers << ",\n"

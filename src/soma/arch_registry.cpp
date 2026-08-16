@@ -11,10 +11,7 @@
 
 #include "soma/arch/gqa.hpp"
 #include "soma/arch/mla.hpp"
-#include "soma/arch_backend.hpp"
 #include "soma/f32_model.hpp"
-
-#include <array>
 
 namespace soma {
 
@@ -73,26 +70,6 @@ const AttentionBackend* resolve_attention_backend(AttentionFamily family) noexce
         return nullptr;
     }
     return nullptr;
-}
-
-const ArchBackend* resolve_arch_backend(const ArchIr& arch) noexcept {
-    switch (arch.attention.family) {
-    case AttentionFamily::Mha:
-    case AttentionFamily::Gqa:
-        return &arch::gqa::backend();
-    case AttentionFamily::Mla:
-    case AttentionFamily::MlaDsa:
-    case AttentionFamily::Unknown:
-        return nullptr;
-    }
-    return nullptr;
-}
-
-std::span<const ArchBackend* const> registered_arch_backends() noexcept {
-    // Reported by `soma admit-verify` so an operator can see what this build
-    // accepts before spending hours converting something it cannot run.
-    static const std::array<const ArchBackend*, 1> kAll{&arch::gqa::backend()};
-    return {kAll.data(), kAll.size()};
 }
 
 } // namespace soma

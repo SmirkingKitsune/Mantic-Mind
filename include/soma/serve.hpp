@@ -27,7 +27,6 @@
 
 namespace soma {
 
-class ModelState;
 class MemoryHierarchy;
 
 /// Every field is settable by BOTH a CLI flag and an env var, because the node

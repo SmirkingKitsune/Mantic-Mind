@@ -137,14 +137,11 @@ public:
     Status open(const std::string& checkpoint_dir, const ArchIr& arch);
     void close();
 
-    Status save(const std::string& key, const SeqState& seq);
-    Status load(const std::string& key, SeqState& seq);
-
-    /// The G3 pair, against the fp32 path's KvCache.
+    /// The pair, against the scheduler's KvCache.
     ///
-    /// Same format, same header, same gating as the SeqState overloads — only the
-    /// in-memory type differs. Keeping one on-disk format across both is the
-    /// whole premise of this file: a checkpoint written by the scheduler must be
+    /// There were once two, this and a `SeqState` overload for an engine that was
+    /// never built; the other has been deleted. One on-disk format is still the
+    /// premise of this file: a checkpoint written by the scheduler must be
     /// loadable by warm reopen and by cluster slot restore without translation.
     ///
     /// `state.tokens` must be exactly the ids occupying the cached positions, in

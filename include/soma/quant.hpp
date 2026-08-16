@@ -2,7 +2,7 @@
 
 // Soma — quantization, specified per TENSOR ROLE.
 //
-// Not per tensor, not globally. The role map lives in arch.json §5; the kernels
+// Not per tensor, not globally. The role map lives in the architecture IR §5; the kernels
 // that consume it are core. No architecture-specific concept appears here.
 
 #include "soma/types.hpp"
@@ -42,7 +42,7 @@ struct QuantSpec {
     std::uint32_t group = 0; ///< group-scale width; 0 = per-tensor scale
 };
 
-/// The full per-role map, as carried in arch.json.
+/// The full per-role map, as carried in the architecture IR.
 struct QuantMap {
     QuantSpec embed;
     QuantSpec attn_proj;

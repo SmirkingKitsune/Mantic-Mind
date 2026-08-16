@@ -1,6 +1,6 @@
 # Soma — Architecture
 
-> **Status:** design pass. Headers and schemas exist; no hot-path implementation yet.
+> **Status:** active experimental implementation; GLM-5.2 serves end to end through the production path.
 > **Scope:** experimental branch, destructive refactor. No cross-compatibility with `main`.
 
 Soma is the MoE-primary inference engine in Mantic-Mind. It runs oversized Mixture-of-Experts models on
@@ -43,8 +43,8 @@ include/soma/arch/*.hpp   backends         — everything model-specific
 
 | Invariant core | Per-architecture backend |
 |---|---|
-| `MemoryHierarchy` — tiers, LRU, pin, heat | `ArchBackend` — struct of function pointers + compile-time descriptor |
-| `ExpertStore` — sidecar index, aligned reads, readahead pool | `AttentionBackend` — cache shape and decode algebra |
+| `MemoryHierarchy` — tiers, LRU, pin, heat | `F32Backend` — execution descriptor and per-layer operations |
+| `ExpertStore` — sidecar index, aligned reads, readahead pool | `AttentionBackend` — planner sizing and KV persistence format |
 | `Scheduler` — step-major loop, ragged batching, admission control | Router semantics — score fn, normalization, bias correction, grouping |
 | `Kernels` — quant GEMM family, static dispatch from `kernel_choice` | Activation, norm placement, RoPE variant |
 | `KvCheckpointStore` — versioned, `arch_hash`-gated | Expert layout descriptor, draft/MTP head |
@@ -60,13 +60,21 @@ form. The runtime loads it as **data**. Two architectures with the same tokenize
 in `arch/` and that is correct.
 
 **Quantization.** Specified per *tensor role*, not per architecture and not per tensor. The role map
-lives in `arch.json`; the kernels are core.
+lives in the architecture IR; the kernels are core.
 
-### 2.2 The two backends this seam is co-designed against
+### 2.2 The attention families this seam is designed against
 
 Shaping an interface to one architecture and discovering it at the second is the classic failure. The
-seam is therefore designed against **GQA** (Qwen3-MoE, Mixtral, GPT-OSS, Llama-family) and **MLA**
-(DeepSeek-V2-Lite, GLM-style) simultaneously, before either is implemented.
+seam was therefore designed against **GQA** (Qwen3-MoE, Mixtral, GPT-OSS, Llama-family) and **MLA**
+(DeepSeek-V2-Lite, Moonlight) simultaneously. Both now run through it.
+
+A **third** family has since gone through it, and it is the one to read this section against:
+**MLA + DSA** (GLM-5.2) — DeepSeek Sparse Attention with IndexShare. It is MLA plus a learned sparse
+key selector, and 57 of its 78 layers own no indexer weights at all; they reuse a selection computed
+by a different layer. The seam carried it without changing shape: one opaque `ArchLayerPayload` on
+the per-forward workspace. The concern recorded here earlier — that per-layer function pointers had
+no channel for cross-layer state — was the wrong shape of problem. The index is per-(row, step) and
+never persists between steps, so it needed a per-FORWARD slot, not a per-sequence one.
 
 Their genuine differences are **KV cache shape** and **decode algebra**:
 
@@ -74,22 +82,31 @@ Their genuine differences are **KV cache shape** and **decode algebra**:
 |---|---|---|
 | Cache contents | Full K and V, `n_kv_heads × head_dim` each | Compressed latent (`kv_lora_rank`) + a small RoPE-carrying slice |
 | Bytes/token | Large — competes directly with the expert cache for RAM | Small — roughly two orders of magnitude less on comparable configs |
-| Load-time weight prep | None | **Weight absorption** — fold up-projections into Q so decode never materializes full K/V. No GQA analogue. |
+| Decode-time algebra | Standard projection | **Weight absorption** — move up-projections to the query side so cached decode never materializes full K/V. No GQA analogue. |
 | Decode | `repeat_kv` then standard SDPA | Operates in latent space |
 
 The interface consequences, and why each exists:
 
-- **The core never sees a K/V tensor pair.** It allocates opaque per-sequence KV bytes and hands the
-  backend a region. Only `kv_bytes_per_token()` crosses the seam. An interface that said `Tensor& k,
-  Tensor& v` would be GQA-shaped and MLA would have to lie to it.
-- **`prepare_weights(ModelState&)` is a first-class backend hook**, called once at load. MLA's
-  implementation performs absorption; GQA's is a no-op. Putting absorption anywhere else — admission, or
-  a special case in the loader — leaks MLA into the core.
-- **`prefill`/`decode` take the whole batch and loop internally.** v1 loops per-sequence inside the
-  backend (each sequence attends its own KV slot at its own length). A future paged-KV backend with a
-  block table can batch the loop away without an interface change.
+- **The core owns cache storage, not cache algebra.** `KvCache` allocates two planes from the
+  backend's `KvGeometry` and hands each row to `F32Backend::attention_kv`; the core never interprets
+  either plane. GQA uses them as full K and V, MLA uses only the latent K plane, and DSA uses the
+  second plane for indexer keys.
+- **Absorption happens per cached-decode step inside MLA.** Folding at load would keep a transposed
+  fp32 copy of the up-projection resident (1.96 GB on GLM-5.2) to save arithmetic that was never the
+  bottleneck. `MlaSpec::absorb_weights` selects the absorbed form or the expanded reference form;
+  there is no load hook and no second execution path (roadmap D38, D39).
+- **`kv_geometry()` reports BOTH cache planes**, because they are not the same size. A single width
+  cannot express "this family stores no second plane", and for want of that MLA allocated a full V
+  plane at the K plane's width for every layer, holding nothing — 2.94 GB on GLM-5.2 at 4k x 4 slots.
+  MLA derives V from the latent, so its V plane is zero; DSA's holds the indexer key, which depends
+  on a past token's hidden state at that layer and cannot be recomputed later (roadmap D35, D37).
+- **`F32Backend::attention_kv` takes the whole ragged batch.** Each row carries its own cache slot,
+  position and visible length. A future paged-KV implementation would extend this actual row/cache
+  interface with a block table.
 - **`persist_format_id`** tags KV checkpoints so an MLA checkpoint can never be replayed into a GQA
-  engine. This is a cheap guard against a genuinely confusing class of bug report.
+  engine. A cheap guard against a genuinely confusing class of bug report, and it has since earned
+  its keep WITHIN a family: MLA's tag went to `.v2` when the V plane changed shape, so a checkpoint
+  written under the old layout is refused rather than replayed into a differently-shaped cache.
 
 **Mixtral is the third design input**, and it is a negative one. Eight experts at top-2, ~88 MB each,
 activates a quarter of every layer — streaming buys almost nothing. The seam must represent it
@@ -111,7 +128,7 @@ Concurrency correctness reduces to knowing who owns what. Three tiers, and the b
 
 | Tier | Contents | Lifetime | Locking |
 |---|---|---|---|
-| **`model`** | Dense tensors, compiled tokenizer, `arch.json`, kernel dispatch table, expert index | Immutable after load | **None.** Read-only, shared freely across threads. |
+| **`model`** | Dense tensors, compiled tokenizer, architecture IR, kernel dispatch table, expert index | Immutable after load | **None.** Read-only, shared freely across threads. |
 | **`seq`** | KV slot, position, sampler + RNG, draft window, grammar state, stop condition | Per-sequence | Owned by one sequence; no cross-sequence access. |
 | **`exec`** | Per-step scratch — ragged batch buffers, router logits, expert-union workspace | Per-step, sized for `max_batch` | Mutex-held for the step. |
 
@@ -397,13 +414,14 @@ which was the actual requirement.
 ## 11. Module graph and enforcement
 
 ```
-serve ──────> scheduler ──────> arch_backend ──────> attention_backend
+serve ──────> scheduler ──────> F32Backend
                  │                    │
                  ├──> memory_hierarchy ──> expert_store ──> disk
                  ├──> kv_checkpoint
                  ├──> kernels          (dispatch table from registry)
                  └──> telemetry ──────> node ──> control ──> /v1/*
 
+plan ───────> AttentionBackend  (sizing + KV format only)
 model  — the three tiers (§3); data every box above operates on
 plan   — derived from registry + host probe; configures scheduler and reports to placement
 ```

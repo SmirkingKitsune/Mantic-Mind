@@ -37,16 +37,16 @@ CREATE TABLE IF NOT EXISTS model (
     source_revision      TEXT,
     model_dir            TEXT    NOT NULL,   -- converted container, control-relative
     schema_version       INTEGER NOT NULL,
-    arch_json            TEXT    NOT NULL,   -- the full arch.json, verbatim
+    arch_json            TEXT    NOT NULL,   -- the full canonical architecture IR
 
-    -- denormalized from arch.json for cheap queries and the TUI
+    -- denormalized from the architecture IR for cheap queries and the TUI
     attention_family     TEXT    NOT NULL,   -- mha | gqa | mla | mla+dsa
     n_layers             INTEGER NOT NULL,
     n_moe_layers         INTEGER NOT NULL,
     n_experts            INTEGER NOT NULL,
     top_k                INTEGER NOT NULL,
 
-    -- economics (arch.json §7); NOT covered by arch_hash
+    -- economics (architecture IR §7); NOT covered by arch_hash
     expert_bytes         INTEGER NOT NULL,
     bytes_per_token      INTEGER NOT NULL,
     total_routed_bytes   INTEGER NOT NULL,

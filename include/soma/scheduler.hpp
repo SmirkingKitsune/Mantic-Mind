@@ -127,18 +127,14 @@ public:
     Scheduler& operator=(const Scheduler&) = delete;
     ~Scheduler();
 
-    Status open(const ModelState& model,
-                MemoryHierarchy& memory,
-                KvCheckpointStore& checkpoints,
-                const SchedulerConfig& config);
-
     /// Drive the scheduler against the fp32 reference model.
     ///
     /// The path that exists at G3. Every conformance gate is expressed against
     /// F32Model, so scheduling it directly is what lets "a batch of N sequences
     /// produces the same tokens as N separate runs" be checked against the same
     /// numbers the ladder already trusts. `memory` may be null for a resident
-    /// model. The ModelState overload lands with the engine at G5.
+    /// model. This is the only entry point; the `ModelState` overload that once
+    /// sat beside it belonged to an execution path no family implemented.
     /// `checkpoints` may be null; preempt/resume then report Unsupported rather
     /// than silently doing nothing.
     Status open_f32(const F32Model& model,

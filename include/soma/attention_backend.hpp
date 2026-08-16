@@ -12,17 +12,12 @@
 // family forced it.
 
 #include "soma/arch_ir.hpp"
-#include "soma/model.hpp"
-#include "soma/types.hpp"
 
 #include <cstddef>
 #include <cstdint>
-#include <span>
 #include <string_view>
 
 namespace soma {
-
-class MemoryHierarchy;
 
 /// Opaque tag identifying a KV checkpoint's on-disk layout. A checkpoint written
 /// by one attention family must never be replayable by another — different cache
@@ -59,8 +54,8 @@ struct AttentionBackend {
 
     /// The ONLY cache property that crosses the seam.
     ///
-    /// The core allocates opaque bytes (KvRegion) and hands the backend a
-    /// region; it never learns what is inside. Worked numbers at fp16:
+    /// The core allocates the cache and hands the backend rows into it; it never
+    /// learns what is inside. Worked numbers at fp16:
     ///   Qwen3-30B-A3B   gqa  2×4×128  = 1024 elem/tok/layer → 98 KB/tok
     ///   DeepSeek-V2-Lite mla 512+64   =  576 elem/tok/layer → 31 KB/tok
     ///
@@ -98,38 +93,24 @@ struct AttentionBackend {
     /// formula on the f32 fixtures and silently disagreed by ~8x on every
     /// quantized plan, which the verdict table caught.
     std::uint64_t (*weight_bytes_per_layer)(const ArchIr& arch, ByteSizer sizer) noexcept = nullptr;
-
-    /// Intended to be called exactly once from load_model() when the production
-    /// loader lands.
-    ///
-    /// Both current families implement this as a no-op. MLA absorption moves the
-    /// up-projection to the query side per decode step; folding at load would keep
-    /// a prohibitively large transposed fp32 copy resident. The hook remains the
-    /// architecture-owned seam for any future load-time weight transformation.
-    Status (*prepare_weights)(ModelState& model) = nullptr;
-
-    /// Both take the WHOLE batch and loop per-sequence internally.
-    ///
-    /// Each sequence attends its own KV slot at its own length, so v1 loops. The
-    /// signature takes a batch anyway so a future paged-KV backend with a block
-    /// table can batch the loop away without changing this interface.
-    StatusCode (*prefill)(const ModelState& model,
-                          ExecScratch& exec,
-                          SeqBatch& batch,
-                          LayerIndex layer,
-                          std::span<const float> in,
-                          std::span<float> out) noexcept = nullptr;
-
-    StatusCode (*decode)(const ModelState& model,
-                         ExecScratch& exec,
-                         SeqBatch& batch,
-                         LayerIndex layer,
-                         std::span<const float> in,
-                         std::span<float> out) noexcept = nullptr;
-
-    /// Initialize a freshly allocated region (zero, or write a layout header).
-    StatusCode (*init_kv_region)(const ArchIr& arch, KvRegion& region) noexcept = nullptr;
 };
+
+// This struct once carried prepare_weights/prefill/decode/init_kv_region as well,
+// against ExecScratch, SeqBatch and KvRegion. No family ever implemented any of
+// them, nothing ever called them, and the path that actually serves is
+// `F32Backend` — quantized SIMD kernels, streamed experts, batch-union CSR,
+// ragged batches, per-sequence KV.
+//
+// They were removed rather than filled in. A second forward path for three
+// families, kept in exact agreement with the first, buys nothing measurable: the
+// engine is bounded by bytes/token over disk bandwidth and already runs at that
+// ceiling (GLM-5.2 reads 14.4 GB per token; 1 tok/s would need 14.4 GB/s
+// sustained). Declared-and-never-defined is also the exact shape of D16 and D39,
+// where a confident comment over an absent definition read as covered.
+//
+// What remains is what the planner and the checkpoint reader genuinely ask of a
+// backend: how big the cache is, how big the weights are, and which on-disk KV
+// layout this family writes.
 
 /// Resolve a backend for a family. Returns nullptr for an unsupported family.
 ///

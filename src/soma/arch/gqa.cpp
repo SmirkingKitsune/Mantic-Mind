@@ -1,4 +1,4 @@
-// Soma — GQA/MHA attention and softmax-family routing, fp32 reference path.
+// Soma — GQA/MHA attention and softmax-family routing, F32-activation path.
 //
 // One of only two translation units permitted to name an architecture (the
 // other is arch_registry.cpp). tools/ci/check_seam.py enforces that.
@@ -412,13 +412,8 @@ const soma::F32Backend& f32_backend() noexcept {
 
 // ── Descriptors ──────────────────────────────────────────────────────────────
 //
-// The streaming-era hot-path members (prefill/decode/apply_expert/...) arrive
-// with the scheduler at G3 and are null here. The members that are meaningful
-// TODAY are real: kv_bytes_per_token feeds the planner, validate is the
-// admission gate, prepare_weights is genuinely a no-op for this family.
-//
-// Left null rather than stubbed-with-Ok so that calling one before G3 fails
-// visibly instead of silently returning success.
+// `F32Backend` is the execution descriptor. `AttentionBackend` carries only the
+// sizing and persistence properties the planner and checkpoint store need.
 
 std::size_t kv_bytes_per_token(const ArchIr& arch) noexcept {
     // Full K and V per token, per layer: 2 * n_kv_heads * head_dim.
@@ -443,41 +438,9 @@ std::uint64_t weight_bytes_per_layer(const ArchIr& arch,
            2 * sizer(arch, hkv, d, TensorRole::AttnProj) + sizer(arch, d, hq, TensorRole::AttnProj);
 }
 
-Status prepare_weights(ModelState& model) {
-    // No weight absorption in this family. The hook exists because MLA needs
-    // it; saying so explicitly is better than the interface not having it.
-    (void)model;
-    return {};
-}
-
 std::uint32_t window_span(const ArchIr& arch, LayerIndex layer) noexcept {
     (void)layer; // families that alternate windowed and full layers override this
     return arch.attention.sliding_window;
-}
-
-Status validate(const ArchIr& arch) {
-    if (arch.attention.family != AttentionFamily::Gqa &&
-        arch.attention.family != AttentionFamily::Mha) {
-        return {StatusCode::Unsupported,
-                std::string("gqa backend cannot execute attention family ") +
-                    to_string(arch.attention.family)};
-    }
-    if (arch.attention.n_kv_heads == 0 || arch.attention.n_heads % arch.attention.n_kv_heads != 0) {
-        return {StatusCode::InvalidArgument, "n_heads is not a multiple of n_kv_heads"};
-    }
-    if (arch.attention.rope.partial_dim > arch.attention.head_dim) {
-        return {StatusCode::InvalidArgument, "rope partial_dim exceeds head_dim"};
-    }
-    if (arch.router.n_groups > 1) {
-        return {StatusCode::Unsupported,
-                "group-limited routing is an MLA-family router; this backend does not "
-                "implement it, and silently ignoring n_group would change which experts fire"};
-    }
-    if (arch.router.bias_correction) {
-        return {StatusCode::Unsupported,
-                "pre-top-k bias correction (noaux_tc) is not implemented by this backend"};
-    }
-    return {};
 }
 
 const AttentionBackend& attention_backend() noexcept {
@@ -488,18 +451,6 @@ const AttentionBackend& attention_backend() noexcept {
         b.persist_format_id = kKvFormat;
         b.kv_bytes_per_token = &kv_bytes_per_token;
         b.weight_bytes_per_layer = &weight_bytes_per_layer;
-        b.prepare_weights = &prepare_weights;
-        return b;
-    }();
-    return kBackend;
-}
-
-const ArchBackend& backend() noexcept {
-    static const ArchBackend kBackend = [] {
-        ArchBackend b{};
-        b.name = "gqa";
-        b.attention = &attention_backend();
-        b.validate = &validate;
         return b;
     }();
     return kBackend;

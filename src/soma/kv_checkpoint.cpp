@@ -14,8 +14,6 @@
 
 #include "soma/kv_checkpoint.hpp"
 
-#include "soma/arch_backend.hpp"
-
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -293,22 +291,6 @@ Status KvCheckpointStore::load(const std::string& key, KvCache& kv, SeqPersistSt
         }
     }
     return kv.set_length(h.length_tokens);
-}
-
-Status KvCheckpointStore::save(const std::string& key, const SeqState& seq) {
-    (void)key;
-    (void)seq;
-    return {StatusCode::Unsupported,
-            "SeqState checkpointing lands with the engine at G5; the KvCache overload "
-            "writes the same format"};
-}
-
-Status KvCheckpointStore::load(const std::string& key, SeqState& seq) {
-    (void)key;
-    (void)seq;
-    return {StatusCode::Unsupported,
-            "SeqState checkpointing lands with the engine at G5; the KvCache overload "
-            "reads the same format"};
 }
 
 Status KvCheckpointStore::stat(const std::string& key, KvCheckpointHeader& out) const {

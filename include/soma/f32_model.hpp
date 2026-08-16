@@ -1,16 +1,12 @@
 #pragma once
 
-// Soma — the G0 fp32 model and single-sequence forward.
+// Soma — the F32-activation model and forward paths.
 //
-// Scope, stated plainly: this loads an upstream fp32 safetensors checkpoint and
-// runs one sequence with no KV cache, recomputing attention over the full
-// prefix each step. That is exactly what G0's gate compares against the
-// transformers oracle, and nothing more.
-//
-// What replaces what, later:
-//   G1  quantized kernels, validated against these numbers
-//   G2  ExpertStore + MemoryHierarchy replace the resident expert table
-//   G3  Scheduler + ExecScratch replace this forward's single-sequence loop
+// The `F32` prefix describes activations and workspace, not weight residency.
+// This is the engine's sole execution path: weights may use quantized SIMD
+// kernels, routed experts may stream through MemoryHierarchy, and Scheduler
+// drives cached ragged batches through KvRows. The teacher-forced whole-sequence
+// entry point remains as the transparent conformance reference.
 //
 // The seam is already real here. Anything family-specific lives behind
 // F32Backend in src/soma/arch/, and tools/ci/check_seam.py enforces that this

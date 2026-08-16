@@ -217,7 +217,7 @@ def main(argv: list[str]) -> int:
         print()
         print("The invariant core must not learn about architectures. Move the")
         print("logic into include/soma/arch/ + src/soma/arch/, or express the")
-        print("difference through the ArchBackend / AttentionBackend function")
+        print("difference through the F32Backend / AttentionBackend function")
         print("pointers. See docs/architecture.md §2 and §11.")
         return 1
 

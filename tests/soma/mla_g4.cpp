@@ -97,10 +97,17 @@ float dot(const std::vector<float>& a, const std::vector<float>& b) {
 }  // namespace
 
 int main() {
-    std::cout << "0. MLA load hook is defined and wired\n";
+    // The load hook went with the rest of the unimplemented parallel execution
+    // path. What a backend still owes the core is DESCRIPTION, and that is what
+    // this now checks.
+    std::cout << "0. MLA's backend describes itself\n";
     const auto& backend = soma::arch::mla::attention_backend();
-    check(backend.prepare_weights == &soma::arch::mla::prepare_weights,
-          "prepare_weights points at MLA's explicit no-op");
+    check(backend.family == soma::AttentionFamily::Mla,
+          "attention_backend() reports the MLA family");
+    check(backend.kv_bytes_per_token != nullptr && backend.weight_bytes_per_layer != nullptr,
+          "and supplies the two sizing functions the planner asks for");
+    check(backend.persist_format_id != soma::kKvFormatInvalid,
+          "and a KV format tag, so a checkpoint cannot cross families");
 
     // DeepSeek-V2-Lite's rope segment.
     constexpr std::uint32_t kDim = 8;

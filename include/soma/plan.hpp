@@ -98,7 +98,7 @@ struct PlanDocument {
     float projected_tok_s = 0.0f;
 
     /// Topology and per-expert economics, carried so a CONSUMER of the plan does
-    /// not need to parse arch.json to learn what it is looking at. Control's
+    /// not need to inspect the architecture IR to learn what it is looking at. Control's
     /// registry denormalizes exactly these for its queries and its TUI, and the
     /// plan is the only view of the model it has.
     std::string attention_family; ///< mha | gqa | mla | mla+dsa
@@ -147,11 +147,11 @@ struct PlanDocument {
     std::uint32_t prefetch_enabled_layers = 0;
 };
 
-/// Reads the container header and arch.json. Allocates no model memory, loads no
-/// weights, and is safe to call on a node that could not host the model.
-/// `quant_overlay_json` states a HYPOTHETICAL quantization, in the same shape a
-/// container's `container_meta.json` uses — `{"dtype_gate_up", "dtype_down",
-/// "group"}` — and is applied AFTER the container's own map, so it wins.
+/// Reads the container metadata and adapts its copied config.json. Allocates no model memory, loads
+/// no weights, and is safe to call on a node that could not host the model. `quant_overlay_json`
+/// states a HYPOTHETICAL quantization, in the same shape a container's `container_meta.json` uses —
+/// `{"dtype_gate_up", "dtype_down", "group"}` — and is applied AFTER the container's own map, so it
+/// wins.
 ///
 /// It exists because the verdict is a property of (model, quantization, host)
 /// and, without it, the only quantization askable was the one the model had

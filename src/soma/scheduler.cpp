@@ -185,22 +185,6 @@ Scheduler::~Scheduler() {
     close();
 }
 
-Status Scheduler::open(const ModelState& model,
-                       MemoryHierarchy& memory,
-                       KvCheckpointStore& checkpoints,
-                       const SchedulerConfig& config) {
-    (void)model;
-    (void)checkpoints;
-    (void)memory;
-    (void)config;
-    // The ModelState-shaped entry point belongs to the G5 engine wiring; the G3
-    // scheduler is driven through open_f32() below, against the fp32 reference
-    // model that every conformance gate is expressed in. Kept declared so the
-    // header stays the contract.
-    return {StatusCode::Unsupported,
-            "Scheduler::open(ModelState) lands with the engine at G5; use open_f32()"};
-}
-
 Status Scheduler::open_f32(const F32Model& model,
                            MemoryHierarchy* memory,
                            const SchedulerConfig& config,

@@ -27,7 +27,6 @@
 // DEPENDENCY RULE: this header may include core headers. Core headers may not
 // include this one, and may not mention "mla". CI enforces it.
 
-#include "soma/arch_backend.hpp"
 #include "soma/arch_ir.hpp"
 #include "soma/attention_backend.hpp"
 #include "soma/f32_model.hpp"
@@ -57,114 +56,9 @@ inline constexpr KvFormatId kKvFormat = kv_format_id("soma.kv.mla.latent.v2");
 /// this family, which is why it is carried forward from the prior art rather
 /// than treated as an optimization.
 std::size_t kv_bytes_per_token(const ArchIr& arch) noexcept;
-
-/// Weight absorption's load-time hook — DELIBERATELY A NO-OP, because absorption
-/// turned out not to want load time.
-///
-/// The absorption itself is real and is in `f32_attention_kv`: `(W_k^T q) . c`
-/// rather than `q . (W_k c)`, and one projection of the accumulated latent rather
-/// than one per attended key. What it does NOT need is a folded copy of the
-/// weights sitting in memory.
-///
-/// Folding at load means materializing `W_k^T` per layer as fp32 — on GLM-5.2
-/// that is `n_heads * qk_nope * kv_lora_rank * 4` bytes per layer, 1.96 GB across
-/// the stack, against a plan that fits a 24 GiB host by 3 GB. Transposing per step
-/// instead costs `n_heads * qk_nope * kv_lora_rank` element reads per layer per
-/// step: 6.3e6, next to the 1.5e8 the absorbed attention already does and the
-/// 3.0e10 it replaced. The memory was the scarce thing; the arithmetic was not.
-///
-/// This declaration previously described the load-time fold in detail and was
-/// never defined at all — the same shape as the `attention_backend()` bug in D16,
-/// where a declared-never-defined function meant the planner silently used GQA's
-/// formula for MLA. Defined here so the description and the code agree, and so a
-/// future caller gets a no-op rather than a link error (roadmap D39).
-Status prepare_weights(ModelState& model);
-
-StatusCode prefill(const ModelState& model,
-                   ExecScratch& exec,
-                   SeqBatch& batch,
-                   LayerIndex layer,
-                   std::span<const float> in,
-                   std::span<float> out) noexcept;
-
-/// Latent-space decode against the compressed cache.
-///
-/// Same signature as the GQA path, and that is the seam working: the core calls
-/// this identically, having never learned that the cache holds a latent rather
-/// than K and V.
-StatusCode decode(const ModelState& model,
-                  ExecScratch& exec,
-                  SeqBatch& batch,
-                  LayerIndex layer,
-                  std::span<const float> in,
-                  std::span<float> out) noexcept;
-
-StatusCode init_kv_region(const ArchIr& arch, KvRegion& region) noexcept;
-
-/// Partial RoPE: only qk_rope_head_dim of each head carries position, the
-/// qk_nope_head_dim remainder does not. Applied to the RoPE slice only.
-StatusCode apply_rope(const ArchIr& arch,
-                      std::span<float> q,
-                      std::span<float> k,
-                      std::span<const std::uint32_t> positions) noexcept;
-
-/// YaRN scaling, including the mscale attenuation applied to attention logits.
-/// Declared separately because it is not a rope variant so much as a rope
-/// variant plus a logit scale, and folding it into apply_rope would hide the
-/// second half.
-float yarn_mscale(const ArchIr& arch) noexcept;
-
 const AttentionBackend& attention_backend() noexcept;
 
-// ── Router ───────────────────────────────────────────────────────────────────
-
-/// Group-limited top-k with optional pre-selection bias correction and
-/// post-selection scaling.
-///
-/// V2-Lite is the degenerate case (n_group 1, topk_group 1, no bias correction,
-/// routed_scaling_factor 1.0) but the general form is implemented from the
-/// start: n_group > 1 selects candidate groups by their top expert before
-/// selecting experts within them, which is a different algorithm rather than a
-/// filter applied afterwards. Retrofitting it would mean rewriting the function
-/// that decides which experts fire.
-StatusCode route(const ArchIr& arch,
-                 std::span<const float> logits_f32,
-                 std::uint32_t n_rows,
-                 RouterOut& out) noexcept;
-
-StatusCode apply_expert(const ModelState& model,
-                        ExecScratch& exec,
-                        LayerIndex layer,
-                        ExpertId expert,
-                        CByteSpan expert_bytes,
-                        std::span<const std::uint32_t> row_indices,
-                        std::span<const float> row_weights) noexcept;
-
-/// Layer 0 on V2-Lite (first_k_dense_replace 1). Topology::layer_kinds is
-/// authoritative; this reads it rather than re-deriving the stride.
-StatusCode dense_ffn(const ModelState& model,
-                     ExecScratch& exec,
-                     LayerIndex layer,
-                     std::uint32_t n_rows) noexcept;
-
-/// Two shared experts on V2-Lite, applied to every row unconditionally —
-/// unlike the routed experts, they are never streamed and live in the resident
-/// half of the static partition.
-StatusCode shared_experts(const ModelState& model,
-                          ExecScratch& exec,
-                          LayerIndex layer,
-                          std::uint32_t n_rows) noexcept;
-
-StatusCode apply_norm(const ModelState& model,
-                      ExecScratch& exec,
-                      const DenseTensor& weight,
-                      std::uint32_t n_rows) noexcept;
-
-Status validate(const ArchIr& arch);
-
-const ArchBackend& backend() noexcept;
-
-// ── fp32 reference path ──────────────────────────────────────────────────────
+// ── F32-activation execution path ────────────────────────────────────────────
 
 /// MLA's per-layer attention weights. Nothing here is shared with GQA — which is
 /// the point of the opaque payload: neither family's tensor list appears in core.

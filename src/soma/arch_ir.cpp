@@ -511,13 +511,13 @@ Status validate_arch_ir(const ArchIr& ir) {
 }
 
 Status parse_arch_ir(std::string_view text, ArchIr& out) {
-    // Our own canonical arch.json is written by admission (G2+). Until that
-    // exists there is nothing to parse, and pretending otherwise would give the
-    // loader a second, untested path into the IR.
+    // The registry persists a canonical JSON form, but the model loader adapts
+    // config.json directly. Keep that as the one tested load path until a
+    // registry consumer needs this parser.
     (void)text;
     (void)out;
     return {StatusCode::Unsupported,
-            "canonical arch.json parsing lands with the admission converter at G2; "
+            "canonical registry architecture JSON parsing is not implemented; "
             "use adapt_hf_config() to read an upstream config.json"};
 }
 

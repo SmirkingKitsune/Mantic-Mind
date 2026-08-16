@@ -1,13 +1,15 @@
-# Architecture IR — `arch.json`
+# Architecture IR — canonical registry JSON
 
 **Schema version:** 1
-**Produced by:** admission (`tools/admission/convert.py`)
+**Produced by:** admission, by adapting the source `config.json`
 **Consumed by:** the Soma loader, the planner, `soma plan --json`, the registry
 
-`arch.json` is the complete, normalized description of a model's architecture. It is written once at
-admission, hashed into `arch_hash`, and never edited by the runtime. Everything the engine needs to
-decide *how to execute* a model is in here or in the sidecar index; nothing is inferred from tensor
-names, filenames, or heuristics at load time.
+The architecture IR is the complete, normalized description of a model. Admission persists its JSON
+form in the registry's `arch_json` column; a converted container does not carry a separate
+`arch.json` file. At load, the same IR is adapted from the container's copied `config.json`, then the
+conversion's quantization record is applied. It is hashed into `arch_hash`, and everything the engine
+needs to decide *how to execute* a model is in the IR or the sidecar index; nothing is inferred from
+tensor names, filenames, or heuristics.
 
 Two rules govern the whole document:
 
@@ -72,12 +74,26 @@ three different ways; resolving that at admission means the core never has to.
 | `n_heads` | int | |
 | `n_kv_heads` | int | `gqa`/`mha` |
 | `head_dim` | int | |
-| `qk_norm` | bool | Per-head q/k RMSNorm (Qwen3) |
+| `qk_norm` | enum | `none` \| `per_head` \| `full_width` — NOT a bool; see below |
 | `sliding_window` | int \| null | Span in tokens; null = full |
 | `bias` | bool | |
 | `rope` | object | `{ theta, partial_dim, interleaved, scaling }` |
 | `rope.scaling` | object \| null | `{ type: "yarn"\|"linear"\|"ntk", factor, original_max_position, beta_fast, beta_slow, mscale, mscale_all_dim }` |
 | `mla` | object \| null | Present iff `family` starts with `mla` |
+| `dsa` | object \| null | Present iff `family` is `mla+dsa` |
+
+`rms_norm_eps` is a TOP-LEVEL field, not an attention one, and it does not apply to every norm. The
+layer norms and the output norm take it; MLA's two LATENT norms (`q_a_layernorm`, `kv_a_layernorm`)
+do NOT — both reference implementations construct those with the RMSNorm class default of `1e-6`,
+whatever the config says. DeepSeek-V2-Lite hides the difference by setting `1e-6` itself; Moonlight
+and GLM-5.2 set `1e-5`, and using it cost Moonlight a conformance error of 7.25e-05, seventy times
+every other fixture, passing and unexplained until GLM-5.2 made it fail outright (roadmap D29).
+
+**`qk_norm` is an enum because the two forms normalize over different things.** `per_head` applies
+over `head_dim` independently per head (Qwen3-MoE: q_norm is [16] with head_dim 16); `full_width`
+applies over `n_heads * head_dim` (OLMoE: q_norm is [64] with 4 heads x 16). Both report
+`"qk_norm": true` upstream. Reading it as one bit produces a model that runs, converges to plausible
+logits, and is wrong.
 
 `mla` sub-object:
 
@@ -88,21 +104,70 @@ three different ways; resolving that at admission means the core never has to.
 | `qk_nope_head_dim` | Non-RoPE part of the QK head |
 | `qk_rope_head_dim` | RoPE-carrying part |
 | `v_head_dim` | |
-| `absorb_weights` | bool — enable load-time weight absorption |
+| `absorb_weights` | bool — move the KV up-projection to the query side during decode |
 
-**`absorb_weights` has no GQA analogue**, which is exactly why it lives in the `mla` sub-object and
-`AttentionBackend::prepare_weights()` exists as a hook rather than as a step in the loader.
+**`absorb_weights` has no GQA analogue**, which is exactly why it lives in the `mla` sub-object.
+
+It applies **per step, not at load**, which is a correction: this once said "load-time" while nothing
+implemented absorption at all (roadmap D38, D39). Folding at load means keeping a transposed fp32 copy
+of the up-projection resident — 1.96 GB on GLM-5.2 — to save arithmetic that was never the bottleneck.
+The unused load hook and its parallel execution API were deleted; absorption lives only in the cached
+MLA decode that actually serves.
+
+The identity is:
+
+    q_nope . (W_k c_j)   =  (W_k^T q_nope) . c_j
+    sum_j a_j (W_v c_j)  =  W_v (sum_j a_j c_j)
+
+Both move `kv_b` off the side that depends on `j`, so it is touched once per head per step however
+many keys are attended. `false` selects the expanded form, kept as the reference the absorbed one is
+checked against.
+
+### `dsa` sub-object — DeepSeek Sparse Attention + IndexShare
+
+Present iff `family` is `mla+dsa`. Part of `arch_hash`, so two quantizations or two indexer
+configurations of the same weights are two models.
+
+| Field | Notes |
+|---|---|
+| `index_topk` | Keys that survive selection. **The number that decides whether a test means anything**: with fewer tokens in context than this, top-k selects everything and the sparse path is bit-identical to dense |
+| `n_index_heads` | Indexer heads. NOT a size knob — see below |
+| `index_head_dim` | Indexer head width |
+| `index_freq` | How often a `full` layer recurs. Informational; `layer_kinds` is authoritative |
+| `layer_kinds` | Per layer: `full` (computes an index) \| `shared` (reuses the nearest preceding `full` layer's) |
+
+**IndexShare is why `layer_kinds` cannot be a stride plus an offset.** On GLM-5.2, 57 of 78 layers
+own no indexer weights at all and cannot compute attention without state produced by a different
+layer. A re-derived stride is a second description waiting to disagree with the weights.
+
+**`n_index_heads` is semantic, not dimensional.** An index score is `sum_h w[h] * relu(q[h].k)`, so
+it is exactly 0.0 only when ReLU zeroes every head at once — probability ~2^-H. Shrinking it for a
+test fixture manufactures ties at the top-k cut, which `torch.topk` then resolves by internals that
+are neither ascending nor descending index order. Measured: 50.69% of scores exactly zero at 1 head,
+27.12% at 2, 13.52% at 3, 6.99% at 4, extrapolating to ~2e-8% at GLM-5.2's real 32 (roadmap D32).
 
 ### KV cost — the number the planner actually cares about
 
-`kv_bytes_per_token()` is the only attention property that crosses the seam. Worked from the real
-configs:
+`kv_bytes_per_token()` and `kv_geometry()` are the attention properties that cross the seam. Worked
+from the real configs:
 
 | Model | Family | Elements/token/layer | Layers | Bytes/token @fp16 | @32k ctx |
 |---|---|---|---|---|---|
 | Qwen3-30B-A3B | gqa | `2 × 4 × 128` = **1024** | 48 | 98 KB | **3.2 GB** |
 | DeepSeek-V2-Lite | mla | `512 + 64` = **576** | 27 | 31 KB | **1.0 GB** |
 | Mixtral-8x7B | gqa | `2 × 8 × 128` = **2048** | 32 | 131 KB | **4.3 GB** |
+| GLM-5.2 | mla+dsa | `(512 + 64) + 128` = **704** | 78 | 107 KB | **3.5 GB** |
+
+**The cache has TWO PLANES and they are not the same size.** `kv_geometry()` reports both, because a
+single width could not express "this family stores no second plane" — and for want of that, MLA
+allocated a full second plane at the K plane's width for every layer, holding nothing. GQA stores
+per-head K and V, so both planes are `n_kv_heads * head_dim`. MLA stores a compressed latent and
+DERIVES V from it, so its V plane is **zero**. DSA is the exception: its indexer key must be cached,
+because it depends on a past token's hidden state at that layer and cannot be recomputed at a later
+step, so the otherwise-dead plane is exactly where it goes (roadmap D35, D37).
+
+On GLM-5.2 at 4k context with 4 slots that correction is 5.89 GB down to 3.60 GB, and the reclaimed
+2.29 GB goes to the expert cache. DeepSeek-V2-Lite and Moonlight lose their second plane outright.
 
 MLA's compression against the same model's uncompressed form is ~8.9× on V2-Lite
 (`576` vs `16 heads × (128+64) + 16 × 128 = 5120`), and considerably larger on full-size V2/V3 where the
@@ -257,7 +322,21 @@ with a smaller quantization.
 
 ### The consequence: **the verdict is not a property of the model**
 
-It is a property of `(model, quantization, host budget)`. Mixtral is `resident-only` because of its
+It is a property of `(model, quantization, host budget)`, and **the throughput floor is part of the
+host budget** — `HostBudget::min_tok_s`, beside `ram_total_bytes` and `disk_bandwidth`, settable with
+`soma plan --min-tok-s`. It was a constant of `1.0` in plan.cpp, which refused GLM-5.2 at every host
+size: 0.087 tok/s on a 24 GiB workstation, 0.79 at 128 GiB with a 7 GB/s disk. Colibri served those
+same 744B weights on 16–24 GB and the result was considered useful, so the constant and the proof
+disagreed. The reasoning it was written with still holds — a model streaming at 0.2 tok/s is not
+usefully served — but "usefully" depends on who is asking, and for a 744B model on a workstation 0.1
+tok/s may be the entire point (roadmap D21).
+
+`0` means UNSTATED and resolves to `1.0`, not to "no floor", so a default-constructed budget guards
+exactly as before and lowering the bar takes a deliberate statement. The refusal names the figure and
+whether it was chosen or inherited, because "raise your tolerance" and "this host is too small" are
+different answers.
+
+Mixtral is `resident-only` because of its
 *shape* — 25 % active fraction is disqualifying at any size — but Qwen3 flips between `resident-only`
 and `stream` purely on quantization and host RAM.
 

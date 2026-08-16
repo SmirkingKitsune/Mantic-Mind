@@ -592,8 +592,8 @@ int cmd_plan(int argc, char** argv) {
     host.min_tok_s = min_tok_s;
 
     soma::PlanDocument doc;
-    // Try the container path first (a converted model carries arch.json), and
-    // fall back to adapting the upstream config.json. Both are legitimate inputs:
+    // Resolve a converted container's copied config.json plus conversion metadata,
+    // or adapt an upstream config.json directly. Both are legitimate inputs:
     // an operator asking "what will this do here?" usually has the HF checkpoint,
     // not a container, and refusing them would make `plan` useless exactly when
     // it is most wanted — before conversion.
