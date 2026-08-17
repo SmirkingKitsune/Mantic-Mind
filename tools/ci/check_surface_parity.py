@@ -18,13 +18,22 @@ An operator holding the entire control API could not suspend an agent, while the
 scheduler did it on its own under capacity pressure. `placement_engine.hpp` said
 so in a comment and is compiled by nothing, so nothing failed.
 
-WHAT THIS CANNOT DO, stated plainly: it cannot prove a TUI button and a route do
-the same thing. It reads what the CLI *calls* and what control_ui *mutates*, and
-asserts both land on a registered route. A curated allowlist carries the residue
-— the in-process reads (list_agents, list_nodes) that are legitimately reads of
-state the process already owns, and the composite handlers the TUI reimplements.
-That residue is listed, not hidden, so it shrinks on purpose rather than by
-accident.
+WHAT THIS CANNOT DO, stated plainly and kept current as each limit is found:
+
+  * It cannot prove a button and a route do the same thing. It proves a surface
+    NAMES a route, not that it drives it correctly.
+  * It matches path segments INDEPENDENTLY, so sibling routes cover for each
+    other. Breaking `/curation/proposals` was not caught, because
+    `/curation/proposals/apply` still supplied both segments. Measured, not
+    theorised — a mutation test found it. Removing the only user of a segment
+    IS caught: breaking `/local-memories` failed all four of its routes.
+  * Reachability is not execution. Disabling a command with `if (false && ...)`
+    leaves its literals in place and passes.
+
+The residue that carries what the heuristics cannot: CLI_COVERAGE_EXEMPT,
+TUI_COVERAGE_EXEMPT, TUI_INPROCESS_READS and TUI_MUTATION_ROUTES. All four are
+listed rather than hidden, each entry with a reason, so they shrink on purpose
+rather than by accident.
 
 Usage: check_surface_parity.py [repo_root]
 """
@@ -369,9 +378,14 @@ def main() -> int:
     stale = [m for m in TUI_MUTATION_ROUTES if m + "(" not in tui_src]
 
     for verb, path in tui_uncovered:
-        # Reported, not fatal, while the backlog is being worked. The CLI half
-        # became fatal only after reaching zero, for the same reason.
-        print(f"tui-gap  {verb:<7} {path}  has no TUI form and no recorded exemption")
+        # FATAL, now that this direction is also at zero — the same ratchet the
+        # CLI half went through. A check stays advisory exactly as long as a
+        # pre-existing backlog makes failing it unfair, and no longer: with
+        # every route reachable or exempt-with-a-reason, a new gap is a new
+        # decision, and the cheapest moment to make it is when the route lands.
+        failures.append(
+            f"{verb} {path} has no TUI form and no recorded exemption — add a control, "
+            f"or an entry in TUI_COVERAGE_EXEMPT stating why it needs none")
     for verb, path in uncovered:
         # FATAL, now that the backlog is zero.
         #

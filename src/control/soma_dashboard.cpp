@@ -214,7 +214,14 @@ void SomaDashboard::stop() {
 
 void SomaDashboard::select_engine(const std::string& id) {
     std::lock_guard<std::mutex> lk(impl_->mu);
+    if (impl_->selected == id) return;
     impl_->selected = id;
+    // Selection changes on the render thread, before the next network poll.
+    // Clear immediately so the new engine never inherits the old engine's
+    // sequence rows during that interval.
+    impl_->snap.sequences.clear();
+    impl_->snap.sequences_engine_id = id;
+    impl_->snap.sequences_at_ms = 0;
 }
 
 std::string SomaDashboard::selected_engine() const {
@@ -281,9 +288,69 @@ void SomaDashboard::poll_once() {
         }
     }
 
+    // Sequences for the same selected engine, and for the same reason heat is
+    // scoped that way: polling every engine would put the dashboard's cost on
+    // models nobody is looking at.
+    //
+    // Unlike heat this is NOT gated on the engine being Soma. llama.cpp answers
+    // with an empty list, which is the honest answer and worth rendering as
+    // "this engine reports none" rather than hiding the panel.
+    std::vector<SomaSequenceView> sequences;
+    bool sequences_ok = false;
+    if (!want_heat.empty() && engines_ok) {
+        const auto selected = std::find_if(
+            engines.begin(), engines.end(), [&](const auto& e) { return e.id == want_heat; });
+        if (selected == engines.end()) {
+            // The engine vanished between selection and this poll. Publishing
+            // an empty result removes its rows; keeping the previous successful
+            // payload would put them under whichever engine is selected next.
+            sequences_ok = true;
+        } else if (const auto res = im.client.get("/v1/engines/" + want_heat + "/slots");
+                   res.ok()) {
+            try {
+                const auto j = nlohmann::json::parse(res.body);
+                const auto& arr = j.contains("sequences") ? j.at("sequences") : j;
+                if (arr.is_array()) {
+                    for (const auto& s : arr) {
+                        SomaSequenceView v;
+                        v.index = s.value("index", 0u);
+                        v.agent_id = s.value("agent_id", std::string{});
+                        v.position = s.value("position", 0u);
+                        v.kv_tokens = s.value("kv_tokens", 0u);
+                        v.prefilling = s.value("prefilling", false);
+                        v.suspended = s.value("suspended", false);
+                        v.determinism = s.value("determinism", std::string{});
+                        sequences.push_back(std::move(v));
+                    }
+                    sequences_ok = true;
+                } else {
+                    error = "GET slots: response has no sequence array";
+                }
+            } catch (const std::exception& e) {
+                error = std::string("GET slots: ") + e.what();
+            }
+        } else if (res.status != 501 && res.status != 404) {
+            error = "GET slots: HTTP " + std::to_string(res.status);
+        } else {
+            // 501/404 is an engine that cannot report per-sequence state. Not a
+            // failure — recording it as one would make every fallback engine
+            // look broken, the same trap the heat path already documents.
+            sequences_ok = true;
+        }
+    }
+
     const auto now = util::now_ms();
     {
         std::lock_guard<std::mutex> lk(im.mu);
+        if (sequences_ok) {
+            im.snap.sequences = std::move(sequences);
+            im.snap.sequences_engine_id = want_heat;
+            im.snap.sequences_at_ms = now;
+        } else if (want_heat != im.snap.sequences_engine_id) {
+            im.snap.sequences.clear();
+            im.snap.sequences_engine_id = want_heat;
+            im.snap.sequences_at_ms = 0;
+        }
         if (engines_ok) {
             im.snap.engines = std::move(engines);
             im.snap.tiers = tiers;

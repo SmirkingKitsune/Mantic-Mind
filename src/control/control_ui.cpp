@@ -333,6 +333,19 @@ void ControlUI::run() {
     std::vector<std::string> cur_agent_entries;
     std::vector<std::string> cur_conv_entries;
     std::vector<std::string> cur_mem_entries;
+    // Ids of the CONVERSATION-LOCAL memories last listed, and its own vector on
+    // purpose: `cur_mem_entries` holds the agent-WIDE memories, and indexing
+    // one list to edit the other would silently address the wrong row. The two
+    // are different scopes that happen to render the same way.
+    std::vector<std::string> cur_local_mem_ids;
+    std::vector<std::string> cur_local_mem_entries;
+    int cur_local_mem_sel = 0;
+    std::string cur_local_mem_conversation_id;
+    // The exact proposal documents returned by the API. Apply validates their
+    // before/after snapshots, so sending an empty body (or reconstructing a
+    // proposal from the visible label) can never work correctly.
+    nlohmann::json cur_proposals = nlohmann::json::array();
+    std::string cur_proposals_agent_id;
     std::string cur_new_title;
     std::string cur_start_s{"0"};
     std::string cur_end_s{"0"};
@@ -1882,9 +1895,12 @@ void ControlUI::run() {
         return row;
     };
     auto cur_mem_menu   = Menu(&cur_mem_entries, &cur_mem_sel, cur_mem_opt);
+    auto cur_local_mem_menu = Menu(&cur_local_mem_entries, &cur_local_mem_sel);
     auto cur_agent_menu_m = Maybe(cur_agent_menu, [&]() { return !cur_agent_entries.empty(); });
     auto cur_conv_menu_m  = Maybe(cur_conv_menu,  [&]() { return !cur_conv_entries.empty(); });
     auto cur_mem_menu_m   = Maybe(cur_mem_menu,   [&]() { return !cur_mem_entries.empty(); });
+    auto cur_local_mem_menu_m =
+        Maybe(cur_local_mem_menu, [&]() { return !cur_local_mem_entries.empty(); });
 
     InputOption cur_iopt;
     cur_iopt.multiline = false;
@@ -1898,6 +1914,258 @@ void ControlUI::run() {
     auto cur_ctx_input     = Input(&cur_context_before_s, cur_num_opt);
     auto cur_new_active_cb = Checkbox("Set active", &cur_new_set_active);
     auto cur_new_parent_cb = Checkbox("Use selected as parent", &cur_new_use_parent);
+
+    // ── curation proposals and conversation-local memories ───────────────────
+    //
+    // These go over HTTP rather than through `a->db()` like the rest of this
+    // tab, deliberately. The db() path bypasses ConversationManager and
+    // MemoryManager as well as the API handler — two layers, not one (roadmap
+    // D54) — and the propose/apply loop in particular has real logic in the
+    // handler that a direct table write would skip entirely.
+    //
+    // It also moves the TUI a step toward being what P1 says it is: one client
+    // of the API, rather than a privileged process that happens to share an
+    // address space.
+    auto curation_http = [this]() {
+        HttpClient cli(control_base_url_);
+        if (!control_api_token_.empty()) cli.set_bearer_token(control_api_token_);
+        return cli;
+    };
+    auto selected_agent_id = [&]() -> std::string {
+        auto agents = agents_.list_agents();
+        if (cur_agent_sel < 0 || cur_agent_sel >= static_cast<int>(agents.size())) return {};
+        return agents[cur_agent_sel].id;
+    };
+
+    auto btn_cur_propose = Button(
+        " Propose ",
+        [&] {
+            const auto id = selected_agent_id();
+            if (id.empty()) return;
+            auto cli = curation_http();
+            const auto r =
+                cli.post("/v1/agents/" + id + "/curation/proposals", nlohmann::json::object());
+            if (!r.ok()) {
+                set_curation_status("failed", "propose failed: HTTP " + std::to_string(r.status));
+            } else {
+                try {
+                    const auto body = nlohmann::json::parse(r.body);
+                    const auto proposals = body.at("proposals");
+                    if (!proposals.is_array())
+                        throw std::runtime_error("proposals is not an array");
+                    cur_proposals = proposals;
+                    cur_proposals_agent_id = id;
+                    set_curation_status("ok",
+                                        std::to_string(cur_proposals.size()) +
+                                            (cur_proposals.empty() ? " proposals; nothing to apply"
+                                                                   : " proposals ready to apply"));
+                } catch (const std::exception& e) {
+                    cur_proposals = nlohmann::json::array();
+                    cur_proposals_agent_id.clear();
+                    set_curation_status("failed",
+                                        std::string("invalid proposal response: ") + e.what());
+                }
+            }
+            refresh();
+        },
+        ButtonOption::Simple());
+
+    auto apply_cur_proposals = [&](const std::string& id,
+                                   const std::string& path,
+                                   const std::string& success) {
+        if (cur_proposals_agent_id != id || !cur_proposals.is_array() || cur_proposals.empty()) {
+            set_curation_status("failed", "generate proposals for this agent first");
+            refresh();
+            return;
+        }
+        auto cli = curation_http();
+        const auto r = cli.post(path, nlohmann::json{{"proposals", cur_proposals}});
+        if (r.ok()) {
+            cur_proposals = nlohmann::json::array();
+            cur_proposals_agent_id.clear();
+            cur_cache_dirty = true;
+        }
+        set_curation_status(r.ok() ? "ok" : "failed",
+                            r.ok() ? success : "apply failed: HTTP " + std::to_string(r.status));
+        refresh();
+    };
+
+    auto btn_cur_apply = Button(
+        " Apply proposals ",
+        [&] {
+            const auto id = selected_agent_id();
+            if (id.empty()) return;
+            // Two routes exist for this; `/curation/proposals/apply` is the one the
+            // API document names as the alias, and both reach one handler.
+            apply_cur_proposals(
+                id, "/v1/agents/" + id + "/curation/proposals/apply", "curation proposals applied");
+        },
+        ButtonOption::Simple());
+
+    auto btn_cur_apply_direct = Button(
+        " Apply edits ",
+        [&] {
+            const auto id = selected_agent_id();
+            if (id.empty()) return;
+            apply_cur_proposals(
+                id, "/v1/agents/" + id + "/curation/apply", "curation edits applied");
+        },
+        ButtonOption::Simple());
+
+    // Conversation-LOCAL memories: scoped to one conversation, distinct from the
+    // agent-wide memories the list above shows. All four verbs were unreachable
+    // from any screen.
+    auto local_mem_base = [&]() -> std::string {
+        const auto id = selected_agent_id();
+        if (id.empty()) return {};
+        auto a = agents_.get_agent(id);
+        if (!a) return {};
+        const auto convs = a->db().list_conversations();
+        if (cur_conv_sel < 0 || cur_conv_sel >= static_cast<int>(convs.size())) return {};
+        return "/v1/agents/" + id + "/conversations/" + convs[cur_conv_sel].id + "/local-memories";
+    };
+
+    auto btn_cur_local_list = Button(
+        " Local memories ",
+        [&] {
+            const auto base = local_mem_base();
+            if (base.empty()) {
+                set_curation_status("failed", "select an agent and a conversation first");
+                return;
+            }
+            auto cli = curation_http();
+            const auto r = cli.get(base);
+            if (!r.ok()) {
+                set_curation_status("failed", "local memories: HTTP " + std::to_string(r.status));
+            } else {
+                std::size_t n = 0;
+                cur_local_mem_ids.clear();
+                cur_local_mem_entries.clear();
+                try {
+                    const auto j = nlohmann::json::parse(r.body);
+                    const auto& arr = j.contains("data") ? j.at("data") : j;
+                    if (!arr.is_array()) throw std::runtime_error("response is not an array");
+                    n = arr.size();
+                    for (const auto& m : arr) {
+                        const auto id = m.value("id", std::string{});
+                        const auto content = m.value("content", std::string{});
+                        if (!id.empty()) {
+                            cur_local_mem_ids.push_back(m.value("id", std::string{}));
+                            cur_local_mem_entries.push_back(
+                                content.size() > 72 ? content.substr(0, 69) + "..." : content);
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    set_curation_status("failed",
+                                        std::string("invalid local-memory response: ") + e.what());
+                    refresh();
+                    return;
+                }
+                if (cur_local_mem_sel >= static_cast<int>(cur_local_mem_ids.size()))
+                    cur_local_mem_sel = 0;
+                cur_local_mem_conversation_id =
+                    cur_local_mem_ids.empty() ? std::string{} : cur_detail_loaded_id;
+                set_curation_status("ok",
+                                    std::to_string(n) + " memory/ies local to this conversation");
+            }
+            refresh();
+        },
+        ButtonOption::Simple());
+
+    auto btn_cur_local_add = Button(
+        " + Local ",
+        [&] {
+            const auto base = local_mem_base();
+            if (base.empty()) {
+                set_curation_status("failed", "select an agent and a conversation first");
+                return;
+            }
+            if (cur_new_title.empty()) {
+                // Reuses the title field rather than adding another input: the
+                // capability is what was missing, and a second text box on this tab
+                // buys nothing an operator asked for.
+                set_curation_status("failed", "type the memory text in the title field first");
+                return;
+            }
+            auto cli = curation_http();
+            const auto r = cli.post(base, nlohmann::json{{"content", cur_new_title}});
+            if (r.ok()) {
+                try {
+                    const auto saved = nlohmann::json::parse(r.body);
+                    const auto saved_id = saved.value("id", std::string{});
+                    if (!saved_id.empty()) {
+                        cur_local_mem_ids.push_back(saved_id);
+                        cur_local_mem_entries.push_back(cur_new_title.size() > 72
+                                                            ? cur_new_title.substr(0, 69) + "..."
+                                                            : cur_new_title);
+                        cur_local_mem_sel = static_cast<int>(cur_local_mem_ids.size()) - 1;
+                        cur_local_mem_conversation_id = cur_detail_loaded_id;
+                    }
+                } catch (const std::exception&) {
+                    // The mutation succeeded. A list refresh can recover the view;
+                    // do not report a successful create as failed because its
+                    // representation could not be refreshed optimistically.
+                }
+            }
+            set_curation_status(r.ok() ? "ok" : "failed",
+                                r.ok() ? "local memory added"
+                                       : "add failed: HTTP " + std::to_string(r.status));
+            refresh();
+        },
+        ButtonOption::Simple());
+
+    auto btn_cur_local_edit = Button(
+        " Edit Local ",
+        [&] {
+            const auto base = local_mem_base();
+            if (base.empty() || cur_local_mem_sel < 0 ||
+                cur_local_mem_sel >= static_cast<int>(cur_local_mem_ids.size())) {
+                set_curation_status("failed", "press Local memories to list them first");
+                return;
+            }
+            if (cur_new_title.empty()) {
+                set_curation_status("failed", "type the replacement text in the title field first");
+                return;
+            }
+            auto cli = curation_http();
+            const auto r =
+                cli.put(base + "/" + cur_local_mem_ids[static_cast<size_t>(cur_local_mem_sel)],
+                        nlohmann::json{{"content", cur_new_title}});
+            if (r.ok())
+                cur_local_mem_entries[static_cast<size_t>(cur_local_mem_sel)] =
+                    cur_new_title.size() > 72 ? cur_new_title.substr(0, 69) + "..." : cur_new_title;
+            set_curation_status(r.ok() ? "ok" : "failed",
+                                r.ok() ? "local memory updated"
+                                       : "update failed: HTTP " + std::to_string(r.status));
+            refresh();
+        },
+        ButtonOption::Simple());
+
+    auto btn_cur_local_del = Button(
+        " - Local ",
+        [&] {
+            const auto base = local_mem_base();
+            if (base.empty() || cur_local_mem_sel < 0 ||
+                cur_local_mem_sel >= static_cast<int>(cur_local_mem_ids.size())) {
+                set_curation_status("failed", "press Local memories to list them first");
+                return;
+            }
+            auto cli = curation_http();
+            const auto r =
+                cli.del(base + "/" + cur_local_mem_ids[static_cast<size_t>(cur_local_mem_sel)]);
+            if (r.ok()) {
+                cur_local_mem_ids.erase(cur_local_mem_ids.begin() + cur_local_mem_sel);
+                cur_local_mem_entries.erase(cur_local_mem_entries.begin() + cur_local_mem_sel);
+                if (cur_local_mem_sel >= static_cast<int>(cur_local_mem_ids.size()))
+                    cur_local_mem_sel = std::max(0, static_cast<int>(cur_local_mem_ids.size()) - 1);
+                if (cur_local_mem_ids.empty()) cur_local_mem_conversation_id.clear();
+            }
+            set_curation_status(r.ok() ? "ok" : "failed",
+                                r.ok() ? "local memory deleted"
+                                       : "delete failed: HTTP " + std::to_string(r.status));
+            refresh();
+        },
+        ButtonOption::Simple());
 
     auto btn_cur_new_conv = Button(" New Conversation ", [&] {
         auto agents = agents_.list_agents();
@@ -2076,6 +2344,7 @@ void ControlUI::run() {
         cur_agent_menu_m,
         cur_conv_menu_m,
         cur_mem_menu_m,
+        cur_local_mem_menu_m,
         cur_new_title_input,
         cur_start_input,
         cur_end_input,
@@ -2087,7 +2356,17 @@ void ControlUI::run() {
         btn_cur_compact,
         btn_cur_delete_conv,
         btn_cur_extract,
-        btn_cur_delete_mem
+        btn_cur_delete_mem,
+        // The propose/apply loop and conversation-local memories. Both reach
+        // the API over HTTP rather than a->db(), so neither adds to the
+        // in-process mutation surface the parity check has to carry.
+        btn_cur_propose,
+        btn_cur_apply,
+        btn_cur_apply_direct,
+        btn_cur_local_list,
+        btn_cur_local_add,
+        btn_cur_local_edit,
+        btn_cur_local_del
     });
 
     auto btn_cur_confirm_delete = Button(" Confirm Delete ", [&] {
@@ -2793,8 +3072,15 @@ void ControlUI::run() {
         // which would spin a redraw loop while the DB stays locked.
         const auto cur_now = std::chrono::steady_clock::now();
         const bool cur_force = cur_cache_dirty.exchange(false);
-        if (cur_force || cur_agent_id != cur_cache_agent_id ||
+        const bool cur_agent_changed = cur_agent_id != cur_cache_agent_id;
+        if (cur_force || cur_agent_changed ||
             cur_now - cur_cache_at > std::chrono::milliseconds(1000)) {
+            if (cur_agent_changed) {
+                cur_local_mem_ids.clear();
+                cur_local_mem_entries.clear();
+                cur_local_mem_conversation_id.clear();
+                cur_local_mem_sel = 0;
+            }
             cur_cache_agent_id = cur_agent_id;
             cur_cache_at = cur_now;
             cur_convs_cache.clear();
@@ -2837,6 +3123,12 @@ void ControlUI::run() {
         if (!convs.empty() && cur_conv_sel >= 0 && cur_conv_sel < static_cast<int>(convs.size())) {
             const std::string want_id = convs[cur_conv_sel].id;
             if (want_id != cur_detail_loaded_id) {
+                if (want_id != cur_local_mem_conversation_id) {
+                    cur_local_mem_ids.clear();
+                    cur_local_mem_entries.clear();
+                    cur_local_mem_conversation_id.clear();
+                    cur_local_mem_sel = 0;
+                }
                 cur_conv_detail_cache.reset();
                 if (auto a = curation_agent()) {
                     try {
@@ -2850,6 +3142,10 @@ void ControlUI::run() {
                 }
             }
         } else {
+            cur_local_mem_ids.clear();
+            cur_local_mem_entries.clear();
+            cur_local_mem_conversation_id.clear();
+            cur_local_mem_sel = 0;
             cur_conv_detail_cache.reset();
             cur_detail_loaded_id.clear();
         }
@@ -2945,6 +3241,27 @@ void ControlUI::run() {
             text(" "), btn_cur_new_conv->Render(),
             filler(),
         }));
+        dl.push_back(hbox({
+            text("curate ") | dim,
+            btn_cur_propose->Render(),
+            text(" "),
+            btn_cur_apply->Render(),
+            text(" "),
+            btn_cur_apply_direct->Render(),
+            filler(),
+        }));
+        dl.push_back(hbox({
+            text("local  ") | dim,
+            btn_cur_local_list->Render(), text(" "),
+            btn_cur_local_add->Render(), text(" "),
+            btn_cur_local_edit->Render(), text(" "),
+            btn_cur_local_del->Render(),
+            filler(),
+        }));
+        if (!cur_local_mem_entries.empty()) {
+            dl.push_back(hbox({text("       ") | dim,
+                               cur_local_mem_menu_m->Render() | size(HEIGHT, LESS_THAN, 3) | flex}));
+        }
         if (!error_snapshot.empty())
             dl.push_back(text("error: " + error_snapshot) | color(Color::Red));
         if (!cur_db_error.empty())

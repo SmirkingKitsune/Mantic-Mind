@@ -79,10 +79,26 @@ struct SomaHeatView {
     bool bucketed() const noexcept { return layer_bucket > 1 || expert_bucket > 1; }
 };
 
+/// One live sequence on an engine, from `GET /v1/engines/{id}/slots`.
+///
+/// The per-sequence view an engine can report about itself, as distinct from
+/// the (node, slot) rows `GET /v1/engines` returns. Soma tracks real
+/// per-sequence state; llama.cpp does not, and the supervisor returns an empty
+/// list rather than synthesising one row per attached agent — a fabricated row
+/// looks like per-sequence data while carrying none.
+struct SomaSequenceView {
+    std::uint32_t index = 0;
+    std::string agent_id;
+    std::uint32_t position = 0;
+    std::uint32_t kv_tokens = 0;
+    bool prefilling = false;
+    bool suspended = false;
+    std::string determinism; ///< batched | strict
+};
+
 /// What the dashboard last managed to read. Every field carries its own staleness
-/// rather than the snapshot carrying one for all of them: engines and heat are
-/// separate requests and one can fail while the other succeeds, and a panel that
-/// blanks both because one timed out is worse than one that says "3s ago".
+/// rather than the snapshot carrying one for all of them: engines, heat, and
+/// sequences are separate requests and one can fail while another succeeds.
 struct SomaSnapshot {
     std::vector<SomaEngineView> engines;
     SomaTierSummary tiers;
@@ -92,8 +108,14 @@ struct SomaSnapshot {
     std::string heat_engine_id;
     SomaHeatView heat;
 
+    /// Sequences for the same selected engine, for the same reason. The engine
+    /// id prevents an old engine's rows surviving under a new selection.
+    std::string sequences_engine_id;
+    std::vector<SomaSequenceView> sequences;
+
     std::int64_t engines_at_ms = 0; ///< 0 = never succeeded
     std::int64_t heat_at_ms = 0;
+    std::int64_t sequences_at_ms = 0;
     std::string last_error; ///< the most recent failure, kept until one succeeds
 };
 

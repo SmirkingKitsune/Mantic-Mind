@@ -50,6 +50,10 @@ render_brain_grid(const SomaSnapshot& snap, std::uint32_t max_rows, std::uint32_
 /// declared and stubbed. Visible-and-zero is the honest rendering of that.
 ftxui::Element render_tier_bar(const SomaSnapshot& snap);
 
+/// Live sequences on the selected engine: agent, phase, KV occupancy, and
+/// determinism. An engine with no sequence telemetry says so explicitly.
+ftxui::Element render_sequences(const SomaSnapshot& snap);
+
 /// Staleness and the last error, as a single line.
 ftxui::Element render_status_line(const SomaSnapshot& snap, std::int64_t now_ms);
 

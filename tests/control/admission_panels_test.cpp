@@ -202,11 +202,21 @@ int main() {
         m.verdict = "stream";
         m.attention_family = "gqa";
         m.bytes_per_token = 3ll * 1024 * 1024 * 1024;
+        m.plan_loaded = true;
+        m.plan_verdict = "stream";
+        m.plan_scope = "admission-host";
+        m.plan_verdict_basis = "measured";
+        m.plan_verdict_reason = "disk floor passed";
+        m.plan_total_routed_bytes = 18ll * 1024 * 1024 * 1024;
+        m.plan_active_fraction = 0.125;
         snap.models.push_back(m);
         const auto out = draw(mm::render_admitted_models(snap));
         check(has(out, "Qwen3-30B-A3B"), "admitted model is listed");
         check(has(out, "stream"), "the verdict is shown — it decides whether Soma serves it");
         check(has(out, "GB"), "bytes/token is humanized rather than raw");
+        check(has(out, "admission-host"), "the plan's scope is not presented as this host");
+        check(has(out, "measured") && has(out, "disk floor passed"),
+              "the plan's evidence is visible");
     }
 
     std::cout << (failures == 0

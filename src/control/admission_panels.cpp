@@ -195,6 +195,32 @@ struct AdmissionDashboard::Impl {
             }
         }
 
+        // The PLAN for the first listed model. It carries the evidence behind
+        // the admission-host verdict. It does NOT claim to be a plan for this
+        // node: the endpoint says the effective verdict is re-derived at the
+        // target, and inventing RAM/disk projections here would contradict the
+        // wire contract. One row is enough to make the document reachable
+        // without adding a round trip for every registry entry.
+        if (!next.models.empty()) {
+            const auto id = std::to_string(next.models.front().id);
+            if (const auto p = c.get("/v1/models/" + id + "/plan"); p.ok()) {
+                try {
+                    const auto j = nlohmann::json::parse(p.body);
+                    auto& m = next.models.front();
+                    m.plan_verdict = j.value("verdict", std::string{});
+                    m.plan_scope = j.value("scope", std::string{});
+                    m.plan_verdict_basis = j.value("verdict_basis", std::string{});
+                    m.plan_verdict_reason = j.value("verdict_reason", std::string{});
+                    m.plan_total_routed_bytes = j.value("total_routed_bytes", std::int64_t{0});
+                    m.plan_active_fraction = j.value("active_fraction", 0.0);
+                    m.plan_loaded = true;
+                } catch (const std::exception&) {
+                    // Left unloaded, which the panel renders as "not available"
+                    // rather than as a plan of zeros.
+                }
+            }
+        }
+
         std::lock_guard<std::mutex> g(mutex);
         snap = std::move(next);
     }
@@ -526,6 +552,30 @@ Element render_admitted_models(const AdmissionSnapshot& snap) {
                      std::string(9 - std::min<std::size_t>(8, m.attention_family.size()), ' ')),
                 text(human_bytes(m.bytes_per_token)) | dim,
             }));
+            // The plan, for the row that has one. Its admission-host scope is
+            // part of the display: the effective verdict is re-derived on the
+            // target node, so presenting this evidence as a current-host plan
+            // would be a materially false operational claim.
+            if (m.plan_loaded) {
+                std::string line = "      plan: " + m.plan_verdict;
+                if (!m.plan_scope.empty()) line += " · " + m.plan_scope;
+                if (m.plan_total_routed_bytes > 0)
+                    line += " · routed " + human_bytes(m.plan_total_routed_bytes);
+                if (m.plan_active_fraction > 0.0) {
+                    char buf[32];
+                    std::snprintf(
+                        buf, sizeof(buf), "%.1f%% active", m.plan_active_fraction * 100.0);
+                    line += " · " + std::string(buf);
+                }
+                rows.push_back(text(line) | dim);
+                if (!m.plan_verdict_basis.empty() || !m.plan_verdict_reason.empty()) {
+                    std::string evidence = "      evidence: " + m.plan_verdict_basis;
+                    if (!m.plan_verdict_basis.empty() && !m.plan_verdict_reason.empty())
+                        evidence += " · ";
+                    evidence += m.plan_verdict_reason;
+                    rows.push_back(paragraph(evidence) | dim);
+                }
+            }
         }
     }
     return vbox({text(" Admitted models ") | bold, separator(), vbox(rows)}) | border;

@@ -77,6 +77,21 @@ struct AdmittedView {
     std::string attention_family;
     std::string arch_hash;
     std::int64_t bytes_per_token = 0;
+
+    /// From `GET /v1/models/{id}/plan` — the evidence behind the stored
+    /// admission verdict. The endpoint explicitly labels this admission-host
+    /// evidence; the effective verdict is re-derived on each target node.
+    ///
+    /// Fetched for the first listed model only: it is still a round trip per
+    /// model and a dashboard should not pay for rows nobody is looking at.
+    /// Empty when not fetched or unavailable.
+    bool plan_loaded = false;
+    std::string plan_verdict;
+    std::string plan_scope;
+    std::string plan_verdict_basis;
+    std::string plan_verdict_reason;
+    std::int64_t plan_total_routed_bytes = 0;
+    double plan_active_fraction = 0.0;
 };
 
 struct AdmissionSnapshot {

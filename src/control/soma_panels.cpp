@@ -277,6 +277,39 @@ Element render_tier_bar(const SomaSnapshot& snap) {
     return tui::panel("MEMORY TIERS", caption, vbox(std::move(rows)));
 }
 
+Element render_sequences(const SomaSnapshot& snap) {
+    if (snap.sequences_engine_id.empty())
+        return tui::panel("SEQUENCES", text("select an engine") | dim | center);
+
+    if (snap.sequences.empty()) {
+        const char* why = snap.sequences_at_ms == 0 ? "no reading yet" : "this engine reports none";
+        return tui::panel("SEQUENCES", text(why) | dim | center);
+    }
+
+    Elements rows;
+    rows.push_back(hbox({tui::col(text("SEQ"), 5),
+                         tui::col(text("AGENT"), 14),
+                         tui::col(text("PHASE"), 10),
+                         tui::col_right(text("POS"), 7),
+                         tui::col_right(text("KV"), 7)}) |
+                   dim);
+    for (const auto& s : snap.sequences) {
+        const std::string phase = s.suspended ? "suspended" : s.prefilling ? "prefill" : "decode";
+        rows.push_back(hbox({
+            tui::col(text(std::to_string(s.index)), 5),
+            tui::col(text(s.agent_id.empty() ? "-" : s.agent_id.substr(0, 12)), 14),
+            tui::col(text(phase), 10),
+            tui::col_right(text(std::to_string(s.position)), 7),
+            tui::col_right(text(std::to_string(s.kv_tokens)), 7),
+        }));
+    }
+
+    std::string caption = std::to_string(snap.sequences.size()) + " live";
+    const auto& determinism = snap.sequences.front().determinism;
+    if (!determinism.empty()) caption += " · " + determinism;
+    return tui::panel("SEQUENCES", caption, vbox(std::move(rows)) | yframe);
+}
+
 Element render_status_line(const SomaSnapshot& snap, std::int64_t now_ms) {
     // Per-field staleness, not one timestamp for the snapshot: engines and heat
     // are separate requests and one can fail while the other succeeds. A single
@@ -286,6 +319,8 @@ Element render_status_line(const SomaSnapshot& snap, std::int64_t now_ms) {
         text(age_label(snap.engines_at_ms, now_ms)),
         text("  · heat ") | dim,
         text(age_label(snap.heat_at_ms, now_ms)),
+        text("  · sequences ") | dim,
+        text(age_label(snap.sequences_at_ms, now_ms)),
     };
     if (!snap.last_error.empty()) {
         parts.push_back(text("  · ") | dim);
@@ -334,7 +369,8 @@ Component soma_tab(SomaDashboard& dashboard, int& selected_index) {
             render_engine_list(snap, count > 0 ? selected_index : -1),
             hbox({
                 render_brain_grid(snap, 24, 96) | flex,
-                render_tier_bar(snap) | size(WIDTH, EQUAL, 46),
+                vbox({render_tier_bar(snap), render_sequences(snap) | flex}) |
+                    size(WIDTH, EQUAL, 46),
             }),
             filler(),
             render_status_line(snap, util::now_ms()),

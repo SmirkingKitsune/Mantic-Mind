@@ -441,6 +441,26 @@ int main(int argc, char** argv) {
         check(has(listing, "eng-soma-1") && has(listing, "eng-llama-1"), "both engines are listed");
         check(has(listing, "llama-cpp"), "the fallback is a first-class row, not an omission");
 
+        snap.sequences_engine_id = "eng-soma-1";
+        snap.sequences_at_ms = 100000;
+        mm::SomaSequenceView sequence;
+        sequence.index = 2;
+        sequence.agent_id = "agent-alpha";
+        sequence.position = 1536;
+        sequence.kv_tokens = 1500;
+        sequence.prefilling = true;
+        sequence.determinism = "strict";
+        snap.sequences.push_back(sequence);
+        const auto sequences = draw(mm::render_sequences(snap), 70, 7);
+        check(has(sequences, "agent-alpha") && has(sequences, "prefill"),
+              "live sequence identity and phase are visible");
+        check(has(sequences, "1536") && has(sequences, "1500") && has(sequences, "strict"),
+              "sequence position, KV occupancy, and determinism are visible");
+
+        snap.sequences.clear();
+        check(has(draw(mm::render_sequences(snap), 70, 5), "reports none"),
+              "an engine with no sequence rows says so");
+
         // ── graceful degradation ─────────────────────────────────────────────
         snap.heat_engine_id = "eng-llama-1";
         check(has(draw(mm::render_brain_grid(snap, 8, 32), 70, 8), "fallback"),
