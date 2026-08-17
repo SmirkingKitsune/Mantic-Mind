@@ -43,6 +43,41 @@ ROUTE_RE = re.compile(r'\{"(GET|POST|PUT|DELETE|PATCH)",\s*"([^"]+)"')
 CLI_CALL_RE = re.compile(r'self\.(get|post|put|del|stream_post)\(\s*"([^"]+)"')
 # Paths the CLI builds by concatenation: "/v1/agents/" + tokens[2] + "/suspend"
 CLI_CONCAT_RE = re.compile(r'self\.(get|post|put|del|stream_post)\(\s*"(/v1/[^"]*)"\s*\+')
+# Every /v1 literal ANYWHERE in the CLI, verb unknown.
+#
+# The two patterns above only see a path written inline at the call. The CLI also
+# builds paths into a variable first — `std::string path = "/v1/activity?tail=" +
+# n; ... self.get(path)` — which both miss entirely. That blind spot made
+# /v1/activity look uncovered in a hand-audit and, worse, would have let a CLI
+# call to a NON-EXISTENT route pass unnoticed, because an unseen call cannot
+# fail the check.
+#
+# Used only for the COVERAGE direction, where a verb-less "the CLI knows this
+# path" is exactly the right signal.
+CLI_ANY_PATH_RE = re.compile(r'"(/v1/[^"]*)"')
+
+# Routes with no CLI form ON PURPOSE. Each needs a reason, because the point of
+# the list is that it stays short and every entry is a decision someone made
+# rather than something nobody got to.
+CLI_COVERAGE_EXEMPT = {
+    ("GET", "/v1/engines/:id/telemetry"):
+        "an unbounded SSE stream; a REPL has no shape for it that is not invented",
+    ("POST", "/v1/chat/completions"):
+        "the OpenAI-compat request shape for the SAME capability `chat send` covers",
+    ("POST", "/v1/audio/speech"):
+        "returns binary audio; `curation`/`chat` cover the text path and a REPL "
+        "cannot usefully render a WAV",
+    ("POST", "/v1/agents/:id/attachments"):
+        "multipart upload of an image; covered by `chat send` for text",
+    ("GET", "/v1/agents/:id/attachments/:attachment_id"):
+        "returns binary image bytes",
+    ("DELETE", "/v1/agents/:id/attachments/:attachment_id"):
+        "attachment lifecycle follows its conversation",
+    ("GET", "/v1/agents/:id/speech/cache/:cache_id"):
+        "returns binary audio",
+    ("POST", "/v1/agents/:id/speech"):
+        "returns binary audio",
+}
 
 VERB = {"get": "GET", "post": "POST", "put": "PUT", "del": "DELETE",
         "stream_post": "POST"}
@@ -121,6 +156,70 @@ def main() -> int:
         if not covered(verb, path):
             failures.append(f"CLI calls {verb} {path}, which is in no scope-table route")
 
+    # ── 1b. every route has a CLI form, or a recorded reason ──────────────────
+    #
+    # The other direction, and the one that actually measures parity. Check 1
+    # asks "does this CLI verb hit a real route"; this asks "can an operator do
+    # from the CLI what the API can do". Sixteen routes had no CLI form when
+    # this was first measured, including all three token routes — so a headless
+    # deployment could not mint its first credential, and the scoped-auth system
+    # was unreachable on exactly the deployments it was built for.
+    cli_paths = {p.split("?")[0] for p in CLI_ANY_PATH_RE.findall(cli_src)}
+    # Every string literal in the CLI, because a path suffix is frequently a
+    # COMMAND WORD rather than part of the URL literal:
+    #     self.post("/v1/agents/" + tokens[2] + "/" + sub, ...)   // sub=="suspend"
+    # There is no "/suspend" literal anywhere; there is a `sub == "suspend"`.
+    # Matching only URL literals reported routes as uncovered that the CLI had
+    # reached since the previous commit.
+    cli_literals = set(re.findall(r'"([^"\\\n]{1,64})"', cli_src))
+
+    def cli_knows(path: str) -> bool:
+        segments = [s for s in path.split("/") if s]
+        head_parts, tail_parts, seen_param = [], [], False
+        for s in segments:
+            if s.startswith(":"):
+                seen_param = True
+                continue
+            (tail_parts if seen_param else head_parts).append(s)
+        head = "/" + "/".join(head_parts)
+
+        # No parameters: the whole path must appear as a literal.
+        if not seen_param:
+            return head in cli_paths or head + "/" in cli_paths
+
+        # Parameterised: the CLI must name this resource AND supply every
+        # literal segment that follows a parameter — as part of a URL or as a
+        # command word.
+        names_resource = any(c == head or c.startswith(head + "/") for c in cli_paths)
+        if not names_resource:
+            return False
+        # Each remaining segment must appear as a WHOLE token — either a bare
+        # command word (`sub == "suspend"`) or a complete path segment in a
+        # fragment the CLI concatenates (`"/conversations/"`).
+        #
+        # Whole-token, not substring, and the difference is the whole value of
+        # this check. A plain `t in lit` test reported `PUT /v1/agents/:id/
+        # backend` as covered after its command had been DELETED, because
+        # "backend" is a substring of the unrelated literal "backend_override".
+        # A checker that reports coverage which does not exist is worse than no
+        # checker: it converts an unknown into a false assurance.
+        def segment_present(t: str) -> bool:
+            for lit in cli_literals:
+                if lit == t:
+                    return True
+                if ("/" + t + "/") in lit or lit.endswith("/" + t):
+                    return True
+            return False
+
+        return all(segment_present(t) for t in tail_parts)
+
+    uncovered = []
+    for verb, path in sorted(routes):
+        if (verb, path) in CLI_COVERAGE_EXEMPT:
+            continue
+        if not cli_knows(path):
+            uncovered.append((verb, path))
+
     # ── 2. every TUI in-process mutation has an equivalent route ──────────────
     tui_src = (root / TUI).read_text(encoding="utf-8", errors="replace")
     for mutator in MUTATORS:
@@ -144,6 +243,18 @@ def main() -> int:
     # entry should be dropped in the same change.
     stale = [m for m in TUI_MUTATION_ROUTES if m + "(" not in tui_src]
 
+    for verb, path in uncovered:
+        # FATAL, now that the backlog is zero.
+        #
+        # This was advisory while a backlog existed — failing the build for gaps
+        # that predate the check would only have taught people to disable it.
+        # With every route either reachable or exempt-with-a-reason, a new gap is
+        # a NEW decision, and the right moment to make it is when the route is
+        # added rather than at the next audit. Adding a route now costs one of:
+        # a CLI verb, or one line in CLI_COVERAGE_EXEMPT saying why not.
+        failures.append(
+            f"{verb} {path} has no CLI form and no recorded exemption — add a CLI "
+            f"verb, or an entry in CLI_COVERAGE_EXEMPT stating why it needs none")
     for f in failures:
         print("FAIL  " + f)
     for m in stale:
@@ -153,9 +264,12 @@ def main() -> int:
         print(f"\n{len(failures)} parity failure(s)")
         return 1
 
+    covered_n = len(routes) - len(uncovered) - len(CLI_COVERAGE_EXEMPT)
     print(f"OK    {len(cli_calls)} CLI route call(s), "
           f"{len(TUI_MUTATION_ROUTES) - len(stale)} TUI mutation(s) mapped, "
           f"{len(routes)} routes in the scope table")
+    print(f"      CLI coverage: {covered_n} reachable, "
+          f"{len(CLI_COVERAGE_EXEMPT)} exempt by reason, {len(uncovered)} gap(s)")
     return 0
 
 

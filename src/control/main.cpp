@@ -327,42 +327,55 @@ static ControlMainArgs parse_control_main_args(int argc, char** argv) {
 }
 
 static void print_control_usage() {
-    std::cout
-        << "Usage: mantic-mind-control [--mode tui|cli] [--output text|json] [--help]\n\n"
-        << "Modes:\n"
-        << "  tui  Default FTXUI terminal interface.\n"
-        << "  cli  Interactive REPL suitable for terminal assistants.\n\n"
-        << "Output:\n"
-        << "  text Default human-readable CLI output.\n"
-        << "  json Structured CLI output for automation.\n\n"
-        << "CLI commands:\n"
-        << "  nodes list\n"
-        << "  nodes discovered\n"
-        << "  nodes add <url> <api_key> [platform] [remember]\n"
-        << "  nodes remove <node_id>\n"
-        << "  nodes forget <node_id>\n"
-        << "  nodes pair start <url>\n"
-        << "  nodes pair complete <url> <nonce> <pin_or_psk> [remember]\n"
-        << "  nodes pair psk <url> [psk] [remember]\n"
-        << "  models list\n"
-        << "  models admit <source> [expert_gate] [expert_down] [group]\n"
-        << "  models admissions\n"
-        << "  models cancel <operation_id>\n"
-        << "  engines show\n"
-        << "  engines conform\n"
-        << "  engines setup\n"
-        << "  engines set primary <engine> [backup <engine>|backup none]\n"
-        << "  engines resync\n"
-        << "  engines share <fingerprint> <target_node_id> [source_node_id]\n"
-        << "  agents list|show|create|update|delete ...\n"
-        << "  agents suspend|restore|release <agent_id>\n"
-        << "  placements\n"
-        << "  chat send <agent_id> <message> [conversation_id]\n"
-        << "  curation conv ...\n"
-        << "  curation mem ...\n"
-        << "  activity tail [n]\n"
-        << "  help\n"
-        << "  quit\n";
+    std::cout << "Usage: mantic-mind-control [--mode tui|cli] [--output text|json] [--help]\n\n"
+              << "Modes:\n"
+              << "  tui  Default FTXUI terminal interface.\n"
+              << "  cli  Interactive REPL suitable for terminal assistants.\n\n"
+              << "Output:\n"
+              << "  text Default human-readable CLI output.\n"
+              << "  json Structured CLI output for automation.\n\n"
+              << "CLI commands:\n"
+              << "  nodes list\n"
+              << "  nodes discovered\n"
+              << "  nodes add <url> <api_key> [platform] [remember]\n"
+              << "  nodes remove <node_id>\n"
+              << "  nodes forget <node_id>\n"
+              << "  nodes pair start <url>\n"
+              << "  nodes pair complete <url> <nonce> <pin_or_psk> [remember]\n"
+              << "  nodes pair psk <url> [psk] [remember]\n"
+              << "  models list\n"
+              << "  models show|plan|conformance|heat <model_id>\n"
+              << "  models admit <source> [expert_gate] [expert_down] [group]\n"
+              << "  models admissions\n"
+              << "  models cancel <operation_id>\n"
+              << "  models register <json>\n"
+              << "  models reprofile <model_id>\n"
+              << "  models verdict <model_id> <stream|hybrid|resident_only|reject> [reason]\n"
+              << "  models delete <model_id>\n"
+              << "  tokens list|create|delete ...\n"
+              << "  performance [reset]\n"
+              << "  engines show\n"
+              << "  engines running\n"
+              << "  engines heat|slots <engine_id>\n"
+              << "  engines conform\n"
+              << "  engines setup\n"
+              << "  engines set primary <engine> [backup <engine>|backup none]\n"
+              << "  engines resync\n"
+              << "  engines share <fingerprint> <target_node_id> [source_node_id]\n"
+              << "  agents list|show|create|update|delete ...\n"
+              << "  agents suspend|restore|release <agent_id>\n"
+              << "  placements\n"
+              << "  chat send <agent_id> <message> [conversation_id]\n"
+              << "  curation conv ...\n"
+              << "  curation mem ...\n"
+              << "  curation local list|create|update|delete <agent_id> <conv_id> ...\n"
+              << "  curation propose <agent_id>\n"
+              << "  curation apply <agent_id> <json>\n"
+              << "  voice show|proposals|propose <agent_id>\n"
+              << "  voice approve|reject|sample <agent_id> <proposal_id>\n"
+              << "  activity tail [n]\n"
+              << "  help\n"
+              << "  quit\n";
 }
 
 class CliPrinter {
@@ -614,7 +627,8 @@ static void run_control_cli(uint16_t listen_port,
 
         if (cmd0 == "engines") {
             if (tokens.size() < 2) {
-                printer.line("usage: engines show|conform|setup|set|resync|share ...");
+                printer.line("usage: engines show|conform|setup|set|resync|share|running|"
+                             "heat|slots ...");
                 continue;
             }
             const std::string sub = mm::util::to_lower(tokens[1]);
@@ -671,6 +685,22 @@ static void run_control_cli(uint16_t listen_port,
                 put_engine_config(primary, backup);
                 continue;
             }
+            // Live engine PROCESSES, as opposed to `engines show`, which is the
+            // cluster's engine POLICY. Two different resources one word apart —
+            // see the /v1/engines vs /v1/cluster/engines split.
+            if (sub == "running") {
+                emit_http_result("engines running", self.get("/v1/engines"));
+                continue;
+            }
+            if (sub == "heat" || sub == "slots") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: engines " + sub + " <engine_id>");
+                    continue;
+                }
+                emit_http_result("engines " + sub,
+                                 self.get("/v1/engines/" + tokens[2] + "/" + sub));
+                continue;
+            }
             if (sub == "share") {
                 if (tokens.size() < 4) {
                     printer.line("usage: engines share <fingerprint> <target_node_id> [source_node_id]");
@@ -683,7 +713,8 @@ static void run_control_cli(uint16_t listen_port,
                                  self.post("/v1/cluster/engines/share", body));
                 continue;
             }
-            printer.line("usage: engines show|conform|setup|set|resync|share ...");
+            printer.line("usage: engines show|conform|setup|set|resync|share|running|"
+                         "heat|slots ...");
             continue;
         }
 
@@ -798,6 +829,107 @@ static void run_control_cli(uint16_t listen_port,
                 emit_http_result("models admissions", self.get("/v1/models/admissions"));
                 continue;
             }
+            // The registry's administrative half. All four are `operator` on the
+            // API and had no CLI form, so a headless deployment could admit a
+            // model and then neither correct its verdict nor remove it.
+            if (sub == "show") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: models show <model_id>");
+                    continue;
+                }
+                emit_http_result("models show", self.get("/v1/models/" + tokens[2]));
+                continue;
+            }
+            if (sub == "plan" || sub == "conformance" || sub == "heat") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: models " + sub + " <model_id>");
+                    continue;
+                }
+                emit_http_result("models " + sub, self.get("/v1/models/" + tokens[2] + "/" + sub));
+                continue;
+            }
+            if (sub == "delete") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: models delete <model_id>");
+                    continue;
+                }
+                emit_http_result("models delete", self.del("/v1/models/" + tokens[2]));
+                continue;
+            }
+            if (sub == "reprofile") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: models reprofile <model_id>");
+                    continue;
+                }
+                // SSE like admit, and handled the same way: read the operation
+                // id off the first frame and let `models admissions` watch it.
+                // Re-profiling re-derives a verdict from the SAME bytes — it
+                // never requantizes, so arch_hash and every KV checkpoint
+                // written against it survive.
+                std::string op_id;
+                int status = 0;
+                std::string error_body;
+                self.stream_post(
+                    "/v1/models/" + tokens[2] + "/reprofile",
+                    nlohmann::json::object(),
+                    [&op_id](const std::string& line) {
+                        const auto pos = line.find("data:");
+                        if (pos == std::string::npos) return true;
+                        try {
+                            const auto j =
+                                nlohmann::json::parse(mm::util::trim(line.substr(pos + 5)));
+                            const auto id = j.value("operation_id", std::string{});
+                            if (!id.empty()) {
+                                op_id = id;
+                                return false;
+                            }
+                        } catch (...) {
+                        }
+                        return true;
+                    },
+                    &status,
+                    &error_body);
+                if (!op_id.empty())
+                    emit_result(
+                        true,
+                        "models reprofile",
+                        nlohmann::json{{"operation_id", op_id}, {"watch", "models admissions"}},
+                        "");
+                else
+                    emit_result(false,
+                                "models reprofile",
+                                nlohmann::json::object(),
+                                error_body.empty() ? "reprofile reported no operation id"
+                                                   : error_body);
+                continue;
+            }
+            if (sub == "verdict") {
+                if (tokens.size() < 4) {
+                    printer.line("usage: models verdict <model_id> "
+                                 "<stream|hybrid|resident_only|reject> [reason]");
+                    continue;
+                }
+                nlohmann::json body{{"verdict", tokens[3]}};
+                if (tokens.size() > 4) body["reason"] = mm::cli::join_tokens(tokens, 4);
+                emit_http_result("models verdict",
+                                 self.put("/v1/models/" + tokens[2] + "/verdict", body));
+                continue;
+            }
+            if (sub == "register") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: models register <json>");
+                    continue;
+                }
+                try {
+                    emit_http_result(
+                        "models register",
+                        self.post("/v1/models",
+                                  nlohmann::json::parse(mm::cli::join_tokens(tokens, 2))));
+                } catch (const std::exception& e) {
+                    printer.line(std::string("error: invalid JSON: ") + e.what());
+                }
+                continue;
+            }
             if (sub == "cancel") {
                 if (tokens.size() < 3) {
                     printer.line("usage: models cancel <operation_id>");
@@ -869,14 +1001,15 @@ static void run_control_cli(uint16_t listen_port,
                 }
                 continue;
             }
-            printer.line("usage: models list|admit|admissions|cancel ...");
+            printer.line("usage: models list|show|plan|conformance|heat|admit|admissions|"
+                         "cancel|register|reprofile|verdict|delete ...");
             continue;
         }
 
         if (cmd0 == "agents") {
             if (tokens.size() < 2) {
-                printer.line(
-                    "usage: agents list|show|create|update|delete|suspend|restore|release ...");
+                printer.line("usage: agents list|show|create|update|delete|backend|"
+                             "suspend|restore|release ...");
                 continue;
             }
             const std::string sub = mm::util::to_lower(tokens[1]);
@@ -921,6 +1054,19 @@ static void run_control_cli(uint16_t listen_port,
                 } catch (const std::exception& e) {
                     printer.line(std::string("error: invalid JSON: ") + e.what());
                 }
+                continue;
+            }
+            // Which ENGINE serves this agent — the one place an operator can
+            // overrule a verdict. `operator` on the API, and it had no CLI form,
+            // so overruling a verdict was a TUI-only act.
+            if (sub == "backend") {
+                if (tokens.size() < 4) {
+                    printer.line("usage: agents backend <agent_id> <auto|soma|fallback>");
+                    continue;
+                }
+                emit_http_result("agents backend",
+                                 self.put("/v1/agents/" + tokens[2] + "/backend",
+                                          nlohmann::json{{"backend_override", tokens[3]}}));
                 continue;
             }
             // Placement lifecycle. These three had no /v1 route at all until the
@@ -1024,11 +1170,97 @@ static void run_control_cli(uint16_t listen_port,
 
         if (cmd0 == "curation") {
             if (tokens.size() < 3) {
-                printer.line("usage: curation conv|mem ...");
+                printer.line("usage: curation conv|mem|local|propose|apply ...");
                 continue;
             }
             const std::string group = mm::util::to_lower(tokens[1]);
             const std::string sub = mm::util::to_lower(tokens[2]);
+
+            // ── proposals ─────────────────────────────────────────────────────
+            // The review half of curation: the model proposes edits, an operator
+            // applies them. Both routes existed with no CLI form, so the
+            // propose/review loop was TUI-only in practice.
+            if (group == "propose") {
+                emit_http_result("curation propose",
+                                 self.post("/v1/agents/" + tokens[2] + "/curation/proposals",
+                                           nlohmann::json::object()));
+                continue;
+            }
+            if (group == "apply") {
+                if (tokens.size() < 4) {
+                    printer.line("usage: curation apply <agent_id> <json>");
+                    continue;
+                }
+                try {
+                    emit_http_result(
+                        "curation apply",
+                        self.post("/v1/agents/" + tokens[2] + "/curation/apply",
+                                  nlohmann::json::parse(mm::cli::join_tokens(tokens, 3))));
+                } catch (const std::exception& e) {
+                    printer.line(std::string("error: invalid JSON: ") + e.what());
+                }
+                continue;
+            }
+
+            // ── conversation-local memories ───────────────────────────────────
+            // Distinct from the agent-wide memories `curation mem` reaches:
+            // these are scoped to one conversation, and all four verbs were
+            // unreachable outside the TUI.
+            if (group == "local") {
+                if (tokens.size() < 5) {
+                    printer.line("usage: curation local list|create|update|delete "
+                                 "<agent_id> <conv_id> [memory_id] [json]");
+                    continue;
+                }
+                const std::string base =
+                    "/v1/agents/" + tokens[3] + "/conversations/" + tokens[4] + "/local-memories";
+                if (sub == "list") {
+                    emit_http_result("curation local list", self.get(base));
+                    continue;
+                }
+                if (sub == "create") {
+                    if (tokens.size() < 6) {
+                        printer.line("usage: curation local create <agent_id> <conv_id> <json>");
+                        continue;
+                    }
+                    try {
+                        emit_http_result(
+                            "curation local create",
+                            self.post(base,
+                                      nlohmann::json::parse(mm::cli::join_tokens(tokens, 5))));
+                    } catch (const std::exception& e) {
+                        printer.line(std::string("error: invalid JSON: ") + e.what());
+                    }
+                    continue;
+                }
+                if (sub == "update") {
+                    if (tokens.size() < 7) {
+                        printer.line("usage: curation local update <agent_id> <conv_id> "
+                                     "<memory_id> <json>");
+                        continue;
+                    }
+                    try {
+                        emit_http_result(
+                            "curation local update",
+                            self.put(base + "/" + tokens[5],
+                                     nlohmann::json::parse(mm::cli::join_tokens(tokens, 6))));
+                    } catch (const std::exception& e) {
+                        printer.line(std::string("error: invalid JSON: ") + e.what());
+                    }
+                    continue;
+                }
+                if (sub == "delete") {
+                    if (tokens.size() < 6) {
+                        printer.line("usage: curation local delete <agent_id> <conv_id> "
+                                     "<memory_id>");
+                        continue;
+                    }
+                    emit_http_result("curation local delete", self.del(base + "/" + tokens[5]));
+                    continue;
+                }
+                printer.line("usage: curation local list|create|update|delete ...");
+                continue;
+            }
 
             if (group == "conv") {
                 if (sub == "list") {
@@ -1112,6 +1344,101 @@ static void run_control_cli(uint16_t listen_port,
         // where every agent actually is.
         if (cmd0 == "placements") {
             emit_http_result("placements", self.get("/v1/placements"));
+            continue;
+        }
+
+        // ── voice ─────────────────────────────────────────────────────────────
+        //
+        // Voice-design proposals: the model drafts a voice, an operator listens
+        // and approves or rejects. Approve/reject are `operator` on the API and
+        // had no CLI form, so a headless deployment could create proposals it
+        // could never act on.
+        //
+        // `sample` renders audio to the server's cache and returns its id; the
+        // audio itself is fetched by a route this REPL exempts, because a WAV is
+        // not something a terminal can usefully render.
+        if (cmd0 == "voice") {
+            const std::string sub =
+                tokens.size() < 2 ? std::string{} : mm::util::to_lower(tokens[1]);
+            if (sub == "show" && tokens.size() > 2) {
+                emit_http_result("voice show", self.get("/v1/agents/" + tokens[2] + "/voice"));
+                continue;
+            }
+            if (sub == "proposals" && tokens.size() > 2) {
+                emit_http_result("voice proposals",
+                                 self.get("/v1/agents/" + tokens[2] + "/voice/proposals"));
+                continue;
+            }
+            if (sub == "propose" && tokens.size() > 2) {
+                emit_http_result("voice propose",
+                                 self.post("/v1/agents/" + tokens[2] + "/voice/proposals",
+                                           nlohmann::json::object()));
+                continue;
+            }
+            if ((sub == "approve" || sub == "reject" || sub == "sample") && tokens.size() > 3) {
+                emit_http_result("voice " + sub,
+                                 self.post("/v1/agents/" + tokens[2] + "/voice/proposals/" +
+                                               tokens[3] + "/" + sub,
+                                           nlohmann::json::object()));
+                continue;
+            }
+            printer.line("usage: voice show|proposals|propose <agent_id>  |  "
+                         "voice approve|reject|sample <agent_id> <proposal_id>");
+            continue;
+        }
+
+        // ── tokens ────────────────────────────────────────────────────────────
+        //
+        // The scoped-credential surface, and the sharpest of the coverage gaps:
+        // with no CLI form, a headless deployment could not mint its FIRST
+        // token. Bootstrapping required either the legacy flat
+        // `external_api_token` from config or hand-rolled HTTP — so the scoped
+        // auth system was, in practice, unreachable on exactly the deployments
+        // it was designed for.
+        //
+        // The plaintext is returned ONCE at creation and never persisted (only
+        // sha256 is stored), so `tokens create` prints the only copy that will
+        // ever exist. Said in the output rather than assumed.
+        if (cmd0 == "tokens") {
+            const std::string sub =
+                tokens.size() < 2 ? std::string{"list"} : mm::util::to_lower(tokens[1]);
+            if (sub == "list") {
+                emit_http_result("tokens list", self.get("/v1/tokens"));
+                continue;
+            }
+            if (sub == "create") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: tokens create <label> [read|chat|operator,...]");
+                    continue;
+                }
+                nlohmann::json body{{"label", tokens[2]}};
+                // Defaults to `read` rather than to everything: a credential
+                // whose scope nobody chose should be the harmless one.
+                body["scopes"] = tokens.size() > 3 ? tokens[3] : std::string{"read"};
+                const auto r = self.post("/v1/tokens", body);
+                if (r.ok()) printer.line("  the plaintext token is shown ONCE — store it now");
+                emit_http_result("tokens create", r);
+                continue;
+            }
+            if (sub == "delete") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: tokens delete <token_id>");
+                    continue;
+                }
+                emit_http_result("tokens delete", self.del("/v1/tokens/" + tokens[2]));
+                continue;
+            }
+            printer.line("usage: tokens list|create|delete ...");
+            continue;
+        }
+
+        // ── performance ───────────────────────────────────────────────────────
+        if (cmd0 == "performance") {
+            if (tokens.size() > 1 && mm::util::to_lower(tokens[1]) == "reset") {
+                emit_http_result("performance reset", self.del("/v1/performance"));
+                continue;
+            }
+            emit_http_result("performance", self.get("/v1/performance"));
             continue;
         }
 
