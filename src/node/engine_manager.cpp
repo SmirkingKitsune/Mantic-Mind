@@ -166,8 +166,16 @@ void NodeEngineManager::apply(const ClusterEngineConfig& cfg) {
         // Only a shareable engine can be satisfied by a peer. Asking control to
         // find a Soma artifact would send it looking for something no node ever
         // advertises.
-        if (needs.empty() && cfg.share_builds && p->shareable()) {
-            if (auto a = p->installed_artifact()) needs = a->fingerprint();
+        // What this node NEEDS, not what it has. Asking installed_artifact()
+        // here was empty by construction: it requires a working runtime, and
+        // this branch is reached only when provisioning failed — so a node that
+        // could not build asked for help by naming the build it did not have,
+        // and named nothing. `desired_artifact` answers the other question.
+        //
+        // Soma returns nullopt: it ships with the node, so no peer has one to
+        // give and asking control to look would be a search that cannot succeed.
+        if (needs.empty() && cfg.share_builds) {
+            if (auto a = p->desired_artifact(*spec)) needs = a->fingerprint();
         }
         MM_WARN("Engine '{}' not ready: {}", id, status.last_error);
     }

@@ -75,8 +75,26 @@ public:
     /// is or package it as a known build.
     virtual std::optional<EngineArtifact> installed_artifact() const = 0;
 
+    /// What this node WANTS for `spec` — as opposed to what it has.
+    ///
+    /// The two are different questions and conflating them broke the share
+    /// path: `needs_artifact` was filled from `installed_artifact()`, which is
+    /// empty in exactly the case a peer is needed, because provisioning had
+    /// just failed. A node that cannot build asked for help by naming the build
+    /// it did not have, and so named nothing.
+    ///
+    /// `nullopt` when the identity cannot be pinned down — most often because
+    /// the spec says "latest" and no update check has resolved what that is.
+    /// A fingerprint with an empty version would match nothing and is worse
+    /// than admitting the node cannot name what it needs.
+    virtual std::optional<EngineArtifact> desired_artifact(const EngineSpec& spec) const = 0;
+
     /// Can this engine be packaged and sent to a peer at all? False for an
     /// engine that ships with the node and for a PATH-resolved binary.
+    ///
+    /// About SENDING. Whether a node can RECEIVE one is `desired_artifact()`
+    /// answering — a node with a failed build is not shareable and is precisely
+    /// the one that needs a share.
     virtual bool shareable() const = 0;
 
     /// Package the installed engine into `out_path`. Returns false with `err`
@@ -119,6 +137,7 @@ public:
     RuntimeStatus update(const EngineSpec& spec, const std::string& variant_override) override;
     RuntimeStatus status() const override;
     std::optional<EngineArtifact> installed_artifact() const override;
+    std::optional<EngineArtifact> desired_artifact(const EngineSpec& spec) const override;
     bool shareable() const override;
     bool package(const std::string& out_path, std::string& err) override;
     bool install_package(const std::string& package_path,
@@ -160,6 +179,7 @@ public:
     RuntimeStatus update(const EngineSpec& spec, const std::string& variant_override) override;
     RuntimeStatus status() const override;
     std::optional<EngineArtifact> installed_artifact() const override;
+    std::optional<EngineArtifact> desired_artifact(const EngineSpec& spec) const override;
     bool shareable() const override;
     bool package(const std::string& out_path, std::string& err) override;
     bool install_package(const std::string& package_path,

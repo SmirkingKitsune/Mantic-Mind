@@ -293,6 +293,42 @@ std::optional<EngineArtifact> LlamaEngineProvisioner::installed_artifact() const
     return a;
 }
 
+std::optional<EngineArtifact>
+LlamaEngineProvisioner::desired_artifact(const EngineSpec& spec) const {
+    std::lock_guard<std::mutex> g(impl_->mutex_);
+
+    // The version this node is trying to reach. A pinned spec names it
+    // outright; "latest" is only knowable once an update check has resolved it,
+    // and `target_variant`/`latest_version` are where that lands.
+    std::string version = spec.version;
+    if (version.empty() || version == "latest") version = impl_->last.latest_version;
+    if (version.empty()) return std::nullopt;
+
+    // The variant this node RESOLVED for itself — the local half of the
+    // intent/resolution split. `target_*` is what it wants rather than what it
+    // fell back to, which matters here: a node running a Vulkan fallback while
+    // targeting CUDA needs the CUDA build shared to it, not another Vulkan one.
+    std::string variant = impl_->last.target_variant;
+    if (variant.empty()) variant = impl_->last.target_accelerator;
+    if (variant.empty()) variant = impl_->last.variant;
+    if (variant.empty()) variant = impl_->last.accelerator;
+    // Required for llama.cpp specifically, even though EngineArtifact permits
+    // an empty variant for engines that have none. Every real llama install
+    // advertises an accelerator, so a fingerprint with a blank one matches no
+    // source that will ever exist — a request that 404s every time is worse
+    // than admitting this node cannot yet name what it needs.
+    if (variant.empty()) return std::nullopt;
+
+    EngineArtifact a;
+    a.engine_id = impl_->id;
+    a.version = version;
+    a.platform = current_runtime_platform();
+    a.arch = current_runtime_arch();
+    a.variant = variant;
+    if (!a.valid()) return std::nullopt;
+    return a;
+}
+
 bool LlamaEngineProvisioner::shareable() const {
     std::lock_guard<std::mutex> g(impl_->mutex_);
     return impl_->managed && llama_runtime_usable(impl_->last);
@@ -449,6 +485,15 @@ std::string SomaEngineProvisioner::executable_path() const {
 std::optional<EngineArtifact> SomaEngineProvisioner::installed_artifact() const {
     // Nothing to advertise: Soma is not acquired, so it is never the answer to
     // another node's need.
+    return std::nullopt;
+}
+
+std::optional<EngineArtifact>
+SomaEngineProvisioner::desired_artifact(const EngineSpec& /*spec*/) const {
+    // Nothing to want from a peer: Soma ships with the node, so a missing one
+    // is a broken install rather than a build this cluster could hand over.
+    // Naming an artifact here would send control looking for a source that
+    // cannot exist.
     return std::nullopt;
 }
 

@@ -16,6 +16,7 @@
 #include "control/agent_scheduler.hpp"
 #include "control/engine_config_store.hpp"
 #include "node/node_state.hpp"
+#include "node/engine_provisioner.hpp"
 #include "node/node_ui.hpp"
 #include "node/engine_descriptor.hpp"
 #include "control/control_api_server.hpp"
@@ -961,6 +962,46 @@ bool test_engine_digest_and_package_grants_are_one_shot() {
     CHECK(state.take_prepared_engine_package("tok-1") == "/tmp/pkg.tar.gz");
     CHECK(state.take_prepared_engine_package("tok-1").empty());
     CHECK(state.take_prepared_engine_package("never-issued").empty());
+    return true;
+}
+
+bool test_desired_artifact_names_what_a_node_lacks() {
+    // The distinction this exists to hold: what a node HAS versus what it
+    // WANTS. `needs_artifact` was filled from installed_artifact(), which
+    // requires a working runtime — and is consulted only when provisioning
+    // FAILED. So a node that could not build asked for help by naming the build
+    // it did not have, and named nothing: the share path had no reachable
+    // trigger at all.
+    mm::SomaEngineProvisioner soma("soma");
+    mm::EngineSpec soma_spec;
+    soma_spec.engine_id = "soma";
+
+    // Soma ships with the node, so there is no peer that could supply one.
+    // Naming an artifact would send control hunting a source that cannot exist.
+    CHECK(!soma.desired_artifact(soma_spec).has_value());
+    CHECK(!soma.installed_artifact().has_value());
+    CHECK(!soma.shareable());
+
+    mm::LlamaEngineProvisioner llama("llama-server", {});
+    mm::EngineSpec llama_spec;
+    llama_spec.engine_id = "llama-cpp";
+
+    // Nothing resolved yet: no version and no variant, so the node cannot name
+    // what it needs and says so rather than emitting a fingerprint with blank
+    // fields that would match no source ever.
+    llama_spec.version = "latest";
+    CHECK(!llama.desired_artifact(llama_spec).has_value());
+
+    // A pinned version is knowable immediately — but a variant still is not,
+    // and every real llama install advertises an accelerator. A fingerprint
+    // with a blank variant 404s every time, which is worse than admitting
+    // ignorance.
+    llama_spec.version = "b4321";
+    CHECK(!llama.desired_artifact(llama_spec).has_value());
+
+    // Nothing is installed, so it is not a source for anyone.
+    CHECK(!llama.installed_artifact().has_value());
+    CHECK(!llama.shareable());
     return true;
 }
 
@@ -6790,6 +6831,8 @@ int main(int argc, char** argv) {
          test_placement_refused_until_engine_config_exists},
         {"conformance_gates_placement_candidates",
          test_conformance_gates_placement_candidates},
+        {"desired_artifact_names_what_a_node_lacks",
+         test_desired_artifact_names_what_a_node_lacks},
         {"node_modal_ladder", test_node_modal_ladder},
         {"engine_digest_and_package_grants_are_one_shot",
          test_engine_digest_and_package_grants_are_one_shot},

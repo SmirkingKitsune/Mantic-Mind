@@ -358,7 +358,8 @@ Element render_conformance_table(const EngineSnapshot& snap, int selected) {
     rows.push_back(text(""));
     rows.push_back(hbox({text("  " + std::to_string(snap.conforming) + "/" +
                               std::to_string(snap.nodes.size()) + " conforming") |
-                         dim}));
+                             dim,
+                         text("   j/k select") | dim}));
 
     return vbox({text(" Cluster conformance ") | bold, separator(), vbox(rows) | flex}) | border;
 }
@@ -467,6 +468,46 @@ Component engine_tab(EngineDashboard& dashboard, int& selected_node, bool& force
 
     auto close_button = Button("Close", [form] { form->open = false; });
 
+    // ── Share ─────────────────────────────────────────────────────────────────
+    //
+    // Targets the SELECTED node and takes its fingerprint from that node's own
+    // `needs_artifact`. The alternative — a text field for a fingerprint — would
+    // make an operator hand-type `llama-cpp|b4321|linux|x86_64|cuda-12`, where a
+    // single wrong field is a silent 404 rather than a wrong build. The cluster
+    // already knows which node is waiting and for what; asking the operator to
+    // restate it is asking them to be a worse copy of the data.
+    //
+    // `source_node_id` is left empty so control picks a holder. Control is the
+    // only party that sees every node's artifacts, so choosing here would mean
+    // choosing from a strictly smaller view.
+    auto share_button = Button("Share to selected", [form, &dashboard, &selected_node] {
+        const auto snap = dashboard.snapshot();
+        if (selected_node < 0 || selected_node >= static_cast<int>(snap.nodes.size())) {
+            form->status = "no node selected";
+            form->status_ok = false;
+            return;
+        }
+        const auto& node = snap.nodes[static_cast<std::size_t>(selected_node)];
+        if (node.needs_artifact.empty()) {
+            // Refused with the reason rather than sent and failed. A node that
+            // is merely unhealthy is not a node waiting on a build, and the two
+            // want completely different responses from an operator.
+            form->status = (node.hostname.empty() ? node.node_id : node.hostname) +
+                           " is not waiting on an engine build";
+            form->status_ok = false;
+            return;
+        }
+        std::string err;
+        if (dashboard.share(node.needs_artifact, node.node_id, {}, err)) {
+            form->status = "shared " + node.needs_artifact + " to " +
+                           (node.hostname.empty() ? node.node_id : node.hostname);
+            form->status_ok = true;
+        } else {
+            form->status = err;
+            form->status_ok = false;
+        }
+    });
+
     auto form_container = Container::Vertical({
         primary_toggle,
         backup_toggle,
@@ -475,7 +516,7 @@ Component engine_tab(EngineDashboard& dashboard, int& selected_node, bool& force
     });
 
     auto edit_button = Button("Configure (e)", [form] { form->open = true; });
-    auto action_row = Container::Horizontal({edit_button, resync_button});
+    auto action_row = Container::Horizontal({edit_button, resync_button, share_button});
 
     auto container = Container::Vertical({action_row, Maybe(form_container, &form->open)});
 
@@ -530,11 +571,29 @@ Component engine_tab(EngineDashboard& dashboard, int& selected_node, bool& force
             return vbox(body);
         });
 
-    return CatchEvent(renderer, [form](const Event& ev) {
+    return CatchEvent(renderer, [form, &dashboard, &selected_node](const Event& ev) {
         if (form->open) return false;
         if (ev == Event::Character('e')) {
             form->open = true;
             return true;
+        }
+        // Move the conformance selection. Without this the highlight was
+        // rendered and never movable, so "the selected node" was always the
+        // first one — which a share button would have quietly inherited.
+        //
+        // j/k rather than the arrows: arrows belong to whichever button has
+        // focus in the action row, and stealing them would make the row
+        // unnavigable.
+        const auto count = static_cast<int>(dashboard.snapshot().nodes.size());
+        if (count > 0) {
+            if (ev == Event::Character('j')) {
+                selected_node = std::min(count - 1, selected_node + 1);
+                return true;
+            }
+            if (ev == Event::Character('k')) {
+                selected_node = std::max(0, selected_node - 1);
+                return true;
+            }
         }
         return false;
     });
