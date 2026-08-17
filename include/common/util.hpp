@@ -18,6 +18,19 @@ std::string hostname();
 //   - First character must be alphanumeric
 bool is_valid_agent_id(const std::string& id);
 
+// Directory holding the RUNNING executable, or "" if it cannot be determined.
+//
+// Not `current_path()` and not argv[0]: a node started as a service, or from a
+// shortcut, has a working directory unrelated to where its binary lives, and
+// argv[0] is whatever the launcher felt like passing. This asks the OS.
+//
+// It exists because "ships beside the node" is a claim the node has to be able
+// to CHECK. Soma is built from this repository and deployed next to
+// mantic-mind, but the node looked for it on PATH alone — so in any build tree,
+// where soma lands in src/soma/ and the node in src/node/, the engine that
+// ships with the node could not be found by the node (D58).
+std::string executable_dir();
+
 // ── Time ─────────────────────────────────────────────────────────────────────
 int64_t now_ms();   // milliseconds since Unix epoch
 int64_t now_s();    // seconds since Unix epoch

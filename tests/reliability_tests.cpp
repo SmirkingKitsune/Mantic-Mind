@@ -16,6 +16,7 @@
 #include "control/agent_scheduler.hpp"
 #include "control/engine_config_store.hpp"
 #include "node/node_state.hpp"
+#include "node/engine_manager.hpp"
 #include "node/engine_provisioner.hpp"
 #include "node/node_ui.hpp"
 #include "node/engine_descriptor.hpp"
@@ -1120,6 +1121,254 @@ bool test_desired_artifact_names_what_a_node_lacks() {
     // Nothing is installed, so it is not a source for anyone.
     CHECK(!llama.installed_artifact().has_value());
     CHECK(!llama.shareable());
+    return true;
+}
+
+namespace {
+
+/// A provisioner that fails the only way the two real ones can't be made to on
+/// demand. Every other method is inert; `ensure` is the one the manager calls.
+class ThrowingProvisioner final : public mm::EngineProvisioner {
+public:
+    explicit ThrowingProvisioner(std::string id) : id_(std::move(id)) {}
+
+    const std::string& engine_id() const override { return id_; }
+    mm::RuntimeStatus ensure(const mm::EngineSpec&) override {
+        ++calls;
+        throw std::runtime_error("provisioner exploded");
+    }
+    mm::RuntimeStatus check_for_update(const mm::EngineSpec&) override { return status(); }
+    mm::RuntimeStatus update(const mm::EngineSpec&, const std::string&) override {
+        return status();
+    }
+    mm::RuntimeStatus status() const override {
+        mm::RuntimeStatus s;
+        s.engine_id = id_;
+        s.status = "absent";
+        return s;
+    }
+    std::optional<mm::EngineArtifact> installed_artifact() const override { return std::nullopt; }
+    std::optional<mm::EngineArtifact> desired_artifact(const mm::EngineSpec&) const override {
+        return std::nullopt;
+    }
+    bool shareable() const override { return false; }
+    bool package(const std::string&, std::string& err) override {
+        err = "not shareable";
+        return false;
+    }
+    bool install_package(const std::string&,
+                         const mm::EngineArtifact&,
+                         std::string& err) override {
+        err = "not installable";
+        return false;
+    }
+    std::string executable_path() const override { return {}; }
+
+    int calls = 0;
+
+private:
+    std::string id_;
+};
+
+} // namespace
+
+bool test_provisioner_exception_fails_the_engine_not_the_node() {
+    // The guarantee behind D56: whatever a provisioner does, the node survives
+    // it and says what happened. The reentrant lock was one way to throw; the
+    // point of the boundary is that it does not have to be the last one.
+    // Soma stays REAL and stays primary, and is planted where it will actually
+    // resolve, because the second half of the claim is that a backup blowing up
+    // does not stop the primary from coming up. With one catch around the whole
+    // loop it would have — and a primary that failed for its own reasons would
+    // have hidden the difference.
+    const std::string soma_name = "mm-soma-fixture-" + mm::util::generate_uuid();
+#ifdef _WIN32
+    const std::filesystem::path planted =
+        std::filesystem::path(mm::util::executable_dir()) / (soma_name + ".exe");
+#else
+    const std::filesystem::path planted =
+        std::filesystem::path(mm::util::executable_dir()) / soma_name;
+#endif
+    {
+        std::ofstream out(planted, std::ios::binary | std::ios::trunc);
+        out << "not a real engine";
+    }
+
+    mm::EngineManagerPaths paths;
+    paths.llama_provision_dir = temp_test_dir("engine-manager-throw").string();
+    paths.soma_executable = soma_name;
+    mm::NodeEngineManager manager(paths);
+
+    auto owned = std::make_unique<ThrowingProvisioner>("llama-cpp");
+    auto* thrower = owned.get();
+    manager.set_provisioner("llama-cpp", std::move(owned));
+
+    mm::ClusterEngineConfig cfg;
+    cfg.version = 1;
+    cfg.primary_engine = "soma";
+    cfg.backup_engine = "llama-cpp";
+    mm::EngineSpec soma_spec;
+    soma_spec.engine_id = "soma";
+    mm::EngineSpec llama_spec;
+    llama_spec.engine_id = "llama-cpp";
+    cfg.engines = {soma_spec, llama_spec};
+
+    manager.apply(cfg); // must return, not terminate
+    CHECK(thrower->calls == 1);
+
+    const auto conf = manager.conformance();
+    // Failed, not Converging: the application finished, and a node stuck
+    // reporting "wait" forever reads healthier than one reporting a fault.
+    CHECK(conf.state == mm::EngineConformanceState::Failed);
+    CHECK(conf.detail.find("provisioner exploded") != std::string::npos);
+
+    // And the per-engine row says error, not absent. Absent means nothing
+    // tried; something tried and blew up, and an operator reading "absent"
+    // would go looking for a missing install rather than a crash.
+    bool saw_llama = false, soma_ready = false;
+    for (const auto& s : manager.engine_statuses()) {
+        if (s.engine_id == "soma") soma_ready = s.ready;
+        if (s.engine_id != "llama-cpp") continue;
+        saw_llama = true;
+        CHECK(s.status == "error");
+        CHECK(!s.ready);
+        CHECK(s.last_error.find("provisioner exploded") != std::string::npos);
+    }
+    CHECK(saw_llama);
+    CHECK(soma_ready);
+
+    std::error_code ec;
+    std::filesystem::remove(planted, ec);
+    return true;
+}
+
+bool test_soma_resolves_beside_the_node_binary() {
+    // D58: the node looked for `soma` on PATH alone, while the documented rule —
+    // and the deployment layout — is that soma ships BESIDE the node binary. In
+    // any build tree those are different directories, so the engine built with
+    // the node was invisible to it and every Soma-primary config reported the
+    // engine absent.
+    const std::string dir = mm::util::executable_dir();
+    CHECK(!dir.empty());
+
+    // Written beside the RUNNING test binary, because that is the only way to
+    // assert "beside the executable" without hardcoding a build layout — which
+    // is the very thing this fix exists to avoid.
+    const std::string name = "mm-soma-fixture-" + mm::util::generate_uuid();
+#ifdef _WIN32
+    const std::filesystem::path planted = std::filesystem::path(dir) / (name + ".exe");
+#else
+    const std::filesystem::path planted = std::filesystem::path(dir) / name;
+#endif
+    {
+        std::ofstream out(planted, std::ios::binary | std::ios::trunc);
+        out << "not a real engine";
+    }
+
+    mm::EngineSpec spec;
+    spec.engine_id = "soma";
+
+    // The bare name resolves to the sibling, and to its full path — a status
+    // that echoed the request back would pass a weaker test while telling the
+    // supervisor nothing it did not already have.
+    mm::SomaEngineProvisioner found(name);
+    const auto ok = found.ensure(spec);
+    CHECK(ok.ready);
+    CHECK(ok.status == "ready");
+    CHECK(ok.executable_path == planted.string());
+
+    std::error_code ec;
+    std::filesystem::remove(planted, ec);
+
+    // Gone from both places now, and the failure has to NAME where it looked.
+    // "not found, check the install" is a dead end when the operator's next
+    // question is which of the two directories was empty.
+    mm::SomaEngineProvisioner missing(name);
+    const auto absent = missing.ensure(spec);
+    CHECK(!absent.ready);
+    CHECK(absent.status == "absent");
+    CHECK(absent.last_error.find(dir) != std::string::npos);
+    return true;
+}
+
+bool test_provisioning_progress_sink_may_read_status() {
+    // The node crash: a cluster config naming llama-cpp killed the node inside
+    // one health poll, with nothing in the log, on every fresh install (D56).
+    //
+    // The shape is a lock held across a callback. LlamaEngineProvisioner held
+    // one mutex for the whole of ensure(); ensure() reports progress by calling
+    // the progress sink; the node's sink asks the engine manager for llama
+    // status, which comes straight back into the same object and takes the same
+    // mutex on the same thread. MSVC does not hang on that — it THROWS
+    // `resource deadlock would occur` — out of a worker thread with no handler,
+    // into std::terminate, which is abort().
+    //
+    // So the assertion is not "no deadlock", which a passing test cannot
+    // distinguish from a test that never reached the callback. It is: the sink
+    // FIRED, it read status from inside the callback, and ensure() returned.
+    // The middle one is what makes the other two mean anything.
+    auto dir = temp_test_dir("provisioner-reentrancy");
+    std::filesystem::create_directories(dir);
+
+    // Injected wholesale: reaching the progress callback at all requires
+    // getting into a managed install, and a test that downloaded llama.cpp to
+    // get there would be a network test that fails for its own reasons.
+    mm::LlamaCommandRunner runner;
+    runner.resolve_executable = [](const std::string&) { return std::string{}; };
+    runner.capture_output = [](const std::vector<std::string>&,
+                               const std::filesystem::path&) { return std::string{}; };
+    runner.capture_first_line = [](const std::vector<std::string>&,
+                                   const std::filesystem::path&) { return std::string{}; };
+    runner.fetch_latest = [](const mm::LlamaProvisionConfig&) { return std::string{"b4321"}; };
+    runner.fetch_release_assets = [](const mm::LlamaProvisionConfig&, const std::string&) {
+        return std::vector<std::string>{};
+    };
+    runner.run = [](const std::vector<std::string>&,
+                    const std::filesystem::path&,
+                    const mm::StreamLineCallback&,
+                    const mm::CancelCheckCallback&,
+                    std::string*) { return 0; };
+
+    mm::LlamaEngineProvisioner llama("llama-server", dir.string(), runner);
+
+    int progress_frames = 0;
+    int reads_from_inside_the_callback = 0;
+    llama.set_progress_sink([&](const mm::RuntimeInstallProgress& p) {
+        if (!p.active) return;
+        ++progress_frames;
+        // Exactly what src/node/main.cpp's progress sink does — it reads the
+        // accelerator to label the operation. Reading it here is the whole
+        // test; before the fix this threw.
+        const auto s = llama.llama_status();
+        (void)s.accelerator;
+        // …and the generic accessors, which the API thread and the TUI reach
+        // through on the same object while a build runs.
+        (void)llama.status();
+        (void)llama.executable_path();
+        ++reads_from_inside_the_callback;
+    });
+
+    mm::EngineSpec spec;
+    spec.engine_id = "llama-cpp";
+    spec.version = "latest";
+    spec.install_method = "auto";
+
+    bool threw = false;
+    try {
+        llama.ensure(spec);
+    } catch (...) {
+        threw = true;
+    }
+
+    CHECK(!threw);
+    // The install cannot SUCCEED here — no bytes were ever downloaded — and
+    // that is fine. It has to reach the progress callback, which is a
+    // different claim, and the one this test is about.
+    CHECK(progress_frames > 0);
+    CHECK(reads_from_inside_the_callback == progress_frames);
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
     return true;
 }
 
@@ -6955,6 +7204,12 @@ int main(int argc, char** argv) {
          test_concurrent_admission_of_one_model_joins_not_duplicates},
         {"desired_artifact_names_what_a_node_lacks",
          test_desired_artifact_names_what_a_node_lacks},
+        {"provisioning_progress_sink_may_read_status",
+         test_provisioning_progress_sink_may_read_status},
+        {"provisioner_exception_fails_the_engine_not_the_node",
+         test_provisioner_exception_fails_the_engine_not_the_node},
+        {"soma_resolves_beside_the_node_binary",
+         test_soma_resolves_beside_the_node_binary},
         {"node_modal_ladder", test_node_modal_ladder},
         {"engine_digest_and_package_grants_are_one_shot",
          test_engine_digest_and_package_grants_are_one_shot},

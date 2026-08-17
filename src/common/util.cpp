@@ -34,6 +34,33 @@ std::string hostname() {
 }
 
 
+std::string executable_dir() {
+#ifdef _WIN32
+    // 32 KiB rather than MAX_PATH: long paths are legal and a truncated one
+    // resolves to a real directory that is the WRONG directory, which is worse
+    // than returning nothing.
+    std::vector<char> buf(32768);
+    const DWORD n = GetModuleFileNameA(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
+    if (n == 0 || n >= buf.size()) return {};
+    std::error_code ec;
+    const std::filesystem::path p(std::string(buf.data(), n));
+    const auto parent = p.parent_path();
+    return std::filesystem::exists(parent, ec) ? parent.string() : std::string{};
+#else
+    std::error_code ec;
+    const auto p = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (ec) {
+        // macOS and the BSDs have no /proc. _NSGetExecutablePath would be the
+        // portable answer there; until this build targets them, saying "I do
+        // not know" is honest and the PATH lookup still runs.
+        return {};
+    }
+    const auto parent = p.parent_path();
+    return std::filesystem::exists(parent, ec) ? parent.string() : std::string{};
+#endif
+}
+
+
 // ── UUID v4 ───────────────────────────────────────────────────────────────────
 std::string generate_uuid() {
     static thread_local std::mt19937 rng{std::random_device{}()};

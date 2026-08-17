@@ -96,6 +96,19 @@ public:
     /// nullptr when this node has no provisioner for `engine_id`.
     EngineProvisioner* provisioner(const std::string& engine_id) const;
 
+    /// Replace the provisioner for one engine, wiring it to the current sinks.
+    ///
+    /// A test seam, and named as one. The property it exists to assert is that a
+    /// provisioner which THROWS leaves this node reporting a failed engine
+    /// rather than taking the process down — and that is not assertable against
+    /// the two real provisioners, which would need a network and a build
+    /// toolchain to be made to fail. It was not hypothetical: an exception out
+    /// of llama.cpp provisioning killed the node on every config push (D56).
+    ///
+    /// Not for the API or the TUI: which engines a node can acquire is a
+    /// property of the build, not something the cluster or an operator sets.
+    void set_provisioner(const std::string& engine_id, std::unique_ptr<EngineProvisioner> p);
+
     /// The llama-specific view, for the routes and TUI that need release
     /// variants and the troubleshooting report. Default-constructed when llama
     /// is not among this node's provisioners.

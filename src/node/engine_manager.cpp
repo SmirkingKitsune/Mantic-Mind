@@ -28,6 +28,13 @@ struct NodeEngineManager::Impl {
     std::string needs_artifact;
     std::string apply_error;
 
+    /// Engines whose provisioner THREW, by id. Overlaid onto engine_statuses()
+    /// so the per-engine row says "error: ..." instead of inheriting whatever
+    /// the provisioner last managed to record — after a throw that is usually
+    /// "absent", which is a different and false claim: absent means nothing
+    /// tried, and something tried and blew up.
+    std::map<std::string, std::string> apply_faults;
+
     EngineProvisioner::LogSink log_sink;
     EngineProvisioner::ProgressSink progress_sink;
     EngineProvisioner::CancelCheck cancel_check;
@@ -102,6 +109,22 @@ EngineProvisioner* NodeEngineManager::provisioner(const std::string& engine_id) 
     return impl_->find(engine_id);
 }
 
+void NodeEngineManager::set_provisioner(const std::string& engine_id,
+                                        std::unique_ptr<EngineProvisioner> p) {
+    std::lock_guard<std::mutex> g(impl_->mutex);
+    if (p == nullptr) {
+        impl_->provisioners.erase(engine_id);
+        return;
+    }
+    // Wired to the sinks already set, so a provisioner installed after
+    // set_log_sink() is not silently mute — the setters only reach the
+    // provisioners that existed when they ran.
+    if (impl_->log_sink) p->set_log_sink(impl_->log_sink);
+    if (impl_->progress_sink) p->set_progress_sink(impl_->progress_sink);
+    if (impl_->cancel_check) p->set_cancel_check(impl_->cancel_check);
+    impl_->provisioners[engine_id] = std::move(p);
+}
+
 ClusterEngineConfig NodeEngineManager::current_config() const {
     std::lock_guard<std::mutex> g(impl_->mutex);
     return impl_->config;
@@ -116,6 +139,7 @@ void NodeEngineManager::apply(const ClusterEngineConfig& cfg) {
         impl_->have_config = true;
         impl_->needs_artifact.clear();
         impl_->apply_error.clear();
+        impl_->apply_faults.clear();
         resolved_cb = impl_->resolved_cb;
     }
     impl_->applying.store(true);
@@ -128,6 +152,7 @@ void NodeEngineManager::apply(const ClusterEngineConfig& cfg) {
 
     std::string first_error;
     std::string needs;
+    std::map<std::string, std::string> faults;
 
     for (const auto& id : cfg.required_engines()) {
         if (impl_->stopping.load()) break;
@@ -147,7 +172,42 @@ void NodeEngineManager::apply(const ClusterEngineConfig& cfg) {
             continue;
         }
 
-        const RuntimeStatus status = p->ensure(*spec);
+        // A provisioner is the one part of this node that runs somebody else's
+        // build system — a release download, an archive extraction, a CMake
+        // invocation — and it runs HERE, on a worker thread with no caller to
+        // catch anything. An exception that escapes reaches std::terminate,
+        // which on Windows is `abort()` via __fastfail: the node vanishes with
+        // no shutdown, no exit line, and no stack. That is not hypothetical;
+        // it is how this was found. Every cluster config naming llama-cpp
+        // killed the node within one health poll, and because the log flushes
+        // on warnings the last four lines never reached disk — so the crash
+        // was invisible in exactly the file written to explain it (D56).
+        //
+        // Caught PER ENGINE, not around the loop: a llama.cpp that throws must
+        // not stop Soma from resolving behind it. That is the same claim the
+        // optional-backup design makes, and a shared catch would quietly
+        // retract it.
+        RuntimeStatus status;
+        try {
+            status = p->ensure(*spec);
+        } catch (const std::exception& e) {
+            status = RuntimeStatus{};
+            status.engine_id = id;
+            status.status = "error";
+            status.ready = false;
+            status.last_error = std::string("provisioning threw: ") + e.what();
+            faults[id] = status.last_error;
+            MM_ERROR("Engine '{}' provisioning threw: {}", id, e.what());
+        } catch (...) {
+            status = RuntimeStatus{};
+            status.engine_id = id;
+            status.status = "error";
+            status.ready = false;
+            status.last_error = "provisioning threw a non-standard exception";
+            faults[id] = status.last_error;
+            MM_ERROR("Engine '{}' provisioning threw a non-standard exception", id);
+        }
+
         if (status.ready) {
             if (resolved_cb && !status.executable_path.empty())
                 resolved_cb(id, status.executable_path);
@@ -184,6 +244,7 @@ void NodeEngineManager::apply(const ClusterEngineConfig& cfg) {
         std::lock_guard<std::mutex> g(impl_->mutex);
         impl_->apply_error = first_error;
         impl_->needs_artifact = needs;
+        impl_->apply_faults = std::move(faults);
     }
     impl_->applying.store(false);
 }
@@ -194,12 +255,45 @@ void NodeEngineManager::apply_async(const ClusterEngineConfig& cfg) {
         std::lock_guard<std::mutex> g(impl_->mutex);
         previous = std::move(impl_->worker);
     }
-    // Joined before starting the next one: two concurrent applications would
-    // race on the same provisioner and could leave a half-installed runtime
-    // that neither call believes it owns.
-    if (previous.joinable()) previous.join();
-
-    std::thread next([this, cfg]() { apply(cfg); });
+    // The previous application is still joined before the next one starts — two
+    // concurrent applications would race on the same provisioner and could
+    // leave a half-installed runtime that neither call believes it owns — but
+    // the join happens INSIDE the new worker, not here.
+    //
+    // It used to happen here, on the caller's thread, which is the HTTP handler
+    // for POST /api/node/engine-config. That route's own comment says
+    // "provisioning runs in the background because a source build takes minutes
+    // and control's push must not block on it" — true for the first push and
+    // false for the second, which waited out the whole build while control's
+    // health poll timed out and marked the node unreachable. Latent until now
+    // only because the node died before it could ever build anything (D59).
+    //
+    // The backstop behind the per-engine catch in apply(). That one covers the
+    // provisioners, which is where the risk actually lives; this covers
+    // everything else on the thread — and, more importantly, guarantees the
+    // property rather than the coverage. A thread function that can throw at
+    // all is a process that can vanish, so the boundary belongs at the thread,
+    // not only at the call known to be dangerous today.
+    std::thread next([this, cfg, previous = std::move(previous)]() mutable {
+        if (previous.joinable()) previous.join();
+        try {
+            apply(cfg);
+        } catch (const std::exception& e) {
+            // `applying` is reset here too: apply() clears it on its own way
+            // out, and a throw that skipped that would leave conformance
+            // permanently Converging — a node stuck reporting "wait" forever,
+            // which reads healthier than Failed and is worse.
+            impl_->applying.store(false);
+            std::lock_guard<std::mutex> g(impl_->mutex);
+            impl_->apply_error = std::string("applying engine config threw: ") + e.what();
+            MM_ERROR("Applying engine config v{} threw: {}", cfg.version, e.what());
+        } catch (...) {
+            impl_->applying.store(false);
+            std::lock_guard<std::mutex> g(impl_->mutex);
+            impl_->apply_error = "applying engine config threw a non-standard exception";
+            MM_ERROR("Applying engine config v{} threw a non-standard exception", cfg.version);
+        }
+    });
     {
         std::lock_guard<std::mutex> g(impl_->mutex);
         impl_->worker = std::move(next);
@@ -213,6 +307,14 @@ std::vector<RuntimeStatus> NodeEngineManager::engine_statuses() const {
     for (const auto& [id, p] : impl_->provisioners) {
         RuntimeStatus s = p->status();
         if (s.engine_id.empty()) s.engine_id = id;
+        // A provisioner that threw never got to record why, so its own status
+        // still reads whatever it held before the attempt. Overlaid rather than
+        // left alone: "absent" means nothing tried, and something tried.
+        if (const auto it = impl_->apply_faults.find(id); it != impl_->apply_faults.end()) {
+            s.status = "error";
+            s.ready = false;
+            s.last_error = it->second;
+        }
         out.push_back(std::move(s));
     }
     return out;

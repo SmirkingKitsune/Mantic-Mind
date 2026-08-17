@@ -183,6 +183,43 @@ if(WIN32)
         COMMAND_EXPAND_LISTS)
 endif()
 
+# ── soma, beside the binaries that look for it ────────────────────────────────
+# The node resolves `soma` BY NAME and the documented rule is that it ships
+# beside the node. In a build tree it did not: soma lands in src/soma/ and the
+# node in src/node/, and neither is on the other's PATH — so a cluster config
+# naming Soma as its primary engine produced `absent` for a binary sitting one
+# directory away, on every fresh build (D58). Control needs the same copy for a
+# different reason: admission shells out to `soma plan` and `soma conform`.
+#
+# Copying rather than teaching the node about build-tree layout. "../soma/
+# Release/soma.exe" is knowledge of a directory structure that does not exist in
+# a deployment, compiled into production code — the honest fix is to make the
+# claim true where it is false.
+#
+# Issued here because add_custom_command(TARGET) must be, in the directory that
+# created the target; the runtime DLLs ride along because a soma.exe that cannot
+# find its OpenSSL dies with 0xC0000135 before main() and the supervisor reports
+# it as "exited before becoming ready".
+foreach(host mantic-mind mantic-mind-control)
+    add_dependencies(${host} soma)
+    add_custom_command(TARGET soma POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:soma>" "$<TARGET_FILE_DIR:${host}>")
+    if(WIN32)
+        add_custom_command(TARGET soma POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "$<TARGET_RUNTIME_DLLS:soma>" "$<TARGET_FILE_DIR:${host}>"
+            COMMAND_EXPAND_LISTS)
+    endif()
+endforeach()
+
+# Same rule for an installed tree: mantic-mind and mantic-mind-control both
+# install to ${CMAKE_INSTALL_BINDIR}, so soma installing there is what makes
+# "beside the node" true after `cmake --install` as well as in the build tree.
+install(TARGETS soma
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
 # ── Header self-test ──────────────────────────────────────────────────────────
 set(SOMA_SELFTEST_DIR "${CMAKE_CURRENT_BINARY_DIR}/header_selftest")
 file(MAKE_DIRECTORY "${SOMA_SELFTEST_DIR}")

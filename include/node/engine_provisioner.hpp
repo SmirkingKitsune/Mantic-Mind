@@ -30,6 +30,10 @@
 #include "common/models.hpp"
 #include "common/process_exec.hpp"
 #include "node/engine_descriptor.hpp"
+// For LlamaCommandRunner, which LlamaEngineProvisioner forwards. The wrapper
+// already exposed LlamaRuntimeStatus, so this pulls in no dependency the seam
+// did not already have.
+#include "node/llama_cpp_provisioner.hpp"
 
 #include <functional>
 #include <memory>
@@ -123,12 +127,36 @@ protected:
 };
 
 /// llama.cpp — wraps LlamaCppProvisioner without reimplementing it.
+///
+/// ── Two mutexes, and why one was a crash ──────────────────────────────────────
+///
+/// A provisioning call runs for minutes and reports progress by CALLING BACK
+/// through `progress_sink_`. The node's sink asks the engine manager for the
+/// current llama status, which comes straight back here. So a single mutex held
+/// across `ensure()` was locked twice by one thread — and MSVC's std::mutex does
+/// not hang on that, it THROWS `resource deadlock would occur`, out of a worker
+/// thread with no handler, into std::terminate. Every cluster config naming
+/// llama-cpp killed the node within one health poll (D56).
+///
+/// So: `op` serializes long operations against each other and is held across
+/// them; `state` guards the fields and is never held across a call into
+/// LlamaCppProvisioner. The rule is the general one — a lock is not held across
+/// a callback into code that does not belong to it — and it also removes a real
+/// two-thread inversion, because the accessors run manager→state while the sink
+/// ran state→manager.
 class LlamaEngineProvisioner final : public EngineProvisioner {
 public:
     /// `requested_executable` and `provision_dir` are NODE deployment settings
     /// (MM_LLAMA_PATH and friends), not cluster policy. They say where this
     /// machine keeps things; the cluster says what it wants kept there.
-    LlamaEngineProvisioner(std::string requested_executable, std::string provision_dir);
+    ///
+    /// `runner` is the same seam LlamaCppProvisioner already exposes, forwarded
+    /// so this wrapper can be exercised without a network: the reentrancy above
+    /// is only reachable once provisioning starts EMITTING progress, and a test
+    /// that had to download llama.cpp to get there would not be a test.
+    LlamaEngineProvisioner(std::string requested_executable,
+                           std::string provision_dir,
+                           LlamaCommandRunner runner = {});
     ~LlamaEngineProvisioner() override;
 
     const std::string& engine_id() const override;
