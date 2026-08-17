@@ -21,6 +21,7 @@ class AgentQueue;
 class NodeRegistry;
 class AgentScheduler;
 class HttpServer;
+class EngineConfigStore;
 
 // Hosts the external REST + SSE API for mantic-mind-control (see plan §REST API).
 // Also hosts the node registration endpoint (/api/control/register-node).
@@ -73,6 +74,12 @@ public:
         scopes_.configure(registry, external_api_token_);
     }
 
+    /// The cluster engine configuration backing /v1/cluster/engines/*.
+    /// Optional; when unset those routes answer 503 rather than reporting an
+    /// unconfigured cluster, because "nobody has configured this" and "this
+    /// build has no configurator" are different facts.
+    void set_engine_config_store(EngineConfigStore* store) { engine_config_ = store; }
+
 private:
     /// Why this agent cannot be sent an image, or empty if it can.
     ///
@@ -97,6 +104,7 @@ private:
     /// pretending an empty registry, because "no models admitted" and "the
     /// registry never opened" are different facts and only one is actionable.
     ControlModelRegistry* models_ = nullptr;
+    EngineConfigStore*    engine_config_ = nullptr;
     /// Scoped authorization for /v1/*. Replaces the flat-token comparison that
     /// used to live in authorize_external_request().
     ScopeAuthorizer scopes_;

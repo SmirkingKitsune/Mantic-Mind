@@ -345,6 +345,11 @@ void AgentScheduler::set_model_registry(const ControlModelRegistry* registry) {
     models_ = registry;
 }
 
+void AgentScheduler::set_engine_config_gate(EngineConfigReadyFn ready) {
+    engine_config_ready_ = std::move(ready);
+    engine_config_required_ = static_cast<bool>(engine_config_ready_);
+}
+
 std::string AgentScheduler::model_location(const AgentConfig& cfg) const {
     // The registry is the AUTHORITY on where an admitted model's bytes are, and
     // until this existed nothing asked it. resolve_backend_for() has always
@@ -388,6 +393,23 @@ AgentScheduler::resolve_backend_for(const AgentConfig& cfg) const {
 
 std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     const AgentConfig& cfg) {
+    // The cluster has no engine policy yet. Refusing here rather than placing
+    // on whatever a node happened to have is the whole point of the master
+    // configurator: an unconfigured cluster serving from an accidental engine
+    // set is exactly the state nobody could see before.
+    //
+    // The message names the fix because this is the first thing a fresh install
+    // hits, and "no available nodes" would send the operator to look at nodes
+    // that are all healthy.
+    if (engine_config_required_ && !engine_config_ready_()) {
+        release_agent(cfg.id);
+        set_last_error(
+            "cluster engine configuration required: no primary engine has been set. "
+            "Configure it in the control TUI's Engines tab, with `engines setup` in "
+            "CLI mode, or via PUT /v1/cluster/engines/config");
+        return std::nullopt;
+    }
+
     const auto routing = resolve_backend_for(cfg);
     if (routing.engine_id.empty()) {
         // Release a prior local placement before reporting the routing result.

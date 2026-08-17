@@ -203,6 +203,49 @@ void NodeState::set_llama_runtime(const LlamaRuntimeStatus& runtime) {
     llama_runtime_ = runtime;
 }
 
+ClusterEngineConfig NodeState::get_engine_config() const {
+    std::lock_guard<std::mutex> g(mutex_);
+    return engine_config_;
+}
+
+void NodeState::set_engine_config(const ClusterEngineConfig& cfg) {
+    std::lock_guard<std::mutex> g(mutex_);
+    engine_config_ = cfg;
+}
+
+void NodeState::expect_engine_digest(const std::string& fingerprint,
+                                     const std::string& sha256) {
+    std::lock_guard<std::mutex> g(mutex_);
+    expected_engine_digests_[fingerprint] = sha256;
+}
+
+std::string NodeState::take_expected_engine_digest(const std::string& fingerprint) {
+    std::lock_guard<std::mutex> g(mutex_);
+    auto it = expected_engine_digests_.find(fingerprint);
+    if (it == expected_engine_digests_.end()) return {};
+    // Erased on read. A grant that outlived its transfer would authorize a
+    // later unbrokered push of the same fingerprint, which is exactly the case
+    // this mechanism exists to refuse.
+    std::string sha = std::move(it->second);
+    expected_engine_digests_.erase(it);
+    return sha;
+}
+
+void NodeState::set_prepared_engine_package(const std::string& token,
+                                            const std::string& path) {
+    std::lock_guard<std::mutex> g(mutex_);
+    prepared_engine_packages_[token] = path;
+}
+
+std::string NodeState::take_prepared_engine_package(const std::string& token) {
+    std::lock_guard<std::mutex> g(mutex_);
+    auto it = prepared_engine_packages_.find(token);
+    if (it == prepared_engine_packages_.end()) return {};
+    std::string path = std::move(it->second);
+    prepared_engine_packages_.erase(it);
+    return path;
+}
+
 NodeActionProgress NodeState::get_action_progress() const {
     std::lock_guard<std::mutex> g(mutex_);
     return action_progress_;

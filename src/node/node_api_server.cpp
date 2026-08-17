@@ -1,9 +1,11 @@
 #include "node/node_api_server.hpp"
 #include "node/engine_descriptor.hpp"
+#include "node/engine_manager.hpp"
 #include "node/node_state.hpp"
 #include "node/engine_supervisor.hpp"
 #include "node/model_store.hpp"
 #include "common/engine_client.hpp"
+#include "common/http_client.hpp"
 #include "common/http_server.hpp"
 #include "common/runtime_client.hpp"
 #include "common/models.hpp"
@@ -44,6 +46,31 @@ namespace {
 // executable (found on PATH or a completed managed install).
 bool node_llama_runtime_ready(const LlamaRuntimeStatus& rt) {
     return (rt.status == "resolved" || rt.status == "ready") && !rt.executable_path.empty();
+}
+
+// True when :id names the engine these llama-shaped actions apply to.
+// Otherwise writes a 400 naming the engine asked for and the reason.
+//
+// A refusal rather than a silent no-op: "switch variant" on Soma is not a
+// request that should quietly succeed, and a 200 would tell the operator a
+// switch happened. The engine id is echoed so the message is about what they
+// asked for rather than about llama.cpp.
+bool require_llama_engine(const httplib::Request& req, httplib::Response& res) {
+    const auto it = req.path_params.find("id");
+    const std::string id = it == req.path_params.end() ? std::string{} : it->second;
+    if (id == "llama-cpp") return true;
+
+    res.status = 400;
+    res.set_content(
+        nlohmann::json{
+            {"error", "engine '" + id +
+                          "' has no release variants or troubleshooting matrix; this action "
+                          "exists only for llama-cpp"},
+            {"engine", id},
+            {"engines", EngineRegistry::instance().ids()}}
+            .dump(),
+        "application/json");
+    return false;
 }
 
 // Load paths currently backing a live slot — models the store must never
@@ -165,6 +192,14 @@ void NodeApiServer::set_model_store(ModelStore* store) {
     model_store_ = store;
 }
 
+void NodeApiServer::set_engine_manager(NodeEngineManager* manager) {
+    engine_manager_ = manager;
+}
+
+void NodeApiServer::set_engine_config_callback(EngineConfigCallback callback) {
+    engine_config_cb_ = std::move(callback);
+}
+
 // ── Auth check ────────────────────────────────────────────────────────────────
 bool NodeApiServer::check_auth(const std::string& auth_header) {
     static const std::string kBearer = "Bearer ";
@@ -247,6 +282,21 @@ void NodeApiServer::register_routes() {
         // than one runtime's path. `llama_server_path` is retained because
         // control's UI reads it, but it comes from the descriptor.
         j["engines"] = EngineRegistry::instance().ids();
+        // The convergence signal control polls on. Reported even when engine
+        // management is unconfigured — version 0 and `unconfigured` are exactly
+        // what tells control to push, and omitting them would leave a node that
+        // has never been told looking identical to one that is up to date.
+        if (engine_manager_ != nullptr) {
+            j["engine_config_version"] = engine_manager_->current_config().version;
+            j["engine_conformance"] = engine_manager_->conformance();
+            j["engine_runtimes"] = engine_manager_->engine_statuses();
+        } else {
+            j["engine_config_version"] = 0;
+            EngineConformance none;
+            none.detail = "engine management is not configured on this node";
+            j["engine_conformance"] = none;
+            j["engine_runtimes"] = nlohmann::json::array();
+        }
         if (const auto* llama = EngineRegistry::instance().find("llama-cpp")) {
             j["llama_server_path"] = llama->build_launch({}).executable;
         }
@@ -307,19 +357,105 @@ void NodeApiServer::register_routes() {
         res.set_content(nlohmann::json{{"lines", lines}}.dump(), "application/json");
     });
 
-    // ── POST /api/node/load-model ─────────────────────────────────────────────
-    server_->Get("/api/node/runtime/llama", [this](const Request& req, Response& res) {
+    // ── Engines ───────────────────────────────────────────────────────────────
+    //
+    // These replace six /api/node/runtime/llama/* routes. The old paths named
+    // one engine in the URL, so a second engine could not be provisioned,
+    // switched, or diagnosed without a second family of routes spelling its
+    // name — which is how the node ended up with exactly one engine it could
+    // manage.
+    //
+    // The llama-only ACTIONS survive under :id and refuse a non-llama engine by
+    // name. That is not a limitation being papered over: release variants and a
+    // troubleshooting matrix are things llama.cpp has and Soma does not.
+
+    // GET /api/node/engines — everything control needs to render this node's
+    // engine state, in one round trip.
+    server_->Get("/api/node/engines", [this](const Request& req, Response& res) {
         if (!check_auth(req.get_header_value("Authorization"))) {
             res.status = 401; return;
         }
-        res.set_content(nlohmann::json{{"llama_runtime", state_.get_llama_runtime()}}.dump(),
+        if (engine_manager_ == nullptr) {
+            res.status = 501;
+            res.set_content(R"({"error":"engine management is not configured on this node"})",
+                            "application/json");
+            return;
+        }
+        nlohmann::json artifacts = nlohmann::json::array();
+        for (const auto& a : engine_manager_->shareable_artifacts()) {
+            artifacts.push_back(nlohmann::json{{"engine_id", a.engine_id},
+                                               {"version", a.version},
+                                               {"platform", a.platform},
+                                               {"arch", a.arch},
+                                               {"variant", a.variant},
+                                               {"fingerprint", a.fingerprint()}});
+        }
+        const auto cluster_cfg = engine_manager_->current_config();
+        res.set_content(nlohmann::json{{"engines", engine_manager_->engine_statuses()},
+                                       {"conformance", engine_manager_->conformance()},
+                                       {"engine_config_version", cluster_cfg.version},
+                                       {"engine_config", cluster_cfg},
+                                       {"shareable_artifacts", artifacts},
+                                       // The llama detail the generic status
+                                       // cannot carry; the TUI's troubleshooting
+                                       // wizard reads it.
+                                       {"llama_runtime", state_.get_llama_runtime()}}
+                            .dump(),
                         "application/json");
     });
 
-    server_->Post("/api/node/runtime/llama/provision", [this](const Request& req, Response& res) {
+    // POST /api/node/engine-config — the master telling this node what to run.
+    server_->Post("/api/node/engine-config", [this](const Request& req, Response& res) {
         if (!check_auth(req.get_header_value("Authorization"))) {
             res.status = 401; return;
         }
+        if (engine_manager_ == nullptr || !engine_config_cb_) {
+            res.status = 501;
+            res.set_content(R"({"error":"engine management is not configured on this node"})",
+                            "application/json");
+            return;
+        }
+        ClusterEngineConfig cfg;
+        try {
+            cfg = nlohmann::json::parse(req.body).get<ClusterEngineConfig>();
+        } catch (const std::exception& e) {
+            // Includes the forbidden-key refusal from from_json. Reported to
+            // the master verbatim: it pushed a config this node will not run,
+            // and it needs the reason rather than a generic 400.
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+            return;
+        }
+
+        // Validated against THIS node's registry, so a config naming an engine
+        // this build cannot run is refused at the push instead of surfacing
+        // later as an unexplained conformance failure.
+        std::string verr;
+        if (!validate_engine_config(cfg, EngineRegistry::instance().ids(), verr)) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", verr}}.dump(), "application/json");
+            return;
+        }
+
+        MM_INFO("Applying cluster engine config v{} from control", cfg.version);
+        engine_config_cb_(cfg);
+
+        // Answers immediately with `converging`; provisioning runs in the
+        // background because a source build takes minutes and control's push
+        // must not block on it.
+        res.set_content(nlohmann::json{{"accepted", true},
+                                       {"engine_config_version", cfg.version},
+                                       {"conformance", engine_manager_->conformance()}}
+                            .dump(),
+                        "application/json");
+    });
+
+    // POST /api/node/engines/:id/provision
+    server_->Post("/api/node/engines/:id/provision", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401; return;
+        }
+        if (!require_llama_engine(req, res)) return;
         bool want_update = false;
         std::string accelerator;
         if (!req.body.empty()) {
@@ -359,10 +495,11 @@ void NodeApiServer::register_routes() {
                         "application/json");
     });
 
-    server_->Post("/api/node/runtime/llama/check-update", [this](const Request& req, Response& res) {
+    server_->Post("/api/node/engines/:id/check-update", [this](const Request& req, Response& res) {
         if (!check_auth(req.get_header_value("Authorization"))) {
             res.status = 401; return;
         }
+        if (!require_llama_engine(req, res)) return;
         if (!llama_check_update_cb_) {
             res.status = 501;
             res.set_content(R"({"error":"llama.cpp update checking is not configured"})",
@@ -375,10 +512,11 @@ void NodeApiServer::register_routes() {
                         "application/json");
     });
 
-    server_->Post("/api/node/runtime/llama/switch", [this](const Request& req, Response& res) {
+    server_->Post("/api/node/engines/:id/switch", [this](const Request& req, Response& res) {
         if (!check_auth(req.get_header_value("Authorization"))) {
             res.status = 401; return;
         }
+        if (!require_llama_engine(req, res)) return;
         if (!llama_switch_cb_) {
             res.status = 501;
             res.set_content(R"({"error":"llama.cpp engine switching is not configured"})",
@@ -409,10 +547,11 @@ void NodeApiServer::register_routes() {
                         "application/json");
     });
 
-    server_->Post("/api/node/runtime/llama/diagnose", [this](const Request& req, Response& res) {
+    server_->Post("/api/node/engines/:id/diagnose", [this](const Request& req, Response& res) {
         if (!check_auth(req.get_header_value("Authorization"))) {
             res.status = 401; return;
         }
+        if (!require_llama_engine(req, res)) return;
         if (!llama_diagnose_cb_) {
             res.status = 501;
             res.set_content(R"({"error":"llama.cpp diagnostics are not configured"})",
@@ -425,10 +564,11 @@ void NodeApiServer::register_routes() {
                         "application/json");
     });
 
-    server_->Post("/api/node/runtime/llama/recover", [this](const Request& req, Response& res) {
+    server_->Post("/api/node/engines/:id/recover", [this](const Request& req, Response& res) {
         if (!check_auth(req.get_header_value("Authorization"))) {
             res.status = 401; return;
         }
+        if (!require_llama_engine(req, res)) return;
         if (!llama_recovery_cb_) {
             res.status = 501;
             res.set_content(R"({"error":"llama.cpp recovery is not configured"})",
@@ -693,6 +833,362 @@ void NodeApiServer::register_routes() {
                 }
             }
             res.set_content(R"({"status":"unloaded"})", "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+        }
+    });
+
+    // ── Engine artifact sharing ───────────────────────────────────────────────
+    //
+    // A node that has built an engine serves it to a node that needs the same
+    // one. Bytes go NODE TO NODE; control brokers — it decides who shares with
+    // whom, mints and revokes the credential, and never stores the artifact.
+    //
+    // Three rules, enforced below rather than only documented:
+    //
+    //  1. The expected digest comes from CONTROL, out of band from the bytes.
+    //     A digest supplied by the sending node would let a compromised source
+    //     define its own checksum, and the verification would be theatre.
+    //  2. Fingerprint equality is EXACT across (engine, version, platform,
+    //     arch, variant). A near-match is a wrong binary, not a close one — an
+    //     x86_64 CUDA-12 build on an aarch64 host does not run.
+    //  3. The receiving node re-checks the artifact against its OWN
+    //     environment. Control's view of this node's platform is a report from
+    //     this node; the only authority on what executes here is here.
+
+    // POST /api/node/engines/prepare — package the artifact and report its
+    // digest, WITHOUT sending it anywhere.
+    //
+    // Phase one of two, and the split exists for one reason: only the holder of
+    // an artifact can hash it, but the receiver must learn the expected digest
+    // from CONTROL rather than from the sender. So control asks here, relays
+    // the answer to the target over its own authenticated channel, and only
+    // then triggers the push.
+    //
+    // What that buys, stated precisely: a transfer credential that leaked
+    // cannot be used to push DIFFERENT bytes, because the digest the target
+    // will accept was fixed by an authenticated peer before the credential was
+    // ever used. It does NOT make a compromised source safe — a source that
+    // lies here supplies both the artifact and the hash. Signed builds would be
+    // the answer to that, and this is not one.
+    server_->Post("/api/node/engines/prepare", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401; return;
+        }
+        if (engine_manager_ == nullptr) {
+            res.status = 501;
+            res.set_content(R"({"error":"engine management is not configured on this node"})",
+                            "application/json");
+            return;
+        }
+        std::string fingerprint;
+        try {
+            fingerprint = nlohmann::json::parse(req.body).value("fingerprint", std::string{});
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+            return;
+        }
+
+        // Must be an artifact this node actually holds and can vouch for.
+        // shareable_artifacts() excludes PATH-resolved binaries: this node
+        // cannot say what build one of those is, and shipping it to a peer
+        // under a fingerprint it invented is worse than a rebuild.
+        EngineArtifact artifact;
+        bool found = false;
+        for (const auto& a : engine_manager_->shareable_artifacts()) {
+            if (a.fingerprint() == fingerprint) { artifact = a; found = true; break; }
+        }
+        if (!found) {
+            res.status = 404;
+            res.set_content(
+                nlohmann::json{{"error", "this node has no shareable artifact " + fingerprint}}
+                    .dump(),
+                "application/json");
+            return;
+        }
+
+        const std::string operation_id = "engine-share-" + mm::util::generate_uuid();
+        NodeActionProgress progress;
+        progress.active = true;
+        progress.operation_id = operation_id;
+        progress.kind = "engine_share";
+        progress.action = "Packaging engine build";
+        progress.target = fingerprint;
+        progress.stage = "packaging";
+        progress.fraction = -1.0;
+        state_.set_action_progress(progress);
+
+        std::error_code ec;
+        const std::string token = mm::util::generate_uuid();
+        const fs::path package =
+            fs::temp_directory_path(ec) / ("mm-engine-" + token + ".tar.gz");
+        std::string err;
+        if (!engine_manager_->package(artifact.engine_id, package.string(), err)) {
+            state_.clear_action_progress(operation_id);
+            res.status = 500;
+            res.set_content(nlohmann::json{{"error", "packaging failed: " + err}}.dump(),
+                            "application/json");
+            return;
+        }
+        const std::string digest = pairing::sha256_file_hex(package.string(), &err);
+        state_.clear_action_progress(operation_id);
+        if (digest.empty()) {
+            fs::remove(package, ec);
+            res.status = 500;
+            res.set_content(nlohmann::json{{"error", "cannot hash package: " + err}}.dump(),
+                            "application/json");
+            return;
+        }
+
+        int64_t size = 0;
+        {
+            std::error_code sec;
+            size = static_cast<int64_t>(fs::file_size(package, sec));
+            if (sec) size = 0;
+        }
+        state_.set_prepared_engine_package(token, package.string());
+        res.set_content(nlohmann::json{{"prepared", true},
+                                       {"fingerprint", fingerprint},
+                                       {"sha256", digest},
+                                       {"package_token", token},
+                                       {"size_bytes", size}}
+                            .dump(),
+                        "application/json");
+    });
+
+    // POST /api/node/engines/share — phase two: send the package prepared
+    // above. Takes the token rather than a fingerprint so the bytes pushed are
+    // provably the bytes hashed; re-packaging here would let the artifact
+    // change between the digest control relayed and what arrives.
+    server_->Post("/api/node/engines/share", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401; return;
+        }
+        std::string token, target_url, transfer_key, fingerprint;
+        try {
+            const auto j = nlohmann::json::parse(req.body);
+            token = j.value("package_token", std::string{});
+            target_url = j.value("target_url", std::string{});
+            transfer_key = j.value("transfer_key", std::string{});
+            fingerprint = j.value("fingerprint", std::string{});
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+            return;
+        }
+        if (token.empty() || target_url.empty() || fingerprint.empty()) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":"package_token, target_url and fingerprint are required"})",
+                "application/json");
+            return;
+        }
+
+        // Consumed: the package is deleted after one send either way, so a
+        // repeated call cannot re-push bytes whose brokered authorization has
+        // already been spent.
+        const std::string package = state_.take_prepared_engine_package(token);
+        if (package.empty()) {
+            res.status = 409;
+            res.set_content(R"({"error":"unknown or already-used package_token"})",
+                            "application/json");
+            return;
+        }
+
+        const std::string operation_id = "engine-share-" + token;
+        NodeActionProgress progress;
+        progress.active = true;
+        progress.operation_id = operation_id;
+        progress.kind = "engine_share";
+        progress.action = "Sharing engine build";
+        progress.target = fingerprint;
+        progress.stage = "uploading";
+        progress.fraction = -1.0;
+        state_.set_action_progress(progress);
+
+        HttpClient peer(target_url);
+        if (!transfer_key.empty()) peer.set_bearer_token(transfer_key);
+        // An engine package is hundreds of megabytes; the default 10 s write
+        // timeout would abort every share on anything but a LAN.
+        peer.set_timeouts(10, 300, 3600);
+        const auto upload =
+            peer.post_file("/api/node/engines/receive", package,
+                           {{"X-MM-Engine-Fingerprint", fingerprint}});
+
+        std::error_code ec;
+        fs::remove(package, ec);
+        state_.clear_action_progress(operation_id);
+
+        if (!upload.ok()) {
+            res.status = 502;
+            res.set_content(nlohmann::json{{"error", "peer refused the artifact"},
+                                           {"peer_status", upload.status},
+                                           {"peer_body", upload.body}}
+                                .dump(),
+                            "application/json");
+            return;
+        }
+        MM_INFO("Shared engine artifact {} to {}", fingerprint, target_url);
+        res.set_content(nlohmann::json{{"shared", true}, {"fingerprint", fingerprint}}.dump(),
+                        "application/json");
+    });
+
+    // POST /api/node/engines/receive — accept a peer's package, streamed to
+    // disk without buffering, then verified and installed.
+    //   X-MM-Engine-Fingerprint  what this claims to be
+    //   X-MM-Engine-Sha256       the sender's digest (informational)
+    // The digest that AUTHORIZES the install is the one control recorded when
+    // it brokered the transfer, matched below.
+    server_->PostUpload("/api/node/engines/receive",
+        [this](const httplib::Request& req, httplib::Response& res,
+               const HttpServer::UploadPump& pump) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401;
+            res.set_content(R"({"error":"unauthorized"})", "application/json");
+            return;
+        }
+        if (engine_manager_ == nullptr) {
+            res.status = 501;
+            res.set_content(R"({"error":"engine management is not configured on this node"})",
+                            "application/json");
+            return;
+        }
+
+        const std::string fingerprint =
+            util::trim(req.get_header_value("X-MM-Engine-Fingerprint"));
+        EngineArtifact artifact;
+        if (fingerprint.empty() || !parse_engine_fingerprint(fingerprint, artifact)) {
+            res.status = 400;
+            res.set_content(R"({"error":"X-MM-Engine-Fingerprint required and must be well-formed"})",
+                            "application/json");
+            return;
+        }
+
+        // The expected digest, relayed by control from the source's prepare
+        // step before the transfer credential was ever handed out. Absent means
+        // nothing brokered this, and an unbrokered artifact is refused rather
+        // than trusted on the sender's word.
+        const std::string expected = state_.take_expected_engine_digest(fingerprint);
+        if (expected.empty()) {
+            res.status = 409;
+            res.set_content(
+                nlohmann::json{
+                    {"error", "no brokered transfer is expected for " + fingerprint +
+                                  "; control must authorize a share before it is sent"}}
+                    .dump(),
+                "application/json");
+            return;
+        }
+
+        const std::string operation_id = "engine-receive-" + mm::util::generate_uuid();
+        NodeActionProgress progress;
+        progress.active = true;
+        progress.operation_id = operation_id;
+        progress.kind = "engine_receive";
+        progress.action = "Receiving engine build";
+        progress.target = fingerprint;
+        progress.stage = "receiving";
+        progress.fraction = -1.0;
+        state_.set_action_progress(progress);
+
+        std::error_code ec;
+        const fs::path temp =
+            fs::temp_directory_path(ec) / ("mm-engine-in-" + mm::util::generate_uuid() + ".tar.gz");
+        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            state_.clear_action_progress(operation_id);
+            res.status = 500;
+            res.set_content(R"({"error":"cannot open destination file for writing"})",
+                            "application/json");
+            return;
+        }
+        bool write_ok = true;
+        int64_t received = 0;
+        const bool pumped = pump([&](const char* data, size_t len) -> bool {
+            out.write(data, static_cast<std::streamsize>(len));
+            if (!out) { write_ok = false; return false; }
+            received += static_cast<int64_t>(len);
+            progress.bytes_done = received;
+            state_.set_action_progress(progress);
+            return true;
+        });
+        out.close();
+        if (!out) write_ok = false;
+
+        if (!pumped || !write_ok) {
+            fs::remove(temp, ec);
+            state_.clear_action_progress(operation_id);
+            res.status = 500;
+            res.set_content(R"({"error":"upload interrupted or write failed"})",
+                            "application/json");
+            return;
+        }
+
+        progress.stage = "verifying";
+        state_.set_action_progress(progress);
+        std::string hash_err;
+        const std::string actual = pairing::sha256_file_hex(temp.string(), &hash_err);
+        if (actual.empty() || actual != expected) {
+            // Deleted, not quarantined: a package whose bytes do not match what
+            // control authorized has no legitimate use on this node, and
+            // keeping it invites someone to install it manually.
+            fs::remove(temp, ec);
+            state_.clear_action_progress(operation_id);
+            MM_WARN("Refused engine artifact {}: digest mismatch (expected {}, got {})",
+                    fingerprint, expected, actual.empty() ? "<unreadable>" : actual);
+            res.status = 409;
+            res.set_content(nlohmann::json{{"error", "digest mismatch; artifact refused"},
+                                           {"expected_sha256", expected}}
+                                .dump(),
+                            "application/json");
+            return;
+        }
+
+        progress.stage = "installing";
+        state_.set_action_progress(progress);
+        artifact.sha256 = actual;
+        std::string install_err;
+        const bool installed =
+            engine_manager_->install_package(temp.string(), artifact, install_err);
+        fs::remove(temp, ec);
+        state_.clear_action_progress(operation_id);
+
+        if (!installed) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", install_err}}.dump(), "application/json");
+            return;
+        }
+        MM_INFO("Installed engine artifact {} received from a peer", fingerprint);
+        res.set_content(nlohmann::json{{"installed", true},
+                                       {"fingerprint", fingerprint},
+                                       {"conformance", engine_manager_->conformance()}}
+                            .dump(),
+                        "application/json");
+    });
+
+    // POST /api/node/engines/expect — control announcing an inbound artifact.
+    //
+    // Split from the share call because the two hit DIFFERENT nodes: control
+    // tells the RECEIVER what digest to expect, then tells the SENDER to push.
+    // Without this the receiver would have to trust the sender's own digest.
+    server_->Post("/api/node/engines/expect", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401; return;
+        }
+        try {
+            const auto j = nlohmann::json::parse(req.body);
+            const auto fingerprint = j.value("fingerprint", std::string{});
+            const auto sha256 = j.value("sha256", std::string{});
+            if (fingerprint.empty() || sha256.empty()) {
+                res.status = 400;
+                res.set_content(R"({"error":"fingerprint and sha256 are required"})",
+                                "application/json");
+                return;
+            }
+            state_.expect_engine_digest(fingerprint, sha256);
+            res.set_content(R"({"expecting":true})", "application/json");
         } catch (const std::exception& e) {
             res.status = 400;
             res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");

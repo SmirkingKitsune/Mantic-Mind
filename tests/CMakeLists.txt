@@ -4,6 +4,7 @@ add_executable(mm_reliability_tests
     ${CMAKE_SOURCE_DIR}/src/control/agent_manager.cpp
     ${CMAKE_SOURCE_DIR}/src/control/agent_config_validator.cpp
     ${CMAKE_SOURCE_DIR}/src/control/agent_scheduler.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/engine_config_store.cpp
     ${CMAKE_SOURCE_DIR}/src/control/model_registry.cpp
     ${CMAKE_SOURCE_DIR}/src/control/route_scope.cpp
     ${CMAKE_SOURCE_DIR}/src/control/control_api_server.cpp
@@ -17,6 +18,10 @@ add_executable(mm_reliability_tests
     ${CMAKE_SOURCE_DIR}/src/node/runtime_process.cpp
     ${CMAKE_SOURCE_DIR}/src/node/llama_runtime.cpp
     ${CMAKE_SOURCE_DIR}/src/node/llama_cpp_provisioner.cpp
+    ${CMAKE_SOURCE_DIR}/src/node/engine_provisioner.cpp
+    ${CMAKE_SOURCE_DIR}/src/node/engine_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/node/node_state.cpp
+    ${CMAKE_SOURCE_DIR}/src/node/node_modal.cpp
 )
 
 target_include_directories(mm_reliability_tests PRIVATE

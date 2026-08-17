@@ -5,6 +5,7 @@
 #include "common/node_discovery.hpp"
 #include "common/util.hpp"
 #include "node/engine_descriptor.hpp"
+#include "node/engine_manager.hpp"
 #include "node/node_api_server.hpp"
 #include "node/node_config.hpp"
 #include "node/model_store.hpp"
@@ -229,36 +230,10 @@ int detect_gpu_count() {
     return count;
 }
 
-// Resolve every visible NVIDIA GPU's compute capability to the CMake form
-// (8.9 -> 89, 12.1 -> 121). Passing an explicit list avoids fragile "native"
-// architecture probing in older CMake versions and WSL toolchains.
-std::string detect_cuda_architectures() {
-    const std::string cmd =
-        "nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits";
-#ifdef _WIN32
-    FILE* f = _popen((cmd + " 2>nul").c_str(), "r");
-#else
-    FILE* f = ::popen((cmd + " 2>/dev/null").c_str(), "r");
-#endif
-    if (!f) return {};
-    std::set<std::string> capabilities;
-    char buf[256];
-    while (fgets(buf, static_cast<int>(sizeof(buf)), f)) {
-        std::string value = mm::util::trim(buf);
-        value.erase(std::remove(value.begin(), value.end(), '.'), value.end());
-        if (!value.empty() && std::all_of(value.begin(), value.end(), [](unsigned char ch) {
-                return std::isdigit(ch) != 0;
-            }))
-            capabilities.insert(value);
-    }
-#ifdef _WIN32
-    _pclose(f);
-#else
-    ::pclose(f);
-#endif
-    std::vector<std::string> ordered(capabilities.begin(), capabilities.end());
-    return mm::util::join(ordered, ";");
-}
+// CUDA compute-capability detection moved to LlamaEngineProvisioner: it is
+// llama.cpp source-build detail, and it belongs with the provisioner that
+// consumes it. The cluster config cannot state it — it is per-machine — so the
+// node side has to discover it, and there is now exactly one place that does.
 
 // Build the capability block this node advertises. Detection fills the gaps
 // the config left blank. llama_version is the resolved llama.cpp build
@@ -900,58 +875,45 @@ int main(int argc, char** argv) {
         }
     });
 
-    // ── llama.cpp runtime management (provision in the background) ─────────────
-    // Release retrieval or its source-build fallback runs on a background
-    // thread, so node startup never blocks on it. The fast
-    // resolve-from-PATH and already-provisioned paths complete near-instantly
-    // inside ensure_runtime(). A shutdown flag drives the provisioner's cancel
-    // check so a download/build in flight aborts promptly.
-    mm::LlamaProvisionConfig llama_provision_cfg;
-    llama_provision_cfg.requested_executable = cfg.llama_server_path;
-    llama_provision_cfg.provision_dir = cfg.llama_provision_dir;
-    llama_provision_cfg.auto_provision = cfg.llama_auto_provision;
-    llama_provision_cfg.install_method = cfg.llama_install_method;
-    llama_provision_cfg.version = cfg.llama_version;
-    llama_provision_cfg.cuda_arch = cfg.llama_cuda_arch;
-    llama_provision_cfg.cmake_args = cfg.llama_cmake_args;
-    llama_provision_cfg.build_jobs = cfg.llama_build_jobs;
-    llama_provision_cfg.accelerator_explicit = !cfg.llama_accelerator.empty();
-    llama_provision_cfg.accelerator = !cfg.llama_accelerator.empty()
-        ? cfg.llama_accelerator
-        : mm::detect_llama_accelerator(mm::current_runtime_platform(), mm::current_runtime_arch(),
-                                       state.get_metrics().gpu_backend_available,
-                                       mm::detect_rocm_present());
-    if (llama_provision_cfg.accelerator == "cuda" &&
-        llama_provision_cfg.cuda_arch.empty()) {
-        llama_provision_cfg.cuda_arch = detect_cuda_architectures();
-        if (!llama_provision_cfg.cuda_arch.empty())
-            MM_INFO("Detected CUDA compute architecture(s) for llama.cpp: {}",
-                    llama_provision_cfg.cuda_arch);
-    }
-    mm::LlamaCppProvisioner llama_provisioner(llama_provision_cfg);
-    state.set_llama_runtime(llama_provisioner.status());
-    MM_INFO("llama.cpp update policy: {} (checks {})",
-            cfg.llama_update_policy, cfg.llama_update_check ? "enabled" : "disabled");
-    llama_provisioner.set_log_sink([](const std::string& line, bool is_stderr) {
-        if (is_stderr) MM_WARN("[llama] {}", line); else MM_INFO("[llama] {}", line);
+    // ── engine acquisition, driven by the master's cluster configuration ──────
+    //
+    // NOTHING is provisioned here. The node acquires exactly the engines the
+    // cluster configuration names, and it has not been told yet — control
+    // pushes the config at registration and again whenever it changes. Until
+    // then this node reports `unconfigured` and control will not place on it.
+    //
+    // This replaces an unconditional llama.cpp provisioning thread: a node on a
+    // Soma-only cluster used to resolve, download, or compile a llama-server it
+    // would never launch, because "which engines does this cluster want" was
+    // not a question anything could ask.
+    mm::EngineManagerPaths engine_paths;
+    engine_paths.llama_executable = cfg.llama_server_path;
+    engine_paths.llama_provision_dir = cfg.llama_provision_dir;
+    engine_paths.soma_executable = cfg.soma_path;
+    mm::NodeEngineManager engine_manager(engine_paths);
+
+    std::atomic<bool> engine_provision_stop{false};
+    std::mutex llama_operation_mutex;
+
+    engine_manager.set_log_sink([](const std::string& line, bool is_stderr) {
+        if (is_stderr) MM_WARN("[engine] {}", line); else MM_INFO("[engine] {}", line);
     });
-    std::atomic<bool> llama_provision_stop{false};
-    llama_provisioner.set_progress_sink([&](const mm::RuntimeInstallProgress& p) {
+    engine_manager.set_progress_sink([&](const mm::RuntimeInstallProgress& p) {
         if (!p.active) {
-            state.clear_action_progress("llama-runtime");
+            state.clear_action_progress("engine-runtime");
             return;
         }
         mm::NodeActionProgress action;
         action.active = true;
-        action.operation_id = "llama-runtime";
+        action.operation_id = "engine-runtime";
         action.kind = "runtime";
         action.action = p.stage.find("Building") != std::string::npos
-            ? "Compiling llama.cpp runtime"
-            : "Provisioning llama.cpp runtime";
-        const auto progress_runtime = llama_provisioner.status();
-        action.target = progress_runtime.accelerator.empty()
-            ? std::string{"llama-server"}
-            : "llama-server (" + progress_runtime.accelerator + ")";
+            ? "Compiling engine runtime"
+            : "Provisioning engine runtime";
+        const auto llama = engine_manager.llama_status();
+        action.target = llama.accelerator.empty()
+            ? std::string{"engine"}
+            : "llama-server (" + llama.accelerator + ")";
         action.stage = p.stage;
         action.detail = p.last_line;
         action.step = p.step;
@@ -960,85 +922,98 @@ int main(int argc, char** argv) {
         action.cancelable = true;
         state.set_action_progress(action);
     });
-    llama_provisioner.set_cancel_check([&]() {
-        return llama_provision_stop.load()
-            || state.action_cancel_requested("llama-runtime");
+    engine_manager.set_cancel_check([&]() {
+        return engine_provision_stop.load()
+            || state.action_cancel_requested("engine-runtime");
     });
 
-    // ── llama.cpp runtime management (provision / update) ─────────────────────
-    // Apply a runtime status produced by the provisioner and refresh advertised
-    // capabilities. Serialized so UI, API, and background work cannot race.
+    // Re-register rather than append: register_engine() replaces by id, so a
+    // provisioner resolving a real path updates the descriptor instead of
+    // leaving a stale one ahead of it in the search order.
     std::mutex runtime_apply_mutex;
-    std::mutex llama_operation_mutex;
-    auto apply_llama_result =
-        [&](mm::LlamaRuntimeStatus runtime) -> mm::LlamaRuntimeStatus {
-        std::lock_guard<std::mutex> lk(runtime_apply_mutex);
-        if (mm::llama_runtime_usable(runtime)) {
-            cfg.llama_server_path = runtime.executable_path;
-            // Re-register rather than append: register_engine() replaces by id,
-            // so the provisioner resolving a real path updates the descriptor
-            // instead of leaving a stale one ahead of it in the search order.
-            mm::EngineRegistry::instance().register_engine(
-                mm::make_llama_descriptor(cfg.llama_server_path));
-            auto caps = detect_node_capabilities(cfg, runtime.version);
-            state.set_capabilities(caps);
-        }
-        if (!runtime.last_error.empty()) {
-            state.set_last_error(runtime.last_error);
-        } else if (mm::llama_runtime_usable(runtime)) {
-            state.set_last_error("");
-        }
-        state.set_llama_runtime(runtime);
-        return runtime;
+    engine_manager.set_engine_resolved_callback(
+        [&](const std::string& engine_id, const std::string& executable) {
+            std::lock_guard<std::mutex> lk(runtime_apply_mutex);
+            if (engine_id == "llama-cpp") {
+                cfg.llama_server_path = executable;
+                mm::EngineRegistry::instance().register_engine(
+                    mm::make_llama_descriptor(executable));
+                // llama.cpp's build fingerprint is what gates RPC group
+                // membership, so capabilities are refreshed with it.
+                state.set_capabilities(
+                    detect_node_capabilities(cfg, engine_manager.llama_status().version));
+            } else if (engine_id == "soma") {
+                cfg.soma_path = executable;
+                mm::EngineRegistry::instance().register_engine(
+                    mm::make_soma_descriptor(executable));
+            }
+            MM_INFO("Engine '{}' resolved to {}", engine_id, executable);
+        });
+
+    // Applying a config is what moves conformance; this mirrors the state the
+    // TUI and the status route read.
+    auto apply_engine_config = [&](const mm::ClusterEngineConfig& cluster_cfg) {
+        state.set_engine_config(cluster_cfg);
+        engine_manager.apply_async(cluster_cfg);
     };
 
-    std::thread llama_provision_thread([&]() {
-        std::lock_guard<std::mutex> op_lk(llama_operation_mutex);
-        auto runtime = apply_llama_result(llama_provisioner.ensure_runtime());
-        if (mm::llama_runtime_usable(runtime)) {
-            MM_INFO("Using llama-server executable: {} (accelerator={})",
-                    runtime.executable_path, runtime.accelerator);
-        } else if (!runtime.last_error.empty()) {
-            MM_WARN("llama.cpp runtime unavailable: {}", runtime.last_error);
+    auto refresh_llama_state = [&]() -> mm::LlamaRuntimeStatus {
+        auto llama = engine_manager.llama_status();
+        if (!llama.last_error.empty()) {
+            state.set_last_error(llama.last_error);
+        } else if (mm::llama_runtime_usable(llama)) {
+            state.set_last_error("");
         }
-    });
+        state.set_llama_runtime(llama);
+        return llama;
+    };
 
     auto ensure_llama_runtime = [&]() -> mm::LlamaRuntimeStatus {
         std::lock_guard<std::mutex> op_lk(llama_operation_mutex);
-        return apply_llama_result(llama_provisioner.ensure_runtime());
+        const auto cluster_cfg = engine_manager.current_config();
+        const mm::EngineSpec* spec = cluster_cfg.find("llama-cpp");
+        if (spec == nullptr) {
+            auto llama = engine_manager.llama_status();
+            llama.last_error =
+                "llama.cpp is not part of this cluster's engine configuration";
+            return llama;
+        }
+        if (auto* p = engine_manager.provisioner("llama-cpp")) {
+            static_cast<mm::LlamaEngineProvisioner*>(p)->ensure(*spec);
+        }
+        return refresh_llama_state();
+    };
+
+    // The llama-only wizard actions. They stay llama-shaped because they ARE:
+    // release-asset variants, CUDA architectures, and a troubleshooting report
+    // have no analogue in an engine that ships with the node, and inventing one
+    // would produce a menu whose every entry fails.
+    auto llama_provisioner_or_null = [&]() -> mm::LlamaEngineProvisioner* {
+        auto* p = engine_manager.provisioner("llama-cpp");
+        return p == nullptr ? nullptr : static_cast<mm::LlamaEngineProvisioner*>(p);
     };
 
     auto do_llama_update = [&](const std::string& accelerator) -> mm::LlamaRuntimeStatus {
         std::lock_guard<std::mutex> op_lk(llama_operation_mutex);
-        auto updated = llama_provisioner.update_runtime(accelerator);
-        if (updated.status == "failed") {
-            const std::string update_error = updated.last_error;
-            auto fallback = llama_provisioner.ensure_runtime();
-            if (mm::llama_runtime_usable(fallback)) {
-                fallback.last_error = "llama.cpp update failed: " + update_error;
-                fallback.troubleshooting = updated.troubleshooting;
-                MM_WARN("llama.cpp update failed, kept existing runtime: {}", update_error);
-                return apply_llama_result(fallback);
-            }
+        auto* p = llama_provisioner_or_null();
+        const auto cluster_cfg = engine_manager.current_config();
+        const mm::EngineSpec* spec = cluster_cfg.find("llama-cpp");
+        if (p == nullptr || spec == nullptr) {
+            auto llama = engine_manager.llama_status();
+            llama.last_error =
+                "llama.cpp is not part of this cluster's engine configuration";
+            return llama;
         }
-        return apply_llama_result(updated);
+        p->update(*spec, accelerator);
+        return refresh_llama_state();
     };
 
     auto do_llama_switch = [&](const std::string& variant) -> mm::LlamaRuntimeStatus {
         std::lock_guard<std::mutex> op_lk(llama_operation_mutex);
-        auto switched = llama_provisioner.switch_runtime(variant);
-        if (switched.status == "failed") {
-            const std::string switch_error = switched.last_error;
-            auto fallback = llama_provisioner.ensure_runtime();
-            if (mm::llama_runtime_usable(fallback)) {
-                fallback.last_error = "llama.cpp engine switch failed: " + switch_error;
-                fallback.troubleshooting = switched.troubleshooting;
-                MM_WARN("llama.cpp engine switch failed, kept existing runtime: {}",
-                        switch_error);
-                return apply_llama_result(fallback);
-            }
-        }
-        return apply_llama_result(switched);
+        auto* p = llama_provisioner_or_null();
+        if (p == nullptr) return engine_manager.llama_status();
+        p->switch_variant(variant);
+        return refresh_llama_state();
     };
 
     auto do_llama_recovery = [&](const std::string& action,
@@ -1046,64 +1021,65 @@ int main(int argc, char** argv) {
         std::lock_guard<std::mutex> op_lk(llama_operation_mutex);
         MM_INFO("llama.cpp troubleshooting action requested: {}{}", action,
                 variant.empty() ? std::string{} : " (" + variant + ")");
-        auto runtime = action == "diagnose"
-            ? llama_provisioner.diagnose_environment()
-            : llama_provisioner.recover_runtime(action, variant);
-        if (action == "target" && runtime.status == "failed") {
-            const auto failed = runtime;
-            auto fallback = llama_provisioner.ensure_runtime();
-            if (mm::llama_runtime_usable(fallback)) {
-                fallback.last_error =
-                    "llama.cpp target install failed; kept active " +
-                    (fallback.variant.empty() ? fallback.accelerator
-                                              : fallback.variant) +
-                    " runtime: " + failed.last_error;
-                fallback.build_log_path = failed.build_log_path;
-                fallback.troubleshooting = failed.troubleshooting;
-                MM_WARN("llama.cpp target install failed, kept active runtime: {}",
-                        failed.last_error);
-                return apply_llama_result(fallback);
-            }
-        }
-        return apply_llama_result(runtime);
+        auto* p = llama_provisioner_or_null();
+        if (p == nullptr) return engine_manager.llama_status();
+        if (action == "diagnose") p->diagnose();
+        else p->recover(action, variant);
+        return refresh_llama_state();
     };
 
     auto check_llama_update = [&]() -> mm::LlamaRuntimeStatus {
         std::lock_guard<std::mutex> op_lk(llama_operation_mutex);
-        auto status = llama_provisioner.check_for_update();
-        state.set_llama_runtime(status);
-        return status;
+        auto* p = llama_provisioner_or_null();
+        const auto cluster_cfg = engine_manager.current_config();
+        const mm::EngineSpec* spec = cluster_cfg.find("llama-cpp");
+        if (p == nullptr || spec == nullptr) return engine_manager.llama_status();
+        p->check_for_update(*spec);
+        auto llama = engine_manager.llama_status();
+        state.set_llama_runtime(llama);
+        return llama;
     };
 
+    // The update policy is now the CLUSTER's, read from the spec rather than
+    // from this machine's .toml — that is the whole point of a master
+    // configurator, and a node checking on its own schedule would be the first
+    // thing to drift. The thread starts unconditionally and does nothing until
+    // a config arrives naming llama.cpp.
     std::atomic<bool> stop_llama_update_check{false};
-    std::thread llama_update_check_thread;
-    if (cfg.llama_update_check && cfg.llama_update_policy != "manual") {
-        llama_update_check_thread = std::thread([&]() {
-            for (int i = 0; i < 50 && !stop_llama_update_check; ++i)
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            while (!stop_llama_update_check) {
-                if (mm::llama_runtime_usable(state.get_llama_runtime())) {
-                    auto st = check_llama_update();
-                    if (st.update_available && cfg.llama_update_policy == "auto") {
-                        if (st.update_action == "unavailable") {
-                            MM_WARN("llama.cpp auto-update skipped: {}", st.update_warning);
-                        } else {
-                            MM_INFO("llama.cpp auto-update policy: updating {} -> {} ({})",
-                                    st.version, st.latest_version,
-                                    st.update_action.empty() ? "release/fallback" : st.update_action);
-                            do_llama_update({});
-                        }
+    std::thread llama_update_check_thread([&]() {
+        for (int i = 0; i < 50 && !stop_llama_update_check; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        while (!stop_llama_update_check) {
+            int interval_hours = 24;
+            const auto cluster_cfg = engine_manager.current_config();
+            const mm::EngineSpec* spec = cluster_cfg.find("llama-cpp");
+            const bool enabled = spec != nullptr && spec->update_check &&
+                                 spec->update_policy != "manual";
+            if (spec != nullptr && spec->update_check_interval_hours > 0)
+                interval_hours = spec->update_check_interval_hours;
+
+            if (enabled && mm::llama_runtime_usable(state.get_llama_runtime())) {
+                auto st = check_llama_update();
+                if (st.update_available && spec->update_policy == "auto") {
+                    if (st.update_action == "unavailable") {
+                        MM_WARN("llama.cpp auto-update skipped: {}", st.update_warning);
+                    } else {
+                        MM_INFO("llama.cpp auto-update policy: updating {} -> {} ({})",
+                                st.version, st.latest_version,
+                                st.update_action.empty() ? "release/fallback"
+                                                         : st.update_action);
+                        do_llama_update({});
                     }
                 }
-                const int64_t interval_ms =
-                    static_cast<int64_t>(cfg.llama_update_check_interval_hours) * 3600 * 1000;
-                for (int64_t slept = 0;
-                     slept < interval_ms && !stop_llama_update_check;
-                     slept += 200)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
             }
-        });
-    }
+            const int64_t interval_ms =
+                static_cast<int64_t>(interval_hours) * 3600 * 1000;
+            for (int64_t slept = 0;
+                 slept < interval_ms && !stop_llama_update_check;
+                 slept += 200)
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    });
 
     // On-demand update worker for the TUI Update button/prompt: runs the (slow)
     // install off the UI thread on a tracked thread that shutdown joins, so the
@@ -1166,6 +1142,8 @@ int main(int argc, char** argv) {
     mm::NodeApiServer api_server(state, engines,
                                  cfg.control_url, cfg.pairing_key);
     api_server.set_model_store(&model_store);
+    api_server.set_engine_manager(&engine_manager);
+    api_server.set_engine_config_callback(apply_engine_config);
     api_server.set_llama_provision_callback([&]() {
         MM_INFO("llama.cpp provisioning requested by user");
         return ensure_llama_runtime();
@@ -1335,7 +1313,14 @@ int main(int argc, char** argv) {
             forget_remembered_pairings,
             request_manual_llama_update,
             request_manual_llama_switch,
-            request_manual_llama_recovery);
+            request_manual_llama_recovery,
+            [&]() {
+                mm::NodeUI::EngineView v;
+                v.config = engine_manager.current_config();
+                v.conformance = engine_manager.conformance();
+                v.runtimes = engine_manager.engine_statuses();
+                return v;
+            });
         ui_ptr = &ui;
         ui.run();
         ui_ptr = nullptr;
@@ -1370,9 +1355,11 @@ int main(int argc, char** argv) {
     if (model_housekeeping_thread.joinable()) model_housekeeping_thread.join();
 
     stop_llama_update_check = true;
-    llama_provision_stop = true;
+    engine_provision_stop = true;
     state.request_action_cancel();
-    if (llama_provision_thread.joinable()) llama_provision_thread.join();
+    // Joins any in-flight apply(); a source build in progress sees the cancel
+    // check and aborts rather than holding shutdown for the rest of the build.
+    engine_manager.shutdown();
     if (llama_update_check_thread.joinable()) llama_update_check_thread.join();
     if (manual_llama_update_thread.joinable()) {
         state.request_action_cancel();

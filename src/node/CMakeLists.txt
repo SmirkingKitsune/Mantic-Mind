@@ -37,9 +37,12 @@ add_executable(mantic-mind
     main.cpp
     runtime_process.cpp
     llama_cpp_provisioner.cpp
+    engine_provisioner.cpp
+    engine_manager.cpp
     model_store.cpp
     node_api_server.cpp
     node_state.cpp
+    node_modal.cpp
     node_ui.cpp
     singleton_lock.cpp
 )

@@ -16,6 +16,7 @@
 //   * build_llama_server_args() called directly from RuntimeProcess.
 //   * `SlotInfo::backend` hardcoded to "llama-cpp" in make_slot_info().
 
+#include "common/engine_config.hpp"
 #include "common/footprint.hpp"
 #include "common/models.hpp"
 #include "node/engine_process.hpp"
@@ -161,17 +162,9 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-/// Per-runtime provisioning/health status, keyed by engine id.
-///
-/// Generalizes LlamaRuntimeStatus, which was a single scalar field on NodeState.
-struct RuntimeStatus {
-    std::string engine_id;
-    std::string status; ///< resolved | ready | building | error | absent
-    std::string executable_path;
-    std::string version;
-    std::string variant;
-    std::string last_error;
-    bool ready = false;
-};
+// RuntimeStatus moved to common/engine_config.hpp — control holds a vector of
+// them on NodeInfo now, and a per-engine status that only the node could name
+// was the reason control could see llama.cpp's health and no other engine's.
+// Reachable from here unchanged: this header includes it transitively.
 
 } // namespace mm

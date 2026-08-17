@@ -6,6 +6,7 @@ set(MM_COMMON_SOURCES
     runtime_client.cpp
     engine_capabilities.cpp
     engine_client.cpp
+    engine_config.cpp
     conversation_manager.cpp
     memory_manager.cpp
     tool_executor.cpp

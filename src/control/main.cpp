@@ -11,6 +11,7 @@
 #include "control/agent_queue.hpp"
 #include "control/control_api_server.hpp"
 #include "control/control_ui.hpp"
+#include "control/engine_config_store.hpp"
 
 #include <atomic>
 #include <algorithm>
@@ -338,6 +339,12 @@ static void print_control_usage() {
         << "  nodes pair complete <url> <nonce> <pin_or_psk> [remember]\n"
         << "  nodes pair psk <url> [psk] [remember]\n"
         << "  models list\n"
+        << "  engines show\n"
+        << "  engines conform\n"
+        << "  engines setup\n"
+        << "  engines set primary <engine> [backup <engine>|backup none]\n"
+        << "  engines resync\n"
+        << "  engines share <fingerprint> <target_node_id> [source_node_id]\n"
         << "  agents list|show|create|update|delete ...\n"
         << "  chat send <agent_id> <message> [conversation_id]\n"
         << "  curation conv ...\n"
@@ -451,6 +458,126 @@ static void run_control_cli(uint16_t listen_port,
         else emit_result(false, command, nlohmann::json::object(), summarize_http_error(r));
     };
 
+    // ── engine configuration ──────────────────────────────────────────────────
+    //
+    // Everything below drives the same /v1/cluster/engines/* routes the TUI
+    // uses, so the rules have one implementation rather than a CLI copy that
+    // drifts. `engines setup` is the CLI half of forced first-run
+    // configuration: a headless deployment must be able to reach the same
+    // decision the TUI's modal asks for, or `--mode cli` would be a way to run
+    // a cluster that can never place anything.
+
+    auto engine_config_missing = [&]() -> bool {
+        const auto r = self.get("/v1/cluster/engines/config");
+        if (!r.ok()) return false; // unreachable/unsupported: not our call to make
+        try {
+            return !nlohmann::json::parse(r.body).value("configured", false);
+        } catch (...) {
+            return false;
+        }
+    };
+
+    // Engine ids any connected node reports it can run. The setup prompt offers
+    // these rather than a hardcoded pair, so a node that grows a third engine
+    // shows up here without an edit.
+    auto known_engine_ids = [&]() -> std::vector<std::string> {
+        std::vector<std::string> ids;
+        const auto r = self.get("/v1/nodes");
+        if (!r.ok()) return ids;
+        try {
+            const auto j = nlohmann::json::parse(r.body);
+            const auto& arr = j.contains("data") ? j.at("data") : j;
+            for (const auto& n : arr) {
+                if (!n.contains("engines")) continue;
+                for (const auto& e : n.at("engines")) {
+                    const auto id = e.value("engine_id", std::string{});
+                    if (!id.empty() &&
+                        std::find(ids.begin(), ids.end(), id) == ids.end())
+                        ids.push_back(id);
+                }
+            }
+        } catch (...) {
+        }
+        return ids;
+    };
+
+    auto put_engine_config = [&](const std::string& primary,
+                                 const std::string& backup) {
+        nlohmann::json engines = nlohmann::json::array();
+        engines.push_back(nlohmann::json{{"engine_id", primary}});
+        if (!backup.empty()) engines.push_back(nlohmann::json{{"engine_id", backup}});
+        const nlohmann::json body{{"primary_engine", primary},
+                                  {"backup_engine", backup},
+                                  {"engines", engines},
+                                  {"share_builds", true}};
+        emit_http_result("engines set", self.put("/v1/cluster/engines/config", body));
+    };
+
+    auto run_engine_setup = [&]() {
+        printer.line("");
+        printer.line("  No cluster engine configuration exists.");
+        printer.line("  Nothing can be placed until one is set — every node is waiting to be");
+        printer.line("  told what to run.");
+        printer.line("");
+
+        auto ids = known_engine_ids();
+        if (ids.empty()) {
+            // Not an error: on a fresh install no node has registered yet.
+            // Offering the two engines this build ships is better than refusing
+            // to proceed until a node appears.
+            ids = {"soma", "llama-cpp"};
+            printer.line("  (no node has reported its engines yet; offering the built-in set)");
+        }
+        printer.line("  Available engines: " + mm::util::join(ids, ", "));
+        printer.line("");
+
+        std::string primary;
+        while (primary.empty()) {
+            printer.line("  Primary engine? (" + mm::util::join(ids, "/") + ")");
+            printer.print_prompt();
+            std::string answer;
+            if (!std::getline(std::cin, answer)) return;
+            answer = mm::util::trim(answer);
+            if (answer.empty()) continue;
+            if (std::find(ids.begin(), ids.end(), answer) == ids.end()) {
+                printer.line("  '" + answer + "' is not one of: " + mm::util::join(ids, ", "));
+                continue;
+            }
+            primary = answer;
+        }
+
+        // llama.cpp is the DEFAULT backup, not a requirement. Offering "none"
+        // explicitly is the point: a Soma-only cluster should not compile a
+        // llama-server it will never launch, and that has to be a choice the
+        // operator can actually make here.
+        std::string backup = (primary == mm::kDefaultBackupEngine)
+                                 ? std::string{}
+                                 : std::string(mm::kDefaultBackupEngine);
+        printer.line("");
+        printer.line(backup.empty()
+                         ? "  Backup engine? (none available — primary is the default backup)"
+                         : "  Backup engine? [" + backup + "] — enter an engine, or 'none'");
+        if (!backup.empty()) {
+            printer.print_prompt();
+            std::string answer;
+            if (std::getline(std::cin, answer)) {
+                answer = mm::util::trim(answer);
+                if (mm::util::to_lower(answer) == "none") backup.clear();
+                else if (!answer.empty()) backup = answer;
+            }
+        }
+
+        printer.line("");
+        printer.line("  primary: " + primary);
+        printer.line("  backup:  " + (backup.empty() ? "(none)" : backup));
+        put_engine_config(primary, backup);
+    };
+
+    // Forced on entry, exactly as the TUI opens its Engines tab modally. The
+    // API stays up either way — this blocks the operator, not the process, so
+    // an automated deployment can still PUT the configuration from outside.
+    if (engine_config_missing()) run_engine_setup();
+
     while (!stop_flag.load()) {
         printer.print_prompt();
         std::string line;
@@ -471,6 +598,81 @@ static void run_control_cli(uint16_t listen_port,
         if (cmd0 == "quit" || cmd0 == "exit") break;
         if (cmd0 == "help") {
             print_help();
+            continue;
+        }
+
+        if (cmd0 == "engines") {
+            if (tokens.size() < 2) {
+                printer.line("usage: engines show|conform|setup|set|resync|share ...");
+                continue;
+            }
+            const std::string sub = mm::util::to_lower(tokens[1]);
+            if (sub == "show") {
+                emit_http_result("engines show", self.get("/v1/cluster/engines/config"));
+                continue;
+            }
+            if (sub == "conform") {
+                emit_http_result("engines conform",
+                                 self.get("/v1/cluster/engines/conformance"));
+                continue;
+            }
+            if (sub == "setup") {
+                run_engine_setup();
+                continue;
+            }
+            if (sub == "resync") {
+                emit_http_result("engines resync",
+                                 self.post("/v1/cluster/engines/resync", nlohmann::json::object()));
+                continue;
+            }
+            if (sub == "set") {
+                // engines set primary <id> [backup <id>|backup none]
+                std::string primary, backup;
+                bool have_backup = false;
+                for (std::size_t i = 2; i + 1 < tokens.size(); i += 2) {
+                    const std::string key = mm::util::to_lower(tokens[i]);
+                    if (key == "primary") primary = tokens[i + 1];
+                    else if (key == "backup") {
+                        have_backup = true;
+                        backup = mm::util::to_lower(tokens[i + 1]) == "none" ? std::string{}
+                                                                            : tokens[i + 1];
+                    }
+                }
+                if (primary.empty()) {
+                    printer.line("usage: engines set primary <engine> [backup <engine>|backup none]");
+                    continue;
+                }
+                // Unstated backup keeps the current one rather than clearing
+                // it: `engines set primary soma` should not silently drop a
+                // configured fallback. Clearing takes the explicit word.
+                if (!have_backup) {
+                    const auto r = self.get("/v1/cluster/engines/config");
+                    if (r.ok()) {
+                        try {
+                            backup = nlohmann::json::parse(r.body)
+                                         .at("config")
+                                         .value("backup_engine", std::string{});
+                        } catch (...) {
+                        }
+                    }
+                }
+                if (backup == primary) backup.clear();
+                put_engine_config(primary, backup);
+                continue;
+            }
+            if (sub == "share") {
+                if (tokens.size() < 4) {
+                    printer.line("usage: engines share <fingerprint> <target_node_id> [source_node_id]");
+                    continue;
+                }
+                nlohmann::json body{{"fingerprint", tokens[2]},
+                                    {"target_node_id", tokens[3]}};
+                if (tokens.size() > 4) body["source_node_id"] = tokens[4];
+                emit_http_result("engines share",
+                                 self.post("/v1/cluster/engines/share", body));
+                continue;
+            }
+            printer.line("usage: engines show|conform|setup|set|resync|share ...");
             continue;
         }
 
@@ -948,10 +1150,43 @@ int main(int argc, char** argv) {
     // reads it to choose an engine, the API serves and edits it. Two lookups
     // against one table rather than a cached copy that can disagree with itself.
     scheduler.set_model_registry(&model_registry);
+
+    // ── the master's engine policy ────────────────────────────────────────────
+    //
+    // What the cluster runs, owned here and pushed to nodes. Until it exists,
+    // placement refuses and first-run setup is forced — see the gate below.
+    mm::EngineConfigStore engine_config(cfg.data_dir);
+    {
+        std::string load_error;
+        if (!engine_config.load(load_error)) {
+            // A present-but-unreadable configuration is fatal to CONFIGURATION,
+            // not to the process: control still serves reads and the setup
+            // surface. Starting with a silently empty policy would be worse —
+            // it would re-run setup on a cluster that already had one and then
+            // push a config the operator did not write.
+            MM_ERROR("Engine configuration unusable: {}", load_error);
+            std::fprintf(stderr, "\n  Engine configuration at %s is unusable:\n    %s\n"
+                                 "  Fix or remove it, then restart.\n\n",
+                         engine_config.path().c_str(), load_error.c_str());
+            return 1;
+        }
+    }
+    // The health poll converges nodes on this; the callback makes a change
+    // propagate immediately instead of waiting up to one poll interval.
+    registry.set_engine_config_provider(
+        [&engine_config]() -> std::optional<mm::ClusterEngineConfig> {
+            if (!engine_config.configured()) return std::nullopt;
+            return engine_config.get();
+        });
+    engine_config.set_change_callback(
+        [&registry](const mm::ClusterEngineConfig& c) { registry.push_engine_config_to_all(c); });
+    scheduler.set_engine_config_gate([&engine_config]() { return engine_config.configured(); });
+
     mm::ControlApiServer  api_server(
         agents, queue, registry, scheduler,
         cfg.data_dir, cfg.models_dir, cfg.external_api_token, cfg.tts);
     api_server.set_model_registry(&model_registry);
+    api_server.set_engine_config_store(&engine_config);
     api_server.cleanup_expired_tts_cache();
     mm::ControlUI         ui(
         registry,

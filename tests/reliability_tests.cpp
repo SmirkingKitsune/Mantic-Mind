@@ -14,6 +14,9 @@
 #include "common/engine_capabilities.hpp"
 #include "common/engine_client.hpp"
 #include "control/agent_scheduler.hpp"
+#include "control/engine_config_store.hpp"
+#include "node/node_state.hpp"
+#include "node/node_ui.hpp"
 #include "node/engine_descriptor.hpp"
 #include "control/control_api_server.hpp"
 #include "common/pairing.hpp"
@@ -610,6 +613,442 @@ bool test_node_action_progress_json_round_trip() {
     auto node = nlohmann::json(n).get<mm::NodeInfo>();
     CHECK(node.action_progress.operation_id == "op-1");
     CHECK(node.action_progress.cancel_requested);
+    return true;
+}
+
+// ── Cluster engine configuration ─────────────────────────────────────────────
+
+bool test_engine_config_validation_and_round_trip() {
+    // A config is only meaningful with a primary.
+    mm::ClusterEngineConfig empty;
+    std::string err;
+    CHECK(!mm::validate_engine_config(empty, {}, err));
+    CHECK(err.find("primary_engine") != std::string::npos);
+
+    // Named but unspecified: the failure that would otherwise surface as a node
+    // provisioning defaults nobody chose.
+    mm::ClusterEngineConfig no_spec;
+    no_spec.primary_engine = "soma";
+    CHECK(!mm::validate_engine_config(no_spec, {}, err));
+    CHECK(err.find("no spec") != std::string::npos);
+
+    auto cfg = mm::EngineConfigStore::default_for("soma");
+    CHECK(cfg.primary_engine == "soma");
+    CHECK(cfg.backup_engine == "llama-cpp");
+    CHECK(mm::validate_engine_config(cfg, {}, err));
+
+    // Backup == primary is a configuration mistake with a silent failure mode
+    // (one engine, reported as two), so it is refused rather than deduplicated.
+    auto same = cfg;
+    same.backup_engine = "soma";
+    CHECK(!mm::validate_engine_config(same, {}, err));
+    CHECK(err.find("differ") != std::string::npos);
+
+    // An engine no node can run is refused at the write, not discovered per node.
+    CHECK(!mm::validate_engine_config(cfg, {"soma"}, err));
+    CHECK(err.find("unknown engine") != std::string::npos);
+    CHECK(mm::validate_engine_config(cfg, {"soma", "llama-cpp"}, err));
+
+    // THE claim this whole feature rests on: an empty backup is a real
+    // configuration, and required_engines() is what makes it mean "never
+    // provision llama.cpp" rather than "provision it and don't use it".
+    auto solo = mm::EngineConfigStore::default_for("soma");
+    solo.backup_engine.clear();
+    solo.engines.erase(std::remove_if(solo.engines.begin(), solo.engines.end(),
+                                      [](const mm::EngineSpec& s) {
+                                          return s.engine_id == "llama-cpp";
+                                      }),
+                       solo.engines.end());
+    CHECK(mm::validate_engine_config(solo, {}, err));
+    CHECK(solo.required_engines().size() == 1);
+    CHECK(solo.required_engines()[0] == "soma");
+
+    // llama.cpp as primary gets no backup, rather than itself as one.
+    auto llama_primary = mm::EngineConfigStore::default_for("llama-cpp");
+    CHECK(llama_primary.backup_engine.empty());
+    CHECK(mm::validate_engine_config(llama_primary, {}, err));
+
+    cfg.version = 7;
+    cfg.updated_by = "tui";
+    const nlohmann::json j = cfg;
+    const auto parsed = j.get<mm::ClusterEngineConfig>();
+    CHECK(parsed.version == 7);
+    CHECK(parsed.primary_engine == "soma");
+    CHECK(parsed.backup_engine == "llama-cpp");
+    CHECK(parsed.updated_by == "tui");
+    CHECK(parsed.engines.size() == cfg.engines.size());
+    return true;
+}
+
+bool test_engine_config_rejects_per_machine_keys() {
+    // The invariant, asserted rather than only documented. A cluster config that
+    // carried an accelerator would make every heterogeneous cluster permanently
+    // non-conforming, and SILENTLY ignoring the key is the worse failure: the
+    // write is accepted and the operator believes the cluster was told.
+    for (const auto& key : mm::forbidden_config_keys()) {
+        nlohmann::json top{{"primary_engine", "soma"}};
+        top[key] = "cuda";
+        bool threw = false;
+        try {
+            (void)top.get<mm::ClusterEngineConfig>();
+        } catch (const std::exception& e) {
+            threw = true;
+            // The message must name the field; "invalid config" would send the
+            // operator looking in the wrong place.
+            CHECK(std::string(e.what()).find(key) != std::string::npos);
+        }
+        CHECK(threw);
+
+        // And nested inside a spec, which is where an operator would most
+        // naturally try to put it.
+        nlohmann::json spec{{"engine_id", "llama-cpp"}};
+        spec[key] = "cuda";
+        nlohmann::json nested{{"primary_engine", "llama-cpp"},
+                              {"engines", nlohmann::json::array({spec})}};
+        bool nested_threw = false;
+        try {
+            (void)nested.get<mm::ClusterEngineConfig>();
+        } catch (const std::exception&) {
+            nested_threw = true;
+        }
+        CHECK(nested_threw);
+    }
+
+    // A well-formed config still parses — the guard must not be a blanket
+    // refusal of anything it does not recognise.
+    const nlohmann::json ok{{"primary_engine", "soma"},
+                            {"engines", nlohmann::json::array(
+                                            {nlohmann::json{{"engine_id", "soma"}}})}};
+    const auto parsed = ok.get<mm::ClusterEngineConfig>();
+    CHECK(parsed.primary_engine == "soma");
+    return true;
+}
+
+bool test_engine_artifact_fingerprint_is_exact() {
+    mm::EngineArtifact base;
+    base.engine_id = "llama-cpp";
+    base.version = "b4321";
+    base.platform = "linux";
+    base.arch = "x86_64";
+    base.variant = "cuda-12";
+    CHECK(base.valid());
+
+    const std::string fp = base.fingerprint();
+
+    // Every identity field must move the fingerprint. A field that did not
+    // would let a share match on a binary that cannot run: an x86_64 build on
+    // aarch64, or cuda-12 on a cuda-13 host.
+    const std::vector<std::function<void(mm::EngineArtifact&)>> mutations = {
+        [](mm::EngineArtifact& a) { a.engine_id = "soma"; },
+        [](mm::EngineArtifact& a) { a.version = "b4322"; },
+        [](mm::EngineArtifact& a) { a.platform = "windows"; },
+        [](mm::EngineArtifact& a) { a.arch = "aarch64"; },
+        [](mm::EngineArtifact& a) { a.variant = "cuda-13"; },
+    };
+    for (const auto& mutate : mutations) {
+        auto other = base;
+        mutate(other);
+        CHECK(other.fingerprint() != fp);
+    }
+
+    // sha256 is deliberately NOT part of it: two independent builds of the same
+    // source at the same version are the same NEED even when their bytes differ.
+    auto rehashed = base;
+    rehashed.sha256 = "deadbeef";
+    CHECK(rehashed.fingerprint() == fp);
+
+    mm::EngineArtifact parsed;
+    CHECK(mm::parse_engine_fingerprint(fp, parsed));
+    CHECK(parsed.engine_id == base.engine_id);
+    CHECK(parsed.version == base.version);
+    CHECK(parsed.platform == base.platform);
+    CHECK(parsed.arch == base.arch);
+    CHECK(parsed.variant == base.variant);
+
+    // An engine with no build variants keeps its empty slot, so the round trip
+    // survives and "soma|1|linux|x86_64|" cannot be confused with a 4-field form.
+    mm::EngineArtifact no_variant;
+    no_variant.engine_id = "soma";
+    no_variant.version = "1";
+    no_variant.platform = "linux";
+    no_variant.arch = "x86_64";
+    mm::EngineArtifact rt;
+    CHECK(mm::parse_engine_fingerprint(no_variant.fingerprint(), rt));
+    CHECK(rt.variant.empty());
+    CHECK(rt.engine_id == "soma");
+
+    mm::EngineArtifact junk;
+    CHECK(!mm::parse_engine_fingerprint("llama-cpp|b1|linux", junk));
+    CHECK(!mm::parse_engine_fingerprint("|||| ", junk));
+    return true;
+}
+
+bool test_engine_config_store_persists_and_bumps_version() {
+    auto dir = temp_test_dir("engine-config-store");
+    std::filesystem::create_directories(dir);
+
+    mm::EngineConfigStore store(dir.string());
+    std::string err;
+    CHECK(store.load(err));
+    // Absence of the file IS the unconfigured signal — the load succeeds and
+    // reports nothing configured, because that is what forces first-run setup.
+    CHECK(err.empty());
+    CHECK(!store.configured());
+    CHECK(store.version() == 0);
+
+    // A rejected write must leave nothing behind: nodes that started chasing a
+    // config the store refused would be converging on something that does not
+    // exist.
+    mm::ClusterEngineConfig bad;
+    CHECK(!store.save(bad, {}, "test", err));
+    CHECK(!store.configured());
+    CHECK(!std::filesystem::exists(dir / "engine_config.json"));
+
+    int callbacks = 0;
+    std::uint32_t seen_version = 0;
+    store.set_change_callback([&](const mm::ClusterEngineConfig& c) {
+        ++callbacks;
+        seen_version = c.version;
+    });
+
+    auto cfg = mm::EngineConfigStore::default_for("soma");
+    // The caller's version is IGNORED — a client echoing a stale one back could
+    // otherwise walk the cluster backwards, and every node compares on it.
+    cfg.version = 999;
+    CHECK(store.save(cfg, {}, "test", err));
+    CHECK(store.configured());
+    CHECK(store.version() == 1);
+    CHECK(callbacks == 1);
+    CHECK(seen_version == 1);
+    CHECK(store.get().updated_by == "test");
+    CHECK(store.get().updated_at_ms > 0);
+
+    cfg.share_builds = false;
+    CHECK(store.save(cfg, {}, "test2", err));
+    CHECK(store.version() == 2);
+    CHECK(callbacks == 2);
+
+    // Reopened from disk: the version survives, so a restart does not re-push
+    // v1 to a cluster already at v2.
+    mm::EngineConfigStore reopened(dir.string());
+    CHECK(reopened.load(err));
+    CHECK(reopened.configured());
+    CHECK(reopened.version() == 2);
+    CHECK(reopened.get().primary_engine == "soma");
+    CHECK(!reopened.get().share_builds);
+
+    // A corrupt file is reported, not silently replaced with a default the
+    // operator never chose — that would re-run setup on a configured cluster.
+    {
+        std::ofstream out(dir / "engine_config.json", std::ios::trunc);
+        out << "{ not json";
+    }
+    mm::EngineConfigStore broken(dir.string());
+    std::string load_err;
+    CHECK(!broken.load(load_err));
+    CHECK(!load_err.empty());
+    CHECK(!broken.configured());
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    return true;
+}
+
+bool test_placement_refused_until_engine_config_exists() {
+    auto dir = temp_test_dir("engine-gate");
+    std::filesystem::create_directories(dir / "models");
+
+    mm::NodeRegistry registry(dir.string());
+    mm::AgentScheduler scheduler(registry, (dir / "models").string());
+    mm::EngineConfigStore store(dir.string());
+    std::string err;
+    CHECK(store.load(err));
+    scheduler.set_engine_config_gate([&store]() { return store.configured(); });
+
+    mm::AgentConfig cfg;
+    cfg.id = "agent-gate";
+    cfg.name = "Gate";
+    cfg.model_path = "Qwen/Qwen3-8B";
+
+    // No configuration: refused, and the message names the fix. "No available
+    // nodes" would send an operator to inspect nodes that are all healthy.
+    CHECK(!scheduler.ensure_agent_running(cfg).has_value());
+    const std::string refusal = scheduler.last_error();
+    CHECK(refusal.find("engine configuration") != std::string::npos);
+    CHECK(refusal.find("/v1/cluster/engines/config") != std::string::npos);
+
+    // Configured: the gate opens. It still finds no node — there are none
+    // registered — but the refusal is no longer the configuration one, which is
+    // the distinction being asserted.
+    CHECK(store.save(mm::EngineConfigStore::default_for("llama-cpp"), {}, "test", err));
+    CHECK(!scheduler.ensure_agent_running(cfg).has_value());
+    CHECK(scheduler.last_error().find("engine configuration required") == std::string::npos);
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    return true;
+}
+
+bool test_conformance_gates_placement_candidates() {
+    auto dir = temp_test_dir("engine-conformance");
+    std::filesystem::create_directories(dir);
+    mm::NodeRegistry registry(dir.string());
+
+    const auto id = registry.add_node("http://127.0.0.1:1", "secret", "linux", false, "n1");
+
+    // With no engine-config provider nothing is MANAGING conformance, so the
+    // gate stays open. Closing it here would mean a registry used without a
+    // config store silently places nowhere, and the symptom would point at
+    // healthy nodes.
+    CHECK(registry.available_nodes().empty()); // not connected yet
+    CHECK(registry.conforming_nodes().empty());
+
+    mm::ClusterEngineConfig cfg = mm::EngineConfigStore::default_for("soma");
+    cfg.version = 3;
+    registry.set_engine_config_provider(
+        [&cfg]() -> std::optional<mm::ClusterEngineConfig> { return cfg; });
+
+    // conformance_permits_placement is the single predicate both filters use,
+    // so assert its contract directly across every state.
+    mm::EngineConformance c;
+    for (const auto st : {mm::EngineConformanceState::Unconfigured,
+                          mm::EngineConformanceState::Converging,
+                          mm::EngineConformanceState::Drifted,
+                          mm::EngineConformanceState::Failed}) {
+        c.state = st;
+        CHECK(!mm::conformance_permits_placement(c));
+    }
+    c.state = mm::EngineConformanceState::Conforming;
+    CHECK(mm::conformance_permits_placement(c));
+
+    // Round-trip through the wire form the node actually sends.
+    c.config_version = 3;
+    c.detail = "running 2 configured engine(s)";
+    const auto parsed = nlohmann::json(c).get<mm::EngineConformance>();
+    CHECK(parsed.state == mm::EngineConformanceState::Conforming);
+    CHECK(parsed.config_version == 3);
+    CHECK(parsed.detail == c.detail);
+
+    // An unrecognised state leaves the default, which STOPS placement. A node
+    // speaking a vocabulary this build does not know is the node not to
+    // schedule onto.
+    const auto unknown =
+        nlohmann::json{{"state", "quantum"}}.get<mm::EngineConformance>();
+    CHECK(unknown.state == mm::EngineConformanceState::Unconfigured);
+    CHECK(!mm::conformance_permits_placement(unknown));
+
+    (void)id;
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    return true;
+}
+
+bool test_engine_digest_and_package_grants_are_one_shot() {
+    mm::NodeState state;
+
+    // Unbrokered transfers are refused: an empty expected digest is what the
+    // receive route turns into a 409.
+    CHECK(state.take_expected_engine_digest("llama-cpp|b1|linux|x86_64|cpu").empty());
+
+    state.expect_engine_digest("llama-cpp|b1|linux|x86_64|cpu", "abc123");
+    CHECK(state.take_expected_engine_digest("llama-cpp|b1|linux|x86_64|cpu") == "abc123");
+    // Consumed. A grant that outlived its transfer would authorize a later
+    // unbrokered push of the same fingerprint — exactly what it exists to
+    // refuse.
+    CHECK(state.take_expected_engine_digest("llama-cpp|b1|linux|x86_64|cpu").empty());
+
+    state.set_prepared_engine_package("tok-1", "/tmp/pkg.tar.gz");
+    CHECK(state.take_prepared_engine_package("tok-1") == "/tmp/pkg.tar.gz");
+    CHECK(state.take_prepared_engine_package("tok-1").empty());
+    CHECK(state.take_prepared_engine_package("never-issued").empty());
+    return true;
+}
+
+bool test_node_modal_ladder() {
+    using mm::NodeModal;
+    using mm::NodeModalInputs;
+
+    // Everything available at once. The precedence has to be asserted from the
+    // TOP down, because that is the property the old code could not state: it
+    // was five scattered "if X then Y = false" statements plus a second,
+    // differently-ordered ladder in the event handler, agreeing only by luck.
+    NodeModalInputs all;
+    all.progress_active = true;
+    all.engine_switch_available = true;
+    all.engine_variants_listed = true;
+    all.can_troubleshoot = true;
+    all.troubleshoot_unacknowledged = true;
+    all.can_install_target = true;
+    all.target_unacknowledged = true;
+    all.can_update = true;
+    all.update_unacknowledged = true;
+
+    // Progress outranks everything, from any current modal.
+    for (const auto cur : {NodeModal::None, NodeModal::EngineSwitch, NodeModal::Troubleshoot,
+                           NodeModal::Target, NodeModal::Update})
+        CHECK(mm::resolve_node_modal(all, cur) == NodeModal::Progress);
+
+    auto no_progress = all;
+    no_progress.progress_active = false;
+
+    // EngineSwitch next — but ONLY when it is already open. It has no
+    // auto-open, so from None the ladder falls through to Troubleshoot even
+    // with everything else available.
+    CHECK(mm::resolve_node_modal(no_progress, NodeModal::EngineSwitch) ==
+          NodeModal::EngineSwitch);
+    CHECK(mm::resolve_node_modal(no_progress, NodeModal::None) == NodeModal::Troubleshoot);
+
+    // Then Troubleshoot > Target > Update, each asserted by removing the one
+    // above it rather than by trusting the order of the branches.
+    auto below_troubleshoot = no_progress;
+    below_troubleshoot.can_troubleshoot = false;
+    CHECK(mm::resolve_node_modal(below_troubleshoot, NodeModal::None) == NodeModal::Target);
+
+    auto below_target = below_troubleshoot;
+    below_target.can_install_target = false;
+    CHECK(mm::resolve_node_modal(below_target, NodeModal::None) == NodeModal::Update);
+
+    auto below_update = below_target;
+    below_update.can_update = false;
+    CHECK(mm::resolve_node_modal(below_update, NodeModal::None) == NodeModal::None);
+
+    // Acknowledgement closes an auto-opening prompt — and NOT while it is the
+    // current modal, or acknowledging from inside would close it mid-read.
+    NodeModalInputs update_only;
+    update_only.can_update = true;
+    update_only.update_unacknowledged = false;
+    CHECK(mm::resolve_node_modal(update_only, NodeModal::None) == NodeModal::None);
+    CHECK(mm::resolve_node_modal(update_only, NodeModal::Update) == NodeModal::Update);
+    update_only.update_unacknowledged = true;
+    CHECK(mm::resolve_node_modal(update_only, NodeModal::None) == NodeModal::Update);
+
+    // "Can" gates the prompt regardless of stickiness: a runtime that stops
+    // offering an update must close the prompt, not keep it pinned open.
+    update_only.can_update = false;
+    CHECK(mm::resolve_node_modal(update_only, NodeModal::Update) == NodeModal::None);
+
+    // EngineSwitch closes when its variant list empties — the modal is a menu,
+    // and a menu with nothing in it is not a thing to show.
+    NodeModalInputs engine_only;
+    engine_only.engine_switch_available = true;
+    engine_only.engine_variants_listed = true;
+    CHECK(mm::resolve_node_modal(engine_only, NodeModal::EngineSwitch) ==
+          NodeModal::EngineSwitch);
+    engine_only.engine_variants_listed = false;
+    CHECK(mm::resolve_node_modal(engine_only, NodeModal::EngineSwitch) == NodeModal::None);
+    engine_only.engine_variants_listed = true;
+    engine_only.engine_switch_available = false;
+    CHECK(mm::resolve_node_modal(engine_only, NodeModal::EngineSwitch) == NodeModal::None);
+
+    // Nothing available is None from every starting point — no modal can pin
+    // itself open against its own preconditions.
+    NodeModalInputs none;
+    for (const auto cur : {NodeModal::None, NodeModal::Progress, NodeModal::EngineSwitch,
+                           NodeModal::Troubleshoot, NodeModal::Target, NodeModal::Update})
+        CHECK(mm::resolve_node_modal(none, cur) == NodeModal::None);
+
+    CHECK(std::string(mm::to_string(NodeModal::EngineSwitch)) == "engine-switch");
+    CHECK(std::string(mm::to_string(NodeModal::None)) == "none");
     return true;
 }
 
@@ -6339,6 +6778,21 @@ int main(int argc, char** argv) {
          test_slot_lease_blocks_unload_and_suspend_while_busy},
         {"node_action_progress_json_round_trip",
          test_node_action_progress_json_round_trip},
+        {"engine_config_validation_and_round_trip",
+         test_engine_config_validation_and_round_trip},
+        {"engine_config_rejects_per_machine_keys",
+         test_engine_config_rejects_per_machine_keys},
+        {"engine_artifact_fingerprint_is_exact",
+         test_engine_artifact_fingerprint_is_exact},
+        {"engine_config_store_persists_and_bumps_version",
+         test_engine_config_store_persists_and_bumps_version},
+        {"placement_refused_until_engine_config_exists",
+         test_placement_refused_until_engine_config_exists},
+        {"conformance_gates_placement_candidates",
+         test_conformance_gates_placement_candidates},
+        {"node_modal_ladder", test_node_modal_ladder},
+        {"engine_digest_and_package_grants_are_one_shot",
+         test_engine_digest_and_package_grants_are_one_shot},
         {"scheduler_skips_failed_node_current_attempt",
          test_scheduler_skips_failed_node_current_attempt},
         {"scheduler_transfers_existing_relative_models_with_unique_cache_ids",

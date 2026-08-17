@@ -22,7 +22,7 @@ rather than a missing endpoint.
 > API client can do it through the same route. There are no TUI-only features and no internal-only
 > capabilities.
 
-Base: `http://<control>:9090`. A separate OpenAI-compatibility listener runs on `:9091` (§9).
+Base: `http://<control>:9090`. A separate OpenAI-compatibility listener runs on `:9091` (§10).
 
 ---
 
@@ -194,7 +194,7 @@ nothing; safe to call for a node that could not host the model.
 ```
 
 Note `max_batch: 12` is **derived, not configured** — `cap_per_layer / expected_unique_experts_per_step`.
-See §5.
+See §6.
 
 ### `GET /v1/models/{id}/conformance` — `read`
 
@@ -287,10 +287,80 @@ RAM), so forcing `soma` is exactly what validates the seam against a second atte
 
 ---
 
-## 4. Runtime telemetry
+## 4. Cluster engine configuration
+
+What the cluster is configured to RUN, as opposed to what is running. Namespaced under
+`/v1/cluster/` because `/v1/engines` is already taken and means a live engine *process* on some
+node; these are about engine *kinds* and policy. Two resources one word apart is how a client
+ends up reading slot state and believing it is policy.
+
+The configuration states **intent** — which engines, at what version, acquired how, updated on
+what policy — and never anything per-machine. `accelerator`, `cuda_arch`, `variant`, and any
+executable path are **rejected** with a 400 naming the field: a Metal Mac and a CUDA box cannot
+share those values, so a cluster config that carried them would leave every heterogeneous
+cluster permanently non-conforming. Each node resolves them from hardware only it can see.
+
+### `GET /v1/cluster/engines/config` — `read`
+The current policy. Answers `200` with `{"configured": false, …}` before first-run setup rather
+than `404`: "nobody has configured this yet" is a state of the cluster a client needs to read,
+and it is what drives the setup surface.
+
+### `PUT /v1/cluster/engines/config` — `operator`
+Replace the policy. `version` is assigned server-side and the client's value ignored — a client
+echoing a stale version back could otherwise make the cluster converge backwards. On success the
+new config is pushed to every connected node whose reported version differs.
+
+`operator` by blast radius: one request can start a source compile on every node at once.
+
+| Field | Notes |
+|---|---|
+| `primary_engine` | Required. Must have a matching entry in `engines`. |
+| `backup_engine` | `""` means **no backup**, which is a real configuration and not an unset one. Defaults to `llama-cpp` at setup. |
+| `engines[]` | `engine_id`, `version`, `install_method` (`auto\|release\|source\|path`), `update_policy` (`prompt\|auto\|manual`), `update_check`, `update_check_interval_hours`, `cmake_args`, `build_jobs`. |
+| `share_builds` | Whether a node that built an engine may serve it to a node that needs the same one. |
+
+### `GET /v1/cluster/engines/conformance` — `read`
+Per node: its conformance state, the config version it last applied, every engine it can
+provision, and whether placement may target it. `placement_eligible` is stated per node because
+"why is nothing scheduling here" is the question this route exists to answer.
+
+States are `unconfigured`, `converging`, `conforming`, `drifted`, `failed`. Only `conforming`
+permits placement; `drifted` and `failed` carry a non-empty `detail`.
+
+### `POST /v1/cluster/engines/resync` — `operator`
+Re-push the configuration to every node whose version differs, without waiting for the next
+health poll. `409` when no configuration exists.
+
+### `POST /v1/cluster/engines/share` — `operator`
+Broker one engine artifact from a node that has it to a node that needs it. The bytes go
+node-to-node; control never stores them. `source_node_id` is optional — omitted, control picks a
+connected node advertising the exact fingerprint.
+
+Five steps, in this order:
+
+1. the **source** packages and hashes the artifact, sending nothing
+2. control relays that digest to the **target** over its own authenticated channel
+3. control mints a scoped transfer credential into the target
+4. the source pushes the package it already hashed
+5. control revokes the credential — on success *and* on failure
+
+Steps 1–3 preceding 4 is the point. **What it guarantees:** the digest the target will accept is
+fixed by an authenticated peer before the transfer credential exists, so a credential that leaks
+cannot be used to push different bytes. **What it does not:** a compromised source supplies both
+the artifact and the hash that validates it, and no ordering fixes that — signed builds would,
+and this is not one.
+
+Fingerprint equality is exact across `(engine_id, version, platform, arch, variant)`; a
+near-match is a wrong binary, not a close one. The receiving node re-checks the artifact against
+its own platform and arch, because control's view of a node is a report from that node.
+
+---
+
+## 5. Runtime telemetry
 
 ### `GET /v1/engines` — `read`
-Live engines cluster-wide, with a tier-occupancy summary per engine.
+Live engines cluster-wide, with a tier-occupancy summary per engine. **Engine processes**, not
+engine kinds — see §4 for the configuration surface.
 
 ### `GET /v1/engines/{engine_id}/telemetry` — `read` — **SSE**
 
@@ -330,7 +400,7 @@ Non-streaming snapshot, same shape as the `heat` frame.
 
 ---
 
-## 5. Concurrency and slots
+## 6. Concurrency and slots
 
 ### `GET /v1/engines/{engine_id}/slots` — `read`
 
@@ -366,7 +436,7 @@ its first sequence and **silently discards the rest**. The rebuild makes that an
 
 ---
 
-## 6. Determinism
+## 7. Determinism
 
 Quantized integer kernels are shape-dependent: batched and single-row forwards round differently, and at
 int4 that can flip argmax ties. **A greedy request's exact token stream can therefore depend on who else
@@ -400,7 +470,7 @@ the API surface** rather than only in a document — which was the actual requir
 
 ---
 
-## 7. Errors
+## 8. Errors
 
 Uniform envelope. Machine-readable `code` first, prose second.
 
@@ -431,7 +501,7 @@ fails.
 
 ---
 
-## 8. Scope map for the existing surface
+## 9. Scope map for the existing surface
 
 All 51 pre-existing routes, annotated. Unchanged in shape; this is the retrofit.
 
@@ -453,7 +523,7 @@ the `/v1` scope gate, as today.
 
 ---
 
-## 9. OpenAI-compatibility listener (`:9091`)
+## 10. OpenAI-compatibility listener (`:9091`)
 
 Unchanged: `GET /v1/models`, `GET /v1/models/:model`, `POST /v1/chat/completions`. Still gates every path
 with a flat token — clients expecting OpenAI semantics do not expect scopes, and adding them would break
@@ -467,7 +537,7 @@ surface on `:9090` carries all four event types.
 
 ---
 
-## 10. SSE semantics
+## 11. SSE semantics
 
 Chat (`POST /v1/agents/:id/chat`) is unchanged:
 
@@ -489,7 +559,7 @@ Two defects in the current node-side mapping are fixed rather than carried forwa
 
 Exactly one `done` is always delivered, on every path including error — that guarantee is preserved.
 
-**Telemetry streams are separate from chat streams** and are rate-limited independently (§4). A client
+**Telemetry streams are separate from chat streams** and are rate-limited independently (§5). A client
 subscribing to both gets chat at production rate and telemetry at `hz`.
 
 ---

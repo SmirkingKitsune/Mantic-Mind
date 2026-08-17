@@ -5,7 +5,9 @@
 #include "control/agent_queue.hpp"
 #include "control/node_registry.hpp"
 #include "control/agent_scheduler.hpp"
+#include "common/pairing.hpp"
 #include "control/agent_config_validator.hpp"
+#include "control/engine_config_store.hpp"
 #include "control/tts_service_client.hpp"
 #include "common/agent.hpp"
 #include "common/agent_db.hpp"
@@ -4183,6 +4185,300 @@ void ControlApiServer::register_routes() {
                                         {{"engines", arr.size()},
                                          {"vram_mb", cluster.vram_mb},
                                          {"node_disk_free_mb", cluster.disk_mb}}}}
+                            .dump(),
+                        "application/json");
+    });
+
+    // ── Cluster engine configuration ──────────────────────────────────────────
+    //
+    // Namespaced under /v1/cluster/ because /v1/engines above is already taken
+    // and means something else: a live engine PROCESS on some node. These are
+    // about engine KINDS and what the cluster is configured to run. Two
+    // resources one word apart is how a client ends up reading slot state and
+    // believing it is policy.
+
+    server_->Get("/v1/cluster/engines/config", [this](const Request&, Response& res) {
+        if (engine_config_ == nullptr) {
+            res.status = 503;
+            res.set_content(R"({"error":"engine configuration is not available"})",
+                            "application/json");
+            return;
+        }
+        // 200 with configured=false, not 404. The absence of a configuration is
+        // a state of the cluster the client needs to READ — it is what drives
+        // first-run setup — and a 404 would read as "this control does not have
+        // this feature".
+        res.set_content(nlohmann::json{{"configured", engine_config_->configured()},
+                                       {"config", engine_config_->get()}}
+                            .dump(),
+                        "application/json");
+    });
+
+    server_->Put("/v1/cluster/engines/config", [this](const Request& req, Response& res) {
+        if (engine_config_ == nullptr) {
+            res.status = 503;
+            res.set_content(R"({"error":"engine configuration is not available"})",
+                            "application/json");
+            return;
+        }
+        ClusterEngineConfig cfg;
+        try {
+            cfg = nlohmann::json::parse(req.body).get<ClusterEngineConfig>();
+        } catch (const std::exception& e) {
+            // Carries the forbidden-key refusal verbatim. An operator who set
+            // `accelerator` needs to be told the field is per-machine, not
+            // handed a generic parse error.
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+            return;
+        }
+
+        // Validated against the union of engine ids any node reports, so a
+        // cluster of Soma-only nodes cannot be configured for an engine none of
+        // them has. Empty means no node has reported yet, and validation then
+        // skips the id check rather than refusing every write until a node
+        // appears.
+        std::vector<std::string> known;
+        for (const auto& n : registry_.list_nodes()) {
+            for (const auto& e : n.engines) {
+                if (std::find(known.begin(), known.end(), e.engine_id) == known.end())
+                    known.push_back(e.engine_id);
+            }
+        }
+
+        std::string err;
+        if (!engine_config_->save(cfg, known, "api", err)) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", err}}.dump(), "application/json");
+            return;
+        }
+        publish_activity(0, std::string("Cluster engine configuration updated to v") +
+                                std::to_string(engine_config_->version()));
+        res.set_content(nlohmann::json{{"configured", true},
+                                       {"config", engine_config_->get()}}
+                            .dump(),
+                        "application/json");
+    });
+
+    server_->Get("/v1/cluster/engines/conformance", [this](const Request&, Response& res) {
+        if (engine_config_ == nullptr) {
+            res.status = 503;
+            res.set_content(R"({"error":"engine configuration is not available"})",
+                            "application/json");
+            return;
+        }
+        const auto cfg = engine_config_->get();
+        nlohmann::json nodes = nlohmann::json::array();
+        int conforming = 0;
+        for (const auto& n : registry_.list_nodes()) {
+            const bool ok = conformance_permits_placement(n.conformance);
+            if (ok) ++conforming;
+            nodes.push_back(nlohmann::json{
+                {"node_id", n.id},
+                {"hostname", n.hostname},
+                {"url", n.url},
+                {"connected", n.connected},
+                {"conformance", n.conformance},
+                {"engine_config_version", n.engine_config_version},
+                {"engines", n.engines},
+                // Stated per node, because "why is nothing scheduling here" is
+                // the question this route exists to answer.
+                {"placement_eligible", n.connected && ok},
+                {"action_progress", n.action_progress}});
+        }
+        res.set_content(nlohmann::json{{"config_version", cfg.version},
+                                       {"primary_engine", cfg.primary_engine},
+                                       {"backup_engine", cfg.backup_engine},
+                                       {"share_builds", cfg.share_builds},
+                                       {"nodes", nodes},
+                                       {"conforming", conforming},
+                                       {"total", nodes.size()}}
+                            .dump(),
+                        "application/json");
+    });
+
+    server_->Post("/v1/cluster/engines/resync", [this](const Request&, Response& res) {
+        if (engine_config_ == nullptr || !engine_config_->configured()) {
+            res.status = 409;
+            res.set_content(R"({"error":"no cluster engine configuration to resync"})",
+                            "application/json");
+            return;
+        }
+        // Forces a push to every node whose version differs, without waiting for
+        // the next health poll. The operator-visible half of convergence.
+        const auto cfg = engine_config_->get();
+        registry_.push_engine_config_to_all(cfg);
+        res.set_content(nlohmann::json{{"resynced", true}, {"config_version", cfg.version}}.dump(),
+                        "application/json");
+    });
+
+    // POST /v1/cluster/engines/share — broker one artifact between two nodes.
+    //
+    // Control decides WHO shares with WHOM, relays the digest, mints and
+    // revokes the credential, and never touches the bytes. The sequence is not
+    // rearrangeable:
+    //
+    //   1. ask the SOURCE to package and hash — it does not send anything
+    //   2. announce that digest to the TARGET, over control's own channel
+    //   3. mint a transfer credential into the TARGET
+    //   4. tell the SOURCE to push the package it already hashed
+    //   5. revoke the credential — on success AND on failure
+    //
+    // Steps 1-3 before 4 are the security argument, and the guarantee is worth
+    // stating exactly: the digest the target will accept is fixed by an
+    // AUTHENTICATED peer before the transfer credential exists, so a credential
+    // that leaks cannot be used to push different bytes. It does NOT make a
+    // compromised source safe — a source that lies in step 1 supplies both the
+    // artifact and the hash that validates it. Signed builds would answer that;
+    // this is not one, and pretending otherwise would be the theatre this
+    // ordering exists to avoid.
+    server_->Post("/v1/cluster/engines/share", [this](const Request& req, Response& res) {
+        std::string fingerprint, source_id, target_id;
+        try {
+            const auto j = nlohmann::json::parse(req.body);
+            fingerprint = j.value("fingerprint", std::string{});
+            source_id = j.value("source_node_id", std::string{});
+            target_id = j.value("target_node_id", std::string{});
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+            return;
+        }
+        if (fingerprint.empty() || target_id.empty()) {
+            res.status = 400;
+            res.set_content(R"({"error":"fingerprint and target_node_id are required"})",
+                            "application/json");
+            return;
+        }
+
+        NodeInfo source{}, target{};
+        bool have_source = false, have_target = false;
+        for (const auto& n : registry_.list_nodes()) {
+            if (n.id == target_id) { target = n; have_target = true; }
+            if (!source_id.empty() && n.id == source_id) { source = n; have_source = true; }
+        }
+        if (!have_target) {
+            res.status = 404;
+            res.set_content(R"({"error":"unknown target_node_id"})", "application/json");
+            return;
+        }
+        // With no source named, control picks one that advertises the exact
+        // fingerprint. Exact: a near-match is a wrong binary.
+        if (!have_source) {
+            for (const auto& n : registry_.list_nodes()) {
+                if (n.id == target_id || !n.connected) continue;
+                for (const auto& e : n.engines) {
+                    EngineArtifact a;
+                    a.engine_id = e.engine_id;
+                    a.version = e.version;
+                    a.platform = n.platform;
+                    a.arch = n.capabilities.arch;
+                    a.variant = e.variant;
+                    if (e.ready && a.fingerprint() == fingerprint) {
+                        source = n;
+                        have_source = true;
+                        break;
+                    }
+                }
+                if (have_source) break;
+            }
+        }
+        if (!have_source) {
+            res.status = 404;
+            res.set_content(
+                nlohmann::json{{"error", "no connected node advertises " + fingerprint}}.dump(),
+                "application/json");
+            return;
+        }
+
+        // ── 1. package and hash at the source ─────────────────────────────────
+        HttpClient source_client(source.url);
+        if (!source.api_key.empty()) source_client.set_bearer_token(source.api_key);
+        // Packaging a CUDA build is a multi-hundred-megabyte tar; the default
+        // 30 s read would time out on the prepare call alone.
+        source_client.set_timeouts(10, 3600, 3600);
+
+        const auto prepared = source_client.post("/api/node/engines/prepare",
+                                                 nlohmann::json{{"fingerprint", fingerprint}});
+        if (!prepared.ok()) {
+            res.status = 502;
+            res.set_content(nlohmann::json{{"error", "source could not package the artifact"},
+                                           {"source_node_id", source.id},
+                                           {"source_status", prepared.status},
+                                           {"source_body", prepared.body}}
+                                .dump(),
+                            "application/json");
+            return;
+        }
+        std::string digest, package_token;
+        try {
+            const auto pj = nlohmann::json::parse(prepared.body);
+            digest = pj.value("sha256", std::string{});
+            package_token = pj.value("package_token", std::string{});
+        } catch (...) {
+        }
+        if (digest.empty() || package_token.empty()) {
+            res.status = 502;
+            res.set_content(R"({"error":"source returned no digest for the artifact"})",
+                            "application/json");
+            return;
+        }
+
+        // ── 2. tell the target what to expect, BEFORE any credential exists ───
+        HttpClient target_client(target.url);
+        if (!target.api_key.empty()) target_client.set_bearer_token(target.api_key);
+        if (!target_client
+                 .post("/api/node/engines/expect",
+                       nlohmann::json{{"fingerprint", fingerprint}, {"sha256", digest}})
+                 .ok()) {
+            res.status = 502;
+            res.set_content(R"({"error":"target node would not record the expected digest"})",
+                            "application/json");
+            return;
+        }
+
+        // ── 3. mint a scoped credential into the target ───────────────────────
+        // Scoped to one node and revoked below. A leaked long-lived node key is
+        // a far worse outcome than a rebuild.
+        const std::string transfer_key = "mmxfer-" + pairing::generate_nonce(24);
+        auto revoke = [&]() {
+            HttpClient c(target.url);
+            if (!target.api_key.empty()) c.set_bearer_token(target.api_key);
+            c.del("/api/node/api-keys/" + transfer_key);
+        };
+
+        if (!target_client.post("/api/node/api-keys",
+                                nlohmann::json{{"key", transfer_key}}).ok()) {
+            res.status = 502;
+            res.set_content(R"({"error":"target node refused the transfer credential"})",
+                            "application/json");
+            return;
+        }
+
+        // ── 4. push, then 5. revoke unconditionally ───────────────────────────
+        const auto push = source_client.post("/api/node/engines/share",
+                                             nlohmann::json{{"package_token", package_token},
+                                                            {"fingerprint", fingerprint},
+                                                            {"target_url", target.url},
+                                                            {"transfer_key", transfer_key}});
+        revoke();
+
+        if (!push.ok()) {
+            res.status = 502;
+            res.set_content(nlohmann::json{{"error", "share failed"},
+                                           {"source_node_id", source.id},
+                                           {"source_status", push.status},
+                                           {"source_body", push.body}}
+                                .dump(),
+                            "application/json");
+            return;
+        }
+        publish_activity(0, "Shared engine artifact " + fingerprint + " from " + source.id +
+                                " to " + target.id);
+        res.set_content(nlohmann::json{{"shared", true},
+                                       {"fingerprint", fingerprint},
+                                       {"source_node_id", source.id},
+                                       {"target_node_id", target.id}}
                             .dump(),
                         "application/json");
     });

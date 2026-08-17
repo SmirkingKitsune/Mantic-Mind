@@ -5,11 +5,18 @@
 // universe.
 //
 // Endpoints:
-//   GET  /health              readiness; what the node's health poll hits
+//   GET  /health                  readiness; what the node's health poll hits
 //   GET  /v1/models
-//   POST /v1/chat/completions JSON and SSE
-//   GET  /internal/telemetry  SSE, node-only, terse frames
-//   GET  /internal/plan       the plan document for the loaded model
+//   POST /v1/chat/completions     JSON and SSE
+//
+// Node-only, all under /internal:
+//   GET  /internal/plan           the plan document for the loaded model
+//   GET  /internal/sessions
+//   POST /internal/kv/save
+//   POST /internal/kv/restore
+//   GET  /internal/telemetry      SSE, terse frames
+//   GET  /internal/telemetry/dump
+//   GET  /internal/heat           expert-access heat map
 //
 // Readiness needs no invention: RuntimeProcess::poll_health() already polls
 // GET /health with early abort on child exit. There is no log sentinel anywhere

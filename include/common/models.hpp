@@ -1,5 +1,7 @@
 #pragma once
 
+#include "common/engine_config.hpp"
+
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -544,8 +546,24 @@ struct NodeInfo {
     int                      slot_suspended = 0;
     int                      slot_error = 0;
     std::string              llama_server_path;
+    // The llama-specific DETAIL view. Kept beside `engines` rather than folded
+    // into it: release-asset variants, CUDA architecture, and the
+    // troubleshooting report are things llama.cpp has and Soma does not, and a
+    // generic per-engine status that carried them would be mostly empty fields
+    // describing a matrix most engines have no concept of.
     LlamaRuntimeStatus       llama_runtime;
     NodeActionProgress       action_progress;
+
+    // ── Cluster engine conformance ────────────────────────────────────────────
+    // Every engine this node can provision, and whether it runs what the master
+    // configured. Before this, `llama_runtime` above was the ONLY engine health
+    // control could see, so a Soma-only node reported a disabled llama runtime
+    // and nothing about the engine it was actually serving with.
+    std::vector<RuntimeStatus> engines;
+    EngineConformance          conformance;
+    // Last config version this node applied. Compared against the store's on
+    // every health poll; a mismatch is what triggers a push.
+    std::uint32_t              engine_config_version = 0;
 };
 
 // ── ToolDefinition ────────────────────────────────────────────────────────────
@@ -1413,7 +1431,10 @@ inline void to_json(nlohmann::json& j, const NodeInfo& n) {
           {"slot_error",    n.slot_error},
           {"llama_server_path",        n.llama_server_path},
           {"llama_runtime",            n.llama_runtime},
-          {"action_progress",          n.action_progress} };
+          {"action_progress",          n.action_progress},
+          {"engines",                  n.engines},
+          {"conformance",              n.conformance},
+          {"engine_config_version",    n.engine_config_version} };
 }
 inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     j.at("id").get_to(n.id);
@@ -1450,6 +1471,10 @@ inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     if (j.contains("llama_server_path")) j.at("llama_server_path").get_to(n.llama_server_path);
     if (j.contains("llama_runtime")) j.at("llama_runtime").get_to(n.llama_runtime);
     if (j.contains("action_progress")) j.at("action_progress").get_to(n.action_progress);
+    if (j.contains("engines")) j.at("engines").get_to(n.engines);
+    if (j.contains("conformance")) j.at("conformance").get_to(n.conformance);
+    if (j.contains("engine_config_version"))
+        j.at("engine_config_version").get_to(n.engine_config_version);
 }
 
 // ─── ToolDefinition ───────────────────────────────────────────────────────────

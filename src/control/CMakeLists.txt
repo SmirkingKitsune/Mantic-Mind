@@ -2,6 +2,7 @@ add_executable(mantic-mind-control
     main.cpp
     node_registry.cpp
     agent_scheduler.cpp
+    engine_config_store.cpp
     model_registry.cpp
     route_scope.cpp
     agent_queue.cpp
@@ -12,6 +13,7 @@ add_executable(mantic-mind-control
     audio_player.cpp
     tts_service_client.cpp
     control_ui.cpp
+    engine_panels.cpp
     soma_dashboard.cpp
     soma_panels.cpp
 )

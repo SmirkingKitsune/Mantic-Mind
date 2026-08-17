@@ -139,11 +139,39 @@ std::vector<NodeInfo> NodeRegistry::nodes_with_model(const std::string& model) c
     return out;
 }
 
+bool NodeRegistry::placement_allowed_locked(const NodeInfo& n) const {
+    // The gate applies only when something is MANAGING engine conformance.
+    //
+    // Without an engine-config provider nothing ever pushes a configuration, so
+    // no node can ever report `conforming` — gating anyway would mean a registry
+    // used without a config store silently places nowhere, and the symptom
+    // ("no available nodes") would point at healthy nodes. Control always sets
+    // the provider, so production always gates; an embedding that does not
+    // manage engines is not silently broken by a policy it never opted into.
+    if (!engine_config_provider_) return true;
+    return conformance_permits_placement(n.conformance);
+}
+
 std::vector<NodeInfo> NodeRegistry::available_nodes() const {
     std::lock_guard<std::mutex> g(mutex_);
     std::vector<NodeInfo> out;
+    // Conformance is part of "available", not a separate check at the call
+    // site. This and nodes_with_capacity() are the two doors placement uses,
+    // and a predicate written at each caller instead is how the third caller
+    // gets missed.
     for (auto& [_, n] : nodes_)
-        if (n.connected) out.push_back(n);
+        if (n.connected && placement_allowed_locked(n)) out.push_back(n);
+    return out;
+}
+
+std::vector<NodeInfo> NodeRegistry::conforming_nodes() const {
+    std::lock_guard<std::mutex> g(mutex_);
+    std::vector<NodeInfo> out;
+    // Literal, unlike the placement filters above: a caller asking which nodes
+    // CONFORM wants the conformance answer, not the placement decision that
+    // happens to coincide with it when nothing is managing engines.
+    for (auto& [_, n] : nodes_)
+        if (conformance_permits_placement(n.conformance)) out.push_back(n);
     return out;
 }
 
@@ -211,6 +239,11 @@ std::vector<NodeInfo> NodeRegistry::nodes_with_capacity(const ResourceFootprint&
     // a different policy without editing this function.
     for (auto& [_, n] : nodes_) {
         if (!n.connected) continue;
+        // A node with room to spare and the wrong engines has no capacity for
+        // the purpose this function serves. Placement asks "where can this
+        // run", and it cannot run on an engine set the cluster did not
+        // configure.
+        if (!placement_allowed_locked(n)) continue;
         const auto capacity = capacity_of(n);
         if (evaluate_fit(footprint, capacity, policy, nullptr) == FitQuality::None) continue;
         cands.push_back({n, capacity_score(footprint, capacity, policy)});
@@ -232,6 +265,74 @@ std::vector<NodeInfo> NodeRegistry::nodes_with_capacity(const ResourceFootprint&
 
 void NodeRegistry::set_update_callback(UpdateCallback cb) {
     std::lock_guard<std::mutex> g(mutex_); update_cb_ = std::move(cb);
+}
+
+// ── Cluster engine configuration ─────────────────────────────────────────────
+void NodeRegistry::set_engine_config_provider(EngineConfigProvider provider) {
+    std::lock_guard<std::mutex> g(mutex_);
+    engine_config_provider_ = std::move(provider);
+}
+
+bool NodeRegistry::push_engine_config(const NodeId& id,
+                                      const ClusterEngineConfig& cfg,
+                                      std::string& out_error) {
+    out_error.clear();
+
+    std::string url;
+    std::string key;
+    {
+        std::lock_guard<std::mutex> g(mutex_);
+        auto it = nodes_.find(id);
+        if (it == nodes_.end()) {
+            out_error = "unknown node " + id;
+            return false;
+        }
+        url = it->second.url;
+        key = it->second.api_key;
+    }
+
+    // Outside the lock: this is an HTTP call, and holding the registry mutex
+    // across it would stall every read for the duration of a push fan-out.
+    HttpClient client(url);
+    if (!key.empty()) client.set_bearer_token(key);
+    const nlohmann::json body = cfg;
+    const auto res = client.post("/api/node/engine-config", body);
+    if (!res.ok()) {
+        out_error = "node " + id + " refused engine config v" +
+                    std::to_string(cfg.version) + ": HTTP " + std::to_string(res.status);
+        // The node's refusal reason matters more than the status code: it is
+        // the one place that knows WHY it will not run this configuration.
+        try {
+            const auto j = nlohmann::json::parse(res.body);
+            if (j.contains("error")) out_error += " — " + j["error"].get<std::string>();
+        } catch (...) {
+        }
+        MM_WARN("NodeRegistry: {}", out_error);
+        return false;
+    }
+
+    MM_INFO("NodeRegistry: pushed engine config v{} to node {}", cfg.version, id);
+    return true;
+}
+
+void NodeRegistry::push_engine_config_to_all(const ClusterEngineConfig& cfg) {
+    std::vector<NodeId> targets;
+    {
+        std::lock_guard<std::mutex> g(mutex_);
+        for (const auto& [id, n] : nodes_) {
+            // Unreachable nodes are skipped rather than retried here: the
+            // health poll pushes on version mismatch, so a node that was down
+            // during a change converges when it comes back instead of needing
+            // an operator to notice.
+            if (!n.connected) continue;
+            if (n.engine_config_version == cfg.version) continue;
+            targets.push_back(id);
+        }
+    }
+    for (const auto& id : targets) {
+        std::string err;
+        push_engine_config(id, cfg, err);
+    }
 }
 
 // ── Discovery ──────────────────────────────────────────────────────────────────
@@ -522,6 +623,18 @@ bool NodeRegistry::ping_node(NodeInfo& info) {
             if (sj.contains("capabilities"))
                 info.capabilities = sj["capabilities"].get<NodeCapabilities>();
 
+            // Engine conformance. A node that reports NOTHING here is left at
+            // the default Unconfigured rather than assumed healthy: an old or
+            // partial node that cannot describe its engines is exactly the node
+            // not to schedule onto, and defaulting the other way would open the
+            // gate to every node whose reply this build cannot read.
+            if (sj.contains("engine_runtimes"))
+                info.engines = sj["engine_runtimes"].get<std::vector<RuntimeStatus>>();
+            if (sj.contains("engine_conformance"))
+                info.conformance = sj["engine_conformance"].get<EngineConformance>();
+            if (sj.contains("engine_config_version"))
+                info.engine_config_version = sj["engine_config_version"].get<std::uint32_t>();
+
             // Backfill occupancy counts when a node returns only raw slots.
             if (!sj.contains("slot_in_use")) {
                 info.slot_ready = 0;
@@ -575,8 +688,9 @@ void NodeRegistry::poll_all_nodes() {
         const auto previous_connection = info.connection_status;
         ping_node(info); // modifies info in place
 
-        // Write updated info back; grab callback outside the lock
+        // Write updated info back; grab callbacks outside the lock
         UpdateCallback cb;
+        EngineConfigProvider provider;
         {
             std::lock_guard<std::mutex> g(mutex_);
             auto it = nodes_.find(id);
@@ -606,12 +720,31 @@ void NodeRegistry::poll_all_nodes() {
                 it->second.llama_runtime = info.llama_runtime;
                 it->second.action_progress = info.action_progress;
                 it->second.capabilities = info.capabilities;
+                it->second.engines = info.engines;
+                it->second.conformance = info.conformance;
+                it->second.engine_config_version = info.engine_config_version;
             }
             cb = update_cb_;
+            provider = engine_config_provider_;
         }
 
         if (info.connection_status != previous_connection) {
             MM_INFO("Node {} is now {}", id, to_string(info.connection_status));
+        }
+
+        // ── Convergence ───────────────────────────────────────────────────────
+        // The health poll IS the convergence loop. Control already contacts
+        // every node on this interval, so a version comparison here costs
+        // nothing and needs no second thread — and a node that was offline
+        // during a config change converges on its next successful poll rather
+        // than staying stale until someone notices.
+        if (info.connected && provider) {
+            if (const auto cfg = provider()) {
+                if (cfg->version != 0 && info.engine_config_version != cfg->version) {
+                    std::string err;
+                    push_engine_config(id, *cfg, err);
+                }
+            }
         }
 
         if (cb) cb(info);

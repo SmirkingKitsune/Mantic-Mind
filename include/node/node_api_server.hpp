@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/engine_config.hpp"
 #include "common/models.hpp"
 #include <functional>
 #include <memory>
@@ -13,6 +14,7 @@ class NodeState;
 class EngineSupervisor;
 class HttpServer;
 class ModelStore;
+class NodeEngineManager;
 
 // Hosts the node REST API.
 // Most endpoints require "Authorization: Bearer <node-api-key>".
@@ -53,10 +55,24 @@ public:
     // when unset the model transfer/receive endpoints report unavailable.
     void set_model_store(ModelStore* store);
 
+    // ── Cluster engine configuration ──────────────────────────────────────────
+    // The manager answers "what do I run and am I conforming"; the callback is
+    // how a pushed config is APPLIED, because applying it also updates NodeState
+    // and starts a background provision that the server must not own.
+    //
+    // Both optional: unset, the engine routes report unavailable rather than
+    // half-working. A node that cannot apply a config should say so to the
+    // master that pushed it, not accept it and quietly do nothing.
+    void set_engine_manager(NodeEngineManager* manager);
+    using EngineConfigCallback = std::function<void(const ClusterEngineConfig&)>;
+    void set_engine_config_callback(EngineConfigCallback callback);
+
 private:
     NodeState&        state_;
     EngineSupervisor& engines_;
     ModelStore*    model_store_ = nullptr;
+    NodeEngineManager* engine_manager_ = nullptr;
+    EngineConfigCallback engine_config_cb_;
     std::string    control_url_;
     std::string    pairing_key_;
     std::unique_ptr<HttpServer> server_;

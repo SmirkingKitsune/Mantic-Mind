@@ -177,6 +177,22 @@ std::vector<RouteScope> route_scope_table() {
         {"GET", "/v1/engines/:id/heat", Scope::Read},
         {"GET", "/v1/engines/:id/slots", Scope::Read},
 
+        // ── cluster engine configuration ─────────────────────────────────────
+        //
+        // Reading the policy and who conforms to it is observation. WRITING it
+        // is operator by blast radius, and generously so: a config change
+        // propagates to every node and can start a compile on all of them at
+        // once. That is unbounded work triggered by one request, which is the
+        // same argument that puts /v1/models/admit here.
+        //
+        // Resync is operator for the same reason even though it changes no
+        // stored state: it re-pushes to the whole cluster.
+        {"GET", "/v1/cluster/engines/config", Scope::Read},
+        {"GET", "/v1/cluster/engines/conformance", Scope::Read},
+        {"PUT", "/v1/cluster/engines/config", Scope::Operator},
+        {"POST", "/v1/cluster/engines/resync", Scope::Operator},
+        {"POST", "/v1/cluster/engines/share", Scope::Operator},
+
         // ── cluster ──────────────────────────────────────────────────────────
         {"GET", "/v1/nodes", Scope::Read},
         {"GET", "/v1/nodes/discovered", Scope::Read},

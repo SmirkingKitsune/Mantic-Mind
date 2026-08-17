@@ -63,6 +63,19 @@ public:
     /// absence of a record is not evidence of admissibility.
     void set_model_registry(const ControlModelRegistry* registry);
 
+    /// Gate placement on the cluster having an engine configuration.
+    ///
+    /// A predicate rather than a stored flag: the configuration arrives while
+    /// the scheduler is already running (first-run setup happens after
+    /// startup), and a bool captured at construction would keep refusing after
+    /// the operator had configured it.
+    ///
+    /// Unset leaves the gate OPEN, which is what every existing test and any
+    /// embedding without a config store needs. Control sets it at startup, so
+    /// the gate is closed exactly where a cluster head is present to answer it.
+    using EngineConfigReadyFn = std::function<bool()>;
+    void set_engine_config_gate(EngineConfigReadyFn ready);
+
     std::optional<ScheduleResult> ensure_agent_running(const AgentConfig& cfg);
     void release_agent(const AgentId& agent_id);
     void mark_agent_idle(const AgentId& agent_id);
@@ -88,6 +101,8 @@ private:
     NodeRegistry& registry_;
     const ControlModelRegistry* models_ = nullptr;
     std::string models_dir_;
+    bool engine_config_required_ = false;
+    EngineConfigReadyFn engine_config_ready_;
 
     // Scheduling can include node HTTP calls and large model transfers. Keep it
     // serialized without blocking read-only placement queries.

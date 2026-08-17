@@ -8,6 +8,7 @@
 // translation unit precisely so they CANNOT reach the three registries this
 // file holds by reference; tools/ci/check_ui_api.py enforces that.
 #include "control/soma_dashboard.hpp"
+#include "control/engine_panels.hpp"
 #include "control/soma_panels.hpp"
 #include "common/agent.hpp"
 #include "common/agent_db.hpp"
@@ -200,6 +201,10 @@ void ControlUI::run() {
 
     int tab_index = 0;
     int soma_selected = 0;
+    int engine_selected = 0;
+    // Owned here rather than inside the tab: the same fact drives the
+    // banner on every other tab, and two owners is how those disagree.
+    bool force_engine_setup = false;
     mm::tui::LayoutStore layout("data/control-tui-layout.json");
     int node_detail_height = layout.get("nodes.detail_height", 20, 12, 40);
     int node_name_width = layout.get("nodes.name_width", 18, 12, 36);
@@ -246,7 +251,13 @@ void ControlUI::run() {
     std::string ed_max_s{"1024"};
     // Local llama.cpp and remote API runtime settings.
     int ed_backend = 0;
-    std::vector<std::string> ed_backend_labels = {"llama.cpp", "Remote API"};
+    // Which ENGINE serves this agent, as distinct from whether it is served
+    // node-locally at all. backend_override has been in AgentConfig and on the
+    // API from the start and reachable from no TUI control, so 'soma' was a
+    // decision an operator could read back and never make.
+    int ed_override = 0;
+    std::vector<std::string> ed_override_labels = {"auto", "soma", "fallback"};
+    std::vector<std::string> ed_backend_labels = {"Cluster engine", "Remote API"};
     std::string ed_unsupported_backend;
     std::string ed_ctx_s{"4096"}, ed_gpu_layers_s{"-1"}, ed_threads_s{"-1"};
     std::string ed_threads_http_s{"-1"}, ed_parallel_s{"1"};
@@ -513,6 +524,9 @@ void ControlUI::run() {
             : (ed_backend >= 2 && !ed_unsupported_backend.empty()
                 ? ed_unsupported_backend
                 : "llama-cpp");
+        cfg.backend_override = ed_override == 1 ? "soma"
+                             : ed_override == 2 ? "fallback"
+                                                : "auto";
         // Generation (shared request contract → RuntimeSettings)
         try { cfg.runtime_settings.temperature = std::stof(ed_temp_s); } catch (...) {}
         try { cfg.runtime_settings.top_p = std::stof(ed_topp_s); } catch (...) {}
@@ -884,7 +898,8 @@ void ControlUI::run() {
         ed_minp_s = "-1.00"; ed_presence_s = "0.00"; ed_repeat_s = "-1.00";
         ed_max_s = "1024";
         ed_backend = 0;
-        ed_backend_labels = {"llama.cpp", "Remote API"};
+        ed_backend_labels = {"Cluster engine", "Remote API"};
+        ed_override = 0;
         ed_unsupported_backend.clear();
         ed_ctx_s = "4096"; ed_gpu_layers_s = "-1"; ed_threads_s = "-1";
         ed_threads_http_s = "-1"; ed_parallel_s = "1"; ed_batch_s = "-1"; ed_ubatch_s = "-1";
@@ -919,7 +934,7 @@ void ControlUI::run() {
             ed_repeat_s = tmp;
             ed_max_s = std::to_string(c.runtime_settings.max_tokens);
             const std::string backend = util::to_lower(c.inference_backend);
-            ed_backend_labels = {"llama.cpp", "Remote API"};
+            ed_backend_labels = {"Cluster engine", "Remote API"};
             ed_unsupported_backend.clear();
             if (backend.empty() || backend == "llama-cpp" || backend == "llama.cpp" ||
                 backend == "llama") {
@@ -931,6 +946,9 @@ void ControlUI::run() {
                 ed_backend_labels.push_back("Unsupported: " + backend);
                 ed_backend = 2;
             }
+            ed_override = c.backend_override == "soma"     ? 1
+                        : c.backend_override == "fallback" ? 2
+                                                           : 0;
             ed_ctx_s = std::to_string(c.runtime_settings.ctx_size);
             ed_gpu_layers_s = std::to_string(c.runtime_settings.n_gpu_layers);
             ed_threads_s = std::to_string(c.runtime_settings.n_threads);
@@ -997,6 +1015,7 @@ void ControlUI::run() {
     auto ed_inp_repeat = Input(&ed_repeat_s, sl);
     auto ed_inp_max   = Input(&ed_max_s,     sl);
     auto ed_backend_toggle = Toggle(&ed_backend_labels, &ed_backend);
+    auto ed_override_toggle = Toggle(&ed_override_labels, &ed_override);
     auto ed_inp_ctx = Input(&ed_ctx_s, sl);
     auto ed_inp_gpu_layers = Input(&ed_gpu_layers_s, sl);
     auto ed_inp_threads = Input(&ed_threads_s, sl);
@@ -1165,6 +1184,7 @@ void ControlUI::run() {
     auto sampling_m = Maybe(sampling_fields, [&] { return ed_open_sampling; });
     auto engine_fields = Container::Vertical({
         ed_backend_toggle,
+        ed_override_toggle,
         ed_inp_ctx, ed_inp_gpu_layers, ed_inp_threads, ed_inp_threads_http,
         ed_inp_parallel, ed_inp_batch, ed_inp_ubatch, ed_cb_flash, ed_inp_llama_extra,
         ed_cb_vision, mmproj_row,
@@ -2377,6 +2397,7 @@ void ControlUI::run() {
             }
             Element engine_body = vbox({
                 field(" backend", ed_backend_toggle->Render() | flex),
+                field(" engine", ed_override_toggle->Render() | flex),
                 separator(),
                 std::move(engine_specific),
             });
@@ -3075,15 +3096,21 @@ void ControlUI::run() {
     soma_dashboard.start(500);
     auto soma_renderer = soma_tab(soma_dashboard, soma_selected);
 
+    // Same discipline as the Soma tab: its own translation unit, fed entirely
+    // by /v1/*, unable to reach the three references this class holds.
+    EngineDashboard engine_dashboard(control_base_url_, control_api_token_);
+    engine_dashboard.start(1000);
+    auto engines_renderer = engine_tab(engine_dashboard, engine_selected, force_engine_setup);
+
     auto main_tabs = Container::Tab({nodes_renderer, agents_renderer, activity_renderer,
         chat_renderer, curation_renderer, performance_renderer, voice_renderer,
-        soma_renderer}, &tab_index);
+        soma_renderer, engines_renderer}, &tab_index);
 
     // Mockup-style header: the tab strip is real Button components (clickable +
     // focusable) rendered as `n Label` chips, the active one inverted.
-    static const std::array<const char*, 8> kTabLabels = {
+    static const std::array<const char*, 9> kTabLabels = {
         "1 Nodes", "2 Agents", "3 Activity", "4 Chat", "5 Curation", "6 Performance", "7 Voice",
-        "8 Soma"};
+        "8 Soma", "9 Engines"};
     Components tab_buttons;
     for (int i = 0; i < static_cast<int>(kTabLabels.size()); ++i) {
         ButtonOption opt = ButtonOption::Simple();
@@ -3123,18 +3150,26 @@ void ControlUI::run() {
             text(" "),
         });
         auto footer = hbox({
-            text(" 1-8 tabs · ↑/↓ select · click rows · q quit") | dim,
+            text(" 1-9 tabs · ↑/↓ select · click rows · q quit") | dim,
             filler(),
             text("mantic-mind · control ") | dim,
         });
 
-        return vbox({
-            header,
-            separator(),
-            main_tabs->Render() | flex,
-            separator(),
-            footer,
-        }) | border;
+        // An unconfigured cluster cannot place anything, and the operator needs
+        // to know that from wherever they are rather than only from the tab
+        // they have not opened. The banner drives them to the one place that
+        // fixes it, and disappears the moment it is fixed.
+        const auto engine_snap = engine_dashboard.snapshot();
+        force_engine_setup = engine_snap.reachable && !engine_snap.configured;
+        Elements shell{header, separator()};
+        if (force_engine_setup && tab_index != 8) {
+            shell.push_back(render_unconfigured_banner(engine_snap));
+            shell.push_back(separator());
+        }
+        shell.push_back(main_tabs->Render() | flex);
+        shell.push_back(separator());
+        shell.push_back(footer);
+        return vbox(shell) | border;
     });
 
     //
@@ -3150,6 +3185,7 @@ void ControlUI::run() {
             if (ev == Event::Character('6')) { tab_index = 5; return true; }
             if (ev == Event::Character('7')) { tab_index = 6; return true; }
             if (ev == Event::Character('8')) { tab_index = 7; return true; }
+            if (ev == Event::Character('9')) { tab_index = 8; return true; }
             if (ev == Event::Character('5')) { tab_index = 4; return true; }
             if (ev == Event::Character('f') && tab_index == 0) {
                 forget_selected_node();

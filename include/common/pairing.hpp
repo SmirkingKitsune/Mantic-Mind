@@ -23,4 +23,13 @@ std::string hmac_sha256_hex(const std::string& key, const std::string& data);
 // to key it with that would not have to be stored beside the hashes it protects.
 std::string sha256_hex(const std::string& data);
 
+// Same digest, read from a file in chunks. Returns "" when the file cannot be
+// opened, with *error set when non-null.
+//
+// Separate from the string form because the caller is engine-artifact transfer:
+// a packaged llama.cpp CUDA build is hundreds of megabytes, and hashing it by
+// first reading it into a std::string would double a transfer's peak memory for
+// no reason.
+std::string sha256_file_hex(const std::string& path, std::string* error = nullptr);
+
 } // namespace mm::pairing
