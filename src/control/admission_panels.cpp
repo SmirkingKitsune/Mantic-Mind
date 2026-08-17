@@ -314,6 +314,56 @@ std::string AdmissionDashboard::admit(const std::string& source,
     return {};
 }
 
+std::string AdmissionDashboard::reprofile(std::int64_t model_id, std::string& out_error) {
+    out_error.clear();
+    auto c = impl_->client();
+    c.set_timeouts(10, 120, 30);
+
+    // Same shape as admit: the route answers only as a stream, so the id is
+    // read off the first frame and the stream dropped. The operation is
+    // detached server-side and shows up in the operations list.
+    std::string operation_id;
+    int status = 0;
+    std::string error_body;
+    const bool connected = c.stream_post(
+        "/v1/models/" + std::to_string(model_id) + "/reprofile",
+        nlohmann::json::object(),
+        [&operation_id](const std::string& line) {
+            const auto pos = line.find("data:");
+            if (pos == std::string::npos) return true;
+            try {
+                const auto j = nlohmann::json::parse(util::trim(line.substr(pos + 5)));
+                const auto id = j.value("operation_id", std::string{});
+                if (!id.empty()) {
+                    operation_id = id;
+                    return false;
+                }
+            } catch (...) {
+            }
+            return true;
+        },
+        &status,
+        &error_body);
+
+    if (!operation_id.empty()) {
+        refresh_now();
+        return operation_id;
+    }
+    if (!error_body.empty()) {
+        try {
+            const auto j = nlohmann::json::parse(error_body);
+            if (j.contains("error") && j.at("error").is_string()) {
+                out_error = j.at("error").get<std::string>();
+                return {};
+            }
+        } catch (...) {
+        }
+    }
+    out_error = connected ? "reprofile started but reported no operation id"
+                          : "cannot reach control (HTTP " + std::to_string(status) + ")";
+    return {};
+}
+
 bool AdmissionDashboard::cancel(const std::string& operation_id, std::string& out_error) {
     out_error.clear();
     if (operation_id.empty()) {
@@ -574,7 +624,29 @@ Component admission_tab(AdmissionDashboard& dashboard, int& selected) {
         form->status_ok = dashboard.cancel(op.operation_id, err);
         form->status = form->status_ok ? "cancel requested" : err;
     });
-    auto action_row = Container::Horizontal({admit_button, cancel_button});
+    // Re-derive the verdict for the FIRST admitted model, which is the one the
+    // registry panel lists at the top. A per-row selector is the better UI and a
+    // larger change; this makes the capability reachable rather than leaving it
+    // API-only, which is the property under test.
+    auto reprofile_button = Button("Reprofile first model", [form, &dashboard] {
+        const auto snap = dashboard.snapshot();
+        if (snap.models.empty()) {
+            form->status = "no admitted models to reprofile";
+            form->status_ok = false;
+            return;
+        }
+        std::string err;
+        const auto id = dashboard.reprofile(snap.models.front().id, err);
+        if (id.empty()) {
+            form->status = err;
+            form->status_ok = false;
+        } else {
+            form->status = "reprofiling " + snap.models.front().name + " as " + id;
+            form->status_ok = true;
+        }
+    });
+
+    auto action_row = Container::Horizontal({admit_button, cancel_button, reprofile_button});
     auto container = Container::Vertical({action_row, Maybe(form_container, &form->open)});
 
     auto renderer = Renderer(

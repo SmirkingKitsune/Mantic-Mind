@@ -36,6 +36,18 @@ SCOPE_TABLE = "src/control/route_scope.cpp"
 CLI = "src/control/main.cpp"
 TUI = "src/control/control_ui.cpp"
 
+# The TUI is not one file. control_ui.cpp holds the tabs that reach NodeRegistry,
+# AgentManager and AgentScheduler in-process; the guarded panels are HTTP clients
+# of /v1 like any other. Coverage has to read both, or the Soma, Engines and
+# Admissions tabs look like they do nothing.
+TUI_FILES = [
+    "src/control/control_ui.cpp",
+    "src/control/soma_dashboard.cpp",
+    "src/control/soma_panels.cpp",
+    "src/control/engine_panels.cpp",
+    "src/control/admission_panels.cpp",
+]
+
 # {"GET", "/v1/agents/:id", Scope::Read},
 ROUTE_RE = re.compile(r'\{"(GET|POST|PUT|DELETE|PATCH)",\s*"([^"]+)"')
 
@@ -94,6 +106,20 @@ MUTATORS = [
     "registry_.start_pair", "registry_.complete_pair", "registry_.pair_node",
     "scheduler_.release_agent", "scheduler_.suspend_agent",
     "scheduler_.ensure_agent_running",
+    # A FOURTH channel, and the one this check originally missed entirely.
+    #
+    # The Curation tab does not go through AgentManager — it takes an agent
+    # handle and reaches `a->db()`, the raw AgentDB. So `set_active_conversation`,
+    # `create_conversation`, `delete_conversation` and `delete_memory` were
+    # mutations the TUI performed that check 2 never watched, because it only
+    # knew about agents_/registry_/scheduler_. Watching three references and
+    # calling that "every in-process mutation" is the same shape of mistake as
+    # a gate registered for one architecture.
+    #
+    # These bypass ConversationManager and MemoryManager as well as the API
+    # handler, so the drift risk is two layers deep rather than one.
+    "db().set_active_conversation", "db().create_conversation",
+    "db().delete_conversation", "db().delete_memory",
 ]
 
 # Each TUI mutation must name the route that does the same job. This is the
@@ -110,6 +136,47 @@ TUI_MUTATION_ROUTES = {
     "registry_.complete_pair":       ("POST", "/v1/nodes/pair/complete"),
     "registry_.pair_node":           ("POST", "/v1/nodes/pair/psk"),
     "scheduler_.release_agent":      ("POST", "/v1/agents/:id/release"),
+    "scheduler_.suspend_agent":      ("POST", "/v1/agents/:id/suspend"),
+    # restore IS ensure_agent_running — its first step is existing/suspended
+    # placement, so the Restore button and POST .../restore make the same call.
+    "scheduler_.ensure_agent_running": ("POST", "/v1/agents/:id/restore"),
+    "db().set_active_conversation":  ("POST", "/v1/agents/:id/conversations/:cid/activate"),
+    "db().create_conversation":      ("POST", "/v1/agents/:id/conversations"),
+    "db().delete_conversation":      ("DELETE", "/v1/agents/:id/conversations/:cid"),
+    "db().delete_memory":            ("DELETE", "/v1/agents/:id/memories/:mid"),
+}
+
+
+# Routes the TUI serves by reading state in-process rather than over HTTP. The
+# capability IS on the screen; the path it took is control_ui.cpp holding the
+# reference directly. Listed so the coverage count reflects what an operator can
+# see, without pretending an HTTP call happened.
+TUI_INPROCESS_READS = {
+    "/v1/agents",            # Agents tab list          — agents_.list_agents()
+    "/v1/nodes",             # Nodes tab                — registry_.list_nodes()
+    "/v1/nodes/discovered",  # Nodes tab, discovery     — get_discovered_nodes()
+    "/v1/activity",          # Activity tab             — the in-process log deque
+    "/v1/placements",        # Nodes/Agents slot columns
+}
+
+# Routes with no TUI form ON PURPOSE, each with a reason. Kept short and
+# specific for the same reason the CLI list is: every entry should be a decision
+# someone made, not something nobody got to.
+TUI_COVERAGE_EXEMPT = {
+    ("POST", "/v1/chat/completions"):
+        "OpenAI-compat request shape; the Chat tab covers the capability",
+    ("GET", "/v1/tokens"): "credential administration is a CLI/API task, not a dashboard one",
+    ("POST", "/v1/tokens"): "the plaintext is shown once and must be captured, not glanced at",
+    ("DELETE", "/v1/tokens/:id"): "see tokens.create",
+    ("POST", "/v1/models"): "registering a pre-converted container is a scripted deploy step",
+    ("GET", "/v1/engines/:id/telemetry"):
+        "consumed as a live SSE stream by the Soma tab's dashboard, not as a route it names",
+    ("GET", "/v1/agents/:id/attachments/:attachment_id"): "binary image bytes",
+    ("DELETE", "/v1/agents/:id/attachments/:attachment_id"):
+        "attachment lifecycle follows its conversation",
+    ("POST", "/v1/agents/:id/attachments"): "multipart upload; the Chat tab covers text",
+    ("GET", "/v1/agents/:id/speech/cache/:cache_id"): "binary audio, fetched by the player",
+    ("POST", "/v1/audio/speech"): "OpenAI-compat spelling of the Voice tab's synthesis",
 }
 
 
@@ -220,6 +287,64 @@ def main() -> int:
         if not cli_knows(path):
             uncovered.append((verb, path))
 
+    # ── 1c. every route has a TUI form, or a recorded reason ──────────────────
+    #
+    # The third direction, and the one nothing measured. Check 2 below asks the
+    # narrow question "does each TUI MUTATION have a route" — it proves the TUI
+    # introduces no capability the API lacks. It says nothing about the reverse:
+    # capabilities the API has that an operator cannot reach from the screen.
+    #
+    # Read from the same two signals the TUI actually uses: /v1 literals in the
+    # guarded panels, and the in-process calls in control_ui.cpp.
+    tui_src_all = "\n".join(
+        (root / f).read_text(encoding="utf-8", errors="replace")
+        for f in TUI_FILES if (root / f).exists())
+    tui_paths = {p.split("?")[0] for p in CLI_ANY_PATH_RE.findall(tui_src_all)}
+    tui_literals = set(re.findall(r'"([^"\\\n]{1,64})"', tui_src_all))
+    # An in-process mutation reaches its mapped route just as surely as an HTTP
+    # call does — the operator gets the capability either way, which is what
+    # this direction measures.
+    #
+    # Counted DIRECTLY as (verb, path) rather than fed through the path matcher.
+    # The map is already proof; re-deriving it from literals reported
+    # POST /v1/nodes/:id/forget as a gap because the TUI's button says "Forget
+    # Pairing" and the matcher wanted a lowercase "forget" segment. A check that
+    # doubts its own evidence produces noise, and noise is what gets a check
+    # switched off.
+    tui_direct = {mapped for mapped in TUI_MUTATION_ROUTES.values()}
+    # Reads the TUI performs in-process, mapped to the route that serves them.
+    for path in TUI_INPROCESS_READS:
+        tui_paths.add(path)
+
+    def surface_knows(path: str, paths: set, literals: set) -> bool:
+        segments = [s for s in path.split("/") if s]
+        head_parts, tail_parts, seen_param = [], [], False
+        for s in segments:
+            if s.startswith(":"):
+                seen_param = True
+                continue
+            (tail_parts if seen_param else head_parts).append(s)
+        head = "/" + "/".join(head_parts)
+        if not seen_param:
+            return head in paths or head + "/" in paths
+        if not any(c == head or c.startswith(head + "/") for c in paths):
+            return False
+
+        def segment_present(t: str) -> bool:
+            for lit in literals:
+                if lit == t or ("/" + t + "/") in lit or lit.endswith("/" + t):
+                    return True
+            return False
+
+        return all(segment_present(t) for t in tail_parts)
+
+    tui_uncovered = []
+    for verb, path in sorted(routes):
+        if (verb, path) in TUI_COVERAGE_EXEMPT or (verb, path) in tui_direct:
+            continue
+        if not surface_knows(path, tui_paths, tui_literals):
+            tui_uncovered.append((verb, path))
+
     # ── 2. every TUI in-process mutation has an equivalent route ──────────────
     tui_src = (root / TUI).read_text(encoding="utf-8", errors="replace")
     for mutator in MUTATORS:
@@ -243,6 +368,10 @@ def main() -> int:
     # entry should be dropped in the same change.
     stale = [m for m in TUI_MUTATION_ROUTES if m + "(" not in tui_src]
 
+    for verb, path in tui_uncovered:
+        # Reported, not fatal, while the backlog is being worked. The CLI half
+        # became fatal only after reaching zero, for the same reason.
+        print(f"tui-gap  {verb:<7} {path}  has no TUI form and no recorded exemption")
     for verb, path in uncovered:
         # FATAL, now that the backlog is zero.
         #
@@ -265,11 +394,14 @@ def main() -> int:
         return 1
 
     covered_n = len(routes) - len(uncovered) - len(CLI_COVERAGE_EXEMPT)
+    tui_covered_n = len(routes) - len(tui_uncovered) - len(TUI_COVERAGE_EXEMPT)
     print(f"OK    {len(cli_calls)} CLI route call(s), "
           f"{len(TUI_MUTATION_ROUTES) - len(stale)} TUI mutation(s) mapped, "
           f"{len(routes)} routes in the scope table")
     print(f"      CLI coverage: {covered_n} reachable, "
           f"{len(CLI_COVERAGE_EXEMPT)} exempt by reason, {len(uncovered)} gap(s)")
+    print(f"      TUI coverage: {tui_covered_n} reachable, "
+          f"{len(TUI_COVERAGE_EXEMPT)} exempt by reason, {len(tui_uncovered)} gap(s)")
     return 0
 
 

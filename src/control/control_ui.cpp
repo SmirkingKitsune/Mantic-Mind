@@ -986,7 +986,45 @@ void ControlUI::run() {
                 agent_sel = std::max(0, static_cast<int>(cs.size()) - 2);
         }
     }, ButtonOption::Simple());
-    auto agent_list_btns = Container::Horizontal({btn_new_a, btn_edit_a, btn_del_a});
+    // ── placement lifecycle, on the tab that is about placements ─────────────
+    //
+    // These reached the API in D51 and the CLI with it, and had no control on
+    // the one screen showing which agents are running. An operator freeing a
+    // node had to drop to a shell — for an action the scheduler performs on its
+    // own under capacity pressure.
+    auto btn_suspend_a = Button(
+        "[⏸] Suspend",
+        [&] {
+            auto cs = agents_.list_agents();
+            if (agent_sel < 0 || agent_sel >= static_cast<int>(cs.size())) return;
+            // Reported either way: "nothing to suspend" and "suspended" are
+            // different outcomes and the row looks identical after both.
+            if (scheduler_.suspend_agent(cs[agent_sel].id))
+                log(LogLevel::Info, "Suspended agent " + cs[agent_sel].id);
+            else
+                log(LogLevel::Warn,
+                    "Agent " + cs[agent_sel].id + " holds no live placement to suspend");
+        },
+        ButtonOption::Simple());
+
+    auto btn_restore_a = Button(
+        "[▶] Restore",
+        [&] {
+            auto cs = agents_.list_agents();
+            if (agent_sel < 0 || agent_sel >= static_cast<int>(cs.size())) return;
+            // Restore IS ensure_agent_running — its first step is
+            // existing/suspended placement, so this resumes from the checkpoint
+            // rather than reloading. Same call the API route makes.
+            if (auto placed = scheduler_.ensure_agent_running(cs[agent_sel]))
+                log(LogLevel::Info,
+                    "Restored agent " + cs[agent_sel].id + " on node " + placed->node_id);
+            else
+                log(LogLevel::Error, "Restore failed: " + scheduler_.last_error());
+        },
+        ButtonOption::Simple());
+
+    auto agent_list_btns =
+        Container::Horizontal({btn_new_a, btn_edit_a, btn_suspend_a, btn_restore_a, btn_del_a});
     // Maybe wrapper: keep agent_menu out of the component tree when empty, matching
     // every other list menu, so FTXUI never indexes/focuses an empty entries vector.
     auto agent_menu_m = Maybe(agent_menu, [&]() { return !agent_entries.empty(); });

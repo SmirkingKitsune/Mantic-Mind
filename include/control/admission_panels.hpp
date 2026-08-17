@@ -118,6 +118,17 @@ public:
 
     bool cancel(const std::string& operation_id, std::string& out_error);
 
+    /// Re-derive a model's verdict from the SAME bytes.
+    ///
+    /// Never requantizes — that is the half of the gate easy to get wrong in the
+    /// other direction, because a reprofile that changed the quantization would
+    /// produce a new arch_hash and orphan every KV checkpoint written against
+    /// the old one, for a request that asked only for a fresh verdict.
+    ///
+    /// Returns the operation id; it appears in the operations list like any
+    /// other admission, which is how it is watched.
+    std::string reprofile(std::int64_t model_id, std::string& out_error);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
