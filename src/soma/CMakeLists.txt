@@ -314,12 +314,61 @@ if(BUILD_TESTING)
                    ${CMAKE_SOURCE_DIR}/tests/soma/probe_container.cpp)
     target_link_libraries(soma_probe_container PRIVATE mm_soma)
 
-    # Conformance stage 3. Also an operator tool rather than a CTest entry: it
-    # needs a real container and a real reference, and neither belongs in the
-    # repo. CI runs stages 1-2 on the committed tiny fixtures.
+    # Conformance stage 3 — logit-KL against the transformers reference.
+    #
+    # This was built and NEVER registered, on the stated grounds that it "needs a
+    # real container and a real reference, and neither belongs in the repo". That
+    # was true when written and is not true now, and the consequence was that the
+    # only DISTRIBUTIONAL correctness gate in the ladder ran for no architecture
+    # at all — stages 1-2 assert token-exactness on tiny-random weights, which is
+    # a different property from "the engine's logits match what transformers
+    # produced".
+    #
+    # Both halves of the premise have since changed:
+    #   * every tiny fixture carries `tf_logits` — a real teacher-forced
+    #     reference from tools/admission/make_oracle.py, committed
+    #   * every family now has a converted container, GLM-5.2 included (D50)
+    #
+    # Measured: 0.1 s per family, mean KL 0.00000-0.00029 nats against a 0.050
+    # bar. And it DISCRIMINATES — pointing a container at another family's
+    # reference fails, which is what makes registering it worth anything.
     add_executable(soma_stage3_g2
                    ${CMAKE_SOURCE_DIR}/tests/soma/stage3_g2.cpp)
     target_link_libraries(soma_stage3_g2 PRIVATE mm_soma)
+
+    # One per family, because stage 3 is where a per-family numerical fault would
+    # show and nowhere else does. GQA, MLA (two routers), MLA+DSA, and MHA.
+    #
+    # Written out rather than looped: mm_test_registry greps this file for a
+    # LITERAL test name, so a foreach() registers tests it cannot see and reports
+    # the suite as under-running. It caught that on the first attempt — and then
+    # caught a comment here quoting its own grep pattern, which it read as a test
+    # named "...". Names must be as discoverable statically as at configure time,
+    # and prose in this file is scanned too.
+    add_test(NAME soma_stage3_gqa_g2
+             COMMAND soma_stage3_g2
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/containers/Qwen3-30B-A3B"
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/Qwen3-30B-A3B")
+    add_test(NAME soma_stage3_mla_g2
+             COMMAND soma_stage3_g2
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/containers/DeepSeek-V2-Lite"
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/DeepSeek-V2-Lite")
+    add_test(NAME soma_stage3_mla_sigmoid_g2
+             COMMAND soma_stage3_g2
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/containers/Moonlight-16B-A3B"
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/Moonlight-16B-A3B")
+    add_test(NAME soma_stage3_coarse_g2
+             COMMAND soma_stage3_g2
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/containers/Mixtral-8x7B-v0.1"
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/Mixtral-8x7B-v0.1")
+    add_test(NAME soma_stage3_mha_g2
+             COMMAND soma_stage3_g2
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/containers/OLMoE-1B-7B-0924"
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/OLMoE-1B-7B-0924")
+    add_test(NAME soma_stage3_dsa_g2
+             COMMAND soma_stage3_g2
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/containers/GLM-5.2"
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/GLM-5.2")
 
     # ── G3 batch union + telemetry dump ───────────────────────────────────────
     # The union's CSR structure, the unique-vs-naive ratio across batch sizes,
