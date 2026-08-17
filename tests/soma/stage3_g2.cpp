@@ -14,6 +14,39 @@
 // about what passes. What stays here is the reporting and the remediation
 // guidance, which is what a harness is for.
 //
+// ── Reading `top-1 agree` ─────────────────────────────────────────────────────
+//
+// It is NOT a quality score, and on the tiny fixtures it is not even mainly
+// about the engine. It measures QUANTIZATION SENSITIVITY, and for DSA it also
+// measures selection stability. Measured, not assumed:
+//
+//   fixture              q4_g/q6_g   q8_0/q8_0
+//   Qwen3-30B-A3B          99.6%       100.0%
+//   Mixtral-8x7B-v0.1      92.4%       100.0%
+//   GLM-5.2                91.2%        98.6%
+//
+// So the 91-92% band that Mixtral, Moonlight and GLM sit in at q4 is the
+// committed containers' quantization, not a per-family fault: at q8 the spread
+// collapses. It is NOT argmax noise either — the obvious explanation, and the
+// wrong one. The reference's own top-1/top-2 margins are near-identical across
+// all six fixtures (median 0.069-0.103, p05 0.006-0.009), and Mixtral has the
+// LARGEST median margin while sitting near the bottom of the ranking. Ties
+// would predict the opposite ordering.
+//
+// GLM's residual ~1.4% at q8 is the DSA indexer, and it appears exactly where
+// the design says it must — at `index_topk`:
+//
+//   positions <= 32    100.0%     top-k selects everything: sparse == dense
+//   positions <= 64    100.0%     index_topk = 64, still everything
+//   positions <= 128    99.2%     selection is genuinely sparse now
+//   positions <= 512    98.6%
+//
+// Top-k is DISCRETE, so a tiny score difference flips which keys are attended
+// and the output moves discontinuously. That is a different error mechanism
+// from smooth quantization drift, and it is why the bar here is distributional:
+// no KL threshold came close to being exceeded in any of the above (worst mean
+// 0.00029 nats against a 0.050 bar).
+//
 // Usage: stage3_g2 <container_dir> <reference_dir> [--cache-gib N] [--positions N]
 
 #include "soma/conformance.hpp"

@@ -258,10 +258,40 @@ configuration that would have "worked" at 0.02 tok/s.
 It also means a deployment can be broken purely by where the container lives, with nothing else wrong.
 The plan document surfaces that rather than burying it.
 
-### Conformance stage 3 — PASSED
+### Conformance stage 3 — PASSED, and now a CI gate for all six families
 
-Real Qwen3-30B-A3B container (`q4_g` gate/up, `q6_g` down) against a **bf16 reference**, 512 prefill
-positions, 8 GiB expert cache:
+Registered per family in D52. Before that it was built and never run — see the defect. The
+committed tiny fixtures give mean KL 0.00000–0.00029 nats against the 0.050 bar.
+
+**What `top-1 agree` means, since the number invites a wrong reading.** It sits at 91–92% for
+Mixtral, Moonlight and GLM-5.2 versus 97–99% for the rest, which looks like a per-family quality
+difference and is not one. It is quantization sensitivity, measured rather than assumed:
+
+| fixture | q4_g/q6_g (committed) | q8_0/q8_0 |
+|---|---|---|
+| Qwen3-30B-A3B | 99.6% | **100.0%** |
+| Mixtral-8x7B-v0.1 | 92.4% | **100.0%** |
+| GLM-5.2 | 91.2% | 98.6% |
+
+At q8 the spread collapses. It is also **not argmax noise** — the obvious explanation and the wrong
+one: the reference's own top-1/top-2 margins are near-identical across all six fixtures (median
+0.069–0.103, p05 0.006–0.009), and Mixtral has the *largest* median margin while ranking near the
+bottom. Ties would predict the opposite ordering.
+
+GLM's residual ~1.4% at q8 is the **DSA indexer**, and it appears exactly where the design says it
+must — at `index_topk = 64`: 100.0% at ≤32 and ≤64 positions, 99.2% at 128, 98.6% at 512. Below
+`index_topk` top-k selects everything and the sparse path is bit-identical to dense; above it,
+selection is genuinely sparse and a tiny score difference flips which keys are attended. Top-k is
+DISCRETE, so the output moves discontinuously — a different error mechanism from smooth
+quantization drift, and precisely why this gate's bar is distributional rather than token-exact.
+
+Nothing here is a defect. It is recorded because a future reader seeing 91% will otherwise spend a
+day proving what this paragraph already measured.
+
+---
+
+Original run — real Qwen3-30B-A3B container (`q4_g` gate/up, `q6_g` down) against a **bf16
+reference**, 512 prefill positions, 8 GiB expert cache:
 
 | | |
 |---|---|
