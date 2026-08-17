@@ -263,8 +263,18 @@ if(BUILD_TESTING)
                    ${CMAKE_SOURCE_DIR}/tests/soma/autotune_g1.cpp)
     target_link_libraries(soma_autotune_g1 PRIVATE mm_soma)
 
+    # PER-FAMILY REGISTRATION. The binary already took an optional fixture
+    # name; only Qwen3 (GQA) was ever registered, so every assertion here was
+    # made against one attention family. That is how streaming_g2 came to
+    # hardcode "layer 0 is routed" — true for Qwen3, false for DeepSeek
+    # (first_k_dense_replace=1) and GLM-5.2 (=3) — and report six failures on a
+    # correct engine the first time it was pointed at MLA.
     add_test(NAME soma_autotune_g1
              COMMAND soma_autotune_g1 "${CMAKE_SOURCE_DIR}/tests/fixtures/tiny")
+    add_test(NAME soma_autotune_mla_g1
+             COMMAND soma_autotune_g1 "${CMAKE_SOURCE_DIR}/tests/fixtures/tiny" "DeepSeek-V2-Lite")
+    add_test(NAME soma_autotune_dsa_g1
+             COMMAND soma_autotune_g1 "${CMAKE_SOURCE_DIR}/tests/fixtures/tiny" "GLM-5.2")
 
     # ── G2a container + verdict ───────────────────────────────────────────────
     # Round-trips the container against the engine's own quantization, and checks
@@ -288,6 +298,15 @@ if(BUILD_TESTING)
 
     add_test(NAME soma_streaming_g2
              COMMAND soma_streaming_g2 "${CMAKE_SOURCE_DIR}/tests/fixtures")
+    # Both MLA families, and MLA+DSA. GLM-5.2 had a tiny checkpoint and NO
+    # container, so every container-dependent gate was structurally blind to
+    # the only DSA architecture; the container is now a committed fixture.
+    add_test(NAME soma_streaming_mla_g2
+             COMMAND soma_streaming_g2 "${CMAKE_SOURCE_DIR}/tests/fixtures" "DeepSeek-V2-Lite")
+    add_test(NAME soma_streaming_moonlight_g2
+             COMMAND soma_streaming_g2 "${CMAKE_SOURCE_DIR}/tests/fixtures" "Moonlight-16B-A3B")
+    add_test(NAME soma_streaming_dsa_g2
+             COMMAND soma_streaming_g2 "${CMAKE_SOURCE_DIR}/tests/fixtures" "GLM-5.2")
 
     # Operator tool, not a test: points at a real container outside the repo, so
     # it is built but never registered with CTest.
@@ -313,6 +332,10 @@ if(BUILD_TESTING)
 
     add_test(NAME soma_union_g3
              COMMAND soma_union_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures")
+    add_test(NAME soma_union_mla_g3
+             COMMAND soma_union_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "DeepSeek-V2-Lite")
+    add_test(NAME soma_union_dsa_g3
+             COMMAND soma_union_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "GLM-5.2")
 
     # ── G3 SIMD quantized kernels ─────────────────────────────────────────────
     # SIMD vs the scalar reference, per dtype and per shape. A CTest entry: it
@@ -334,6 +357,12 @@ if(BUILD_TESTING)
 
     add_test(NAME soma_threading_g3
              COMMAND soma_threading_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures")
+    # Bit-identity across worker counts is a property of the SCHEDULER, but the
+    # work it schedules is per-family attention. Verified passing on all three.
+    add_test(NAME soma_threading_mla_g3
+             COMMAND soma_threading_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "DeepSeek-V2-Lite")
+    add_test(NAME soma_threading_dsa_g3
+             COMMAND soma_threading_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "GLM-5.2")
 
     # ── G3 streamed-path determinism ──────────────────────────────────────────
     # The gate whose absence let a concurrent-read race in ExpertStore surface as
@@ -345,6 +374,10 @@ if(BUILD_TESTING)
 
     add_test(NAME soma_streamed_determinism_g3
              COMMAND soma_streamed_determinism_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures")
+    add_test(NAME soma_streamed_determinism_mla_g3
+             COMMAND soma_streamed_determinism_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "DeepSeek-V2-Lite")
+    add_test(NAME soma_streamed_determinism_dsa_g3
+             COMMAND soma_streamed_determinism_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "GLM-5.2")
 
     # ── G3 step-major scheduler ───────────────────────────────────────────────
     # The load-bearing check: batching sequences together must not change what

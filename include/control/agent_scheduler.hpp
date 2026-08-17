@@ -78,6 +78,22 @@ public:
 
     std::optional<ScheduleResult> ensure_agent_running(const AgentConfig& cfg);
     void release_agent(const AgentId& agent_id);
+
+    /// Suspend an agent's placement: its KV is checkpointed and its slot freed,
+    /// but the placement is remembered so a later ensure_agent_running() can
+    /// restore it rather than reloading from scratch.
+    ///
+    /// PUBLIC because P1 says there are no internal-only capabilities, and this
+    /// was one. The scheduler has always been able to do it — eviction under
+    /// capacity pressure calls it — and the node API has always exposed
+    /// /api/node/suspend-slot, but no /v1/* route could reach it, so an operator
+    /// with the whole API could not do a thing the scheduler does on its own.
+    /// `include/control/placement_engine.hpp` (unimplemented — roadmap D46)
+    /// documented exactly this gap and called for promoting it; that header
+    /// builds nothing, so the note never became a route.
+    ///
+    /// Returns false when the agent has no live placement to suspend.
+    bool suspend_agent(const AgentId& agent_id);
     void mark_agent_idle(const AgentId& agent_id);
     void mark_agent_active(const AgentId& agent_id);
     std::optional<AgentPlacement> get_placement(const AgentId& agent_id) const;
@@ -129,7 +145,6 @@ private:
                                       const AgentId& agent_id,
                                       const std::string& reason);
     std::vector<AgentId> lru_idle_agents(const NodeId& on_node = {}) const;
-    bool suspend_agent(const AgentId& agent_id);
     std::optional<SlotId> restore_agent_on_node(const AgentPlacement& placement,
                                                 const AgentConfig& cfg,
                                                 const NodeId& node_id);

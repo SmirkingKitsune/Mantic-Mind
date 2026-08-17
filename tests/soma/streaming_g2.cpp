@@ -105,6 +105,31 @@ int main(int argc, char** argv) {
               << routed_total / 1024 << " KiB routed set; cap_per_layer=" << mem.cap_per_layer()
               << "\n\n";
 
+    // WHICH LAYERS CARRY ROUTED EXPERTS.
+    //
+    // Every section below drives a layer by index, and a DENSE layer owns no
+    // routed experts — acquiring one correctly returns nothing. Layer 0 was
+    // hardcoded throughout, which is true for Qwen3 (no dense prefix) and false
+    // for both other families: DeepSeek-V2-Lite sets first_k_dense_replace=1,
+    // GLM-5.2 sets 3.
+    //
+    // The gate had only ever been registered against Qwen3, so it was asserting
+    // against the one architecture whose layer 0 happens to be routed. Pointed
+    // at MLA it reported six failures on a CORRECT engine — eviction safety, LRU
+    // order and prefetch all "failing" because they were reading a dense layer.
+    // The assumption was the bug, and it was invisible while one family ran it.
+    std::vector<std::uint32_t> moe_layers;
+    for (std::uint32_t l = 0; l < h.n_layers; ++l)
+        if (model.arch.is_moe_layer(l)) moe_layers.push_back(l);
+    if (moe_layers.empty()) {
+        std::cerr << "fixture has no MoE layer; nothing to stream\n";
+        return 2;
+    }
+    const std::uint32_t L0 = moe_layers.front();
+    const std::uint32_t L1 = moe_layers.size() > 1 ? moe_layers[1] : L0;
+    std::cout << "   routed layers: " << moe_layers.size() << " of " << h.n_layers
+              << " (first = " << L0 << ")\n\n";
+
     // ── 1. a borrowed expert survives pressure ───────────────────────────────
     std::cout << "1. eviction safety\n";
     {
@@ -119,7 +144,7 @@ int main(int argc, char** argv) {
         tight.ram_expert_cache_bytes = h.expert_bytes * 3;
         (void)ev.open(model.arch, store, tight);
 
-        auto held = ev.acquire(0, 0);
+        auto held = ev.acquire(L0, 0);
         check(static_cast<bool>(held), "acquire returns a live reference");
         const auto* addr = held.bytes().data();
         const auto len = held.bytes().size();
@@ -128,7 +153,7 @@ int main(int argc, char** argv) {
 
         for (std::uint32_t pass = 0; pass < 4; ++pass) {
             for (std::uint32_t e = 1; e < h.n_experts; ++e) {
-                auto tmp = ev.acquire(0, e);
+                auto tmp = ev.acquire(L0, e);
                 (void)tmp;
             }
         }
@@ -149,16 +174,16 @@ int main(int argc, char** argv) {
         b2.ram_expert_cache_bytes = h.expert_bytes * 3;   // exactly 3 slots
         (void)m2.open(model.arch, store, b2);
 
-        { auto a = m2.acquire(0, 0); }
-        { auto b = m2.acquire(0, 1); }
-        { auto c = m2.acquire(0, 2); }
-        { auto a2 = m2.acquire(0, 0); }   // 0 becomes most-recent; 1 is now LRU
-        { auto d = m2.acquire(0, 3); }    // must evict 1
+        { auto a = m2.acquire(L0, 0); }
+        { auto b = m2.acquire(L0, 1); }
+        { auto c = m2.acquire(L0, 2); }
+        { auto a2 = m2.acquire(L0, 0); }   // 0 becomes most-recent; 1 is now LRU
+        { auto d = m2.acquire(L0, 3); }    // must evict 1
 
         const auto before = m2.stats().misses;
-        { auto a3 = m2.acquire(0, 0); }   // still resident -> hit
+        { auto a3 = m2.acquire(L0, 0); }   // still resident -> hit
         const auto after_hit = m2.stats().misses;
-        { auto b2r = m2.acquire(0, 1); }  // was evicted -> miss
+        { auto b2r = m2.acquire(L0, 1); }  // was evicted -> miss
         const auto after_miss = m2.stats().misses;
 
         check(after_hit == before, "recently-touched slot survived", "0 still resident");
@@ -181,6 +206,12 @@ int main(int argc, char** argv) {
     // failure mode of enabling it blindly is worse than not having it.
     std::cout << "\n4. prefetch gating\n";
     {
+        // Routed layers, from the hoisted choice above. L1 falls back to L0 when
+        // the fixture has only one, which still exercises enabled-vs-disabled
+        // because the flags are per layer.
+        const std::uint32_t moe_a = L0;
+        const std::uint32_t moe_b = L1;
+
         bool any_on = false;
         for (std::uint32_t l = 0; l < h.n_layers; ++l) any_on |= mem.prefetch_enabled(l);
         check(!any_on, "prefetch is OFF for every layer by default");
@@ -201,22 +232,36 @@ int main(int argc, char** argv) {
         // it would have tested nothing.
         soma::MemoryHierarchy pf;
         (void)pf.open(model.arch, store, budget);
-        pf.set_prefetch_enabled(0, true);
-        pf.set_prefetch_enabled(1, false);
+        pf.set_prefetch_enabled(moe_a, true);
+        if (moe_b != moe_a) pf.set_prefetch_enabled(moe_b, false);
 
         const auto before = pf.stats();
-        pf.prefetch(1, std::vector<soma::ExpertId>{0, 1, 2});   // disabled layer
+        if (moe_b != moe_a) {
+            pf.prefetch(moe_b, std::vector<soma::ExpertId>{0, 1, 2}); // disabled layer
+            const auto mid0 = pf.stats();
+            check(mid0.bytes_read == before.bytes_read,
+                  "prefetch on a disabled layer is a no-op");
+        }
         const auto mid = pf.stats();
-        check(mid.bytes_read == before.bytes_read, "prefetch on a disabled layer is a no-op");
 
-        pf.prefetch(0, std::vector<soma::ExpertId>{5, 6});      // enabled layer
+        // Expert ids are clamped to the fixture's routed count — a tiny fixture
+        // may have fewer than 7 experts, and asking for one that does not exist
+        // is a different failure from the one under test.
+        const auto n_experts = static_cast<soma::ExpertId>(model.arch.router.n_experts);
+        std::vector<soma::ExpertId> want;
+        for (soma::ExpertId e = 0; e < n_experts && want.size() < 2; ++e) want.push_back(e);
+
+        pf.prefetch(moe_a, want); // enabled layer
         const auto after = pf.stats();
         check(after.bytes_read > mid.bytes_read, "prefetch on an enabled layer fetches",
-              std::to_string((after.bytes_read - mid.bytes_read)) + " B");
+              std::to_string((after.bytes_read - mid.bytes_read)) + " B on layer " +
+                  std::to_string(moe_a));
 
-        { auto r = pf.acquire(0, 5); }
-        check(pf.stats().prefetch_hits > after.prefetch_hits,
-              "a prefetched expert is credited as a prefetch hit");
+        if (!want.empty()) {
+            { auto r = pf.acquire(moe_a, want.front()); }
+            check(pf.stats().prefetch_hits > after.prefetch_hits,
+                  "a prefetched expert is credited as a prefetch hit");
+        }
     }
 
     // ── 5. heat bootstrap: cold vs warm ──────────────────────────────────────

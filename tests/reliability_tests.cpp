@@ -965,6 +965,124 @@ bool test_engine_digest_and_package_grants_are_one_shot() {
     return true;
 }
 
+bool test_admission_variant_is_the_collision_key() {
+    // The identity rule, asserted without converting anything. Two refs that
+    // denote one model must produce ONE container directory — that is what makes
+    // the variant usable as an in-flight collision key, and it is why the key is
+    // derived by the same function that picks the write path rather than by a
+    // second copy of the rule.
+    mm::AdmissionTools tools;
+    tools.quant = "q4_g";
+    tools.expert_down = "q6_g";
+    tools.group = 128;
+
+    const auto from_repo = mm::admission_variant("Qwen/Qwen3-30B-A3B", true, tools);
+    const auto from_dir =
+        mm::admission_variant("/models/Qwen3-30B-A3B", false, tools);
+    CHECK(from_repo == from_dir);
+    CHECK(from_repo == "Qwen3-30B-A3B-q4_g-q6_g-g128");
+
+    // A revision suffix names the same model directory. (Whether it SHOULD is a
+    // separate question — see the note in the roadmap — but the two halves of
+    // the system must at least agree, which is what this pins.)
+    CHECK(mm::admission_variant("Qwen/Qwen3-30B-A3B@main", true, tools) == from_repo);
+
+    // Quantization is part of the identity: the same weights at two quants are
+    // two containers, and must NOT collide.
+    auto other = tools;
+    other.expert_down = "q4_g";
+    CHECK(mm::admission_variant("Qwen/Qwen3-30B-A3B", true, other) != from_repo);
+    auto grouped = tools;
+    grouped.group = 64;
+    CHECK(mm::admission_variant("Qwen/Qwen3-30B-A3B", true, grouped) != from_repo);
+
+    // The fetch destination shares the name half, so sources/<name> and
+    // containers/<name>-... cannot disagree about which model a ref denotes.
+    CHECK(mm::admission_source_name("Qwen/Qwen3-30B-A3B", true) == "Qwen3-30B-A3B");
+    CHECK(mm::admission_source_name("/models/Qwen3-30B-A3B", false) == "Qwen3-30B-A3B");
+    CHECK(mm::admission_source_name("Qwen/Qwen3-30B-A3B@main", true) == "Qwen3-30B-A3B");
+    return true;
+}
+
+bool test_concurrent_admission_of_one_model_joins_not_duplicates() {
+    // The case nothing had ever run. Both existing admission tests drive exactly
+    // one operation, so two in flight — the shape that corrupts a container —
+    // had never happened in the suite.
+    const char* soma_path = std::getenv("MM_TEST_SOMA_PATH");
+    const char* container_dir = std::getenv("MM_TEST_CONTAINER_DIR");
+    if (soma_path == nullptr || container_dir == nullptr) {
+        std::cout << "  (skipped: MM_TEST_SOMA_PATH / MM_TEST_CONTAINER_DIR unset)\n";
+        return true;
+    }
+
+    auto dir = temp_test_dir("admission-concurrency");
+    mm::ControlModelRegistry reg;
+    std::string err;
+    CHECK(reg.open(dir.string(), err));
+
+    mm::AdmissionTools tools;
+    tools.soma_path = soma_path;
+    tools.containers_dir = (dir / "containers").string();
+    tools.sources_dir = (dir / "sources").string();
+    reg.set_tools(tools);
+
+    // Default is 1, and 0 must not be honoured — a cap of zero parks every
+    // admission on a gate nothing can open, which reads as "pause" and behaves
+    // as "hang forever".
+    CHECK(reg.max_concurrent_admissions() == 1);
+    reg.set_max_concurrent_admissions(0);
+    CHECK(reg.max_concurrent_admissions() == 1);
+    reg.set_max_concurrent_admissions(2);
+    CHECK(reg.max_concurrent_admissions() == 2);
+    reg.set_max_concurrent_admissions(1);
+
+    // Two admissions of ONE source. The second must JOIN the first rather than
+    // start a second convert.py writing the same directory.
+    std::atomic<int> frames_a{0};
+    std::atomic<int> frames_b{0};
+    const std::string source = container_dir;
+
+    const auto id_a = reg.admit(source, [&frames_a](const mm::AdmissionProgress&) {
+        ++frames_a;
+    }, err);
+    CHECK(!id_a.empty());
+    const auto id_b = reg.admit(source, [&frames_b](const mm::AdmissionProgress&) {
+        ++frames_b;
+    }, err);
+    CHECK(!id_b.empty());
+
+    // THE assertion: one operation, not two. Before the fix these were distinct
+    // ids and both threads ran.
+    CHECK(id_a == id_b);
+
+    // The joiner gets a replayed frame immediately rather than waiting for the
+    // next stage boundary, which mid-convert can be twenty minutes away.
+    CHECK(frames_b.load() >= 1);
+
+    // And the registry lists ONE operation for the pair.
+    int matching = 0;
+    for (const auto& op : reg.operations())
+        if (op.source_ref == source) ++matching;
+    CHECK(matching == 1);
+
+    reg.cancel(id_a);
+    for (int i = 0; i < 100; ++i) {
+        const auto op = reg.operation(id_a);
+        if (op && op->done) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    const auto finished = reg.operation(id_a);
+    CHECK(finished.has_value());
+    // Exactly one terminal frame on every path — including cancelled-while-
+    // queued, which used to publish nothing at all and left a watcher waiting
+    // forever for an operation that had already stopped.
+    CHECK(finished->done);
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    return true;
+}
+
 bool test_desired_artifact_names_what_a_node_lacks() {
     // The distinction this exists to hold: what a node HAS versus what it
     // WANTS. `needs_artifact` was filled from installed_artifact(), which
@@ -6831,6 +6949,10 @@ int main(int argc, char** argv) {
          test_placement_refused_until_engine_config_exists},
         {"conformance_gates_placement_candidates",
          test_conformance_gates_placement_candidates},
+        {"admission_variant_is_the_collision_key",
+         test_admission_variant_is_the_collision_key},
+        {"concurrent_admission_of_one_model_joins_not_duplicates",
+         test_concurrent_admission_of_one_model_joins_not_duplicates},
         {"desired_artifact_names_what_a_node_lacks",
          test_desired_artifact_names_what_a_node_lacks},
         {"node_modal_ladder", test_node_modal_ladder},

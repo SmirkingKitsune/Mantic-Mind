@@ -13,6 +13,7 @@ add_executable(mantic-mind-control
     audio_player.cpp
     tts_service_client.cpp
     control_ui.cpp
+    admission_panels.cpp
     engine_panels.cpp
     soma_dashboard.cpp
     soma_panels.cpp
@@ -51,6 +52,17 @@ if(BUILD_TESTING)
     # Compiles the guarded TU directly rather than linking the control binary,
     # which is an executable. That also keeps the test honest about the TU's
     # dependencies: if a panel ever needed NodeRegistry, this would stop linking.
+    # The Admissions tab's renderers, drawn to an off-screen buffer and asserted
+    # as text. Compiles admission_panels.cpp directly — the panels are pure over
+    # a snapshot, so none of this needs a server, a registry, or a terminal.
+    add_executable(mm_admission_panels
+        ${CMAKE_CURRENT_SOURCE_DIR}/admission_panels.cpp
+        ${CMAKE_SOURCE_DIR}/tests/control/admission_panels_test.cpp)
+    target_link_libraries(mm_admission_panels PRIVATE
+        mm_common ftxui::screen ftxui::dom ftxui::component ${MM_PLATFORM_LIBS})
+    target_include_directories(mm_admission_panels PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME mm_admission_panels COMMAND mm_admission_panels)
+
     add_executable(mm_dashboard_g7
         ${CMAKE_CURRENT_SOURCE_DIR}/soma_dashboard.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/soma_panels.cpp

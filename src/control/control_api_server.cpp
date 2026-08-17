@@ -3356,6 +3356,92 @@ void ControlApiServer::register_routes() {
         res.set_content(R"({"status":"deleted"})", "application/json");
     });
 
+    // ── Placement lifecycle ───────────────────────────────────────────────────
+    //
+    // Suspend, restore, release. The scheduler has always been able to do all
+    // three — eviction under capacity pressure suspends, and ensure_agent_running
+    // restores a suspended placement rather than reloading — and the node API has
+    // always exposed /api/node/suspend-slot and /restore-slot. No /v1/* route
+    // could reach any of it, so an operator holding the entire control API could
+    // not do a thing the scheduler routinely does on its own.
+    //
+    // That is the P1 violation in the API's own words: "no internal-only
+    // capabilities". include/control/placement_engine.hpp called for promoting
+    // exactly these and is compiled by nothing (roadmap D46), so the note never
+    // became a route.
+
+    server_->Post("/v1/agents/:id/suspend", [this](const Request& req, Response& res) {
+        const std::string id = req.path_params.at("id");
+        if (!agents_.get_agent(id)) {
+            res.status = 404;
+            res.set_content(R"({"error":"no such agent"})", "application/json");
+            return;
+        }
+        if (!scheduler_.suspend_agent(id)) {
+            // 409 rather than 404: the agent exists, it simply has no live
+            // placement to suspend. Those are different states and an operator
+            // script needs to tell them apart.
+            res.status = 409;
+            res.set_content(nlohmann::json{{"error", "agent has no live placement to suspend"},
+                                           {"agent_id", id}}
+                                .dump(),
+                            "application/json");
+            return;
+        }
+        publish_activity(0, "Suspended agent " + id);
+        res.set_content(nlohmann::json{{"status", "suspended"}, {"agent_id", id}}.dump(),
+                        "application/json");
+    });
+
+    server_->Post("/v1/agents/:id/restore", [this](const Request& req, Response& res) {
+        const std::string id = req.path_params.at("id");
+        auto handle = agents_.get_agent(id);
+        if (!handle) {
+            res.status = 404;
+            res.set_content(R"({"error":"no such agent"})", "application/json");
+            return;
+        }
+        const AgentConfig cfg = handle->get_config();
+        handle.reset();
+
+        // Restore IS ensure_agent_running: its first step is "existing/suspended
+        // placement", so a suspended agent is restored from its checkpoint
+        // rather than reloaded from scratch. Adding a second path would be a
+        // second implementation of the placement ladder.
+        const auto placed = scheduler_.ensure_agent_running(cfg);
+        if (!placed) {
+            res.status = 409;
+            res.set_content(nlohmann::json{{"error", scheduler_.last_error()},
+                                           {"agent_id", id}}
+                                .dump(),
+                            "application/json");
+            return;
+        }
+        publish_activity(0, "Restored agent " + id + " on node " + placed->node_id);
+        res.set_content(nlohmann::json{{"status", "restored"},
+                                       {"agent_id", id},
+                                       {"node_id", placed->node_id},
+                                       {"slot_id", placed->slot_id}}
+                            .dump(),
+                        "application/json");
+    });
+
+    server_->Post("/v1/agents/:id/release", [this](const Request& req, Response& res) {
+        const std::string id = req.path_params.at("id");
+        if (!agents_.get_agent(id)) {
+            res.status = 404;
+            res.set_content(R"({"error":"no such agent"})", "application/json");
+            return;
+        }
+        // Idempotent by design: releasing an agent that holds nothing is a
+        // no-op, not an error. An operator clearing a stuck placement should not
+        // have to check first.
+        scheduler_.release_agent(id);
+        publish_activity(0, "Released agent " + id);
+        res.set_content(nlohmann::json{{"status", "released"}, {"agent_id", id}}.dump(),
+                        "application/json");
+    });
+
     auto voice_request_mentions_real_person = [](const VoiceDesignProposal& p) {
         const std::string text = util::to_lower(p.display_name + "\n" +
                                                 p.voice_description + "\n" +

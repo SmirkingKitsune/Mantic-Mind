@@ -35,6 +35,8 @@ GUARDED = [
     "src/control/soma_panels.cpp",
     "include/control/engine_panels.hpp",
     "src/control/engine_panels.cpp",
+    "include/control/admission_panels.hpp",
+    "src/control/admission_panels.cpp",
 ]
 
 # Includes that carry in-process state. Matched on the include PATH, so a header

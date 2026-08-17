@@ -22,7 +22,7 @@ rather than a missing endpoint.
 > API client can do it through the same route. There are no TUI-only features and no internal-only
 > capabilities.
 
-Base: `http://<control>:9090`. A separate OpenAI-compatibility listener runs on `:9091` (§10).
+Base: `http://<control>:9090`. A separate OpenAI-compatibility listener runs on `:9091` (§11).
 
 ---
 
@@ -194,7 +194,7 @@ nothing; safe to call for a node that could not host the model.
 ```
 
 Note `max_batch: 12` is **derived, not configured** — `cap_per_layer / expected_unique_experts_per_step`.
-See §6.
+See §7.
 
 ### `GET /v1/models/{id}/conformance` — `read`
 
@@ -287,7 +287,36 @@ RAM), so forcing `soma` is exactly what validates the seam against a second atte
 
 ---
 
-## 4. Cluster engine configuration
+## 4. Placement lifecycle
+
+Where an agent runs, and the three verbs that move it. `GET /v1/placements` reports the table;
+these change it.
+
+They exist because they were the clearest **P1 violation in the system**: the scheduler suspends
+agents on its own under capacity pressure, the node API has always exposed
+`/api/node/suspend-slot` and `/api/node/restore-slot`, and no `/v1/*` route could reach any of it.
+An operator holding the entire control API could not do a thing the scheduler does routinely.
+`include/control/placement_engine.hpp` argued for promoting exactly these — and is compiled by
+nothing (roadmap D46), so the argument never became a route.
+
+### `POST /v1/agents/{id}/suspend` — `operator`
+Checkpoint the agent's KV and free its slot, remembering the placement so a restore does not
+reload from scratch. `404` when the agent does not exist; **`409`** when it exists but holds no
+live placement — different states, and a script needs to tell them apart.
+
+### `POST /v1/agents/{id}/restore` — `operator`
+Bring a suspended agent back. This *is* `ensure_agent_running`: its first step is
+"existing/suspended placement", so a suspended agent restores from its checkpoint rather than
+reloading. A second code path would be a second implementation of the placement ladder. Returns
+the `node_id` and `slot_id` it landed on; `409` with the scheduler's reason when it cannot place.
+
+### `POST /v1/agents/{id}/release` — `operator`
+Drop the placement entirely. **Idempotent**: releasing an agent that holds nothing is a no-op, not
+an error — an operator clearing a stuck placement should not have to check first.
+
+---
+
+## 5. Cluster engine configuration
 
 What the cluster is configured to RUN, as opposed to what is running. Namespaced under
 `/v1/cluster/` because `/v1/engines` is already taken and means a live engine *process* on some
@@ -356,11 +385,11 @@ its own platform and arch, because control's view of a node is a report from tha
 
 ---
 
-## 5. Runtime telemetry
+## 6. Runtime telemetry
 
 ### `GET /v1/engines` — `read`
 Live engines cluster-wide, with a tier-occupancy summary per engine. **Engine processes**, not
-engine kinds — see §4 for the configuration surface.
+engine kinds — see §5 for the configuration surface.
 
 ### `GET /v1/engines/{engine_id}/telemetry` — `read` — **SSE**
 
@@ -400,7 +429,7 @@ Non-streaming snapshot, same shape as the `heat` frame.
 
 ---
 
-## 6. Concurrency and slots
+## 7. Concurrency and slots
 
 ### `GET /v1/engines/{engine_id}/slots` — `read`
 
@@ -436,7 +465,7 @@ its first sequence and **silently discards the rest**. The rebuild makes that an
 
 ---
 
-## 7. Determinism
+## 8. Determinism
 
 Quantized integer kernels are shape-dependent: batched and single-row forwards round differently, and at
 int4 that can flip argmax ties. **A greedy request's exact token stream can therefore depend on who else
@@ -470,7 +499,7 @@ the API surface** rather than only in a document — which was the actual requir
 
 ---
 
-## 8. Errors
+## 9. Errors
 
 Uniform envelope. Machine-readable `code` first, prose second.
 
@@ -501,7 +530,7 @@ fails.
 
 ---
 
-## 9. Scope map for the existing surface
+## 10. Scope map for the existing surface
 
 All 51 pre-existing routes, annotated. Unchanged in shape; this is the retrofit.
 
@@ -523,7 +552,7 @@ the `/v1` scope gate, as today.
 
 ---
 
-## 10. OpenAI-compatibility listener (`:9091`)
+## 11. OpenAI-compatibility listener (`:9091`)
 
 Unchanged: `GET /v1/models`, `GET /v1/models/:model`, `POST /v1/chat/completions`. Still gates every path
 with a flat token — clients expecting OpenAI semantics do not expect scopes, and adding them would break
@@ -537,7 +566,7 @@ surface on `:9090` carries all four event types.
 
 ---
 
-## 11. SSE semantics
+## 12. SSE semantics
 
 Chat (`POST /v1/agents/:id/chat`) is unchanged:
 
@@ -559,7 +588,7 @@ Two defects in the current node-side mapping are fixed rather than carried forwa
 
 Exactly one `done` is always delivered, on every path including error — that guarantee is preserved.
 
-**Telemetry streams are separate from chat streams** and are rate-limited independently (§5). A client
+**Telemetry streams are separate from chat streams** and are rate-limited independently (§6). A client
 subscribing to both gets chat at production rate and telemetry at `hz`.
 
 ---

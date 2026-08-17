@@ -99,6 +99,8 @@ static mm::ControlConfig load_config(
         cfg.sources_dir           = file.get("sources_dir",           cfg.sources_dir);
         cfg.admission_allow_pickle =
             file.get_bool("admission_allow_pickle", cfg.admission_allow_pickle);
+        cfg.admission_max_concurrent =
+            file.get_int("admission_max_concurrent", cfg.admission_max_concurrent);
         cfg.admission_quant       = file.get("admission_quant",       cfg.admission_quant);
         cfg.admission_expert_down = file.get("admission_expert_down", cfg.admission_expert_down);
         cfg.log_file    = file.get("log_file",   cfg.log_file);
@@ -161,6 +163,10 @@ static mm::ControlConfig load_config(
     cfg.sources_dir           = env("MM_SOURCES_DIR",      cfg.sources_dir);
     cfg.admission_allow_pickle =
         env_bool("MM_ADMISSION_ALLOW_PICKLE", cfg.admission_allow_pickle);
+    // env_int already keeps the current value on an unparseable string, so a
+    // garbage knob does not stop a cluster head from booting.
+    cfg.admission_max_concurrent =
+        env_int("MM_ADMISSION_MAX_CONCURRENT", cfg.admission_max_concurrent);
     cfg.admission_quant       = env("MM_ADMISSION_QUANT",  cfg.admission_quant);
     cfg.log_file    = env("MM_LOG_FILE",    cfg.log_file);
     cfg.models_dir  = env("MM_MODELS_DIR",  cfg.models_dir);
@@ -339,6 +345,9 @@ static void print_control_usage() {
         << "  nodes pair complete <url> <nonce> <pin_or_psk> [remember]\n"
         << "  nodes pair psk <url> [psk] [remember]\n"
         << "  models list\n"
+        << "  models admit <source> [expert_gate] [expert_down] [group]\n"
+        << "  models admissions\n"
+        << "  models cancel <operation_id>\n"
         << "  engines show\n"
         << "  engines conform\n"
         << "  engines setup\n"
@@ -346,6 +355,8 @@ static void print_control_usage() {
         << "  engines resync\n"
         << "  engines share <fingerprint> <target_node_id> [source_node_id]\n"
         << "  agents list|show|create|update|delete ...\n"
+        << "  agents suspend|restore|release <agent_id>\n"
+        << "  placements\n"
         << "  chat send <agent_id> <message> [conversation_id]\n"
         << "  curation conv ...\n"
         << "  curation mem ...\n"
@@ -777,17 +788,95 @@ static void run_control_cli(uint16_t listen_port,
         }
 
         if (cmd0 == "models") {
-            if (tokens.size() >= 2 && mm::util::to_lower(tokens[1]) != "list") {
-                printer.line("usage: models [list]");
+            const std::string sub =
+                tokens.size() < 2 ? std::string{"list"} : mm::util::to_lower(tokens[1]);
+            if (sub == "list") {
+                emit_http_result("models list", self.get("/v1/models"));
                 continue;
             }
-            emit_http_result("models list", self.get("/v1/models"));
+            if (sub == "admissions") {
+                emit_http_result("models admissions", self.get("/v1/models/admissions"));
+                continue;
+            }
+            if (sub == "cancel") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: models cancel <operation_id>");
+                    continue;
+                }
+                emit_http_result("models cancel",
+                                 self.post("/v1/models/admissions/" + tokens[2] + "/cancel",
+                                           nlohmann::json::object()));
+                continue;
+            }
+            if (sub == "admit") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: models admit <source> [expert_gate] [expert_down] [group]");
+                    continue;
+                }
+                nlohmann::json body{{"source", tokens[2]}};
+                nlohmann::json quant = nlohmann::json::object();
+                if (tokens.size() > 3 && !tokens[3].empty()) quant["expert_gate"] = tokens[3];
+                if (tokens.size() > 4 && !tokens[4].empty()) quant["expert_down"] = tokens[4];
+                if (tokens.size() > 5) {
+                    try { quant["group"] = std::stoi(tokens[5]); } catch (...) {}
+                }
+                if (!quant.empty()) body["quantization"] = quant;
+
+                // The route answers ONLY as a stream, and this admission runs
+                // for hours. So the id is read off the first frame and the
+                // stream dropped — control logs "client disconnected;
+                // conversion continues" and the worker is detached precisely so
+                // it outlives the request. `models admissions` is how you watch
+                // it afterwards, which is also what makes this survive closing
+                // the REPL.
+                std::string op_id;
+                int status = 0;
+                std::string error_body;
+                const bool connected = self.stream_post(
+                    "/v1/models/admit", body,
+                    [&op_id](const std::string& line) {
+                        const auto pos = line.find("data:");
+                        if (pos == std::string::npos) return true;
+                        try {
+                            const auto j =
+                                nlohmann::json::parse(mm::util::trim(line.substr(pos + 5)));
+                            const auto id = j.value("operation_id", std::string{});
+                            if (!id.empty()) { op_id = id; return false; }
+                        } catch (...) {
+                        }
+                        return true;
+                    },
+                    &status, &error_body);
+
+                if (!op_id.empty()) {
+                    emit_result(true, "models admit",
+                                nlohmann::json{{"operation_id", op_id},
+                                               {"source", tokens[2]},
+                                               {"watch", "models admissions"}},
+                                "");
+                } else {
+                    std::string why = error_body;
+                    try {
+                        const auto j = nlohmann::json::parse(error_body);
+                        if (j.contains("error")) why = j["error"].get<std::string>();
+                    } catch (...) {
+                    }
+                    if (why.empty())
+                        why = connected ? "admission started but reported no operation id"
+                                        : "cannot reach control (HTTP " +
+                                              std::to_string(status) + ")";
+                    emit_result(false, "models admit", nlohmann::json::object(), why);
+                }
+                continue;
+            }
+            printer.line("usage: models list|admit|admissions|cancel ...");
             continue;
         }
 
         if (cmd0 == "agents") {
             if (tokens.size() < 2) {
-                printer.line("usage: agents list|show|create|update|delete ...");
+                printer.line(
+                    "usage: agents list|show|create|update|delete|suspend|restore|release ...");
                 continue;
             }
             const std::string sub = mm::util::to_lower(tokens[1]);
@@ -832,6 +921,19 @@ static void run_control_cli(uint16_t listen_port,
                 } catch (const std::exception& e) {
                     printer.line(std::string("error: invalid JSON: ") + e.what());
                 }
+                continue;
+            }
+            // Placement lifecycle. These three had no /v1 route at all until the
+            // parity audit: the scheduler could do them and the node API exposed
+            // them, and no client could ask for them.
+            if (sub == "suspend" || sub == "restore" || sub == "release") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: agents " + sub + " <agent_id>");
+                    continue;
+                }
+                emit_http_result("agents " + sub,
+                                 self.post("/v1/agents/" + tokens[2] + "/" + sub,
+                                           nlohmann::json::object()));
                 continue;
             }
             if (sub == "delete") {
@@ -1006,6 +1108,13 @@ static void run_control_cli(uint16_t listen_port,
             continue;
         }
 
+        // GET /v1/placements had no CLI reader at all — the one route that says
+        // where every agent actually is.
+        if (cmd0 == "placements") {
+            emit_http_result("placements", self.get("/v1/placements"));
+            continue;
+        }
+
         if (cmd0 == "activity") {
             if (tokens.size() < 2 || mm::util::to_lower(tokens[1]) != "tail") {
                 printer.line("usage: activity tail [n] [level]");
@@ -1134,6 +1243,8 @@ int main(int argc, char** argv) {
             tools.quant = cfg.admission_quant;
             tools.expert_down = cfg.admission_expert_down;
             model_registry.set_tools(tools);
+            model_registry.set_max_concurrent_admissions(
+                static_cast<std::size_t>(std::max(1, cfg.admission_max_concurrent)));
             MM_INFO("Model registry: {} models, schema v{}",
                     model_registry.list().size(), model_registry.schema_version());
         }

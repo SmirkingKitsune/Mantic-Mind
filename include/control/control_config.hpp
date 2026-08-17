@@ -34,6 +34,11 @@ struct ControlConfig {
     // conversion has to unpickle — i.e. execute. Opt-in per deployment.
     bool admission_allow_pickle      = false;              // MM_ADMISSION_ALLOW_PICKLE
 
+    // How many admissions may run at once; the rest queue. 1 by default —
+    // a conversion moves tens to hundreds of GB, so two on one box contend
+    // for the same disk rather than going twice as fast.
+    int  admission_max_concurrent    = 1;                  // MM_ADMISSION_MAX_CONCURRENT
+
     // Optional bearer token required by external /v1/* client routes.
     std::string external_api_token;
 

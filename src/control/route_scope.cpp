@@ -197,6 +197,18 @@ std::vector<RouteScope> route_scope_table() {
         {"GET", "/v1/nodes", Scope::Read},
         {"GET", "/v1/nodes/discovered", Scope::Read},
         {"GET", "/v1/placements", Scope::Read},
+
+        // ── placement lifecycle ──────────────────────────────────────────────
+        //
+        // Operator, all three: each moves a live model in or out of a node slot
+        // and can take a running agent offline. Read-only /v1/placements above
+        // was the ONLY placement surface — the verbs existed inside the
+        // scheduler and on the node API, and no /v1 route could reach them,
+        // which is the "no internal-only capabilities" half of P1 going
+        // unenforced.
+        {"POST", "/v1/agents/:id/suspend", Scope::Operator},
+        {"POST", "/v1/agents/:id/restore", Scope::Operator},
+        {"POST", "/v1/agents/:id/release", Scope::Operator},
         {"GET", "/v1/performance", Scope::Read},
         {"GET", "/v1/activity", Scope::Read},
         {"POST", "/v1/nodes", Scope::Operator},

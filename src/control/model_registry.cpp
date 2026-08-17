@@ -32,6 +32,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <condition_variable>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -82,6 +83,33 @@ bool valid_repo_component(const std::string& c) {
 }
 
 } // namespace
+
+std::string admission_source_name(const std::string& source, bool needs_fetch) {
+    // The trailing component either way — a repo id `Qwen/Qwen3-30B-A3B` and a
+    // directory `.../Qwen3-30B-A3B` are the same model and must produce the same
+    // container, or admitting one after the other silently makes two.
+    if (!needs_fetch) return fs::path(source).filename().string();
+    auto id = source;
+    if (const auto at = id.rfind('@'); at != std::string::npos) id = id.substr(0, at);
+    const auto slash = id.find_last_of('/');
+    return (slash == std::string::npos) ? id : id.substr(slash + 1);
+}
+
+std::string admission_variant(const std::string& source,
+                              bool needs_fetch,
+                              const AdmissionTools& tools) {
+    const auto name = admission_source_name(source, needs_fetch);
+    // The QUANTIZATION is part of the directory name, not just the record.
+    //
+    // Without it, admitting the same weights at q4_g and again at q6_g wrote both
+    // to `containers/<name>` — the second overwrote the first, and the first's
+    // registry row then pointed at bytes that were no longer the quantization it
+    // described. The verdict, the expert_bytes, the KV format: all recorded
+    // against a container that had been replaced underneath them, with nothing
+    // to detect it.
+    return name + "-" + tools.quant + "-" + tools.expert_down + "-g" +
+           std::to_string(tools.group);
+}
 
 bool valid_repo_id(const std::string& ref, std::string& out_why) {
     auto id = util::trim(ref);
@@ -170,6 +198,14 @@ struct AdmissionOperation {
     std::vector<AdmissionProgressSink> sinks;
     std::atomic<bool> cancel{false};
     std::thread worker;
+
+    /// The container directory this operation will write, and therefore what it
+    /// collides with. Empty for an operation that writes no container.
+    std::string variant;
+    /// Still holding a concurrency slot? Cleared when the worker finishes, so a
+    /// completed operation stops counting against the cap without being erased
+    /// from the history the API serves.
+    bool occupying_slot = false;
 };
 
 struct ControlModelRegistry::Impl {
@@ -182,6 +218,47 @@ struct ControlModelRegistry::Impl {
     mutable std::mutex ops_mu;
     std::map<std::string, std::shared_ptr<AdmissionOperation>> ops;
     std::vector<std::string> op_order; ///< newest last
+
+    /// How many admissions may RUN at once. Everything past this waits in
+    /// `admission_gate` and reports `queued` until a slot frees.
+    ///
+    /// One by default, and that is a deliberate choice rather than a
+    /// placeholder. A conversion spawns Python and moves tens to hundreds of
+    /// gigabytes; two at once on one box do not go twice as fast, they contend
+    /// for the same disk and the same RAM and can take each other out. Admission
+    /// is a once-per-model operation, so serializing costs latency nobody is
+    /// waiting on interactively — and the operation already had a `queued` state
+    /// it never actually used.
+    ///
+    /// Raiseable for a host that really can run two, which is why it is a field
+    /// rather than a constant.
+    std::size_t max_concurrent_admissions = 1;
+    std::condition_variable admission_gate;
+
+    /// Operations counted against `max_concurrent_admissions`. Call with ops_mu.
+    std::size_t running_admissions_locked() const {
+        std::size_t n = 0;
+        for (const auto& [id, op] : ops)
+            if (op && op->occupying_slot) ++n;
+        return n;
+    }
+
+    /// The live operation writing `variant`, or nullptr. Call with ops_mu.
+    ///
+    /// Keyed on the container directory rather than the source string, because
+    /// that is what actually collides: two different-looking refs for one model
+    /// resolve to one directory, and two `convert.py` processes interleaving
+    /// writes into it produce a corrupt container with a registry row calling it
+    /// good.
+    std::shared_ptr<AdmissionOperation> live_for_variant_locked(const std::string& variant) const {
+        if (variant.empty()) return nullptr;
+        for (const auto& [id, op] : ops) {
+            if (!op || op->variant != variant) continue;
+            if (op->progress.done) continue;
+            return op;
+        }
+        return nullptr;
+    }
 
     /// Publish a progress update to every attached sink.
     ///
@@ -959,6 +1036,24 @@ void ControlModelRegistry::set_tools(const AdmissionTools& tools) {
     impl_->tools = tools;
 }
 
+void ControlModelRegistry::set_max_concurrent_admissions(std::size_t n) {
+    {
+        std::lock_guard<std::mutex> lk(impl_->ops_mu);
+        // Zero would park every admission on a gate nothing can open — a
+        // configuration that reads as "pause admissions" and behaves as "hang
+        // them forever".
+        impl_->max_concurrent_admissions = std::max<std::size_t>(1, n);
+    }
+    // Raising the cap must release whoever is already waiting, or the new value
+    // takes effect only after the next admission happens to finish.
+    impl_->admission_gate.notify_all();
+}
+
+std::size_t ControlModelRegistry::max_concurrent_admissions() const {
+    std::lock_guard<std::mutex> lk(impl_->ops_mu);
+    return impl_->max_concurrent_admissions;
+}
+
 AdmissionTools ControlModelRegistry::tools() const {
     std::lock_guard<std::mutex> lk(impl_->mu);
     return impl_->tools;
@@ -998,11 +1093,17 @@ bool ControlModelRegistry::attach_sink(const std::string& operation_id,
 }
 
 bool ControlModelRegistry::cancel(const std::string& operation_id) {
-    std::lock_guard<std::mutex> lk(impl_->ops_mu);
-    auto it = impl_->ops.find(operation_id);
-    if (it == impl_->ops.end()) return false;
-    if (it->second->progress.done) return false;   // too late is not a failure to report
-    it->second->cancel.store(true);
+    {
+        std::lock_guard<std::mutex> lk(impl_->ops_mu);
+        auto it = impl_->ops.find(operation_id);
+        if (it == impl_->ops.end()) return false;
+        if (it->second->progress.done) return false; // too late is not a failure to report
+        it->second->cancel.store(true);
+    }
+    // Wakes an operation still WAITING for a concurrency slot. Without this a
+    // queued admission would sit on the gate until some other operation
+    // finished, long after it was told to stop.
+    impl_->admission_gate.notify_all();
     return true;
 }
 
@@ -1102,6 +1203,12 @@ std::string ControlModelRegistry::start_operation(const std::string& source,
     const bool needs_fetch = !container_is_ready && !fs::exists(source, ec);
     const auto stages = admission_stages(container_is_ready, needs_fetch);
 
+    // What this operation will WRITE, and therefore what it collides with.
+    // Container admissions and reprofiles target an existing directory and are
+    // not conversions, so they carry no variant and cannot collide this way.
+    const std::string variant =
+        container_is_ready ? std::string{} : admission_variant(source, needs_fetch, tools_copy);
+
     auto op = std::make_shared<AdmissionOperation>();
     op->progress.operation_id = id;
     op->progress.stage = stages.front();
@@ -1109,17 +1216,98 @@ std::string ControlModelRegistry::start_operation(const std::string& source,
     op->progress.total_steps = static_cast<int>(stages.size());
     op->progress.source_ref = source;
     op->progress.started_at_ms = util::now_ms();
+    op->variant = variant;
     // The sink is attached BEFORE the thread starts, so the first frames cannot
     // be produced before anyone is listening for them.
     if (sink) op->sinks.push_back(std::move(sink));
+    // ── Duplicate in flight ───────────────────────────────────────────────────
+    //
+    // JOIN it rather than refuse. The caller asked for this model to be admitted
+    // and it is being admitted; handing back the running operation's id — with
+    // their sink attached — gives them the progress stream they wanted, and
+    // gives the second caller of a double-clicked button the right answer
+    // instead of an error.
+    //
+    // Refusing would also be defensible. Starting a second is not, and that is
+    // what happened: two convert.py processes interleaved writes into one
+    // directory, and the loser's registry row described bytes the winner had
+    // replaced.
     {
-        std::lock_guard<std::mutex> lk(ops_mu_ref());
-        impl_->ops[id] = op;
-        impl_->op_order.push_back(id);
+        std::shared_ptr<AdmissionOperation> live;
+        AdmissionProgress replay;
+        std::vector<AdmissionProgressSink> joined;
+        {
+            std::lock_guard<std::mutex> lk(ops_mu_ref());
+            live = impl_->live_for_variant_locked(variant);
+            if (live) {
+                for (auto& s : op->sinks)
+                    if (s) {
+                        live->sinks.push_back(s);
+                        joined.push_back(std::move(s));
+                    }
+                replay = live->progress;
+            } else {
+                impl_->ops[id] = op;
+                impl_->op_order.push_back(id);
+            }
+        }
+        if (live) {
+            const auto joined_id = replay.operation_id;
+            // Replayed OUTSIDE the lock, following publish()'s rule: a sink
+            // writes to a socket, and a slow client holding ops_mu would stall
+            // the conversion it just joined. The replay exists because a joiner
+            // arriving mid-convert would otherwise see nothing until the next
+            // stage boundary, which can be twenty minutes away.
+            for (const auto& s : joined)
+                if (s) s(replay);
+            MM_INFO("admission: joined in-flight operation {} for '{}' (variant '{}')",
+                    joined_id, source, variant);
+            return joined_id;
+        }
     }
 
     op->worker = std::thread([this, op, source, tools_copy, container_is_ready] {
-        run_admission(op, source, tools_copy, container_is_ready);
+        // ── Concurrency gate ──────────────────────────────────────────────────
+        //
+        // Waited on HERE rather than in start_operation, so the caller's request
+        // returns immediately with an operation id and the wait shows up as
+        // `queued` in the progress stream. Blocking the HTTP thread until a slot
+        // freed would turn a queued admission into a hung request.
+        {
+            std::unique_lock<std::mutex> lk(ops_mu_ref());
+            impl_->admission_gate.wait(lk, [this, &op] {
+                return op->cancel.load() ||
+                       impl_->running_admissions_locked() < impl_->max_concurrent_admissions;
+            });
+            // Claimed under the same lock the predicate was evaluated under, so
+            // two waiters cannot both see a free slot and both take it.
+            if (!op->cancel.load()) op->occupying_slot = true;
+        }
+
+        if (op->cancel.load()) {
+            // Cancelled while still QUEUED, so run_admission never ran and never
+            // published a terminal frame. Exactly one `done` is delivered on
+            // every path — the API's stated guarantee — and a watcher that got
+            // none would wait forever for an operation that had already stopped.
+            auto progress = op->progress;
+            progress.detail = "canceled before it started";
+            progress.last_error = "canceled";
+            progress.canceled = true;
+            progress.done = true;
+            progress.cancelable = false;
+            progress.finished_at_ms = util::now_ms();
+            impl_->publish(op, progress);
+        } else {
+            run_admission(op, source, tools_copy, container_is_ready);
+        }
+
+        // Released on EVERY path — cancel included — or one stuck admission
+        // would wedge every queued one behind it forever.
+        {
+            std::lock_guard<std::mutex> lk(ops_mu_ref());
+            op->occupying_slot = false;
+        }
+        impl_->admission_gate.notify_all();
     });
     // Detached because the operation outlives its request by design: a client
     // that disconnects mid-conversion must not cancel it, and joining here would
@@ -1162,27 +1350,13 @@ void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
 
     const fs::path tools_dir(tools.tools_dir);
 
-    // The model's name comes from the trailing component either way — a repo id
-    // `Qwen/Qwen3-30B-A3B` and a directory `.../Qwen3-30B-A3B` are the same
-    // model and must produce the same container, or admitting one after the
-    // other silently makes two.
-    auto name = fs::path(source).filename().string();
-    if (needs_fetch) {
-        auto id = source;
-        if (const auto at = id.rfind('@'); at != std::string::npos) id = id.substr(0, at);
-        const auto slash = id.find_last_of('/');
-        name = (slash == std::string::npos) ? id : id.substr(slash + 1);
-    }
-    // The QUANTIZATION is part of the directory name, not just the record.
-    //
-    // Without it, admitting the same weights at q4_g and again at q6_g wrote both
-    // to `containers/<name>` — the second overwrote the first, and the first's
-    // registry row then pointed at bytes that were no longer the quantization it
-    // described. The verdict, the expert_bytes, the KV format: all recorded
-    // against a container that had been replaced underneath them, with nothing
-    // to detect it.
-    const auto variant = name + "-" + tools.quant + "-" + tools.expert_down + "-g" +
-                         std::to_string(tools.group);
+    // Derived by the shared helper, which start_operation() also uses as the
+    // in-flight collision key. Deriving it twice is how a guard ends up watching
+    // a different directory from the one being written.
+    const auto variant = admission_variant(source, needs_fetch, tools);
+    // The fetch destination shares the same name rule, so the two cannot
+    // disagree about which model this is.
+    const auto name = admission_source_name(source, needs_fetch);
     const auto container = (fs::path(tools.containers_dir) / variant).string();
 
     // What conversion actually reads. For a local source that is the source; for

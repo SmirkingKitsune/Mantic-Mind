@@ -8,6 +8,7 @@
 // translation unit precisely so they CANNOT reach the three registries this
 // file holds by reference; tools/ci/check_ui_api.py enforces that.
 #include "control/soma_dashboard.hpp"
+#include "control/admission_panels.hpp"
 #include "control/engine_panels.hpp"
 #include "control/soma_panels.hpp"
 #include "common/agent.hpp"
@@ -202,6 +203,7 @@ void ControlUI::run() {
     int tab_index = 0;
     int soma_selected = 0;
     int engine_selected = 0;
+    int admission_selected = 0;
     // Owned here rather than inside the tab: the same fact drives the
     // banner on every other tab, and two owners is how those disagree.
     bool force_engine_setup = false;
@@ -3102,15 +3104,23 @@ void ControlUI::run() {
     engine_dashboard.start(1000);
     auto engines_renderer = engine_tab(engine_dashboard, engine_selected, force_engine_setup);
 
+    // Admission is the longest operation in the system — hours, hundreds of GB —
+    // and until now it had a full progress/cancel/rejoin protocol and no surface
+    // that could show it (roadmap D47). Polled, not streamed, so reopening the
+    // TUI mid-conversion rejoins with no protocol on this side.
+    AdmissionDashboard admission_dashboard(control_base_url_, control_api_token_);
+    admission_dashboard.start(1000);
+    auto admissions_renderer = admission_tab(admission_dashboard, admission_selected);
+
     auto main_tabs = Container::Tab({nodes_renderer, agents_renderer, activity_renderer,
         chat_renderer, curation_renderer, performance_renderer, voice_renderer,
-        soma_renderer, engines_renderer}, &tab_index);
+        soma_renderer, engines_renderer, admissions_renderer}, &tab_index);
 
     // Mockup-style header: the tab strip is real Button components (clickable +
     // focusable) rendered as `n Label` chips, the active one inverted.
-    static const std::array<const char*, 9> kTabLabels = {
+    static const std::array<const char*, 10> kTabLabels = {
         "1 Nodes", "2 Agents", "3 Activity", "4 Chat", "5 Curation", "6 Performance", "7 Voice",
-        "8 Soma", "9 Engines"};
+        "8 Soma", "9 Engines", "0 Admissions"};
     Components tab_buttons;
     for (int i = 0; i < static_cast<int>(kTabLabels.size()); ++i) {
         ButtonOption opt = ButtonOption::Simple();
@@ -3150,7 +3160,7 @@ void ControlUI::run() {
             text(" "),
         });
         auto footer = hbox({
-            text(" 1-9 tabs · ↑/↓ select · click rows · q quit") | dim,
+            text(" 1-9,0 tabs · ↑/↓ select · click rows · q quit") | dim,
             filler(),
             text("mantic-mind · control ") | dim,
         });
@@ -3186,6 +3196,7 @@ void ControlUI::run() {
             if (ev == Event::Character('7')) { tab_index = 6; return true; }
             if (ev == Event::Character('8')) { tab_index = 7; return true; }
             if (ev == Event::Character('9')) { tab_index = 8; return true; }
+            if (ev == Event::Character('0')) { tab_index = 9; return true; }
             if (ev == Event::Character('5')) { tab_index = 4; return true; }
             if (ev == Event::Character('f') && tab_index == 0) {
                 forget_selected_node();

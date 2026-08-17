@@ -148,6 +148,31 @@ struct AdmissionTools {
 /// only through a download that fails.
 bool valid_repo_id(const std::string& ref, std::string& out_why);
 
+/// The model name that both the container variant and the fetch destination are
+/// built from.
+///
+/// The trailing component either way — a repo id `Qwen/Qwen3-30B-A3B` and a
+/// directory `.../Qwen3-30B-A3B` are the same model and must produce the same
+/// container, or admitting one after the other silently makes two. Shared so
+/// `sources/<name>` and `containers/<name>-…` cannot disagree about which model
+/// a ref denotes.
+std::string admission_source_name(const std::string& source, bool needs_fetch);
+
+/// The container directory name an admission of `source` will write:
+/// `<name>-<quant>-<expert_down>-g<group>`.
+///
+/// Extracted because it is the COLLISION KEY as well as the write path, and the
+/// two must not be able to disagree. run_admission derived it inline; adding a
+/// second derivation for the in-flight check would have been the same defect one
+/// layer up — a guard watching a different directory from the one being written
+/// is a guard that passes while the corruption happens.
+///
+/// Pure, so the identity rule ("these two refs are one model") can be asserted
+/// without converting anything.
+std::string admission_variant(const std::string& source,
+                              bool needs_fetch,
+                              const AdmissionTools& tools);
+
 /// One row of api_token. The token itself is NEVER stored — only its SHA-256 —
 /// so a leaked database backup does not hand over working credentials.
 struct ApiToken {
@@ -170,6 +195,18 @@ public:
     void close();
 
     void set_tools(const AdmissionTools& tools);
+
+    /// How many admissions may RUN at once; the rest wait and report `queued`.
+    ///
+    /// One by default. A conversion spawns Python and moves tens to hundreds of
+    /// gigabytes, so two on one box do not go twice as fast — they contend for
+    /// the same disk and RAM. Before this there was no limit at all: every
+    /// `admit()` detached a thread, so N requests meant N conversions.
+    ///
+    /// Clamped to at least 1, because 0 would deadlock every admission on a gate
+    /// nothing can open.
+    void set_max_concurrent_admissions(std::size_t n);
+    std::size_t max_concurrent_admissions() const;
     AdmissionTools tools() const;
 
     /// Every admission this process has run, newest first. Survives the SSE

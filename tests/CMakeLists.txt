@@ -106,6 +106,21 @@ if(Python3_Interpreter_FOUND)
                      "${CMAKE_SOURCE_DIR}/tools/ci/check_api_docs.py"
                      "${CMAKE_SOURCE_DIR}")
 
+    # P1's other half. check_api_docs walks docs -> scope table and check_ui_api
+    # walks panel includes; neither asks whether a capability the TUI or CLI can
+    # reach is reachable through /v1 at all.
+    #
+    # It was not: AgentScheduler::suspend_agent was private, the node API had
+    # /api/node/suspend-slot, and no /v1 route could reach either — so an
+    # operator holding the whole control API could not suspend an agent while
+    # the scheduler did it on its own under capacity pressure.
+    # placement_engine.hpp said exactly that in a comment, and is compiled by
+    # nothing (roadmap D46), so nothing failed.
+    add_test(NAME mm_surface_parity
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_SOURCE_DIR}/tools/ci/check_surface_parity.py"
+                     "${CMAKE_SOURCE_DIR}")
+
     # Pure, no network, no huggingface_hub: which files a repo transfer takes is
     # both the economic argument for this stage and its safety boundary.
     add_test(NAME mm_fetch_selection
