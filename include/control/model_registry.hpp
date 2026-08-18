@@ -185,6 +185,30 @@ struct ApiToken {
     bool revoked = false;
 };
 
+/// One row of `placement_history` — where an agent ran, on what engine, and why.
+///
+/// The reason is the same composed string the scheduler acted on
+/// (`BackendDecision::explain()`), not a reconstruction, which is the whole
+/// point of recording it at placement time: after the fact the admission record
+/// may have changed and the decision would no longer be re-derivable.
+struct PlacementHistoryEntry {
+    NodeId node_id;
+    SlotId slot_id;
+    std::string backend;
+    std::string backend_reason;
+    std::int64_t vram_mb = 0;
+    std::int64_t ram_mb = 0;
+    std::int64_t disk_mb = 0;
+    std::int64_t placed_at_ms = 0;
+
+    /// 0 while the placement is still live. The column is nullable and this is
+    /// not; zero reads as "still open" everywhere it is rendered, and an epoch
+    /// timestamp of 0 is not a plausible real value.
+    std::int64_t released_at_ms = 0;
+
+    bool open() const noexcept { return released_at_ms == 0; }
+};
+
 class ControlModelRegistry {
 public:
     ControlModelRegistry();
@@ -328,6 +352,22 @@ public:
                           const std::string& backend,
                           const std::string& backend_reason,
                           const ResourceFootprint& footprint);
+
+    /// Close the agent's most recent open row. Idempotent: an agent with no open
+    /// row is a no-op, not an error, because a release can legitimately arrive
+    /// for a placement this process never recorded (control restarted).
+    void mark_placement_released(const AgentId& agent_id);
+
+    /// The agent's placement history, newest first, at most `limit` rows.
+    ///
+    /// A READER is what makes the writer worth having. The table, its index and
+    /// `record_placement()` all shipped with no caller and no query — a schema
+    /// created on every start for a history nothing recorded and nothing could
+    /// read (roadmap D60). Wiring only the writer would have been worse: an
+    /// unbounded write-only table is a capability with no way to reach it, which
+    /// is the thing P1 exists to forbid.
+    std::vector<PlacementHistoryEntry> placement_history(const AgentId& agent_id,
+                                                         int limit = 20) const;
 
     std::string reprofile(std::int64_t id, AdmissionProgressSink sink, std::string& out_error);
     /// Watch an operation that is already running.

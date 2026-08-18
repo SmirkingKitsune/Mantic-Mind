@@ -299,6 +299,41 @@ override would evaporate on the next eviction cycle and read as a flapping bug.
 This is also how G4 runs: DeepSeek-V2-Lite at q4 admits as `resident-only` (7.2 GB routed set fits in
 RAM), so forcing `soma` is exactly what validates the seam against a second attention family.
 
+### `GET /v1/agents/{id}` — `read`
+
+Beyond the agent's config, placement and status, this route carries **the routing decision and the
+agent's placement history**:
+
+```jsonc
+{ "id": "agent-1", "name": "…", /* …config… */
+  "status": "active",
+  "placement": { /* … */ },
+  "node_compatibility": { /* … */ },
+
+  // WHICH engine would serve this agent, and WHY. Computed by the same pure
+  // function the scheduler acts on, so asking causes no placement.
+  "backend": "soma",
+  "backend_reason": "soma (verdict=hybrid)",
+
+  // Where it has run before, newest first, at most 20 rows.
+  "placement_history": [{
+    "node_id": "node-b", "slot_id": "slot-7",
+    "backend": "soma", "backend_reason": "soma (verdict=stream)",
+    "footprint": { "vram_mb": 0, "ram_mb": 19840, "disk_mb": 14848 },
+    "placed_at_ms": 1755400000000,
+    "released_at_ms": 0,          // 0 = still open, never null
+    "open": true
+  }] }
+```
+
+`backend`/`backend_reason` were **promised by this route's own header comment and never emitted**
+(roadmap D61). `placement_history` reads the `placement_history` table, whose writer and index
+shipped with no caller and no query (roadmap D60) — a row is inserted when an agent acquires a slot
+(fresh load or restore-from-suspend, not on a refresh of an unchanged placement) and closed when the
+placement ends. It lives on this route rather than behind `GET /v1/agents/{id}/placements` on
+purpose: the index is already `(agent_id, placed_at DESC)`, and reusing a route that CLI and TUI
+already reach keeps both parity directions at zero without inventing a surface for one reader.
+
 ---
 
 ## 4. Placement lifecycle

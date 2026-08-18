@@ -1589,6 +1589,26 @@ int main(int argc, char** argv) {
     // against one table rather than a cached copy that can disagree with itself.
     scheduler.set_model_registry(&model_registry);
 
+    // The audit trail. `placement_history` and its writer shipped with no caller
+    // and no reader — a table created on every start for a history nothing
+    // recorded (roadmap D60). Wired here rather than inside the scheduler
+    // because the scheduler holds the registry as const on purpose: it reads
+    // verdicts and must not be able to write model rows.
+    scheduler.set_placement_audit({
+        [&model_registry](const mm::AgentId& agent_id,
+                          const mm::NodeId& node_id,
+                          const mm::SlotId& slot_id,
+                          const std::string& backend,
+                          const std::string& backend_reason,
+                          const mm::ResourceFootprint& footprint) {
+            model_registry.record_placement(
+                agent_id, node_id, slot_id, backend, backend_reason, footprint);
+        },
+        [&model_registry](const mm::AgentId& agent_id) {
+            model_registry.mark_placement_released(agent_id);
+        },
+    });
+
     // ── the master's engine policy ────────────────────────────────────────────
     //
     // What the cluster runs, owned here and pushed to nodes. Until it exists,

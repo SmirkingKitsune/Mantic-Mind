@@ -1919,6 +1919,209 @@ bool test_scheduler_eviction_skips_unsuspendable_shared_slot() {
     return ok;
 }
 
+bool test_scheduler_audits_placement_and_release() {
+    // The wiring D60 was missing: nothing ever CALLED record_placement. A
+    // registry round-trip proves the table works and says nothing about whether
+    // a placement reaches it, which is the half that was actually broken.
+    const auto dir = temp_test_dir("scheduler-audit");
+    std::filesystem::create_directories(dir / "models");
+    const uint16_t port = find_free_test_port();
+    CHECK(port != 0);
+    const std::string url = "http://127.0.0.1:" + std::to_string(port);
+
+    httplib::Server server;
+    server.Get("/api/node/health", [](const httplib::Request&, httplib::Response& res) {
+        mm::NodeHealthMetrics health;
+        health.gpu_vram_total_mb = 131072;
+        health.gpu_backend_available = true;
+        res.set_content(nlohmann::json(health).dump(), "application/json");
+    });
+    server.Get("/api/node/status", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(nlohmann::json{{"slots", nlohmann::json::array()},
+                                       {"max_slots", 2},
+                                       {"slot_available", 2}}
+                            .dump(),
+                        "application/json");
+    });
+    server.Post("/api/node/load-model", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(nlohmann::json{{"status", "loaded"}, {"slot_id", "slot-audit"}}.dump(),
+                        "application/json");
+    });
+    server.Post("/api/node/detach-agent", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(nlohmann::json{{"status", "detached"}}.dump(), "application/json");
+    });
+
+    std::atomic<bool> listen_ok{false};
+    std::thread server_thread([&] { listen_ok = server.listen("127.0.0.1", port); });
+
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    RECORD(wait_for_test_server(url));
+    mm::NodeRegistry registry((dir / "registry").string());
+    const auto node_id = registry.add_node(url, "audit-secret", "test");
+    registry.start_health_poll(1);
+    RECORD(wait_for_registered_node(registry, node_id));
+    mm::AgentScheduler scheduler(registry, (dir / "models").string());
+
+    struct Placed {
+        mm::AgentId agent_id;
+        mm::NodeId node_id;
+        mm::SlotId slot_id;
+        std::string backend;
+        std::string reason;
+    };
+
+    std::mutex audit_mutex;
+    std::vector<Placed> placed;
+    std::vector<mm::AgentId> released;
+    scheduler.set_placement_audit({[&](const mm::AgentId& a,
+                                       const mm::NodeId& n,
+                                       const mm::SlotId& sl,
+                                       const std::string& backend,
+                                       const std::string& reason,
+                                       const mm::ResourceFootprint&) {
+                                       std::lock_guard<std::mutex> lk(audit_mutex);
+                                       placed.push_back({a, n, sl, backend, reason});
+                                   },
+                                   [&](const mm::AgentId& a) {
+                                       std::lock_guard<std::mutex> lk(audit_mutex);
+                                       released.push_back(a);
+                                   }});
+
+    mm::AgentConfig cfg;
+    cfg.id = "audited-agent";
+    cfg.name = "Audited";
+    cfg.model_path = "org/model";
+    cfg.preferred_node_id = node_id;
+
+    RECORD(scheduler.ensure_agent_running(cfg).has_value());
+    {
+        std::lock_guard<std::mutex> lk(audit_mutex);
+        RECORD(placed.size() == 1);
+        if (placed.size() == 1) {
+            RECORD(placed[0].agent_id == cfg.id);
+            RECORD(placed[0].node_id == node_id);
+            RECORD(placed[0].slot_id == "slot-audit");
+            // The engine the scheduler ACTED on, and its reason string — not a
+            // reconstruction. Nothing is admitted here, so it routes to the
+            // fallback and says so.
+            RECORD(placed[0].backend == "llama-cpp");
+            RECORD(placed[0].reason.find("no_admission_record") != std::string::npos);
+        }
+        RECORD(released.empty());
+    }
+
+    // A second ensure on an UNCHANGED placement is a refresh, not a placement.
+    // store_placement() is called on that path too, which is exactly why the
+    // audit hangs off the two publish sites rather than off the store.
+    RECORD(scheduler.ensure_agent_running(cfg).has_value());
+    {
+        std::lock_guard<std::mutex> lk(audit_mutex);
+        RECORD(placed.size() == 1);
+    }
+
+    scheduler.release_agent(cfg.id);
+    {
+        std::lock_guard<std::mutex> lk(audit_mutex);
+        RECORD(released.size() == 1);
+        if (released.size() == 1) RECORD(released[0] == cfg.id);
+    }
+
+    registry.stop_health_poll();
+    server.stop();
+    if (server_thread.joinable()) server_thread.join();
+    RECORD(listen_ok);
+    RECORD(remove_tree(dir));
+
+#undef RECORD
+    return ok;
+}
+
+bool test_placement_history_records_and_closes_rows() {
+    // D60: the table, its index and record_placement() all shipped with no
+    // caller and no query. The subtle half is the CLOSE rule — an agent that was
+    // placed, released, and placed again has two rows, and stamping "the row for
+    // this agent" would close the older one a second time and lose the first
+    // placement's duration entirely.
+    auto dir = temp_test_dir("placement-history");
+    // Scoped so the SQLite handle is closed before the directory is removed —
+    // on Windows an open file cannot be deleted, and the failure surfaces as a
+    // cleanup error that says nothing about the behaviour under test.
+    {
+        mm::ControlModelRegistry reg;
+        std::string err;
+        CHECK(reg.open(dir.string(), err));
+
+        CHECK(reg.placement_history("agent-1").empty());
+
+        mm::ResourceFootprint first;
+        first.vram_mb = 4096;
+        reg.record_placement(
+            "agent-1", "node-a", "slot-1", "llama-cpp", "llama-cpp (no_admission_record)", first);
+
+        auto rows = reg.placement_history("agent-1");
+        CHECK(rows.size() == 1);
+        CHECK(rows[0].node_id == "node-a");
+        CHECK(rows[0].backend == "llama-cpp");
+        CHECK(rows[0].backend_reason == "llama-cpp (no_admission_record)");
+        CHECK(rows[0].vram_mb == 4096);
+        // Open until something closes it — and 0 rather than a null, so a renderer
+        // does not need a separate presence check to ask the same question.
+        CHECK(rows[0].open());
+        CHECK(rows[0].released_at_ms == 0);
+
+        reg.mark_placement_released("agent-1");
+        rows = reg.placement_history("agent-1");
+        CHECK(rows.size() == 1);
+        CHECK(!rows[0].open());
+        const std::int64_t first_released = rows[0].released_at_ms;
+        CHECK(first_released > 0);
+
+        // Placed again, on a different engine. Two rows now, newest first.
+        mm::ResourceFootprint second;
+        second.ram_mb = 19840;
+        second.disk_mb = 14848;
+        reg.record_placement(
+            "agent-1", "node-b", "slot-7", "soma", "soma (verdict=stream)", second);
+        rows = reg.placement_history("agent-1");
+        CHECK(rows.size() == 2);
+        CHECK(rows[0].backend == "soma"); // newest first
+        CHECK(rows[0].ram_mb == 19840);
+        CHECK(rows[0].disk_mb == 14848);
+        CHECK(rows[0].open());
+        CHECK(rows[1].backend == "llama-cpp");
+        CHECK(!rows[1].open());
+
+        // THE RULE: closing again must close the NEW row and leave the old one's
+        // timestamp untouched.
+        reg.mark_placement_released("agent-1");
+        rows = reg.placement_history("agent-1");
+        CHECK(rows.size() == 2);
+        CHECK(!rows[0].open());
+        CHECK(rows[1].released_at_ms == first_released);
+
+        // Idempotent: a release for an agent with no open row is a no-op, because a
+        // release can legitimately arrive for a placement this process never saw.
+        reg.mark_placement_released("agent-1");
+        reg.mark_placement_released("agent-never-placed");
+        rows = reg.placement_history("agent-1");
+        CHECK(rows.size() == 2);
+        CHECK(rows[1].released_at_ms == first_released);
+
+        // Other agents are not touched, and the limit is honoured.
+        CHECK(reg.placement_history("agent-2").empty());
+        CHECK(reg.placement_history("agent-1", 1).size() == 1);
+        CHECK(reg.placement_history("agent-1", 0).empty());
+    }
+
+    CHECK(remove_tree(dir));
+    return true;
+}
+
 bool test_scheduler_backend_change_releases_local_placement() {
     const auto dir = temp_test_dir("scheduler-backend-change");
     std::filesystem::create_directories(dir / "models");
@@ -7219,6 +7422,10 @@ int main(int argc, char** argv) {
          test_scheduler_transfers_existing_relative_models_with_unique_cache_ids},
         {"scheduler_eviction_skips_unsuspendable_shared_slot",
          test_scheduler_eviction_skips_unsuspendable_shared_slot},
+        {"scheduler_audits_placement_and_release",
+         test_scheduler_audits_placement_and_release},
+        {"placement_history_records_and_closes_rows",
+         test_placement_history_records_and_closes_rows},
         {"scheduler_backend_change_releases_local_placement",
          test_scheduler_backend_change_releases_local_placement},
         {"scheduler_reconciles_ready_absent_and_suspended_snapshots",

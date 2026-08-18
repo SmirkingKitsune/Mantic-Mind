@@ -341,6 +341,23 @@ AgentScheduler::BackendRouting AgentScheduler::resolve_backend(
             decision.explain()};
 }
 
+void AgentScheduler::set_placement_audit(PlacementAudit audit) {
+    audit_ = std::move(audit);
+}
+
+void AgentScheduler::flush_audit(std::vector<PendingAudit>& pending) const {
+    for (const auto& e : pending) {
+        if (e.placed) {
+            if (audit_.placed)
+                audit_.placed(
+                    e.agent_id, e.node_id, e.slot_id, e.backend, e.backend_reason, e.footprint);
+        } else if (audit_.released) {
+            audit_.released(e.agent_id);
+        }
+    }
+    pending.clear();
+}
+
 void AgentScheduler::set_model_registry(const ControlModelRegistry* registry) {
     models_ = registry;
 }
@@ -420,6 +437,32 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
 
     const std::string desired_fingerprint =
         engine_fingerprint(cfg, models_dir_, routing.engine_id);
+
+    // Audit events are QUEUED here and delivered by `audit_guard`'s destructor,
+    // which runs after `schedule_lock` is released because destruction order is
+    // the reverse of construction. Two reasons it is worth the eight lines:
+    // `schedule_mutex_` already serializes multi-GB model transfers and a
+    // synchronous SQLite insert has no business lengthening it, and a callback
+    // invoked while holding a lock is the exact shape that killed the node in
+    // D56. This function has a dozen return points, so a guard is also the only
+    // way to get the flush right on all of them.
+    std::vector<PendingAudit> pending_audit;
+
+    struct AuditGuard {
+        const AgentScheduler& self;
+        std::vector<PendingAudit>& pending;
+
+        ~AuditGuard() {
+            // An audit row must never break the placement it describes — the
+            // same contract record_placement() states for itself. A throwing
+            // destructor would be std::terminate.
+            try {
+                self.flush_audit(pending);
+            } catch (...) {
+            }
+        }
+    } audit_guard{*this, pending_audit};
+
     std::lock_guard schedule_lock(schedule_mutex_);
     set_last_error({});
 
@@ -428,6 +471,7 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         MM_INFO("AgentScheduler: engine identity changed for agent {}; "
                 "releasing stale placement", cfg.id);
         erase_placement_entry(cfg.id);
+        pending_audit.push_back({false, cfg.id, {}, {}, {}, {}, {}});
         detach_placement_best_effort(*existing, cfg.id, "engine identity changed");
         existing.reset();
     }
@@ -478,6 +522,7 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
                     "on node {} slot {}", cfg.id, existing->node_id,
                     existing->slot_id);
             erase_placement_entry(cfg.id);
+            pending_audit.push_back({false, cfg.id, {}, {}, {}, {}, {}});
             detach_placement_best_effort(*existing, cfg.id,
                                          "node no longer reports attached ready slot");
             existing.reset();
@@ -525,6 +570,8 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
             placement.engine_fingerprint = desired_fingerprint;
             placement.kv_cache_node_path.clear();
             store_placement(placement);
+            pending_audit.push_back(
+                {true, cfg.id, node_id, slot_id, routing.engine_id, routing.reason, needed});
             return ScheduleResult{node_id, slot_id};
         };
 
@@ -559,6 +606,8 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         placement.last_active_ms = placement.placed_at_ms;
         placement.engine_fingerprint = desired_fingerprint;
         store_placement(placement);
+        pending_audit.push_back(
+            {true, cfg.id, node_id, slot_id, routing.engine_id, routing.reason, needed});
         return ScheduleResult{node_id, slot_id};
     };
 
@@ -664,6 +713,8 @@ void AgentScheduler::release_agent(const AgentId& agent_id) {
         erase_placement_entry(agent_id);
     }
 
+    // Outside the lock, like every other audit call — see PlacementAudit.
+    if (audit_.released) audit_.released(agent_id);
     detach_placement_best_effort(*placement, agent_id, "placement released");
     MM_INFO("AgentScheduler: released agent {}", agent_id);
 }

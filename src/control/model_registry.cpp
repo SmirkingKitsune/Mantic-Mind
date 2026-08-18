@@ -895,6 +895,75 @@ void ControlModelRegistry::record_placement(const AgentId& agent_id,
     }
 }
 
+void ControlModelRegistry::mark_placement_released(const AgentId& agent_id) {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    if (!impl_->db) return;
+    try {
+        // The most recent OPEN row only. An agent placed, released, and placed
+        // again has two rows; stamping by agent alone would close the older one
+        // a second time and lose the first placement's duration.
+        SQLite::Statement q(*impl_->db, R"(
+            UPDATE placement_history SET released_at = ?
+             WHERE id = (SELECT id FROM placement_history
+                          WHERE agent_id = ? AND released_at IS NULL
+                          ORDER BY placed_at DESC LIMIT 1)
+        )");
+        q.bind(1, util::now_ms());
+        q.bind(2, agent_id);
+        q.exec();
+    } catch (const std::exception& e) {
+        // Same rule as the insert: an audit row must never fail the operation
+        // it is describing.
+        MM_WARN("ControlModelRegistry::mark_placement_released: {}", e.what());
+    }
+}
+
+std::vector<PlacementHistoryEntry> ControlModelRegistry::placement_history(const AgentId& agent_id,
+                                                                           int limit) const {
+    std::vector<PlacementHistoryEntry> out;
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    if (!impl_->db) return out;
+    if (limit <= 0) return out;
+    try {
+        SQLite::Statement q(*impl_->db, R"(
+            SELECT node_id, slot_id, backend, backend_reason, footprint_json,
+                   placed_at, released_at
+              FROM placement_history
+             WHERE agent_id = ?
+             ORDER BY placed_at DESC
+             LIMIT ?
+        )");
+        q.bind(1, agent_id);
+        q.bind(2, limit);
+        while (q.executeStep()) {
+            PlacementHistoryEntry e;
+            e.node_id = q.getColumn(0).getString();
+            e.slot_id = q.getColumn(1).getString();
+            e.backend = q.getColumn(2).getString();
+            e.backend_reason = q.getColumn(3).getString();
+            // Stored as JSON rather than three columns because the footprint's
+            // shape is owned by common/footprint.hpp and has already gained an
+            // axis once. A malformed blob yields zeroes rather than throwing:
+            // losing one row's numbers must not blank the whole history.
+            const std::string fp = q.getColumn(4).getString();
+            if (!fp.empty()) {
+                const auto j = nlohmann::json::parse(fp, nullptr, /*allow_exceptions=*/false);
+                if (j.is_object()) {
+                    e.vram_mb = j.value("vram_mb", std::int64_t{0});
+                    e.ram_mb = j.value("ram_mb", std::int64_t{0});
+                    e.disk_mb = j.value("disk_mb", std::int64_t{0});
+                }
+            }
+            e.placed_at_ms = q.getColumn(5).getInt64();
+            e.released_at_ms = q.getColumn(6).isNull() ? 0 : q.getColumn(6).getInt64();
+            out.push_back(std::move(e));
+        }
+    } catch (const std::exception& e) {
+        MM_WARN("ControlModelRegistry::placement_history: {}", e.what());
+    }
+    return out;
+}
+
 // ── api tokens ────────────────────────────────────────────────────────────────
 
 std::string ControlModelRegistry::create_api_token(const std::string& label,

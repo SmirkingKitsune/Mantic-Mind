@@ -1,8 +1,10 @@
 #pragma once
 
+#include "common/footprint.hpp"
 #include "common/models.hpp"
 #include "soma/routing.hpp"
 
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -63,6 +65,32 @@ public:
     /// absence of a record is not evidence of admissibility.
     void set_model_registry(const ControlModelRegistry* registry);
 
+    /// Where an agent landed, and where it stopped being — for the audit trail.
+    ///
+    /// A CALLBACK PAIR rather than a second registry pointer, for two reasons.
+    /// The scheduler holds `ControlModelRegistry` as `const*` because it reads
+    /// verdicts and must not be able to mutate the model tables; recording an
+    /// audit row is a different concern that happens to live in the same
+    /// database. And a callback lets the owner decide what "record" means —
+    /// tests substitute a vector.
+    ///
+    /// Both fire with NO scheduler lock held. `schedule_mutex_` serializes whole
+    /// scheduling operations including multi-GB transfers, and a synchronous
+    /// SQLite insert has no business inside it; a callback invoked under a lock
+    /// is also exactly the shape that killed the node in D56.
+    struct PlacementAudit {
+        std::function<void(const AgentId&,
+                           const NodeId&,
+                           const SlotId&,
+                           const std::string& backend,
+                           const std::string& backend_reason,
+                           const ResourceFootprint&)>
+            placed;
+        std::function<void(const AgentId&)> released;
+    };
+
+    void set_placement_audit(PlacementAudit audit);
+
     /// Gate placement on the cluster having an engine configuration.
     ///
     /// A predicate rather than a stored flag: the configuration arrives while
@@ -118,6 +146,7 @@ public:
 private:
     NodeRegistry& registry_;
     const ControlModelRegistry* models_ = nullptr;
+    PlacementAudit audit_;
     std::string models_dir_;
     bool engine_config_required_ = false;
     EngineConfigReadyFn engine_config_ready_;
@@ -128,6 +157,20 @@ private:
     mutable std::mutex state_mutex_;
     std::unordered_map<AgentId, AgentPlacement> placements_;
     std::string last_error_;
+
+    /// Audit events queued during a scheduling operation, flushed once the
+    /// scheduling mutex is released. See PlacementAudit.
+    struct PendingAudit {
+        bool placed = false; ///< false = released
+        AgentId agent_id;
+        NodeId node_id;
+        SlotId slot_id;
+        std::string backend;
+        std::string backend_reason;
+        ResourceFootprint footprint;
+    };
+
+    void flush_audit(std::vector<PendingAudit>& pending) const;
 
     std::optional<AgentPlacement> find_placement_copy(const AgentId& id) const;
     void store_placement(const AgentPlacement& placement);

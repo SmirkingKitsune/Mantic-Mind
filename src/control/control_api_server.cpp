@@ -3294,6 +3294,51 @@ void ControlApiServer::register_routes() {
             j["status"] = "unplaced";
         }
         j["node_compatibility"] = compute_node_compat(cfg);
+
+        // WHICH engine would serve this agent, and WHY.
+        //
+        // `soma/routing.hpp` justified making the decision pure with "the same
+        // function answers GET /v1/agents/{id}" — and this route carried no
+        // backend field at all, so the claim was true of the design and false of
+        // the code (roadmap D61). It is pure, so asking here reports the
+        // decision without causing a placement, which is the property that
+        // makes it safe on a read route.
+        const auto routing = scheduler_.resolve_backend_for(cfg);
+        j["backend"] = routing.engine_id;
+        j["backend_reason"] = routing.reason;
+
+        // Where it has run before, newest first. The per-agent read is the
+        // natural place for it — the index is already
+        // (agent_id, placed_at DESC) — and putting it here rather than behind a
+        // new route means no new scope entry, CLI verb or TUI control is needed
+        // to keep both parity directions at zero (roadmap D60).
+        {
+            // Always present, even with no registry attached, for the same
+            // reason `released_at_ms` is 0 rather than null: a key that is
+            // sometimes absent makes every client write a presence check before
+            // it can ask the question it actually has.
+            const std::vector<PlacementHistoryEntry> rows =
+                models_ != nullptr ? models_->placement_history(id)
+                                   : std::vector<PlacementHistoryEntry>{};
+            nlohmann::json history = nlohmann::json::array();
+            for (const auto& e : rows) {
+                history.push_back(
+                    {{"node_id", e.node_id},
+                     {"slot_id", e.slot_id},
+                     {"backend", e.backend},
+                     {"backend_reason", e.backend_reason},
+                     {"footprint",
+                      {{"vram_mb", e.vram_mb}, {"ram_mb", e.ram_mb}, {"disk_mb", e.disk_mb}}},
+                     {"placed_at_ms", e.placed_at_ms},
+                     // 0, not null: "still open" is a state the
+                     // renderer has to distinguish, and a missing
+                     // key makes every client write the same
+                     // defensive check.
+                     {"released_at_ms", e.released_at_ms},
+                     {"open", e.open()}});
+            }
+            j["placement_history"] = std::move(history);
+        }
         res.set_content(j.dump(), "application/json");
     });
 
