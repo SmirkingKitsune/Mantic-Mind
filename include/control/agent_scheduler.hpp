@@ -21,6 +21,45 @@ struct ScheduleResult {
     SlotId slot_id;
 };
 
+/// Why a placement did not happen.
+///
+/// Every value here corresponds to a real `set_failure()` site in
+/// agent_scheduler.cpp — the taxonomy was read OUT of the code, not designed for
+/// it. A deleted design header proposed a similar enum with values like
+/// `Rejected` and `EngineUnavailable` that matched nothing the scheduler
+/// actually does (roadmap D46/D63); copying that list would have produced codes
+/// no caller could ever observe.
+///
+/// The gap this closes: placement failure was a bare English string, so
+/// "no node is conforming" and "every node is full" — opposite operator actions
+/// — differed only by wording, and the only way to tell them apart was to match
+/// prose (roadmap D64).
+enum class PlacementFailure : std::uint8_t {
+    None = 0,            ///< no failure recorded
+    EngineConfigMissing, ///< the cluster has no engine policy yet
+    NoLocalBackend,      ///< API-backed agent: it owns no node slot by design
+    NoEligibleNode,      ///< nothing passed the connected + conforming filter
+    NoCapacity,          ///< eligible nodes exist; none could take this model
+    ModelTransferFailed, ///< the model could not be put on the target node
+    NodeRejected,        ///< the node answered with an HTTP error
+    NodeUnreachable,     ///< the request to the node threw
+    NodeProtocolError,   ///< the node answered OK with no slot id
+};
+
+const char* to_string(PlacementFailure failure) noexcept;
+
+/// Might retrying, with nobody changing anything, plausibly work?
+///
+/// Deliberately biased toward `true` where it is arguable. A false "retryable"
+/// costs a client one wasted poll; a false "not retryable" makes it give up on
+/// a placement that would have succeeded. `NoEligibleNode` is the interesting
+/// case and it is retryable: a node that was offline or mid-convergence rejoins
+/// on its own, with no operator involved.
+///
+/// Only the two that genuinely require a human are `false` — the cluster has no
+/// engine configuration, or the agent is configured to own no slot at all.
+bool placement_failure_retryable(PlacementFailure failure) noexcept;
+
 /// Placement engine. Backend-agnostic and verdict-driven.
 ///
 /// No longer "VRAM-aware scheduler for llama.cpp agents": it resolves WHICH
@@ -129,6 +168,10 @@ public:
     std::optional<AgentPlacement> get_placement(const AgentId& agent_id) const;
     std::vector<AgentPlacement> list_placements() const;
     std::string last_error() const;
+
+    /// The same failure, as a code. Set with the message and cleared with it, so
+    /// the two can never disagree about whether a placement failed.
+    PlacementFailure last_failure() const;
     void housekeeping(const std::vector<AgentConfig>& active_agents);
 
     /// Does this engine refusal mean "no capacity right now", i.e. evict and retry?
@@ -157,6 +200,7 @@ private:
     mutable std::mutex state_mutex_;
     std::unordered_map<AgentId, AgentPlacement> placements_;
     std::string last_error_;
+    PlacementFailure last_failure_ = PlacementFailure::None;
 
     /// Audit events queued during a scheduling operation, flushed once the
     /// scheduling mutex is released. See PlacementAudit.
@@ -185,6 +229,13 @@ private:
         return true;
     }
 
+    /// Record a failure and its code together. THE reason they are one call:
+    /// two setters would let a caller set one without the other, and a code that
+    /// disagrees with its message is worse than no code.
+    void set_failure(PlacementFailure failure, const std::string& error);
+
+    /// Clears the code as well. Named for what it is used for — the success
+    /// path calls it with {} to reset both.
     void set_last_error(const std::string& error);
     void detach_placement_best_effort(const AgentPlacement& placement,
                                       const AgentId& agent_id,

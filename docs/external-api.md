@@ -334,6 +334,35 @@ placement ends. It lives on this route rather than behind `GET /v1/agents/{id}/p
 purpose: the index is already `(agent_id, placed_at DESC)`, and reusing a route that CLI and TUI
 already reach keeps both parity directions at zero without inventing a surface for one reader.
 
+### Placement failure codes
+
+Any route that places an agent — `POST /v1/agents/{id}/restore`, and the chat paths that place on
+demand — answers a failure with a machine-readable `code` beside the prose, and a `retryable` flag:
+
+```jsonc
+{ "error": "no eligible node: none is connected and conforming to the cluster engine configuration",
+  "code": "no_eligible_node",
+  "retryable": true,
+  "agent_id": "agent-1" }
+```
+
+| `code` | Means | `retryable` |
+|---|---|---|
+| `engine_config_missing` | The cluster has no engine policy yet | **false** — an operator must set one |
+| `no_local_backend` | The agent is API-backed and owns no node slot by design | **false** — retrying never helps |
+| `no_eligible_node` | Nothing passed the connected + conforming filter | true — a node can rejoin or converge on its own |
+| `no_capacity` | Eligible nodes are connected; none could take this model | true |
+| `model_transfer_failed` | The model could not be placed on the target node | true |
+| `node_rejected` | The node answered with an HTTP error | true |
+| `node_unreachable` | The request to the node threw | true |
+| `node_protocol_error` | The node answered OK with no slot id | true |
+
+`no_eligible_node` and `no_capacity` are the pair this exists for: they call for **opposite operator
+actions** — fix the cluster, versus wait or add hardware — and before this both produced the sentence
+"no capacity: no connected node could load this model", so telling them apart meant matching English
+(roadmap D64). `retryable` is deliberately biased toward `true` where it is arguable: a wrong `true`
+costs a client one wasted poll, a wrong `false` makes it abandon a placement that would have worked.
+
 ---
 
 ## 4. Placement lifecycle

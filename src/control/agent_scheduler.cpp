@@ -420,10 +420,10 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     // that are all healthy.
     if (engine_config_required_ && !engine_config_ready_()) {
         release_agent(cfg.id);
-        set_last_error(
-            "cluster engine configuration required: no primary engine has been set. "
-            "Configure it in the control TUI's Engines tab, with `engines setup` in "
-            "CLI mode, or via PUT /v1/cluster/engines/config");
+        set_failure(PlacementFailure::EngineConfigMissing,
+                    "cluster engine configuration required: no primary engine has been set. "
+                    "Configure it in the control TUI's Engines tab, with `engines setup` in "
+                    "CLI mode, or via PUT /v1/cluster/engines/config");
         return std::nullopt;
     }
 
@@ -431,7 +431,8 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     if (routing.engine_id.empty()) {
         // Release a prior local placement before reporting the routing result.
         release_agent(cfg.id);
-        set_last_error("agent has no node-local backend: " + routing.reason);
+        set_failure(PlacementFailure::NoLocalBackend,
+                    "agent has no node-local backend: " + routing.reason);
         return std::nullopt;
     }
 
@@ -698,8 +699,28 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
 
     MM_WARN("AgentScheduler: no capacity for agent {} (model={})",
             cfg.id, cfg.model_path);
-    if (last_error().empty()) {
-        set_last_error("no capacity: no connected node could load this model");
+
+    // `last_failure()`, not `last_error().empty()`. The old check asked "did a
+    // load attempt already record something" by testing a STRING for emptiness,
+    // which is the same defect one layer down from the one this fixes: the
+    // control flow depended on prose. A code answers it directly, and cannot be
+    // broken by rewording a message.
+    if (last_failure() == PlacementFailure::None) {
+        // THE distinction D64 exists for. Both of these used to read "no
+        // capacity: no connected node could load this model", and they call for
+        // opposite actions: one means fix the cluster, the other means wait or
+        // add hardware. `available_nodes()` applies the connected + conforming
+        // filter, so an empty list means nothing was ELIGIBLE — every node is
+        // offline, unconfigured, or not conforming to the engine policy.
+        if (registry_.available_nodes().empty()) {
+            set_failure(PlacementFailure::NoEligibleNode,
+                        "no eligible node: none is connected and conforming to the "
+                        "cluster engine configuration");
+        } else {
+            set_failure(PlacementFailure::NoCapacity,
+                        "no capacity: eligible nodes are connected, but none could "
+                        "load this model");
+        }
     }
     return std::nullopt;
 }
@@ -769,9 +790,57 @@ bool AgentScheduler::erase_placement_entry(const AgentId& id) {
     return placements_.erase(id) > 0;
 }
 
+const char* to_string(PlacementFailure failure) noexcept {
+    switch (failure) {
+    case PlacementFailure::None:
+        return "none";
+    case PlacementFailure::EngineConfigMissing:
+        return "engine_config_missing";
+    case PlacementFailure::NoLocalBackend:
+        return "no_local_backend";
+    case PlacementFailure::NoEligibleNode:
+        return "no_eligible_node";
+    case PlacementFailure::NoCapacity:
+        return "no_capacity";
+    case PlacementFailure::ModelTransferFailed:
+        return "model_transfer_failed";
+    case PlacementFailure::NodeRejected:
+        return "node_rejected";
+    case PlacementFailure::NodeUnreachable:
+        return "node_unreachable";
+    case PlacementFailure::NodeProtocolError:
+        return "node_protocol_error";
+    }
+    return "unknown";
+}
+
+bool placement_failure_retryable(PlacementFailure failure) noexcept {
+    switch (failure) {
+    case PlacementFailure::EngineConfigMissing: // an operator must set a policy
+    case PlacementFailure::NoLocalBackend:      // the agent owns no slot by design
+        return false;
+    default:
+        return true;
+    }
+}
+
+void AgentScheduler::set_failure(PlacementFailure failure, const std::string& error) {
+    std::lock_guard state_lock(state_mutex_);
+    last_failure_ = failure;
+    last_error_ = error;
+}
+
 void AgentScheduler::set_last_error(const std::string& error) {
     std::lock_guard state_lock(state_mutex_);
     last_error_ = error;
+    // Cleared together. A stale code beside a fresh empty message would say a
+    // placement failed when the caller had just recorded that it did not.
+    if (error.empty()) last_failure_ = PlacementFailure::None;
+}
+
+PlacementFailure AgentScheduler::last_failure() const {
+    std::lock_guard state_lock(state_mutex_);
+    return last_failure_;
 }
 
 void AgentScheduler::detach_placement_best_effort(
@@ -939,8 +1008,9 @@ std::optional<SlotId> AgentScheduler::restore_agent_on_node(
         const auto prepared = prepare_model_for_node(
             node, cfg, model_location(cfg), models_dir_, pin, false, &prepare_error);
         if (!prepared) {
-            set_last_error("failed to prepare model for restore on node " + node_id
-                           + ": " + prepare_error);
+            set_failure(PlacementFailure::ModelTransferFailed,
+                        "failed to prepare model for restore on node " + node_id + ": " +
+                            prepare_error);
             return std::nullopt;
         }
 
@@ -970,7 +1040,8 @@ std::optional<SlotId> AgentScheduler::restore_agent_on_node(
                 const auto slot_id = nlohmann::json::parse(response.body)
                                          .value("slot_id", std::string{});
                 if (!slot_id.empty()) return slot_id;
-                set_last_error("restore-slot returned an empty slot_id on node " + node_id);
+                set_failure(PlacementFailure::NodeProtocolError,
+                            "restore-slot returned an empty slot_id on node " + node_id);
                 return std::nullopt;
             }
 
@@ -981,13 +1052,15 @@ std::optional<SlotId> AgentScheduler::restore_agent_on_node(
 
             std::string preview = response.body;
             if (preview.size() > 300) preview = preview.substr(0, 300) + "...";
-            set_last_error("restore-slot failed on node " + node_id + " (HTTP "
-                           + std::to_string(response.status) + "): " + preview);
+            set_failure(PlacementFailure::NodeRejected,
+                        "restore-slot failed on node " + node_id + " (HTTP " +
+                            std::to_string(response.status) + "): " + preview);
             return std::nullopt;
         }
     } catch (const std::exception& e) {
         MM_WARN("AgentScheduler: restore failed on node {}: {}", node_id, e.what());
-        set_last_error("restore-slot exception on node " + node_id + ": " + e.what());
+        set_failure(PlacementFailure::NodeUnreachable,
+                    "restore-slot exception on node " + node_id + ": " + e.what());
     }
     return std::nullopt;
 }
@@ -1006,8 +1079,8 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
         auto prepared = prepare_model_for_node(
             node, cfg, model_location(cfg), models_dir_, pin, false, &prepare_error);
         if (!prepared) {
-            set_last_error("failed to prepare model for node " + node_id
-                           + ": " + prepare_error);
+            set_failure(PlacementFailure::ModelTransferFailed,
+                        "failed to prepare model for node " + node_id + ": " + prepare_error);
             return std::nullopt;
         }
 
@@ -1040,7 +1113,8 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
                             cfg.id, node_id, slot_id);
                     return slot_id;
                 }
-                set_last_error("load-model returned an empty slot_id on node " + node_id);
+                set_failure(PlacementFailure::NodeProtocolError,
+                            "load-model returned an empty slot_id on node " + node_id);
                 return std::nullopt;
             }
 
@@ -1068,13 +1142,15 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
 
             std::string preview = response.body;
             if (preview.size() > 300) preview = preview.substr(0, 300) + "...";
-            set_last_error("load-model failed on node " + node_id + " (HTTP "
-                           + std::to_string(response.status) + "): " + preview);
+            set_failure(PlacementFailure::NodeRejected,
+                        "load-model failed on node " + node_id + " (HTTP " +
+                            std::to_string(response.status) + "): " + preview);
             return std::nullopt;
         }
     } catch (const std::exception& e) {
         MM_WARN("AgentScheduler: load failed on node {}: {}", node_id, e.what());
-        set_last_error("load-model exception on node " + node_id + ": " + e.what());
+        set_failure(PlacementFailure::NodeUnreachable,
+                    "load-model exception on node " + node_id + ": " + e.what());
     }
     return std::nullopt;
 }

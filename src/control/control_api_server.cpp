@@ -3456,8 +3456,16 @@ void ControlApiServer::register_routes() {
         // second implementation of the placement ladder.
         const auto placed = scheduler_.ensure_agent_running(cfg);
         if (!placed) {
+            // The reason as a CODE, beside the prose. "No node is conforming"
+            // and "every node is full" call for opposite operator actions and
+            // used to differ only by wording (roadmap D64); a script should not
+            // have to match English to tell them apart, and `retryable` answers
+            // the one question a client actually has.
+            const auto failure = scheduler_.last_failure();
             res.status = 409;
             res.set_content(nlohmann::json{{"error", scheduler_.last_error()},
+                                           {"code", to_string(failure)},
+                                           {"retryable", placement_failure_retryable(failure)},
                                            {"agent_id", id}}
                                 .dump(),
                             "application/json");
@@ -5138,8 +5146,13 @@ void ControlApiServer::register_routes() {
         if (!sched_result) {
             std::string err = scheduler_.last_error();
             if (err.empty()) err = "no node available or model failed to load";
+            const auto failure = scheduler_.last_failure();
             res.status = 503;
-            res.set_content(nlohmann::json{{"error", err}}.dump(), "application/json");
+            res.set_content(nlohmann::json{{"error", err},
+                                           {"code", to_string(failure)},
+                                           {"retryable", placement_failure_retryable(failure)}}
+                                .dump(),
+                            "application/json");
             return;
         }
 

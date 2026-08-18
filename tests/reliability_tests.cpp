@@ -878,6 +878,13 @@ bool test_placement_refused_until_engine_config_exists() {
     const std::string refusal = scheduler.last_error();
     CHECK(refusal.find("engine configuration") != std::string::npos);
     CHECK(refusal.find("/v1/cluster/engines/config") != std::string::npos);
+    // Structurally, not by prose. This assertion used to exist only as the
+    // string match above, which is the defect D64 names: reword the message and
+    // the test still passes while every client breaks.
+    CHECK(scheduler.last_failure() == mm::PlacementFailure::EngineConfigMissing);
+    // An operator must act. Retrying this forever is the wrong behaviour and a
+    // client can now know that without reading English.
+    CHECK(!mm::placement_failure_retryable(scheduler.last_failure()));
 
     // Configured: the gate opens. It still finds no node — there are none
     // registered — but the refusal is no longer the configuration one, which is
@@ -885,6 +892,11 @@ bool test_placement_refused_until_engine_config_exists() {
     CHECK(store.save(mm::EngineConfigStore::default_for("llama-cpp"), {}, "test", err));
     CHECK(!scheduler.ensure_agent_running(cfg).has_value());
     CHECK(scheduler.last_error().find("engine configuration required") == std::string::npos);
+    // The SAME failure the old code called "no capacity: no connected node
+    // could load this model" — which conflated an unconfigured cluster with a
+    // full one. Nothing is eligible here; nothing is full.
+    CHECK(scheduler.last_failure() == mm::PlacementFailure::NoEligibleNode);
+    CHECK(mm::placement_failure_retryable(scheduler.last_failure()));
 
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
@@ -1908,6 +1920,95 @@ bool test_scheduler_eviction_skips_unsuspendable_shared_slot() {
     RECORD(shared_idle.has_value() && !shared_idle->suspended);
     RECORD(shared_active.has_value() && !shared_active->suspended);
     RECORD(standalone.has_value() && standalone->suspended);
+
+    registry.stop_health_poll();
+    server.stop();
+    if (server_thread.joinable()) server_thread.join();
+    RECORD(listen_ok);
+    RECORD(remove_tree(dir));
+
+#undef RECORD
+    return ok;
+}
+
+bool test_placement_failure_codes_separate_eligibility_from_capacity() {
+    // The pair D64 exists for. "No node is conforming" and "every node is full"
+    // called for opposite operator actions and produced the SAME sentence, so
+    // the only way to tell them apart was to match prose.
+    //
+    // The eligibility half is covered by the engine-config gate test with no
+    // nodes registered. This is the other half, which needs a node that is
+    // connected and conforming and simply has no room — otherwise the two codes
+    // could be swapped and nothing would notice.
+    const auto dir = temp_test_dir("placement-failure-codes");
+    std::filesystem::create_directories(dir / "models");
+    const uint16_t port = find_free_test_port();
+    CHECK(port != 0);
+    const std::string url = "http://127.0.0.1:" + std::to_string(port);
+
+    httplib::Server server;
+    server.Get("/api/node/health", [](const httplib::Request&, httplib::Response& res) {
+        mm::NodeHealthMetrics health;
+        // Connected and healthy, with nowhere near enough room for any model.
+        // This is what separates "not eligible" from "no capacity": the node
+        // passes every filter except the one about space.
+        health.gpu_vram_total_mb = 1;
+        health.gpu_vram_used_mb = 1;
+        health.gpu_backend_available = true;
+        health.disk_free_mb = 1;
+        res.set_content(nlohmann::json(health).dump(), "application/json");
+    });
+    server.Get("/api/node/status", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(nlohmann::json{{"slots", nlohmann::json::array()},
+                                       {"max_slots", 1},
+                                       {"slot_available", 1}}
+                            .dump(),
+                        "application/json");
+    });
+
+    std::atomic<bool> listen_ok{false};
+    std::thread server_thread([&] { listen_ok = server.listen("127.0.0.1", port); });
+
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    RECORD(wait_for_test_server(url));
+    mm::NodeRegistry registry((dir / "registry").string());
+    const auto node_id = registry.add_node(url, "codes-secret", "test");
+    registry.start_health_poll(1);
+    RECORD(wait_for_registered_node(registry, node_id));
+    mm::AgentScheduler scheduler(registry, (dir / "models").string());
+
+    mm::AgentConfig cfg;
+    cfg.id = "no-room-agent";
+    cfg.name = "No Room";
+    cfg.model_path = "org/model";
+
+    RECORD(!scheduler.ensure_agent_running(cfg).has_value());
+    // A node IS eligible — it is connected and no engine-config gate is set —
+    // so this must not report NoEligibleNode.
+    RECORD(!registry.available_nodes().empty());
+    RECORD(scheduler.last_failure() == mm::PlacementFailure::NoCapacity);
+    RECORD(mm::placement_failure_retryable(scheduler.last_failure()));
+    // The prose is still there and still useful; it is simply no longer the
+    // only thing carrying the answer.
+    RECORD(scheduler.last_error().find("no capacity") != std::string::npos);
+
+    // The wire spellings are part of the contract: clients branch on these, so
+    // renaming one is an API change and should break a test.
+    RECORD(std::string(mm::to_string(mm::PlacementFailure::None)) == "none");
+    RECORD(std::string(mm::to_string(mm::PlacementFailure::NoEligibleNode)) == "no_eligible_node");
+    RECORD(std::string(mm::to_string(mm::PlacementFailure::NoCapacity)) == "no_capacity");
+    RECORD(std::string(mm::to_string(mm::PlacementFailure::EngineConfigMissing)) ==
+           "engine_config_missing");
+    // Only the two that genuinely need a human are non-retryable.
+    RECORD(!mm::placement_failure_retryable(mm::PlacementFailure::EngineConfigMissing));
+    RECORD(!mm::placement_failure_retryable(mm::PlacementFailure::NoLocalBackend));
+    RECORD(mm::placement_failure_retryable(mm::PlacementFailure::NodeUnreachable));
+    RECORD(mm::placement_failure_retryable(mm::PlacementFailure::ModelTransferFailed));
 
     registry.stop_health_poll();
     server.stop();
@@ -7422,6 +7523,8 @@ int main(int argc, char** argv) {
          test_scheduler_transfers_existing_relative_models_with_unique_cache_ids},
         {"scheduler_eviction_skips_unsuspendable_shared_slot",
          test_scheduler_eviction_skips_unsuspendable_shared_slot},
+        {"placement_failure_codes_separate_eligibility_from_capacity",
+         test_placement_failure_codes_separate_eligibility_from_capacity},
         {"scheduler_audits_placement_and_release",
          test_scheduler_audits_placement_and_release},
         {"placement_history_records_and_closes_rows",
