@@ -1931,6 +1931,67 @@ bool test_scheduler_eviction_skips_unsuspendable_shared_slot() {
     return ok;
 }
 
+bool test_soma_footprint_is_ram_shaped_not_vram_shaped() {
+    // D62: every demand figure was VRAM, produced by llama.cpp's estimator, for
+    // BOTH engines. Soma v1 is CPU-only, and evaluate_fit() refuses to offload
+    // against a host with less than min_gpu_for_offload_mb (8 GiB) of GPU — so a
+    // Soma agent could not be placed on a GPU-less node at all, for VRAM it
+    // would never have touched. That is a rejection, not merely a bad estimate.
+    mm::ResourceFootprint soma;
+    soma.ram_mb = 8192; // a resident half, no VRAM — the shape soma_footprint returns
+
+    mm::HostCapacity cpu_only;
+    cpu_only.vram_total_mb = 0; // no GPU whatsoever
+    cpu_only.vram_free_mb = 0;
+    cpu_only.ram_total_mb = 65536;
+    cpu_only.ram_free_mb = 64000;
+    cpu_only.disk_free_mb = 500000;
+
+    const mm::CapacityPolicy policy;
+    std::string reason;
+    // A zero-VRAM ask short-circuits to Native: RAM and disk are still checked,
+    // the GPU question simply never arises.
+    CHECK(mm::evaluate_fit(soma, cpu_only, policy, &reason) == mm::FitQuality::Native);
+
+    // The same host, asked the OLD way — a llama-shaped VRAM figure for a model
+    // whose real cost is RAM. This is what placement used to compute for Soma,
+    // and it is refused outright: not "ranked lower", refused.
+    mm::ResourceFootprint vram_shaped;
+    vram_shaped.vram_mb = 8192;
+    CHECK(mm::evaluate_fit(vram_shaped, cpu_only, policy, &reason) == mm::FitQuality::None);
+    CHECK(reason.find("no GPU large enough") != std::string::npos);
+
+    // RAM is still a real constraint in the new shape — this is not "Soma fits
+    // everywhere". A resident half larger than the host's free RAM is refused,
+    // which is the whole point of moving the demand onto the right axis.
+    mm::ResourceFootprint too_big;
+    too_big.ram_mb = 63000; // leaves under the 2 GiB RAM headroom
+    CHECK(mm::evaluate_fit(too_big, cpu_only, policy, &reason) == mm::FitQuality::None);
+    CHECK(reason.find("MB RAM") != std::string::npos);
+
+    // And the producer, not just the rule it feeds. Whatever the registry knows
+    // or does not know about a model, the Soma footprint never asks for VRAM —
+    // that is the invariant, and the one the old code broke for every agent.
+    const auto dir = temp_test_dir("soma-footprint");
+    std::filesystem::create_directories(dir / "models");
+    {
+        mm::NodeRegistry registry((dir / "registry").string());
+        mm::AgentScheduler scheduler(registry, (dir / "models").string());
+        mm::AgentConfig cfg;
+        cfg.id = "soma-agent";
+        cfg.model_path = "org/model";
+        const auto fp = scheduler.soma_footprint(cfg);
+        CHECK(fp.vram_mb == 0);
+        // No registry and no local bytes, so the resident half is unknown and
+        // reported as nothing rather than guessed — under-charging is the safe
+        // direction, since the node re-derives the real plan before loading.
+        CHECK(fp.ram_mb == 0);
+        CHECK(fp.disk_mb == 0);
+    }
+    CHECK(remove_tree(dir));
+    return true;
+}
+
 bool test_placement_failure_codes_separate_eligibility_from_capacity() {
     // The pair D64 exists for. "No node is conforming" and "every node is full"
     // called for opposite operator actions and produced the SAME sentence, so
@@ -7523,6 +7584,8 @@ int main(int argc, char** argv) {
          test_scheduler_transfers_existing_relative_models_with_unique_cache_ids},
         {"scheduler_eviction_skips_unsuspendable_shared_slot",
          test_scheduler_eviction_skips_unsuspendable_shared_slot},
+        {"soma_footprint_is_ram_shaped_not_vram_shaped",
+         test_soma_footprint_is_ram_shaped_not_vram_shaped},
         {"placement_failure_codes_separate_eligibility_from_capacity",
          test_placement_failure_codes_separate_eligibility_from_capacity},
         {"scheduler_audits_placement_and_release",

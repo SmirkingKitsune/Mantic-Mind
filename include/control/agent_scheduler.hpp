@@ -100,6 +100,21 @@ public:
     /// distinction is worth being able to state from outside.
     std::string model_location(const AgentConfig& cfg) const;
 
+    /// What a Soma-routed agent actually costs the host it lands on.
+    ///
+    /// PUBLIC because it is what a test needs to assert, and because the shape
+    /// of the answer — RAM and disk, no VRAM — is the claim worth being able to
+    /// state from outside.
+    ///
+    /// Soma v1 is CPU-only: `plan.cpp` sets `vram_hot_bytes` and
+    /// `footprint.vram_bytes` to zero and says so. Placement nevertheless
+    /// charged every agent a llama.cpp-shaped `estimate_inference_vram_mb()`,
+    /// and `evaluate_fit()` refuses to offload against a host with less than
+    /// `min_gpu_for_offload_mb` (8 GiB) of GPU — so a Soma agent could not be
+    /// placed on a GPU-less node AT ALL, however much RAM it had, for VRAM it
+    /// would never have touched (roadmap D62).
+    ResourceFootprint soma_footprint(const AgentConfig& cfg) const;
+
     /// Optional. Without it every `auto` agent routes to the fallback, since
     /// absence of a record is not evidence of admissibility.
     void set_model_registry(const ControlModelRegistry* registry);

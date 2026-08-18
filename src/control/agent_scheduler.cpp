@@ -367,6 +367,44 @@ void AgentScheduler::set_engine_config_gate(EngineConfigReadyFn ready) {
     engine_config_required_ = static_cast<bool>(engine_config_ready_);
 }
 
+ResourceFootprint AgentScheduler::soma_footprint(const AgentConfig& cfg) const {
+    ResourceFootprint out;
+
+    // vram_mb stays 0, and that is the fix rather than an omission. Soma v1 is
+    // CPU-only; evaluate_fit() short-circuits to Native on a zero VRAM ask, so a
+    // GPU-less node is now a valid host instead of an automatic rejection.
+
+    const std::int64_t model_bytes = measure_model_bytes(model_location(cfg), models_dir_);
+    std::int64_t routed_bytes = 0;
+    if (models_ != nullptr) {
+        if (const auto admitted = models_->resolve(cfg.model_path)) {
+            routed_bytes = admitted->total_routed_bytes;
+        }
+    }
+
+    // The RESIDENT half: everything that is not a streamed expert has to be in
+    // RAM for the whole session, whatever the host decides its expert cache
+    // should be. That makes it the part control can state without knowing the
+    // target's budget — which is exactly what `plan_for_host()` refuses to
+    // guess, since the verdict is a property of (model, quantization, host).
+    //
+    // A LOWER BOUND, deliberately. It excludes the KV cache (context-dependent)
+    // and the expert cache (sized from the node's free RAM at load). Under-
+    // charging is the safe direction here: the alternative is inventing the
+    // node's cache policy on control and rejecting hosts that would have
+    // worked, and the node re-derives the real plan before it loads anything.
+    const std::int64_t resident_bytes = std::max<std::int64_t>(0, model_bytes - routed_bytes);
+    constexpr std::int64_t kMib = 1024 * 1024;
+    out.ram_mb = resident_bytes / kMib;
+
+    // disk_mb stays 0, for the reason it always has: the container's residency
+    // is not ADDITIONAL to what the target already holds, and NodeInfo still
+    // cannot say whether it holds it. Charging it would reject every node that
+    // already has the model — the ones that are cheapest to place on. Closing
+    // that needs the node to report local model residency first (roadmap D65).
+    return out;
+}
+
 std::string AgentScheduler::model_location(const AgentConfig& cfg) const {
     // The registry is the AUTHORITY on where an admitted model's bytes are, and
     // until this existed nothing asked it. resolve_backend_for() has always
@@ -530,20 +568,31 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         }
     }
 
-    // Three axes, not one.
+    // Three axes, and now shaped by the ENGINE that will serve it.
     //
     // llama.cpp's estimate folds weights, KV and overhead into a single number
     // that behaves like VRAM, so that is where it goes and `ram_mb` stays zero —
     // the offload path inside evaluate_fit() is what trades RAM against it, as
-    // before. `disk_mb` stays zero too, because the model file's residency is
-    // not additional to what the node already holds and NodeInfo cannot yet say
-    // whether it does. What changed is that disk headroom is now checked on
-    // every placement, and that a Soma footprint — RAM + disk, from its plan —
-    // has somewhere to go.
+    // before.
+    //
+    // Soma is the opposite shape: no VRAM at all in v1, and a resident half that
+    // is genuinely RAM. Both used to go through the llama estimator, which meant
+    // a Soma agent was charged VRAM it would never touch — and since
+    // evaluate_fit() will not offload against a host below
+    // `min_gpu_for_offload_mb`, a GPU-less node was rejected outright for a
+    // CPU-only engine (D62).
+    //
+    // `disk_mb` stays zero for BOTH, and that part is unchanged: a container's
+    // residency is not additional to what the target already holds, and NodeInfo
+    // still cannot say whether it holds it (D65).
     ResourceFootprint needed;
-    needed.vram_mb = estimate_inference_vram_mb(
-                         cfg.model_path, cfg.runtime_settings, models_dir_) +
-                     projector_file_mb(cfg, models_dir_);
+    if (routing.engine_id == "soma") {
+        needed = soma_footprint(cfg);
+    } else {
+        needed.vram_mb =
+            estimate_inference_vram_mb(cfg.model_path, cfg.runtime_settings, models_dir_) +
+            projector_file_mb(cfg, models_dir_);
+    }
 
     if (existing && existing->suspended) {
         AgentPlacement placement = *existing;
