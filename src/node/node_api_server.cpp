@@ -278,6 +278,32 @@ void NodeApiServer::register_routes() {
         j["slot_suspending"] = suspending_slots;
         j["slot_suspended"] = suspended_slots;
         j["slot_error"]    = error_slots;
+        // Which models this node already holds, by cache id.
+        //
+        // Ids only, not sizes: control knows the size of anything it would send
+        // and the list rides every 30s health poll, so the useful signal is
+        // membership. Control charges a placement for the model's disk footprint
+        // only when the target does NOT appear to hold it — before this it could
+        // not ask, so it charged nothing and disk demand was invisible to
+        // placement (roadmap D65).
+        //
+        // A HINT with a poll's worth of age on it, and safe in both directions:
+        // a stale "resident" means control under-charges and the transfer path's
+        // own make_room_for() evicts to fit, and a stale "absent" means it
+        // over-charges and prefers a different node. Neither can place a model
+        // somewhere it cannot go.
+        if (model_store_ != nullptr) {
+            nlohmann::json ids = nlohmann::json::array();
+            for (const auto& m : model_store_->list())
+                ids.push_back(m.id);
+            j["local_model_ids"] = std::move(ids);
+        } else {
+            // Absent rather than empty would be indistinguishable from "this
+            // node holds nothing", and those are different claims.
+            j["local_model_ids"] = nlohmann::json::array();
+            j["local_model_cache"] = false;
+        }
+
         // Engines are DATA now, so health advertises the whole registry rather
         // than one runtime's path. `llama_server_path` is retained because
         // control's UI reads it, but it comes from the descriptor.

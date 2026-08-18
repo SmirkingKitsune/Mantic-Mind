@@ -115,6 +115,25 @@ public:
     /// would never have touched (roadmap D62).
     ResourceFootprint soma_footprint(const AgentConfig& cfg) const;
 
+    /// What `cfg` costs a SPECIFIC node — the same footprint, plus the disk the
+    /// container needs only if that node does not already hold it.
+    ///
+    /// Public for the same reason `model_location` is: "this node already has
+    /// it, so it is free" is the whole claim, and it deserves to be assertable
+    /// without standing up two nodes and a transfer.
+    ResourceFootprint footprint_for_node(const AgentConfig& cfg,
+                                         const ResourceFootprint& base,
+                                         const NodeInfo& node) const;
+
+    /// The cache id the node would store this agent's model under, or "" when
+    /// control holds no local bytes for it.
+    ///
+    /// Empty is meaningful rather than a failure: `prepare_model_for_node()`
+    /// transfers only what control can resolve locally, so a ref control cannot
+    /// resolve is one no node will be sent — and therefore one that costs no
+    /// disk anywhere.
+    std::string model_cache_id(const AgentConfig& cfg) const;
+
     /// Optional. Without it every `auto` agent routes to the fallback, since
     /// absence of a record is not evidence of admissibility.
     void set_model_registry(const ControlModelRegistry* registry);

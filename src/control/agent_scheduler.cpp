@@ -367,6 +367,49 @@ void AgentScheduler::set_engine_config_gate(EngineConfigReadyFn ready) {
     engine_config_required_ = static_cast<bool>(engine_config_ready_);
 }
 
+std::string AgentScheduler::model_cache_id(const AgentConfig& cfg) const {
+    // The SAME derivation prepare_model_for_node() uses to name the transfer, so
+    // "does this node hold it" is asked in the node's own vocabulary. Two
+    // derivations would drift, and the failure would be silent: every node would
+    // look like it holds nothing and every placement would be charged for a
+    // transfer that never happens.
+    const auto local = util::resolve_existing_local_model_path(model_location(cfg), models_dir_);
+    if (!local) return {};
+    return manifest_cache_id(*local);
+}
+
+ResourceFootprint AgentScheduler::footprint_for_node(const AgentConfig& cfg,
+                                                     const ResourceFootprint& base,
+                                                     const NodeInfo& node) const {
+    ResourceFootprint out = base;
+
+    // Disk is charged only where a transfer would actually happen.
+    //
+    // This is why `nodes_with_capacity_for()` exists: a container that the
+    // target already holds costs it nothing, and one it lacks costs the whole
+    // size, so the demand genuinely differs per node and a single footprint
+    // cannot say it. Before this, `disk_mb` was always 0 — the axis was enforced
+    // but only ever against the 8 GiB headroom, never against a model's real
+    // demand (roadmap D65).
+    const std::string cache_id = model_cache_id(cfg);
+    if (cache_id.empty()) {
+        // Control holds no local bytes, so nothing will be transferred and no
+        // disk will be consumed by this placement. Same reasoning as
+        // prepare_model_for_node(), which passes such a ref through untouched.
+        return out;
+    }
+
+    const bool resident =
+        std::find(node.local_model_ids.begin(), node.local_model_ids.end(), cache_id) !=
+        node.local_model_ids.end();
+    if (resident) return out;
+
+    const std::int64_t bytes = measure_model_bytes(model_location(cfg), models_dir_);
+    constexpr std::int64_t kMib = 1024 * 1024;
+    out.disk_mb += bytes / kMib;
+    return out;
+}
+
 ResourceFootprint AgentScheduler::soma_footprint(const AgentConfig& cfg) const {
     ResourceFootprint out;
 
@@ -728,7 +771,11 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         }
     }
 
-    for (const auto& node : registry_.nodes_with_capacity(needed)) {
+    // Per-node demand: `needed` is what the model costs anywhere, and
+    // footprint_for_node() adds the container's disk only to nodes that would
+    // have to fetch it.
+    const auto demand = [&](const NodeInfo& node) { return footprint_for_node(cfg, needed, node); };
+    for (const auto& node : registry_.nodes_with_capacity_for(demand)) {
         if (const auto slot_id = try_load(node.id)) {
             return publish_new(node.id, *slot_id);
         }

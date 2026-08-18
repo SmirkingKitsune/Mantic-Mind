@@ -224,8 +224,14 @@ std::vector<NodeInfo> NodeRegistry::nodes_with_model_loaded(
 }
 
 std::vector<NodeInfo> NodeRegistry::nodes_with_capacity(const ResourceFootprint& footprint,
-                                                       const CapacityPolicy& policy) const
-{
+                                                        const CapacityPolicy& policy) const {
+    // The uniform-demand case, expressed in terms of the per-node one so there
+    // is a single ranking implementation rather than two that must agree.
+    return nodes_with_capacity_for([&footprint](const NodeInfo&) { return footprint; }, policy);
+}
+
+std::vector<NodeInfo> NodeRegistry::nodes_with_capacity_for(const FootprintForNode& demand,
+                                                            const CapacityPolicy& policy) const {
     std::lock_guard<std::mutex> g(mutex_);
     struct Candidate {
         NodeInfo info;
@@ -245,6 +251,8 @@ std::vector<NodeInfo> NodeRegistry::nodes_with_capacity(const ResourceFootprint&
         // configure.
         if (!placement_allowed_locked(n)) continue;
         const auto capacity = capacity_of(n);
+        // Asked per node, because the answer differs per node.
+        const ResourceFootprint footprint = demand(n);
         if (evaluate_fit(footprint, capacity, policy, nullptr) == FitQuality::None) continue;
         cands.push_back({n, capacity_score(footprint, capacity, policy)});
     }
@@ -598,6 +606,17 @@ bool NodeRegistry::ping_node(NodeInfo& info) {
                 info.hostname = sj["hostname"].get<std::string>();
             if (sj.contains("disk_free_mb"))
                 info.disk_free_mb = sj["disk_free_mb"].get<int64_t>();
+            // Which models the node already holds. A node too old to report the
+            // field keeps `local_model_cache = true` with an empty list, so it
+            // is charged for every transfer — the conservative direction, and
+            // the same answer placement gave before the field existed.
+            if (sj.contains("local_model_ids") && sj["local_model_ids"].is_array()) {
+                info.local_model_ids.clear();
+                for (const auto& id : sj["local_model_ids"]) {
+                    if (id.is_string()) info.local_model_ids.push_back(id.get<std::string>());
+                }
+            }
+            info.local_model_cache = sj.value("local_model_cache", true);
             if (sj.contains("max_slots"))
                 info.max_slots = sj["max_slots"].get<int>();
             if (sj.contains("slot_in_use"))
@@ -701,6 +720,8 @@ void NodeRegistry::poll_all_nodes() {
                 it->second.loaded_model  = info.loaded_model;
                 it->second.slots         = info.slots;
                 it->second.disk_free_mb  = info.disk_free_mb;
+                it->second.local_model_ids = info.local_model_ids;
+                it->second.local_model_cache = info.local_model_cache;
                 it->second.max_slots     = info.max_slots;
                 it->second.slot_in_use   = info.slot_in_use;
                 it->second.connection_status = info.connection_status;

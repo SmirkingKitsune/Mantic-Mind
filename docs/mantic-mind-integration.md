@@ -280,7 +280,7 @@ a config key's clothing. See [architecture.md §4.2](architecture.md).
 | `POST /api/node/load-model` | `backend` is a registry lookup; unknown → 400 listing real ids. `runtime_settings` gains the Soma block. |
 | `POST /api/node/restore-slot` | Same lookup (the duplicated gate at `:911` disappears). Rejects a cross-`arch_hash` checkpoint **before** spawning. |
 | `POST /api/node/suspend-slot` | 409 `multi_sequence_unsupported` instead of a silent partial save. |
-| `GET /api/node/status` | `llama_runtime` → `runtimes[]`, keyed by engine id. |
+| `GET /api/node/status` | `llama_runtime` → `runtimes[]`, keyed by engine id. Also gains `local_model_ids` — the cache ids this node already holds — so placement can charge a model's disk footprint only to candidates that would have to fetch it (roadmap D65). |
 | `/api/node/runtime/llama/*` | → `/api/node/runtime/{id}/*` |
 | `GET /api/node/engines/{slot}/telemetry` | **New.** Node-side SSE forwarded from Soma; control re-publishes it. |
 | `POST /api/node/infer` | Chunk→event mapping becomes independent emission rather than an `if/else-if` priority chain, so a chunk with both `thinking_delta` and `delta_content` stops dropping one. `tool_result_json` is emitted. |

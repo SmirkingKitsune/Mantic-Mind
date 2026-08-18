@@ -1931,6 +1931,85 @@ bool test_scheduler_eviction_skips_unsuspendable_shared_slot() {
     return ok;
 }
 
+bool test_disk_is_charged_only_to_nodes_lacking_the_model() {
+    // D65: `disk_mb` was 0 for every placement, so the disk axis could only ever
+    // reject on the 8 GiB headroom and never on a model's actual demand. The
+    // reason it stayed 0 was sound — a container the target already holds is not
+    // an additional cost, and NodeInfo could not say whether it holds it — so
+    // the fix is the missing INPUT, and this is the property it buys.
+    const auto dir = temp_test_dir("disk-residency");
+    const auto models = dir / "models";
+    std::filesystem::create_directories(models);
+
+    // A real model FILE, because the size charged is measured rather than
+    // stated — and because a file is what control can actually transfer.
+    // `prepare_model_for_node()` resolves through
+    // `resolve_existing_local_model_path()`, which matches `is_regular_file`
+    // only, so a container DIRECTORY never reaches the transfer path at all
+    // (logged as D66). Charging disk for bytes that will never be sent would be
+    // a worse error than charging none.
+    const auto model_file = models / "tiny-model.gguf";
+    {
+        std::ofstream out(model_file, std::ios::binary | std::ios::trunc);
+        const std::vector<char> block(1024 * 1024, 'w'); // 1 MiB, enough to be measurable
+        for (int i = 0; i < 3; ++i)
+            out.write(block.data(), static_cast<std::streamsize>(block.size()));
+    }
+
+    mm::NodeRegistry registry((dir / "registry").string());
+    mm::AgentScheduler scheduler(registry, models.string());
+
+    mm::AgentConfig cfg;
+    cfg.id = "disk-agent";
+    cfg.model_path = model_file.string();
+
+    const std::string cache_id = scheduler.model_cache_id(cfg);
+    CHECK(!cache_id.empty());
+
+    mm::ResourceFootprint base; // no disk of its own
+
+    // A node that does NOT hold it pays for the transfer.
+    mm::NodeInfo without;
+    without.id = "node-without";
+    const auto charged = scheduler.footprint_for_node(cfg, base, without);
+    CHECK(charged.disk_mb >= 3);
+
+    // The same node, once it holds it, pays nothing — which is the entire point.
+    // Charging it anyway would reject exactly the nodes that are cheapest to
+    // place on, and that risk is why this stayed unfixed rather than guessed at.
+    mm::NodeInfo with;
+    with.id = "node-with";
+    with.local_model_ids.push_back(cache_id);
+    const auto free_for_holder = scheduler.footprint_for_node(cfg, base, with);
+    CHECK(free_for_holder.disk_mb == 0);
+
+    // A DIFFERENT model's id must not count as this one. The ids come from
+    // manifest_cache_id() on both sides; a mismatch here would silently make
+    // every node look empty, and every placement would be over-charged forever.
+    mm::NodeInfo other;
+    other.id = "node-other";
+    other.local_model_ids.push_back("some-other-model-id");
+    CHECK(scheduler.footprint_for_node(cfg, base, other).disk_mb >= 3);
+
+    // A ref control cannot resolve locally is one no node will be sent, so it
+    // costs no disk anywhere — the same rule prepare_model_for_node() follows.
+    mm::AgentConfig remote = cfg;
+    remote.model_path = "org/never-fetched";
+    CHECK(scheduler.model_cache_id(remote).empty());
+    CHECK(scheduler.footprint_for_node(remote, base, without).disk_mb == 0);
+
+    // The base footprint is carried through untouched — this adds disk, it does
+    // not replace the engine-shaped demand computed for the model.
+    mm::ResourceFootprint ram_base;
+    ram_base.ram_mb = 4096;
+    const auto combined = scheduler.footprint_for_node(cfg, ram_base, without);
+    CHECK(combined.ram_mb == 4096);
+    CHECK(combined.disk_mb >= 3);
+
+    CHECK(remove_tree(dir));
+    return true;
+}
+
 bool test_soma_footprint_is_ram_shaped_not_vram_shaped() {
     // D62: every demand figure was VRAM, produced by llama.cpp's estimator, for
     // BOTH engines. Soma v1 is CPU-only, and evaluate_fit() refuses to offload
@@ -7584,6 +7663,8 @@ int main(int argc, char** argv) {
          test_scheduler_transfers_existing_relative_models_with_unique_cache_ids},
         {"scheduler_eviction_skips_unsuspendable_shared_slot",
          test_scheduler_eviction_skips_unsuspendable_shared_slot},
+        {"disk_is_charged_only_to_nodes_lacking_the_model",
+         test_disk_is_charged_only_to_nodes_lacking_the_model},
         {"soma_footprint_is_ram_shaped_not_vram_shaped",
          test_soma_footprint_is_ram_shaped_not_vram_shaped},
         {"placement_failure_codes_separate_eligibility_from_capacity",

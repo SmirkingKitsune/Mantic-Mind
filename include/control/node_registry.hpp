@@ -73,6 +73,21 @@ public:
     std::vector<NodeInfo> nodes_with_capacity(const ResourceFootprint& footprint,
                                               const CapacityPolicy& policy = {}) const;
 
+    /// The same ranking, with the demand computed PER NODE.
+    ///
+    /// A footprint is not a property of the model alone — the same shape of
+    /// claim the verdict makes about `(model, quantization, host budget)`. The
+    /// concrete case is disk: a node that already holds the container needs no
+    /// room for it, and one that does not needs all of it, so a single
+    /// `ResourceFootprint` cannot express the demand this function is filtering
+    /// on (roadmap D65).
+    ///
+    /// `demand` is called once per connected, placement-eligible node and must
+    /// be pure — it runs under the registry's lock.
+    using FootprintForNode = std::function<ResourceFootprint(const NodeInfo&)>;
+    std::vector<NodeInfo> nodes_with_capacity_for(const FootprintForNode& demand,
+                                                  const CapacityPolicy& policy = {}) const;
+
     // Callback fired whenever node status changes (health poll results).
     using UpdateCallback = std::function<void(const NodeInfo&)>;
     void set_update_callback(UpdateCallback cb);

@@ -545,6 +545,24 @@ struct NodeInfo {
     int                      slot_suspending = 0;
     int                      slot_suspended = 0;
     int                      slot_error = 0;
+
+    /// Cache ids of the models this node already holds, from its last status
+    /// poll. Empty means "holds none" OR "has no managed cache" — the two are
+    /// distinguished by `local_model_cache`.
+    ///
+    /// Placement charges a candidate for a model's disk footprint only when the
+    /// id is absent here. Before this the health poll collected `disk_free_mb`
+    /// and placement had no way to know whether a transfer was even needed, so
+    /// it charged nothing and the disk axis could only ever reject on headroom
+    /// (roadmap D65).
+    std::vector<std::string> local_model_ids;
+
+    /// False when the node reports no managed model cache at all. Distinct from
+    /// an empty list: "I hold nothing" and "I cannot tell you" lead to different
+    /// decisions, and conflating them would make a node with no cache look like
+    /// one that is empty and therefore cheap to place on.
+    bool local_model_cache = true;
+
     std::string              llama_server_path;
     // The llama-specific DETAIL view. Kept beside `engines` rather than folded
     // into it: release-asset variants, CUDA architecture, and the

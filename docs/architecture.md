@@ -324,7 +324,7 @@ its whole life. Every idea in it shipped anyway, into `AgentScheduler`:
 | The header proposed | Where it actually lives |
 |---|---|
 | backend selection first, recorded with a reason | `AgentScheduler::BackendRouting{engine_id, reason}`, `resolve_backend()` / `resolve_backend_for()`, delegating to `soma::select_backend()` and keeping its `explain()` |
-| `ResourceFootprint{vram, ram, disk}`, disk a real constraint | `common/footprint.hpp`; `NodeRegistry::nodes_with_capacity(const ResourceFootprint&)`; disk headroom checked on every placement. Demand is now engine-shaped: `AgentScheduler::soma_footprint()` asks for RAM and no VRAM, so a CPU-only engine is placeable on a GPU-less node (D62). `disk_mb` is still 0 pending node-side model residency (D65) |
+| `ResourceFootprint{vram, ram, disk}`, disk a real constraint | `common/footprint.hpp`; `NodeRegistry::nodes_with_capacity(const ResourceFootprint&)`; disk headroom checked on every placement. Demand is now engine-shaped: `AgentScheduler::soma_footprint()` asks for RAM and no VRAM, so a CPU-only engine is placeable on a GPU-less node (D62). `disk_mb` is charged per node — the container's measured size, only to candidates whose reported `local_model_ids` lack it, via `nodes_with_capacity_for()` (D65) |
 | structured capacity pressure, not six English substrings | `{"error":{"code":"capacity_pressure"}}` from both engines, with the substring match kept only as a rolling-upgrade fallback for a pre-code node |
 | the two-mutex split, kept | `schedule_mutex_` / `state_mutex_`, unchanged |
 | suspend/restore promoted to `/v1` | `POST /v1/agents/{id}/{suspend,restore,release}` (roadmap D51) |
