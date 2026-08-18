@@ -151,10 +151,16 @@ Status compute_plan(const ArchIr& arch, const HostBudget& budget, PlanDocument& 
 
     // ── KV, which competes with the expert cache for the SAME RAM ────────────
     //
-    // Not a footnote. At 32k context Qwen3's GQA cache wants 3.2 GB of exactly
-    // the memory the expert cache wants. Sizing the expert cache first and
-    // letting KV take the remainder thrashes on long contexts and presents as an
-    // unrelated bug.
+    // Not a footnote. At 32k context Qwen3's GQA cache wants 6.4 GB of exactly
+    // the memory the expert cache wants — per slot, and `kv_slots` multiplies
+    // it. Sizing the expert cache first and letting KV take the remainder
+    // thrashes on long contexts and presents as an unrelated bug.
+    //
+    // 6.4, not the 3.2 this said: that was the fp16 figure, and the cache is
+    // fp32 (D45). The ARITHMETIC below was always right — `kv_bytes_per_token`
+    // has always multiplied by `sizeof(float)` — so no plan ever came out
+    // wrong. What was wrong is the number a reader checks it against, which is
+    // how a correct implementation gets "fixed" into a broken one.
     std::uint64_t kv_per_token = 0;
     if (attn != nullptr && attn->kv_bytes_per_token != nullptr) {
         kv_per_token = attn->kv_bytes_per_token(arch);

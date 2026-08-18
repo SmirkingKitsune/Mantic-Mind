@@ -131,7 +131,6 @@ ClusterEngineConfig NodeEngineManager::current_config() const {
 }
 
 void NodeEngineManager::apply(const ClusterEngineConfig& cfg) {
-    std::vector<std::pair<std::string, const EngineSpec*>> work;
     EngineResolvedCallback resolved_cb;
     {
         std::lock_guard<std::mutex> g(impl_->mutex);

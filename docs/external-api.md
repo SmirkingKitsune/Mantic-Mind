@@ -248,20 +248,34 @@ Recorded with the reason, so the override is visible rather than mysterious.
 Extended with the decision and **its reason**. "Which backend" is far less useful than "which backend,
 and why".
 
+A **bare array**, not an object with a `placements` key:
+
 ```jsonc
-{ "placements": [{
-    "agent_id": "agent-1", "node_id": "node-a", "slot_id": "slot-3",
-    "engine_id": "soma",
-    "backend_reason": "verdict",
-    "backend_detail": "registry verdict 'stream' for arch_hash …",
-    "footprint": { "vram_mb": 0, "ram_mb": 19840, "disk_mb": 14848 },
-    "footprint_source": "plan",        // "plan" = measured | "estimate" = from file size
-    "model_id": 42,
-    "suspended": false, "is_active": true }] }
+[{
+  "agent_id": "agent-1", "node_id": "node-a", "slot_id": "slot-3",
+  "suspended": false, "is_active": true,
+  "kv_cache_node_path": "…", "engine_fingerprint": "…",
+  "placed_at_ms": 1755400000000, "last_active_ms": 1755400090000,
+
+  // added per row by the handler, from the same pure function the scheduler acted on
+  "backend": "soma",
+  "backend_reason": "soma (verdict=hybrid)"
+}]
 ```
 
-`backend_reason` ∈ `verdict` | `no_admission_record` | `operator_override` | `verdict_reject` |
-`resident_only` | `remote_api`.
+`backend_reason` is a **composed sentence**, not an enum token: `BackendDecision::explain()` renders
+`"<engine> (<reason>)"`, folding the verdict in — `soma (verdict=hybrid)`, or
+`llama-cpp (override_refused_conformance, verdict=reject)` where the reason and the verdict are
+different facts and both are worth having. The reason component is one of `verdict` |
+`no_admission_record` | `stale_admission_record` | `operator_override` |
+`override_refused_conformance` (`soma::BackendReason`, `include/soma/routing.hpp`).
+
+> This block previously documented a `{"placements": […]}` wrapper, an `engine_id` field, and
+> `backend_detail` / `footprint` / `footprint_source` / `model_id` fields — none of which this route
+> emits — over an enum (`verdict_reject`, `resident_only`, `remote_api`) that came from
+> `placement_engine.hpp`, a header that was never implemented and is now deleted. A published
+> contract copied from an unbuilt design is worse than an absent one, because a client codes against
+> it. Found by the D46 sweep and corrected here (roadmap D63).
 
 ### Routing policy
 
@@ -296,8 +310,8 @@ They exist because they were the clearest **P1 violation in the system**: the sc
 agents on its own under capacity pressure, the node API has always exposed
 `/api/node/suspend-slot` and `/api/node/restore-slot`, and no `/v1/*` route could reach any of it.
 An operator holding the entire control API could not do a thing the scheduler does routinely.
-`include/control/placement_engine.hpp` argued for promoting exactly these — and is compiled by
-nothing (roadmap D46), so the argument never became a route.
+A design header argued for promoting exactly these — and was compiled by nothing, so the argument
+never became a route. It has since been deleted (roadmap D46); these routes are what it wanted.
 
 ### `POST /v1/agents/{id}/suspend` — `operator`
 Checkpoint the agent's KV and free its slot, remembering the placement so a restore does not

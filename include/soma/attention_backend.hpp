@@ -55,14 +55,21 @@ struct AttentionBackend {
     /// The ONLY cache property that crosses the seam.
     ///
     /// The core allocates the cache and hands the backend rows into it; it never
-    /// learns what is inside. Worked numbers at fp16:
-    ///   Qwen3-30B-A3B   gqa  2×4×128  = 1024 elem/tok/layer → 98 KB/tok
-    ///   DeepSeek-V2-Lite mla 512+64   =  576 elem/tok/layer → 31 KB/tok
+    /// learns what is inside. Worked numbers at **fp32**, which is what the cache
+    /// actually holds — `KvCache` is a `std::vector<float>` and nothing selects
+    /// a narrower dtype:
+    ///   Qwen3-30B-A3B   gqa  2×4×128  = 1024 elem/tok/layer × 48 → 192 KiB/tok
+    ///   DeepSeek-V2-Lite mla 512+64   =  576 elem/tok/layer × 27 →  61 KiB/tok
     ///
-    /// GQA's KV is a first-class planner input, not a footnote: at 32k context
-    /// Qwen3 wants 3.2 GB of the same RAM the expert cache wants, and a planner
-    /// that sized the expert cache first would thrash on long contexts and look
-    /// like an unrelated bug.
+    /// These were written at fp16 — 98 KB and 31 KB — beside implementations
+    /// that multiply by `sizeof(float)`. Exactly half the real figure, on the
+    /// optimistic side, for the one quantity this comment exists to say is not a
+    /// footnote (D45).
+    ///
+    /// GQA's KV is a first-class planner input: at 32k context Qwen3 wants
+    /// **6.4 GB** of the same RAM the expert cache wants, and a planner that
+    /// sized the expert cache first would thrash on long contexts and look like
+    /// an unrelated bug.
     std::size_t (*kv_bytes_per_token)(const ArchIr& arch) noexcept = nullptr;
 
     /// How many bytes one (rows x cols) tensor of `role` occupies under the

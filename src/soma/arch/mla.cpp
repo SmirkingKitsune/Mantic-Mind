@@ -1250,8 +1250,9 @@ std::size_t kv_bytes_per_token(const ArchIr& arch) noexcept {
     // magnitude less on comparable configs, which is why it can afford a long
     // context beside a big expert cache.
     //
-    // fp32 to match the GQA implementation's G0 cache dtype; the planner scales
-    // by the configured KV dtype.
+    // fp32, matching the GQA implementation and the cache itself. There is no
+    // configured KV dtype for the planner to scale by — see the note in
+    // gqa.cpp's kv_bytes_per_token (D45).
     //
     // BOTH PLANES, each at its own width — which for plain MLA means the K plane
     // and nothing else.

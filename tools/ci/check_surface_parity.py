@@ -15,8 +15,9 @@ Two checks already guard neighbouring properties and neither guards this one:
 The gap it closes, concretely: `AgentScheduler::suspend_agent` was PRIVATE, the
 node API had `/api/node/suspend-slot`, and no `/v1/*` route could reach either.
 An operator holding the entire control API could not suspend an agent, while the
-scheduler did it on its own under capacity pressure. `placement_engine.hpp` said
-so in a comment and is compiled by nothing, so nothing failed.
+scheduler did it on its own under capacity pressure. A design header said so in a
+comment and was compiled by nothing, so nothing failed. This check exists so the
+claim lives somewhere a build can refuse it; that header is gone (roadmap D46).
 
 WHAT THIS CANNOT DO, stated plainly and kept current as each limit is found:
 

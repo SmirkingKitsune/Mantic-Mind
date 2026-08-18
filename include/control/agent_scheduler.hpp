@@ -88,9 +88,11 @@ public:
     /// capacity pressure calls it — and the node API has always exposed
     /// /api/node/suspend-slot, but no /v1/* route could reach it, so an operator
     /// with the whole API could not do a thing the scheduler does on its own.
-    /// `include/control/placement_engine.hpp` (unimplemented — roadmap D46)
-    /// documented exactly this gap and called for promoting it; that header
-    /// builds nothing, so the note never became a route.
+    /// A design header that nothing compiled documented exactly this gap and
+    /// called for promoting it. Because it compiled, nothing could fail, so the
+    /// note sat there being right for as long as anyone cared to read it. That
+    /// header is deleted (roadmap D46); the lesson it cost is that a design
+    /// stated where no build can check it is a design that does not exist.
     ///
     /// Returns false when the agent has no live placement to suspend.
     bool suspend_agent(const AgentId& agent_id);

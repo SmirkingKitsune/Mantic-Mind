@@ -98,7 +98,13 @@ One format serves warm reopen, scheduler preemption, and cluster slot suspend/re
 
 ---
 
-## 2. Verdict-driven routing in `PlacementEngine`
+## 2. Verdict-driven routing in `AgentScheduler`
+
+> Written when this was going to be a new class called `PlacementEngine`. It never was: the header
+> was declared, implemented by nothing, and deleted (roadmap D46). **Most** of what follows shipped
+> into `AgentScheduler` itself — see [architecture.md §8.0](architecture.md) for the mapping — with
+> two exceptions flagged inline below, because a note saying "everything below shipped" over a
+> section where two things did not would be the same kind of claim this deletion exists to remove.
 
 ### The algorithm is preserved
 
@@ -115,28 +121,44 @@ operations including multi-GB model transfers, while `state_mutex_` guards only 
 
 ### What changes around it
 
-**Backend selection happens first**, from the registry verdict, and is recorded with a reason. The
-current first act is the opposite:
+**Backend selection happens first**, from the registry verdict, and is recorded with a reason. What
+it replaced was the opposite — an unconditional refusal of anything that was not llama.cpp:
 
 ```cpp
-// agent_scheduler.cpp:304
+// then
 if (!is_llama_backend(cfg.inference_backend)) { release_agent(cfg.id); return nullopt; }
 ```
 
-`select_backend(cfg)` is **pure** given `(config, registry)` and is exposed separately — it deserves to
-be tested without a node in the loop, and it serves `GET /v1/agents/{id}` so a client can see the
-decision without causing a placement.
+```cpp
+// now — the check survives, meaning something else entirely: node-local vs API-backed.
+// Soma passes through it and `soma::select_backend` picks.
+AgentScheduler::BackendRouting AgentScheduler::resolve_backend(
+    const AgentConfig& cfg, const soma::AdmissionRecord& record);   // {engine_id, reason}
+```
 
-**`engine_fingerprint` gains `engine_id` and `arch_hash`.** The same weights served by two different
-engines are not the same engine, and a requantization changes `arch_hash` without changing any launch
-flag. Without both, a re-admitted model would keep running on a stale process.
+`resolve_backend(cfg, record)` is **pure** given `(config, record)` and is `static` — it deserves to
+be tested without a node in the loop — with `resolve_backend_for(cfg)` doing the registry lookup for
+callers that have one. The reason string travels with the decision, so a client can see it without
+causing a placement.
+
+**`engine_fingerprint` gains `engine_id`** — the same weights served by two different engines are not
+the same engine, so a backend change forces a reload. Live: `engine_fingerprint(cfg, models_dir, engine_id)`.
+
+> **`arch_hash` is not a named component**, and the reason it may not need to be is worth recording
+> rather than asserting either way. The `model` component is `file_manifest_identity()`, which for a
+> container directory walks it recursively and records every file's relative path, size and mtime.
+> A requantization written into the SAME directory therefore changes the fingerprint already, without
+> anyone naming `arch_hash`. What is NOT traced here is the cross-directory case — a re-admission at a
+> different quantization lands in its own container (`<name>-q4_g-q6_g-g128`), and whether the agent's
+> `model_path` then resolves to the new one is a question about ref resolution, not about this
+> fingerprint. Stated as an open question because that is what it is; no defect is claimed.
 
 ### The placement estimate is re-shaped, not re-tuned
 
 | | Before | After |
 |---|---|---|
 | Type | `int64_t vram_needed` | `ResourceFootprint{vram_mb, ram_mb, disk_mb}` |
-| Source | `estimate_inference_vram_mb()` | Soma: **read from `plan --json`**. Fallback: recursive directory sizing. |
+| Source | `estimate_inference_vram_mb()` | Soma: **read from `plan --json`**. Fallback: recursive directory sizing. **Not shipped control-side** — every footprint control builds still sets `vram_mb` alone (D62); the three-axis figure is computed node-side, after placement has chosen. |
 | Node query | `nodes_with_available_vram(int64_t)` | `nodes_with_capacity(ResourceFootprint)` |
 | Disk | Never consulted | Hard constraint |
 

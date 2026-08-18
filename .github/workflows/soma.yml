@@ -111,7 +111,6 @@ jobs:
                        include/node/kv_checkpoint_backend.hpp \
                        include/common/engine_client.hpp \
                        include/common/footprint.hpp \
-                       include/control/placement_engine.hpp \
                        include/control/model_registry.hpp \
                        include/control/route_scope.hpp \
                        -name '*.hpp' -o -name '*.cpp' 2>/dev/null | sort)

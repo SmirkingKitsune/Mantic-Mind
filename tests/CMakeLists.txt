@@ -114,8 +114,9 @@ if(Python3_Interpreter_FOUND)
     # /api/node/suspend-slot, and no /v1 route could reach either — so an
     # operator holding the whole control API could not suspend an agent while
     # the scheduler did it on its own under capacity pressure.
-    # placement_engine.hpp said exactly that in a comment, and is compiled by
-    # nothing (roadmap D46), so nothing failed.
+    # A design header said exactly that in a comment and was compiled by
+    # nothing (roadmap D46), so nothing failed. This check is the answer to
+    # that: the claim now lives somewhere a build can refuse it.
     add_test(NAME mm_surface_parity
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_SOURCE_DIR}/tools/ci/check_surface_parity.py"

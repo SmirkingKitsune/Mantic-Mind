@@ -3366,9 +3366,10 @@ void ControlApiServer::register_routes() {
     // not do a thing the scheduler routinely does on its own.
     //
     // That is the P1 violation in the API's own words: "no internal-only
-    // capabilities". include/control/placement_engine.hpp called for promoting
-    // exactly these and is compiled by nothing (roadmap D46), so the note never
-    // became a route.
+    // capabilities". A design header that nothing compiled called for promoting
+    // exactly these; nothing compiled it, so nothing could fail, and the note
+    // never became a route. The header is gone (roadmap D46) — these routes are
+    // what it was asking for.
 
     server_->Post("/v1/agents/:id/suspend", [this](const Request& req, Response& res) {
         const std::string id = req.path_params.at("id");

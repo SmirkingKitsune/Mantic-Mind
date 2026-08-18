@@ -418,9 +418,17 @@ const soma::F32Backend& f32_backend() noexcept {
 std::size_t kv_bytes_per_token(const ArchIr& arch) noexcept {
     // Full K and V per token, per layer: 2 * n_kv_heads * head_dim.
     //
-    // fp32 here because that is the G0 cache dtype; the planner scales this by
-    // the configured KV dtype. Worth stating because GQA's KV competes directly
-    // with the expert cache for RAM (docs/architecture.md §2.2).
+    // fp32, full stop. This used to add "the planner scales this by the
+    // configured KV dtype", and there is no such configuration: KvCache holds
+    // `std::vector<float>` (kv_cache.hpp), plan.cpp multiplies this figure by
+    // context and slots and by nothing else, and no flag, env var or container
+    // field selects a KV dtype. The sentence described an fp16 cache that was
+    // never built, and it mattered because the numbers quoted alongside it were
+    // fp16 numbers — half the RAM this actually asks for, in the optimistic
+    // direction (D45).
+    //
+    // Worth stating at all because GQA's KV competes directly with the expert
+    // cache for the same RAM (docs/architecture.md §2.2).
     const std::size_t per_layer =
         2ull * arch.attention.n_kv_heads * arch.attention.head_dim * sizeof(float);
     return per_layer * arch.topology.n_layers;

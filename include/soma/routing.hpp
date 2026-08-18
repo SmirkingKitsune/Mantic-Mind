@@ -3,10 +3,16 @@
 // Soma — which engine serves an agent.
 //
 // PURE, given (agent config, admission record). No node, no placement, no I/O.
-// That is deliberate: the same function answers `GET /v1/agents/{id}` — so a
-// client can see the decision and its reason without causing a placement — and
-// it is the one piece of G5 that can be tested exhaustively rather than
+// That is deliberate: the decision can be ANSWERED without causing a placement,
+// and it is the one piece of G5 that can be tested exhaustively rather than
 // observed.
+//
+// This said "the same function answers `GET /v1/agents/{id}`". It does not:
+// that handler returns config, placement, status and node compatibility, and
+// carries no `backend` or `backend_reason` at all. `GET /v1/placements` and
+// `PUT /v1/agents/{id}/backend` are the two routes that do surface the reason
+// string. Purity is what makes the missing one a three-line fix rather than a
+// design problem — see roadmap D61.
 //
 // The policy, from docs/architecture.md §9:
 //
