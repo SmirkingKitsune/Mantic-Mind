@@ -198,9 +198,14 @@ bool model_ref_is_local_path(const std::string& ref) {
     return false;
 }
 
-std::optional<std::string> resolve_existing_local_model_path(
-    const std::string& ref,
-    const std::string& models_dir) {
+namespace {
+
+/// Shared body of the two resolvers. `allow_directory` is the only difference:
+/// what counts as "a model" depends on the engine, and a single predicate could
+/// not serve both without one caller silently accepting the wrong thing.
+std::optional<std::string> resolve_local_model_ref(const std::string& ref,
+                                                   const std::string& models_dir,
+                                                   bool allow_directory) {
     namespace fs = std::filesystem;
 
     std::string cleaned = trim(ref);
@@ -242,7 +247,12 @@ std::optional<std::string> resolve_existing_local_model_path(
 
     for (const auto& candidate : candidates) {
         std::error_code ec;
-        if (!fs::is_regular_file(candidate, ec)) continue;
+        bool acceptable = fs::is_regular_file(candidate, ec);
+        if (!acceptable && allow_directory) {
+            ec.clear();
+            acceptable = fs::is_directory(candidate, ec);
+        }
+        if (!acceptable) continue;
 
         ec.clear();
         fs::path resolved = fs::weakly_canonical(candidate, ec);
@@ -254,6 +264,18 @@ std::optional<std::string> resolve_existing_local_model_path(
         return resolved.lexically_normal().string();
     }
     return std::nullopt;
+}
+
+} // namespace
+
+std::optional<std::string> resolve_existing_local_model_path(const std::string& ref,
+                                                             const std::string& models_dir) {
+    return resolve_local_model_ref(ref, models_dir, /*allow_directory=*/false);
+}
+
+std::optional<std::string> resolve_existing_local_model_ref(const std::string& ref,
+                                                            const std::string& models_dir) {
+    return resolve_local_model_ref(ref, models_dir, /*allow_directory=*/true);
 }
 
 std::string bytes_label(std::int64_t bytes) {

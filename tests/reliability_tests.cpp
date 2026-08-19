@@ -1931,6 +1931,136 @@ bool test_scheduler_eviction_skips_unsuspendable_shared_slot() {
     return ok;
 }
 
+bool test_container_directory_transfers_to_a_node() {
+    // D66: transfer_model_to_node() has always walked a directory and streamed
+    // every file, and both of its callers resolved through a FILE-ONLY helper —
+    // so the directory branch was unreachable from placement and an admitted
+    // Soma container was never sent to a node. Soma's models are always
+    // container directories, so this was the normal case for the engine the
+    // branch exists to serve.
+    //
+    // Asserted by counting what the node RECEIVES. A test that only checked the
+    // resolver would pass with the transfer still unreachable — the resolver was
+    // never the point, reaching the streaming branch was.
+    const auto dir = temp_test_dir("container-transfer");
+    const auto models = dir / "models";
+    std::filesystem::create_directories(models);
+
+    const auto container = models / "Qwen3-30B-A3B-q4_g-q6_g-g128";
+    std::filesystem::create_directories(container / "experts");
+    for (const auto& rel : {std::string("container_meta.json"),
+                            std::string("dense.bin"),
+                            std::string("experts/layer0.bin")}) {
+        std::ofstream out(container / rel, std::ios::binary | std::ios::trunc);
+        out << "payload-" << rel;
+    }
+
+    const uint16_t port = find_free_test_port();
+    CHECK(port != 0);
+    const std::string url = "http://127.0.0.1:" + std::to_string(port);
+
+    httplib::Server server;
+    std::mutex received_mutex;
+    std::vector<std::string> received_paths;
+    std::string received_model_id;
+
+    server.Get("/api/node/health", [](const httplib::Request&, httplib::Response& res) {
+        mm::NodeHealthMetrics health;
+        health.gpu_vram_total_mb = 131072;
+        health.gpu_backend_available = true;
+        health.disk_free_mb = 1000000;
+        health.ram_total_mb = 65536;
+        res.set_content(nlohmann::json(health).dump(), "application/json");
+    });
+    server.Get("/api/node/status", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(nlohmann::json{{"slots", nlohmann::json::array()},
+                                       {"max_slots", 2},
+                                       {"slot_available", 2}}
+                            .dump(),
+                        "application/json");
+    });
+    server.Post("/api/node/load-model", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(nlohmann::json{{"status", "loaded"}, {"slot_id", "slot-container"}}.dump(),
+                        "application/json");
+    });
+    server.Get("/api/node/models/local", [](const httplib::Request&, httplib::Response& res) {
+        // Not present, so the transfer is not skipped by the dedup check.
+        res.set_content(nlohmann::json{{"available", true}, {"present", false}}.dump(),
+                        "application/json");
+    });
+    server.Post("/api/node/models/receive",
+                [&](const httplib::Request& req, httplib::Response& res) {
+                    {
+                        std::lock_guard<std::mutex> lk(received_mutex);
+                        received_paths.push_back(req.get_header_value("X-MM-Rel-Path"));
+                        received_model_id = req.get_header_value("X-MM-Model-Id");
+                    }
+                    res.set_content(nlohmann::json{{"status", "stored"},
+                                                   {"load_path", "/node/models/container"}}
+                                        .dump(),
+                                    "application/json");
+                });
+
+    std::atomic<bool> listen_ok{false};
+    std::thread server_thread([&] { listen_ok = server.listen("127.0.0.1", port); });
+
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    RECORD(wait_for_test_server(url));
+
+    // The resolver half: a directory now resolves as a model reference, while
+    // the file-only form still refuses it — the split is the fix, not a widening.
+    RECORD(mm::util::resolve_existing_local_model_ref(container.string(), models.string())
+               .has_value());
+    RECORD(!mm::util::resolve_existing_local_model_path(container.string(), models.string())
+                .has_value());
+
+    mm::NodeRegistry registry((dir / "registry").string());
+    const auto node_id = registry.add_node(url, "container-secret", "test");
+    registry.start_health_poll(1);
+    RECORD(wait_for_registered_node(registry, node_id));
+    mm::AgentScheduler scheduler(registry, models.string());
+
+    mm::AgentConfig cfg;
+    cfg.id = "container-agent";
+    cfg.model_path = container.string();
+
+    // The cache id is derivable for a directory, which is what lets residency
+    // and disk accounting work for containers at all (D65 leaned on this).
+    RECORD(!scheduler.model_cache_id(cfg).empty());
+
+    // And the bytes actually move — driven through REAL placement rather than the
+    // transfer helper, because "the directory reaches the streaming branch when
+    // an agent is placed" is the claim, and calling the helper directly would
+    // assert it about a path placement might not take.
+    cfg.preferred_node_id = node_id;
+    RECORD(scheduler.ensure_agent_running(cfg).has_value());
+    {
+        std::lock_guard<std::mutex> lk(received_mutex);
+        RECORD(received_paths.size() == 3);
+        RECORD(!received_model_id.empty());
+        RECORD(std::find(received_paths.begin(), received_paths.end(), "container_meta.json") !=
+               received_paths.end());
+        // Nested files keep their RELATIVE path — a flattened transfer would
+        // land every shard in the container root and fail at load.
+        RECORD(std::find(received_paths.begin(), received_paths.end(), "experts/layer0.bin") !=
+               received_paths.end());
+    }
+
+    registry.stop_health_poll();
+    server.stop();
+    if (server_thread.joinable()) server_thread.join();
+    RECORD(listen_ok);
+    RECORD(remove_tree(dir));
+
+#undef RECORD
+    return ok;
+}
+
 bool test_disk_is_charged_only_to_nodes_lacking_the_model() {
     // D65: `disk_mb` was 0 for every placement, so the disk axis could only ever
     // reject on the 8 GiB headroom and never on a model's actual demand. The
@@ -7663,6 +7793,8 @@ int main(int argc, char** argv) {
          test_scheduler_transfers_existing_relative_models_with_unique_cache_ids},
         {"scheduler_eviction_skips_unsuspendable_shared_slot",
          test_scheduler_eviction_skips_unsuspendable_shared_slot},
+        {"container_directory_transfers_to_a_node",
+         test_container_directory_transfers_to_a_node},
         {"disk_is_charged_only_to_nodes_lacking_the_model",
          test_disk_is_charged_only_to_nodes_lacking_the_model},
         {"soma_footprint_is_ram_shaped_not_vram_shaped",

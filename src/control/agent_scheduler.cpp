@@ -282,8 +282,12 @@ std::optional<PreparedModel> prepare_model_for_node(const NodeInfo& node,
         ? cfg.vision_settings.mmproj_path
         : std::string{};
 
-    if (const auto model_path =
-            util::resolve_existing_local_model_path(model_ref, models_dir)) {
+    // A model is a FILE for llama.cpp and a DIRECTORY for Soma, and this is the
+    // one place that has to accept both: transfer_model_to_node() already walks
+    // a directory and streams every file, but resolving through the file-only
+    // form made that branch unreachable, so an admitted container was never
+    // sent anywhere (roadmap D66).
+    if (const auto model_path = util::resolve_existing_local_model_ref(model_ref, models_dir)) {
         const std::string cache_id = manifest_cache_id(*model_path);
         auto local = transfer_model_to_node(
             node, *model_path, pin, force, error, cache_id);
@@ -373,7 +377,7 @@ std::string AgentScheduler::model_cache_id(const AgentConfig& cfg) const {
     // derivations would drift, and the failure would be silent: every node would
     // look like it holds nothing and every placement would be charged for a
     // transfer that never happens.
-    const auto local = util::resolve_existing_local_model_path(model_location(cfg), models_dir_);
+    const auto local = util::resolve_existing_local_model_ref(model_location(cfg), models_dir_);
     if (!local) return {};
     return manifest_cache_id(*local);
 }
