@@ -59,6 +59,7 @@ std::uint64_t now_ms() {
 struct KvCheckpointStore::Impl {
     fs::path dir;
     ArchIr arch;
+    const AttentionBackend* attention = nullptr;
     KvFormatId format_id = kKvFormatInvalid;
     bool open = false;
 
@@ -89,10 +90,10 @@ struct KvCheckpointStore::Impl {
     }
 
     Status gate(const KvCheckpointHeader& h) const {
-        if (h.version != kKvCheckpointVersion) {
+        if (h.version != kKvCheckpointVersion &&
+            h.version != kKvCheckpointVersionSpeculative) {
             return {StatusCode::VersionMismatch,
-                    "checkpoint version " + std::to_string(h.version) +
-                        " != " + std::to_string(kKvCheckpointVersion)};
+                    "unsupported checkpoint version " + std::to_string(h.version)};
         }
         if (h.arch_hash != arch.arch_hash) {
             return {StatusCode::ArchMismatch,
@@ -126,6 +127,7 @@ Status KvCheckpointStore::open(const std::string& checkpoint_dir, const ArchIr& 
         return {StatusCode::Unsupported, "no attention backend for this architecture"};
     }
     im.format_id = attention->persist_format_id;
+    im.attention = attention;
     if (im.format_id == kKvFormatInvalid) {
         return {StatusCode::Unsupported, "attention backend declares no KV persist format"};
     }
@@ -163,22 +165,43 @@ KvCheckpointStore::save(const std::string& key, const KvCache& kv, const SeqPers
     const auto layers = kv.n_layers();
     const auto payload_floats =
         static_cast<std::uint64_t>(len) * (static_cast<std::uint64_t>(k_hkv) + v_hkv) * layers;
+    std::vector<std::byte> opaque_payload;
+    if (kv.is_opaque()) {
+        if (im.attention == nullptr || im.attention->serialize_kv == nullptr) {
+            return {StatusCode::Unsupported,
+                    "opaque KV backend does not provide checkpoint serialization"};
+        }
+        if (auto st = im.attention->serialize_kv(
+                im.arch,
+                std::span<const std::byte>(kv.opaque_data(), kv.opaque_size()),
+                kv.capacity(),
+                len,
+                opaque_payload);
+            !st.ok()) return st;
+    }
+    const auto cache_payload_bytes = kv.is_opaque()
+                                         ? static_cast<std::uint64_t>(opaque_payload.size())
+                                         : payload_floats * sizeof(float);
 
     std::vector<std::byte> buf;
-    buf.reserve(static_cast<std::size_t>(payload_floats) * sizeof(float) + 256);
+    buf.reserve(static_cast<std::size_t>(cache_payload_bytes) + 256);
     for (const char c : kMagic)
         buf.push_back(static_cast<std::byte>(c));
-    put_u32(buf, kKvCheckpointVersion);
+    const auto version = state.auxiliary.empty() ? kKvCheckpointVersion
+                                                  : kKvCheckpointVersionSpeculative;
+    put_u32(buf, version);
     put_str(buf, im.arch.arch_hash);
     put_u32(buf, im.format_id);
     put_u32(buf, len);
     put_u32(buf, im.arch.topology.d_model);
-    put_u64(buf, payload_floats * sizeof(float));
+    put_u64(buf, cache_payload_bytes);
     put_u64(buf, now_ms());
     // v3: the sampler's stream position, so a resumed sequence continues the
     // draw it was on rather than starting a fresh one.
     put_u64(buf, state.rng_state);
     put_u32(buf, static_cast<std::uint32_t>(state.emitted.size()));
+    if (version == kKvCheckpointVersionSpeculative)
+        put_u64(buf, static_cast<std::uint64_t>(state.auxiliary.size()));
     // v2: the ids occupying the cached positions, so a restore can be CHECKED
     // against the prompt it is attached to rather than trusted.
     for (const auto t : state.tokens)
@@ -196,12 +219,17 @@ KvCheckpointStore::save(const std::string& key, const KvCache& kv, const SeqPers
         const auto* b = reinterpret_cast<const std::byte*>(src);
         buf.insert(buf.end(), b, b + n_floats * sizeof(float));
     };
-    for (std::uint32_t l = 0; l < layers; ++l) {
-        append(mut.k_at(l, 0), static_cast<std::size_t>(len) * k_hkv);
+    if (kv.is_opaque()) {
+        buf.insert(buf.end(), opaque_payload.begin(), opaque_payload.end());
+    } else {
+        for (std::uint32_t l = 0; l < layers; ++l) {
+            append(mut.k_at(l, 0), static_cast<std::size_t>(len) * k_hkv);
+        }
+        for (std::uint32_t l = 0; l < layers && v_hkv > 0; ++l) {
+            append(mut.v_at(l, 0), static_cast<std::size_t>(len) * v_hkv);
+        }
     }
-    for (std::uint32_t l = 0; l < layers && v_hkv > 0; ++l) {
-        append(mut.v_at(l, 0), static_cast<std::size_t>(len) * v_hkv);
-    }
+    buf.insert(buf.end(), state.auxiliary.begin(), state.auxiliary.end());
 
     // Write to a temporary and rename. A checkpoint is written under memory
     // pressure and read after a crash or a migration; a half-written file that
@@ -251,10 +279,42 @@ Status KvCheckpointStore::load(const std::string& key, KvCache& kv, SeqPersistSt
     out.tokens = read_ids(h.tokens_at, h.length_tokens);
     out.emitted = read_ids(h.emitted_at, h.n_emitted);
     out.rng_state = h.rng_state;
+    if (h.auxiliary_bytes > 0) {
+        if (h.auxiliary_at > raw.size() || h.auxiliary_bytes > raw.size() - h.auxiliary_at) {
+            return {StatusCode::InvalidArgument,
+                    "checkpoint auxiliary state is truncated"};
+        }
+        out.auxiliary.assign(raw.begin() + h.auxiliary_at,
+                             raw.begin() + h.auxiliary_at + h.auxiliary_bytes);
+    } else {
+        out.auxiliary.clear();
+    }
 
     const auto k_hkv = kv.k_hkv();
     const auto v_hkv = kv.v_hkv();
     const auto layers = kv.n_layers();
+    if (kv.is_opaque()) {
+        if (h.length_tokens > kv.capacity()) {
+            return {StatusCode::InvalidArgument, "opaque checkpoint exceeds destination capacity"};
+        }
+        if (raw.size() - at < h.payload_bytes) {
+            return {StatusCode::InvalidArgument,
+                    "opaque checkpoint payload is truncated"};
+        }
+        if (im.attention == nullptr || im.attention->restore_kv == nullptr) {
+            return {StatusCode::Unsupported,
+                    "opaque KV backend does not provide checkpoint restoration"};
+        }
+        if (auto st = im.attention->restore_kv(
+                im.arch,
+                std::span<const std::byte>(raw.data() + at,
+                                           static_cast<std::size_t>(h.payload_bytes)),
+                h.length_tokens,
+                std::span<std::byte>(kv.opaque_data(), kv.opaque_size()),
+                kv.capacity());
+            !st.ok()) return st;
+        return kv.set_length(h.length_tokens);
+    }
     if (k_hkv == 0 || layers == 0) {
         return {StatusCode::InvalidArgument, "destination cache is not open"};
     }

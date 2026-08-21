@@ -31,6 +31,7 @@ struct HostBudget {
     std::uint64_t disk_bandwidth = 0; ///< bytes/sec, measured at expert size
     std::uint32_t ctx_size = 4096;
     std::uint32_t kv_slots = 4;
+    bool speculative = false; ///< include optional draft resident/KV footprints
 
     /// Slowest generation the DEPLOYER will accept, tok/s. Below it the verdict
     /// is Reject.
@@ -80,12 +81,26 @@ struct PlanDocument {
     ResourceFootprint footprint{};
 
     std::uint64_t dense_resident_bytes = 0;
+    std::uint32_t ctx_size = 0;           ///< requested context for this plan
+    std::uint32_t max_context = 0;        ///< architecture's configurable ceiling
+    std::uint32_t kv_slots = 1;           ///< independently live cache slots selected
     std::uint64_t kv_bytes_at_ctx = 0;    ///< ctx_size × kv_slots
     std::uint64_t expert_cache_bytes = 0; ///< the safe cap after KV is subtracted
     std::uint64_t pin_bytes = 0;
     std::uint64_t vram_hot_bytes = 0; ///< v1: always 0
     std::uint64_t total_routed_bytes = 0;
     std::uint64_t disk_footprint_bytes = 0;
+
+    bool speculative_available = false;
+    bool speculative_selected = false;
+    std::string speculative_method;
+    std::uint32_t speculative_stages = 0;
+    std::uint32_t speculative_trained_block_size = 0;
+    std::uint32_t speculative_default_tokens = 0;
+    std::uint64_t speculative_routed_bytes = 0;
+    std::uint64_t speculative_resident_bytes = 0;
+    std::uint64_t speculative_kv_bytes_per_slot = 0;
+    std::uint64_t speculative_kv_bytes_at_ctx = 0;
 
     /// Cache-aware concurrency, derived not configured:
     ///     cap_per_layer / expected_unique_experts_per_step

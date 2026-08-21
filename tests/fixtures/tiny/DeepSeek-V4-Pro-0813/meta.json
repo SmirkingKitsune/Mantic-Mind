@@ -1,0 +1,43 @@
+{
+  "fixture_version": 1,
+  "generate": 256,
+  "greedy_first_16": [
+    352,
+    260,
+    447,
+    44,
+    116,
+    276,
+    83,
+    474,
+    82,
+    353,
+    372,
+    389,
+    5,
+    335,
+    29,
+    251
+  ],
+  "implementation": "native",
+  "layer_kinds": [
+    "moe",
+    "moe",
+    "moe",
+    "moe"
+  ],
+  "n_params": 601405,
+  "numpy_version": "2.5.2",
+  "positions": 512,
+  "seed": 20260727,
+  "slug": "DeepSeek-V4-Pro-0813",
+  "source": "C:\\Users\\RyanM\\AppData\\Local\\Temp\\deepseek-v4-pro-0813-meta",
+  "source_architectures": [
+    "DeepseekV4ForCausalLM"
+  ],
+  "source_model_type": "deepseek_v4",
+  "tf_logits_sha256": "e33725f3ff06af86531343652a02fa0c9bd2b3148675170f67ba53cf85e40f79",
+  "torch_version": "2.13.0+cpu",
+  "transformers_version": "5.15.0",
+  "weights_sha256": "0210b7b7b14d0eea15df903064787ae7fb1f014d7510c18c01992c53f46d0dba"
+}

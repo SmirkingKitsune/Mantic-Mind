@@ -83,9 +83,27 @@ def dump_reference(fixture: Path, out: Path, positions: int) -> None:
     from transformers import AutoConfig, AutoModelForCausalLM
 
     cfg = AutoConfig.from_pretrained(fixture)
-    model = AutoModelForCausalLM.from_pretrained(
-        fixture, config=cfg, torch_dtype=torch.float32
-    )
+    is_v4 = cfg.model_type == "deepseek_v4"
+    name_map_path = fixture / "native_to_soma.json"
+    if is_v4 and name_map_path.exists():
+        # The committed fixture speaks the production checkpoint dialect Soma
+        # serves. Reconstruct native Transformers' descriptive module names for
+        # activation inspection without storing a duplicate 2.4 MB state dict.
+        from safetensors.torch import load_file
+
+        model = AutoModelForCausalLM.from_config(cfg).to(torch.float32)
+        native_to_soma = __import__("json").loads(name_map_path.read_text(encoding="utf-8"))
+        soma_to_native = {soma: native for native, soma in native_to_soma.items()}
+        expected = model.state_dict()
+        restored = {}
+        for soma_name, tensor in load_file(str(fixture / "model.safetensors")).items():
+            native_name = soma_to_native[soma_name]
+            restored[native_name] = tensor.to(dtype=expected[native_name].dtype)
+        model.load_state_dict(restored, strict=True)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            fixture, config=cfg, dtype=torch.float32
+        )
     model.eval()
 
     # The oracle's own token ids. Inventing a sequence here would make the two
@@ -155,9 +173,75 @@ def dump_reference(fixture: Path, out: Path, positions: int) -> None:
     }
 
     layers = model.model.layers
+    v4_hc: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+    def v4_hc_hook(idx, site):
+        def fn(_mod, args, output):
+            residual = args[0]
+            post, comb, collapsed = output
+            v4_hc[(idx, site)] = (residual, post, comb)
+            records.append((idx, f"hc_{site}_pre", collapsed.detach().float().numpy()))
+        return fn
+
+    def v4_attn_hook(idx):
+        def fn(_mod, _args, output):
+            branch = output[0] if isinstance(output, tuple) else output
+            records.append((idx, "attn_out", branch.detach().float().numpy()))
+            residual, post, comb = v4_hc[(idx, "attn")]
+            streams = post.to(residual.dtype).unsqueeze(-1) * branch.unsqueeze(-2) + torch.matmul(
+                comb.to(residual.dtype).transpose(-1, -2), residual)
+            records.append((idx, "hc_attn_streams", streams.detach().float().numpy()))
+        return fn
+
+    def v4_ffn_hook(idx):
+        def fn(_mod, _args, branch):
+            residual, post, comb = v4_hc[(idx, "ffn")]
+            streams = post.to(residual.dtype).unsqueeze(-1) * branch.unsqueeze(-2) + torch.matmul(
+                comb.to(residual.dtype).transpose(-1, -2), residual)
+            records.append((idx, "hc_ffn_streams", streams.detach().float().numpy()))
+        return fn
+
+    def v4_compressor_hook(idx):
+        def fn(_mod, _args, output):
+            compressed = output[0] if isinstance(output, tuple) else output
+            if compressed.numel():
+                records.append((idx, "compressor_kv", compressed.detach().float().numpy()))
+        return fn
+
+    def v4_indexer_pre_hook(idx):
+        def fn(_mod, args):
+            # Scorer(q, compressed_kv, hidden_states): its second input is the
+            # post-compression, post-RoPE index history used for selection.
+            if len(args) > 1 and args[1].numel():
+                records.append((idx, "indexer_kv", args[1].detach().float().numpy()))
+        return fn
+
+    def v4_router_hook(idx):
+        def fn(mod, _args, output):
+            logits, weights, indices = output
+            dense = torch.zeros(logits.shape, dtype=weights.dtype, device=weights.device)
+            dense.scatter_add_(1, indices.long(), weights)
+            records.append((idx, "router_logits", logits.detach().float().numpy()))
+            records.append((idx, "router_dense", dense.detach().float().numpy()))
+        return fn
+
     for i, layer in enumerate(layers):
-        handles.append(layer.register_forward_hook(layer_hook(i), with_kwargs=False))
-        handles.append(layer.self_attn.register_forward_hook(attn_hook(i)))
+        if not is_v4:
+            handles.append(layer.register_forward_hook(layer_hook(i), with_kwargs=False))
+            handles.append(layer.self_attn.register_forward_hook(attn_hook(i)))
+        else:
+            handles.append(layer.attn_hc.register_forward_hook(v4_hc_hook(i, "attn")))
+            handles.append(layer.self_attn.register_forward_hook(v4_attn_hook(i)))
+            handles.append(layer.ffn_hc.register_forward_hook(v4_hc_hook(i, "ffn")))
+            handles.append(layer.mlp.register_forward_hook(v4_ffn_hook(i)))
+            handles.append(layer.mlp.gate.register_forward_hook(v4_router_hook(i)))
+            if layer.self_attn.compressor is not None:
+                handles.append(layer.self_attn.compressor.register_forward_hook(
+                    v4_compressor_hook(i)))
+                indexer = getattr(layer.self_attn.compressor, "indexer", None)
+                if indexer is not None:
+                    handles.append(indexer.scorer.register_forward_pre_hook(
+                        v4_indexer_pre_hook(i)))
         for attr, when in SUB:
             mod = getattr(layer.self_attn, attr, None)
             if mod is None:
@@ -197,8 +281,9 @@ def dump_reference(fixture: Path, out: Path, positions: int) -> None:
     # (`view_as_complex` over adjacent pairs), which is the interleaved
     # convention. The absence of the others is not an error; the absence of ALL
     # of them is, and is reported rather than silently producing no taps.
-    for fname in ("apply_rotary_emb", "apply_rotary_pos_emb",
-                  "apply_rotary_pos_emb_interleave"):
+    rope_functions = () if is_v4 else (
+        "apply_rotary_emb", "apply_rotary_pos_emb", "apply_rotary_pos_emb_interleave")
+    for fname in rope_functions:
         orig = getattr(mod, fname, None)
         if orig is None or not callable(orig):
             continue
@@ -247,7 +332,7 @@ def dump_reference(fixture: Path, out: Path, positions: int) -> None:
         patched.append((fname, orig))
         setattr(mod, fname, make(orig, fname))
 
-    if not patched:
+    if not patched and not is_v4:
         print(f"  warning: no apply_rotary_pos_emb* found in {mod.__name__};"
               " rope taps will be absent", file=sys.stderr)
 
@@ -284,6 +369,7 @@ def diff(ref_path: Path, eng_path: Path) -> int:
     # Execution order, so "first divergence" means what it says.
     ORDER = {
         "hidden_in": 0,
+        "hc_attn_pre": 1,
         "q_proj": 1,
         "kv_a_proj": 2,
         "kv_a_layernorm": 3,
@@ -291,8 +377,15 @@ def diff(ref_path: Path, eng_path: Path) -> int:
         "k_pe_rot": 5,
         "q_pe_rot": 6,
         "o_proj_in": 7,
+        "compressor_kv": 7,
+        "indexer_kv": 7,
         "attn_out": 8,
-        "hidden_out": 9,
+        "hc_attn_streams": 9,
+        "hc_ffn_pre": 10,
+        "router_logits": 11,
+        "router_dense": 12,
+        "hc_ffn_streams": 13,
+        "hidden_out": 14,
     }
     keys.sort(key=lambda k: (k[0], ORDER.get(k[1], 9)))
 

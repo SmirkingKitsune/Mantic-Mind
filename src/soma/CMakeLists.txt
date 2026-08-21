@@ -31,6 +31,7 @@ set(SOMA_CORE_HEADERS
     soma/registry.hpp
     soma/telemetry.hpp
     soma/serve.hpp
+    soma/prompt_codec.hpp
 )
 
 # Per-architecture backends. Co-designed against Qwen3-MoE (GQA) and
@@ -39,6 +40,8 @@ set(SOMA_CORE_HEADERS
 set(SOMA_ARCH_HEADERS
     soma/arch/gqa.hpp
     soma/arch/mla.hpp
+    soma/arch/compressed_sparse.hpp
+    soma/arch/deepseek_dspark.hpp
 )
 
 list(APPEND SOMA_CORE_HEADERS
@@ -83,6 +86,9 @@ set(MM_SOMA_SOURCES
     arch_registry.cpp      # the ONE core TU permitted to include soma/arch/
     arch/gqa.cpp
     arch/mla.cpp
+    arch/compressed_sparse.cpp
+    arch/deepseek_dsml.cpp
+    arch/deepseek_dspark.cpp
 )
 
 # ── SIMD quantized kernels ────────────────────────────────────────────────────
@@ -203,6 +209,7 @@ endif()
 foreach(host mantic-mind mantic-mind-control)
     add_dependencies(${host} soma)
     add_custom_command(TARGET soma POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${host}>"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "$<TARGET_FILE:soma>" "$<TARGET_FILE_DIR:${host}>")
     if(WIN32)
@@ -245,6 +252,7 @@ endforeach()
 
 add_library(soma_header_selftest OBJECT ${SOMA_SELFTEST_SOURCES})
 target_include_directories(soma_header_selftest PRIVATE "${CMAKE_SOURCE_DIR}/include")
+target_link_libraries(soma_header_selftest PRIVATE nlohmann_json::nlohmann_json)
 target_compile_features(soma_header_selftest PRIVATE cxx_std_20)
 
 # Show the headers in IDEs even though nothing compiles them directly yet.
@@ -344,6 +352,8 @@ if(BUILD_TESTING)
              COMMAND soma_streaming_g2 "${CMAKE_SOURCE_DIR}/tests/fixtures" "Moonlight-16B-A3B")
     add_test(NAME soma_streaming_dsa_g2
              COMMAND soma_streaming_g2 "${CMAKE_SOURCE_DIR}/tests/fixtures" "GLM-5.2")
+    add_test(NAME soma_streaming_v4_g2
+             COMMAND soma_streaming_g2 "${CMAKE_SOURCE_DIR}/tests/fixtures" "DeepSeek-V4-Pro-0813")
 
     # Operator tool, not a test: points at a real container outside the repo, so
     # it is built but never registered with CTest.
@@ -406,6 +416,10 @@ if(BUILD_TESTING)
              COMMAND soma_stage3_g2
                      "${CMAKE_SOURCE_DIR}/tests/fixtures/containers/GLM-5.2"
                      "${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/GLM-5.2")
+    add_test(NAME soma_stage3_v4_g2
+             COMMAND soma_stage3_g2
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/containers/DeepSeek-V4-Pro-0813"
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/DeepSeek-V4-Pro-0813")
 
     # ── G3 batch union + telemetry dump ───────────────────────────────────────
     # The union's CSR structure, the unique-vs-naive ratio across batch sizes,
@@ -422,6 +436,8 @@ if(BUILD_TESTING)
              COMMAND soma_union_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "DeepSeek-V2-Lite")
     add_test(NAME soma_union_dsa_g3
              COMMAND soma_union_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "GLM-5.2")
+    add_test(NAME soma_union_v4_g3
+             COMMAND soma_union_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "DeepSeek-V4-Pro-0813")
 
     # ── G3 SIMD quantized kernels ─────────────────────────────────────────────
     # SIMD vs the scalar reference, per dtype and per shape. A CTest entry: it
@@ -449,6 +465,8 @@ if(BUILD_TESTING)
              COMMAND soma_threading_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "DeepSeek-V2-Lite")
     add_test(NAME soma_threading_dsa_g3
              COMMAND soma_threading_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "GLM-5.2")
+    add_test(NAME soma_threading_v4_g3
+             COMMAND soma_threading_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "DeepSeek-V4-Pro-0813")
 
     # ── G3 streamed-path determinism ──────────────────────────────────────────
     # The gate whose absence let a concurrent-read race in ExpertStore surface as
@@ -464,6 +482,8 @@ if(BUILD_TESTING)
              COMMAND soma_streamed_determinism_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "DeepSeek-V2-Lite")
     add_test(NAME soma_streamed_determinism_dsa_g3
              COMMAND soma_streamed_determinism_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "GLM-5.2")
+    add_test(NAME soma_streamed_determinism_v4_g3
+             COMMAND soma_streamed_determinism_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "DeepSeek-V4-Pro-0813")
 
     # ── G3 step-major scheduler ───────────────────────────────────────────────
     # The load-bearing check: batching sequences together must not change what
@@ -479,6 +499,8 @@ if(BUILD_TESTING)
              COMMAND soma_scheduler_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "DeepSeek-V2-Lite")
     add_test(NAME soma_scheduler_dsa_g3
              COMMAND soma_scheduler_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "GLM-5.2")
+    add_test(NAME soma_scheduler_v4_g3
+             COMMAND soma_scheduler_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "DeepSeek-V4-Pro-0813")
 
     # ── G3 KV checkpoints and preemption ──────────────────────────────────────
     # preempt -> resume must reproduce the continuation byte-for-byte, and every
@@ -493,6 +515,26 @@ if(BUILD_TESTING)
              COMMAND soma_checkpoint_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "DeepSeek-V2-Lite")
     add_test(NAME soma_checkpoint_dsa_g3
              COMMAND soma_checkpoint_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "GLM-5.2")
+    add_test(NAME soma_checkpoint_v4_g3
+             COMMAND soma_checkpoint_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "DeepSeek-V4-Pro-0813")
+
+    # ── G4 target-verified speculative decoding ──────────────────────────────
+    # Every possible draft acceptance prefix must reproduce the exact ordinary
+    # autoregressive stream and expose truthful acceptance counters.
+    add_executable(soma_speculative_g4
+                   ${CMAKE_SOURCE_DIR}/tests/soma/speculative_g4.cpp)
+    target_link_libraries(soma_speculative_g4 PRIVATE mm_soma)
+    add_test(NAME soma_speculative_g4
+             COMMAND soma_speculative_g4
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/DeepSeek-V4-Pro-0813")
+
+    add_executable(soma_deepseek_dspark_oracle
+                   ${CMAKE_SOURCE_DIR}/tests/soma/deepseek_dspark_oracle.cpp)
+    target_link_libraries(soma_deepseek_dspark_oracle PRIVATE mm_soma)
+    add_test(NAME soma_deepseek_dspark_oracle
+             COMMAND soma_deepseek_dspark_oracle
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/oracles/DeepSeek-V4-Pro-0813-DSpark"
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/DeepSeek-V4-Pro-0813-DSpark")
 
     # ── G3 sampling ───────────────────────────────────────────────────────────
     # Structural checks plus an empirical frequency test: a sampler drawing from
@@ -516,6 +558,22 @@ if(BUILD_TESTING)
     add_executable(soma_mla_g4 ${CMAKE_SOURCE_DIR}/tests/soma/mla_g4.cpp)
     target_link_libraries(soma_mla_g4 PRIVATE mm_soma)
     add_test(NAME soma_mla_g4 COMMAND soma_mla_g4)
+
+    # V4's official prompt/completion grammar: exact direct/thinking prefixes,
+    # Unicode, tools, stable call ids, and explicit malformed-output failures.
+    add_executable(soma_deepseek_v4_codec
+                   ${CMAKE_SOURCE_DIR}/tests/soma/deepseek_v4_codec.cpp)
+    target_link_libraries(soma_deepseek_v4_codec PRIVATE mm_soma)
+    add_test(NAME soma_deepseek_v4_codec
+             COMMAND soma_deepseek_v4_codec
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/dsml/encoding")
+
+    add_executable(soma_deepseek_v4_plan
+                   ${CMAKE_SOURCE_DIR}/tests/soma/deepseek_v4_plan.cpp)
+    target_link_libraries(soma_deepseek_v4_plan PRIVATE mm_soma)
+    add_test(NAME soma_deepseek_v4_plan
+             COMMAND soma_deepseek_v4_plan
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/DeepSeek-V4-Pro-0813")
 
     # ── G6 telemetry ──────────────────────────────────────────────────────────
     # bucket_heat() is pure, so the downsampling claims are checked without a

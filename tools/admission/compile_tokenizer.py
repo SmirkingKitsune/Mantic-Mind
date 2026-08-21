@@ -22,8 +22,9 @@ Supported today:
   * ByteLevel BPE, GLM Split pattern          (GLM-5.2) — Qwen3's, with digits
     grouped in runs of up to three instead of one at a time
 
+  * DeepSeek-V4's ordered numeric/CJK/general Split chain
+
 Refused, with the reason, until their families land:
-  * multi-Split chains with explicit CJK/Latin ranges   (DeepSeek — G4)
   * byte_fallback / SentencePiece pipelines             (Mixtral)
   * legacy vocab.json + merges.txt, no tokenizer.json   (granite)
 
@@ -67,6 +68,14 @@ QWEN_PATTERN = (
 GLM_PATTERN = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*"
     r"|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+
+DEEPSEEK_NUMBER_PATTERN = r"\p{N}{1,3}"
+DEEPSEEK_CJK_PATTERN = r"[一-龥぀-ゟ゠-ヿ]+"
+DEEPSEEK_MAIN_PATTERN = (
+    "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|"
+    "[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+|"
+    " ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"
 )
 
 CONTRACTIONS = ["'s", "'t", "'re", "'ve", "'m", "'ll", "'d"]
@@ -113,6 +122,22 @@ def is_number(cp: int) -> bool:
     return _cat(cp).startswith("N")
 
 
+def is_mark(cp: int) -> bool:
+    return _cat(cp).startswith("M")
+
+
+def is_punct(cp: int) -> bool:
+    return _cat(cp).startswith("P")
+
+
+def is_symbol(cp: int) -> bool:
+    return _cat(cp).startswith("S")
+
+
+def is_deepseek_cjk(cp: int) -> bool:
+    return 0x4E00 <= cp <= 0x9FA5 or 0x3040 <= cp <= 0x30FF
+
+
 def is_space(cp: int) -> bool:
     return chr(cp) in _WS
 
@@ -137,6 +162,12 @@ def build_classes(pool: ClassTable) -> dict[str, int]:
     letters = ranges_for(is_letter)
     numbers = ranges_for(is_number)
     spaces = ranges_for(is_space)
+    marks = ranges_for(is_mark)
+    punct = ranges_for(is_punct)
+    symbols = ranges_for(is_symbol)
+    cjk = ranges_for(is_deepseek_cjk)
+    letters_marks_no_cjk = ranges_for(
+        lambda cp: (is_letter(cp) or is_mark(cp)) and not is_deepseek_cjk(cp))
 
     def union(*sets: list[tuple[int, int]]) -> list[tuple[int, int]]:
         pts: list[tuple[int, int]] = sorted(r for s in sets for r in s)
@@ -159,6 +190,16 @@ def build_classes(pool: ClassTable) -> dict[str, int]:
         "NOT_SLN": pool.add(union(spaces, letters, numbers), True),
         # [^\r\n\p{L}\p{N}]
         "NOT_CRLF_LN": pool.add(union(crlf, letters, numbers), True),
+        "M": pool.add(marks, False),
+        "P_OR_SYMBOL": pool.add(union(punct, symbols), False),
+        "CJK": pool.add(cjk, False),
+        "LM_NO_CJK": pool.add(letters_marks_no_cjk, False),
+        "ASCII_LETTER": pool.add([(ord("A"), ord("Z")), (ord("a"), ord("z"))], False),
+        "ASCII_PUNCT": pool.add([
+            (0x21, 0x2F), (0x3A, 0x40), (0x5B, 0x60), (0x7B, 0x7E)
+        ], False),
+        # [^\r\n\p{L}\p{P}\p{S}]
+        "NOT_CRLF_LPS": pool.add(union(crlf, letters, punct, symbols), True),
     }
 
 
@@ -204,6 +245,30 @@ def program_qwen(c: dict[str, int], digit_run: int = 1) -> list:
                      (ITEM_CLASS, c["NOT_SLN"], 1, INF),
                      (ITEM_CLASS, c["CRLF"], 0, INF)]),
         (ALT_WS_THEN_NEWLINES, [(ITEM_CLASS, c["S"], 0, INF), (ITEM_CLASS, c["CRLF"], 1, INF)]),
+        (ALT_WS_NOT_FOLLOWED_BY_NONSPACE, [(ITEM_CLASS, c["S"], 1, INF)]),
+        (ALT_PLAIN, [(ITEM_CLASS, c["S"], 1, INF)]),
+    ]
+
+
+def program_deepseek(c: dict[str, int]) -> list:
+    """Equivalent of DeepSeek-V4's three ordered isolated Split stages.
+
+    Numeric runs and CJK runs are placed first.  The general letter class
+    explicitly excludes the CJK ranges so a Latin match cannot greedily cross a
+    boundary that the preceding Split stage would have isolated.
+    """
+    return [
+        (ALT_PLAIN, [(ITEM_CLASS, c["N"], 1, 3)]),
+        (ALT_PLAIN, [(ITEM_CLASS, c["CJK"], 1, INF)]),
+        (ALT_PLAIN, [(ITEM_CLASS, c["ASCII_PUNCT"], 1, 1),
+                     (ITEM_CLASS, c["ASCII_LETTER"], 1, INF)]),
+        (ALT_PLAIN, [(ITEM_CLASS, c["NOT_CRLF_LPS"], 0, 1),
+                     (ITEM_CLASS, c["LM_NO_CJK"], 1, INF)]),
+        (ALT_PLAIN, [(ITEM_CLASS, c["SPACE_LITERAL"], 0, 1),
+                     (ITEM_CLASS, c["P_OR_SYMBOL"], 1, INF),
+                     (ITEM_CLASS, c["CRLF"], 0, INF)]),
+        (ALT_WS_THEN_NEWLINES, [(ITEM_CLASS, c["S"], 0, INF),
+                                (ITEM_CLASS, c["CRLF"], 1, INF)]),
         (ALT_WS_NOT_FOLLOWED_BY_NONSPACE, [(ITEM_CLASS, c["S"], 1, INF)]),
         (ALT_PLAIN, [(ITEM_CLASS, c["S"], 1, INF)]),
     ]
@@ -314,10 +379,17 @@ def recognize(tj: dict) -> tuple[str, bool]:
         others = [s.get("type") for s in subs if s.get("type") not in ("Split", "ByteLevel")]
         if others:
             raise Unsupported(f"pretokenizer stages {others} are not compiled")
+        patterns = [(s.get("pattern") or {}).get("Regex") for s in splits]
+        behaviours = [s.get("behavior") for s in splits]
+        inversions = [bool(s.get("invert", False)) for s in splits]
+        if (patterns == [DEEPSEEK_NUMBER_PATTERN, DEEPSEEK_CJK_PATTERN, DEEPSEEK_MAIN_PATTERN]
+                and behaviours == ["Isolated", "Isolated", "Isolated"]
+                and not any(inversions)
+                and len(bl) == 1 and not bl[0].get("use_regex", True)):
+            return "deepseek_v4", bool(bl[0].get("add_prefix_space", False))
         if len(splits) != 1:
             raise Unsupported(
-                f"{len(splits)} Split stages; only a single recognized Split is compiled "
-                "(DeepSeek's 5-stage chain with explicit CJK/Latin ranges lands with G4)")
+                f"{len(splits)} Split stages do not match the recognized DeepSeek-V4 chain")
         pattern = (splits[0].get("pattern") or {}).get("Regex")
         add_prefix = bool(bl[0].get("add_prefix_space", False)) if bl else False
         if pattern == QWEN_PATTERN:
@@ -373,6 +445,8 @@ def main(argv: list[str]) -> int:
 
     norm = tj.get("normalizer") or {}
     norm_type = norm.get("type")
+    if norm_type == "Sequence" and not norm.get("normalizers"):
+        norm_type = None
     if norm_type not in (None, "NFC"):
         print(f"  REFUSED  {src.name}: normalizer {norm_type!r} is not implemented")
         (out_dir / "tokenizer.unsupported").write_text(
@@ -425,6 +499,8 @@ def main(argv: list[str]) -> int:
     classes = build_classes(pool)
     if program_name == "gpt2":
         program = program_gpt2(classes)
+    elif program_name == "deepseek_v4":
+        program = program_deepseek(classes)
     else:
         # The digit run is the only thing that differs, so it is the only thing
         # selected here. See program_qwen.
@@ -491,8 +567,14 @@ def main(argv: list[str]) -> int:
     # Every corpus string is checked to be NFC-stable. If one is not, it is
     # dropped and COUNTED — a silently-shrinking corpus would make the gate
     # weaker over time without anyone noticing.
-    nfc_unstable = [t for t in texts if unicodedata.normalize("NFC", t) != t]
-    texts = [t for t in texts if unicodedata.normalize("NFC", t) == t]
+    # A tokenizer with no normalizer must see decomposed Unicode byte-for-byte;
+    # filtering it there would hide exactly the behavior the oracle should
+    # prove. Only an explicitly requested NFC transform is beyond the C++
+    # runtime today.
+    nfc_unstable = ([t for t in texts if unicodedata.normalize("NFC", t) != t]
+                    if norm_type == "NFC" else [])
+    if norm_type == "NFC":
+        texts = [t for t in texts if unicodedata.normalize("NFC", t) == t]
     if nfc_unstable:
         print(f"           NOTE: dropped {len(nfc_unstable)} NFC-unstable corpus string(s); "
               f"engine-side NFC is not implemented")

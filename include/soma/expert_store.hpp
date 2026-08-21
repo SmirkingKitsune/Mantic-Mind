@@ -80,6 +80,13 @@ public:
     /// Opens the container and loads the sidecar index. Refuses to open when the
     /// container's arch_hash does not match the model being loaded.
     Status open(const std::string& model_dir, const ArchIr& arch);
+    /// Open an additional container using the same wire format but distinct
+    /// index/shard names. Optional speculative backends use this without making
+    /// the ordinary store or memory hierarchy aware of a model family.
+    Status open_indexed(const std::string& model_dir,
+                        const ArchIr& arch,
+                        const std::string& index_file,
+                        const std::string& shard_prefix);
     void close();
 
     const ContainerHeader& header() const noexcept;

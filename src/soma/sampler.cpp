@@ -7,6 +7,10 @@
 
 namespace soma {
 
+bool logits_are_finite(std::span<const float> logits) noexcept {
+    return std::all_of(logits.begin(), logits.end(), [](float v) { return std::isfinite(v); });
+}
+
 TokenId sample_token(std::span<const float> logits,
                      SamplerState& s,
                      std::span<const TokenId> history,

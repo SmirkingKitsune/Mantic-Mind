@@ -228,10 +228,17 @@ std::uint64_t ExpertStore::bytes_read() const noexcept {
 }
 
 Status ExpertStore::open(const std::string& model_dir, const ArchIr& arch) {
+    return open_indexed(model_dir, arch, "soma.container", "experts-");
+}
+
+Status ExpertStore::open_indexed(const std::string& model_dir,
+                                 const ArchIr& arch,
+                                 const std::string& index_file,
+                                 const std::string& shard_prefix) {
     close();
     impl_->dir = model_dir;
 
-    const fs::path index_path = fs::path(model_dir) / "soma.container";
+    const fs::path index_path = fs::path(model_dir) / index_file;
     std::ifstream in(index_path, std::ios::binary);
     if (!in) {
         return {StatusCode::NotFound, "no soma.container in " + model_dir};
@@ -331,7 +338,7 @@ Status ExpertStore::open(const std::string& model_dir, const ArchIr& arch) {
 
     for (std::uint32_t s = 0; s < h.n_shards; ++s) {
         char name[32];
-        std::snprintf(name, sizeof(name), "experts-%05u.bin", s);
+        std::snprintf(name, sizeof(name), "%s%05u.bin", shard_prefix.c_str(), s);
         ShardFile f;
         if (!f.open(fs::path(model_dir) / name)) {
             return {StatusCode::NotFound, std::string("missing shard ") + name};

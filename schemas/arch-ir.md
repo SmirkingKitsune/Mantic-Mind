@@ -1,6 +1,6 @@
 # Architecture IR — canonical registry JSON
 
-**Schema version:** 1
+**Schema versions:** 1 (existing families), 2 (DeepSeek V4 compressed/sparse)
 **Produced by:** admission, by adapting the source `config.json`
 **Consumed by:** the Soma loader, the planner, `soma plan --json`, the registry
 
@@ -46,6 +46,12 @@ Two rules govern the whole document:
 a model on faster disks must not invalidate its KV checkpoints. Requantizing it must, and does, because
 §5 is inside the hash.
 
+Schema v2 is intentionally narrow. DeepSeek V4 is adapted to v2; every existing GQA, MLA, and
+MLA+DSA model remains v1 and keeps its container and KV checkpoint formats. A v2 document may select
+the “compressed+sparse” attention family and the V4 routing/hyper-connection fields below. No core
+caller infers V4 from model_type: resolved backend descriptors carry the model/layer payload binders,
+block hooks, opaque KV implementation, exact sizing functions, and optional prompt codec.
+
 ---
 
 ## 2. `topology`
@@ -59,6 +65,8 @@ a model on faster disks must not invalidate its KV checkpoints. Requantizing it 
 | `first_k_dense` | int | Informational; `layer_kinds` is authoritative |
 | `draft_layer` | int \| null | MTP / draft head layer index |
 | `tie_word_embeddings` | bool | |
+| `max_position_embeddings` | int | Hard request/admission ceiling; V4 is 1,048,576 |
+| `eos_token_ids` | `[int]` | Generation stops before emitting one of these tokens |
 
 `layer_kinds` is a materialized array rather than the upstream `decoder_sparse_step` /
 `moe_layer_freq` / `mlp_only_layers` triangle. Three different families express "which layers are MoE"
@@ -70,7 +78,7 @@ three different ways; resolving that at admission means the core never has to.
 
 | Field | Type | Notes |
 |---|---|---|
-| `family` | enum | `mha` \| `gqa` \| `mla` \| `mla+dsa` — **selects the backend** |
+| `family` | enum | `mha` \| `gqa` \| `mla` \| `mla+dsa` \| `compressed+sparse` — **selects the backend** |
 | `n_heads` | int | |
 | `n_kv_heads` | int | `gqa`/`mha` |
 | `head_dim` | int | |
@@ -81,6 +89,30 @@ three different ways; resolving that at admission means the core never has to.
 | `rope.scaling` | object \| null | `{ type: "yarn"\|"linear"\|"ntk", factor, original_max_position, beta_fast, beta_slow, mscale, mscale_all_dim }` |
 | `mla` | object \| null | Present iff `family` starts with `mla` |
 | `dsa` | object \| null | Present iff `family` is `mla+dsa` |
+| `compressed` | object \| null | Schema v2; present iff `family` is `compressed+sparse` |
+
+### `compressed` sub-object — DeepSeek V4
+
+The V4 backend combines a 128-token live BF16 window with per-layer BF16 compressed history. Ratio-4
+layers additionally retain BF16 indexer history; ratio-128 layers attend the complete compressed
+history. Compressor value/score carry remains FP32 because the official model performs compression
+in FP32; it is backend-owned opaque working state rather than an attention-key storage plane.
+Checkpoints contain only the live window, completed histories, and the carry needed to resume an
+incomplete compression group under the `compressed-sparse-bf16-v1` persistence format.
+
+| Field | Notes |
+|---|---|
+| `compress_ratios` | Per-layer array; the pinned base stack alternates 128 and 4 |
+| `compress_rope_theta` | RoPE base used by compressed attention |
+| `q_lora_rank` | Q down-projection width |
+| `rope_head_dim` | RoPE-carrying suffix of each 512-wide attention head |
+| `o_groups`, `o_lora_rank` | Grouped low-rank output projection |
+| `index_n_heads`, `index_head_dim`, `index_topk` | Ratio-4 sparse indexer geometry |
+| `semantic_fp8_quant_dequant` | FP8 Q/DQ simulation is model semantics, not a storage dtype |
+| `semantic_fp4_quant_dequant` | FP4 indexer Q/DQ simulation is model semantics |
+
+Both low-precision operations are implemented as software quantize/dequantize. The runtime does not
+require native FP8 or FP4 kernels.
 
 `rms_norm_eps` is a TOP-LEVEL field, not an attention one, and it does not apply to every norm. The
 layer norms and the output norm take it; MLA's two LATENT norms (`q_a_layernorm`, `kv_a_layernorm`)
@@ -188,13 +220,14 @@ like an unrelated bug.
 |---|---|---|
 | `n_experts` | int | Routed experts only |
 | `top_k` | int | |
-| `score_fn` | enum | `softmax` \| `sigmoid` |
+| `score_fn` | enum | `softmax` \| `sigmoid` \| `sqrtsoftplus` (computes `sqrt(softplus(x))`) |
 | `normalize_topk` | bool | `norm_topk_prob` |
 | `routed_scaling_factor` | float | |
 | `bias_correction` | bool | Per-expert bias added before top-k (V3-style) |
 | `n_groups` | int | Group-limited routing; 1 = ungrouped |
 | `topk_group` | int | |
 | `n_shared_experts` | int | 0 = none |
+| `n_hash_layers` | int | V4: first three layers use token-id hash routing |
 
 ### `ffn`
 
@@ -205,7 +238,12 @@ like an unrelated bug.
 | `expert_intermediate` | int | `moe_intermediate_size` |
 | `dense_intermediate` | int | For `layer_kinds == "dense"` layers |
 | `shared_intermediate` | int | |
+| `swiglu_limit` | float | V4 clamps gate above and up symmetrically before SwiGLU |
 | `expert_layout` | enum | `interleaved_gud` — gate/up/down interleaved per expert (§5.3 of architecture.md) |
+
+Schema v2 also carries `hyper_connections = { multiplier, sinkhorn_iters, eps }`. V4 uses four
+streams, with learned block pre/post controls and a Sinkhorn-normalized stream mixing matrix at both
+attention and FFN boundaries.
 
 ---
 

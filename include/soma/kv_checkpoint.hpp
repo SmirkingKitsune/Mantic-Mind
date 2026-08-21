@@ -50,6 +50,7 @@ namespace soma {
 /// v1 files refuse to load rather than being reinterpreted, which is the same
 /// rule every other on-disk format here follows.
 inline constexpr std::uint32_t kKvCheckpointVersion = 3;
+inline constexpr std::uint32_t kKvCheckpointVersionSpeculative = 4;
 
 struct KvCheckpointHeader {
     std::uint32_t version = kKvCheckpointVersion;
@@ -70,6 +71,7 @@ struct KvCheckpointHeader {
     /// a cache.
     std::uint64_t rng_state = 0;
     std::uint32_t n_emitted = 0;
+    std::uint64_t auxiliary_bytes = 0;
 
     /// Offsets into the file, COMPUTED by the parser rather than stored. They
     /// are arithmetic from the fixed fields, which is what lets stat() read a
@@ -78,6 +80,7 @@ struct KvCheckpointHeader {
     std::size_t tokens_at = 0;
     std::size_t emitted_at = 0;
     std::size_t payload_at = 0;
+    std::size_t auxiliary_at = 0;
 };
 
 /// Everything a resume needs beyond the cache itself.
@@ -99,6 +102,9 @@ struct SeqPersistState {
     /// top_p and the rest ride the request, and a checkpoint that restored them
     /// would make a client's change silently ineffective after a resume.
     std::uint64_t rng_state = 0;
+    /// Optional backend-owned per-sequence state. Version 4 checkpoints append
+    /// it after the ordinary target KV payload; v3 remains byte-identical.
+    std::vector<std::byte> auxiliary;
 };
 
 /// Parse a checkpoint header out of raw bytes.

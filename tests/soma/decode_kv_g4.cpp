@@ -76,6 +76,17 @@ Outcome check_fixture(const fs::path& dir, std::uint32_t n_tokens, bool absorb) 
     // letting it rot would quietly remove the thing that makes absorption
     // believable.
     model.arch.attention.mla.absorb_weights = absorb;
+    if (model.arch.attention.family == soma::AttentionFamily::CompressedSparse) {
+        // The committed V4 fixture disables semantic low-precision operations
+        // for its native-Transformers fp32 oracle: `from_config` does not invoke
+        // the checkpoint quantizer. Cached conformance is instead about the
+        // production V4 state contract, whose window and compressed histories
+        // are BF16 and whose FP8/FP4 Q/DQ steps make the whole-sequence path use
+        // the same representation. Re-enable those source-checkpoint semantics
+        // on both sides of this teacher-vs-cache comparison.
+        model.arch.attention.compressed.semantic_fp8_quant_dequant = true;
+        model.arch.attention.compressed.semantic_fp4_quant_dequant = true;
+    }
     // From this point on, every failure belongs to a family the engine claims to
     // support and must fail the gate. The original draft treated all early
     // returns as skips, which would have let MLA regress back to Unsupported while
@@ -124,6 +135,9 @@ Outcome check_fixture(const fs::path& dir, std::uint32_t n_tokens, bool absorb) 
         row.v_stride = kv.v_stride();
         row.k_hkv = kv.k_hkv();
         row.v_hkv = kv.v_hkv();
+        row.opaque_base = kv.opaque_data();
+        row.opaque_bytes = kv.opaque_size();
+        row.max_ctx = kv.capacity();
         row.pos = p;
         row.len = p + 1; // visible history INCLUDING this position
 

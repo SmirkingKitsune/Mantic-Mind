@@ -115,6 +115,12 @@ HttpResponse HttpClient::post_file(
 
     httplib::Headers headers = make_headers(bearer_token_);
     for (const auto& [k, v] : extra_headers) headers.emplace(k, v);
+    // Authenticate and validate request headers before a potentially multi-GB
+    // body leaves disk. The server's expectation handler runs the same
+    // pre-routing middleware and either returns 100 or the final error status.
+    // Set this explicitly even for tiny files so behavior does not change at
+    // cpp-httplib's size threshold.
+    headers.emplace("Expect", "100-continue");
 
     // Large transfers can take a while; lift the write timeout to the same
     // generous floor used for streaming reads.

@@ -47,8 +47,8 @@ include/soma/arch/*.hpp   backends         — everything model-specific
 | `ExpertStore` — sidecar index, aligned reads, readahead pool | `AttentionBackend` — planner sizing and KV persistence format |
 | `Scheduler` — step-major loop, ragged batching, admission control | Router semantics — score fn, normalization, bias correction, grouping |
 | `Kernels` — quant GEMM family, static dispatch from `kernel_choice` | Activation, norm placement, RoPE variant |
-| `KvCheckpointStore` — versioned, `arch_hash`-gated | Expert layout descriptor, draft/MTP head |
-| `Serve` — OpenAI-compatible HTTP/SSE | — |
+| `KvCheckpointStore` — versioned, `arch_hash`-gated | Expert layout descriptor, `SpeculativeBackend` draft head |
+| `Serve` — OpenAI-compatible HTTP/SSE | Optional prompt/completion codec (DSML for V4) |
 | `Telemetry` — tier occupancy, routing heat | — |
 
 ### 2.1 What is deliberately *not* in the seam
@@ -75,6 +75,44 @@ by a different layer. The seam carried it without changing shape: one opaque `Ar
 the per-forward workspace. The concern recorded here earlier — that per-layer function pointers had
 no channel for cross-layer state — was the wrong shape of problem. The index is per-(row, step) and
 never persists between steps, so it needed a per-FORWARD slot, not a per-sequence one.
+
+A **fourth** family, `compressed+sparse`, serves DeepSeek V4. It exercises the generalized seams
+rather than adding core branches: backend-owned model/layer payload binding, block pre/post hooks for
+four hyper-connection streams, exact context-dependent resident/cache sizing, opaque KV
+serialization/restoration, and the optional DSML prompt/completion codec. Its cache is not expressible
+as two fixed per-token planes: a 128-token BF16 ring, per-layer BF16 compressed history, ratio-4 BF16
+indexer history, and the official FP32 compressor working carry all have different context laws. The
+attention descriptor therefore
+owns the entire opaque layout and its live-state checkpoint format.
+
+### 2.3 Target-verified speculation
+
+Speculation is a generic scheduler operation, not a V4 branch. A
+`SpeculativeBackend` owns auxiliary weight binding, its private per-sequence state, proposals, target
+observation, and state serialization. The scheduler owns the contract that makes those proposals safe:
+it verifies `[anchor, draft…]` in one target forward, samples only target logits, commits the accepted
+KV prefix through a reverse journal, and emits the same stream and finish reason as autoregressive
+decoding. Batch sizes above one fall back to the ordinary path.
+
+The first backend is DeepSeek V4's three-stage DSpark head. Its checkpoint-trained query block is five
+tokens even though the generic runtime cap defaults to seven, so the backend clamps each proposal to
+five. `--speculative dspark` selects it explicitly. `auto` selects it only when the converted metadata
+contains a measured `dspark_profiled_speedup >= 1.05`; an unprofiled or slower draft stays on the
+autoregressive path. Telemetry exposes proposed and accepted token counts so loading a head cannot be
+mistaken for actually exercising it.
+
+The representative full-weight CPU/streaming profile measured `0.795x` warm speed with 34.62% draft
+acceptance and exact target output. It consequently records a negative result and leaves `auto`
+disabled; explicit `--speculative dspark` remains available for conformance and further tuning.
+
+DSpark conformance is independent of Soma. `make_dspark_oracle.py` imports the pinned DeepSeek
+`inference/model.py` by SHA-256 and substitutes literal CPU implementations for its TileLang FP8,
+FP4, sparse-attention, Sinkhorn, and Hadamard kernels. Deterministic exported target-layer hidden
+streams drive both graphs. The permanent gate compares the five proposal tokens exactly and checks
+77 activation records across Q projections, sparse attention, hyper-connections, routing, logits,
+Markov bias, and confidence. This gate caught errors that target verification could safely hide: the
+Sinkhorn combination matrix was applied on the wrong axis, the draft used compressed-cache RoPE/YaRN
+instead of DSpark's base RoPE, and low-precision activation boundaries were missing from the CPU path.
 
 Their genuine differences are **KV cache shape** and **decode algebra**:
 

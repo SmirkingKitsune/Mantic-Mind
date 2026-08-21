@@ -1,0 +1,39 @@
+{
+  "align": 4096,
+  "config_sha256": "6feff8bd2e7409edc671c595588b38c1a9c35c4cb810a3338585966cd28bf94a",
+  "container_version": 1,
+  "dense_sharded": true,
+  "dense_tensors": 66,
+  "dspark": "not-present",
+  "dtype_dense": "q4_g",
+  "dtype_down": "q6_g",
+  "dtype_gate_up": "q4_g",
+  "effective_groups": {
+    "q4_g": 64,
+    "q6_g": 32
+  },
+  "expert_bytes": 4352,
+  "group": 128,
+  "index_sha256": "7352971c674c2a67011b534dbfd18687e69226bb7100027ba126feaf5e4c7960",
+  "layer_kinds": [
+    "moe",
+    "moe",
+    "moe",
+    "moe"
+  ],
+  "lossless_resident_bytes": 277924,
+  "model_type": "deepseek_v4",
+  "n_experts": 16,
+  "n_layers": 4,
+  "n_moe_layers": 4,
+  "n_shards": 4,
+  "omitted_mtp_namespaces": [],
+  "omitted_mtp_tensors": 0,
+  "quantized_resident_bytes": 96128,
+  "quantized_resident_tensors": 46,
+  "source": "tests\\fixtures\\tiny\\DeepSeek-V4-Pro-0813",
+  "source_repo": "fixture/DeepSeek-V4-Pro-0813",
+  "source_revision": "tiny-fixture",
+  "tokenizer": "unsupported",
+  "total_expert_bytes": 278528
+}

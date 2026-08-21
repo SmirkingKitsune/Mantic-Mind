@@ -36,6 +36,8 @@ namespace soma {
 
 class MemoryHierarchy;
 
+enum class SpeculativeMode : std::uint8_t { Off = 0, Auto, Required };
+
 /// Every field is settable by BOTH a CLI flag and an env var, because the node
 /// spawns this as a subprocess and argv quoting across Windows and POSIX is a
 /// worse place to discover a mistake than an environment block.
@@ -66,9 +68,14 @@ struct ServeConfig {
     std::uint32_t ctx_size = 4096; // --ctx-size    SOMA_CTX_SIZE
     std::uint32_t kv_slots = 4;    // --kv-slots    SOMA_KV_SLOTS
     std::uint32_t max_batch = 0;   // --max-batch   SOMA_MAX_BATCH (0 = gate decides)
+    std::uint32_t generation_timeout_seconds = 600; // --generation-timeout SOMA_GENERATION_TIMEOUT
 
     float top_p_expert_prune = 0.0f;                // --expert-prune SOMA_EXPERT_PRUNE
     Determinism determinism = Determinism::Batched; // --determinism SOMA_DETERMINISM
+
+    SpeculativeMode speculative = SpeculativeMode::Auto; // --speculative SOMA_SPECULATIVE
+    std::uint32_t speculative_tokens = 7; // --speculative-tokens SOMA_SPECULATIVE_TOKENS
+    float speculative_confidence_threshold = 0.0f; // --dspark-confidence-threshold
 
     std::uint32_t telemetry_hz = kDefaultTelemetryHz; // --telemetry-hz
 };
@@ -80,6 +87,7 @@ enum class ServeError : std::uint8_t {
     NotFound,           ///< 404
     UnsupportedContent, ///< 422 — image parts; text-only v1
     CapacityPressure,   ///< 503, structured code
+    ProtocolError,      ///< 502 — malformed model-specific completion protocol
     Internal,           ///< 500
 };
 

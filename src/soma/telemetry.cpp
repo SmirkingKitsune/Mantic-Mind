@@ -374,6 +374,10 @@ Status TelemetryChannel::write_text_dump(std::string& out) const {
     o << "sched  active=" << f.scheduler.active_sequences << " batch=" << f.scheduler.current_batch
       << "/" << f.scheduler.effective_max_batch << " steps=" << f.scheduler.steps
       << " tokens=" << f.scheduler.tokens_out;
+    if (f.scheduler.speculative_draft_tokens > 0) {
+        o << " spec=" << f.scheduler.speculative_accepted_tokens << "/"
+          << f.scheduler.speculative_draft_tokens;
+    }
     if (f.scheduler.unique_experts_last_step > 0) {
         // THE payoff, in one number. A ratio near 1.0 means the union is buying
         // nothing and something upstream is wrong.

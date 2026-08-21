@@ -79,6 +79,14 @@ Status compute_plan(const ArchIr& arch, const HostBudget& budget, PlanDocument& 
     if (d == 0 || n_layers == 0) {
         return {StatusCode::InvalidArgument, "plan: topology has a zero dimension"};
     }
+    if (arch.schema_version >= kArchIrSchemaVersionV2 &&
+        arch.topology.max_position_embeddings > 0 &&
+        budget.ctx_size > arch.topology.max_position_embeddings) {
+        return {StatusCode::InvalidArgument,
+                "requested context " + std::to_string(budget.ctx_size) +
+                    " exceeds model maximum " +
+                    std::to_string(arch.topology.max_position_embeddings)};
+    }
 
     // ── one expert: gate + up + down ─────────────────────────────────────────
     const std::uint64_t expert_bytes = bytes_for(arch, fi, d, TensorRole::ExpertGate) +
@@ -93,10 +101,25 @@ Status compute_plan(const ArchIr& arch, const HostBudget& budget, PlanDocument& 
     out.expert_bytes = expert_bytes;
     out.active_fraction =
         n_experts > 0 ? static_cast<double>(top_k) / static_cast<double>(n_experts) : 0.0;
+    out.ctx_size = budget.ctx_size;
+    out.max_context = arch.topology.max_position_embeddings;
+    out.kv_slots = std::max<std::uint32_t>(1, budget.kv_slots);
 
     out.total_routed_bytes = static_cast<std::uint64_t>(n_moe) * n_experts * expert_bytes;
     out.bytes_per_token = static_cast<std::uint64_t>(n_moe) * top_k * expert_bytes;
     out.disk_footprint_bytes = out.total_routed_bytes;
+    out.speculative_available = arch.speculative.present;
+    out.speculative_selected = arch.speculative.present && budget.speculative;
+    if (arch.speculative.present) {
+        out.speculative_method = "dspark";
+        out.speculative_stages = arch.speculative.n_layers;
+        out.speculative_trained_block_size = arch.speculative.trained_block_size;
+        out.speculative_default_tokens = 7;
+        out.speculative_routed_bytes = arch.speculative.routed_bytes;
+        out.speculative_resident_bytes = arch.speculative.resident_bytes;
+        out.speculative_kv_bytes_per_slot = arch.speculative.kv_bytes_per_sequence;
+        out.disk_footprint_bytes += arch.speculative.routed_bytes + arch.speculative.resident_bytes;
+    }
 
     // ── the resident half ────────────────────────────────────────────────────
     std::uint64_t dense = 0;
@@ -104,13 +127,17 @@ Status compute_plan(const ArchIr& arch, const HostBudget& budget, PlanDocument& 
     if (!arch.topology.tie_word_embeddings) {
         dense += bytes_for(arch, arch.topology.vocab_size, d, TensorRole::Embed);
     }
+    dense += static_cast<std::uint64_t>(d) * sizeof(float); // final norm, always f32
     // Asked of the BACKEND, not computed here. The formula differs by family
     // and the planner must not know how — a core-side branch on the family is
     // exactly what tools/ci/check_seam.py refuses, and it was right to.
     const auto* attn = resolve_attention_backend(arch.attention.family);
-    const std::uint64_t attn_bytes = (attn != nullptr && attn->weight_bytes_per_layer != nullptr)
-                                         ? attn->weight_bytes_per_layer(arch, &bytes_for)
-                                         : 0;
+    const bool exact_attn = attn != nullptr && attn->resident_weight_bytes != nullptr;
+    if (exact_attn) dense += attn->resident_weight_bytes(arch, &bytes_for);
+    const std::uint64_t attn_bytes =
+        (!exact_attn && attn != nullptr && attn->weight_bytes_per_layer != nullptr)
+            ? attn->weight_bytes_per_layer(arch, &bytes_for)
+            : 0;
     for (std::uint32_t l = 0; l < n_layers; ++l) {
         dense += attn_bytes;
         dense += 2ull * d * sizeof(float); // input + post-attn norms, always f32
@@ -147,6 +174,7 @@ Status compute_plan(const ArchIr& arch, const HostBudget& budget, PlanDocument& 
             dense += bytes_for(arch, d, di, TensorRole::SharedExpert);
         }
     }
+    if (out.speculative_selected) dense += arch.speculative.resident_bytes;
     out.dense_resident_bytes = dense;
 
     // ── KV, which competes with the expert cache for the SAME RAM ────────────
@@ -161,12 +189,19 @@ Status compute_plan(const ArchIr& arch, const HostBudget& budget, PlanDocument& 
     // has always multiplied by `sizeof(float)` — so no plan ever came out
     // wrong. What was wrong is the number a reader checks it against, which is
     // how a correct implementation gets "fixed" into a broken one.
-    std::uint64_t kv_per_token = 0;
-    if (attn != nullptr && attn->kv_bytes_per_token != nullptr) {
-        kv_per_token = attn->kv_bytes_per_token(arch);
+    std::uint64_t kv_one_slot = 0;
+    if (attn != nullptr && attn->kv_bytes_for_context != nullptr) {
+        kv_one_slot = attn->kv_bytes_for_context(arch, budget.ctx_size);
+    } else if (attn != nullptr && attn->kv_bytes_per_token != nullptr) {
+        kv_one_slot = attn->kv_bytes_per_token(arch) * budget.ctx_size;
     }
     out.kv_bytes_at_ctx =
-        kv_per_token * budget.ctx_size * std::max<std::uint32_t>(1, budget.kv_slots);
+        kv_one_slot * std::max<std::uint32_t>(1, budget.kv_slots);
+    if (out.speculative_selected) {
+        out.speculative_kv_bytes_at_ctx =
+            arch.speculative.kv_bytes_per_sequence * std::max<std::uint32_t>(1, budget.kv_slots);
+        out.kv_bytes_at_ctx += out.speculative_kv_bytes_at_ctx;
+    }
 
     // ── what is left for experts ─────────────────────────────────────────────
     const std::uint64_t available =
@@ -176,15 +211,20 @@ Status compute_plan(const ArchIr& arch, const HostBudget& budget, PlanDocument& 
     out.pin_bytes = out.expert_cache_bytes / 8; // default: 12.5% of the cache pinned
     out.vram_hot_bytes = 0;                     // v1 is CPU-only; declared, always empty
 
+    const auto effective_routed = out.total_routed_bytes +
+                                  (out.speculative_selected ? out.speculative_routed_bytes : 0);
+    const auto effective_moe_layers = n_moe +
+                                      (out.speculative_selected ? out.speculative_stages : 0);
     out.footprint.ram_bytes = out.dense_resident_bytes + out.kv_bytes_at_ctx +
-                              std::min(out.expert_cache_bytes, out.total_routed_bytes);
+                              std::min(out.expert_cache_bytes, effective_routed);
     out.footprint.disk_bytes = out.disk_footprint_bytes;
     out.footprint.vram_bytes = 0;
 
     // ── cache-aware concurrency ──────────────────────────────────────────────
     out.cap_per_layer =
-        (expert_bytes > 0 && n_moe > 0)
-            ? static_cast<std::uint32_t>(out.expert_cache_bytes / (expert_bytes * n_moe))
+        (expert_bytes > 0 && effective_moe_layers > 0)
+            ? static_cast<std::uint32_t>(out.expert_cache_bytes /
+                                         (expert_bytes * effective_moe_layers))
             : 0;
 
     // Expected UNIQUE experts across a batch of rows, from the coupon-collector
@@ -195,7 +235,7 @@ Status compute_plan(const ArchIr& arch, const HostBudget& budget, PlanDocument& 
         (n_experts > 0) ? static_cast<float>(top_k) / static_cast<float>(n_experts) : 0.0f;
     out.expected_unique_experts_per_step = static_cast<float>(top_k);
 
-    out.expert_set_fully_resident = (out.total_routed_bytes <= out.expert_cache_bytes);
+    out.expert_set_fully_resident = (effective_routed <= out.expert_cache_bytes);
 
     if (out.expert_set_fully_resident) {
         // Nothing to amortize and nothing to thrash: concurrency is bounded by
@@ -245,7 +285,19 @@ Status compute_plan(const ArchIr& arch, const HostBudget& budget, PlanDocument& 
     const float min_tok_s = (budget.min_tok_s > 0.0f) ? budget.min_tok_s : kDefaultMinProjectedTokS;
 
     std::ostringstream why;
-    if (n_moe == 0 || n_experts == 0) {
+    if (arch.schema_version >= kArchIrSchemaVersionV2 && available > 0 && committed > available) {
+        out.verdict = Verdict::Reject;
+        why << "resident weights plus " << budget.kv_slots << " KV slot(s) at context "
+            << budget.ctx_size << " require " << committed / (1024 * 1024)
+            << " MiB RAM, exceeding the available " << available / (1024 * 1024) << " MiB";
+    } else if (arch.schema_version >= kArchIrSchemaVersionV2 && n_moe > 0 &&
+               out.expert_cache_bytes < expert_bytes) {
+        out.verdict = Verdict::Reject;
+        why << "resident weights plus KV leave "
+            << out.expert_cache_bytes / (1024 * 1024)
+            << " MiB for routed experts, less than one live expert ("
+            << expert_bytes / (1024 * 1024) << " MiB)";
+    } else if (n_moe == 0 || n_experts == 0) {
         out.verdict = Verdict::ResidentOnly;
         why << "no routed experts; nothing to stream";
     } else if (out.expert_set_fully_resident) {
@@ -332,11 +384,29 @@ Status serialize_plan(const PlanDocument& plan, std::string& out_json) {
       << ", \"ram_mb\": " << plan.footprint.ram_bytes / (1024 * 1024)
       << ", \"disk_mb\": " << plan.footprint.disk_bytes / (1024 * 1024) << "},\n"
       << "  \"dense_resident_bytes\": " << plan.dense_resident_bytes << ",\n"
+      << "  \"ctx_size\": " << plan.ctx_size << ",\n"
+      << "  \"max_context\": " << plan.max_context << ",\n"
+      << "  \"kv_slots\": " << plan.kv_slots << ",\n"
       << "  \"kv_bytes_at_ctx\": " << plan.kv_bytes_at_ctx << ",\n"
       << "  \"expert_cache_bytes\": " << plan.expert_cache_bytes << ",\n"
       << "  \"pin_bytes\": " << plan.pin_bytes << ",\n"
       << "  \"vram_hot_bytes\": " << plan.vram_hot_bytes << ",\n"
       << "  \"total_routed_bytes\": " << plan.total_routed_bytes << ",\n"
+      << "  \"speculative_available\": "
+      << (plan.speculative_available ? "true" : "false") << ",\n"
+      << "  \"speculative_selected\": "
+      << (plan.speculative_selected ? "true" : "false") << ",\n"
+      << "  \"speculative_method\": \"" << plan.speculative_method << "\",\n"
+      << "  \"speculative_stages\": " << plan.speculative_stages << ",\n"
+      << "  \"speculative_trained_block_size\": "
+      << plan.speculative_trained_block_size << ",\n"
+      << "  \"speculative_default_tokens\": " << plan.speculative_default_tokens << ",\n"
+      << "  \"speculative_routed_bytes\": " << plan.speculative_routed_bytes << ",\n"
+      << "  \"speculative_resident_bytes\": " << plan.speculative_resident_bytes << ",\n"
+      << "  \"speculative_kv_bytes_per_slot\": "
+      << plan.speculative_kv_bytes_per_slot << ",\n"
+      << "  \"speculative_kv_bytes_at_ctx\": "
+      << plan.speculative_kv_bytes_at_ctx << ",\n"
       << "  \"cap_per_layer\": " << plan.cap_per_layer << ",\n"
       << "  \"expected_unique_experts_per_step\": " << plan.expected_unique_experts_per_step
       << ",\n"

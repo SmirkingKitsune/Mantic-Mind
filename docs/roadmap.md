@@ -32,11 +32,10 @@ ambiguous between the two. Concretely: the harness lands at **G0/G1**, the seam 
 A snapshot, not a definition — the gate table above says what each gate MEANS, and this says what has
 happened. Kept short on purpose: a long status section is one that stops being updated.
 
-**Three attention families go through the seam with zero core divergence:** GQA (Qwen3-MoE, Mixtral,
-OLMoE), MLA (DeepSeek-V2-Lite, Moonlight), and MLA+DSA (GLM-5.2). Both fp32 entry points are
-implemented for all three — teacher-forced and cached decode — and the cached path is asserted equal
-to the teacher-forced one at every position, for every fixture, in both the absorbed and expanded
-forms.
+**Four attention families go through the seam:** GQA (Qwen3-MoE, Mixtral, OLMoE), MLA
+(DeepSeek-V2-Lite, Moonlight), MLA+DSA (GLM-5.2), and compressed+sparse (DeepSeek V4). Both fp32 entry
+points are implemented for all four — teacher-forced and cached decode — and the cached path is
+asserted equal to the teacher-forced one across each fixture's cache boundaries.
 
 **GLM-5.2 runs end to end**, which is the case this engine exists for: 744B parameters, ~372 GB of
 weights, on a 24 GiB workstation.
@@ -48,6 +47,33 @@ weights, on a 24 GiB workstation.
 | plan | `stream` at `--ram 24G --quant-dense q4_g --min-tok-s 0.05` |
 | conform | `tokenizer_roundtrip` and `quant_codec` pass; three stages honestly skipped |
 | serve | prompted "The capital of France is", answers " Paris." in ~64 s |
+
+**DeepSeek V4 DSpark runs through target-verified speculative decoding.** The pinned 7,009 tensors
+convert into 48,356,130,816 routed bytes plus 828,988,820 resident bytes; its private three-stage BF16
+history is 393,216 bytes per sequence. Acceptance-depth tests cover 0 through 7 with exact
+autoregressive output, including reverse-journal commits across V4 window/compression boundaries. The
+full checkpoint was launched twice at 4K with `--speculative dspark`; both returned token `11932`
+(`OK`) and telemetry recorded five real draft proposals. Zero were accepted by this deliberately tiny
+one-token smoke, and measured latency was slower than the earlier autoregressive run, so `auto`
+correctly remained disabled pending a representative profile.
+
+The numerical gap behind that zero-acceptance result is now covered by a deterministic pinned-source
+oracle. DeepSeek's exact `inference/model.py` runs on CPU replacements for E4M3/E8M0, E2M1/E8M0,
+sparse attention, Sinkhorn, and Hadamard; Soma consumes the same synthetic target-layer streams. The
+tiny lossless gate is proposal-token exact (`101 202 303 404 505`) and checks 77 intermediate records.
+It identified and fixed DSpark's incorrect use of compressed RoPE/YaRN (the auxiliary graph requires
+base theta 10000 with scaling disabled), corrected the Sinkhorn matrix axis, and restored
+source-semantic BF16/FP8 activation boundaries.
+
+The post-fix full-weight profile is now complete. It bracketed one DSpark process with two ordinary
+autoregressive processes and ran knowledge, code, and arithmetic prompts for 16 greedy tokens twice
+per launch at 4K/batch-1: 288 visible tokens in all. Every DSpark token was target-exact. DSpark
+accepted 27/78 drafts (34.62%) on each pass, but the cold pass took 503.88 s against a bracketed
+396.03 s baseline (`0.786x`) and the warm pass took 505.06 s against 401.62 s (`0.795x`). Even the
+code workload's 61.11% acceptance remained slower. Warm expert-cache traffic was 744,221 MiB versus
+590,261 MiB for either baseline, a 26% increase that tracks the latency penalty; peak working set
+remained approximately 145 GiB. `auto` therefore remains disabled. DSpark is numerically functional
+and accepts real full-weight drafts, but it is not economical on this CPU/streaming host.
 
 **Execution-path naming:** `F32Backend` is the production execution path, not a reference path waiting
 to be replaced. `F32` describes its activations; its weights already use quantized SIMD kernels and
@@ -82,15 +108,17 @@ RoPE, compiled tokenizer, single-sequence forward. `tools/admission/make_oracle.
 | Qwen3-30B-A3B (GQA 16/2, per-head qk-norm) | 1.01e-06 | 256/256 | 36/36 |
 | Mixtral-8x7B (GQA 8/2, forced top-k renorm) | 1.79e-06 | 256/256 | refused¹ |
 | DeepSeek-V2-Lite, Moonlight | — | — | — (MLA, G4) |
+| DeepSeek-V4-Pro-0813 (compressed+sparse, four HC streams) | 1.13e-06 | 256/256 | 37/37 |
 | granite-3.0-3b-a800m | — | — | — (4 arch multipliers) |
 
 Errors are fp32 reassociation noise against logits with σ≈0.4.
 
 ¹ **Tokenizer coverage is narrower than model coverage, deliberately.** The compiler *recognizes or
 refuses* — it never approximates. Refused today, each with its reason recorded in
-`tokenizer.unsupported`: Mixtral's byte-fallback/SentencePiece pipeline, DeepSeek's 5-stage Split chain
-with explicit CJK/Latin ranges, granite's legacy `vocab.json`+`merges.txt`, and Moonlight (which ships
-no tokenizer files at all). A tokenizer gate that silently approximated would pass while
+`tokenizer.unsupported`: Mixtral's byte-fallback/SentencePiece pipeline, granite's legacy
+`vocab.json`+`merges.txt`, and Moonlight (which ships no tokenizer files at all). DeepSeek V4's ordered
+numeric/CJK/general Split chain is compiled and checked over Unicode and decomposed forms. A tokenizer
+gate that silently approximated would pass while
 mis-tokenizing, and mis-tokenization presents at G2 as "the model is subtly stupid" rather than as a
 tokenizer fault.
 
@@ -4340,7 +4368,7 @@ the next architecture through the seam will want to know which interface moved.
 |---|---|
 | GPU tier residency + GPU kernels | Post-G4. The tier is declared and reported throughout, so this is an implementation, not a migration. |
 | ~~**MLA/DSA decode against a cached latent**~~ | **DONE.** `f32_attention_kv` decodes against the compressed cache for both Mla and MlaDsa. The cache width now comes from the backend (D36); the K plane holds the normalised latent plus the shared RoPE segment, and the V plane — which MLA leaves empty, since its V is derived rather than stored — holds DSA's indexer key (D37). Under DSA only the SELECTED latents are expanded through `kv_b`, so the sparse path pays for itself here rather than merely being honoured: at `index_topk` 2048 against a 32k context that is a sixteenth of the expansion, and the saving grows with context. Verified by `soma_decode_kv_g4`, which requires the cached path to agree with the teacher-forced one at EVERY position across all six fixtures (max 4.77e-07), and which was itself checked by breaking the code two ways. **Absorption landed separately and is now the default** — see the row below. One follow-up remains: plain MLA allocates a V plane it never uses, 2.94 GB of waste on GLM-5.2 at 4k context. |
-| ~~**A compiled tokenizer for GLM-5.2**~~ | **DONE.** `compile_tokenizer.py` refused its Split pattern, so every token the engine produced from GLM-5.2 came from serve's byte fallback: the forward pass was real and the TEXT was meaningless. The pattern turned out to be Qwen3's with one alternative changed — `\p{N}{1,3}` for `\p{N}`, digits grouped in runs of up to three, the GPT-4/cl100k convention. **No engine change was needed**: the compiled program already carries `(kind, payload, min, max)` per item and the C++ matcher already honours `max_count` generically, so a bounded repeat was representable all along — the compiler simply had no pattern that used one. `program_qwen` is now parameterized on the digit run rather than copied, since a second near-identical program is how the two drift. Round-trip against HF `tokenizers`: **36/36 encode, decode and stream**. Verified load-bearing by compiling GLM as though it were Qwen — encode falls to 34/36 and the failing string is exactly `"3.14159 and 42 and 0x1F and 1,000,000"`, 28 ids where 20 are wanted. Committed as a fixture (6.6 MB, alongside Qwen3's 3.7 MB) so `soma_tokenizer_g0` covers it permanently. **The result**: GLM-5.2 served from its 499 GiB container at `--quant-dense q4_g` on a 24 GiB budget, prompted "The capital of France is", answers " Paris." **And now emitted by the converter**, so this cannot recur per model: `convert.py` compiles the tokenizer into the container before the expert loop, records `tokenizer: compiled | unsupported` in container_meta.json, and repeats it in the final summary line because an early message is invisible after four hours of layer output. NON-FATAL by design — most families' pretokenizers are still uncompiled (DeepSeek's multi-Split chain, Mixtral's SentencePiece, granite's legacy vocab) and aborting a multi-hour conversion over a tokenizer would be disproportionate to a gap the container can be used without. A container straight out of the converter now passes `tokenizer_roundtrip` with no manual step; installing those three files by hand got two of the three the first time. |
+| ~~**A compiled tokenizer for GLM-5.2**~~ | **DONE.** `compile_tokenizer.py` refused its Split pattern, so every token the engine produced from GLM-5.2 came from serve's byte fallback: the forward pass was real and the TEXT was meaningless. The pattern turned out to be Qwen3's with one alternative changed — `\p{N}{1,3}` for `\p{N}`, digits grouped in runs of up to three, the GPT-4/cl100k convention. **No engine change was needed**: the compiled program already carries `(kind, payload, min, max)` per item and the C++ matcher already honours `max_count` generically, so a bounded repeat was representable all along — the compiler simply had no pattern that used one. `program_qwen` is now parameterized on the digit run rather than copied, since a second near-identical program is how the two drift. Round-trip against HF `tokenizers`: **36/36 encode, decode and stream**. Verified load-bearing by compiling GLM as though it were Qwen — encode falls to 34/36 and the failing string is exactly `"3.14159 and 42 and 0x1F and 1,000,000"`, 28 ids where 20 are wanted. Committed as a fixture (6.6 MB, alongside Qwen3's 3.7 MB) so `soma_tokenizer_g0` covers it permanently. **The result**: GLM-5.2 served from its 499 GiB container at `--quant-dense q4_g` on a 24 GiB budget, prompted "The capital of France is", answers " Paris." **And now emitted by the converter**, so this cannot recur per model: `convert.py` compiles the tokenizer into the container before the expert loop, records `tokenizer: compiled | unsupported` in container_meta.json, and repeats it in the final summary line because an early message is invisible after four hours of layer output. NON-FATAL by design — unsupported families such as Mixtral's SentencePiece and granite's legacy vocab remain, and aborting a multi-hour conversion over a tokenizer would be disproportionate to a gap the container can be used without. DeepSeek V4's ordered multi-Split chain has since landed and is covered by its own 37-case fixture. A container straight out of the converter now passes `tokenizer_roundtrip` with no manual step; installing those three files by hand got two of the three the first time. |
 | ~~**The indexer's own O(context) scoring**~~ | **DONE, and the win is a constant factor rather than an order.** DSA must score EVERY cached key to take a top-k, so the linearity is inherent; what was available was the nesting. The loops were head-outer, so they walked the whole key array once PER HEAD — on GLM-5.2 at 32k, 32 passes over 16.8 MB instead of one. Transposed to key-outer, which reads each key once and applies every head to it, and which is also what makes the key loop parallelisable: each iteration writes exactly one score and reads shared immutable state, where head-outer cannot be split because every head accumulates into every score. **Bit-identical, not merely equivalent** — `score[j]` still accumulates over h in ascending order — and that was the point to protect, because this score feeds a top-k where a perturbed low bit can flip a near-tie and change which keys the model attends to. Verified: conformance unchanged at `max=1.25e-06@t0`, and decode's `max|dlogit|` identical at the same POSITIONS across every context tested. **Measured** on the tiny fixture, against a 5-6% run-to-run noise floor established by repeat runs: 2048 keys 1223 ms -> 769-808 ms (**1.5x**), 1024 359 -> 320 (1.12x), 512 and 256 unchanged within noise. The first version had no floor and was SLOWER at 256 and 512 — a parallel optimisation losing to sequential code at the sizes most requests use — so dispatch is now gated at 1024 keys. **What the fixture cannot show**: its `index_head_dim` is 32 against the real 128, so its key array fits in cache at every size testable here and the DRAM-traffic reduction the transpose was written for never engages. What is demonstrated is the parallelism the transpose enables; the traffic argument is reasoned, not measured. |
 | ~~**The production `ArchBackend` execution path**~~ | **REMOVED.** This was not missing production work: `F32Backend` is the path that already runs quantized SIMD kernels, streamed experts, batch-union CSR and per-sequence KV; F32 names its activations, not its weights. The duplicate contract declared a second forward API that no family implemented and nothing called. It was deleted, along with its `ModelState`, `ExecScratch`, `SeqBatch` and `KvRegion` types, so a confident declaration cannot be mistaken for a pending implementation. `AttentionBackend` remains only for the planner sizing and KV persistence properties it genuinely owns. |
 | Paged KV with a block table | Post-G4. Extend the actual `F32Backend::attention_kv` / `KvRow` interface with block-table addressing. |

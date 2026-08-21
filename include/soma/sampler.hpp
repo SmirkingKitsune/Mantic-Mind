@@ -50,6 +50,11 @@ struct SamplerScratch {
     std::vector<float> prob;
 };
 
+/// Sampling assumes a total ordering over logits and finite softmax inputs.
+/// Check this at the scheduler boundary so NaNs/Infs become an explicit model
+/// error instead of an arbitrary but superficially valid token.
+bool logits_are_finite(std::span<const float> logits) noexcept;
+
 /// Pick one token from `logits`.
 ///
 /// Stages apply in this order, and the order is load-bearing:

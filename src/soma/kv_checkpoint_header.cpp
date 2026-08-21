@@ -93,16 +93,17 @@ parse_kv_checkpoint_header(const std::byte* data, std::size_t size, KvCheckpoint
     out.written_at_ms = c.u64();
     out.rng_state = c.u64();
     out.n_emitted = c.u32();
+    if (out.version == kKvCheckpointVersionSpeculative) out.auxiliary_bytes = c.u64();
     if (!c.ok) return {StatusCode::InvalidArgument, "truncated KV checkpoint header"};
 
     // Checked HERE rather than only in the store's gate, because the node reads
     // this header without a store and must not interpret a v1 layout — where the
     // payload starts immediately and the token array does not exist — as a v2
     // one. Every offset below would be wrong by 4 x length_tokens.
-    if (out.version != kKvCheckpointVersion) {
+    if (out.version != kKvCheckpointVersion &&
+        out.version != kKvCheckpointVersionSpeculative) {
         return {StatusCode::VersionMismatch,
-                "checkpoint version " + std::to_string(out.version) +
-                    " != " + std::to_string(kKvCheckpointVersion)};
+                "unsupported checkpoint version " + std::to_string(out.version)};
     }
 
     // Arithmetic, not consumed: stat() reads a bounded prefix and the token
@@ -110,6 +111,7 @@ parse_kv_checkpoint_header(const std::byte* data, std::size_t size, KvCheckpoint
     out.tokens_at = c.at;
     out.emitted_at = out.tokens_at + static_cast<std::size_t>(out.length_tokens) * 4;
     out.payload_at = out.emitted_at + static_cast<std::size_t>(out.n_emitted) * 4;
+    out.auxiliary_at = out.payload_at + static_cast<std::size_t>(out.payload_bytes);
     return {};
 }
 

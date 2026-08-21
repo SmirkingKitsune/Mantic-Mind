@@ -289,6 +289,9 @@ int main(int argc, char** argv) {
         mm::EngineLoadRequest req;
         req.model_path = model;
         req.port = 8123;
+        req.settings.ctx_size = 12345;
+        req.settings.parallel = 3;
+        req.settings.extra_args = {"--max-batch", "2"};
         const auto spec = s->build_launch(req);
         bool has_serve = false, has_port = false;
         for (const auto& a : spec.args) {
@@ -297,6 +300,15 @@ int main(int argc, char** argv) {
         }
         check(has_serve && has_port && spec.executable == exe,
               "build_launch emits a runnable argv");
+        const auto soma_argv_has = [&](const std::string& flag, const std::string& value) {
+            for (std::size_t i = 0; i + 1 < spec.args.size(); ++i) {
+                if (spec.args[i] == flag && spec.args[i + 1] == value) return true;
+            }
+            return false;
+        };
+        check(soma_argv_has("--ctx-size", "12345"), "Soma context reaches admission");
+        check(soma_argv_has("--kv-slots", "3"), "Soma selected KV slots reach admission");
+        check(soma_argv_has("--max-batch", "2"), "Soma operator extra_args survive");
         check(spec.readiness.kind == mm::ReadinessProbe::Kind::HttpHealth,
               "readiness is an HTTP probe, not a stdout sentinel");
 

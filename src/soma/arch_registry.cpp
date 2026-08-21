@@ -11,6 +11,8 @@
 
 #include "soma/arch/gqa.hpp"
 #include "soma/arch/mla.hpp"
+#include "soma/arch/compressed_sparse.hpp"
+#include "soma/arch/deepseek_dspark.hpp"
 #include "soma/f32_model.hpp"
 
 namespace soma {
@@ -39,7 +41,21 @@ const F32Backend* resolve_f32_backend(const ArchIr& arch) noexcept {
         // declared, so flipping this line is what makes the plan's verdict change.
         return &arch::mla::f32_backend();
 
+    case AttentionFamily::CompressedSparse:
+        return &arch::compressed_sparse::f32_backend();
+
     case AttentionFamily::Unknown:
+        return nullptr;
+    }
+    return nullptr;
+}
+
+const SpeculativeBackend* resolve_speculative_backend(const ArchIr& arch) noexcept {
+    if (!arch.speculative.present) return nullptr;
+    switch (arch.speculative.method) {
+    case SpeculativeMethod::DSpark:
+        return &arch::deepseek_dspark::backend();
+    case SpeculativeMethod::None:
         return nullptr;
     }
     return nullptr;
@@ -65,6 +81,9 @@ const AttentionBackend* resolve_attention_backend(AttentionFamily family) noexce
         // selects keys before the softmax. Nothing can accidentally execute dense
         // attention through this pointer, because there is nothing here to call.
         return &arch::mla::attention_backend();
+
+    case AttentionFamily::CompressedSparse:
+        return &arch::compressed_sparse::attention_backend();
 
     case AttentionFamily::Unknown:
         return nullptr;

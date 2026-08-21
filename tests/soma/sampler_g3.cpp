@@ -18,6 +18,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -55,6 +56,19 @@ soma::SamplerState plain(std::uint64_t seed) {
 int main() {
     soma::SamplerScratch sc;
     const std::vector<soma::TokenId> none;
+
+    // The scheduler relies on this guard before sampling. Without it NaN can
+    // quietly turn into token zero in greedy mode, which makes a broken launch
+    // look like valid generation.
+    const std::vector<float> finite_logits{1.0f, -2.0f, 0.0f};
+    const std::vector<float> nan_logits{1.0f, std::numeric_limits<float>::quiet_NaN()};
+    const std::vector<float> inf_logits{1.0f, std::numeric_limits<float>::infinity()};
+    check(soma::logits_are_finite(finite_logits),
+          "finite logits pass the runtime guard");
+    check(!soma::logits_are_finite(nan_logits),
+          "NaN logits fail the runtime guard");
+    check(!soma::logits_are_finite(inf_logits),
+          "infinite logits fail the runtime guard");
 
     // ── 1. greedy ────────────────────────────────────────────────────────────
     std::cout << "1. greedy\n";

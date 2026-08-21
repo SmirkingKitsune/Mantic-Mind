@@ -42,6 +42,40 @@ expert miss:
   tokenizer_meta.json                             ) with the reason
 ```
 
+DeepSeek V4 uses the compatible indexed/sharded resident form because its resident half is itself too
+large for a single dense sidecar:
+
+```
+  experts-00000.bin … experts-00060.bin  one atomically completed routed layer each
+  dense.safetensors.index.json           lossless norms/routing/sinks/HC controls
+  dense-00000.safetensors …              top-level then one lossless layer shard
+  dense.qweights.index.json              mmap index for runtime-layout QTensor payloads
+  dense-q-00000.bin …                    quantized embeddings/projections/shared experts/head
+  conversion-manifest.json               pinned revision, config/index hashes, completed shards,
+                                         and the committed DSpark/omission state
+```
+
+With `convert.py --include-dspark`, the pinned `mtp.0/1/2` source tensors are translated into stable
+`model.dspark.*` names and a second compatible sidecar set:
+
+```
+  soma.dspark                             three-stage routed-expert index
+  dspark-experts-00000.bin … -00002.bin   384 atomically completed experts per stage
+  dspark.safetensors.index.json           lossless HC/norm/router controls
+  dspark-dense-00000.safetensors …        one lossless resident shard per stage
+  dspark.qweights.index.json              runtime-layout projection/Markov/head index
+  dspark-dense-q-00000.bin …              quantized resident payloads
+```
+
+The manifest records `dspark_included: true` and an empty `omitted_namespaces` only after every
+auxiliary shard and index is committed. A resumed base-only conversion therefore remains safely
+autoregressive until the augmentation is complete. Without the flag, the three `mtp.*` namespaces are
+the only permitted omissions and remain recorded explicitly. Existing v1 containers and single-file
+dense sidecars are unchanged.
+
+`SafeTensors::open_dir` unions the two resident indexes. Existing single-file
+`dense.safetensors` and v1 indexes remain valid and are not rewritten.
+
 **There is no `arch.json` FILE in a container.** This listing named one and no converter has ever
 written it. The IR is ADAPTED from `config.json` at load, by the same `resolve_arch()` that
 `soma plan` uses, so a container and a plain HF checkpoint go down one path — a second description
@@ -57,7 +91,8 @@ did, and it is the only place the quantization exists at all: `dtype_gate_up`, `
 and `tokenizer` (`compiled` | `unsupported`). `arch_hash` covers the quant map precisely so that the
 same weights at two quantizations are two models, with two verdicts and two sets of KV checkpoints.
 
-The dense half is stored **F32 regardless of `--quant-dense`**, and that is deliberate: the loader
+For v1 containers, the dense half is stored **F32 regardless of `--quant-dense`**, and that is
+deliberate: the loader
 quantizes it into RAM per the role's spec, so the resident precision can be changed without
 reconverting a byte — which is exactly what the expert half cannot do. `--quant-dense` is therefore a
 flag on `plan` and `serve`, not on the converter.
@@ -69,9 +104,14 @@ disproportionate to a gap the container can be used without. A container without
 `soma serve` falls back to one token per byte, which produces real tokens from real weights and
 meaningless text, and `conform` reports `tokenizer_roundtrip` as skipped rather than passed.
 
-The **dense half stays in safetensors** deliberately. It is loaded once, in full, at startup — none of
+The v1 **dense half stays in safetensors** deliberately. It is loaded once, in full, at startup — none of
 the four requirements above apply to it, and keeping a standard format means it stays inspectable with
 ordinary tools.
+
+V4 is the exception described above: large resident matrices are translated offline into the chosen
+Soma QTensor layout and bound directly from `dense-q-*.bin`; lossless controls remain inspectable
+SafeTensors. A serve-time resident dtype that disagrees with this prequantized index is refused rather
+than silently requantized.
 
 ### `soma.container`
 

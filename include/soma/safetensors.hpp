@@ -29,6 +29,8 @@ namespace soma {
 struct TensorView {
     std::string name;
     DType dtype = DType::F32;
+    /// Non-zero only for Soma's indexed quantized resident sidecar.
+    std::uint32_t group = 0;
     std::vector<std::int64_t> shape;
     CByteSpan bytes;
 
@@ -54,9 +56,9 @@ public:
     /// Read one .safetensors file into memory.
     Status open(const std::string& path);
 
-    /// Read a sharded checkpoint. Accepts either a directory containing
-    /// model.safetensors, or one containing model.safetensors.index.json plus
-    /// its shards. Tensor names are unioned across shards.
+    /// Read a sharded checkpoint. Soma container directories may union their
+    /// lossless dense SafeTensors with `dense.qweights.index.json`, whose binary
+    /// shards already use the runtime QTensor layouts.
     Status open_dir(const std::string& dir);
 
     void close();

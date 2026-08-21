@@ -179,6 +179,7 @@ nothing; safe to call for a node that could not host the model.
 { "arch_hash": "…", "model_name": "Qwen3-30B-A3B",
   "footprint": { "vram_mb": 0, "ram_mb": 19840, "disk_mb": 14848 },
   "dense_resident_bytes": 3221225472,
+  "ctx_size": 4096, "max_context": 32768, "kv_slots": 4,
   "kv_bytes_at_ctx": 3435973836,
   "expert_cache_bytes": 12884901888,
   "vram_hot_bytes": 0,
@@ -591,7 +592,9 @@ Uniform envelope. Machine-readable `code` first, prose second.
 | `invalid_bearer_token` | 403 | |
 | `insufficient_scope` | 403 | Includes `required` and `granted` |
 | `validation_failed` | 422 | Existing agent-config shape, with `issues[]` |
+| `bad_request` | 400 | Invalid model-protocol option, including unsupported V4 reasoning/tool forcing |
 | `unsupported_content` | 422 | Image content part; **text-only v1** |
+| `protocol_error` | 502 | The model emitted malformed DSML; no tool call is fabricated |
 | `model_not_admitted` | 409 | Soma requested, no record |
 | `capacity_pressure` | 503 | Retryable; drives evict-and-retry |
 | `multi_sequence_unsupported` | 409 | Suspend on a multi-seq slot the backend can't checkpoint |

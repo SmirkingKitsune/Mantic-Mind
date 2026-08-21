@@ -39,14 +39,6 @@ namespace {
 
 constexpr std::uint64_t kGiB = 1024ull * 1024 * 1024;
 
-soma::QuantMap container_map() {
-    soma::QuantMap m;
-    m.expert_gate = {soma::DType::Q4_G, 128};
-    m.expert_up = {soma::DType::Q4_G, 128};
-    m.expert_down = {soma::DType::Q6_G, 128};
-    return m;
-}
-
 // ── 1. container round-trip ──────────────────────────────────────────────────
 
 int check_container(const fs::path& fixture, const fs::path& container) {
@@ -61,10 +53,21 @@ int check_container(const fs::path& fixture, const fs::path& container) {
         return gap ? 0 : 1;
     }
 
-    // Re-quantize with the ENGINE first, so its IR describes the container's
-    // precision. Opening with the all-f32 IR is now correctly refused.
+    // Resolve the conversion's own map. V1 containers carry only expert dtypes
+    // and keep resident tensors F32; V4 additionally carries dtype_dense and a
+    // prequantized resident index which correctly refuses an all-F32 load.
+    soma::ArchIr container_arch;
+    if (auto st = soma::resolve_arch(container.string(), {}, container_arch); !st.ok()) {
+        std::cout << "   container identity failed: " << st.message() << "\n";
+        return 1;
+    }
+
+    // Re-quantize the source with the ENGINE first, so the independent source
+    // path describes precisely the bytes the converter says it wrote.
     soma::F32Model qmodel;
-    if (auto st = soma::load_f32_model(fixture.string(), qmodel, container_map()); !st.ok()) {
+    if (auto st = soma::load_f32_model(
+            fixture.string(), qmodel, container_arch.quantization);
+        !st.ok()) {
         std::cout << "   quantized load failed: " << st.message() << "\n";
         return 1;
     }
@@ -82,7 +85,8 @@ int check_container(const fs::path& fixture, const fs::path& container) {
     // G4 passed on the fp32 SOURCE path, which has the tensors. The container
     // path is the one production serves.
     soma::F32Model from_container;
-    if (auto st = soma::load_f32_model(container.string(), from_container, container_map());
+    if (auto st = soma::load_f32_model(
+            container.string(), from_container, container_arch.quantization);
         !st.ok()) {
         std::cout << "   CONTAINER WILL NOT LOAD: " << st.message() << "\n"
                   << "   (the round-trip below only checks experts; this is the dense half)\n";
@@ -758,6 +762,14 @@ int check_plan_matches_serve(const fs::path& containers) {
     check(!mst.ok() && mst.code() == soma::StatusCode::InvalidArgument,
           "--quant-dense without a value is refused",
           mst.message());
+
+    const char* timeout_argv[] = {
+        "--model-dir", "fixture", "--generation-timeout", "7200", "--kv-slots", "1"};
+    soma::ServeConfig timeout_cfg;
+    const auto tst = soma::parse_serve_config(6, timeout_argv, timeout_cfg);
+    check(tst.ok() && timeout_cfg.generation_timeout_seconds == 7200,
+          "long full-model generation timeout is configurable",
+          tst.ok() ? std::to_string(timeout_cfg.generation_timeout_seconds) : tst.message());
     return bad;
 }
 

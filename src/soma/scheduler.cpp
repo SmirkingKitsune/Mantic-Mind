@@ -61,6 +61,7 @@ namespace {
 struct Seq {
     SeqId id = 0;
     KvCache kv;
+    ArchLayerPayload speculative_state;
 
     std::vector<TokenId> prompt;
     std::uint32_t prompt_pos = 0; ///< next prompt token to feed
@@ -68,6 +69,7 @@ struct Seq {
 
     std::uint32_t generated = 0;
     std::uint32_t max_tokens = 0;
+    std::vector<TokenId> stop_token_ids;
     SamplerState sampler{};
     Determinism determinism = Determinism::Batched;
 
@@ -190,6 +192,12 @@ Status Scheduler::open_f32(const F32Model& model,
                            const SchedulerConfig& config,
                            KvCheckpointStore* checkpoints) {
     close();
+    if (model.arch.schema_version >= kArchIrSchemaVersionV2 &&
+        model.arch.topology.max_position_embeddings > 0 &&
+        config.ctx_size > model.arch.topology.max_position_embeddings) {
+        return {StatusCode::InvalidArgument,
+                "ctx_size exceeds the model's maximum context"};
+    }
     auto& im = *impl_;
     im.model = &model;
     im.memory = memory;
@@ -252,10 +260,22 @@ Status Scheduler::admit(SeqRequest request, SeqId& out_id, AdmitRejection& out_r
     auto s = std::make_unique<Seq>();
     s->id = im.next_id++;
     if (auto st = s->kv.open(im.model->arch, im.cfg.ctx_size); !st.ok()) return st;
+    if (im.cfg.enable_speculation && im.model->speculative_backend != nullptr) {
+        const auto* speculative = im.model->speculative_backend;
+        if (speculative->open_sequence == nullptr) {
+            return {StatusCode::Unsupported, "speculative backend cannot create sequence state"};
+        }
+        if (const auto rc = speculative->open_sequence(
+                *im.model, im.cfg.ctx_size, s->speculative_state);
+            rc != StatusCode::Ok) {
+            return {rc, "could not create speculative sequence state"};
+        }
+    }
     s->prompt = std::move(request.prompt);
     s->sampler = request.sampler;
     s->determinism = request.determinism;
     s->max_tokens = request.max_tokens;
+    s->stop_token_ids = std::move(request.stop_token_ids);
 
     // ── warm reopen ──────────────────────────────────────────────────────────
     //
@@ -267,9 +287,17 @@ Status Scheduler::admit(SeqRequest request, SeqId& out_id, AdmitRejection& out_r
     if (!request.resume_key.empty() && im.checkpoints != nullptr) {
         SeqPersistState cached;
         const auto st = im.checkpoints->load(request.resume_key, s->kv, cached);
-        const bool is_prefix =
+        const bool base_prefix =
             st.ok() && cached.tokens.size() <= s->prompt.size() &&
             std::equal(cached.tokens.begin(), cached.tokens.end(), s->prompt.begin());
+        bool speculative_ok = true;
+        if (base_prefix && im.cfg.enable_speculation && im.model->speculative_backend != nullptr) {
+            speculative_ok = !cached.auxiliary.empty() &&
+                             im.model->speculative_backend->restore_state != nullptr &&
+                             im.model->speculative_backend->restore_state(
+                                 *im.model, cached.auxiliary, s->speculative_state).ok();
+        }
+        const bool is_prefix = base_prefix && speculative_ok;
         if (is_prefix && !cached.tokens.empty()) {
             s->history = std::move(cached.tokens);
             s->prompt_pos = static_cast<std::uint32_t>(s->history.size());
@@ -299,6 +327,13 @@ Status Scheduler::admit(SeqRequest request, SeqId& out_id, AdmitRejection& out_r
             // and a partially populated cache with length 0 is worse than none.
             if (auto reopen = s->kv.open(im.model->arch, im.cfg.ctx_size); !reopen.ok()) {
                 return reopen;
+            }
+            if (im.cfg.enable_speculation && im.model->speculative_backend != nullptr) {
+                if (const auto rc = im.model->speculative_backend->open_sequence(
+                        *im.model, im.cfg.ctx_size, s->speculative_state);
+                    rc != StatusCode::Ok) {
+                    return {rc, "could not reset speculative sequence state"};
+                }
             }
         }
     }
@@ -354,6 +389,170 @@ Status Scheduler::step() {
         im.stats.current_batch = 0;
         return {};
     }
+
+    const auto* speculative =
+        (im.cfg.enable_speculation ? im.model->speculative_backend : nullptr);
+
+    // Batch-1 speculative verification. Proposal construction is backend-owned;
+    // sampling, stopping, streaming and target KV prefix commit remain ordinary
+    // scheduler semantics, which is what makes accepted drafts observationally
+    // identical to autoregressive decoding.
+    if (speculative != nullptr && batch.size() == 1 && !batch[0]->prefilling()) {
+        Seq* s = batch[0];
+        const auto remaining_ctx = s->kv.capacity() - s->kv.length();
+        const auto remaining_out = s->max_tokens - s->generated;
+        const auto proposal_cap = remaining_ctx > 0
+                                      ? std::min({im.cfg.speculative_tokens,
+                                                  remaining_out,
+                                                  remaining_ctx - 1})
+                                      : 0u;
+        SpeculativeProposal proposal;
+        if (proposal_cap > 0) {
+            if (const auto rc = speculative->propose(
+                    *im.model,
+                    im.model->speculative_payload,
+                    s->speculative_state,
+                    s->next_token,
+                    proposal_cap,
+                    im.cfg.speculative_confidence_threshold,
+                    proposal);
+                rc != StatusCode::Ok) {
+                if (im.on_error) im.on_error(s->id, rc, "speculative proposal failed");
+                s->finished = true;
+                return {rc, "speculative proposal failed"};
+            }
+        }
+        if (!proposal.tokens.empty()) {
+            const auto n_draft = static_cast<std::uint32_t>(proposal.tokens.size());
+            std::vector<TokenId> verify;
+            verify.reserve(static_cast<std::size_t>(n_draft) + 1);
+            verify.push_back(s->next_token);
+            verify.insert(verify.end(), proposal.tokens.begin(), proposal.tokens.end());
+            if (auto st = s->kv.begin_tentative(static_cast<std::uint32_t>(verify.size()));
+                !st.ok()) {
+                im.ready.push_back(s->id);
+                return st;
+            }
+            std::vector<KvRow> verify_rows(verify.size());
+            for (std::uint32_t j = 0; j < verify_rows.size(); ++j) {
+                auto& r = verify_rows[j];
+                if (s->kv.is_opaque()) {
+                    r.opaque_base = s->kv.opaque_data();
+                    r.opaque_bytes = s->kv.opaque_size();
+                    r.max_ctx = s->kv.capacity();
+                } else {
+                    r.k_base = s->kv.k_at(0, 0);
+                    r.v_base = s->kv.v_at(0, 0);
+                }
+                r.k_stride = s->kv.k_stride();
+                r.v_stride = s->kv.v_stride();
+                r.k_hkv = s->kv.k_hkv();
+                r.v_hkv = s->kv.v_hkv();
+                r.pos = s->kv.length() + j;
+                r.len = r.pos + 1;
+                r.transaction = s->kv.transaction();
+                r.transaction_row = j;
+            }
+            HiddenStateTaps taps{im.model->arch.speculative.target_layer_ids};
+            if (auto st = forward_step_f32(
+                    *im.model, verify, verify_rows, im.ws, im.logits, &taps);
+                !st.ok()) {
+                s->kv.abort_tentative();
+                if (im.on_error) im.on_error(s->id, st.code(), st.message().c_str());
+                s->finished = true;
+                return st;
+            }
+            const auto vocab = im.model->vocab();
+            for (std::uint32_t row = 0; row < verify.size(); ++row) {
+                const float* lg = im.logits.data() + static_cast<std::size_t>(row) * vocab;
+                if (logits_are_finite(std::span<const float>(lg, vocab))) continue;
+                s->kv.abort_tentative();
+                s->finished = true;
+                const Status st{StatusCode::Internal,
+                                "model produced non-finite output logits"};
+                if (im.on_error) im.on_error(s->id, st.code(), st.message().c_str());
+                return st;
+            }
+
+            std::uint32_t accepted = 0;
+            std::uint32_t committed_rows = 1; // the anchor is always a real input
+            bool terminal = false, hit_stop = false;
+            TokenId last = s->next_token;
+            const auto emit_sample = [&](std::uint32_t row) {
+                const float* lg = im.logits.data() + static_cast<std::size_t>(row) * vocab;
+                last = sample_token(std::span<const float>(lg, vocab),
+                                    s->sampler,
+                                    s->emitted,
+                                    s->scratch);
+                s->emitted.push_back(last);
+                s->next_token = last;
+                ++s->generated;
+                ++im.stats.tokens_out;
+                hit_stop = std::find(s->stop_token_ids.begin(),
+                                     s->stop_token_ids.end(),
+                                     last) != s->stop_token_ids.end();
+                terminal = hit_stop || s->generated >= s->max_tokens;
+            };
+
+            for (std::uint32_t i = 0; i < n_draft; ++i) {
+                emit_sample(i);
+                const bool matched = last == proposal.tokens[i];
+                if (matched && !terminal) {
+                    ++accepted;
+                    ++committed_rows; // matched token is the next verified input row
+                }
+                // Test capacity after extending the accepted prefix.  The
+                // transaction commits exactly `committed_rows`, so this is the
+                // earliest point at which the callback can truthfully mark the
+                // token that consumed the last cache position.
+                terminal = terminal ||
+                           s->kv.length() + committed_rows >= s->kv.capacity();
+                if (!hit_stop && im.on_token) im.on_token(s->id, last, terminal);
+                if (!matched || terminal) break;
+            }
+            if (accepted == n_draft && !terminal) {
+                emit_sample(n_draft); // target bonus token
+                if (!hit_stop && im.on_token) im.on_token(s->id, last, terminal);
+            }
+
+            if (auto st = s->kv.commit_tentative_prefix(committed_rows); !st.ok()) return st;
+            s->history.insert(s->history.end(), verify.begin(), verify.begin() + committed_rows);
+            if (speculative->observe_target != nullptr) {
+                if (const auto rc = speculative->observe_target(
+                        *im.model,
+                        im.model->speculative_payload,
+                        s->speculative_state,
+                        taps,
+                        0,
+                        committed_rows,
+                        verify_rows.front().pos);
+                    rc != StatusCode::Ok) {
+                    s->finished = true;
+                    return {rc, "updating speculative target context failed"};
+                }
+            }
+            im.stats.speculative_draft_tokens += n_draft;
+            im.stats.speculative_accepted_tokens += accepted;
+            ++im.stats.speculative_verifications;
+            if (s->kv.length() >= s->kv.capacity()) terminal = true;
+            if (terminal) {
+                s->finished = true;
+                if (im.on_finish)
+                    im.on_finish(s->id, hit_stop ? FinishReason::Stop : FinishReason::Length);
+            } else {
+                im.ready.push_back(s->id);
+            }
+            ++im.stats.steps;
+            im.stats.current_batch = 1;
+            im.stats.max_batch_seen = std::max(im.stats.max_batch_seen, 1u);
+            im.stats.prefill_rows_last_step = 0;
+            im.stats.decode_rows_last_step = static_cast<std::uint32_t>(verify.size());
+            im.stats.active_sequences = static_cast<std::uint32_t>(im.seqs.size());
+            return {};
+        }
+    }
+    if (speculative != nullptr && (batch.size() > 1 || !batch[0]->prefilling()))
+        ++im.stats.speculative_fallback_steps;
 
     std::uint32_t prefill_rows = 0, decode_rows = 0;
     // The row geometry comes FROM each sequence's cache, below. It used to be
@@ -416,8 +615,14 @@ Status Scheduler::step() {
             tokens.push_back(s->prefilling() ? s->prompt[s->prompt_pos + j] : s->next_token);
 
             KvRow r{};
-            r.k_base = s->kv.k_at(0, 0);
-            r.v_base = s->kv.v_at(0, 0);
+            if (s->kv.is_opaque()) {
+                r.opaque_base = s->kv.opaque_data();
+                r.opaque_bytes = s->kv.opaque_size();
+                r.max_ctx = s->kv.capacity();
+            } else {
+                r.k_base = s->kv.k_at(0, 0);
+                r.v_base = s->kv.v_at(0, 0);
+            }
             r.k_stride = s->kv.k_stride();
             r.v_stride = s->kv.v_stride();
             r.k_hkv = s->kv.k_hkv();
@@ -435,7 +640,13 @@ Status Scheduler::step() {
     }
 
     // ── one batched forward ──────────────────────────────────────────────────
-    if (auto st = forward_step_f32(*im.model, tokens, rows, im.ws, im.logits); !st.ok()) {
+    HiddenStateTaps taps;
+    HiddenStateTaps* taps_ptr = nullptr;
+    if (speculative != nullptr) {
+        taps.layers = im.model->arch.speculative.target_layer_ids;
+        taps_ptr = &taps;
+    }
+    if (auto st = forward_step_f32(*im.model, tokens, rows, im.ws, im.logits, taps_ptr); !st.ok()) {
         if (im.on_error) {
             for (Seq* s : batch)
                 im.on_error(s->id, st.code(), st.message().c_str());
@@ -449,6 +660,30 @@ Status Scheduler::step() {
 
     const auto vocab = im.model->vocab();
 
+    // Never let a non-finite model result turn into an apparently valid token.
+    // In particular, greedy argmax would otherwise quietly select token zero
+    // when its first candidate is NaN, and stochastic sorting has no ordering
+    // contract in the presence of NaNs. Validate the rows that can actually be
+    // sampled before committing any sequence state, so the caller receives an
+    // explicit model-execution failure and can discard the launch.
+    for (const auto [first, count] : span) {
+        const float* lg =
+            im.logits.data() + static_cast<std::size_t>(first + count - 1) * vocab;
+        if (logits_are_finite(std::span<const float>(lg, vocab))) continue;
+
+        Status st{StatusCode::Internal, "model produced non-finite output logits"};
+        if (im.on_error) {
+            for (Seq* s : batch)
+                im.on_error(s->id, st.code(), st.message().c_str());
+        }
+        // A non-finite result is deterministic for this model state. Requeueing
+        // it would make the driver spin forever on the same corrupt launch
+        // after the HTTP waiter had already received the explicit failure.
+        for (Seq* s : batch)
+            s->finished = true;
+        return st;
+    }
+
     // ── scatter ──────────────────────────────────────────────────────────────
     for (std::size_t i = 0; i < batch.size(); ++i) {
         Seq* s = batch[i];
@@ -458,6 +693,20 @@ Status Scheduler::step() {
         // its rows without committing, and a history recorded at row-build time
         // would then claim positions the cache does not hold.
         s->history.insert(s->history.end(), tokens.begin() + first, tokens.begin() + first + count);
+        if (speculative != nullptr && speculative->observe_target != nullptr) {
+            if (const auto rc = speculative->observe_target(
+                    *im.model,
+                    im.model->speculative_payload,
+                    s->speculative_state,
+                    taps,
+                    first,
+                    count,
+                    rows[first].pos);
+                rc != StatusCode::Ok) {
+                s->finished = true;
+                return {rc, "updating speculative target context failed"};
+            }
+        }
 
         // The LAST row of this sequence's span carries its prediction. Interior
         // prefill rows exist to populate the cache; sampling from one would emit
@@ -466,12 +715,16 @@ Status Scheduler::step() {
 
         // Sampled with the SEQUENCE's own sampler and its own RNG state, so the
         // draw does not depend on how many other sequences shared this step.
+        bool hit_stop = false;
         const auto emit = [&]() {
             s->next_token =
                 sample_token(std::span<const float>(lg, vocab), s->sampler, s->emitted, s->scratch);
             s->emitted.push_back(s->next_token);
             ++s->generated;
             ++im.stats.tokens_out;
+            hit_stop = std::find(s->stop_token_ids.begin(),
+                                 s->stop_token_ids.end(),
+                                 s->next_token) != s->stop_token_ids.end();
         };
 
         bool produced = false;
@@ -492,20 +745,26 @@ Status Scheduler::step() {
         // cost warm reopen exists to remove. The slot is real memory, so the
         // caller is responsible for cancel()ing sessions it no longer wants —
         // admit() reports NoKvSlot rather than silently evicting someone.
-        const bool done = (!s->prefilling() && s->generated >= s->max_tokens) ||
+        const bool done = hit_stop ||
+                          (!s->prefilling() && s->generated >= s->max_tokens) ||
                           s->kv.length() >= s->kv.capacity();
 
         // `last` is computed BEFORE the token goes out, so a listener that keys
         // completion off it is not told about a token and then, separately, that
         // the turn is over.
-        if (produced && im.on_token) im.on_token(s->id, s->next_token, done);
+        // A stop token is model protocol, not assistant content. It is counted
+        // as generated and retained in sampler history, but never reaches the
+        // tokenizer streamer or the public response.
+        if (produced && !hit_stop && im.on_token) im.on_token(s->id, s->next_token, done);
 
         if (done) {
             s->finished = true;
             // The unambiguous signal. A sequence can end without producing a
             // token — a prompt that fills the context during prefill does — so a
             // caller waiting on `last` from on_token would wait forever.
-            if (im.on_finish) im.on_finish(s->id);
+            if (im.on_finish) {
+                im.on_finish(s->id, hit_stop ? FinishReason::Stop : FinishReason::Length);
+            }
             continue;
         }
         im.ready.push_back(s->id);
@@ -582,6 +841,11 @@ Status Scheduler::checkpoint(SeqId id, const std::string& key) {
     persist.tokens = s->history;
     persist.emitted = s->emitted;
     persist.rng_state = s->sampler.rng_state;
+    if (im.cfg.enable_speculation && im.model->speculative_backend != nullptr) {
+        if (auto st = im.model->speculative_backend->serialize_state(
+                *im.model, s->speculative_state, persist.auxiliary);
+            !st.ok()) return st;
+    }
     return im.checkpoints->save(key, s->kv, persist);
 }
 
@@ -622,11 +886,17 @@ Status Scheduler::preempt(SeqId id) {
     persist.tokens = s->history;
     persist.emitted = s->emitted;
     persist.rng_state = s->sampler.rng_state;
+    if (im.cfg.enable_speculation && im.model->speculative_backend != nullptr) {
+        if (auto st = im.model->speculative_backend->serialize_state(
+                *im.model, s->speculative_state, persist.auxiliary);
+            !st.ok()) return st;
+    }
     if (auto st = im.checkpoints->save(checkpoint_key(id), s->kv, persist); !st.ok()) return st;
 
     // The KV buffer is released here — that is the entire point. Preemption that
     // keeps the memory it was called to reclaim is a no-op with extra steps.
     s->kv = KvCache{};
+    s->speculative_state.reset();
     s->preempted = true;
     im.ready.erase(std::remove(im.ready.begin(), im.ready.end(), id), im.ready.end());
     im.waiting.push_back(id);
@@ -647,6 +917,13 @@ Status Scheduler::resume(SeqId id) {
     if (!s->preempted) return {StatusCode::InvalidArgument, "sequence is not preempted"};
 
     if (auto st = s->kv.open(im.model->arch, im.cfg.ctx_size); !st.ok()) return st;
+    if (im.cfg.enable_speculation && im.model->speculative_backend != nullptr) {
+        if (const auto rc = im.model->speculative_backend->open_sequence(
+                *im.model, im.cfg.ctx_size, s->speculative_state);
+            rc != StatusCode::Ok) {
+            return {rc, "could not reopen speculative sequence state"};
+        }
+    }
     SeqPersistState restored;
     if (auto st = im.checkpoints->load(checkpoint_key(id), s->kv, restored); !st.ok()) return st;
     s->history = std::move(restored.tokens);
@@ -655,6 +932,16 @@ Status Scheduler::resume(SeqId id) {
     // caller set them, so a temperature change survives a preempt/resume cycle
     // rather than being silently reverted to whatever was in flight.
     s->sampler.rng_state = restored.rng_state;
+    if (im.cfg.enable_speculation && im.model->speculative_backend != nullptr) {
+        if (restored.auxiliary.empty() ||
+            im.model->speculative_backend->restore_state == nullptr) {
+            return {StatusCode::VersionMismatch,
+                    "checkpoint has no speculative sequence state"};
+        }
+        if (auto st = im.model->speculative_backend->restore_state(
+                *im.model, restored.auxiliary, s->speculative_state);
+            !st.ok()) return st;
+    }
 
     s->preempted = false;
     im.waiting.erase(std::remove(im.waiting.begin(), im.waiting.end(), id), im.waiting.end());

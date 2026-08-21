@@ -18,7 +18,13 @@
 
 namespace soma {
 
+// Version 1 remains the default for every architecture that predates the
+// block-level execution contract below.  DeepSeek-V4 is the first v2 adapter.
+// Keeping v1 as the default is intentional: merely compiling a newer Soma must
+// not change the arch_hash (and therefore invalidate KV checkpoints) of an
+// existing GQA/MLA container.
 inline constexpr std::uint32_t kArchIrSchemaVersion = 1;
+inline constexpr std::uint32_t kArchIrSchemaVersionV2 = 2;
 
 /// Selects the attention backend. The core switches on this exactly once, at
 /// load, to resolve a descriptor — never in a loop.
@@ -27,7 +33,14 @@ inline constexpr std::uint32_t kArchIrSchemaVersion = 1;
 /// no default *family*: a default-constructed spec that claimed to be GQA would
 /// be both wrong and a quiet bias toward the first architecture shipped, which
 /// is the exact failure the two-family co-design exists to prevent.
-enum class AttentionFamily : std::uint8_t { Unknown = 0, Mha, Gqa, Mla, MlaDsa };
+enum class AttentionFamily : std::uint8_t {
+    Unknown = 0,
+    Mha,
+    Gqa,
+    Mla,
+    MlaDsa,
+    CompressedSparse,
+};
 
 enum class LayerKind : std::uint8_t { Dense = 0, Moe };
 
@@ -42,7 +55,7 @@ enum class LayerKind : std::uint8_t { Dense = 0, Moe };
 /// Both report `"qk_norm": true` upstream. Reading it as one bit produces a
 /// model that runs, converges to plausible logits, and is wrong.
 enum class QkNormKind : std::uint8_t { None = 0, PerHead, FullWidth };
-enum class ScoreFn : std::uint8_t { Softmax = 0, Sigmoid };
+enum class ScoreFn : std::uint8_t { Softmax = 0, Sigmoid, SqrtSoftplus };
 enum class Activation : std::uint8_t { SwiGlu = 0, GeGlu, Relu2 };
 enum class RopeScalingKind : std::uint8_t { None = 0, Linear, Ntk, Yarn };
 enum class ExpertLayout : std::uint8_t { InterleavedGateUpDown = 0 };
@@ -131,6 +144,69 @@ struct DsaSpec {
     }
 };
 
+/// Hybrid compressed/sparse attention used by v2 Architecture IR models.
+///
+/// Unlike DSA, compression changes both the cache representation and the set of
+/// key positions.  `compress_ratios` is therefore authoritative per layer and
+/// is part of the architecture identity.
+struct CompressedAttentionSpec {
+    std::uint32_t q_lora_rank = 0;
+    std::uint32_t rope_head_dim = 0;
+    std::uint32_t o_groups = 0;
+    std::uint32_t o_lora_rank = 0;
+    std::uint32_t index_n_heads = 0;
+    std::uint32_t index_head_dim = 0;
+    std::uint32_t index_topk = 0;
+    float compress_rope_theta = 10000.0f;
+    /// Source checkpoint activation quant/dequant operations. These are model
+    /// semantics for the production FP8/FP4 checkpoint, not a request for a
+    /// native low-precision runtime kernel: the reference backend emulates them
+    /// in fp32. Dense tiny fixtures can turn them off explicitly to match native
+    /// Transformers' `from_config` execution.
+    bool semantic_fp8_quant_dequant = true;
+    bool semantic_fp4_quant_dequant = true;
+    std::vector<std::uint32_t> compress_ratios;
+};
+
+/// Manifold-constrained residual mixing.  A multiplier of one is the ordinary
+/// residual stream and requires no block hooks.
+struct HyperConnectionSpec {
+    std::uint32_t multiplier = 1;
+    std::uint32_t sinkhorn_iters = 0;
+    float eps = 1e-6f;
+};
+
+/// Optional DeepSeek speculative head carried by a converted container.
+///
+/// The upstream V4 config declares these values even when its `mtp.*` tensors
+/// were deliberately omitted during conversion. `source_declared` records that
+/// fact; `present` is the serving capability and becomes true only after
+/// container metadata proves all DSpark payloads were converted. Keeping the
+/// two separate prevents an old autoregressive-only container from advertising
+/// a draft model it cannot load.
+enum class SpeculativeMethod : std::uint8_t { None = 0, DSpark };
+
+struct SpeculativeSpec {
+    SpeculativeMethod method = SpeculativeMethod::None;
+    bool source_declared = false;
+    bool present = false;
+    std::uint32_t n_layers = 0;
+    std::vector<LayerIndex> target_layer_ids;
+    std::uint32_t trained_block_size = 0;
+    TokenId noise_token_id = 0;
+    std::uint32_t markov_rank = 0;
+    bool confidence_head = false;
+
+    /// Exact converted payload accounting. Routed experts are streamed through
+    /// the ordinary expert cache; resident tensors and persistent BF16 draft KV
+    /// are admitted separately.
+    std::uint64_t routed_bytes = 0;
+    std::uint64_t resident_bytes = 0;
+    std::uint64_t expert_bytes = 0;
+    std::uint64_t kv_bytes_per_sequence = 0;
+    float profiled_speedup = 0.0f; ///< host measurement; excluded from arch_hash
+};
+
 struct Topology {
     std::uint32_t n_layers = 0;
     std::uint32_t d_model = 0;
@@ -145,6 +221,8 @@ struct Topology {
     std::uint32_t first_k_dense = 0; ///< informational; layer_kinds is authoritative
     LayerIndex draft_layer = kInvalidLayer;
     bool tie_word_embeddings = false;
+    std::uint32_t max_position_embeddings = 0;
+    std::vector<std::uint32_t> eos_token_ids;
 };
 
 struct AttentionSpec {
@@ -158,6 +236,7 @@ struct AttentionSpec {
     RopeConfig rope{};
     MlaSpec mla{}; ///< meaningful only for Mla/MlaDsa
     DsaSpec dsa{}; ///< meaningful only for MlaDsa
+    CompressedAttentionSpec compressed{}; ///< CompressedSparse only
 };
 
 struct RouterSpec {
@@ -170,6 +249,7 @@ struct RouterSpec {
     std::uint32_t n_groups = 1;
     std::uint32_t topk_group = 1;
     std::uint32_t n_shared_experts = 0;
+    std::uint32_t n_hash_layers = 0;
 };
 
 struct FfnSpec {
@@ -178,6 +258,7 @@ struct FfnSpec {
     std::uint32_t expert_intermediate = 0;
     std::uint32_t dense_intermediate = 0;
     std::uint32_t shared_intermediate = 0;
+    float swiglu_limit = 0.0f;
     ExpertLayout expert_layout = ExpertLayout::InterleavedGateUpDown;
 };
 
@@ -246,6 +327,8 @@ struct ArchIr {
     AttentionSpec attention{};
     RouterSpec router{};
     FfnSpec ffn{};
+    HyperConnectionSpec hyper_connections{};
+    SpeculativeSpec speculative{};
     QuantMap quantization{};
     TensorNaming naming{};
     TokenizerSpec tokenizer{};

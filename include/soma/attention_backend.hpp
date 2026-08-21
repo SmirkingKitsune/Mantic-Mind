@@ -15,7 +15,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string_view>
+#include <vector>
 
 namespace soma {
 
@@ -72,6 +74,27 @@ struct AttentionBackend {
     /// an unrelated bug.
     std::size_t (*kv_bytes_per_token)(const ArchIr& arch) noexcept = nullptr;
 
+    /// Exact per-sequence bytes at a requested context.  Compressed caches are
+    /// not linear in context because each layer has its own ratio and fixed
+    /// carry/window state. Null falls back to kv_bytes_per_token * context.
+    std::uint64_t (*kv_bytes_for_context)(const ArchIr& arch,
+                                          std::uint32_t context) noexcept = nullptr;
+
+    /// Opaque caches own their persistence geometry too. The serializer writes
+    /// only state live at `length`; the restorer may target a different context
+    /// capacity. Existing plane-based formats leave both null and retain their
+    /// byte-identical checkpoint path.
+    Status (*serialize_kv)(const ArchIr& arch,
+                           std::span<const std::byte> source,
+                           std::uint32_t source_context,
+                           std::uint32_t length,
+                           std::vector<std::byte>& payload) = nullptr;
+    Status (*restore_kv)(const ArchIr& arch,
+                         std::span<const std::byte> payload,
+                         std::uint32_t length,
+                         std::span<std::byte> destination,
+                         std::uint32_t destination_context) = nullptr;
+
     /// How many bytes one (rows x cols) tensor of `role` occupies under the
     /// model's quantization. Supplied BY the planner TO the backend below.
     ///
@@ -100,6 +123,14 @@ struct AttentionBackend {
     /// formula on the f32 fixtures and silently disagreed by ~8x on every
     /// quantized plan, which the verdict table caught.
     std::uint64_t (*weight_bytes_per_layer)(const ArchIr& arch, ByteSizer sizer) noexcept = nullptr;
+
+    /// Exact attention-owned resident bytes for the whole model.
+    ///
+    /// Optional and preferred over `weight_bytes_per_layer`. Architectures with
+    /// heterogeneous layers cannot be represented exactly by an average: V4's
+    /// ratio-4 layers own indexers and its other layers do not. Older uniform
+    /// backends leave this null and retain their byte-identical planning path.
+    std::uint64_t (*resident_weight_bytes)(const ArchIr& arch, ByteSizer sizer) noexcept = nullptr;
 };
 
 // This struct once carried prepare_weights/prefill/decode/init_kv_region as well,

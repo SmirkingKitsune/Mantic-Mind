@@ -43,6 +43,8 @@ struct SchedulerConfig {
     /// acceptance and batch composition is a second-order problem. Grammar-forced
     /// drafts compose more easily and stay on.
     bool enable_speculation = true;
+    std::uint32_t speculative_tokens = 7;
+    float speculative_confidence_threshold = 0.0f;
 };
 
 /// Why admit() refused. Distinguished because the remedies differ: Thrash means
@@ -61,6 +63,7 @@ struct SeqRequest {
     Determinism determinism = Determinism::Batched;
     std::uint32_t max_tokens = 0;
     std::vector<std::string> stop_strings;
+    std::vector<TokenId> stop_token_ids;
 
     /// Optional: replay this persisted checkpoint as the prompt's prefix.
     ///
@@ -86,7 +89,8 @@ using ErrorCallback = std::function<void(SeqId, StatusCode, const char* what)>;
 /// `is_last` on TokenCallback is not enough: a sequence can end without
 /// producing a token — a prompt that fills the context during prefill does —
 /// and a caller keying completion off `is_last` would wait forever.
-using FinishCallback = std::function<void(SeqId)>;
+enum class FinishReason : std::uint8_t { Stop = 0, Length };
+using FinishCallback = std::function<void(SeqId, FinishReason)>;
 
 struct SchedulerStats {
     std::uint32_t active_sequences = 0;
@@ -118,6 +122,10 @@ struct SchedulerStats {
     std::uint64_t steps = 0;
     std::uint64_t tokens_out = 0;
     std::uint64_t preemptions = 0;
+    std::uint64_t speculative_draft_tokens = 0;
+    std::uint64_t speculative_accepted_tokens = 0;
+    std::uint64_t speculative_verifications = 0;
+    std::uint64_t speculative_fallback_steps = 0;
 };
 
 class Scheduler {

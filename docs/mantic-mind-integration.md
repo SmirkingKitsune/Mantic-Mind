@@ -35,7 +35,7 @@ parallel universe, and the existing machinery is closer to generic than it looks
 |---|---|
 | `GET /health` | Readiness. What the node's existing poll hits, unchanged. |
 | `GET /v1/models` | Served model name |
-| `POST /v1/chat/completions` | JSON + SSE. `enable_thinking`, `reasoning_effort`, `determinism`. |
+| `POST /v1/chat/completions` | JSON + SSE. Generic chat for v1 families; official DSML reasoning/tools for DeepSeek V4. |
 | `GET /internal/plan` | The plan document for the loaded model |
 | `GET /internal/telemetry` | SSE, terse frames — node-only |
 
@@ -48,8 +48,24 @@ mistake than an environment block:
 --kv-dir    / SOMA_KV_DIR         --pin        / SOMA_PIN
 --port      / SOMA_PORT           --ctx-size   / SOMA_CTX_SIZE
 --kv-slots  / SOMA_KV_SLOTS       --max-batch  / SOMA_MAX_BATCH   (0 = the gate decides)
+--generation-timeout / SOMA_GENERATION_TIMEOUT  (seconds; default 600)
 --determinism / SOMA_DETERMINISM  --telemetry-hz / SOMA_TELEMETRY_HZ
+--speculative / SOMA_SPECULATIVE  (off | auto | dspark)
+--speculative-tokens / SOMA_SPECULATIVE_TOKENS
+--dspark-confidence-threshold / SOMA_DSPARK_CONFIDENCE_THRESHOLD
 ```
+
+`auto` is deliberately evidence-gated: it selects DSpark only when container metadata records a
+profiled speedup of at least 1.05x. Use `--speculative dspark` to force target-verified DSpark for
+validation or profiling. The generic cap defaults to seven tokens, while the official V4 head clamps
+its query block to the five positions it was trained with. Batch sizes above one use ordinary decoding.
+
+DeepSeek V4 accepts an absent `reasoning_effort` for direct chat, or `low`, `high`, and `max` for
+the official reasoning prefixes. It accepts `tool_choice` omitted/`auto` and `none`; required or named
+forcing is rejected because DSML defines no encoding for it. Streaming deltas use
+`reasoning_content`, `content`, and validated OpenAI-shaped `tool_calls`. The non-streaming request
+extension `soma_return_token_ids: true` adds top-level `soma_token_ids`; it is intended for deterministic
+validation artifacts and is absent by default.
 
 `EngineProcess` gains an **env block** — `CreateProcessA` and `execvp` both inherit the parent's
 verbatim today (`nullptr` env), so a subprocess could only ever be configured through argv.

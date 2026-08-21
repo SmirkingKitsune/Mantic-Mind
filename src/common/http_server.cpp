@@ -16,9 +16,24 @@ HttpServer::HttpServer() : impl_(std::make_unique<Impl>()) {}
 HttpServer::~HttpServer() { stop(); }
 
 void HttpServer::SetPreRoutingHandler(PreRoutingHandler h) {
+    // A large streamed upload arrives with `Expect: 100-continue`. cpp-httplib
+    // consults its expectation handler before normal pre-routing; leaving that
+    // handler at the default sends 100 immediately, so an unauthorized client
+    // transmits the entire model before the auth middleware can return 401.
+    // Share one handler object between both phases. Allowed requests receive
+    // 100 and are checked again during ordinary routing; rejected requests keep
+    // the status/body populated by the middleware and never send their body.
+    auto handler = std::make_shared<PreRoutingHandler>(std::move(h));
+    impl_->srv.set_expect_100_continue_handler(
+        [handler](const httplib::Request& req, httplib::Response& res) {
+            if ((*handler)(req, res)) return static_cast<int>(httplib::StatusCode::Continue_100);
+            return res.status > 0
+                       ? res.status
+                       : static_cast<int>(httplib::StatusCode::ExpectationFailed_417);
+        });
     impl_->srv.set_pre_routing_handler(
-        [handler = std::move(h)](const httplib::Request& req, httplib::Response& res) {
-            return handler(req, res)
+        [handler](const httplib::Request& req, httplib::Response& res) {
+            return (*handler)(req, res)
                 ? httplib::Server::HandlerResponse::Unhandled
                 : httplib::Server::HandlerResponse::Handled;
         });

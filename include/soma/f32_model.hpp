@@ -26,6 +26,9 @@
 
 namespace soma {
 
+struct PromptCodec;
+struct SpeculativeBackend;
+
 /// Resolved weight pointers for one layer. Spans point into the SafeTensors
 /// buffers, which must outlive the model.
 /// Attention weights, owned by the backend and opaque to the core.
@@ -118,7 +121,13 @@ struct F32Model {
     SafeTensors weights;
     std::vector<F32LayerWeights> layers;
 
-    std::span<const float> embed; ///< gathered by row; stays fp32
+    /// Architecture-owned model-level weights. Existing backends leave this
+    /// empty; v2 block topologies use it for their final stream collapse.
+    ArchLayerPayload arch_payload;
+    ArchLayerPayload speculative_payload;
+    const SpeculativeBackend* speculative_backend = nullptr;
+
+    WeightRef embed; ///< gathered by row; may be resident-quantized
     std::span<const float> out_norm;
     WeightRef out_head; ///< aliases embed when tie_word_embeddings
 
@@ -291,6 +300,23 @@ struct F32Workspace {
     void reserve(const ArchIr& arch, std::uint32_t max_tokens);
 };
 
+/// Optional production hidden-state taps requested by a speculative backend.
+/// Values are packed [requested_layer][row][d_model] in the same order as
+/// `layers`. The core compares numeric layer ids only; it never knows why a
+/// backend selected them or which model family consumes them.
+struct HiddenStateTaps {
+    std::span<const LayerIndex> layers;
+    std::vector<float> values;
+    std::uint32_t n_rows = 0;
+    std::uint32_t d_model = 0;
+
+    std::span<const float> layer(std::size_t ordinal) const noexcept {
+        const auto width = static_cast<std::size_t>(n_rows) * d_model;
+        if (ordinal >= layers.size() || (ordinal + 1) * width > values.size()) return {};
+        return std::span<const float>(values).subspan(ordinal * width, width);
+    }
+};
+
 /// The architecture seam for the G0 path.
 ///
 /// Only two operations differ by family at this gate: attention (cache shape,
@@ -308,9 +334,16 @@ struct LayerBindCtx {
     const QuantMap* quant = nullptr;
     std::vector<QTensor>* owner = nullptr; ///< keeps quantized tensors alive
     LayerIndex layer = 0;
+    std::string prefix; ///< optional exact layer prefix for auxiliary graphs
 
     /// "self_attn.q_proj.weight" -> model.layers.{layer}.self_attn.q_proj.weight
     std::string name(const char* suffix) const;
+};
+
+struct ModelBindCtx {
+    const SafeTensors* weights = nullptr;
+    const QuantMap* quant = nullptr;
+    std::vector<QTensor>* owner = nullptr;
 };
 
 /// fp32 bind, for norms.
@@ -326,8 +359,23 @@ Status bind_layer_weight(const LayerBindCtx& ctx,
                          WeightRef& out,
                          bool optional = false);
 
+Status bind_model_f32(const ModelBindCtx& ctx,
+                      const char* name,
+                      std::span<const float>& out,
+                      bool optional = false);
+
+Status bind_model_weight(const ModelBindCtx& ctx,
+                         const char* name,
+                         TensorRole role,
+                         WeightRef& out,
+                         bool optional = false);
+
 struct F32Backend {
     const char* name = nullptr;
+
+    /// Optional model-owned prompt/completion protocol. Null preserves the
+    /// generic role flattening used by all existing families.
+    const PromptCodec* prompt_codec = nullptr;
 
     /// Bind this layer's attention tensors into a payload the backend owns.
     ///
@@ -336,6 +384,59 @@ struct F32Backend {
     StatusCode (*bind_layer)(const ArchIr& arch,
                              const LayerBindCtx& ctx,
                              ArchLayerPayload& out) noexcept = nullptr;
+
+    StatusCode (*bind_model)(const ArchIr& arch,
+                             const ModelBindCtx& ctx,
+                             ArchLayerPayload& out) noexcept = nullptr;
+
+    /// Optional block lifecycle. Null preserves the ordinary single-stream
+    /// residual path exactly; v2 architectures can own residual topology without
+    /// adding family checks to the core loop.
+    StatusCode (*begin_forward)(const ArchIr& arch,
+                                const ArchLayerPayload& model_payload,
+                                const TokenId* tokens,
+                                std::uint32_t n_tokens,
+                                F32Workspace& ws,
+                                float* hidden) noexcept = nullptr;
+    StatusCode (*pre_attention)(const ArchIr& arch,
+                                const F32LayerWeights& w,
+                                std::uint32_t n_tokens,
+                                F32Workspace& ws,
+                                float* hidden) noexcept = nullptr;
+    StatusCode (*merge_attention)(const ArchIr& arch,
+                                  const F32LayerWeights& w,
+                                  const float* branch,
+                                  std::uint32_t n_tokens,
+                                  F32Workspace& ws,
+                                  float* hidden) noexcept = nullptr;
+    StatusCode (*pre_ffn)(const ArchIr& arch,
+                          const F32LayerWeights& w,
+                          std::uint32_t n_tokens,
+                          F32Workspace& ws,
+                          float* hidden) noexcept = nullptr;
+    StatusCode (*merge_ffn)(const ArchIr& arch,
+                            const F32LayerWeights& w,
+                            const float* branch,
+                            std::uint32_t n_tokens,
+                            F32Workspace& ws,
+                            float* hidden) noexcept = nullptr;
+
+    /// Optional architecture-owned representation exported after a block.
+    /// Null copies the core's ordinary hidden rows. Multi-stream topologies use
+    /// this to expose the exact conditioning state consumed by auxiliary
+    /// decoders without teaching the core how their residual streams are laid
+    /// out or collapsed.
+    StatusCode (*export_layer_hidden)(const ArchIr& arch,
+                                      LayerIndex layer,
+                                      std::uint32_t n_tokens,
+                                      const F32Workspace& ws,
+                                      const float* hidden,
+                                      float* out) noexcept = nullptr;
+    StatusCode (*end_forward)(const ArchIr& arch,
+                              const ArchLayerPayload& model_payload,
+                              std::uint32_t n_tokens,
+                              F32Workspace& ws,
+                              float* hidden) noexcept = nullptr;
 
     /// x:[T, d_model] -> out:[T, d_model]. Causal, no cache.
     StatusCode (*attention)(const ArchIr& arch,
@@ -395,15 +496,67 @@ struct F32Backend {
     /// backend's own payload, so a router's extra tensors travel with it.
     StatusCode (*route)(const ArchIr& arch,
                         const F32LayerWeights& w,
+                        const TokenId* input_tokens,
                         const float* logits,
                         std::uint32_t n_tokens,
                         std::uint32_t* out_ids,
                         float* out_weights) noexcept = nullptr;
 };
 
+struct SpeculativeProposal {
+    std::vector<TokenId> tokens;
+    std::vector<float> confidence;
+    /// Optional draft-graph activation tap. Null in production; conformance
+    /// tools use the same callback shape as the target model workspace.
+    F32Workspace::Sink sink{};
+};
+
+/// Optional speculative model seam. The core owns scheduling and target KV
+/// transactions; this descriptor owns draft weights, draft cache semantics, and
+/// proposal construction. A null descriptor is ordinary autoregressive serving.
+struct SpeculativeBackend {
+    const char* name = nullptr;
+
+    StatusCode (*bind_model)(F32Model& model,
+                             const std::string& model_dir) noexcept = nullptr;
+    StatusCode (*start_runtime)(F32Model& model,
+                                const std::string& model_dir,
+                                std::uint64_t expert_cache_bytes) noexcept = nullptr;
+    StatusCode (*open_sequence)(const F32Model& model,
+                                std::uint32_t max_context,
+                                ArchLayerPayload& state) noexcept = nullptr;
+
+    StatusCode (*observe_target)(const F32Model& model,
+                                 const ArchLayerPayload& payload,
+                                 ArchLayerPayload& state,
+                                 const HiddenStateTaps& taps,
+                                 std::uint32_t first_row,
+                                 std::uint32_t row_count,
+                                 std::uint32_t first_position) noexcept = nullptr;
+
+    StatusCode (*propose)(const F32Model& model,
+                          const ArchLayerPayload& payload,
+                          ArchLayerPayload& state,
+                          TokenId anchor,
+                          std::uint32_t max_tokens,
+                          float confidence_threshold,
+                          SpeculativeProposal& out) noexcept = nullptr;
+
+    Status (*serialize_state)(const F32Model& model,
+                              const ArchLayerPayload& state,
+                              std::vector<std::byte>& out) = nullptr;
+    Status (*restore_state)(const F32Model& model,
+                            std::span<const std::byte> payload,
+                            ArchLayerPayload& state) = nullptr;
+};
+
 /// Resolves once, at load. A switch on family anywhere in a loop is a seam
 /// violation; this is the only permitted one.
 const F32Backend* resolve_f32_backend(const ArchIr& arch) noexcept;
+
+/// Resolves from an optional architecture descriptor once at load. Core loops
+/// call only the returned function table and contain no model-specific branch.
+const SpeculativeBackend* resolve_speculative_backend(const ArchIr& arch) noexcept;
 
 /// Load config.json + safetensors from a fixture or checkpoint directory.
 ///
@@ -461,7 +614,8 @@ Status forward_step_f32(const F32Model& model,
                         std::span<const TokenId> tokens,
                         std::span<const KvRow> rows,
                         F32Workspace& ws,
-                        std::vector<float>& out_logits);
+                        std::vector<float>& out_logits,
+                        HiddenStateTaps* taps = nullptr);
 
 /// Greedy continuation from `prefix`, recomputing the full prefix each step.
 Status generate_greedy_f32(const F32Model& model,

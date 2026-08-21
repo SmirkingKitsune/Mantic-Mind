@@ -165,6 +165,18 @@ TensorNaming mixtral_naming() {
     return n;
 }
 
+TensorNaming compressed_sparse_naming() {
+    TensorNaming n;
+    n.moe_block = "ffn";
+    n.dense_block = "ffn";
+    n.shared_block = "ffn.shared_experts";
+    n.router = "gate.weight";
+    n.expert_gate = "w1.weight";
+    n.expert_up = "w3.weight";
+    n.expert_down = "w2.weight";
+    return n;
+}
+
 FamilyTraits traits_for(const std::string& model_type) {
     // qk_norm kind is family knowledge, not config knowledge. Both OLMoE and
     // Qwen3-MoE simply have q_norm/k_norm tensors; only the shape distinguishes
@@ -209,6 +221,14 @@ FamilyTraits traits_for(const std::string& model_type) {
         // converting 1.4 TB it could not serve.
         return {AttentionFamily::MlaDsa, QkNormKind::None, true, false, 1e-5f, {}};
     }
+    if (model_type == "deepseek_v4") {
+        return {AttentionFamily::CompressedSparse,
+                QkNormKind::FullWidth,
+                true,
+                false,
+                1e-6f,
+                compressed_sparse_naming()};
+    }
     return {};
 }
 
@@ -235,6 +255,8 @@ const char* to_string(AttentionFamily family) noexcept {
         return "mla";
     case AttentionFamily::MlaDsa:
         return "mla+dsa";
+    case AttentionFamily::CompressedSparse:
+        return "compressed+sparse";
     }
     return "unknown";
 }
@@ -257,6 +279,8 @@ const char* to_string(ScoreFn score_fn) noexcept {
         return "softmax";
     case ScoreFn::Sigmoid:
         return "sigmoid";
+    case ScoreFn::SqrtSoftplus:
+        return "sqrtsoftplus";
     }
     return "unknown";
 }
@@ -278,12 +302,15 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
         return {StatusCode::Unsupported,
                 "no adapter for model_type '" + model_type +
                     "'; supported: olmoe, qwen3_moe, qwen2_moe, mixtral, deepseek_v2, "
-                    "deepseek_v3, glm_moe_dsa"};
+                    "deepseek_v3, deepseek_v4, glm_moe_dsa"};
     }
 
     out = ArchIr{};
+    if (model_type == "deepseek_v4") out.schema_version = kArchIrSchemaVersionV2;
     out.source_model_type = model_type;
     out.adapter = model_type;
+    out.source_repo = get_or<std::string>(j, "_name_or_path", "");
+    out.source_revision = get_or<std::string>(j, "_commit_hash", "");
 
     // ── topology ─────────────────────────────────────────────────────────────
     // Family default when the key is absent — NOT a global constant.
@@ -296,6 +323,19 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
     out.topology.vocab_size = get_or<std::uint32_t>(j, "vocab_size", 0);
     out.topology.first_k_dense = get_or<std::uint32_t>(j, "first_k_dense_replace", 0);
     out.topology.tie_word_embeddings = get_or<bool>(j, "tie_word_embeddings", false);
+    out.topology.max_position_embeddings =
+        get_or<std::uint32_t>(j, "max_position_embeddings", 0);
+    if (const auto it = j.find("eos_token_id"); it != j.end() && !it->is_null()) {
+        if (it->is_array()) {
+            for (const auto& token : *it) {
+                if (token.is_number_unsigned() || token.is_number_integer()) {
+                    out.topology.eos_token_ids.push_back(token.get<std::uint32_t>());
+                }
+            }
+        } else if (it->is_number_unsigned() || it->is_number_integer()) {
+            out.topology.eos_token_ids.push_back(it->get<std::uint32_t>());
+        }
+    }
     out.topology.layer_kinds = resolve_layer_kinds(j, out.topology.n_layers);
 
     // ── attention ────────────────────────────────────────────────────────────
@@ -394,6 +434,34 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
         }
     }
 
+    if (attn.family == AttentionFamily::CompressedSparse) {
+        auto& c = attn.compressed;
+        c.q_lora_rank = get_or<std::uint32_t>(j, "q_lora_rank", 0);
+        c.rope_head_dim = get_or<std::uint32_t>(j, "qk_rope_head_dim", 0);
+        c.o_groups = get_or<std::uint32_t>(j, "o_groups", 0);
+        c.o_lora_rank = get_or<std::uint32_t>(j, "o_lora_rank", 0);
+        c.index_n_heads = get_or<std::uint32_t>(j, "index_n_heads", 0);
+        c.index_head_dim = get_or<std::uint32_t>(j, "index_head_dim", 0);
+        c.index_topk = get_or<std::uint32_t>(j, "index_topk", 0);
+        c.compress_rope_theta = get_or<float>(j, "compress_rope_theta", 10000.0f);
+        c.semantic_fp8_quant_dequant =
+            get_or<bool>(j, "semantic_fp8_quant_dequant", true);
+        c.semantic_fp4_quant_dequant =
+            get_or<bool>(j, "semantic_fp4_quant_dequant", true);
+        if (const auto it = j.find("compress_ratios"); it != j.end() && it->is_array()) {
+            c.compress_ratios.reserve(out.topology.n_layers);
+            for (std::size_t i = 0; i < it->size() && i < out.topology.n_layers; ++i) {
+                c.compress_ratios.push_back((*it)[i].get<std::uint32_t>());
+            }
+        }
+        // Every V4 attention layer owns a single shared KV head.  The upstream
+        // config states this too, but recording the architecture rule here makes
+        // a malformed config fail validation rather than select a different
+        // cache layout.
+        attn.rope.partial_dim = c.rope_head_dim;
+        attn.sliding_window = get_or<std::uint32_t>(j, "sliding_window", 0);
+    }
+
     if (get_or<bool>(j, "use_sliding_window", false)) {
         attn.sliding_window = get_or<std::uint32_t>(j, "sliding_window", 0);
     }
@@ -405,15 +473,17 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
         router.n_experts = n->get<std::uint32_t>();
     }
     router.top_k = get_or<std::uint32_t>(j, "num_experts_per_tok", 0);
-    router.score_fn = (get_or<std::string>(j, "scoring_func", "softmax") == "sigmoid")
-                          ? ScoreFn::Sigmoid
-                          : ScoreFn::Softmax;
+    const auto scoring = get_or<std::string>(j, "scoring_func", "softmax");
+    router.score_fn = scoring == "sigmoid"       ? ScoreFn::Sigmoid
+                      : scoring == "sqrtsoftplus" ? ScoreFn::SqrtSoftplus
+                                                   : ScoreFn::Softmax;
     router.normalize_topk = traits.force_normalize_topk || get_or<bool>(j, "norm_topk_prob", false);
     router.routed_scaling_factor = get_or<float>(j, "routed_scaling_factor", 1.0f);
     router.bias_correction = (get_or<std::string>(j, "topk_method", "greedy") == "noaux_tc");
     router.n_groups = std::max<std::uint32_t>(1, get_or<std::uint32_t>(j, "n_group", 1));
     router.topk_group = std::max<std::uint32_t>(1, get_or<std::uint32_t>(j, "topk_group", 1));
     router.n_shared_experts = get_or<std::uint32_t>(j, "n_shared_experts", 0);
+    router.n_hash_layers = get_or<std::uint32_t>(j, "num_hash_layers", 0);
 
     // ── ffn ──────────────────────────────────────────────────────────────────
     auto& ffn = out.ffn;
@@ -449,6 +519,29 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
         ffn.shared_intermediate = ffn.expert_intermediate * router.n_shared_experts;
     }
     ffn.expert_layout = ExpertLayout::InterleavedGateUpDown;
+    ffn.swiglu_limit = get_or<float>(j, "swiglu_limit", 0.0f);
+
+    out.hyper_connections.multiplier = get_or<std::uint32_t>(j, "hc_mult", 1);
+    out.hyper_connections.sinkhorn_iters = get_or<std::uint32_t>(j, "hc_sinkhorn_iters", 0);
+    out.hyper_connections.eps = get_or<float>(j, "hc_eps", 1e-6f);
+
+    // V4 ships the DSpark descriptor in config.json even when a Soma
+    // conversion intentionally omitted every mtp.* tensor.  Parse the source
+    // declaration here, but do not turn it into a runtime capability: only the
+    // atomic container metadata overlay below may set `present`.
+    if (model_type == "deepseek_v4") {
+        auto& d = out.speculative;
+        d.method = SpeculativeMethod::DSpark;
+        d.trained_block_size = get_or<std::uint32_t>(j, "dspark_block_size", 0);
+        d.noise_token_id = get_or<TokenId>(j, "dspark_noise_token_id", 0);
+        d.markov_rank = get_or<std::uint32_t>(j, "dspark_markov_rank", 0);
+        if (const auto it = j.find("dspark_target_layer_ids");
+            it != j.end() && it->is_array()) {
+            for (const auto& layer : *it) d.target_layer_ids.push_back(layer.get<LayerIndex>());
+        }
+        d.n_layers = static_cast<std::uint32_t>(d.target_layer_ids.size());
+        d.source_declared = d.n_layers > 0 || d.trained_block_size > 0 || d.markov_rank > 0;
+    }
 
     // G0/G1 read fp32 HF checkpoints directly; requantization happens at
     // admission, not here.
@@ -458,10 +551,11 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
 }
 
 Status validate_arch_ir(const ArchIr& ir) {
-    if (ir.schema_version != kArchIrSchemaVersion) {
+    if (ir.schema_version != kArchIrSchemaVersion &&
+        ir.schema_version != kArchIrSchemaVersionV2) {
         return {StatusCode::VersionMismatch,
                 "arch IR schema " + std::to_string(ir.schema_version) +
-                    " != " + std::to_string(kArchIrSchemaVersion)};
+                    " is not supported"};
     }
     if (ir.topology.n_layers == 0 || ir.topology.d_model == 0 || ir.topology.vocab_size == 0) {
         return {StatusCode::InvalidArgument, "topology has a zero dimension"};
@@ -481,6 +575,36 @@ Status validate_arch_ir(const ArchIr& ir) {
         return {StatusCode::InvalidArgument,
                 "n_heads " + std::to_string(ir.attention.n_heads) +
                     " is not a multiple of n_kv_heads " + std::to_string(ir.attention.n_kv_heads)};
+    }
+    if (ir.attention.family == AttentionFamily::CompressedSparse) {
+        if (ir.schema_version != kArchIrSchemaVersionV2) {
+            return {StatusCode::VersionMismatch, "compressed sparse attention requires arch IR v2"};
+        }
+        const auto& c = ir.attention.compressed;
+        if (c.compress_ratios.size() != ir.topology.n_layers) {
+            return {StatusCode::InvalidArgument,
+                    "compress_ratios has " + std::to_string(c.compress_ratios.size()) +
+                        " entries for " + std::to_string(ir.topology.n_layers) + " layers"};
+        }
+        if (c.q_lora_rank == 0 || c.rope_head_dim == 0 || c.rope_head_dim > ir.attention.head_dim ||
+            c.o_groups == 0 || ir.attention.n_heads % c.o_groups != 0 ||
+            c.o_lora_rank == 0 || c.index_n_heads == 0 || c.index_head_dim == 0 ||
+            c.index_topk == 0 || ir.attention.sliding_window == 0) {
+            return {StatusCode::InvalidArgument, "compressed sparse attention is incomplete"};
+        }
+        for (const auto ratio : c.compress_ratios) {
+            if (ratio != 4 && ratio != 128) {
+                return {StatusCode::InvalidArgument,
+                        "base-model compression ratio must be 4 or 128"};
+            }
+        }
+        if (ir.hyper_connections.multiplier < 2 || ir.hyper_connections.sinkhorn_iters == 0) {
+            return {StatusCode::InvalidArgument,
+                    "compressed sparse attention requires configured hyper-connections"};
+        }
+        if (ir.router.n_hash_layers > ir.topology.n_layers) {
+            return {StatusCode::InvalidArgument, "n_hash_layers exceeds n_layers"};
+        }
     }
     if (ir.n_moe_layers() > 0) {
         if (ir.router.n_experts == 0 || ir.router.top_k == 0) {
@@ -507,6 +631,28 @@ Status validate_arch_ir(const ArchIr& ir) {
         ir.ffn.expert_intermediate == 0) {
         return {StatusCode::InvalidArgument, "shared experts declared with no width"};
     }
+    if (ir.speculative.present) {
+        const auto& d = ir.speculative;
+        if (ir.schema_version != kArchIrSchemaVersionV2 ||
+            ir.attention.family != AttentionFamily::CompressedSparse) {
+            return {StatusCode::InvalidArgument,
+                    "DSpark requires a compressed-sparse Architecture IR v2 target"};
+        }
+        if (!d.source_declared || d.n_layers != 3 || d.target_layer_ids.size() != d.n_layers ||
+            d.trained_block_size == 0 || d.markov_rank == 0 || !d.confidence_head ||
+            d.routed_bytes == 0 || d.resident_bytes == 0 || d.expert_bytes == 0 ||
+            d.kv_bytes_per_sequence == 0) {
+            return {StatusCode::InvalidArgument, "DSpark descriptor is incomplete"};
+        }
+        for (const auto layer : d.target_layer_ids) {
+            if (layer >= ir.topology.n_layers) {
+                return {StatusCode::InvalidArgument, "DSpark target layer is out of range"};
+            }
+        }
+        if (d.noise_token_id >= ir.topology.vocab_size) {
+            return {StatusCode::InvalidArgument, "DSpark noise token is out of range"};
+        }
+    }
     return validate_quant_map(ir.quantization);
 }
 
@@ -531,6 +677,13 @@ Status apply_container_quant(std::string_view meta_json, ArchIr& io) {
     }
 
     const auto group = j.value("group", 0u);
+    // Conversion identity is metadata rather than architecture, but carrying it
+    // in the IR lets the plan name the exact artifact it describes. Overlay
+    // JSON omits these keys and therefore leaves the source unchanged.
+    if (const auto repo = j.value("source_repo", std::string{}); !repo.empty())
+        io.source_repo = repo;
+    if (const auto revision = j.value("source_revision", std::string{}); !revision.empty())
+        io.source_revision = revision;
     // An UNNAMED role is left entirely alone — dtype and group.
     //
     // The group used to be applied unconditionally, which was harmless while only
@@ -582,6 +735,19 @@ Status apply_container_quant(std::string_view meta_json, ArchIr& io) {
     set(io.quantization.embed, dense);
     set(io.quantization.attn_proj, dense);
     set(io.quantization.shared_expert, dense);
+    if (j.value("dspark", std::string{}) == "present") {
+        auto& d = io.speculative;
+        d.present = true;
+        d.confidence_head = j.value("dspark_confidence_head", false);
+        d.routed_bytes = j.value("dspark_total_expert_bytes", std::uint64_t{0});
+        d.resident_bytes = j.value("dspark_resident_bytes", std::uint64_t{0});
+        d.expert_bytes = j.value("dspark_expert_bytes", std::uint64_t{0});
+        d.kv_bytes_per_sequence =
+            j.value("dspark_kv_bytes_per_sequence", std::uint64_t{0});
+        d.profiled_speedup = j.value("dspark_profiled_speedup", 0.0f);
+        set(io.quantization.draft_head,
+            j.value("dtype_dspark", j.value("dtype_dense", std::string{})));
+    }
     return {};
 }
 
@@ -624,6 +790,32 @@ Status compute_arch_hash(const ArchIr& ir, std::string& out_hash) {
         for (const auto k : ir.attention.dsa.layer_kinds) {
             canon << (k == IndexerKind::Full ? 'f' : k == IndexerKind::Shared ? 's' : '-');
         }
+    }
+    if (ir.attention.family == AttentionFamily::CompressedSparse) {
+        const auto& c = ir.attention.compressed;
+        canon << "|csa=" << c.q_lora_rank << ':' << c.rope_head_dim << ':' << c.o_groups << ':'
+              << c.o_lora_rank << ':' << c.index_n_heads << ':' << c.index_head_dim << ':'
+              << c.index_topk << ':' << c.compress_rope_theta << ':'
+              << c.semantic_fp8_quant_dequant << ':' << c.semantic_fp4_quant_dequant << ':';
+        for (const auto ratio : c.compress_ratios) canon << ratio << ',';
+        canon << "|hc=" << ir.hyper_connections.multiplier << ':'
+              << ir.hyper_connections.sinkhorn_iters << ':' << ir.hyper_connections.eps
+              << "|hash=" << ir.router.n_hash_layers << "|limit=" << ir.ffn.swiglu_limit
+              << "|maxctx=" << ir.topology.max_position_embeddings;
+        canon << "|eos=";
+        for (const auto token : ir.topology.eos_token_ids) canon << token << ',';
+    }
+
+    // Conditional for backwards compatibility: merely adding DSpark support to
+    // Soma must not change the identity of existing V4 containers which record
+    // `dspark: omitted`. A capable container necessarily has a different hash.
+    if (ir.speculative.present) {
+        const auto& d = ir.speculative;
+        canon << "|dspark=" << d.n_layers << ':' << d.trained_block_size << ':'
+              << d.noise_token_id << ':' << d.markov_rank << ':' << d.confidence_head << ':';
+        for (const auto layer : d.target_layer_ids) canon << layer << ',';
+        canon << ':' << d.routed_bytes << ':' << d.resident_bytes << ':' << d.expert_bytes
+              << ':' << d.kv_bytes_per_sequence;
     }
 
     // The WHOLE quant map, every role, dtype AND group.

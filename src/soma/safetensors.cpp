@@ -1,5 +1,7 @@
 #include "soma/safetensors.hpp"
 
+#include "soma/quant_format.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -304,6 +306,117 @@ struct SafeTensors::Impl {
         }
         return {};
     }
+
+    Status ingest_index(const fs::path& root, const fs::path& index) {
+        std::vector<std::byte> raw;
+        if (auto st = read_whole_file(index, raw); !st.ok()) return st;
+        json j;
+        try {
+            j = json::parse(reinterpret_cast<const char*>(raw.data()),
+                            reinterpret_cast<const char*>(raw.data()) + raw.size());
+        } catch (const std::exception& e) {
+            return {StatusCode::InvalidArgument, index.string() + ": invalid JSON: " + e.what()};
+        }
+        if (!j.contains("weight_map") || !j["weight_map"].is_object()) {
+            return {StatusCode::InvalidArgument, index.string() + ": no weight_map"};
+        }
+        std::vector<std::string> shards;
+        for (const auto& [_, file] : j["weight_map"].items()) {
+            auto name = file.get<std::string>();
+            if (std::find(shards.begin(), shards.end(), name) == shards.end())
+                shards.push_back(std::move(name));
+        }
+        std::sort(shards.begin(), shards.end());
+        for (const auto& shard : shards)
+            if (auto st = ingest(root / shard); !st.ok()) return st;
+        return {};
+    }
+
+    Status ingest_quant_index(const fs::path& root, const fs::path& index) {
+        std::vector<std::byte> raw;
+        if (auto st = read_whole_file(index, raw); !st.ok()) return st;
+        json j;
+        try {
+            j = json::parse(reinterpret_cast<const char*>(raw.data()),
+                            reinterpret_cast<const char*>(raw.data()) + raw.size());
+        } catch (const std::exception& e) {
+            return {StatusCode::InvalidArgument, index.string() + ": invalid JSON: " + e.what()};
+        }
+        if (j.value("format", 0) != 1 || !j.contains("weight_map") ||
+            !j["weight_map"].is_object()) {
+            return {StatusCode::InvalidArgument,
+                    index.string() + ": expected quantized sidecar format 1 and weight_map"};
+        }
+
+        std::vector<std::string> files;
+        for (const auto& [name, entry] : j["weight_map"].items()) {
+            if (!entry.is_object())
+                return {StatusCode::InvalidArgument, name + ": quantized entry is not an object"};
+            const auto file = entry.value("file", std::string{});
+            const fs::path rel(file);
+            if (file.empty() || rel.is_absolute() || rel.has_parent_path()) {
+                return {StatusCode::InvalidArgument,
+                        name + ": quantized shard must be a flat relative filename"};
+            }
+            if (std::find(files.begin(), files.end(), file) == files.end()) files.push_back(file);
+        }
+        std::sort(files.begin(), files.end());
+
+        std::unordered_map<std::string, std::size_t> mapped;
+        for (const auto& file : files) {
+            const auto slot = buffers.size();
+            auto& buf = buffers.emplace_back();
+            if (auto st = buf.open(root / file); !st.ok()) return st;
+            mapped.emplace(file, slot);
+        }
+
+        for (const auto& [name, entry] : j["weight_map"].items()) {
+            TensorView tv;
+            tv.name = name;
+            const auto dtype = entry.value("dtype", std::string{});
+            if (dtype == "f32") tv.dtype = DType::F32;
+            else if (dtype == "q8_0") tv.dtype = DType::Q8_0;
+            else if (dtype == "q4_0") tv.dtype = DType::Q4_0;
+            else if (dtype == "q4_g") tv.dtype = DType::Q4_G;
+            else if (dtype == "q6_g") tv.dtype = DType::Q6_G;
+            else
+                return {StatusCode::Unsupported, name + ": unsupported qweight dtype '" + dtype + "'"};
+            tv.group = entry.value("group", 0u);
+            if (!entry.contains("shape") || !entry["shape"].is_array() ||
+                entry["shape"].size() != 2) {
+                return {StatusCode::InvalidArgument, name + ": qweight shape must be rank 2"};
+            }
+            for (const auto& d : entry["shape"])
+                tv.shape.push_back(d.get<std::int64_t>());
+            if (tv.dim(0) <= 0 || tv.dim(1) <= 0 || tv.group == 0) {
+                return {StatusCode::InvalidArgument, name + ": invalid qweight shape/group"};
+            }
+            const auto file = entry.value("file", std::string{});
+            const auto off = entry.value("offset", std::uint64_t{0});
+            const auto length = entry.value("length", std::uint64_t{0});
+            const auto bit = mapped.find(file);
+            if (bit == mapped.end()) return {StatusCode::InvalidArgument, name + ": unknown shard"};
+            const auto& buf = buffers[bit->second];
+            if (off > buf.size() || length > buf.size() - static_cast<std::size_t>(off)) {
+                return {StatusCode::InvalidArgument, name + ": qweight range outside shard"};
+            }
+            const auto want = quantized_tensor_bytes(tv.dtype,
+                                                     static_cast<std::uint32_t>(tv.dim(0)),
+                                                     static_cast<std::uint32_t>(tv.dim(1)),
+                                                     tv.group);
+            if (length != want) {
+                return {StatusCode::InvalidArgument,
+                        name + ": qweight has " + std::to_string(length) +
+                            " bytes; expected " + std::to_string(want)};
+            }
+            tv.bytes = CByteSpan(buf.data() + off, static_cast<std::size_t>(length));
+            bytes_loaded += length;
+            if (!tensors.emplace(name, std::move(tv)).second) {
+                return {StatusCode::InvalidArgument, name + ": duplicate resident tensor"};
+            }
+        }
+        return {};
+    }
 };
 
 SafeTensors::SafeTensors() : impl_(std::make_unique<Impl>()) {}
@@ -325,50 +438,49 @@ Status SafeTensors::open_dir(const std::string& dir) {
         return {StatusCode::NotFound, dir + " is not a directory"};
     }
 
-    const fs::path index = root / "model.safetensors.index.json";
-    if (fs::exists(index, ec)) {
-        std::vector<std::byte> raw;
-        if (auto st = read_whole_file(index, raw); !st.ok()) return st;
-        json j;
-        try {
-            j = json::parse(reinterpret_cast<const char*>(raw.data()),
-                            reinterpret_cast<const char*>(raw.data()) + raw.size());
-        } catch (const std::exception& e) {
-            return {StatusCode::InvalidArgument, index.string() + ": invalid JSON: " + e.what()};
-        }
-        if (!j.contains("weight_map")) {
-            return {StatusCode::InvalidArgument, index.string() + ": no weight_map"};
-        }
-        // Unique shard names, in sorted order so ingestion is reproducible.
-        std::vector<std::string> shards;
-        for (const auto& [_, file] : j["weight_map"].items()) {
-            auto name = file.get<std::string>();
-            if (std::find(shards.begin(), shards.end(), name) == shards.end()) {
-                shards.push_back(std::move(name));
-            }
-        }
-        std::sort(shards.begin(), shards.end());
-        for (const auto& shard : shards) {
-            if (auto st = impl_->ingest(root / shard); !st.ok()) return st;
-        }
-        return {};
+    if (const fs::path index = root / "model.safetensors.index.json"; fs::exists(index, ec)) {
+        return impl_->ingest_index(root, index);
     }
 
     if (const fs::path single = root / "model.safetensors"; fs::exists(single, ec)) {
         return impl_->ingest(single);
     }
 
-    // A Soma container names its resident half `dense.safetensors` — routed
-    // experts live in experts-*.bin, so there is no model.safetensors to find.
-    // Accepting both names here is what lets one loader read either an upstream
-    // checkpoint or a container (schemas/container.md).
-    if (const fs::path dense = root / "dense.safetensors"; fs::exists(dense, ec)) {
-        return impl_->ingest(dense);
+    // Container residents can be split between lossless metadata/norm tensors
+    // and pre-quantized projections. Both indexes are optional independently so
+    // v1 dense.safetensors containers remain readable unchanged.
+    bool loaded = false;
+    if (const fs::path index = root / "dense.safetensors.index.json"; fs::exists(index, ec)) {
+        if (auto st = impl_->ingest_index(root, index); !st.ok()) return st;
+        loaded = true;
+    } else if (const fs::path dense = root / "dense.safetensors"; fs::exists(dense, ec)) {
+        if (auto st = impl_->ingest(dense); !st.ok()) return st;
+        loaded = true;
+    }
+    if (const fs::path qindex = root / "dense.qweights.index.json"; fs::exists(qindex, ec)) {
+        if (auto st = impl_->ingest_quant_index(root, qindex); !st.ok()) return st;
+        loaded = true;
+    }
+    if (loaded) {
+        // Optional DSpark augmentation. These indexes deliberately remain
+        // separate on disk so an interrupted augmentation cannot damage the
+        // base container; once metadata advertises the capability the loader
+        // unions both namespaces into the same immutable tensor table.
+        if (const fs::path index = root / "dspark.safetensors.index.json";
+            fs::exists(index, ec)) {
+            if (auto st = impl_->ingest_index(root, index); !st.ok()) return st;
+        }
+        if (const fs::path qindex = root / "dspark.qweights.index.json";
+            fs::exists(qindex, ec)) {
+            if (auto st = impl_->ingest_quant_index(root, qindex); !st.ok()) return st;
+        }
+        return {};
     }
 
     return {StatusCode::NotFound,
             dir + ": none of model.safetensors, model.safetensors.index.json, "
-                  "or dense.safetensors"};
+                  "dense.safetensors.index.json, dense.safetensors, or "
+                  "dense.qweights.index.json"};
 }
 
 void SafeTensors::close() {

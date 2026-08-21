@@ -167,10 +167,24 @@ EngineDescriptor make_soma_descriptor(const std::string& executable) {
                      std::to_string(req.port),
                      "--host",
                      "127.0.0.1"};
+        if (req.settings.ctx_size > 0) {
+            spec.args.push_back("--ctx-size");
+            spec.args.push_back(std::to_string(req.settings.ctx_size));
+        }
+        // RuntimeSettings::parallel predates Soma and defaults to llama.cpp's
+        // one slot. Treat that legacy default as "unstated" so Soma retains its
+        // established four-sequence capacity; explicit wider selections still
+        // flow through. Direct Soma launches can select one with --kv-slots 1.
+        if (req.settings.parallel > 1) {
+            spec.args.push_back("--kv-slots");
+            spec.args.push_back(std::to_string(req.settings.parallel));
+        }
         if (!req.kv_checkpoint_dir.empty()) {
             spec.args.push_back("--kv-dir");
             spec.args.push_back(req.kv_checkpoint_dir);
         }
+        spec.args.insert(
+            spec.args.end(), req.settings.extra_args.begin(), req.settings.extra_args.end());
         return spec;
     };
 

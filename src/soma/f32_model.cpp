@@ -1,5 +1,6 @@
 #include "soma/f32_model.hpp"
 
+#include "soma/attention_backend.hpp"
 #include "soma/kernels_f32.hpp"
 #include "soma/threading.hpp"
 
@@ -13,6 +14,37 @@ namespace fs = std::filesystem;
 using json = nlohmann::json;
 
 namespace soma {
+
+void KvTransaction::begin(std::uint32_t max_rows) {
+    entries_.clear();
+    saved_.clear();
+    max_rows_ = max_rows;
+    active_ = true;
+}
+
+void KvTransaction::capture(std::uint32_t row,
+                            std::byte* destination,
+                            std::size_t bytes) {
+    if (!active_ || destination == nullptr || bytes == 0 || row >= max_rows_) return;
+    const auto offset = saved_.size();
+    saved_.insert(saved_.end(), destination, destination + bytes);
+    entries_.push_back({row, destination, offset, bytes});
+}
+
+void KvTransaction::rollback_from(std::uint32_t first_row) noexcept {
+    if (!active_) return;
+    for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
+        if (it->row < first_row) continue;
+        std::copy_n(saved_.data() + it->offset, it->bytes, it->destination);
+    }
+}
+
+void KvTransaction::clear() noexcept {
+    entries_.clear();
+    saved_.clear();
+    max_rows_ = 0;
+    active_ = false;
+}
 
 namespace {
 
@@ -47,6 +79,49 @@ bind_tensor_optional(const SafeTensors& st, const std::string& name, std::span<c
     return {};
 }
 
+Status bind_weight_view(const TensorView& tv,
+                        const std::string& name,
+                        const QuantSpec& spec,
+                        std::vector<QTensor>& owner,
+                        WeightRef& out) {
+    if (tv.rank() != 2) {
+        return {StatusCode::InvalidArgument,
+                name + " has rank " + std::to_string(tv.rank()) + "; expected 2"};
+    }
+    const auto rows = static_cast<std::uint32_t>(tv.dim(0));
+    const auto cols = static_cast<std::uint32_t>(tv.dim(1));
+    if (is_quantized(tv.dtype)) {
+        const auto want_group = effective_group(cols, spec.group ? spec.group : kDefaultGroup);
+        if (tv.dtype != spec.dtype || tv.group != want_group) {
+            return {StatusCode::InvalidArgument,
+                    name + " sidecar is " + to_string(tv.dtype) + " group " +
+                        std::to_string(tv.group) + "; load requested " + to_string(spec.dtype) +
+                        " group " + std::to_string(want_group)};
+        }
+        out = WeightRef::from_quantized_bytes(tv.bytes, tv.dtype, tv.group, rows, cols);
+        return {};
+    }
+    if (tv.dtype != DType::F32) {
+        return {StatusCode::Unsupported, name + " is not fp32 or a Soma qweight"};
+    }
+    if (!is_quantized(spec.dtype)) {
+        out = WeightRef::from_f32(tv.f32(), rows, cols);
+        return {};
+    }
+    owner.emplace_back();
+    if (auto s = quantize_tensor(tv.f32(),
+                                 rows,
+                                 cols,
+                                 spec.dtype,
+                                 spec.group ? spec.group : kDefaultGroup,
+                                 owner.back());
+        !s.ok()) {
+        return {s.code(), name + ": " + s.message()};
+    }
+    out = WeightRef::from_q(owner.back());
+    return {};
+}
+
 /// Bind a projection, quantizing it if its ROLE says so.
 ///
 /// The QTensor is appended to the model's owning vector and the WeightRef points
@@ -55,33 +130,7 @@ bind_tensor_optional(const SafeTensors& st, const std::string& name, std::span<c
 Status bind_weight(F32Model& model, const std::string& name, TensorRole role, WeightRef& out) {
     const TensorView* tv = nullptr;
     if (auto s = model.weights.require(name, tv); !s.ok()) return s;
-    if (tv->dtype != DType::F32) {
-        return {StatusCode::Unsupported, name + " is not fp32 in the checkpoint"};
-    }
-    if (tv->rank() != 2) {
-        return {StatusCode::InvalidArgument,
-                name + " has rank " + std::to_string(tv->rank()) + "; expected 2"};
-    }
-    const auto rows = static_cast<std::uint32_t>(tv->dim(0));
-    const auto cols = static_cast<std::uint32_t>(tv->dim(1));
-
-    const QuantSpec& spec = model.quant_map.for_role(role);
-    if (!is_quantized(spec.dtype)) {
-        out = WeightRef::from_f32(tv->f32(), rows, cols);
-        return {};
-    }
-    model.quantized.emplace_back();
-    if (auto s = quantize_tensor(tv->f32(),
-                                 rows,
-                                 cols,
-                                 spec.dtype,
-                                 spec.group ? spec.group : kDefaultGroup,
-                                 model.quantized.back());
-        !s.ok()) {
-        return {s.code(), name + ": " + s.message()};
-    }
-    out = WeightRef::from_q(model.quantized.back());
-    return {};
+    return bind_weight_view(*tv, name, model.quant_map.for_role(role), model.quantized, out);
 }
 
 Status
@@ -205,7 +254,7 @@ Status bind_fused_experts(F32Model& model,
 // WHICH names exist. Each keeps its half, and neither needs the other's.
 
 std::string LayerBindCtx::name(const char* suffix) const {
-    return layer_prefix(layer) + suffix;
+    return (prefix.empty() ? layer_prefix(layer) : prefix) + suffix;
 }
 
 Status bind_layer_f32(const LayerBindCtx& ctx,
@@ -223,33 +272,22 @@ Status bind_layer_weight(
     const TensorView* tv = nullptr;
     if (optional && ctx.weights->find(n) == nullptr) return {};
     if (auto s = ctx.weights->require(n, tv); !s.ok()) return s;
-    if (tv->dtype != DType::F32) {
-        return {StatusCode::Unsupported, n + " is not fp32 in the checkpoint"};
-    }
-    if (tv->rank() != 2) {
-        return {StatusCode::InvalidArgument,
-                n + " has rank " + std::to_string(tv->rank()) + "; expected 2"};
-    }
-    const auto rows = static_cast<std::uint32_t>(tv->dim(0));
-    const auto cols = static_cast<std::uint32_t>(tv->dim(1));
+    return bind_weight_view(*tv, n, ctx.quant->for_role(role), *ctx.owner, out);
+}
 
-    const QuantSpec& spec = ctx.quant->for_role(role);
-    if (!is_quantized(spec.dtype)) {
-        out = WeightRef::from_f32(tv->f32(), rows, cols);
-        return {};
-    }
-    ctx.owner->emplace_back();
-    if (auto s = quantize_tensor(tv->f32(),
-                                 rows,
-                                 cols,
-                                 spec.dtype,
-                                 spec.group ? spec.group : kDefaultGroup,
-                                 ctx.owner->back());
-        !s.ok()) {
-        return {s.code(), n + ": " + s.message()};
-    }
-    out = WeightRef::from_q(ctx.owner->back());
-    return {};
+Status bind_model_f32(
+    const ModelBindCtx& ctx, const char* name, std::span<const float>& out, bool optional) {
+    if (optional && ctx.weights->find(name) == nullptr) return {};
+    return bind_tensor(*ctx.weights, name, out);
+}
+
+Status bind_model_weight(
+    const ModelBindCtx& ctx, const char* name, TensorRole role, WeightRef& out, bool optional) {
+    const TensorView* tv = nullptr;
+    if (optional && ctx.weights->find(name) == nullptr) return {};
+    if (auto s = ctx.weights->require(name, tv); !s.ok()) return s;
+    return bind_weight_view(
+        *tv, std::string(name), ctx.quant->for_role(role), *ctx.owner, out);
 }
 
 void F32Workspace::reserve(const ArchIr& arch, std::uint32_t max_tokens) {
@@ -305,6 +343,16 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
     if (auto s = read_text(root / "config.json", cfg_text); !s.ok()) return s;
     if (auto s = adapt_hf_config(cfg_text, out.arch); !s.ok()) return s;
 
+    // Container metadata is the atomic capability commit for optional model
+    // payloads. Config.json only says the upstream source declared DSpark; this
+    // overlay proves the three draft stages are actually present and supplies
+    // their exact byte accounting.
+    if (fs::exists(root / "container_meta.json")) {
+        std::string meta_text;
+        if (auto s = read_text(root / "container_meta.json", meta_text); !s.ok()) return s;
+        if (auto s = apply_container_quant(meta_text, out.arch); !s.ok()) return s;
+    }
+
     // The IR for MLA is complete and validated — MlaSpec was co-designed with
     // GQA during the design pass and needed no change to admit DeepSeek. What is
     // NOT ready is the weight binding below, which names q_proj/k_proj/v_proj:
@@ -339,6 +387,7 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
     // and the container's expert-size check compares against the wrong number.
     // Both were observed before this line existed.
     out.arch.quantization = quant;
+    if (auto s = validate_arch_ir(out.arch); !s.ok()) return s;
 
     // A container directory carries the dense half in dense.safetensors and the
     // routed experts in experts-*.bin. Detected here so expert binding can be
@@ -389,7 +438,7 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
     out.quantized.reserve(static_cast<std::size_t>(arch.topology.n_layers) *
                               (3 * static_cast<std::size_t>(arch.router.n_experts) + 14) +
                           2);
-    if (auto s = bind_tensor(out.weights, "model.embed_tokens.weight", out.embed); !s.ok())
+    if (auto s = bind_weight(out, "model.embed_tokens.weight", TensorRole::Embed, out.embed); !s.ok())
         return s;
     if (auto s = bind_tensor(out.weights, "model.norm.weight", out.out_norm); !s.ok()) return s;
 
@@ -403,8 +452,15 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
         }
         // Tied embeddings: safetensors stores the shared storage once
         // (save_model drops the duplicate), so the head aliases the embedding.
-        out.out_head =
-            WeightRef::from_f32(out.embed, arch.topology.vocab_size, arch.topology.d_model);
+        out.out_head = out.embed;
+    }
+
+    if (backend->bind_model != nullptr) {
+        ModelBindCtx ctx{&out.weights, &out.quant_map, &out.quantized};
+        if (const auto rc = backend->bind_model(arch, ctx, out.arch_payload);
+            rc != StatusCode::Ok) {
+            return {rc, "binding architecture model weights failed"};
+        }
     }
 
     out.layers.resize(arch.topology.n_layers);
@@ -668,6 +724,13 @@ void apply_glu_expert_tile(const ArchIr& arch,
         const std::span<const float> g(ws.tile_gate.data() + off, inter);
         const std::span<const float> u(ws.tile_up.data() + off, inter);
         const std::span<float> a(ws.tile_act.data() + off, inter);
+        if (arch.ffn.swiglu_limit > 0.0f) {
+            const float limit = arch.ffn.swiglu_limit;
+            for (std::uint32_t i = 0; i < inter; ++i) {
+                ws.tile_gate[off + i] = std::min(ws.tile_gate[off + i], limit);
+                ws.tile_up[off + i] = std::clamp(ws.tile_up[off + i], -limit, limit);
+            }
+        }
         switch (arch.ffn.activation) {
         case Activation::SwiGlu:
             f32::swiglu(g, u, inter, a);
@@ -710,6 +773,14 @@ void apply_glu_expert(const ArchIr& arch,
     matvec(gate_w, xs, s.gate);
     matvec(up_w, xs, s.up);
 
+    if (arch.ffn.swiglu_limit > 0.0f) {
+        const float limit = arch.ffn.swiglu_limit;
+        for (std::uint32_t i = 0; i < inter; ++i) {
+            s.gate[i] = std::min(s.gate[i], limit);
+            s.up[i] = std::clamp(s.up[i], -limit, limit);
+        }
+    }
+
     switch (arch.ffn.activation) {
     case Activation::SwiGlu:
         f32::swiglu(s.gate, s.up, inter, s.act);
@@ -737,6 +808,25 @@ Status KvCache::open(const ArchIr& arch, std::uint32_t max_ctx) {
     // and it was applied to every family — including one whose cache holds a
     // compressed latent and no per-head K or V at all.
     const auto* backend = resolve_f32_backend(arch);
+    const auto* attention = resolve_attention_backend(arch.attention.family);
+    if (attention != nullptr && attention->kv_bytes_for_context != nullptr) {
+        const auto bytes = attention->kv_bytes_for_context(arch, max_ctx);
+        try {
+            opaque_.assign(static_cast<std::size_t>(bytes), std::byte{0});
+        } catch (const std::bad_alloc&) {
+            return {StatusCode::CapacityPressure,
+                    "could not allocate " + std::to_string(bytes) + " bytes of opaque KV"};
+        }
+        k_.clear();
+        v_.clear();
+        max_ctx_ = max_ctx;
+        k_hkv_ = 0;
+        v_hkv_ = 0;
+        length_ = 0;
+        n_layers_ = arch.topology.n_layers;
+        return {};
+    }
+    opaque_.clear();
     const auto geom = (backend != nullptr && backend->kv_geometry != nullptr)
                           ? backend->kv_geometry(arch)
                           : KvGeometry{arch.attention.n_kv_heads * arch.attention.head_dim,
@@ -748,7 +838,40 @@ Status KvCache::open(const ArchIr& arch, std::uint32_t max_ctx) {
     k_.assign(static_cast<std::size_t>(max_ctx_) * k_hkv_ * layers, 0.0f);
     v_.assign(static_cast<std::size_t>(max_ctx_) * v_hkv_ * layers, 0.0f);
     length_ = 0;
+    n_layers_ = arch.topology.n_layers;
     return {};
+}
+
+Status KvCache::begin_tentative(std::uint32_t max_rows) {
+    if (max_rows == 0) return {StatusCode::InvalidArgument, "zero-row KV transaction"};
+    if (transaction_.active()) {
+        return {StatusCode::InvalidArgument, "KV transaction is already active"};
+    }
+    if (max_rows > max_ctx_ - length_) {
+        return {StatusCode::InvalidArgument, "KV transaction exceeds remaining context"};
+    }
+    try {
+        transaction_.begin(max_rows);
+    } catch (const std::bad_alloc&) {
+        return {StatusCode::CapacityPressure, "could not allocate KV reverse journal"};
+    }
+    return {};
+}
+
+Status KvCache::commit_tentative_prefix(std::uint32_t accepted_rows) {
+    if (!transaction_.active()) {
+        return {StatusCode::InvalidArgument, "no active KV transaction"};
+    }
+    transaction_.rollback_from(accepted_rows);
+    length_ += accepted_rows;
+    transaction_.clear();
+    return {};
+}
+
+void KvCache::abort_tentative() noexcept {
+    if (!transaction_.active()) return;
+    transaction_.rollback_from(0);
+    transaction_.clear();
 }
 
 void F32Workspace::ensure_tile_scratch(std::uint32_t tile,
@@ -899,7 +1022,8 @@ Status forward_impl(const F32Model& model,
                     std::span<const TokenId> tokens,
                     std::span<const KvRow> rows,
                     F32Workspace& ws,
-                    std::vector<float>& out_logits) {
+                    std::vector<float>& out_logits,
+                    HiddenStateTaps* taps) {
     const auto& arch = model.arch;
     const auto d = arch.topology.d_model;
     const auto vocab = arch.topology.vocab_size;
@@ -920,6 +1044,11 @@ Status forward_impl(const F32Model& model,
     }
 
     ws.reserve(arch, n);
+    if (taps != nullptr) {
+        taps->n_rows = n;
+        taps->d_model = d;
+        taps->values.assign(static_cast<std::size_t>(taps->layers.size()) * n * d, 0.0f);
+    }
 
     // Embedding lookup.
     for (std::uint32_t t = 0; t < n; ++t) {
@@ -928,15 +1057,27 @@ Status forward_impl(const F32Model& model,
             return {StatusCode::InvalidArgument,
                     "token id " + std::to_string(id) + " >= vocab " + std::to_string(vocab)};
         }
-        std::copy_n(model.embed.data() + static_cast<std::size_t>(id) * d,
-                    d,
-                    ws.hidden.begin() + static_cast<std::size_t>(t) * d);
+        const auto row = row_block(model.embed, id, 1);
+        if (row.empty()) return {StatusCode::Internal, "embedding row view is empty"};
+        if (auto s = dequantize(row,
+                                std::span<float>(ws.hidden).subspan(
+                                    static_cast<std::size_t>(t) * d, d));
+            !s.ok()) {
+            return {s.code(), "embedding lookup: " + s.message()};
+        }
     }
 
     // A selection computed for a previous prompt has the wrong length and the
     // wrong contents. Dropping it here means a backend that forgets to publish one
     // fails on the next forward instead of silently reusing the last.
     ws.reset_arch_state();
+    if (backend->begin_forward != nullptr) {
+        if (const auto rc = backend->begin_forward(
+                arch, model.arch_payload, tokens.data(), n, ws, ws.hidden.data());
+            rc != StatusCode::Ok) {
+            return {rc, "architecture begin-forward hook failed"};
+        }
+    }
 
     for (std::uint32_t l = 0; l < arch.topology.n_layers; ++l) {
         const auto& lw = model.layers[l];
@@ -944,6 +1085,11 @@ Status forward_impl(const F32Model& model,
         ws.sink(l, "hidden_in", ws.hidden.data(), static_cast<std::size_t>(n) * d);
 
         // ── attention block ──────────────────────────────────────────────────
+        if (backend->pre_attention != nullptr) {
+            if (const auto rc = backend->pre_attention(arch, lw, n, ws, ws.hidden.data());
+                rc != StatusCode::Ok)
+                return {rc, "pre-attention hook failed at layer " + std::to_string(l)};
+        }
         for (std::uint32_t t = 0; t < n; ++t) {
             const auto off = static_cast<std::size_t>(t) * d;
             f32::rmsnorm_into(std::span<const float>(ws.hidden).subspan(off, d),
@@ -966,11 +1112,22 @@ Status forward_impl(const F32Model& model,
         // whether the layer as a whole is where divergence begins.
         ws.sink(l, "attn_out", ws.attn_out.data(), static_cast<std::size_t>(n) * d);
 
-        for (std::size_t i = 0; i < static_cast<std::size_t>(n) * d; ++i) {
-            ws.hidden[i] += ws.attn_out[i];
+        if (backend->merge_attention != nullptr) {
+            if (const auto rc = backend->merge_attention(
+                    arch, lw, ws.attn_out.data(), n, ws, ws.hidden.data());
+                rc != StatusCode::Ok)
+                return {rc, "attention merge hook failed at layer " + std::to_string(l)};
+        } else {
+            for (std::size_t i = 0; i < static_cast<std::size_t>(n) * d; ++i)
+                ws.hidden[i] += ws.attn_out[i];
         }
 
         // ── feed-forward block ───────────────────────────────────────────────
+        if (backend->pre_ffn != nullptr) {
+            if (const auto rc = backend->pre_ffn(arch, lw, n, ws, ws.hidden.data());
+                rc != StatusCode::Ok)
+                return {rc, "pre-ffn hook failed at layer " + std::to_string(l)};
+        }
         for (std::uint32_t t = 0; t < n; ++t) {
             const auto off = static_cast<std::size_t>(t) * d;
             f32::rmsnorm_into(std::span<const float>(ws.hidden).subspan(off, d),
@@ -1002,12 +1159,36 @@ Status forward_impl(const F32Model& model,
             f32::matmul(lw.router, ws.normed, n, n_exp, d, ws.router_logits);
             if (const auto rc = backend->route(arch,
                                                lw,
+                                               tokens.data(),
                                                ws.router_logits.data(),
                                                n,
                                                ws.expert_ids.data(),
                                                ws.expert_weights.data());
                 rc != StatusCode::Ok) {
                 return {rc, "routing failed at layer " + std::to_string(l)};
+            }
+            ws.sink(l,
+                    "router_logits",
+                    ws.router_logits.data(),
+                    static_cast<std::size_t>(n) * n_exp);
+            ws.sink(l,
+                    "router_weights",
+                    ws.expert_weights.data(),
+                    static_cast<std::size_t>(n) * top_k);
+            if (ws.sink) {
+                std::vector<float> route_ids(static_cast<std::size_t>(n) * top_k);
+                std::vector<float> route_dense(static_cast<std::size_t>(n) * n_exp, 0.0f);
+                std::transform(ws.expert_ids.begin(),
+                               ws.expert_ids.begin() + route_ids.size(),
+                               route_ids.begin(),
+                               [](std::uint32_t id) { return static_cast<float>(id); });
+                for (std::uint32_t t = 0; t < n; ++t)
+                    for (std::uint32_t k = 0; k < top_k; ++k)
+                        route_dense[static_cast<std::size_t>(t) * n_exp +
+                                    ws.expert_ids[static_cast<std::size_t>(t) * top_k + k]] +=
+                            ws.expert_weights[static_cast<std::size_t>(t) * top_k + k];
+                ws.sink(l, "router_ids", route_ids.data(), route_ids.size());
+                ws.sink(l, "router_dense", route_dense.data(), route_dense.size());
             }
 
             for (std::uint32_t t = 0; t < n; ++t) {
@@ -1143,10 +1324,40 @@ Status forward_impl(const F32Model& model,
             }
         }
 
-        for (std::size_t i = 0; i < static_cast<std::size_t>(n) * d; ++i) {
-            ws.hidden[i] += ws.attn_out[i];
+        if (backend->merge_ffn != nullptr) {
+            if (const auto rc = backend->merge_ffn(
+                    arch, lw, ws.attn_out.data(), n, ws, ws.hidden.data());
+                rc != StatusCode::Ok)
+                return {rc, "ffn merge hook failed at layer " + std::to_string(l)};
+        } else {
+            for (std::size_t i = 0; i < static_cast<std::size_t>(n) * d; ++i)
+                ws.hidden[i] += ws.attn_out[i];
         }
         ws.sink(l, "hidden_out", ws.hidden.data(), static_cast<std::size_t>(n) * d);
+        if (taps != nullptr) {
+            for (std::size_t ordinal = 0; ordinal < taps->layers.size(); ++ordinal) {
+                if (taps->layers[ordinal] != l) continue;
+                float* dst = taps->values.data() +
+                             ordinal * static_cast<std::size_t>(n) * d;
+                if (backend->export_layer_hidden != nullptr) {
+                    if (const auto rc = backend->export_layer_hidden(
+                            arch, l, n, ws, ws.hidden.data(), dst);
+                        rc != StatusCode::Ok) {
+                        return {rc, "layer hidden export failed at layer " +
+                                        std::to_string(l)};
+                    }
+                } else {
+                    std::copy_n(ws.hidden.data(), static_cast<std::size_t>(n) * d, dst);
+                }
+            }
+        }
+    }
+
+    if (backend->end_forward != nullptr) {
+        if (const auto rc =
+                backend->end_forward(arch, model.arch_payload, n, ws, ws.hidden.data());
+            rc != StatusCode::Ok)
+            return {rc, "architecture end-forward hook failed"};
     }
 
     out_logits.assign(static_cast<std::size_t>(n) * vocab, 0.0f);
@@ -1168,21 +1379,22 @@ Status forward_f32(const F32Model& model,
                    std::span<const TokenId> tokens,
                    F32Workspace& ws,
                    std::vector<float>& out_logits) {
-    return forward_impl(model, tokens, {}, ws, out_logits);
+    return forward_impl(model, tokens, {}, ws, out_logits, nullptr);
 }
 
 Status forward_step_f32(const F32Model& model,
                         std::span<const TokenId> tokens,
                         std::span<const KvRow> rows,
                         F32Workspace& ws,
-                        std::vector<float>& out_logits) {
+                        std::vector<float>& out_logits,
+                        HiddenStateTaps* taps) {
     if (rows.size() != tokens.size()) {
         return {StatusCode::InvalidArgument,
                 "forward_step_f32: " + std::to_string(tokens.size()) + " tokens against " +
                     std::to_string(rows.size()) + " KV rows"};
     }
     if (rows.empty()) return {StatusCode::InvalidArgument, "empty batch"};
-    return forward_impl(model, tokens, rows, ws, out_logits);
+    return forward_impl(model, tokens, rows, ws, out_logits, taps);
 }
 
 Status generate_greedy_f32(const F32Model& model,

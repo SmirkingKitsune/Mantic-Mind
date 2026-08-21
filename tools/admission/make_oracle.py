@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -135,6 +136,53 @@ def shrink_attention(cfg: dict[str, Any]) -> None:
         # head_dim is implied by hidden_size / heads, so hidden_size must stay
         # divisible by the new head count.
         cfg["hidden_size"] = new_heads * TARGET_HEAD_DIM
+
+
+def shrink_deepseek_v4(cfg: dict[str, Any], layers: int) -> None:
+    """Shrink V4 without erasing any of its distinguishing mechanisms.
+
+    V4 is MQA with an intentionally enormous production head ratio, so the
+    generic GQA shrinker would preserve 128:1 by creating 256 tiny query heads.
+    That is dimensional, not semantic, and makes the fixture larger than the
+    models it is meant to replace. Keep shared-KV MQA while shrinking the query
+    fanout, then preserve HCA+CSA, the sparse indexer, grouped Q/O low rank,
+    four HC streams, and the three-layer hash bootstrap explicitly.
+    """
+    cfg["num_attention_heads"] = 4
+    cfg["num_key_value_heads"] = 1
+    cfg["head_dim"] = 16
+    cfg["hidden_size"] = 64
+    cfg["q_lora_rank"] = 32
+    cfg["qk_rope_head_dim"] = 8
+    cfg["partial_rotary_factor"] = 0.5
+    cfg["o_groups"] = 2
+    cfg["o_lora_rank"] = 16
+    cfg["index_n_heads"] = 16
+    cfg["index_head_dim"] = 16
+    cfg["index_topk"] = 16
+    cfg["sliding_window"] = 64
+    cfg["compress_ratios"] = [128, 128, 4, 128][:layers]
+    if layers > 4:
+        cfg["compress_ratios"] += [4 if i % 2 == 0 else 128 for i in range(4, layers)]
+    cfg["num_hash_layers"] = min(3, layers)
+    cfg["hc_mult"] = 4
+    cfg["max_position_embeddings"] = TARGET_MAX_POS
+    if isinstance(cfg.get("rope_scaling"), dict):
+        factor = float(cfg["rope_scaling"].get("factor", 1.0) or 1.0)
+        cfg["rope_scaling"]["original_max_position_embeddings"] = max(
+            1, int(TARGET_MAX_POS / factor))
+    # DSpark is deliberately outside this base-model milestone. Keeping its
+    # production noise id after shrinking the vocabulary creates a misleading
+    # native-config warning even though no MTP module is instantiated.
+    cfg["dspark_noise_token_id"] = None
+    cfg["dspark_target_layer_ids"] = []
+    # Native Transformers executes an fp32 model made with `from_config` as an
+    # ordinary dense model: the quantization_config is only consumed by the
+    # `from_pretrained` quantizer.  Record that fact explicitly for Soma's V4
+    # semantic low-precision switches.  Production configs do not carry these
+    # fixture overrides and therefore keep both source FP8/FP4 operations on.
+    cfg["semantic_fp8_quant_dequant"] = False
+    cfg["semantic_fp4_quant_dequant"] = False
 
 
 def shrink_mla(cfg: dict[str, Any]) -> None:
@@ -289,9 +337,12 @@ def shrink_config(raw: dict[str, Any], layers: int, experts: int) -> dict[str, A
     cfg["dtype"] = "float32"
     cfg["torch_dtype"] = "float32"
 
-    shrink_attention(cfg)
-    shrink_mla(cfg)
-    shrink_dsa(cfg)  # after shrink_mla: DSA is MLA plus an indexer
+    if cfg.get("model_type") == "deepseek_v4":
+        shrink_deepseek_v4(cfg, layers)
+    else:
+        shrink_attention(cfg)
+        shrink_mla(cfg)
+        shrink_dsa(cfg)  # after shrink_mla: DSA is MLA plus an indexer
     shrink_moe(cfg)
 
     _shrink(cfg, "vocab_size", TARGET_VOCAB)
@@ -352,7 +403,8 @@ def layer_kinds(cfg: dict[str, Any]) -> list[str]:
     # to notice it.
     explicit = cfg.get("mlp_layer_types")
     if isinstance(explicit, list) and len(explicit) >= n:
-        return ["moe" if str(t) == "sparse" else "dense" for t in explicit[:n]]
+        return ["moe" if str(t) in {"sparse", "moe", "hash_moe"} else "dense"
+                for t in explicit[:n]]
 
     first_dense = int(cfg.get("first_k_dense_replace", 0) or 0)
     for i in range(min(first_dense, n)):
@@ -375,6 +427,93 @@ def layer_kinds(cfg: dict[str, Any]) -> list[str]:
             kinds[i] = "dense"
 
     return kinds
+
+
+def canonicalize_deepseek_v4_state(model: Any,
+                                   name_map: dict[str, str] | None = None) -> dict[str, Any]:
+    """Translate native Transformers V4 names to the release/runtime dialect.
+
+    DeepSeek's reference checkpoint uses the short inference names (``wq_a``,
+    ``hc_attn_fn``, ``ffn``), while Transformers exposes descriptive module names
+    (``q_a_proj``, ``attn_hc.fn``, ``mlp``).  Soma intentionally binds the former
+    because that is what the 66 production shards contain.  Tiny fixtures are
+    normalized once at generation time so production execution has one naming
+    contract instead of a V4-specific alias tree in its hot loader.
+    """
+    state = model.state_dict()
+    out: dict[str, Any] = {}
+
+    exact = {
+        "model.hc_head.hc_fn": "model.hc_head_fn",
+        "model.hc_head.hc_base": "model.hc_head_base",
+        "model.hc_head.hc_scale": "model.hc_head_scale",
+    }
+    suffixes = {
+        "attn_hc.fn": "hc_attn_fn",
+        "attn_hc.base": "hc_attn_base",
+        "attn_hc.scale": "hc_attn_scale",
+        "ffn_hc.fn": "hc_ffn_fn",
+        "ffn_hc.base": "hc_ffn_base",
+        "ffn_hc.scale": "hc_ffn_scale",
+        "input_layernorm.weight": "input_layernorm.weight",
+        "post_attention_layernorm.weight": "post_attention_layernorm.weight",
+        "self_attn.sinks": "self_attn.attn_sink",
+        "self_attn.q_a_proj.weight": "self_attn.wq_a.weight",
+        "self_attn.q_a_norm.weight": "self_attn.q_norm.weight",
+        "self_attn.q_b_proj.weight": "self_attn.wq_b.weight",
+        "self_attn.kv_proj.weight": "self_attn.wkv.weight",
+        "self_attn.kv_norm.weight": "self_attn.kv_norm.weight",
+        "self_attn.o_a_proj.weight": "self_attn.wo_a.weight",
+        "self_attn.o_b_proj.weight": "self_attn.wo_b.weight",
+        "self_attn.compressor.position_bias": "self_attn.compressor.ape",
+        "self_attn.compressor.kv_proj.weight": "self_attn.compressor.wkv.weight",
+        "self_attn.compressor.gate_proj.weight": "self_attn.compressor.wgate.weight",
+        "self_attn.compressor.kv_norm.weight": "self_attn.compressor.norm.weight",
+        "self_attn.compressor.indexer.q_b_proj.weight": "self_attn.indexer.wq_b.weight",
+        "self_attn.compressor.indexer.scorer.weights_proj.weight":
+            "self_attn.indexer.weights_proj.weight",
+        "self_attn.compressor.indexer.position_bias": "self_attn.indexer.compressor.ape",
+        "self_attn.compressor.indexer.kv_proj.weight":
+            "self_attn.indexer.compressor.wkv.weight",
+        "self_attn.compressor.indexer.gate_proj.weight":
+            "self_attn.indexer.compressor.wgate.weight",
+        "self_attn.compressor.indexer.kv_norm.weight":
+            "self_attn.indexer.compressor.norm.weight",
+        "mlp.gate.weight": "ffn.gate.weight",
+        "mlp.gate.tid2eid": "ffn.gate.tid2eid",
+        "mlp.gate.e_score_correction_bias": "ffn.gate.bias",
+        "mlp.experts.gate_up_proj": "ffn.experts.gate_up_proj",
+        "mlp.experts.down_proj": "ffn.experts.down_proj",
+        "mlp.shared_experts.gate_proj.weight": "ffn.shared_experts.gate_proj.weight",
+        "mlp.shared_experts.up_proj.weight": "ffn.shared_experts.up_proj.weight",
+        "mlp.shared_experts.down_proj.weight": "ffn.shared_experts.down_proj.weight",
+    }
+
+    for name, tensor in state.items():
+        mapped = exact.get(name)
+        if mapped is None:
+            match = re.match(r"^(model\.layers\.\d+)\.(.+)$", name)
+            if match is not None:
+                tail = suffixes.get(match.group(2))
+                if tail is not None:
+                    mapped = f"{match.group(1)}.{tail}"
+        if mapped is None:
+            # Non-persistent rotary buffers are absent. Every persistent V4
+            # tensor must be understood; silently preserving a native-only name
+            # would produce a fixture whose unconsumed mechanisms go unnoticed.
+            if name in {"model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"}:
+                mapped = name
+            else:
+                raise RuntimeError(f"unmapped native DeepSeek V4 tensor: {name}")
+        # Hash ids are integer buffers in Transformers and exact small integers.
+        # Soma's release checkpoint carries routing metadata as lossless floats,
+        # allowing the backend-owned payload binder to stay dtype-uniform.
+        if mapped.endswith("ffn.gate.tid2eid"):
+            tensor = tensor.to(dtype=next(model.parameters()).dtype)
+        out[mapped] = tensor.detach().contiguous()
+        if name_map is not None:
+            name_map[name] = mapped
+    return out
 
 
 def main(argv: list[str]) -> int:
@@ -502,6 +641,19 @@ def main(argv: list[str]) -> int:
                 p.copy_(torch.full_like(p, base)
                         + torch.empty_like(p).uniform_(-0.02, 0.02, generator=gen))
 
+        # The native initializers intentionally leave routing metadata at zero
+        # for a real checkpoint to overwrite. A random fixture has no checkpoint,
+        # so populate both routing modes deterministically and non-degenerately.
+        for name, b in sorted(model.named_buffers()):
+            if name.endswith("tid2eid"):
+                layer_match = re.search(r"layers\.(\d+)\.", name)
+                layer = int(layer_match.group(1)) if layer_match else 0
+                token = torch.arange(b.shape[0], device=b.device).unsqueeze(1)
+                slot = torch.arange(b.shape[1], device=b.device).unsqueeze(0)
+                b.copy_((token * 13 + slot * 3 + layer * 5) % tiny_cfg[ek])
+            elif name.endswith("e_score_correction_bias"):
+                b.copy_(torch.linspace(-0.02, 0.02, b.numel(), dtype=b.dtype, device=b.device))
+
     vocab = tiny_cfg["vocab_size"]
     ids = torch.randint(0, vocab, (1, args.positions), generator=gen, dtype=torch.long)
 
@@ -559,8 +711,16 @@ def main(argv: list[str]) -> int:
     # refuses to write shared tensors. save_model drops the duplicate and records
     # the tie in metadata. The C++ loader reconstructs it from
     # config.tie_word_embeddings, which is already in the fixture config.
-    from safetensors.torch import save_model
-    save_model(model, str(out_dir / "model.safetensors"))
+    if model_type == "deepseek_v4":
+        from safetensors.torch import save_file
+        native_to_soma: dict[str, str] = {}
+        save_file(canonicalize_deepseek_v4_state(model, native_to_soma),
+                  str(out_dir / "model.safetensors"))
+        (out_dir / "native_to_soma.json").write_text(
+            json.dumps(native_to_soma, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    else:
+        from safetensors.torch import save_model
+        save_model(model, str(out_dir / "model.safetensors"))
 
     weights_sha = hashlib.sha256((out_dir / "model.safetensors").read_bytes()).hexdigest()
     logits_sha = hashlib.sha256(tf_logits.numpy().tobytes()).hexdigest()

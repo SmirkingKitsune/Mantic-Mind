@@ -1,0 +1,14 @@
+{
+  "add_prefix_space": false,
+  "corpus_size": 37,
+  "n_added": 1283,
+  "n_classes": 14,
+  "n_merges": 127741,
+  "n_vocab": 129280,
+  "nfc_implemented_in_engine": false,
+  "nfc_unstable_dropped": 0,
+  "normalizer": null,
+  "program": "deepseek_v4",
+  "source": "Z:\\AI\\Ubiquitious-Memories\\Mantic-Mind\\models\\deepseek-ai\\DeepSeek-V4-Pro-0813",
+  "total_oracle_tokens": 345
+}

@@ -351,6 +351,15 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--group", type=int, default=128)
     ap.add_argument("--shard-bytes", type=int, default=4 * 1024 ** 3)
     ap.add_argument("--layers", type=int, default=0, help="limit layers (debug)")
+    ap.add_argument("--source-revision", default=None,
+                    help="expected immutable Hub revision (V4 is pinned)")
+    ap.add_argument("--validate-only", action="store_true",
+                    help="check config/tensor coverage without reading payloads")
+    ap.add_argument("--no-resume", action="store_true",
+                    help="refuse reuse of a compatible conversion manifest")
+    ap.add_argument("--include-dspark", action="store_true",
+                    help="augment DeepSeek-V4 with its three-stage DSpark draft model")
+    ap.add_argument("--test-fixture", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args(argv[1:])
 
     import numpy as np
@@ -363,6 +372,9 @@ def main(argv: list[str]) -> int:
 
     cfg = json.loads((src / "config.json").read_text(encoding="utf-8"))
     model_type = cfg.get("model_type")
+    if model_type == "deepseek_v4":
+        import convert_deepseek_v4
+        return convert_deepseek_v4.run(args)
 
     n_layers = int(cfg.get("num_hidden_layers", 0))
     if args.layers:
@@ -561,9 +573,9 @@ def main(argv: list[str]) -> int:
     # self-sufficient by construction — the alternative is remembering three files
     # by hand, which is exactly what was done once and got two of the three.
     #
-    # NON-FATAL, deliberately. Most families' pretokenizers are not compiled yet
-    # (DeepSeek's multi-Split chain, Mixtral's SentencePiece, granite's legacy
-    # vocab.json) and aborting a multi-hour conversion over a tokenizer would be a
+    # NON-FATAL, deliberately. Some families' pretokenizers are not compiled yet
+    # (Mixtral's SentencePiece and granite's legacy vocab.json), and aborting a
+    # multi-hour conversion over a tokenizer would be a
     # disproportionate response to a gap the container can be used without. The
     # outcome is recorded in container_meta.json and repeated in the final summary
     # line, because an early message is invisible after four hours of layer output.

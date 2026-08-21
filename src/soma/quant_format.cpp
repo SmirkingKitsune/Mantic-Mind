@@ -111,6 +111,19 @@ WeightRef WeightRef::from_quantized_bytes(CByteSpan data,
                                           std::uint32_t rows,
                                           std::uint32_t cols) noexcept {
     WeightRef w;
+    // Indexed expert sidecars may carry lossless F32 rows for conformance
+    // fixtures.  Such bytes are an ordinary unquantized weight view; treating
+    // them as a group format would produce a zero-byte row layout.
+    if (dtype == DType::F32) {
+        const auto count = static_cast<std::size_t>(rows) * cols;
+        if (data.size() >= count * sizeof(float) &&
+            reinterpret_cast<std::uintptr_t>(data.data()) % alignof(float) == 0) {
+            w.f32 = {reinterpret_cast<const float*>(data.data()), count};
+            w.rows = rows;
+            w.cols = cols;
+            return w;
+        }
+    }
     w.bytes = data;
     w.dtype = dtype;
     w.group = group ? group : effective_group(cols, kDefaultGroup);

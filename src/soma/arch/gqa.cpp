@@ -332,6 +332,7 @@ StatusCode f32_attention(const ArchIr& arch,
 
 StatusCode f32_route(const ArchIr& arch,
                      const soma::F32LayerWeights& lw,
+                     const TokenId*,
                      const float* logits,
                      std::uint32_t n_tokens,
                      std::uint32_t* out_ids,

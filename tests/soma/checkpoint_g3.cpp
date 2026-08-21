@@ -57,17 +57,22 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    // The three CTest registrations deliberately cover all cache shapes: GQA's
+    // The CTest registrations deliberately cover all cache shapes: GQA's
     // equal K/V planes, plain MLA's absent V plane, and MLA+DSA's narrower V
-    // plane. Without running checkpointing on the latter two, the save/load
-    // loops could keep assuming the old shared width while decode stayed green.
+    // plane, plus V4's backend-owned opaque live-state format. Without running
+    // checkpointing on each, the save/load loops could keep assuming an older
+    // shape while decode stayed green.
     {
         soma::KvCache probe;
         if (auto st = probe.open(model.arch, 8); !st.ok()) {
             std::cerr << "cache open failed: " << st.message() << "\n";
             return 2;
         }
-        if (model.arch.attention.family == soma::AttentionFamily::Mla) {
+        if (probe.is_opaque()) {
+            check(probe.opaque_size() > 0 && probe.k_hkv() == 0 && probe.v_hkv() == 0,
+                  "backend-owned cache uses only its opaque arena",
+                  std::to_string(probe.opaque_size()) + " bytes");
+        } else if (model.arch.attention.family == soma::AttentionFamily::Mla) {
             check(probe.v_hkv() == 0 && probe.v_at(0, 0) == nullptr,
                   "plain MLA allocates no V plane",
                   std::to_string(probe.v_hkv()) + " floats/position");
@@ -92,6 +97,28 @@ int main(int argc, char** argv) {
     if (auto st = store.open(dir.string(), model.arch); !st.ok()) {
         std::cerr << "store open failed: " << st.message() << "\n";
         return 2;
+    }
+
+    // A speculative backend owns additional per-sequence state.  Its presence
+    // selects v4 without changing the byte layout of ordinary v3 checkpoints.
+    {
+        soma::KvCache written, restored;
+        check(written.open(model.arch, 8).ok() && restored.open(model.arch, 8).ok(),
+              "auxiliary checkpoint cache opens");
+        soma::SeqPersistState state;
+        state.auxiliary = {std::byte{0x11}, std::byte{0x00}, std::byte{0x7f}, std::byte{0xa5}};
+        check(store.save("auxiliary-v4", written, state).ok(),
+              "backend state selects checkpoint v4");
+        soma::KvCheckpointHeader header;
+        check(store.stat("auxiliary-v4", header).ok() &&
+                  header.version == soma::kKvCheckpointVersionSpeculative &&
+                  header.auxiliary_bytes == state.auxiliary.size(),
+              "v4 header records exact auxiliary extent");
+        soma::SeqPersistState loaded;
+        check(store.load("auxiliary-v4", restored, loaded).ok() &&
+                  loaded.auxiliary == state.auxiliary,
+              "v4 auxiliary state round-trips byte-exactly");
+        (void)store.remove("auxiliary-v4");
     }
 
     const std::vector<soma::TokenId> prompt{3, 11, 29};

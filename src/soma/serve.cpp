@@ -23,6 +23,7 @@
 #include "soma/kv_checkpoint.hpp"
 #include "soma/memory_hierarchy.hpp"
 #include "soma/plan.hpp"
+#include "soma/prompt_codec.hpp"
 #include "soma/scheduler.hpp"
 #include "soma/telemetry.hpp"
 #include "soma/tokenizer.hpp"
@@ -33,6 +34,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
@@ -49,6 +51,7 @@
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
+using ordered_json = nlohmann::ordered_json;
 
 namespace soma {
 
@@ -64,6 +67,8 @@ const char* to_string(ServeError error) noexcept {
         return "unsupported_content";
     case ServeError::CapacityPressure:
         return "capacity_pressure";
+    case ServeError::ProtocolError:
+        return "protocol_error";
     case ServeError::Internal:
         return "internal";
     }
@@ -82,6 +87,8 @@ int http_status_for(ServeError error) noexcept {
         return 422;
     case ServeError::CapacityPressure:
         return 503;
+    case ServeError::ProtocolError:
+        return 502;
     case ServeError::Internal:
         return 500;
     }
@@ -168,7 +175,16 @@ json telemetry_frame_json(const TelemetryFrame& f) {
           {"naive_expert_reads", f.scheduler.naive_expert_reads_last_step},
           {"steps", f.scheduler.steps},
           {"tokens_out", f.scheduler.tokens_out},
-          {"preemptions", f.scheduler.preemptions}}},
+          {"preemptions", f.scheduler.preemptions},
+          {"speculative_draft_tokens", f.scheduler.speculative_draft_tokens},
+          {"speculative_accepted_tokens", f.scheduler.speculative_accepted_tokens},
+          {"speculative_verifications", f.scheduler.speculative_verifications},
+          {"speculative_fallback_steps", f.scheduler.speculative_fallback_steps},
+          {"speculative_acceptance_rate",
+           f.scheduler.speculative_draft_tokens > 0
+               ? static_cast<double>(f.scheduler.speculative_accepted_tokens) /
+                     static_cast<double>(f.scheduler.speculative_draft_tokens)
+               : 0.0}}},
     };
 }
 
@@ -242,6 +258,8 @@ struct ServeServer::Impl {
     KvCheckpointStore checkpoints;
     CompiledTokenizer tokenizer;
     bool have_tokenizer = false;
+    const PromptCodec* prompt_codec = nullptr;
+    bool speculative_selected = false;
 
     Scheduler sched;
 
@@ -281,7 +299,9 @@ struct ServeServer::Impl {
         std::unique_ptr<CompiledTokenizer::Streamer> stream;
 
         std::string acc;
+        std::vector<TokenId> token_ids;
         bool done = false;
+        FinishReason finish_reason = FinishReason::Length;
         Status error;
         std::function<void(const std::string&)> on_delta;
     };
@@ -312,15 +332,19 @@ struct ServeServer::Impl {
         sc.kv_slots = std::max(1u, cfg.kv_slots);
         sc.ctx_size = cfg.ctx_size;
         sc.max_batch = cfg.max_batch;
+        sc.enable_speculation = speculative_selected;
+        sc.speculative_tokens = cfg.speculative_tokens;
+        sc.speculative_confidence_threshold = cfg.speculative_confidence_threshold;
         if (auto st = sched.open_f32(model, memory_ptr(), sc, &checkpoints); !st.ok()) return st;
 
         // Set ONCE, dispatching by SeqId. Re-registering per request was fine
         // when one turn ran at a time and is not: the last writer would own every
         // sequence's tokens.
         sched.set_token_callback([this](SeqId id, TokenId t, bool) { on_token(id, t); });
-        sched.set_finish_callback([this](SeqId id) { finish(id, {}); });
+        sched.set_finish_callback(
+            [this](SeqId id, FinishReason reason) { finish(id, {}, reason); });
         sched.set_error_callback([this](SeqId id, StatusCode code, const char* what) {
-            finish(id, Status{code, what ? what : "sequence failed"});
+            finish(id, Status{code, what ? what : "sequence failed"}, FinishReason::Length);
         });
 
         sched_open = true;
@@ -372,6 +396,7 @@ struct ServeServer::Impl {
         std::string delta;
         {
             std::lock_guard<std::mutex> lk(w->mu);
+            w->token_ids.push_back(t);
             if (w->stream) {
                 if (!w->stream->push(t, delta).ok()) return;
             } else {
@@ -387,7 +412,7 @@ struct ServeServer::Impl {
         if (w->on_delta) w->on_delta(delta);
     }
 
-    void finish(SeqId id, Status error) {
+    void finish(SeqId id, Status error, FinishReason reason) {
         std::shared_ptr<Waiter> w;
         {
             std::lock_guard<std::mutex> lk(state_mu);
@@ -413,6 +438,7 @@ struct ServeServer::Impl {
         {
             std::lock_guard<std::mutex> lk(w->mu);
             if (!error.ok()) w->error = std::move(error);
+            w->finish_reason = reason;
             w->done = true;
         }
         w->cv.notify_all();
@@ -479,7 +505,9 @@ struct ServeServer::Impl {
                     const SamplerState& sampler,
                     const std::string& conversation,
                     const std::function<void(const std::string&)>& on_delta,
-                    std::string& out_text) {
+                    std::string& out_text,
+                    std::vector<TokenId>* out_token_ids,
+                    FinishReason& out_finish_reason) {
         std::vector<TokenId> ids;
         if (have_tokenizer) {
             if (auto st = tokenizer.encode(prompt, ids); !st.ok()) return st;
@@ -542,6 +570,12 @@ struct ServeServer::Impl {
             req.prompt = ids;
             req.max_tokens = max_tokens;
             req.sampler = sampler;
+            // Model-owned chat protocols also own their special-token boundary.
+            // Existing generic families retain their byte-identical generation
+            // behavior; V4's codec stops on EOS before it can enter protocol
+            // parsing or public content.
+            if (prompt_codec != nullptr)
+                req.stop_token_ids = model.arch.topology.eos_token_ids;
             // Cross-PROCESS warm reopen: if this conversation was checkpointed
             // before the engine was stopped, attach that cache. Same mechanism,
             // one tier up — see kv_checkpoint.hpp's "one format, three callers".
@@ -580,17 +614,22 @@ struct ServeServer::Impl {
         // presents as a failed request rather than a hung connection, not as a
         // generation limit. A step-loop fault reaches the waiter through
         // fail_all() long before this fires.
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(10);
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(cfg.generation_timeout_seconds);
         Status result;
         {
             std::unique_lock<std::mutex> lk(waiter->mu);
             const bool finished = waiter->cv.wait_until(lk, deadline, [&] { return waiter->done; });
             if (!finished) {
-                result = {StatusCode::Internal, "generation did not complete within 10 minutes"};
+                result = {StatusCode::Internal,
+                          "generation did not complete within " +
+                              std::to_string(cfg.generation_timeout_seconds) + " seconds"};
             } else {
                 result = waiter->error;
             }
             out_text = waiter->acc;
+            if (out_token_ids != nullptr) *out_token_ids = waiter->token_ids;
+            out_finish_reason = waiter->finish_reason;
         }
 
         {
@@ -878,28 +917,82 @@ Status ServeServer::open(const ServeConfig& config) {
     }
     ArchIr resolved;
     if (auto st = resolve_arch(config.model_dir, overlay, resolved); !st.ok()) return st;
-    if (auto st = load_f32_model(config.model_dir, im.model, resolved.quantization); !st.ok()) {
-        return st;
-    }
 
-    // A container directory streams; a plain checkpoint is resident. Both are
-    // legitimate residency modes — `resident-only` is a verdict, not a failure —
-    // so the server supports either without a flag.
-    if (im.model.experts_are_streamed) {
-        if (auto st = im.store.open(config.model_dir, im.model.arch); !st.ok()) return st;
-        MemoryBudget b;
-        b.ram_expert_cache_bytes = config.ram_budget_bytes ? config.ram_budget_bytes : (2ull << 30);
-        b.pin_bytes = config.pin_bytes;
-        if (auto st = im.memory.open(im.model.arch, im.store, b); !st.ok()) return st;
-        im.model.streamed_experts = &im.memory;
+    if (config.speculative == SpeculativeMode::Required && !resolved.speculative.present) {
+        return {StatusCode::Unsupported,
+                "--speculative dspark requires a DSpark-capable converted container"};
     }
+    im.speculative_selected =
+        config.speculative == SpeculativeMode::Required ||
+        (config.speculative == SpeculativeMode::Auto && resolved.speculative.present &&
+         resolved.speculative.profiled_speedup >= 1.05f);
 
     HostBudget host;
     host.ram_total_bytes = config.ram_budget_bytes ? config.ram_budget_bytes * 2 : (8ull << 30);
     host.ram_free_bytes = config.ram_budget_bytes ? config.ram_budget_bytes : (4ull << 30);
     host.ctx_size = config.ctx_size;
     host.kv_slots = config.kv_slots;
-    (void)compute_plan(im.model.arch, host, im.plan_doc);
+    host.speculative = im.speculative_selected;
+    if (auto st = compute_plan(resolved, host, im.plan_doc); !st.ok()) return st;
+    const auto available = host.ram_free_bytes ? host.ram_free_bytes : host.ram_total_bytes;
+    const auto committed = im.plan_doc.dense_resident_bytes + im.plan_doc.kv_bytes_at_ctx;
+    if (resolved.schema_version >= kArchIrSchemaVersionV2 && available > 0 && committed > available) {
+        return {StatusCode::CapacityPressure, im.plan_doc.verdict_reason};
+    }
+    if (auto st = load_f32_model(config.model_dir, im.model, resolved.quantization); !st.ok()) {
+        return st;
+    }
+    if (const auto* backend = resolve_f32_backend(im.model.arch)) {
+        im.prompt_codec = backend->prompt_codec;
+    }
+
+    // A container directory streams; a plain checkpoint is resident. Both are
+    // legitimate residency modes — `resident-only` is a verdict, not a failure —
+    // so the server supports either without a flag.
+    if (im.model.experts_are_streamed) {
+        if (resolved.schema_version >= kArchIrSchemaVersionV2 &&
+            im.plan_doc.expert_cache_bytes < im.plan_doc.expert_bytes) {
+            return {StatusCode::CapacityPressure, im.plan_doc.verdict_reason};
+        }
+        if (auto st = im.store.open(config.model_dir, im.model.arch); !st.ok()) return st;
+        MemoryBudget b;
+        // Schema v2 requires exact admission: compute_plan reserves resident
+        // weights and every selected KV slot before deriving this remainder.
+        // Keep v1's established cache interpretation unchanged for old
+        // containers, whose planner contract predates that hard admission gate.
+        b.ram_expert_cache_bytes =
+            resolved.schema_version >= kArchIrSchemaVersionV2
+                ? im.plan_doc.expert_cache_bytes
+                : (config.ram_budget_bytes ? config.ram_budget_bytes : (2ull << 30));
+        if (im.speculative_selected && resolved.topology.n_layers > 0) {
+            b.ram_expert_cache_bytes = b.ram_expert_cache_bytes * resolved.topology.n_layers /
+                                       (resolved.topology.n_layers +
+                                        resolved.speculative.n_layers);
+        }
+        b.pin_bytes = config.pin_bytes;
+        if (auto st = im.memory.open(im.model.arch, im.store, b); !st.ok()) return st;
+        im.model.streamed_experts = &im.memory;
+    }
+
+    if (im.speculative_selected) {
+        const auto* speculative = resolve_speculative_backend(im.model.arch);
+        if (speculative == nullptr || speculative->bind_model == nullptr ||
+            speculative->start_runtime == nullptr) {
+            return {StatusCode::Unsupported,
+                    "the selected speculative method has no backend in this build"};
+        }
+        im.model.speculative_backend = speculative;
+        if (const auto rc = speculative->bind_model(im.model, config.model_dir);
+            rc != StatusCode::Ok) {
+            return {rc, "binding speculative model weights failed"};
+        }
+        const auto draft_cache = im.plan_doc.expert_cache_bytes * resolved.speculative.n_layers /
+                                 (resolved.topology.n_layers + resolved.speculative.n_layers);
+        if (const auto rc = speculative->start_runtime(im.model, config.model_dir, draft_cache);
+            rc != StatusCode::Ok) {
+            return {rc, "starting speculative model runtime failed"};
+        }
+    }
 
     const auto tok = fs::path(config.model_dir) / "tokenizer.soma";
     if (fs::exists(tok)) {
@@ -1112,8 +1205,13 @@ Status ServeServer::open(const ServeConfig& config) {
         "/v1/chat/completions",
         [this, served](const httplib::Request& req, httplib::Response& res) {
             json body;
+            ordered_json ordered_body;
             try {
-                body = json::parse(req.body);
+                // Keep an ordered parse for model protocols which serialize
+                // request-owned schemas into the prompt. The ordinary json
+                // copy preserves the existing generic HTTP behavior.
+                ordered_body = ordered_json::parse(req.body);
+                body = ordered_body;
             } catch (const std::exception& e) {
                 res.status = http_status_for(ServeError::BadRequest);
                 res.set_content(error_body(ServeError::BadRequest, e.what()), "application/json");
@@ -1127,11 +1225,23 @@ Status ServeServer::open(const ServeConfig& config) {
             }
 
             std::string prompt;
+            PromptCodecState codec_state;
             ServeError err = ServeError::None;
-            if (auto st = flatten_messages(body["messages"], prompt, err); !st.ok()) {
-                res.status = http_status_for(err);
-                res.set_content(error_body(err, st.message()), "application/json");
-                return;
+            if (impl_->prompt_codec) {
+                if (auto st = impl_->prompt_codec->encode(ordered_body, prompt, codec_state);
+                    !st.ok()) {
+                    err = st.code() == StatusCode::Unsupported ? ServeError::UnsupportedContent
+                                                               : ServeError::BadRequest;
+                    res.status = http_status_for(err);
+                    res.set_content(error_body(err, st.message()), "application/json");
+                    return;
+                }
+            } else {
+                if (auto st = flatten_messages(body["messages"], prompt, err); !st.ok()) {
+                    res.status = http_status_for(err);
+                    res.set_content(error_body(err, st.message()), "application/json");
+                    return;
+                }
             }
 
             SamplerState sampler;
@@ -1140,6 +1250,7 @@ Status ServeServer::open(const ServeConfig& config) {
             sampler.rng_state = body.value("seed", 0ull);
             const auto max_tokens = body.value("max_tokens", 64u);
             const bool stream = body.value("stream", false);
+            const bool return_token_ids = body.value("soma_return_token_ids", false);
 
             // The conversation key. Body field first, header second: the body is what
             // an OpenAI-shaped client can set, the header is what a proxy can add
@@ -1152,8 +1263,18 @@ Status ServeServer::open(const ServeConfig& config) {
 
             if (!stream) {
                 std::string text;
+                std::vector<TokenId> token_ids;
+                FinishReason finish = FinishReason::Length;
                 if (auto st =
-                        impl_->generate(prompt, max_tokens, sampler, conversation, nullptr, text);
+                        impl_->generate(
+                            prompt,
+                            max_tokens,
+                            sampler,
+                            conversation,
+                            nullptr,
+                            text,
+                            return_token_ids ? &token_ids : nullptr,
+                            finish);
                     !st.ok()) {
                     const auto kind = (st.code() == StatusCode::CapacityPressure)
                                           ? ServeError::CapacityPressure
@@ -1165,10 +1286,26 @@ Status ServeServer::open(const ServeConfig& config) {
                 json out;
                 out["object"] = "chat.completion";
                 out["model"] = served;
+                json message{{"role", "assistant"}, {"content", text}};
+                std::string finish_name = finish == FinishReason::Stop ? "stop" : "length";
+                if (impl_->prompt_codec) {
+                    if (auto st = impl_->prompt_codec->parse(
+                            text, codec_state, true, finish == FinishReason::Stop, message);
+                        !st.ok()) {
+                        res.status = http_status_for(ServeError::ProtocolError);
+                        res.set_content(error_body(ServeError::ProtocolError, st.message()),
+                                        "application/json");
+                        return;
+                    }
+                    if (message.contains("tool_calls") && !message["tool_calls"].empty()) {
+                        finish_name = "tool_calls";
+                    }
+                }
                 out["choices"] =
                     json::array({json{{"index", 0},
-                                      {"message", json{{"role", "assistant"}, {"content", text}}},
-                                      {"finish_reason", "length"}}});
+                                      {"message", std::move(message)},
+                                      {"finish_reason", finish_name}}});
+                if (return_token_ids) out["soma_token_ids"] = std::move(token_ids);
                 res.set_content(out.dump(), "application/json");
                 return;
             }
@@ -1178,27 +1315,80 @@ Status ServeServer::open(const ServeConfig& config) {
             // the answer is complete is the thing clients notice immediately.
             res.set_chunked_content_provider(
                 "text/event-stream",
-                [this, prompt, max_tokens, sampler, served, conversation](std::size_t,
-                                                                          httplib::DataSink& sink) {
+                [this, prompt, max_tokens, sampler, served, conversation, codec_state](
+                    std::size_t, httplib::DataSink& sink) {
                     auto send = [&](const json& j) {
                         const auto s = "data: " + j.dump() + "\n\n";
                         return sink.write(s.data(), s.size());
                     };
+                    auto send_delta = [&](json delta) {
+                        json chunk;
+                        chunk["object"] = "chat.completion.chunk";
+                        chunk["model"] = served;
+                        chunk["choices"] =
+                            json::array({json{{"index", 0}, {"delta", std::move(delta)}}});
+                        (void)send(chunk);
+                    };
+
                     std::string text;
+                    std::string raw;
+                    std::size_t reasoning_sent = 0;
+                    std::size_t content_sent = 0;
+                    bool calls_sent = false;
+                    Status codec_error;
+
+                    const auto emit_parsed = [&](bool final, bool stopped) -> Status {
+                        json message;
+                        if (auto parsed = impl_->prompt_codec->parse(
+                                raw, codec_state, final, stopped, message);
+                            !parsed.ok()) return parsed;
+
+                        const auto reasoning = message.value("reasoning_content", std::string{});
+                        const auto content = message.value("content", std::string{});
+                        if (reasoning.size() < reasoning_sent || content.size() < content_sent) {
+                            return {StatusCode::Internal,
+                                    "prompt codec produced a non-monotonic streaming prefix"};
+                        }
+                        if (reasoning.size() > reasoning_sent) {
+                            send_delta(json{{"reasoning_content",
+                                             reasoning.substr(reasoning_sent)}});
+                            reasoning_sent = reasoning.size();
+                        }
+                        if (content.size() > content_sent) {
+                            send_delta(json{{"content", content.substr(content_sent)}});
+                            content_sent = content.size();
+                        }
+                        if (!calls_sent && message.contains("tool_calls") &&
+                            !message["tool_calls"].empty()) {
+                            json deltas = json::array();
+                            for (std::size_t i = 0; i < message["tool_calls"].size(); ++i) {
+                                auto call = message["tool_calls"][i];
+                                call["index"] = i;
+                                deltas.push_back(std::move(call));
+                            }
+                            send_delta(json{{"tool_calls", std::move(deltas)}});
+                            calls_sent = true;
+                        }
+                        return {};
+                    };
+
+                    FinishReason finish = FinishReason::Length;
                     const auto st = impl_->generate(
                         prompt,
                         max_tokens,
                         sampler,
                         conversation,
                         [&](const std::string& delta) {
-                            json chunk;
-                            chunk["object"] = "chat.completion.chunk";
-                            chunk["model"] = served;
-                            chunk["choices"] = json::array(
-                                {json{{"index", 0}, {"delta", json{{"content", delta}}}}});
-                            (void)send(chunk);
+                            if (impl_->prompt_codec) {
+                                raw += delta;
+                                if (codec_error.ok()) codec_error = emit_parsed(false, false);
+                            } else {
+                                send_delta(json{{"content", delta}});
+                            }
                         },
-                        text);
+                        text,
+                        nullptr,
+                        finish);
                     if (!st.ok()) {
                         json e;
                         e["error"]["code"] = to_string(st.code() == StatusCode::CapacityPressure
@@ -1206,6 +1396,27 @@ Status ServeServer::open(const ServeConfig& config) {
                                                            : ServeError::Internal);
                         e["error"]["message"] = st.message();
                         (void)send(e);
+                    } else if (impl_->prompt_codec) {
+                        raw = text;
+                        if (codec_error.ok()) {
+                            codec_error = emit_parsed(true, finish == FinishReason::Stop);
+                        }
+                        if (!codec_error.ok()) {
+                            json e;
+                            e["error"]["code"] = to_string(ServeError::ProtocolError);
+                            e["error"]["message"] = codec_error.message();
+                            (void)send(e);
+                        }
+                    }
+                    if (st.ok() && codec_error.ok()) {
+                        std::string reason = finish == FinishReason::Stop ? "stop" : "length";
+                        if (calls_sent) reason = "tool_calls";
+                        json chunk;
+                        chunk["object"] = "chat.completion.chunk";
+                        chunk["model"] = served;
+                        chunk["choices"] = json::array(
+                            {json{{"index", 0}, {"delta", json::object()}, {"finish_reason", reason}}});
+                        (void)send(chunk);
                     }
                     const std::string done = "data: [DONE]\n\n";
                     sink.write(done.data(), done.size());
@@ -1272,7 +1483,31 @@ Status parse_serve_config(int argc, const char* const* argv, ServeConfig& out) {
     if (const auto r = env_or("SOMA_RAM_BUDGET", ""); !r.empty()) {
         out.ram_budget_bytes = std::stoull(r);
     }
+    if (const auto s = env_or("SOMA_KV_SLOTS", ""); !s.empty()) {
+        out.kv_slots = static_cast<std::uint32_t>(std::stoul(s));
+    }
+    if (const auto b = env_or("SOMA_MAX_BATCH", ""); !b.empty()) {
+        out.max_batch = static_cast<std::uint32_t>(std::stoul(b));
+    }
+    if (const auto t = env_or("SOMA_GENERATION_TIMEOUT", ""); !t.empty()) {
+        out.generation_timeout_seconds = static_cast<std::uint32_t>(std::stoul(t));
+    }
     out.quant_dense = env_or("SOMA_QUANT_DENSE", out.quant_dense);
+    const auto parse_speculative = [](const std::string& value, SpeculativeMode& mode) {
+        if (value == "off") mode = SpeculativeMode::Off;
+        else if (value == "auto") mode = SpeculativeMode::Auto;
+        else if (value == "dspark") mode = SpeculativeMode::Required;
+        else return false;
+        return true;
+    };
+    if (const auto s = env_or("SOMA_SPECULATIVE", ""); !s.empty() &&
+        !parse_speculative(s, out.speculative)) {
+        return {StatusCode::InvalidArgument, "SOMA_SPECULATIVE wants off, auto, or dspark"};
+    }
+    if (const auto n = env_or("SOMA_SPECULATIVE_TOKENS", ""); !n.empty())
+        out.speculative_tokens = static_cast<std::uint32_t>(std::stoul(n));
+    if (const auto c = env_or("SOMA_DSPARK_CONFIDENCE_THRESHOLD", ""); !c.empty())
+        out.speculative_confidence_threshold = std::stof(c);
 
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1291,6 +1526,21 @@ Status parse_serve_config(int argc, const char* const* argv, ServeConfig& out) {
             out.port = static_cast<std::uint16_t>(std::stoul(argv[++i]));
         else if (a == "--ctx-size" && i + 1 < argc)
             out.ctx_size = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+        else if (a == "--kv-slots" && i + 1 < argc)
+            out.kv_slots = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+        else if (a == "--max-batch" && i + 1 < argc)
+            out.max_batch = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+        else if (a == "--speculative" && i + 1 < argc) {
+            if (!parse_speculative(argv[++i], out.speculative)) {
+                return {StatusCode::InvalidArgument,
+                        "--speculative wants off, auto, or dspark"};
+            }
+        } else if (a == "--speculative-tokens" && i + 1 < argc)
+            out.speculative_tokens = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+        else if (a == "--dspark-confidence-threshold" && i + 1 < argc)
+            out.speculative_confidence_threshold = std::stof(argv[++i]);
+        else if (a == "--generation-timeout" && i + 1 < argc)
+            out.generation_timeout_seconds = static_cast<std::uint32_t>(std::stoul(argv[++i]));
         else if (a == "--ram-budget" && i + 1 < argc)
             out.ram_budget_bytes = std::stoull(argv[++i]);
         else if (a == "--pin" && i + 1 < argc)
@@ -1304,6 +1554,17 @@ Status parse_serve_config(int argc, const char* const* argv, ServeConfig& out) {
     }
     if (out.model_dir.empty()) {
         return {StatusCode::InvalidArgument, "--model-dir (or SOMA_MODEL_DIR) is required"};
+    }
+    if (out.ctx_size == 0 || out.kv_slots == 0 || out.generation_timeout_seconds == 0 ||
+        out.speculative_tokens == 0) {
+        return {StatusCode::InvalidArgument,
+                "context, KV slots, generation timeout, and speculative tokens must be positive"};
+    }
+    if (!std::isfinite(out.speculative_confidence_threshold) ||
+        out.speculative_confidence_threshold < 0.0f ||
+        out.speculative_confidence_threshold > 1.0f) {
+        return {StatusCode::InvalidArgument,
+                "--dspark-confidence-threshold must be between 0 and 1"};
     }
     return {};
 }
