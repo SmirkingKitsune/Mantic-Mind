@@ -565,6 +565,54 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
                     }
                 }
             }
+            if (arch.ffn.routed_expert_hidden != 0) {
+                // Required, not optional. The IR says this layer routes into a
+                // latent space; a checkpoint without the projections is a broken
+                // conversion, and running full-width instead would feed every
+                // expert the wrong shape.
+                const auto& blk = arch.naming.moe_block;
+                // SharedExpert, NOT AttnProj — the same role the dense-layer MLP
+                // and the shared expert take, and for the same reason: these are
+                // dense FFN-side tensors the converter keeps at F32.
+                //
+                // Measured, not assumed. Quantizing them with everything else at
+                // q4_g takes this family's error amplification from 2.91 (with
+                // the latent MoE removed, i.e. the same range as the other seven
+                // fixtures) to 6.55. They sit in front of and behind EVERY
+                // routed expert, so their error is common-mode across the top-k
+                // rather than averaging out — which is exactly the error a
+                // quantized MoE otherwise gets to cancel.
+                //
+                // The trade is also lopsided in production: at 7168 x 3584 over
+                // 92 layers they are ~4.7 B parameters, so q4 saves ~2 GB of a
+                // ~1.5 TB model — a tenth of a percent — for correlated error on
+                // every token's entire routed contribution.
+                if (auto s = bind_weight_optional(out,
+                                                  p + blk + ".routed_expert_down_proj.weight",
+                                                  TensorRole::SharedExpert,
+                                                  lw.latent_down);
+                    !s.ok())
+                    return s;
+                if (auto s = bind_weight_optional(out,
+                                                  p + blk + ".routed_expert_up_proj.weight",
+                                                  TensorRole::SharedExpert,
+                                                  lw.latent_up);
+                    !s.ok())
+                    return s;
+                if (lw.latent_down.empty() || lw.latent_up.empty()) {
+                    return {StatusCode::NotFound,
+                            "layer " + std::to_string(l) +
+                                " declares a latent MoE but has no routed_expert_"
+                                "down_proj/up_proj"};
+                }
+                if (arch.ffn.routed_expert_norm) {
+                    if (auto s = bind_tensor(out.weights,
+                                             p + blk + ".routed_expert_norm.weight",
+                                             lw.latent_norm);
+                        !s.ok())
+                        return s;
+                }
+            }
             if (arch.router.n_shared_experts > 0) {
                 if (auto s =
                         bind_weight_optional(out,
@@ -741,6 +789,9 @@ void apply_glu_expert_tile(const ArchIr& arch,
         case Activation::Relu2:
             f32::relu2_glu(g, u, inter, a);
             break;
+        case Activation::Situ:
+            f32::situ_glu(g, u, inter, arch.ffn.situ_beta, arch.ffn.situ_linear_beta, a);
+            break;
         }
     }
 
@@ -790,6 +841,10 @@ void apply_glu_expert(const ArchIr& arch,
         break;
     case Activation::Relu2:
         f32::relu2_glu(s.gate, s.up, inter, s.act);
+        break;
+    case Activation::Situ:
+        f32::situ_glu(
+            s.gate, s.up, inter, arch.ffn.situ_beta, arch.ffn.situ_linear_beta, s.act);
         break;
     }
 
@@ -872,6 +927,12 @@ void KvCache::abort_tentative() noexcept {
     if (!transaction_.active()) return;
     transaction_.rollback_from(0);
     transaction_.clear();
+}
+
+void F32Workspace::ensure_latent(std::uint32_t n_tokens, std::uint32_t width) {
+    const auto need = static_cast<std::size_t>(n_tokens) * width;
+    if (latent_in.size() < need) latent_in.assign(need, 0.0f);
+    if (latent_out.size() < need) latent_out.assign(need, 0.0f);
 }
 
 void F32Workspace::ensure_tile_scratch(std::uint32_t tile,
@@ -1191,8 +1252,33 @@ Status forward_impl(const F32Model& model,
                 ws.sink(l, "router_dense", route_dense.data(), route_dense.size());
             }
 
-            for (std::uint32_t t = 0; t < n; ++t) {
-                std::fill_n(ws.attn_out.begin() + static_cast<std::size_t>(t) * d, d, 0.0f);
+            // ── the latent space the routed experts live in ──────────────────
+            //
+            // `routed_expert_width()` is d_model for every family without a
+            // latent MoE, so everything below is the ordinary path when there is
+            // none. When there is one, the residual is projected DOWN and the
+            // experts see only the narrower vector.
+            //
+            // The ROUTER is deliberately upstream of this: it scored the
+            // full-width input above. Routing on the projected vector would be a
+            // different model that still selects plausible experts.
+            const auto ew = arch.routed_expert_width();
+            const bool latent = arch.ffn.routed_expert_hidden != 0;
+            const float* expert_x = ws.normed.data();
+            float* expert_out = ws.attn_out.data();
+            if (latent) {
+                ws.ensure_latent(n, ew);
+                soma::matmul(lw.latent_down, std::span<const float>(ws.normed).first(
+                                                 static_cast<std::size_t>(n) * d),
+                             n, std::span<float>(ws.latent_in).first(
+                                    static_cast<std::size_t>(n) * ew));
+                std::fill_n(ws.latent_out.begin(), static_cast<std::size_t>(n) * ew, 0.0f);
+                expert_x = ws.latent_in.data();
+                expert_out = ws.latent_out.data();
+            } else {
+                for (std::uint32_t t = 0; t < n; ++t) {
+                    std::fill_n(ws.attn_out.begin() + static_cast<std::size_t>(t) * d, d, 0.0f);
+                }
             }
 
             // ── the batch-union ──────────────────────────────────────────────
@@ -1296,18 +1382,45 @@ Status forward_impl(const F32Model& model,
                                           exp.gate,
                                           exp.up,
                                           exp.down,
-                                          ws.normed.data(),
-                                          d,
+                                          expert_x,
+                                          ew,
                                           arch.ffn.expert_intermediate,
                                           &ws.union_rows[i],
                                           &ws.union_weights[i],
                                           tile,
                                           ws,
-                                          ws.attn_out.data());
+                                          expert_out);
                 }
             }
 
+            if (latent) {
+                // Norm the COMBINED top-k output, then project back up.
+                //
+                // Order matters twice over. The norm is after the weighted sum,
+                // so it cannot be folded into the experts; and the up-projection
+                // OVERWRITES `attn_out` rather than accumulating, because the
+                // routed half is the whole of it until the shared expert adds
+                // itself below.
+                if (!lw.latent_norm.empty()) {
+                    for (std::uint32_t t = 0; t < n; ++t) {
+                        f32::rmsnorm(std::span<float>(ws.latent_out)
+                                         .subspan(static_cast<std::size_t>(t) * ew, ew),
+                                     lw.latent_norm,
+                                     ew,
+                                     arch.rms_norm_eps);
+                    }
+                }
+                soma::matmul(lw.latent_up,
+                             std::span<const float>(ws.latent_out)
+                                 .first(static_cast<std::size_t>(n) * ew),
+                             n,
+                             std::span<float>(ws.attn_out).first(static_cast<std::size_t>(n) * d));
+            }
+
             if (!lw.shared_gate.empty()) {
+                // The shared expert reads the FULL-WIDTH input, not the latent
+                // one, and adds into the up-projected result. It is outside the
+                // latent space entirely.
                 for (std::uint32_t t = 0; t < n; ++t) {
                     const auto off = static_cast<std::size_t>(t) * d;
                     apply_glu_expert(arch,

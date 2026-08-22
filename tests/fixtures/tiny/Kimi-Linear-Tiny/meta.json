@@ -1,0 +1,46 @@
+{
+  "attn_implementation": "eager",
+  "device": "cuda",
+  "fixture_version": 1,
+  "generate": 256,
+  "greedy_first_16": [
+    44,
+    394,
+    274,
+    17,
+    134,
+    332,
+    230,
+    425,
+    26,
+    113,
+    244,
+    190,
+    482,
+    439,
+    319,
+    343
+  ],
+  "implementation": "remote_code",
+  "kda_mode": "fused_recurrent",
+  "layer_kinds": [
+    "dense",
+    "moe",
+    "moe",
+    "moe"
+  ],
+  "n_params": 361556,
+  "numpy_version": "2.4.6",
+  "positions": 512,
+  "seed": 20260727,
+  "slug": "Kimi-Linear-Tiny",
+  "source": "C:/Users/RyanM/AppData/Local/Temp/claude/Z--AI-Ubiquitious-Memories-Mantic-Mind/52d6bb7e-84b3-434e-be9c-63170289e96a/scratchpad/kimi-linear-src",
+  "source_architectures": [
+    "KimiLinearForCausalLM"
+  ],
+  "source_model_type": "kimi_linear",
+  "tf_logits_sha256": "b3fa533d8fae0a1b6ab50111a500ba4afb87ac6c9c7bd20c863cc0990c3521f6",
+  "torch_version": "2.11.0+cu128",
+  "transformers_version": "4.57.6",
+  "weights_sha256": "782a6559c8be6f168fb929cee5c01aa30caae00dd46d5108abc89aff4ec5ace3"
+}

@@ -18,6 +18,19 @@ namespace {
 constexpr std::array kExpertCountKeys = {"num_experts", "num_local_experts", "n_routed_experts"};
 constexpr std::array kMoeIntermediateKeys = {"moe_intermediate_size"};
 
+// Kimi spells the DeepSeek router's every field differently while meaning
+// exactly the same thing — it says so itself, in a comment mapping
+// `num_experts_per_token -> num_experts_per_tok` and three more. Reading only
+// the DeepSeek spelling leaves top_k at 0, which validation catches, and
+// `n_shared_experts` at 0, which it does NOT: the model then plans with no
+// shared expert, under-counts the resident half, and serves fine right up until
+// the tensors do not bind.
+constexpr std::array kTopKKeys = {"num_experts_per_tok", "num_experts_per_token"};
+constexpr std::array kSharedExpertKeys = {"n_shared_experts", "num_shared_experts"};
+constexpr std::array kExpertGroupKeys = {"n_group", "num_expert_group"};
+constexpr std::array kScoringKeys = {"scoring_func", "moe_router_activation_func"};
+constexpr std::array kNormTopkKeys = {"norm_topk_prob", "moe_renormalize"};
+
 template <typename T>
 T get_or(const json& j, std::string_view key, T fallback) {
     const auto it = j.find(key);
@@ -177,6 +190,18 @@ TensorNaming compressed_sparse_naming() {
     return n;
 }
 
+TensorNaming kimi_naming() {
+    TensorNaming n;
+    n.moe_block = "block_sparse_moe";
+    n.dense_block = "mlp";                            // KimiMLP: gate/up/down
+    n.shared_block = "block_sparse_moe.shared_experts"; // KimiMLP too
+    n.router = "gate.weight";
+    n.expert_gate = "w1.weight"; // KimiBlockSparseMLP: w1 = gate
+    n.expert_up = "w3.weight";   //                     w3 = up
+    n.expert_down = "w2.weight"; //                     w2 = down
+    return n;
+}
+
 FamilyTraits traits_for(const std::string& model_type) {
     // qk_norm kind is family knowledge, not config knowledge. Both OLMoE and
     // Qwen3-MoE simply have q_norm/k_norm tensors; only the shape distinguishes
@@ -221,6 +246,25 @@ FamilyTraits traits_for(const std::string& model_type) {
         // converting 1.4 TB it could not serve.
         return {AttentionFamily::MlaDsa, QkNormKind::None, true, false, 1e-5f, {}};
     }
+    if (model_type == "kimi_k3" || model_type == "kimi_linear") {
+        // Hybrid, and the hybrid is the architecture — not a variant of either
+        // half. 24 of 93 layers are MLA (NoPE, output-gated); the other 69 are
+        // gated delta-rule linear attention with a constant-size recurrent
+        // state. Calling it Mla would size 93 layers of KV cache for a model
+        // that has 24, which at its 1M context is a ~120 GB over-count in the
+        // pessimistic direction; calling it a linear family would drop the KV
+        // cache the other 24 genuinely need.
+        //
+        // `kimi_linear` is the same language model without the vision tower, and
+        // shares every trait: `text_config.model_type` IS `kimi_linear`, so the
+        // two names arriving here are the wrapper and the thing it wraps.
+        //
+        // Experts are Mixtral-spelled (w1/w3/w2 under `block_sparse_moe`) while
+        // the DENSE and SHARED blocks are gate/up/down — one family using both
+        // conventions in one layer, which is exactly why TensorNaming carries
+        // the blocks separately instead of a single family switch.
+        return {AttentionFamily::MlaKda, QkNormKind::None, true, false, 1e-6f, kimi_naming()};
+    }
     if (model_type == "deepseek_v4") {
         return {AttentionFamily::CompressedSparse,
                 QkNormKind::FullWidth,
@@ -257,6 +301,8 @@ const char* to_string(AttentionFamily family) noexcept {
         return "mla+dsa";
     case AttentionFamily::CompressedSparse:
         return "compressed+sparse";
+    case AttentionFamily::MlaKda:
+        return "mla+kda";
     }
     return "unknown";
 }
@@ -269,6 +315,18 @@ const char* to_string(Activation activation) noexcept {
         return "geglu";
     case Activation::Relu2:
         return "relu2";
+    case Activation::Situ:
+        return "situ";
+    }
+    return "unknown";
+}
+
+const char* to_string(Modality modality) noexcept {
+    switch (modality) {
+    case Modality::Text:
+        return "text";
+    case Modality::VisionText:
+        return "vision+text";
     }
     return "unknown";
 }
@@ -286,7 +344,7 @@ const char* to_string(ScoreFn score_fn) noexcept {
 }
 
 Status adapt_hf_config(std::string_view text, ArchIr& out) {
-    json j;
+    json j; // reassigned below when a multimodal wrapper nests the language model
     try {
         j = json::parse(text);
     } catch (const std::exception& e) {
@@ -302,7 +360,7 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
         return {StatusCode::Unsupported,
                 "no adapter for model_type '" + model_type +
                     "'; supported: olmoe, qwen3_moe, qwen2_moe, mixtral, deepseek_v2, "
-                    "deepseek_v3, deepseek_v4, glm_moe_dsa"};
+                    "deepseek_v3, deepseek_v4, glm_moe_dsa, kimi_k3, kimi_linear"};
     }
 
     out = ArchIr{};
@@ -311,6 +369,40 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
     out.adapter = model_type;
     out.source_repo = get_or<std::string>(j, "_name_or_path", "");
     out.source_revision = get_or<std::string>(j, "_commit_hash", "");
+
+    // ── the multimodal wrapper, hoisted ──────────────────────────────────────
+    //
+    // Every family before this one ships a FLAT config.json: the language model
+    // IS the top level. A multimodal checkpoint instead makes the top level a
+    // container — `text_config` holds the language model, `vision_config` the
+    // tower — and the top level then carries almost none of the keys read below.
+    //
+    // Read flat, this does not fail. It SUCCEEDS with n_layers 0, d_model 0 and
+    // no experts, and validation rejects it with "topology has a zero
+    // dimension", which is true and tells the operator nothing about why.
+    //
+    // The wrapper's own facts are captured BEFORE the hoist, because after it
+    // they are unreachable. Which modality the checkpoint accepts is one of
+    // them, and it is not cosmetic: a vision checkpoint served as text is a
+    // model being asked about images it was never given.
+    if (const auto it = j.find("vision_config"); it != j.end() && it->is_object()) {
+        auto& mm = out.modality;
+        mm.modality = Modality::VisionText;
+        mm.media_placeholder_token_id =
+            get_or<std::uint32_t>(j, "media_placeholder_token_id", 0);
+        mm.vision_layers = get_or<std::uint32_t>(*it, "vt_num_hidden_layers", 0);
+        mm.vision_hidden = get_or<std::uint32_t>(*it, "vt_hidden_size", 0);
+        mm.vision_patch_size = get_or<std::uint32_t>(*it, "patch_size", 0);
+    }
+    if (const auto it = j.find("text_config"); it != j.end() && it->is_object()) {
+        // The nested block wins wholesale rather than being merged key-by-key.
+        // Both levels declare bos/eos/pad and tie_word_embeddings, and the
+        // language model's copy is the one its tensors were trained with; a
+        // merge would have to pick a winner per key and would pick wrong the
+        // first time the two disagree.
+        json nested = *it;
+        j = std::move(nested);
+    }
 
     // ── topology ─────────────────────────────────────────────────────────────
     // Family default when the key is absent — NOT a global constant.
@@ -372,7 +464,8 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
     // RoPE segment, not per-head K and V. `head_dim` above is the GQA reading of
     // the config and is meaningless here, so it is recomputed from the two halves
     // MLA actually splits a query into.
-    if (attn.family == AttentionFamily::Mla || attn.family == AttentionFamily::MlaDsa) {
+    if (attn.family == AttentionFamily::Mla || attn.family == AttentionFamily::MlaDsa ||
+        attn.family == AttentionFamily::MlaKda) {
         auto& m = attn.mla;
         m.kv_lora_rank = get_or<std::uint32_t>(j, "kv_lora_rank", 0);
         // null in config.json for V2-Lite: Q is NOT down-projected there, while
@@ -388,6 +481,9 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
         attn.head_dim = m.qk_nope_head_dim + m.qk_rope_head_dim;
         // Only the rope half is rotated.
         attn.rope.partial_dim = m.qk_rope_head_dim;
+
+        m.nope = get_or<bool>(j, "mla_use_nope", false);
+        m.output_gate = get_or<bool>(j, "mla_use_output_gate", false);
     }
 
     // ── DSA ──────────────────────────────────────────────────────────────────
@@ -434,6 +530,89 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
         }
     }
 
+    // ── KDA ──────────────────────────────────────────────────────────────────
+    //
+    // The layer sets are stated, not strided, and they are stated ONE-BASED.
+    //
+    // That is the whole hazard of this family. `full_attn_layers` reads
+    // [4, 8, ... 88, 92, 93] against 93 layers, which is a perfectly plausible
+    // zero-based list right up to the 93 — and even that reads as a harmless
+    // off-the-end entry rather than the proof it is. Upstream resolves it in one
+    // line, `(layer_idx + 1) in kda_layers`, and every layer of the resulting
+    // model depends on it.
+    //
+    // Read zero-based, the assignment shifts by one: layer 3 becomes linear and
+    // layer 4 becomes full, the KV cache is sized for the wrong 24 layers, and
+    // the tensors bind to the wrong blocks. The stride LOOKS regular enough
+    // (every 4th) that a re-derivation would agree with the wrong answer
+    // everywhere except the final pair 92/93 — which is exactly where the list
+    // stops being a stride.
+    //
+    // So it is converted here, once, and `layer_kinds` is authoritative after.
+    if (attn.family == AttentionFamily::MlaKda) {
+        auto& kda = attn.kda;
+        const auto it = j.find("linear_attn_config");
+        if (it == j.end() || !it->is_object()) {
+            return {StatusCode::InvalidArgument,
+                    "hybrid linear attention declared with no linear_attn_config"};
+        }
+        const json& lc = *it;
+        kda.n_heads = get_or<std::uint32_t>(lc, "num_heads", 0);
+        kda.head_dim = get_or<std::uint32_t>(lc, "head_dim", 0);
+        kda.conv_kernel = get_or<std::uint32_t>(lc, "short_conv_kernel_size", 0);
+        kda.full_rank_gate = get_or<bool>(lc, "use_full_rank_gate", false);
+        if (const auto g = lc.find("gate_lower_bound"); g != lc.end() && g->is_number()) {
+            kda.has_gate_bound = true;
+            kda.gate_lower_bound = g->get<float>();
+        }
+        if (kda.n_heads == 0 || kda.head_dim == 0 || kda.conv_kernel == 0) {
+            return {StatusCode::InvalidArgument, "linear_attn_config has a zero dimension"};
+        }
+
+        const auto n_layers = out.topology.n_layers;
+        // Default Full, then mark the stated linear layers. A layer named by
+        // NEITHER list would silently stay Full, so both lists are read and
+        // their total is checked against n_layers below.
+        kda.layer_kinds.assign(n_layers, AttnLayerKind::Full);
+        std::uint32_t named = 0;
+        const auto mark = [&](const char* key, AttnLayerKind kind) -> Status {
+            const auto list = lc.find(key);
+            if (list == lc.end() || !list->is_array()) {
+                return {StatusCode::InvalidArgument,
+                        std::string("linear_attn_config is missing '") + key + "'"};
+            }
+            for (const auto& v : *list) {
+                if (!v.is_number_integer() && !v.is_number_unsigned()) continue;
+                const auto one_based = v.get<std::int64_t>();
+                if (one_based < 1 || one_based > static_cast<std::int64_t>(n_layers)) {
+                    return {StatusCode::InvalidArgument,
+                            std::string(key) + " names layer " + std::to_string(one_based) +
+                                ", outside 1.." + std::to_string(n_layers)};
+                }
+                kda.layer_kinds[static_cast<std::size_t>(one_based - 1)] = kind;
+                ++named;
+            }
+            return {};
+        };
+        if (auto st = mark("kda_layers", AttnLayerKind::Linear); !st.ok()) return st;
+        if (auto st = mark("full_attn_layers", AttnLayerKind::Full); !st.ok()) return st;
+
+        // Every layer named exactly once. A config that names one twice or skips
+        // one is a config that disagrees with itself, and the resulting stack
+        // would bind the wrong tensors in a way nothing downstream can detect.
+        if (named != n_layers) {
+            return {StatusCode::InvalidArgument,
+                    "linear_attn_config names " + std::to_string(named) + " layers for " +
+                        std::to_string(n_layers) + " layers"};
+        }
+        if (kda.n_full_layers() == 0) {
+            return {StatusCode::InvalidArgument,
+                    "hybrid stack has no full-attention layer, so nothing carries a KV cache"};
+        }
+    }
+
+    out.block_residual.block_size = get_or<std::uint32_t>(j, "attn_res_block_size", 0);
+
     if (attn.family == AttentionFamily::CompressedSparse) {
         auto& c = attn.compressed;
         c.q_lora_rank = get_or<std::uint32_t>(j, "q_lora_rank", 0);
@@ -467,22 +646,52 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
     }
     if (auto st = parse_rope(j, attn.rope); !st.ok()) return st;
 
+    // NoPE, applied AFTER parse_rope and not before it.
+    //
+    // The slice stays; the ROTATION goes. `qk_rope_head_dim` is still 64 and
+    // still concatenated into every query and cached key, so `head_dim` and the
+    // cache width above are unchanged — see MlaSpec::nope.
+    //
+    // What goes is any claim about an angle. `RopeConfig{}` does NOT express
+    // that: its default theta is 10000, so a default-constructed config asserts
+    // "rotate at 10000" as confidently as a stated one. theta is inside
+    // arch_hash, so leaving either the default or the parsed value would make
+    // "rotated" and "not rotated at all" hash identically for two models that
+    // are not the same model — and would hand a backend a plausible angle to
+    // rotate by.
+    //
+    // Ordering is the whole of the fix: written before parse_rope, this was
+    // overwritten by it and had no effect at all.
+    if (attn.mla.nope) {
+        attn.rope = RopeConfig{};
+        attn.rope.theta = 0.0f;
+        attn.rope.partial_dim = 0;
+    }
+
     // ── router ───────────────────────────────────────────────────────────────
     auto& router = out.router;
     if (const json* n = find_first(j, kExpertCountKeys)) {
         router.n_experts = n->get<std::uint32_t>();
     }
-    router.top_k = get_or<std::uint32_t>(j, "num_experts_per_tok", 0);
-    const auto scoring = get_or<std::string>(j, "scoring_func", "softmax");
+    if (const json* k = find_first(j, kTopKKeys)) router.top_k = k->get<std::uint32_t>();
+    const json* score = find_first(j, kScoringKeys);
+    const auto scoring = (score != nullptr && score->is_string()) ? score->get<std::string>()
+                                                                 : std::string("softmax");
     router.score_fn = scoring == "sigmoid"       ? ScoreFn::Sigmoid
                       : scoring == "sqrtsoftplus" ? ScoreFn::SqrtSoftplus
                                                    : ScoreFn::Softmax;
-    router.normalize_topk = traits.force_normalize_topk || get_or<bool>(j, "norm_topk_prob", false);
+    const json* norm = find_first(j, kNormTopkKeys);
+    router.normalize_topk =
+        traits.force_normalize_topk || (norm != nullptr && norm->is_boolean() && norm->get<bool>());
     router.routed_scaling_factor = get_or<float>(j, "routed_scaling_factor", 1.0f);
     router.bias_correction = (get_or<std::string>(j, "topk_method", "greedy") == "noaux_tc");
-    router.n_groups = std::max<std::uint32_t>(1, get_or<std::uint32_t>(j, "n_group", 1));
+    router.n_groups = 1;
+    if (const json* g = find_first(j, kExpertGroupKeys))
+        router.n_groups = std::max<std::uint32_t>(1, g->get<std::uint32_t>());
     router.topk_group = std::max<std::uint32_t>(1, get_or<std::uint32_t>(j, "topk_group", 1));
-    router.n_shared_experts = get_or<std::uint32_t>(j, "n_shared_experts", 0);
+    router.n_shared_experts = 0;
+    if (const json* sh = find_first(j, kSharedExpertKeys))
+        router.n_shared_experts = sh->get<std::uint32_t>();
     router.n_hash_layers = get_or<std::uint32_t>(j, "num_hash_layers", 0);
 
     // ── ffn ──────────────────────────────────────────────────────────────────
@@ -494,6 +703,16 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
         ffn.activation = Activation::GeGlu;
     } else if (act == "relu2") {
         ffn.activation = Activation::Relu2;
+    } else if (act == "situ") {
+        ffn.activation = Activation::Situ;
+        // `beta or 1.0` upstream: a stated 0 is treated as absent, because
+        // dividing by it is the only other reading and it is not one.
+        const auto beta = get_or<float>(j, "activation_situ_beta", 0.0f);
+        ffn.situ_beta = beta != 0.0f ? beta : 1.0f;
+        // The linear half is transformed ONLY when its beta is stated. Absent
+        // means the up projection passes through untouched — not "beta 0", which
+        // would multiply the whole FFN output by zero.
+        ffn.situ_linear_beta = get_or<float>(j, "activation_situ_linear_beta", 0.0f);
     } else {
         return {StatusCode::Unsupported, "unsupported hidden_act '" + act + "'"};
     }
@@ -520,6 +739,16 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
     }
     ffn.expert_layout = ExpertLayout::InterleavedGateUpDown;
     ffn.swiglu_limit = get_or<float>(j, "swiglu_limit", 0.0f);
+
+    // Latent MoE: the routed experts live in a NARROWER space than the residual
+    // stream. Recorded only when it actually differs, so that a config stating
+    // `routed_expert_hidden_size == hidden_size` is identical to one omitting
+    // it — including in arch_hash, which is conditional on this being non-zero.
+    if (const auto rh = get_or<std::uint32_t>(j, "routed_expert_hidden_size", 0);
+        rh != 0 && rh != out.topology.d_model) {
+        ffn.routed_expert_hidden = rh;
+        ffn.routed_expert_norm = get_or<bool>(j, "latent_moe_use_norm", false);
+    }
 
     out.hyper_connections.multiplier = get_or<std::uint32_t>(j, "hc_mult", 1);
     out.hyper_connections.sinkhorn_iters = get_or<std::uint32_t>(j, "hc_sinkhorn_iters", 0);
@@ -575,6 +804,41 @@ Status validate_arch_ir(const ArchIr& ir) {
         return {StatusCode::InvalidArgument,
                 "n_heads " + std::to_string(ir.attention.n_heads) +
                     " is not a multiple of n_kv_heads " + std::to_string(ir.attention.n_kv_heads)};
+    }
+    if (ir.attention.family == AttentionFamily::MlaKda) {
+        const auto& k = ir.attention.kda;
+        if (k.layer_kinds.size() != ir.topology.n_layers) {
+            return {StatusCode::InvalidArgument,
+                    "kda layer_kinds has " + std::to_string(k.layer_kinds.size()) +
+                        " entries for " + std::to_string(ir.topology.n_layers) + " layers"};
+        }
+        if (k.n_heads == 0 || k.head_dim == 0 || k.conv_kernel < 2) {
+            return {StatusCode::InvalidArgument, "hybrid linear attention is incomplete"};
+        }
+        // No full-attention layer means no KV cache anywhere, which the planner
+        // would report as a free context and the checkpoint reader as an empty
+        // cache. Both are wrong in the optimistic direction.
+        if (k.n_full_layers() == 0) {
+            return {StatusCode::InvalidArgument,
+                    "hybrid stack has no full-attention layer"};
+        }
+        // The full-attention layers are MLA, so their dimensions must be real.
+        // A hybrid that reached here with a zero kv_lora_rank would size a
+        // zero-byte cache for 24 layers that need one.
+        const auto& m = ir.attention.mla;
+        if (m.kv_lora_rank == 0 || m.qk_nope_head_dim == 0 || m.v_head_dim == 0) {
+            return {StatusCode::InvalidArgument,
+                    "hybrid full-attention layers have no MLA dimensions"};
+        }
+    }
+    if (ir.ffn.routed_expert_hidden != 0 && ir.n_moe_layers() > 0 &&
+        ir.ffn.routed_expert_hidden > ir.topology.d_model) {
+        // A latent MoE projects DOWN. Wider than the residual stream is not a
+        // latent space, and taking it at face value would inflate every
+        // expert — the one number the verdict is computed from.
+        return {StatusCode::InvalidArgument,
+                "routed_expert_hidden " + std::to_string(ir.ffn.routed_expert_hidden) +
+                    " exceeds d_model " + std::to_string(ir.topology.d_model)};
     }
     if (ir.attention.family == AttentionFamily::CompressedSparse) {
         if (ir.schema_version != kArchIrSchemaVersionV2) {
@@ -790,6 +1054,34 @@ Status compute_arch_hash(const ArchIr& ir, std::string& out_hash) {
         for (const auto k : ir.attention.dsa.layer_kinds) {
             canon << (k == IndexerKind::Full ? 'f' : k == IndexerKind::Shared ? 's' : '-');
         }
+    }
+    // KDA, on the same conditional terms as DSA above and for the same reason:
+    // which layers carry a cache versus a recurrent state is what the model IS,
+    // and a checkpoint written under one split must never replay under another.
+    // Emitted only for this family, so no existing container's hash moves.
+    if (ir.attention.family == AttentionFamily::MlaKda) {
+        const auto& k = ir.attention.kda;
+        canon << "|kda=" << k.n_heads << ':' << k.head_dim << ':' << k.conv_kernel << ':'
+              << k.has_gate_bound << ':' << k.gate_lower_bound << ':' << k.full_rank_gate << ':'
+              << ir.attention.mla.nope << ':' << ir.attention.mla.output_gate << ':';
+        for (const auto kind : k.layer_kinds) canon << (kind == AttnLayerKind::Linear ? 'l' : 'f');
+        canon << "|blkres=" << ir.block_residual.block_size;
+    }
+    // The latent width, and the activation's parameters, are model identity: two
+    // checkpoints differing only in `situ_beta` are two different models, and
+    // the expert width decides what a converted expert's bytes even mean.
+    //
+    // Both conditional, so a family that has neither hashes exactly as before.
+    if (ir.ffn.routed_expert_hidden != 0) {
+        canon << "|latent=" << ir.ffn.routed_expert_hidden << ':' << ir.ffn.routed_expert_norm;
+    }
+    if (ir.ffn.activation == Activation::Situ) {
+        canon << "|situ=" << ir.ffn.situ_beta << ':' << ir.ffn.situ_linear_beta;
+    }
+    if (ir.modality.modality != Modality::Text) {
+        canon << "|mm=" << to_string(ir.modality.modality) << ':'
+              << ir.modality.media_placeholder_token_id << ':' << ir.modality.vision_layers << ':'
+              << ir.modality.vision_hidden << ':' << ir.modality.vision_patch_size;
     }
     if (ir.attention.family == AttentionFamily::CompressedSparse) {
         const auto& c = ir.attention.compressed;

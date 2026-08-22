@@ -243,12 +243,31 @@ StatusCode f32_bind_layer(const ArchIr& arch,
         return StatusCode::NotFound;
     }
 
+    // Required when the IR says the variant has it, absent otherwise. Not
+    // "optional": a config declaring an output gate whose tensor is missing is a
+    // broken conversion, and silently running ungated is a different model that
+    // produces perfectly reasonable text.
+    if (m.output_gate &&
+        !soma::bind_layer_weight(
+             ctx, "self_attn.g_proj.weight", TensorRole::AttnProj, w->out_gate)
+             .ok()) {
+        return StatusCode::NotFound;
+    }
+
     // Optional: present only on V3's MoE layers. Absent on V2 entirely and on
     // any dense layer, so a missing tensor here is normal rather than an error.
-    (void)soma::bind_layer_f32(ctx,
-                               "mlp.gate.e_score_correction_bias",
-                               w->e_score_bias,
-                               /*optional=*/true);
+    //
+    // The BLOCK NAME comes from the IR, and hardcoding "mlp" here was a real
+    // defect rather than a tidiness issue. `TensorNaming::moe_block` exists
+    // because families disagree — Mixtral and Kimi both use
+    // `block_sparse_moe` — and this bind is optional, so on a family that
+    // disagrees the bias silently did not load. The router then ran without the
+    // per-expert selection bias, which does not fail: it SELECTS DIFFERENT
+    // EXPERTS, and the model produces fluent output from the wrong ones.
+    // Caught by the Kimi oracle, where it moved the first MoE layer's output by
+    // 4.9e-02 against a clean input.
+    const auto bias_name = arch.naming.moe_block + ".gate.e_score_correction_bias";
+    (void)soma::bind_layer_f32(ctx, bias_name.c_str(), w->e_score_bias, /*optional=*/true);
 
     // ── DSA indexer, on `full` layers only ───────────────────────────────────
     //
@@ -414,6 +433,23 @@ StatusCode f32_index_select(const ArchIr& arch,
     return StatusCode::Ok;
 }
 
+/// `o *= sigmoid(g_proj(x))`, per head-dimension, before o_proj.
+///
+/// A GATE ON THE ATTENTION OUTPUT, not on the residual: it lands after the heads
+/// are concatenated and before the output projection, which is the only ordering
+/// that matches the shape `[n_heads * v_head_dim, d_model]`. Applying it after
+/// o_proj would need a `d_model`-wide gate and would be a different operator.
+void apply_output_gate(const F32AttnWeights& w,
+                       std::span<const float> xs,
+                       std::uint32_t n_rows,
+                       std::uint32_t width,
+                       std::vector<float>& heads) {
+    std::vector<float> g(static_cast<std::size_t>(n_rows) * width);
+    soma::matmul(w.out_gate, xs, n_rows, g);
+    for (std::size_t i = 0; i < heads.size() && i < g.size(); ++i)
+        heads[i] *= 1.0f / (1.0f + std::exp(-g[i]));
+}
+
 StatusCode f32_attention(const ArchIr& arch,
                          const soma::F32LayerWeights& lw,
                          const float* x,
@@ -431,6 +467,8 @@ StatusCode f32_attention(const ArchIr& arch,
     const auto qk = nope + rope_d; // one query/key head
     const auto vd = m.v_head_dim;  // a DIFFERENT width
     const auto lora = m.kv_lora_rank;
+    // NoPE is a property of the VARIANT, read once here. See the rotation sites.
+    const bool rotate = !m.nope;
     // MLA's two LATENT norms do NOT use the model's rms_norm_eps.
     //
     // `arch_ir.hpp` says the epsilon "applies to attention q/k norms, layer norms,
@@ -543,7 +581,14 @@ StatusCode f32_attention(const ArchIr& arch,
                      w.kv_a_norm,
                      lora,
                      eps);
-        rope_at(k_pe.data() + static_cast<std::size_t>(t) * rope_d, rope_d, t, inv_freq, cs_scale);
+        // NoPE keeps the SLICE and drops the ROTATION. `k_pe` is still projected,
+        // still concatenated into every key and still cached at its full width —
+        // narrowing it here would produce a cache the weights do not fit. What
+        // disappears is the angle, because position enters this stack through
+        // its linear-attention layers instead.
+        if (rotate)
+            rope_at(
+                k_pe.data() + static_cast<std::size_t>(t) * rope_d, rope_d, t, inv_freq, cs_scale);
     }
 
     ws.sink(ws.current_layer, "kv_a_layernorm", latent.data(), latent.size());
@@ -557,7 +602,7 @@ StatusCode f32_attention(const ArchIr& arch,
     for (std::uint32_t t = 0; t < n_tokens; ++t) {
         for (std::uint32_t h = 0; h < H; ++h) {
             float* qh = q.data() + (static_cast<std::size_t>(t) * H + h) * qk;
-            rope_at(qh + nope, rope_d, t, inv_freq, cs_scale);
+            if (rotate) rope_at(qh + nope, rope_d, t, inv_freq, cs_scale);
         }
     }
 
@@ -679,6 +724,8 @@ StatusCode f32_attention(const ArchIr& arch,
     // not, the fault is in the rope/score/softmax/value math itself rather than
     // in any projection — which is the one region the module-boundary taps
     // cannot subdivide.
+    if (m.output_gate) apply_output_gate(w, xs, n_tokens, H * vd, heads);
+
     ws.sink(ws.current_layer, "o_proj_in", heads.data(), heads.size());
 
     soma::matmul(
@@ -870,6 +917,7 @@ StatusCode f32_attention_kv(const ArchIr& arch,
     const auto qk = nope + rope_d;
     const auto vd = m.v_head_dim;
     const auto lora = m.kv_lora_rank;
+    const bool rotate = !m.nope;
     const bool is_dsa = arch.attention.family == AttentionFamily::MlaDsa;
 
     // Deliberately the same constant, and the same reason, as the prefill path:
@@ -926,14 +974,15 @@ StatusCode f32_attention_kv(const ArchIr& arch,
         std::copy_n(src, lora, slot);
         f32::rmsnorm(std::span<float>(slot, lora), w.kv_a_norm, lora, kLatentNormEps);
         std::copy_n(src + lora, rope_d, slot + lora);
-        rope_at(slot + lora, rope_d, p, inv_freq, cs_scale);
+        if (rotate) rope_at(slot + lora, rope_d, p, inv_freq, cs_scale);
 
         for (std::uint32_t h = 0; h < H; ++h) {
-            rope_at(q.data() + (static_cast<std::size_t>(r) * H + h) * qk + nope,
-                    rope_d,
-                    p,
-                    inv_freq,
-                    cs_scale);
+            if (rotate)
+                rope_at(q.data() + (static_cast<std::size_t>(r) * H + h) * qk + nope,
+                        rope_d,
+                        p,
+                        inv_freq,
+                        cs_scale);
         }
     }
 
@@ -1105,18 +1154,24 @@ StatusCode f32_attention_kv(const ArchIr& arch,
         }
     }
 
+    if (m.output_gate) apply_output_gate(w, xs, n_rows, H * vd, heads);
+
     soma::matmul(
         w.o_proj, heads, n_rows, std::span<float>(out, static_cast<std::size_t>(n_rows) * d));
     return StatusCode::Ok;
 }
 
-StatusCode f32_route(const ArchIr& arch,
-                     const soma::F32LayerWeights& lw,
-                     const TokenId*,
-                     const float* logits,
-                     std::uint32_t n_tokens,
-                     std::uint32_t* out_ids,
-                     float* out_weights) noexcept {
+namespace {
+
+/// The router proper. Takes the selection bias as a POINTER rather than digging
+/// it out of a payload, because two families now share this code and they do
+/// not share a payload type — see `f32_route_with_bias`.
+StatusCode route_impl(const ArchIr& arch,
+                      const float* bias,
+                      const float* logits,
+                      std::uint32_t n_tokens,
+                      std::uint32_t* out_ids,
+                      float* out_weights) noexcept {
     // DeepSeek's own router rather than a borrowed one.
     //
     // Reusing the GQA backend's would work numerically for V2-Lite — softmax
@@ -1134,9 +1189,6 @@ StatusCode f32_route(const ArchIr& arch,
     // same code — softmax, no bias, one group — so there is one router rather
     // than two that must be kept in agreement.
     const bool sigmoid = (arch.router.score_fn == ScoreFn::Sigmoid);
-    const auto* bias = (lw.attn.empty() || lw.attn.as<F32AttnWeights>()->e_score_bias.size() != E)
-                           ? nullptr
-                           : lw.attn.as<F32AttnWeights>()->e_score_bias.data();
 
     const auto n_grp = std::max<std::uint32_t>(1, arch.router.n_groups);
     const auto topk_grp = std::max<std::uint32_t>(1, arch.router.topk_group);
@@ -1220,6 +1272,33 @@ StatusCode f32_route(const ArchIr& arch,
         }
     }
     return StatusCode::Ok;
+}
+
+} // namespace
+
+StatusCode f32_route(const ArchIr& arch,
+                     const soma::F32LayerWeights& lw,
+                     const TokenId*,
+                     const float* logits,
+                     std::uint32_t n_tokens,
+                     std::uint32_t* out_ids,
+                     float* out_weights) noexcept {
+    const auto E = arch.router.n_experts;
+    const auto* p = lw.attn.empty() ? nullptr : lw.attn.as<F32AttnWeights>();
+    const float* bias =
+        (p == nullptr || p->e_score_bias.size() != E) ? nullptr : p->e_score_bias.data();
+    return route_impl(arch, bias, logits, n_tokens, out_ids, out_weights);
+}
+
+StatusCode f32_route_with_bias(const ArchIr& arch,
+                               std::span<const float> e_score_bias,
+                               const float* logits,
+                               std::uint32_t n_tokens,
+                               std::uint32_t* out_ids,
+                               float* out_weights) noexcept {
+    const auto E = arch.router.n_experts;
+    const float* bias = (e_score_bias.size() != E) ? nullptr : e_score_bias.data();
+    return route_impl(arch, bias, logits, n_tokens, out_ids, out_weights);
 }
 
 const soma::F32Backend& f32_backend() noexcept {

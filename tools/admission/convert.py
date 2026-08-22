@@ -376,6 +376,46 @@ def main(argv: list[str]) -> int:
         import convert_deepseek_v4
         return convert_deepseek_v4.run(args)
 
+    # ── refuse for the REAL reason, not a downstream symptom ─────────────────
+    #
+    # A multimodal checkpoint nests the language model under `text_config`, so
+    # every key read below is absent at the top level. Left alone, this function
+    # finds n_layers 0 and n_experts 0 and prints "no routed experts; nothing to
+    # stream" — about a model with 896 of them. The operator then goes looking
+    # for a routing problem that does not exist.
+    #
+    # Refusing here is also cheap in the way that matters: these checkpoints run
+    # to a terabyte and more, and the alternative is discovering the problem
+    # after hours of reading.
+    text_cfg = cfg.get("text_config")
+    if isinstance(text_cfg, dict):
+        inner = text_cfg.get("model_type", "?")
+        print(f"  REFUSED  {src.name}: multimodal wrapper (model_type "
+              f"{model_type!r}, language model nested under 'text_config' as "
+              f"{inner!r}).")
+        print("           Soma converts a text stack only, and a vision tower "
+              "dropped silently would")
+        print("           serve a model answering about images it never "
+              "received. Run `soma plan` for")
+        print("           the architecture verdict before converting.")
+        return 3
+
+    # compressed-tensors ships weights already packed at 4 bits with their own
+    # scale layout. Every reader below assumes bf16/f32 source tensors and would
+    # quantize the PACKED BYTES as if they were weights — producing a container
+    # that loads, streams, and generates noise.
+    quant_cfg = cfg.get("quantization_config")
+    if isinstance(quant_cfg, dict):
+        method = quant_cfg.get("quant_method", "?")
+        fmt = quant_cfg.get("format", "?")
+        print(f"  REFUSED  {src.name}: checkpoint is already quantized "
+              f"({method}, format {fmt}).")
+        print("           convert.py quantizes FROM bf16/f32; re-quantizing "
+              "packed bytes yields a")
+        print("           container that loads and generates noise. Convert "
+              "from an unquantized upload.")
+        return 3
+
     n_layers = int(cfg.get("num_hidden_layers", 0))
     if args.layers:
         n_layers = min(n_layers, args.layers)

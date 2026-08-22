@@ -10,6 +10,7 @@
 // again.
 
 #include "soma/arch/gqa.hpp"
+#include "soma/arch/kda.hpp"
 #include "soma/arch/mla.hpp"
 #include "soma/arch/compressed_sparse.hpp"
 #include "soma/arch/deepseek_dspark.hpp"
@@ -43,6 +44,40 @@ const F32Backend* resolve_f32_backend(const ArchIr& arch) noexcept {
 
     case AttentionFamily::CompressedSparse:
         return &arch::compressed_sparse::f32_backend();
+
+    case AttentionFamily::MlaKda:
+        // SERVABLE, and this line moved only when there was evidence for it.
+        //
+        // It returned nullptr through the whole of the implementation work, on
+        // the grounds that every check the family had was internal — invariants,
+        // hand-computed traces, three-way agreement between prefill, streaming
+        // and cached decode — and all of those would pass on an engine that is
+        // self-consistently wrong. The bar was the one DSA had to clear:
+        // token-exact against a reference oracle.
+        //
+        // `tests/fixtures/tiny/Kimi-Linear-Tiny` is that oracle, built by the
+        // real `modeling_kimi_linear.py` against `fla`. Soma matches it at
+        // max 2.21e-06 over 512 teacher-forced positions with 256 greedy tokens
+        // exact — the same order as the seven families already through this
+        // switch.
+        //
+        // It was worth waiting for. The oracle immediately found two defects
+        // that every internal test had passed:
+        //
+        //   * `mla::f32_bind_layer` looked for the router's selection bias under
+        //     a hardcoded "mlp." block. Kimi's MoE block is `block_sparse_moe`,
+        //     the bind is optional, so the bias silently did not load and the
+        //     router chose different experts — fluently.
+        //   * this backend pointed `route` straight at `mla::f32_route`, which
+        //     recovers that bias by casting the layer payload to
+        //     `mla::F32AttnWeights`. A hybrid layer's payload is a
+        //     `F32HybridWeights`. Undefined behaviour that read a garbage span
+        //     length, failed a size check, and dropped the bias.
+        //
+        // Both moved the first MoE layer's output by 4.9e-02 against an input
+        // that agreed to 7e-08, and neither is the kind of thing an invariant
+        // written by the same author was ever going to catch.
+        return &arch::kda::f32_backend();
 
     case AttentionFamily::Unknown:
         return nullptr;
@@ -84,6 +119,18 @@ const AttentionBackend* resolve_attention_backend(AttentionFamily family) noexce
 
     case AttentionFamily::CompressedSparse:
         return &arch::compressed_sparse::attention_backend();
+
+    case AttentionFamily::MlaKda:
+        // Its OWN backend, not MLA's — which is the whole reason a family that
+        // cannot yet execute still needs one here.
+        //
+        // MLA's sizing would charge 93 layers of latent cache for a stack that
+        // has 24, and charge nothing for the 69 recurrent states that exist
+        // whether or not anything can run them. At 1M context that is a ~4x
+        // over-count on the quantity the verdict turns on, so the planner would
+        // refuse a model that fits — a wrong answer arrived at confidently,
+        // rather than the honest "not yet" that `resolve_f32_backend` returns.
+        return &arch::kda::attention_backend();
 
     case AttentionFamily::Unknown:
         return nullptr;

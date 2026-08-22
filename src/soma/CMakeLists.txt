@@ -40,6 +40,7 @@ set(SOMA_CORE_HEADERS
 set(SOMA_ARCH_HEADERS
     soma/arch/gqa.hpp
     soma/arch/mla.hpp
+    soma/arch/kda.hpp
     soma/arch/compressed_sparse.hpp
     soma/arch/deepseek_dspark.hpp
 )
@@ -86,6 +87,7 @@ set(MM_SOMA_SOURCES
     arch_registry.cpp      # the ONE core TU permitted to include soma/arch/
     arch/gqa.cpp
     arch/mla.cpp
+    arch/kda.cpp
     arch/compressed_sparse.cpp
     arch/deepseek_dsml.cpp
     arch/deepseek_dspark.cpp
@@ -574,6 +576,58 @@ if(BUILD_TESTING)
     add_test(NAME soma_deepseek_v4_plan
              COMMAND soma_deepseek_v4_plan
                      "${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/DeepSeek-V4-Pro-0813")
+
+    # The KDA kernel, checked against derived invariants rather than a
+    # transcription: almost every misreading of a delta rule still converges.
+    add_executable(soma_kda_kernel
+                   ${CMAKE_SOURCE_DIR}/tests/soma/kda_kernel.cpp)
+    target_link_libraries(soma_kda_kernel PRIVATE mm_soma)
+    add_test(NAME soma_kda_kernel COMMAND soma_kda_kernel)
+
+    # The KDA kernel against fla's own `fused_recurrent_kda`. The one EXTERNAL
+    # check this family has; everything else is a second opinion from the author.
+    add_executable(soma_kda_oracle
+                   ${CMAKE_SOURCE_DIR}/tests/soma/kda_oracle.cpp)
+    target_link_libraries(soma_kda_oracle PRIVATE mm_soma)
+    add_test(NAME soma_kda_oracle
+             COMMAND soma_kda_oracle
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/kernels/kda")
+
+    # The block residual: mixing pinned by identities, sequencing by two traces
+    # computed by hand under a zero score vector.
+    add_executable(soma_block_residual
+                   ${CMAKE_SOURCE_DIR}/tests/soma/block_residual.cpp)
+    target_link_libraries(soma_block_residual PRIVATE mm_soma)
+    add_test(NAME soma_block_residual COMMAND soma_block_residual)
+
+    # The latent MoE, driven through the real forward. Family-agnostic, so it
+    # runs on GQA — the simplest backend that reaches the expert loop.
+    add_executable(soma_latent_moe
+                   ${CMAKE_SOURCE_DIR}/tests/soma/latent_moe.cpp)
+    target_link_libraries(soma_latent_moe PRIVATE mm_soma)
+    add_test(NAME soma_latent_moe COMMAND soma_latent_moe)
+
+    # MLA's NoPE and output-gate variants. The G4 fixtures configure neither,
+    # so without this they are guarded code nobody has ever run.
+    add_executable(soma_mla_variants
+                   ${CMAKE_SOURCE_DIR}/tests/soma/mla_variants.cpp)
+    target_link_libraries(soma_mla_variants PRIVATE mm_soma)
+    add_test(NAME soma_mla_variants COMMAND soma_mla_variants)
+
+    # The layer around the kernel: prefill, streaming and cached decode are
+    # three routes through one recurrence and must agree, or one of them is wrong.
+    add_executable(soma_kda_layer
+                   ${CMAKE_SOURCE_DIR}/tests/soma/kda_layer.cpp)
+    target_link_libraries(soma_kda_layer PRIVATE mm_soma)
+    add_test(NAME soma_kda_layer COMMAND soma_kda_layer)
+
+    # Kimi-K3: hybrid KDA/MLA, latent MoE, multimodal wrapper. Config-only —
+    # no fixture, because every claim it makes is a property of the adapter and
+    # the planner, and the checkpoint is ~1.5 TB.
+    add_executable(soma_kimi_k3_plan
+                   ${CMAKE_SOURCE_DIR}/tests/soma/kimi_k3_plan.cpp)
+    target_link_libraries(soma_kimi_k3_plan PRIVATE mm_soma)
+    add_test(NAME soma_kimi_k3_plan COMMAND soma_kimi_k3_plan)
 
     # ── G6 telemetry ──────────────────────────────────────────────────────────
     # bucket_heat() is pure, so the downsampling claims are checked without a

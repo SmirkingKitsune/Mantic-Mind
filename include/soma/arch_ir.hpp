@@ -40,7 +40,25 @@ enum class AttentionFamily : std::uint8_t {
     Mla,
     MlaDsa,
     CompressedSparse,
+
+    /// Hybrid stack: a minority of full-attention layers (MLA) interleaved with
+    /// a majority of linear-attention layers carrying a fixed-size recurrent
+    /// state instead of a per-token cache.
+    ///
+    /// Appended rather than inserted. The value is not what identifies the
+    /// family in `arch_hash` — `to_string` is — but the enum is serialized
+    /// nowhere it can be reordered safely, and appending costs nothing.
+    MlaKda,
 };
+
+/// Whether a layer attends over a cache or carries a recurrent state.
+///
+/// Deliberately family-neutral: it says what the layer COSTS, which is the only
+/// thing the planner asks. Length-n_layers and authoritative, for the same
+/// reason `Topology::layer_kinds` and `DsaSpec::layer_kinds` are — the upstream
+/// config states the layer sets as two explicit 1-BASED lists, and a stride
+/// re-derived downstream is a disagreement waiting to happen.
+enum class AttnLayerKind : std::uint8_t { Full = 0, Linear };
 
 enum class LayerKind : std::uint8_t { Dense = 0, Moe };
 
@@ -56,7 +74,21 @@ enum class LayerKind : std::uint8_t { Dense = 0, Moe };
 /// model that runs, converges to plausible logits, and is wrong.
 enum class QkNormKind : std::uint8_t { None = 0, PerHead, FullWidth };
 enum class ScoreFn : std::uint8_t { Softmax = 0, Sigmoid, SqrtSoftplus };
-enum class Activation : std::uint8_t { SwiGlu = 0, GeGlu, Relu2 };
+/// Gated FFN nonlinearity.
+///
+/// `Situ` is Moonshot's: `beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)`,
+/// parameterized by `FfnSpec::situ_beta` and `situ_linear_beta`. It is a math
+/// primitive selected by a family, not an architecture — same category as
+/// SwiGlu, and core kernels may name it.
+enum class Activation : std::uint8_t { SwiGlu = 0, GeGlu, Relu2, Situ };
+
+/// What the checkpoint accepts as INPUT. Not a serving capability.
+///
+/// A vision-capable checkpoint served text-only is a real and useful thing; a
+/// vision-capable checkpoint SILENTLY served text-only is a model answering
+/// about an image it never received. Recording the declaration is what lets the
+/// plan say which one is happening.
+enum class Modality : std::uint8_t { Text = 0, VisionText };
 enum class RopeScalingKind : std::uint8_t { None = 0, Linear, Ntk, Yarn };
 enum class ExpertLayout : std::uint8_t { InterleavedGateUpDown = 0 };
 enum class TokenizerKind : std::uint8_t { Bpe = 0, Unigram };
@@ -98,6 +130,73 @@ struct MlaSpec {
     /// False selects the expanded form, which is kept as the reference the
     /// absorbed one is checked against; `soma_decode_kv_g4` runs both.
     bool absorb_weights = true;
+
+    /// No positional encoding on this family's full-attention layers.
+    ///
+    /// NOT the same as `qk_rope_head_dim == 0`. The rope-width slice still
+    /// exists — it is projected, concatenated, cached and attended over — it is
+    /// simply never rotated, because position enters the stack through the
+    /// linear layers instead. So the SHAPES are the ordinary MLA shapes and only
+    /// the rotation disappears.
+    ///
+    /// Reading `nope` as "drop the rope slice" would narrow every K by
+    /// qk_rope_head_dim and produce a cache the weights do not fit. Reading
+    /// `rope.theta` as meaningful would rotate a model that must not be
+    /// rotated — finite logits, exact at position 0, wrong everywhere else,
+    /// which is the D-class failure this codebase keeps re-finding.
+    bool nope = false;
+
+    /// Sigmoid output gate on the attention block: `o * sigmoid(g_proj(x))`.
+    /// A full `d_model x (n_heads * v_head_dim)` matrix, so it is resident
+    /// weight the planner must charge, not a flag.
+    bool output_gate = false;
+};
+
+/// Present iff `AttentionSpec::family` is MlaKda.
+///
+/// Gated delta-rule linear attention. The property that matters to the planner
+/// is that its per-sequence state is CONSTANT in context: a
+/// `n_heads x head_dim x head_dim` recurrent matrix plus a short causal
+/// convolution window, and nothing that grows with token count.
+///
+/// That is not a detail — it inverts the usual cache arithmetic. A stack where
+/// most layers are linear pays a large fixed state and a small per-token cache,
+/// so the crossover with an all-full-attention stack sits at a few thousand
+/// tokens and the long-context end is where it wins.
+struct KdaSpec {
+    std::uint32_t n_heads = 0;
+    std::uint32_t head_dim = 0;
+
+    /// Short causal depthwise convolution applied to each of q/k/v. The carried
+    /// state is `kernel - 1` positions wide, per projection.
+    std::uint32_t conv_kernel = 0;
+
+    /// Clamp on the log-space forget gate. Zero and "absent" are NOT the same
+    /// thing here — an absent bound means no clamp — so `has_gate_bound`
+    /// carries the distinction rather than overloading the value.
+    bool has_gate_bound = false;
+    float gate_lower_bound = 0.0f;
+
+    /// Full-rank output gate (`d_model x n_heads*head_dim`) versus the low-rank
+    /// pair through `head_dim`. A ~56x difference in that tensor's size, so it
+    /// is a sizing input and not a style note.
+    bool full_rank_gate = false;
+
+    /// Length == n_layers when non-empty. Empty for every family but this one.
+    std::vector<AttnLayerKind> layer_kinds;
+
+    std::uint32_t n_linear_layers() const noexcept {
+        std::uint32_t n = 0;
+        for (const auto k : layer_kinds)
+            if (k == AttnLayerKind::Linear) ++n;
+        return n;
+    }
+    std::uint32_t n_full_layers() const noexcept {
+        std::uint32_t n = 0;
+        for (const auto k : layer_kinds)
+            if (k == AttnLayerKind::Full) ++n;
+        return n;
+    }
 };
 
 /// Which layers own a sparse-attention indexer.
@@ -236,6 +335,7 @@ struct AttentionSpec {
     RopeConfig rope{};
     MlaSpec mla{}; ///< meaningful only for Mla/MlaDsa
     DsaSpec dsa{}; ///< meaningful only for MlaDsa
+    KdaSpec kda{}; ///< meaningful only for MlaKda
     CompressedAttentionSpec compressed{}; ///< CompressedSparse only
 };
 
@@ -260,6 +360,76 @@ struct FfnSpec {
     std::uint32_t shared_intermediate = 0;
     float swiglu_limit = 0.0f;
     ExpertLayout expert_layout = ExpertLayout::InterleavedGateUpDown;
+
+    /// Width the ROUTED experts operate at, when it is not `d_model`.
+    ///
+    /// Zero means "the residual width", which is what every family before this
+    /// one does. A latent MoE instead projects the residual DOWN into a narrower
+    /// space, routes and runs the experts entirely inside it, and projects the
+    /// combined result back up.
+    ///
+    /// **This is the single most consequential number in the whole IR for a
+    /// streaming engine, because `bytes_per_token` is linear in it.** The
+    /// planner sized an expert as `d_model x expert_intermediate` for five
+    /// families where that was correct by coincidence — no earlier family had a
+    /// latent MoE. Applied to one that does, it overcharges every expert by
+    /// `d_model / routed_expert_hidden` and the error lands squarely on the
+    /// quantity the verdict is computed from. Use `ArchIr::routed_expert_width()`
+    /// rather than reading this field directly, so the "0 means d_model" rule
+    /// exists in one place.
+    ///
+    /// The two projections it implies are RESIDENT per MoE layer and are charged
+    /// as such: they are dense, they are read every token, and at
+    /// `2 * d_model * routed_expert_hidden` per layer they are not a rounding
+    /// error.
+    std::uint32_t routed_expert_hidden = 0;
+
+    /// RMSNorm on the combined expert output before the up-projection. Only
+    /// meaningful when `routed_expert_hidden` is set.
+    bool routed_expert_norm = false;
+
+    /// `Activation::Situ` parameters. Ignored for every other activation.
+    float situ_beta = 1.0f;
+
+    /// Zero means the linear half is NOT transformed — absent, not "beta 0",
+    /// which would collapse the term to zero and silence the up projection
+    /// entirely.
+    float situ_linear_beta = 0.0f;
+};
+
+/// Softmax-weighted mixing over periodically-snapshotted residuals.
+///
+/// Every `block_size`-th layer pushes a copy of the residual stream onto a
+/// per-token stack; each layer then mixes over that stack with learned scores.
+/// Zero — the default and every prior family — is the ordinary residual stream
+/// and implies no stack, no per-layer projections, and no extra activation
+/// memory.
+///
+/// Distinct from `HyperConnectionSpec`, which is Sinkhorn-normalized mixing over
+/// a widened residual. Both "mix the residual", and folding them into one field
+/// would mean a model executing the wrong one of two real mechanisms.
+struct BlockResidualSpec {
+    std::uint32_t block_size = 0;
+
+    /// Snapshots a stack accumulates over `n_layers`. Derived, not read: it is
+    /// what the activation footprint scales with.
+    std::uint32_t n_blocks(std::uint32_t n_layers) const noexcept {
+        if (block_size == 0) return 0;
+        return (n_layers + block_size - 1) / block_size;
+    }
+};
+
+/// What the checkpoint declares it accepts, and the tower that would serve it.
+///
+/// Sizes are recorded so a plan can state the cost of the half it is NOT
+/// serving. Refusing to convert is a decision for admission; describing the
+/// model honestly is this struct's only job.
+struct ModalitySpec {
+    Modality modality = Modality::Text;
+    std::uint32_t media_placeholder_token_id = 0;
+    std::uint32_t vision_layers = 0;
+    std::uint32_t vision_hidden = 0;
+    std::uint32_t vision_patch_size = 0;
 };
 
 /// How this family spells its tensors.
@@ -327,6 +497,8 @@ struct ArchIr {
     AttentionSpec attention{};
     RouterSpec router{};
     FfnSpec ffn{};
+    ModalitySpec modality{};
+    BlockResidualSpec block_residual{};
     HyperConnectionSpec hyper_connections{};
     SpeculativeSpec speculative{};
     QuantMap quantization{};
@@ -336,6 +508,15 @@ struct ArchIr {
 
     std::uint32_t n_moe_layers() const noexcept;
     bool is_moe_layer(LayerIndex layer) const noexcept;
+
+    /// The width a routed expert's gate/up read and its down writes.
+    ///
+    /// `d_model` for every family without a latent MoE, which is why callers
+    /// that predate one still get the same answer. Expressed once, here, so a
+    /// second site cannot forget the fallback and charge zero.
+    std::uint32_t routed_expert_width() const noexcept {
+        return ffn.routed_expert_hidden != 0 ? ffn.routed_expert_hidden : topology.d_model;
+    }
 };
 
 /// Parse + validate the registry's canonical architecture JSON.
@@ -375,6 +556,7 @@ Status compute_arch_hash(const ArchIr& ir, std::string& out_hash);
 
 const char* to_string(AttentionFamily family) noexcept;
 const char* to_string(Activation activation) noexcept;
+const char* to_string(Modality modality) noexcept;
 const char* to_string(ScoreFn score_fn) noexcept;
 
 } // namespace soma

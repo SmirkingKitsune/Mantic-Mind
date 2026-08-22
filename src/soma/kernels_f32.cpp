@@ -174,6 +174,24 @@ void relu2_glu(std::span<const float> gate,
     }
 }
 
+void situ_glu(std::span<const float> gate,
+              std::span<const float> up,
+              std::uint32_t n,
+              float beta,
+              float linear_beta,
+              std::span<float> out) noexcept {
+    // Guarded rather than trusted: a zero beta would divide, and the IR's own
+    // rule is that an unstated beta means one.
+    const float b = beta != 0.0f ? beta : 1.0f;
+    const bool clamp_linear = linear_beta != 0.0f;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const float g = gate[i];
+        const float a = b * std::tanh(g / b) * (1.0f / (1.0f + std::exp(-g)));
+        const float u = clamp_linear ? linear_beta * std::tanh(up[i] / linear_beta) : up[i];
+        out[i] = a * u;
+    }
+}
+
 void rope_neox(std::span<float> vec,
                std::uint32_t n_heads,
                std::uint32_t head_dim,

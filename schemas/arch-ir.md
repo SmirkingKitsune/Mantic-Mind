@@ -78,7 +78,7 @@ three different ways; resolving that at admission means the core never has to.
 
 | Field | Type | Notes |
 |---|---|---|
-| `family` | enum | `mha` \| `gqa` \| `mla` \| `mla+dsa` \| `compressed+sparse` — **selects the backend** |
+| `family` | enum | `mha` \| `gqa` \| `mla` \| `mla+dsa` \| `mla+kda` \| `compressed+sparse` — **selects the backend** |
 | `n_heads` | int | |
 | `n_kv_heads` | int | `gqa`/`mha` |
 | `head_dim` | int | |
@@ -89,6 +89,7 @@ three different ways; resolving that at admission means the core never has to.
 | `rope.scaling` | object \| null | `{ type: "yarn"\|"linear"\|"ntk", factor, original_max_position, beta_fast, beta_slow, mscale, mscale_all_dim }` |
 | `mla` | object \| null | Present iff `family` starts with `mla` |
 | `dsa` | object \| null | Present iff `family` is `mla+dsa` |
+| `kda` | object \| null | Present iff `family` is `mla+kda` |
 | `compressed` | object \| null | Schema v2; present iff `family` is `compressed+sparse` |
 
 ### `compressed` sub-object — DeepSeek V4
@@ -137,6 +138,8 @@ logits, and is wrong.
 | `qk_rope_head_dim` | RoPE-carrying part |
 | `v_head_dim` | |
 | `absorb_weights` | bool — move the KV up-projection to the query side during decode |
+| `nope` | bool — the rope slice is still projected, concatenated and cached; only the ROTATION is absent |
+| `output_gate` | bool — sigmoid gate on the block output; a full `d_model × n_heads·v_head_dim` matrix, not a flag |
 
 **`absorb_weights` has no GQA analogue**, which is exactly why it lives in the `mla` sub-object.
 
@@ -178,6 +181,32 @@ test fixture manufactures ties at the top-k cut, which `torch.topk` then resolve
 are neither ascending nor descending index order. Measured: 50.69% of scores exactly zero at 1 head,
 27.12% at 2, 13.52% at 3, 6.99% at 4, extrapolating to ~2e-8% at GLM-5.2's real 32 (roadmap D32).
 
+### `kda` sub-object — hybrid linear/full attention
+
+Present iff `family` is `mla+kda`. Part of `arch_hash`: which layers carry a cache versus a
+recurrent state is what the model IS, and a KV checkpoint written under one split must never replay
+under another.
+
+| Field | Notes |
+|---|---|
+| `n_heads`, `head_dim` | Linear-attention geometry. The recurrent state is `n_heads × head_dim × head_dim` — a MATRIX per head, not a vector |
+| `conv_kernel` | Short causal depthwise convolution over q/k/v; `kernel − 1` positions carried per projection |
+| `has_gate_bound`, `gate_lower_bound` | Clamp on the log-space forget gate. Absent ≠ 0 — hence two fields |
+| `full_rank_gate` | Output gate is `d_model × n_heads·head_dim` when true, a low-rank pair through `head_dim` when false. A ~56× difference in that tensor on Kimi-K3 |
+| `layer_kinds` | Per layer: `full` (MLA, cached) \| `linear` (recurrent). Length `n_layers`, authoritative |
+
+**The upstream layer lists are ONE-BASED.** `full_attn_layers` and `kda_layers` are both stated
+explicitly, and `KimiLinearConfig.is_kda_layer` resolves them as `(layer_idx + 1) in kda_layers`.
+Read zero-based, every layer shifts by one: the KV cache is sized for the wrong 24 layers and the
+tensors bind to the wrong blocks. The trap is that the stride *looks* regular — every 4th layer —
+so a re-derivation agrees with the wrong answer everywhere except the tail, where Kimi-K3's list
+ends `…, 88, 92, 93` and two adjacent layers are both full. The adapter converts once; nothing
+downstream re-derives it.
+
+Both lists are read and their union checked against `n_layers`. A config naming a layer twice, or
+skipping one, is a config disagreeing with itself, and the resulting stack would bind wrong tensors
+in a way nothing downstream detects.
+
 ### KV cost — the number the planner actually cares about
 
 `kv_bytes_per_token()` and `kv_geometry()` are the attention properties that cross the seam. Worked
@@ -189,6 +218,15 @@ from the real configs:
 | DeepSeek-V2-Lite | mla | `512 + 64` = **576** | 27 | 31 KB | **1.0 GB** |
 | Mixtral-8x7B | gqa | `2 × 8 × 128` = **2048** | 32 | 131 KB | **4.3 GB** |
 | GLM-5.2 | mla+dsa | `(512 + 64) + 128` = **704** | 78 | 107 KB | **3.5 GB** |
+| Kimi-K3 | mla+kda | `512 + 64` = **576**, on **24 of 93** layers | 24 (+69 stateful) | 27 KB | **1.1 GB** = 906 MB + 232 MB fixed |
+
+**One row in that table is not linear in context.** Kimi-K3's 69 linear layers hold a
+`n_heads × head_dim × head_dim` recurrent matrix and a short convolution window each — present in
+full at zero tokens and unchanged at a million. So its per-sequence cost is `growth × context +
+constant`, and the constant is the larger term below ~17k tokens. `kv_bytes_for_context` exists for
+exactly this: a per-token figure multiplied by context is wrong in one direction at short context
+and the other at long. (Figures above follow this table's fp16 convention; the engine's cache is
+fp32, so the real allocations are double — see D45.)
 
 **The cache has TWO PLANES and they are not the same size.** `kv_geometry()` reports both, because a
 single width could not express "this family stores no second plane" — and for want of that, MLA
@@ -233,13 +271,16 @@ like an unrelated bug.
 
 | Field | Type | Notes |
 |---|---|---|
-| `activation` | enum | `swiglu` \| `geglu` \| `relu2` |
+| `activation` | enum | `swiglu` \| `geglu` \| `relu2` \| `situ` |
 | `has_gate` | bool | |
 | `expert_intermediate` | int | `moe_intermediate_size` |
 | `dense_intermediate` | int | For `layer_kinds == "dense"` layers |
 | `shared_intermediate` | int | |
 | `swiglu_limit` | float | V4 clamps gate above and up symmetrically before SwiGLU |
 | `expert_layout` | enum | `interleaved_gud` — gate/up/down interleaved per expert (§5.3 of architecture.md) |
+| `routed_expert_hidden` | int | **Latent MoE.** Width the ROUTED experts operate at; 0 = `d_model`. `bytes_per_token` is linear in it |
+| `routed_expert_norm` | bool | RMSNorm on the COMBINED top-k output, before the up-projection — not per expert, which is why it cannot be folded into the expert weights |
+| `situ_beta`, `situ_linear_beta` | float | `situ` only; a stated 0 for the linear beta means the up half is NOT transformed |
 
 Schema v2 also carries `hyper_connections = { multiplier, sinkhorn_iters, eps }`. V4 uses four
 streams, with learned block pre/post controls and a Sinkhorn-normalized stream mixing matrix at both
@@ -407,6 +448,10 @@ Admission rejects a document that fails any of:
 - `quantization.router.dtype != "f32"`
 - `top_k > n_experts`, `n_groups` does not divide `n_experts`, `topk_group > n_groups`
 - `n_shared_experts > 0` with `shared_intermediate == 0`
+- `mla+kda` with `len(kda.layer_kinds) != n_layers`, no `full` layer (nothing carries a cache), or
+  no MLA dimensions for the layers that do
+- `routed_expert_hidden > d_model` — a latent MoE projects DOWN; wider than the residual stream is
+  not a latent space, and taking it at face value inflates every expert
 - tokenizer round-trip mismatch
 - any `economics` field absent (profiling did not complete)
 

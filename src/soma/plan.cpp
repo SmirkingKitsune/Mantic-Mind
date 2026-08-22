@@ -89,9 +89,21 @@ Status compute_plan(const ArchIr& arch, const HostBudget& budget, PlanDocument& 
     }
 
     // ── one expert: gate + up + down ─────────────────────────────────────────
-    const std::uint64_t expert_bytes = bytes_for(arch, fi, d, TensorRole::ExpertGate) +
-                                       bytes_for(arch, fi, d, TensorRole::ExpertUp) +
-                                       bytes_for(arch, d, fi, TensorRole::ExpertDown);
+    //
+    // At the ROUTED width, which is `d_model` for every family without a latent
+    // MoE and narrower for one that has it. This read `d` directly, and was
+    // correct for five families by coincidence rather than by argument — none of
+    // them projected the residual stream down before routing.
+    //
+    // The coincidence is expensive to keep: `bytes_per_token` is
+    // `n_moe_layers x top_k x expert_bytes` and the verdict is computed from it,
+    // so charging an expert at 7168 wide when it is 3584 wide doubles the
+    // headline number and refuses a model that streams comfortably. Wrong in the
+    // pessimistic direction, which is the direction that looks responsible.
+    const auto ew = arch.routed_expert_width();
+    const std::uint64_t expert_bytes = bytes_for(arch, fi, ew, TensorRole::ExpertGate) +
+                                       bytes_for(arch, fi, ew, TensorRole::ExpertUp) +
+                                       bytes_for(arch, ew, fi, TensorRole::ExpertDown);
 
     out.attention_family = to_string(arch.attention.family);
     out.n_layers = n_layers;
@@ -143,6 +155,22 @@ Status compute_plan(const ArchIr& arch, const HostBudget& budget, PlanDocument& 
         dense += 2ull * d * sizeof(float); // input + post-attn norms, always f32
         if (arch.is_moe_layer(l)) {
             dense += static_cast<std::uint64_t>(n_experts) * d * sizeof(float); // router, f32
+            if (arch.ffn.routed_expert_hidden != 0) {
+                // A latent MoE's two projections. Dense, read on every token,
+                // and NOT small: at 7168 x 3584 each, over 92 MoE layers, they
+                // are ~4.7 B parameters — comparable to the whole resident half
+                // of a mid-size model. Omitting them because the experts they
+                // wrap are streamed would under-count exactly the memory that
+                // has to be there before any expert can be.
+                // SharedExpert, matching how f32_model binds them: dense FFN tensors
+                // the converter keeps at F32. Charging AttnProj here while
+                // binding SharedExpert would make the plan and the load
+                // disagree about the same bytes.
+                dense += 2ull * bytes_for(arch, ew, d, TensorRole::SharedExpert);
+                if (arch.ffn.routed_expert_norm) {
+                    dense += static_cast<std::uint64_t>(ew) * sizeof(float);
+                }
+            }
             if (arch.router.n_shared_experts > 0) {
                 // `shared_intermediate` ALREADY carries the count.
                 //

@@ -114,6 +114,18 @@ struct F32LayerWeights {
 
     WeightRef shared_gate, shared_up, shared_down;
     WeightRef dense_gate, dense_up, dense_down;
+
+    /// LATENT MoE: the routed experts run in a space narrower than the residual
+    /// stream. Empty unless `FfnSpec::routed_expert_hidden` is set.
+    ///
+    /// These wrap the routed experts and NOT the shared one, which reads the
+    /// full-width input — so they cannot be folded into the expert weights even
+    /// though both projections are linear. `latent_norm` sits between the
+    /// combination and the up-projection and is not linear at all, which settles
+    /// it: the norm applies to the WEIGHTED SUM over the top-k, once, not to each
+    /// expert's contribution.
+    WeightRef latent_down, latent_up;
+    std::span<const float> latent_norm;
 };
 
 struct F32Model {
@@ -216,6 +228,14 @@ struct F32Workspace {
     /// disjoint offsets by construction.
     std::vector<float> tile_x, tile_gate, tile_up, tile_act, tile_out;
     void ensure_tile_scratch(std::uint32_t tile, std::uint32_t d_model, std::uint32_t inter);
+
+    /// Latent-MoE staging: the down-projected input the routed experts read, and
+    /// the combined output they accumulate into, both at the latent width.
+    ///
+    /// Separate from `attn_out` because the shared expert still writes there at
+    /// the full width, and the two are summed only after the up-projection.
+    std::vector<float> latent_in, latent_out;
+    void ensure_latent(std::uint32_t n_tokens, std::uint32_t width);
 
     // ── batch-union (CSR) ────────────────────────────────────────────────────
     //

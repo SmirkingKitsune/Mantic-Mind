@@ -60,7 +60,11 @@ TARGET_MAX_POS = 2048
 # Config keys naming the same concept across families. Upstream is inconsistent;
 # resolving that here means nothing downstream has to care.
 EXPERT_COUNT_KEYS = ("num_experts", "num_local_experts", "n_routed_experts")
-TOPK_KEYS = ("num_experts_per_tok",)
+# Kimi spells it `num_experts_per_token`. Missing the alias leaves top_k at
+# its production 16 against a shrunken 16 experts, i.e. top_k == n_experts,
+# which skips selection entirely — the fixture would route to everything and
+# never exercise the router at all.
+TOPK_KEYS = ("num_experts_per_tok", "num_experts_per_token")
 MOE_INTERMEDIATE_KEYS = ("moe_intermediate_size",)
 SHARED_INTERMEDIATE_KEYS = ("shared_expert_intermediate_size",)
 
@@ -284,6 +288,64 @@ def shrink_dsa(cfg: dict[str, Any]) -> None:
         )
 
 
+def shrink_kimi_linear(cfg: dict[str, Any], layers: int) -> None:
+    """Shrink the hybrid KDA/MLA stack, its latent MoE and its block residual.
+
+    Four mechanisms live here and every one of them can be shrunk into
+    invisibility, so each gets an explicit floor:
+
+    THE HYBRID SPLIT. `full_attn_layers` and `kda_layers` are stated ONE-BASED
+    (`is_kda_layer` reads `(layer_idx + 1) in kda_layers`). A fixture with only
+    one kind is not a hybrid, so both must survive — and the production stack
+    ends `..., 88, 92, 93`, two ADJACENT full layers, which is where a
+    stride-based re-derivation would first disagree. The shrunken pattern keeps
+    that: the last two layers are both full.
+
+    KDA HEAD DIM HAS A HARD FLOOR OF 16. Not a preference: fla's Triton kernels
+    reject anything smaller from inside `tl.dot` with "K >= 16", so a fixture at
+    8 does not run at all.
+
+    THE LATENT MoE. `routed_expert_hidden_size` must stay strictly BELOW
+    hidden_size or the latent space is not latent and the projections are
+    square — which would let a `d_model`-width expert sizing pass.
+
+    THE BLOCK RESIDUAL. `attn_res_block_size` 12 against 4 layers would snapshot
+    only at layer 0, leaving a stack of one, and a softmax over `{snapshot,
+    prefix}` with a single snapshot cannot distinguish an implementation that
+    ignores the stack from one that reads it. Set so at least two snapshots
+    accumulate AND at least one layer is not a boundary.
+    """
+    heads, head_dim = 2, 16
+    lac = cfg.get("linear_attn_config")
+    if not isinstance(lac, dict):
+        raise SystemExit("  REFUSED: kimi_linear without linear_attn_config is not a hybrid")
+
+    # 1-based, and the last two layers are both full.
+    full = [layers - 1, layers]
+    kda = [i for i in range(1, layers + 1) if i not in full]
+    if not kda:
+        raise SystemExit(
+            f"  REFUSED: {layers} layers leaves no KDA layer once the two-adjacent-full "
+            f"tail is preserved. Raise --layers to 3 or more.")
+    lac["full_attn_layers"] = full
+    lac["kda_layers"] = kda
+    lac["num_heads"] = heads
+    lac["head_dim"] = head_dim
+    # Semantics, preserved verbatim: the convolution window length, the gate
+    # clamp, and which of the two output-gate ranks the weights use.
+    lac.setdefault("short_conv_kernel_size", 4)
+    lac.setdefault("gate_lower_bound", -5.0)
+    lac.setdefault("use_full_rank_gate", True)
+
+    hidden = int(cfg.get("hidden_size", 64))
+    if cfg.get("routed_expert_hidden_size"):
+        cfg["routed_expert_hidden_size"] = max(16, hidden // 2)
+
+    if cfg.get("attn_res_block_size"):
+        # Two snapshots minimum, and never every layer.
+        cfg["attn_res_block_size"] = max(2, layers // 2)
+
+
 def shrink_moe(cfg: dict[str, Any]) -> None:
     """Shrink expert counts and widths, preserving every routing semantic."""
     ekey = _first_present(cfg, EXPERT_COUNT_KEYS)
@@ -343,6 +405,10 @@ def shrink_config(raw: dict[str, Any], layers: int, experts: int) -> dict[str, A
         shrink_attention(cfg)
         shrink_mla(cfg)
         shrink_dsa(cfg)  # after shrink_mla: DSA is MLA plus an indexer
+        if cfg.get("model_type") in ("kimi_linear", "kimi_k3"):
+            # After shrink_mla, which owns the FULL-attention layers' dims and
+            # settles hidden_size — the latent MoE width is derived from it.
+            shrink_kimi_linear(cfg, layers)
     shrink_moe(cfg)
 
     _shrink(cfg, "vocab_size", TARGET_VOCAB)
@@ -529,6 +595,26 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--generate", type=int, default=256,
                     help="greedy tokens (gate requires >= 256)")
     ap.add_argument("--name", default=None, help="fixture slug override")
+    ap.add_argument("--kda-mode", default=None,
+                    help="force fla's KDA kernel mode on every linear-attention layer. "
+                         "`KimiDeltaAttention` picks `chunk` for any prompt longer than one "
+                         "token, and fla's chunked and recurrent kernels disagree with EACH "
+                         "OTHER by ~6e-04 — so a chunked oracle cannot grade a recurrent "
+                         "engine at a useful tolerance. Pass fused_recurrent to compare like "
+                         "with like.")
+    ap.add_argument("--attn-impl", default=None,
+                    help="override config._attn_implementation AFTER construction. "
+                         "Kimi's KimiLinearModel.__init__ forces flash_attention_2 "
+                         "unconditionally and warns that it is ignoring whatever it was "
+                         "asked for, so the only way to reach the eager path is to set it "
+                         "back afterwards. `eager` is also the better oracle: it is "
+                         "transformers' reference attention, and it makes create_causal_mask "
+                         "build a real mask instead of deferring causality to the kernel.")
+    ap.add_argument("--device", default="cpu",
+                    help="device to RUN on. cpu unless the family's reference needs "
+                         "otherwise: Kimi's KDA layers call fla, whose kernels are Triton "
+                         "and have no CPU backend at all. Weights are always built and "
+                         "seeded on the cpu, so the fixture is identical either way.")
     args = ap.parse_args(argv[1:])
 
     # Imported late so --help works without torch installed.
@@ -622,6 +708,28 @@ def main(argv: list[str]) -> int:
         model = AutoModelForCausalLM.from_config(cfg_obj, trust_remote_code=not native)
     model = model.to(torch.float32).eval()
 
+    if args.attn_impl:
+        # Every submodule holds a reference to the SAME config object, so one
+        # assignment reaches the whole stack. Done after construction because
+        # construction is what overwrote it.
+        model.config._attn_implementation = args.attn_impl
+        if hasattr(model, "model") and hasattr(model.model, "config"):
+            model.model.config._attn_implementation = args.attn_impl
+        print(f"  attn impl   : {args.attn_impl} (forced after construction)")
+
+    if args.kda_mode:
+        inner = getattr(model, "model", model)
+        forced = 0
+        for layer in getattr(inner, "layers", []):
+            if getattr(layer, "is_linear_attn", False):
+                layer.self_attn.mode = args.kda_mode
+                forced += 1
+        if forced == 0:
+            print("error: --kda-mode given but no linear-attention layer was found",
+                  file=sys.stderr)
+            return 2
+        print(f"  kda mode    : {args.kda_mode} on {forced} layer(s)")
+
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  params      : {n_params:,}  ({n_params * 4 / 1e6:.1f} MB fp32)")
 
@@ -657,12 +765,26 @@ def main(argv: list[str]) -> int:
     vocab = tiny_cfg["vocab_size"]
     ids = torch.randint(0, vocab, (1, args.positions), generator=gen, dtype=torch.long)
 
+    # Weights were initialized on the cpu above, from a cpu generator, and are
+    # moved only now. Building on the accelerator instead would make the fixture
+    # depend on that device's RNG — which is not reproducible across driver
+    # versions, and a fixture whose weights drift is not a fixture.
+    dev = args.device
+    if dev != "cpu":
+        if not torch.cuda.is_available() and dev.startswith("cuda"):
+            print("error: --device cuda requested but torch reports no CUDA",
+                  file=sys.stderr)
+            return 2
+        model = model.to(dev)
+        ids = ids.to(dev)
+        print(f"  device      : {dev} ({torch.cuda.get_device_name(0)})")
+
     with torch.no_grad():
         # use_cache=False: G0 is a single-sequence, no-KV-reuse comparison, and
         # the greedy loop below re-runs the full prefix each step anyway. Running
         # the reference without a cache removes an entire class of divergence
         # between the oracle and the engine from the ground truth.
-        tf_logits = model(ids, use_cache=False).logits.to(torch.float32)
+        tf_logits = model(ids, use_cache=False).logits.to(torch.float32).cpu()
 
     # Greedy from a short prefix. Hand-rolled rather than model.generate() so the
     # loop matches what the engine does: argmax, append, re-run. generate()
@@ -676,8 +798,16 @@ def main(argv: list[str]) -> int:
             out = model(cur, use_cache=False).logits[:, -1, :]
             nxt = int(torch.argmax(out, dim=-1).item())
             greedy.append(nxt)
-            cur = torch.cat([cur, torch.tensor([[nxt]], dtype=torch.long)], dim=1)
+            cur = torch.cat(
+                [cur, torch.tensor([[nxt]], dtype=torch.long, device=cur.device)], dim=1)
 
+    # Everything below writes the fixture, so it all comes back to the cpu —
+    # including the weights, which must be saved as cpu tensors whatever they
+    # were executed on.
+    ids = ids.cpu()
+    prefix = prefix.cpu()
+    if dev != "cpu":
+        model = model.to("cpu")
     ids_np = ids.numpy().astype(np.int32)
     tf_np = tf_logits.numpy().astype(np.float32)
     prefix_np = prefix.numpy().astype(np.int32)
@@ -739,6 +869,14 @@ def main(argv: list[str]) -> int:
         "generate": args.generate,
         "weights_sha256": weights_sha,
         "tf_logits_sha256": logits_sha,
+        # The two execution choices that are NOT defaults. Without them the
+        # fixture cannot be regenerated to the same bytes: Kimi needs eager
+        # (its constructor forces flash_attention_2) and the recurrent KDA
+        # kernel (fla's chunked kernel disagrees with its own recurrent one
+        # by ~6e-04, which no engine can be graded against).
+        "attn_implementation": args.attn_impl,
+        "kda_mode": args.kda_mode,
+        "device": args.device,
         "greedy_first_16": greedy[:16],
         "torch_version": torch.__version__,
         "transformers_version": transformers.__version__,

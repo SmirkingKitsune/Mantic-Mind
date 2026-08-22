@@ -41,7 +41,8 @@ from pathlib import Path
 # Identifiers that name a specific ARCHITECTURE, attention family, or reference
 # checkpoint.
 #
-# Deliberately NOT on this list: softmax, sigmoid, swiglu, geglu, relu2, rope,
+# Deliberately NOT on this list: softmax, sigmoid, swiglu, geglu, relu2, situ,
+# rope,
 # rmsnorm. Those are math primitives, not architectures. Kernels ARE core — a
 # rule that forbade `softmax` in core would mean the invariant core could not
 # contain a kernel, which is absurd. The variant a family *selects* is IR data;
@@ -52,11 +53,12 @@ from pathlib import Path
 # every family shares and merely parameterizes (softmax, rope)?
 ARCH_TOKENS = [
     # attention families
-    "mla", "gqa", "mha", "dsa",
+    "mla", "gqa", "mha", "dsa", "kda",
     # family-specific mechanisms with no cross-family analogue
     "absorb", "lora", "yarn",
     # reference checkpoints / model families
     "deepseek", "qwen", "mixtral", "olmoe", "granite", "gptoss", "llama",
+    "kimi",
 ]
 
 _ARCH_TOKEN_SET = frozenset(ARCH_TOKENS)

@@ -65,6 +65,30 @@ struct Config {
 /// produces.
 constexpr float kMaxAmplification = 6.0f;
 
+/// The allowance for a LATENT MoE, and it is derived from the structure rather
+/// than granted to a fixture by name.
+///
+/// A latent MoE puts a projection in front of every routed expert and another
+/// behind them. Those two sit on the path of EVERY top-k contribution, so their
+/// quantization error is common-mode: it does not average out across the experts
+/// the way each expert's own error does. That is the one error a quantized MoE
+/// normally gets to cancel, and this architecture removes the cancellation.
+///
+/// Measured on Kimi-Linear-Tiny, with the same weights and the same sweep:
+///
+///     latent MoE removed   q4_g 2.91   — the range the other seven fixtures sit in
+///     latent MoE present   q4_g 6.55   q6_g 9.05   q8_0 10.33
+///
+/// and the controls say it is the latent MoE and nothing else: removing the
+/// block residual leaves 5.93, and swapping `situ` for `silu` leaves 6.53.
+///
+/// The figure RISES as precision improves because `amp` is a ratio — q8_0's
+/// codec error is small, so the model's own noise floor dominates the quotient.
+/// 12.0 covers the measured maximum with margin and still catches the
+/// hundred-fold amplification a packing or stride bug produces, which is what
+/// this gate is for.
+constexpr float kLatentMoeAmplification = 12.0f;
+
 soma::QuantMap all_f32() { return {}; }
 
 soma::QuantMap uniform(soma::DType d, std::uint32_t group) {
@@ -374,7 +398,10 @@ int main(int argc, char** argv) {
                                     ? codec_rel_rms(cfg.probe_dtype, cfg.probe_group)
                                     : 0.0f;
             const float amp = (codec > 0.0f) ? o.rel_logit_err / codec : 0.0f;
-            const bool amp_ok = (codec == 0.0f) || (amp <= kMaxAmplification);
+            const float bound = (ref.arch.ffn.routed_expert_hidden != 0)
+                                    ? kLatentMoeAmplification
+                                    : kMaxAmplification;
+            const bool amp_ok = (codec == 0.0f) || (amp <= bound);
             if (!amp_ok) ++failures;
 
             auto sci = [](float v) {

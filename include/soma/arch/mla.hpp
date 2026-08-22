@@ -74,6 +74,15 @@ struct F32AttnWeights {
     soma::WeightRef kv_b_proj; ///< latent -> per-head (K-nope ++ V)
     soma::WeightRef o_proj;
 
+    /// `g_proj` — a sigmoid gate on the attention output, present iff
+    /// `MlaSpec::output_gate`. `[n_heads * v_head_dim, d_model]`.
+    ///
+    /// A VARIANT OF MLA, bound and applied here rather than in whichever family
+    /// happens to use it first. Kimi-K3's full-attention layers are MLA layers;
+    /// a hybrid stack borrowing this backend should borrow the whole of it, not
+    /// reimplement the gate beside it and drift.
+    soma::WeightRef out_gate;
+
     /// `mlp.gate.e_score_correction_bias` — V3's `noaux_tc` routing bias.
     ///
     /// A ROUTER parameter living in the attention payload, which is only odd
@@ -190,6 +199,22 @@ StatusCode f32_route(const ArchIr& arch,
                      std::uint32_t n_tokens,
                      std::uint32_t* out_ids,
                      float* out_weights) noexcept;
+
+/// The same `noaux_tc` router, for a family that does not share this backend's
+/// layer payload.
+///
+/// `f32_route` reads the selection bias out of `F32AttnWeights`, which is only
+/// valid for a layer THIS backend bound. A hybrid stack binds its own payload
+/// type, and casting one to the other is undefined behaviour that happens to
+/// read a plausible-looking empty span — so the bias silently disappears and
+/// the router selects different experts. Passing the span explicitly makes the
+/// sharing legitimate.
+StatusCode f32_route_with_bias(const ArchIr& arch,
+                               std::span<const float> e_score_bias,
+                               const float* logits,
+                               std::uint32_t n_tokens,
+                               std::uint32_t* out_ids,
+                               float* out_weights) noexcept;
 
 const soma::F32Backend& f32_backend() noexcept;
 

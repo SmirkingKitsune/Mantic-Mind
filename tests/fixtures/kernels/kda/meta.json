@@ -1,0 +1,19 @@
+{
+  "producer": "fla.ops.kda.fused_recurrent_kda",
+  "fla_version": "0.5.2",
+  "torch": "2.11.0+cu128",
+  "device": "NVIDIA GeForce RTX 5090",
+  "seed": 20260822,
+  "heads": 2,
+  "head_dim": 16,
+  "tokens": 48,
+  "gate_lower_bound": -5.0,
+  "flags": [
+    "use_qk_l2norm_in_kernel",
+    "use_gate_in_kernel",
+    "use_beta_sigmoid_in_kernel",
+    "safe_gate"
+  ],
+  "state_layout": "[heads][key][value]",
+  "bytes": 33316
+}

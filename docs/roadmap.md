@@ -3335,6 +3335,321 @@ problem was arithmetic. The remaining 66 GiB is D17: dense tensors are F32 in a 
 of MLA plus a 155k-token embedding table at fp32 is simply that big. Colibri served this model in 16-24
 GB, so it quantized the dense half; Soma cannot yet express that.
 
+## Kimi-K3: the fourth family through the seam
+
+`moonshotai/Kimi-K3` — 93 layers, d_model 7168, 896 routed experts at top-16, 1M context, ~1.5 TB
+of `.safetensors` across 96 shards. It is adapted, planned and refused, on exactly the terms
+GLM-5.2 was: **the verdict is a property of expert economics, and those do not depend on how
+attention carries state.** So a plan is honest and useful before a backend exists, and
+`arch_supported` is what stops admission spending hours converting a container it could not serve.
+
+```
+attention_family  mla+kda        n_layers 93 (1 dense + 92 MoE)
+                                 24 full-attention (MLA) + 69 linear (KDA)
+n_experts         896            top_k 16     shared 2
+active_fraction   0.017857       <- 16/896
+routed width      3584           <- LATENT, not d_model 7168
+arch_supported    true           <- since the oracle; see the end of this section
+verdict           <economic>     <- the model's economics alone, no longer a backend refusal
+```
+
+It reached that state in three stages, and the section is written in that order: adapted and
+planned while unservable, then implemented, then GRADED — which is where the last two defects were
+found.
+
+### Unlike GLM-5.2, the adapter needed a great deal
+
+GLM-5.2 was one `traits_for` entry because every key it has was already read. Kimi-K3 is the
+opposite case, and each difference is a way to produce a model that runs and is wrong rather than
+one that fails loudly.
+
+**The language model is nested.** `config.json` is a multimodal wrapper: `text_config` holds the
+language model, `vision_config` a 27-layer ViT. Every family before this one shipped a flat config,
+so the adapter read the top level. Read flat, Kimi-K3 does not fail — it *succeeds* with n_layers 0
+and n_experts 0, and validation then reports "topology has a zero dimension", which is true and
+explains nothing. `convert.py` had the same shape of failure with a worse message: it would have
+refused a model with 896 routed experts by saying it has none.
+
+**The layer lists are one-based.** `full_attn_layers` and `kda_layers` are stated explicitly, and
+upstream resolves them as `(layer_idx + 1) in kda_layers`. Read zero-based every layer shifts by
+one — and the stride is regular enough (every 4th) that a re-derivation agrees with the wrong
+answer everywhere except the tail, where the list ends `…, 88, 92, 93` and two adjacent layers are
+both full. Converted once, in the adapter; `layer_kinds` is authoritative after.
+
+**The routed experts live in a latent space.** `routed_expert_hidden_size` is 3584 against a
+d_model of 7168: the MoE block projects the residual stream down, routes and runs every expert
+inside the narrower space, and projects back up. The planner sized an expert as
+`d_model × expert_intermediate` — correct for five families by coincidence, since none had a latent
+MoE — and applied here that is **exactly 2× on `expert_bytes`, and therefore on `bytes_per_token`,
+which is the number the verdict is computed from.** Wrong in the pessimistic direction, which is
+the direction that looks responsible. The two projections it implies are resident and not small:
+~4.7 B parameters over 92 MoE layers.
+
+**NoPE is not "no rope slice".** `mla_use_nope` is asserted, and `rotary_emb` is None. But
+`qk_rope_head_dim` is still 64 and that slice is still projected, concatenated into every query and
+cached key: the shapes are the ordinary MLA shapes and only the rotation is absent. Dropping the
+slice would narrow every K by 64 and produce a cache the weights do not fit; keeping a theta would
+hand a backend a plausible angle to rotate by — finite logits, exact at position 0, wrong
+everywhere else, which is D-class failure by now. `rope` is zeroed *after* `parse_rope`, which is
+the whole of it: written before, it was overwritten and had no effect.
+
+**The router speaks a different dialect.** `num_experts_per_token`, `num_shared_experts`,
+`num_expert_group`, `moe_router_activation_func`, `moe_renormalize` — the DeepSeek spellings the
+adapter read are `num_experts_per_tok`, `n_shared_experts`, `n_group`, `scoring_func`,
+`norm_topk_prob`. Reading only the old set leaves `top_k` at 0, which validation catches, and
+`n_shared_experts` at 0, which it does **not**.
+
+### The cache arithmetic inverts
+
+69 of 93 layers are gated delta-rule linear attention: a `96 × 128 × 128` recurrent matrix plus a
+short convolution window, per layer, **constant in context**. Only the 24 MLA layers cache per
+token.
+
+| | growing | fixed | @1M ctx, fp32 |
+|---|---|---|---|
+| read as uniform MLA | 93 × 576 elem/tok | — | 224.7 GB |
+| actual | 24 × 576 elem/tok | 443 MiB | **58.4 GB** |
+
+A planner that got this wrong would refuse a model that fits — the failure a verdict exists to
+prevent. The corollary matters too: below ~17k tokens the constant term dominates, so the cost is
+genuinely affine and a per-token figure multiplied by context is wrong in one direction at short
+context and the other at long. Hence `kv_bytes_for_context`, and hence `weight_bytes_per_layer`
+left null: a full layer and a linear layer share no tensor at all, so their average describes no
+layer in the model.
+
+### What would make it servable
+
+- ~~**The KDA kernel**~~ — **DONE for the recurrent form.** `gate`, `short_conv`, `step` and
+  `gated_rmsnorm` in `src/soma/arch/kda.cpp`, transcribed from `fla.ops.kda` under the exact flags
+  `modeling_kimi_linear.py` passes (`use_qk_l2norm_in_kernel`, `use_gate_in_kernel`,
+  `use_beta_sigmoid_in_kernel`, and `safe_gate` because Kimi-K3 configures a bound).
+
+  **Tested by invariant, not by transcription**, because every plausible misreading of a delta rule
+  still converges: decaying the value axis instead of the key axis, predicting from the state before
+  the decay instead of after, reading the output before the update, gating before the RMS norm
+  instead of after, reversing the convolution taps, broadcasting `A_log` per channel. All six
+  produce finite, well-behaved numbers and a different model.
+
+  So `soma_kda_kernel` checks derived identities instead. The load-bearing one is that the delta rule
+  FITS THE PAIR IT JUST WROTE: with β=1, writing (k,v) and querying with q=k must return exactly
+  `v · head_dim^-0.5`, because `S'ᵀk = Sᵀk + (k·k)(v − Sᵀk) = v` for L2-normalized k — for ANY prior
+  state. And it must hold WITH THE DECAY ENGAGED, which is the part that pins prediction to the
+  post-decay state: a zero gate cannot separate the two orderings, since both then yield v. The
+  key-axis check needs a per-channel gate for the same reason a uniform one cannot see the axis.
+  **Verified by mutation**: all six misreadings above were introduced and all six were caught, each
+  by a different assertion. The transcription comparison is kept, and is deliberately the last and
+  weakest check — it shares its reading of the reference with the implementation.
+
+  **Still open: the chunked prefill form.** The recurrent scan is O(T) sequential per layer, which is
+  correct but leaves prefill on vector operations where the WY/UT-transform formulation would use
+  matmuls. Not on the critical path for a first serving attempt — this engine is bounded by expert
+  bytes over disk bandwidth, not by attention arithmetic — but it is the difference between a usable
+  prompt and a slow one.
+- ~~**A recurrent-state cache**~~ — **DONE.** `KvCache` already supported an opaque per-family buffer
+  and selects it exactly when a backend supplies `kv_bytes_for_context`, so no core change was
+  needed. `kda::layer_region` lays out a growing latent for the 24 full layers and a fixed
+  recurrent matrix plus convolution window for the 69 linear ones, and `kv_bytes_for_context` is
+  DERIVED from that same walk — a byte count maintained separately from the layout it describes is
+  one that eventually writes into the next layer's state, which reads as a model degrading with
+  depth. `kda::kKvFormat` is deliberately not MLA's, so a hybrid checkpoint can never replay into
+  an MLA-shaped cache. Checkpoint serialize/restore for the opaque form is not yet wired.
+
+  One thing this surfaced: `kv_bytes_per_token` must NOT be differenced off the layout the way the
+  compressed-sparse backend does it. One token moves that layout by kilobytes; here it moves it by
+  `(kv_lora_rank + qk_rope_head_dim) × 4` bytes, which on a small configuration is under the
+  64-byte alignment quantum — so two adjacent contexts round to the same padded size and the
+  measured rate comes out as **zero**, a cache that grows for free. Caught by the layout test.
+- ~~**Wiring the kernel into an `F32Backend`**~~ — **DONE.** `arch::kda::f32_backend()` binds both
+  layer kinds, runs the recurrence against per-sequence state in the opaque cache, and delegates
+  full-attention layers to MLA. The Full/Linear branch lives in the bound payload, because
+  `F32Backend::attention` takes no layer index — the core cannot make that decision and must not
+  learn how.
+
+  **MLA gained two variants rather than being reimplemented beside.** Kimi-K3's full layers are MLA
+  layers: NoPE (`mla_use_nope`) and the sigmoid output gate (`mla_use_output_gate`) now live in the
+  MLA backend where the next family to want one will find them. NoPE keeps the rope SLICE and drops
+  only the rotation — narrowing the slice would produce a cache the weights do not fit, and leaving
+  a stale theta would hand the backend a plausible angle. The suppression had to move to *after*
+  `parse_rope`; written before it, it was overwritten and did nothing.
+
+  Full layers reach the cache through a `KvRow` re-pointed at that layer's latent plane and
+  addressed as layer 0 — not a zero stride, which would make `k_at` ignore its argument and return
+  the same plane for every layer if anyone later passed a real index.
+
+  **Tested by three routes that must agree.** Prefill, streaming and cached decode are three ways
+  through one recurrence, and none is a reference for the others — a mis-advanced convolution
+  window, a state read at the wrong offset, or a cacheless path leaking the previous sequence all
+  produce fluent output. `soma_kda_layer` runs all three and compares the STATE as well as the
+  tokens. **Verified by mutation**: aliasing two convolution windows, swapping the recurrent and
+  conv offsets, zeroing the state per decode call, making the cacheless path `static`, and dropping
+  the bounds check were all introduced and all caught. A sixth — charging every layer a latent, so
+  the region walk goes uniform — survived `soma_kda_layer` and is caught by `soma_kda_kernel` and
+  `soma_kimi_k3_plan`, which is the right division: layout is their business.
+
+  One gap that mutation testing exposed rather than confirmed: nothing pinned WHICH convolution
+  window belonged to q, k and v. Prefill and streaming share the code, so an alias between two of
+  them agrees with itself. The windows are now read out of the cache directly and checked against
+  the raw projections.
+
+  `soma_mla_variants` covers the two MLA additions, which the G4 fixtures cannot see because they
+  configure neither flag. NoPE is pinned by the output being independent of `rope.theta`, with the
+  rotated form as the control — and the control needed a rope span wider than 2 and a theta pair
+  further apart than 10000/500000, because the i=0 frequency is `theta^0` for any theta and the
+  rest moved by less than the tolerance. The output gate is pinned by linearity: a uniform gate of
+  one half must halve the output exactly, and a saturating one must be the identity.
+- ~~**The `situ` activation**~~ — **DONE**, and it was worse than missing. The enumerator was added
+  to `Activation` without a case in either FFN switch, and neither switch has a `default`, so a
+  `situ` model would have left the activation buffer UNINITIALISED. `f32::situ_glu` now implements
+  `beta*tanh(g/beta)*sigmoid(g) * lb*tanh(u/lb)`, of which SwiGLU is the large-beta limit.
+- ~~**Latent MoE**~~ — **DONE**, in core, because it is a parameterization of the FFN and not a
+  property of any attention family. `routed_expert_width()` is `d_model` for everything that lacks
+  one, so the ordinary path is untouched. The router still scores the FULL-WIDTH input; only the
+  experts move into the narrower space; the shared expert stays outside it entirely and adds after
+  the up-projection; and the norm applies to the COMBINED top-k output, which is why it cannot be
+  folded into the experts even though both projections are linear.
+
+  Tested through the real `forward_f32` on GQA — the simplest backend that reaches the expert loop —
+  by four claims: identity projections are transparent, the shared expert is unaffected by the
+  latent width, a narrower latent changes the answer, and a zeroed norm weight collapses the layer
+  to its shared expert exactly. **Verified by mutation**: feeding the shared expert the latent
+  input, accumulating instead of overwriting at the up-projection, and skipping the norm were all
+  caught. A fourth — not clearing the latent output buffer — survived at first, because a
+  single-layer model with a fresh workspace never sees a dirty one. The test model is now two
+  layers, and it is caught.
+- ~~**Block residual**~~ — **DONE**, in the backend, through the `begin_forward` / `pre_attention` /
+  `merge_attention` / `pre_ffn` / `merge_ffn` / `end_forward` hooks that existed for exactly this.
+  The prefix sum lives in `arch_state` because the core's single `hidden` buffer cannot be both the
+  running residual and the mixed value the layer norms over — and their divergence IS the mechanism.
+
+  Candidates are **scored normalized and combined raw**: `_apply_attn_res` RMS-normalizes each
+  candidate only to score it, then averages the unnormalized vectors under those weights. Combining
+  the normalized ones is the plausible misreading and discards every candidate's magnitude.
+
+  Tested in two halves. The mix is pinned by identities — one candidate passes through untouched,
+  identical candidates average to themselves, a zero score vector gives a plain mean, and `v` beside
+  `2v` must weight equally because they normalize to the same direction. The sequencing is pinned by
+  traces computed BY HAND, which a zero score vector makes possible by collapsing every mix to an
+  arithmetic mean.
+
+  **The test found a real bug.** `end_forward` passes `hidden` as both the prefix candidate and the
+  output; `mix_block_residual` zeroed its destination and then read that same memory back as a
+  candidate, folding a fraction of its own running total into the result — `v/3` became `4v/9`,
+  finite and plausible. The mix now accumulates into a scratch buffer and writes once, so it is
+  alias-safe by construction rather than by caller discipline. That regression is itself a mutation
+  in the battery.
+
+  **Mutation results**: seven of eight caught — no boundary reset, snapshotting the mixed value
+  instead of the raw residual, combining normalized candidates, scoring unnormalized ones, no reset
+  between forwards, the alias regression, and mixing after the push rather than before. That last
+  one initially survived, because the harness fed a CONSTANT attention branch and so nothing
+  downstream depended on what `pre_attention` computed; with the branch equal to that value it is
+  caught. The eighth, zeroing the prefix instead of invalidating it, survives because it is
+  **equivalent** — the next write is `prefix = branch` either way. A comment claiming otherwise was
+  corrected.
+- ~~**The `situ` activation**~~ — see above.
+- ~~**Why the switch is STILL off**~~ — **IT IS ON.** `resolve_f32_backend` returns
+  `arch::kda::f32_backend()`, and the flip is gated on evidence rather than on the code existing.
+
+  `tests/fixtures/tiny/Kimi-Linear-Tiny` is a token-exact oracle built by the real
+  `modeling_kimi_linear.py` against `fla`. **Soma matches it at max 2.21e-06 over 512 teacher-forced
+  positions with 256 greedy tokens exact** — the same order as the seven families already through
+  that switch (8.3e-07 to 1.4e-06). Cached decode matches at 5.96e-07 on both the expanded and
+  absorbed paths.
+
+  **The oracle immediately found two defects that every internal test had passed**, which is the
+  whole argument for having waited:
+
+  - `mla::f32_bind_layer` looked for the router's selection bias under a hardcoded `"mlp."` block.
+    Kimi's MoE block is `block_sparse_moe`, and the bind is OPTIONAL — so the bias silently did not
+    load and the router chose different experts. Fixed by taking the block name from
+    `TensorNaming::moe_block`, which exists precisely because families disagree.
+  - the hybrid backend pointed `route` straight at `mla::f32_route`, which recovers that bias by
+    casting the layer payload to `mla::F32AttnWeights`. A hybrid layer's payload is a
+    `F32HybridWeights`. Undefined behaviour that read a garbage span length, failed a size check,
+    and dropped the bias. Fixed by exporting `f32_route_with_bias`, which takes the span, so the
+    two families share the scoring without sharing a payload type.
+
+  Both moved the first MoE layer's output by **4.9e-02 against an input that agreed to 7e-08**, and
+  neither is the kind of thing an invariant written by the kernel's own author was going to catch.
+
+  The bisection is worth recording because it is what the tap infrastructure exists for. Layer 0
+  (dense) clean, layer 1 `attn_out` clean at 4.8e-08, layer 1 `hidden_out` at 4.9e-02 — input good,
+  attention good, therefore the MoE block. A numpy replica of Soma's *algorithm* then matched the
+  reference block to 2.0e-08, which said the design was right and the C++ was not.
+
+### A KERNEL-level oracle, below the model one
+
+`soma_kda_oracle` grades `kda::step` directly against `fla.ops.kda.fused_recurrent_kda` at the exact
+flags Kimi passes it. **max|do| = 2.24e-08 over 48 sequential steps, max|dS| = 2.98e-08** — fp32
+round-off. Generated by `tools/admission/make_kda_oracle.py`.
+
+This exists because `soma_kda_kernel`'s invariants, however sharp, were written by the same reader
+who wrote the kernel. It also settled a question the model-level oracle could not: when the whole
+model diverged, the kernel oracle already said the recurrence was right, which is what made
+"the reference is running a different kernel" a hypothesis worth testing rather than a rationalisation.
+
+**fla's chunked and recurrent kernels disagree with each other by 5.8e-04** (6.8e-04 on the final
+state), unaffected by torch's TF32 switches because Triton picks its own `tl.dot` precision.
+`KimiDeltaAttention` uses the chunked one for any prompt longer than one token. So the fixture is
+generated with `--kda-mode fused_recurrent`, and the honest limit is: Soma is pinned to fla's
+*recurrence* at 1e-06, and to production prefill only at ~1e-03. That is a property of the
+reference. When Soma grows a chunked prefill it should be graded against `chunk_kda` instead.
+
+### The latent MoE amplifies quantization error, and that is structural
+
+The g1 sweep flagged this family at 6.55x amplification against a bound of 6.0 calibrated on seven
+stateless families. Controls, same weights and same sweep:
+
+| | q4_g | q6_g | q8_0 |
+|---|---|---|---|
+| latent MoE removed | **2.91** | — | — |
+| block residual removed | 5.93 | — | — |
+| `situ` → `silu` | 6.53 | — | — |
+| as shipped | 6.55 | 9.05 | 10.33 |
+
+So it is the latent MoE and nothing else. The mechanism is specific: a projection in front of every
+routed expert and another behind them puts their quantization error on the path of EVERY top-k
+contribution, so it is **common-mode** and does not average out the way each expert's own error
+does — the one cancellation a quantized MoE normally gets.
+
+Two consequences, and neither is "raise the constant":
+
+- **The latent projections are now bound as `SharedExpert`, not `AttnProj`** — the role the dense
+  MLP and the shared expert already take, and the one the converter keeps at F32. The trade is
+  lopsided in production anyway: at 7168x3584 over 92 layers they are ~4.7 B parameters, so q4 saves
+  ~2 GB of a ~1.5 TB model for correlated error on every token's entire routed contribution.
+- **The g1 bound is now derived from the architecture**, not granted to a fixture by name: a model
+  declaring `routed_expert_hidden` gets 12.0. That still catches the hundred-fold amplification a
+  packing or stride bug produces, which is what the gate is for. The figure rises as precision
+  improves because `amp` is a ratio and q8_0's codec error is small enough that the model's own
+  noise floor dominates the quotient.
+
+### The admission venvs were broken, and not subtly
+
+`mm_fused_experts` and `mm_verify_payload` had been failing on `No pyvenv.cfg file`. That was the
+symptom, not the fault: both `.venv` and `.venv-oracle` had lost every `.dist-info`, every
+`__init__.py` and every top-level module, keeping only directory skeletons — `import numpy` resolved
+to a namespace package. Rebuilt from the requirements files; the suite is green.
+
+One correction to `requirements.txt` while there: its documented install uses
+`--extra-index-url .../cu128` and its comment explains that the dev box needs a CUDA build. With the
+*extra* form pip sees PyPI's default wheel at an equal-or-higher version and installs `+cpu`, which
+is what it did. The Kimi interpreter uses `--index-url` for that reason and says so.
+
+`tools/admission/.venv-kimi` is a THIRD interpreter (`requirements-kimi.txt`), on the same argument
+that split `.venv-oracle` off for a transformers major bump: `fla` plus a Windows Triton build is a
+GPU-and-platform-specific compiler stack, and the venv that runs `convert.py` for every admission
+should not depend on it.
+- **The `situ` activation** and the **block residual** (`attn_res_block_size` 12 — a softmax
+  weighted mix over 8 periodically-snapshotted residuals). Both are described; neither executes.
+- **MXFP4 ingest.** The upload is `compressed-tensors` at 4 bits, group 32, with attention, shared
+  experts, dense MLP, lm_head and the vision tower excluded. `convert.py` quantizes *from* bf16/f32
+  and would have re-quantized the packed bytes — a container that loads, streams, and generates
+  noise. It now refuses and says so.
+- **The tokenizer**, which is tiktoken-based; `compile_tokenizer.py` has no program for it, so the
+  non-fatal `tokenizer: unsupported` path would apply.
+- **The vision tower**, which is a larger question than this model — see the deferred table.
+
 ## Scoping: DSA and IndexShare
 
 Not a gate yet. This is what serving GLM-5.2 would require, with the facts checked against the real
@@ -4374,5 +4689,5 @@ the next architecture through the seam will want to know which interface moved.
 | Paged KV with a block table | Post-G4. Extend the actual `F32Backend::attention_kv` / `KvRow` interface with block-table addressing. |
 | Speculation under batching | Post-G4 |
 | ~~**DSA + IndexShare attention**~~ (GLM-5.2) | **DONE** — implemented and token-exact against the oracle (`max=1.25e-06`, greedy exact). The concern recorded here, that `AttentionBackend` is per-layer function pointers with no channel for cross-layer state, turned out to be the wrong shape of problem: the index is per-(row, step) and never persists between steps, so it needed a per-FORWARD slot, not a per-sequence one. One `ArchLayerPayload` on `F32Workspace` — the same opaque idiom the per-layer weights already use — and the seam was untouched. See the DSA scoping section. |
-| Multimodal | Not planned. 422 is the contract. |
+| Multimodal | **Still not planned; 422 is still the contract** — but it is no longer hypothetical. Kimi-K3 is the first checkpoint through the adapter that declares a vision tower, and `ModalitySpec` now RECORDS that declaration rather than dropping it. That is deliberately not a capability: it is what lets a plan say which of the two things is happening, because a vision checkpoint served text-only is fine and a vision checkpoint served text-only *silently* is a model answering about an image it never received. |
 | Distributed / multi-node single model | Not planned for v1 |

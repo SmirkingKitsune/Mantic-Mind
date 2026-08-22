@@ -69,6 +69,22 @@ void relu2_glu(std::span<const float> gate,
                std::uint32_t n,
                std::span<float> out) noexcept;
 
+/// SiTU: out = beta*tanh(gate/beta)*sigmoid(gate) * u, where u is `up` itself
+/// when `linear_beta` is zero and `linear_beta*tanh(up/linear_beta)` otherwise.
+///
+/// A saturating SwiGLU: as beta grows, `beta*tanh(g/beta) -> g` and the gate half
+/// becomes exactly SiLU, so SwiGLU is its limit rather than an approximation of
+/// it. The parameters are model identity, not tuning knobs, and live in FfnSpec.
+///
+/// `linear_beta == 0` means the linear half is NOT transformed. It does not mean
+/// "beta zero", which would collapse `0*tanh(up/0)` and silence the FFN.
+void situ_glu(std::span<const float> gate,
+              std::span<const float> up,
+              std::uint32_t n,
+              float beta,
+              float linear_beta,
+              std::span<float> out) noexcept;
+
 /// NeoX-style rotary embedding — the "rotate half" form HF uses.
 ///
 /// head_dim is split in half: pairs are (i, i + head_dim/2), NOT adjacent
