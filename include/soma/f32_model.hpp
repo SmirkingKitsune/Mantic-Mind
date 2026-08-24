@@ -115,6 +115,22 @@ struct F32LayerWeights {
     WeightRef shared_gate, shared_up, shared_down;
     WeightRef dense_gate, dense_up, dense_down;
 
+    /// The `[1, d_model]` scalar gate on the WHOLE shared branch:
+    /// `out += sigmoid(w · x) * shared(x)`.
+    ///
+    /// Confusingly adjacent to `shared_gate` and a completely different thing.
+    /// `shared_gate` is the shared expert's `gate_proj` — the GLU half, one of
+    /// three matrices making up an ordinary FFN. This is a single row that
+    /// decides HOW MUCH of that FFN's output reaches the residual stream, and
+    /// on a token where the sigmoid lands near 0 the shared branch is switched
+    /// off entirely.
+    ///
+    /// Empty unless `FfnSpec::shared_expert_gate`. Leaving it empty adds the
+    /// shared expert at full strength on every token — a scale error of up to
+    /// 2x on one of the two FFN branches, which reads as a subtly mis-tuned
+    /// model rather than a missing tensor.
+    WeightRef shared_scale;
+
     /// LATENT MoE: the routed experts run in a space narrower than the residual
     /// stream. Empty unless `FfnSpec::routed_expert_hidden` is set.
     ///
@@ -188,6 +204,19 @@ struct F32Workspace {
     std::vector<float> q, k, v;    ///< [T, n_heads*head_dim] / [T, n_kv*head_dim]
     std::vector<float> attn_heads; ///< [T, n_heads*head_dim] — pre-o_proj
     std::vector<float> scores;     ///< [n_workers * T] — see worker_scores()
+
+    /// Both EMPTY unless `AttentionSpec::fused_output_gate`.
+    ///
+    /// A family that fuses its output gate into `q_proj` produces
+    /// `[T, n_heads, 2 * head_dim]` from a projection every other family sizes
+    /// at `[T, n_heads * head_dim]`. `q_raw` receives that, and the query and
+    /// gate halves are split out of it per head into `q` and `attn_gate`.
+    ///
+    /// Sized here rather than allocated inside attention because the hot path
+    /// performs no allocation, and a per-layer `std::vector` in the middle of a
+    /// 92-layer forward is exactly the sort of thing that only looks free.
+    std::vector<float> q_raw;     ///< [T, 2 * n_heads * head_dim]
+    std::vector<float> attn_gate; ///< [T, n_heads * head_dim] — pre-sigmoid
 
     /// Size `scores` for `n_workers` concurrent query positions.
     ///

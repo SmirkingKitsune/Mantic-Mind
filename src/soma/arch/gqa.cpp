@@ -36,21 +36,84 @@ namespace {
 /// meant produces finite, plausible logits that are simply wrong — which is why
 /// the IR carries QkNormKind rather than a bool, and why the loader
 /// cross-checks the tensor's actual length against it.
+/// `offset` is `ArchIr::rms_norm_weight_offset()` — the q/k norms are ordinary
+/// RMSNorms of whatever convention the model uses, so they follow it exactly as
+/// the layer norms do. Passing 0 unconditionally would scale a one-plus
+/// checkpoint's queries by a weight centred on ZERO.
 void apply_qk_norm(QkNormKind kind,
                    std::span<float> vec,
                    std::span<const float> weight,
                    std::uint32_t n_heads,
                    std::uint32_t head_dim,
-                   float eps) noexcept {
+                   float eps,
+                   float offset) noexcept {
     if (kind == QkNormKind::None || weight.empty()) return;
 
     if (kind == QkNormKind::FullWidth) {
-        f32::rmsnorm(vec, weight, n_heads * head_dim, eps);
+        f32::rmsnorm(vec, weight, n_heads * head_dim, eps, offset);
         return;
     }
     for (std::uint32_t h = 0; h < n_heads; ++h) {
-        f32::rmsnorm(
-            vec.subspan(static_cast<std::size_t>(h) * head_dim, head_dim), weight, head_dim, eps);
+        f32::rmsnorm(vec.subspan(static_cast<std::size_t>(h) * head_dim, head_dim),
+                     weight,
+                     head_dim,
+                     eps,
+                     offset);
+    }
+}
+
+/// Project queries, splitting off a fused output gate when the family has one.
+///
+/// Without the gate this is one matmul into `ws.q` and nothing else. With it,
+/// `q_proj` is emitted at `n_heads x 2 * head_dim` and each HEAD's slice is
+/// `[query | gate]` — upstream views the projection as `[..., n_heads,
+/// 2 * head_dim]` and chunks the last axis.
+///
+/// The de-interleave is the whole content of this function and the reason it
+/// exists rather than being written twice. Reading the projection as two
+/// contiguous halves — all queries then all gates — is the plausible
+/// alternative, it produces correctly-shaped buffers, and it pairs every head's
+/// output with a different head's gate. Finite, fluent, and not the model.
+void project_q(const ArchIr& arch,
+               const soma::WeightRef& q_proj,
+               std::span<const float> xs,
+               std::uint32_t n_rows,
+               soma::F32Workspace& ws) noexcept {
+    if (!arch.attention.fused_output_gate) {
+        soma::matmul(q_proj, xs, n_rows, ws.q);
+        return;
+    }
+    const auto H = arch.attention.n_heads;
+    const auto hd = arch.attention.head_dim;
+    const auto hq = H * hd;
+
+    soma::matmul(q_proj, xs, n_rows, ws.q_raw);
+    for (std::uint32_t r = 0; r < n_rows; ++r) {
+        const float* src = ws.q_raw.data() + static_cast<std::size_t>(r) * 2 * hq;
+        float* q = ws.q.data() + static_cast<std::size_t>(r) * hq;
+        float* g = ws.attn_gate.data() + static_cast<std::size_t>(r) * hq;
+        for (std::uint32_t h = 0; h < H; ++h) {
+            const float* head = src + static_cast<std::size_t>(h) * 2 * hd;
+            std::copy_n(head, hd, q + static_cast<std::size_t>(h) * hd);
+            std::copy_n(head + hd, hd, g + static_cast<std::size_t>(h) * hd);
+        }
+    }
+}
+
+/// `attn_heads *= sigmoid(gate)`, in place, before the output projection.
+///
+/// AFTER attention and BEFORE `o_proj`, which is the only ordering that is the
+/// model: gating the o_proj OUTPUT would apply an `n_heads * head_dim`-wide mask
+/// to a `d_model`-wide vector, and gating the queries instead would change what
+/// attention attends to rather than how much of it survives.
+void apply_output_gate(const ArchIr& arch,
+                       std::uint32_t n_rows,
+                       soma::F32Workspace& ws) noexcept {
+    if (!arch.attention.fused_output_gate) return;
+    const auto hq = arch.attention.n_heads * arch.attention.head_dim;
+    const auto span = static_cast<std::size_t>(n_rows) * hq;
+    for (std::size_t i = 0; i < span; ++i) {
+        ws.attn_heads[i] *= 1.0f / (1.0f + std::exp(-ws.attn_gate[i]));
     }
 }
 
@@ -72,6 +135,17 @@ StatusCode f32_bind_layer(const ArchIr& arch,
         !soma::bind_layer_weight(ctx, "self_attn.o_proj.weight", TensorRole::AttnProj, w->o_proj)
              .ok()) {
         return StatusCode::NotFound;
+    }
+
+    // The IR says whether the output gate rides inside `q_proj`; the tensor says
+    // how wide it actually is. Checked here because the disagreement is
+    // otherwise silent in the worst way: at the plain width the de-interleave
+    // reads past the projection, and at the double width without the flag every
+    // head's query is really half query and half gate. Both run.
+    {
+        const auto hq = arch.attention.n_heads * arch.attention.head_dim;
+        const auto want = arch.attention.fused_output_gate ? 2u * hq : hq;
+        if (w->q_proj.rows != want) return StatusCode::InvalidArgument;
     }
 
     if (arch.attention.qk_norm != QkNormKind::None) {
@@ -122,7 +196,7 @@ StatusCode f32_attention_kv(const ArchIr& arch,
     const auto& aw = *w.attn.as<F32AttnWeights>();
 
     const std::span<const float> xs(x, static_cast<std::size_t>(n_rows) * d);
-    soma::matmul(aw.q_proj, xs, n_rows, ws.q);
+    project_q(arch, aw.q_proj, xs, n_rows, ws);
     soma::matmul(aw.k_proj, xs, n_rows, ws.k);
     soma::matmul(aw.v_proj, xs, n_rows, ws.v);
 
@@ -132,13 +206,15 @@ StatusCode f32_attention_kv(const ArchIr& arch,
                       aw.q_norm,
                       H,
                       hd,
-                      eps);
+                      eps,
+                      arch.rms_norm_weight_offset());
         apply_qk_norm(arch.attention.qk_norm,
                       std::span<float>(ws.k).subspan(static_cast<std::size_t>(r) * hkv, hkv),
                       aw.k_norm,
                       KV,
                       hd,
-                      eps);
+                      eps,
+                      arch.rms_norm_weight_offset());
 
         const auto& rope = arch.attention.rope;
         const auto rotary = (rope.partial_dim > 0) ? rope.partial_dim : hd;
@@ -206,6 +282,7 @@ StatusCode f32_attention_kv(const ArchIr& arch,
             }
         });
 
+    apply_output_gate(arch, n_rows, ws);
     soma::matmul(aw.o_proj,
                  ws.attn_heads,
                  n_rows,
@@ -233,7 +310,7 @@ StatusCode f32_attention(const ArchIr& arch,
     const auto& aw = *w.attn.as<F32AttnWeights>();
 
     const std::span<const float> xs(x, static_cast<std::size_t>(n_tokens) * d);
-    soma::matmul(aw.q_proj, xs, n_tokens, ws.q);
+    project_q(arch, aw.q_proj, xs, n_tokens, ws);
     soma::matmul(aw.k_proj, xs, n_tokens, ws.k);
     soma::matmul(aw.v_proj, xs, n_tokens, ws.v);
 
@@ -244,13 +321,15 @@ StatusCode f32_attention(const ArchIr& arch,
                       aw.q_norm,
                       H,
                       hd,
-                      eps);
+                      eps,
+                      arch.rms_norm_weight_offset());
         apply_qk_norm(arch.attention.qk_norm,
                       std::span<float>(ws.k).subspan(static_cast<std::size_t>(t) * hkv, hkv),
                       aw.k_norm,
                       KV,
                       hd,
-                      eps);
+                      eps,
+                      arch.rms_norm_weight_offset());
 
         const auto& rope = arch.attention.rope;
         const auto rotary = (rope.partial_dim > 0) ? rope.partial_dim : hd;
@@ -323,6 +402,7 @@ StatusCode f32_attention(const ArchIr& arch,
             }
         });
 
+    apply_output_gate(arch, n_tokens, ws);
     soma::matmul(aw.o_proj,
                  ws.attn_heads,
                  n_tokens,

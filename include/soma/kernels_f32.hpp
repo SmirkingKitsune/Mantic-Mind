@@ -33,20 +33,32 @@ void matmul(std::span<const float> w,
             std::uint32_t k,
             std::span<float> y) noexcept;
 
-/// x * rsqrt(mean(x^2) + eps) * weight, in place over `n` elements.
+/// x * rsqrt(mean(x^2) + eps) * (weight + weight_offset), in place over `n`.
 ///
 /// Matches HF's RMSNorm: the mean is taken in fp32 and the weight is applied
 /// after the reciprocal square root, not folded into it.
+///
+/// `weight_offset` selects between the two scale conventions in the wild —
+/// `x_hat * w` and Gemma-style `x_hat * (1 + w)`. It is IR data
+/// (`ArchIr::rms_norm_weight_offset`), not architecture logic: the operation is
+/// the same reduction either way, and this is the same category as `softmax`
+/// being shared while which family selects it is not.
+///
+/// Defaulted to 0 so that every call written before the second convention
+/// existed keeps its exact behaviour, rather than every call site becoming a
+/// place to get it wrong.
 void rmsnorm(std::span<float> x,
              std::span<const float> weight,
              std::uint32_t n,
-             float eps) noexcept;
+             float eps,
+             float weight_offset = 0.0f) noexcept;
 
 void rmsnorm_into(std::span<const float> x,
                   std::span<const float> weight,
                   std::uint32_t n,
                   float eps,
-                  std::span<float> out) noexcept;
+                  std::span<float> out,
+                  float weight_offset = 0.0f) noexcept;
 
 /// In-place softmax over `n`, max-subtracted.
 void softmax(std::span<float> x, std::uint32_t n) noexcept;

@@ -78,7 +78,7 @@ three different ways; resolving that at admission means the core never has to.
 
 | Field | Type | Notes |
 |---|---|---|
-| `family` | enum | `mha` \| `gqa` \| `mla` \| `mla+dsa` \| `mla+kda` \| `compressed+sparse` — **selects the backend** |
+| `family` | enum | `mha` \| `gqa` \| `mla` \| `mla+dsa` \| `mla+kda` \| `gqa+gdn` \| `compressed+sparse` — **selects the backend** |
 | `n_heads` | int | |
 | `n_kv_heads` | int | `gqa`/`mha` |
 | `head_dim` | int | |
@@ -90,6 +90,8 @@ three different ways; resolving that at admission means the core never has to.
 | `mla` | object \| null | Present iff `family` starts with `mla` |
 | `dsa` | object \| null | Present iff `family` is `mla+dsa` |
 | `kda` | object \| null | Present iff `family` is `mla+kda` |
+| `gdn` | object \| null | Present iff `family` is `gqa+gdn` |
+| `fused_output_gate` | bool | Sigmoid gate on the full-attention block whose projection rides INSIDE `q_proj` at double width — no tensor of its own, and the split is per head |
 | `compressed` | object \| null | Schema v2; present iff `family` is `compressed+sparse` |
 
 ### `compressed` sub-object — DeepSeek V4
@@ -121,6 +123,15 @@ do NOT — both reference implementations construct those with the RMSNorm class
 whatever the config says. DeepSeek-V2-Lite hides the difference by setting `1e-6` itself; Moonlight
 and GLM-5.2 set `1e-5`, and using it cost Moonlight a conformance error of 7.25e-05, seventy times
 every other fixture, passing and unexplained until GLM-5.2 made it fail outright (roadmap D29).
+
+**`rms_norm_scale` is a TOP-LEVEL field too, and it is the other way an ordinary RMSNorm differs
+between families.** `weight` applies `x_hat * w`; `one_plus_weight` applies `x_hat * (1 + w)`, which
+is Gemma's convention and Qwen3.5's. A checkpoint written for the second ships its norm weights
+centred on ZERO, so reading it as the first scales every normalized activation by roughly nothing.
+Nothing fails — the tensor is present, fully populated and the right shape — and the logits are
+wrong from the first layer. It is per MODEL but not per norm CLASS: Qwen3.5 applies one-plus to its
+layer norms, q/k norms and final norm, while the gated norm inside its linear-attention block is a
+different class that initializes to ones and applies `w` plainly.
 
 **`qk_norm` is an enum because the two forms normalize over different things.** `per_head` applies
 over `head_dim` independently per head (Qwen3-MoE: q_norm is [16] with head_dim 16); `full_width`
@@ -207,6 +218,29 @@ Both lists are read and their union checked against `n_layers`. A config naming 
 skipping one, is a config disagreeing with itself, and the resulting stack would bind wrong tensors
 in a way nothing downstream detects.
 
+### `gdn` sub-object — the second hybrid
+
+Present iff `family` is `gqa+gdn`. Part of `arch_hash`, for the same reason `kda` is.
+
+| Field | Notes |
+|---|---|
+| `n_k_heads`, `n_v_heads` | **Two head counts.** q/k project `n_k_heads`; the recurrence runs at `n_v_heads`, with q and k broadcast up by `repeat_interleave`. Qwen3.5: 16 and 128 |
+| `head_k_dim`, `head_v_dim` | Per-head widths. The recurrent state is `n_v_heads × head_k_dim × head_v_dim` |
+| `conv_kernel` | ONE short causal depthwise convolution over `2·key_dim + value_dim` channels — q ++ k ++ v together, no bias |
+| `layer_kinds` | Per layer: `full` (GQA, cached) \| `linear` (recurrent). Length `n_layers`, authoritative |
+
+**The state follows the VALUE head count.** Sizing it from `n_k_heads` — the number the q/k tensors
+actually carry — under-counts by `n_v_heads / n_k_heads`. On Qwen3.8-2.4T-A95B that is 69 MiB
+reported against 552 MiB actual, in the optimistic direction, on a term that does not grow with
+context and so has nothing else to catch it.
+
+**`layer_types` is ZERO-BASED here — the opposite of `kda`'s lists.** `layer_types[i]` names layer
+`i` and needs no conversion. The trap is the FALLBACK: when the list is absent, upstream synthesizes
+`"linear_attention" if (i + 1) % full_attention_interval else "full_attention"`, a ONE-based stride
+producing full layers at zero-based 3, 7, 11 … The natural `i % interval == 0` reading places them
+at 0, 4, 8 … instead, shifting every layer's kind by three and binding `linear_attn` tensors into
+`self_attn` blocks. Two hybrids, two conventions, and each states its own.
+
 ### KV cost — the number the planner actually cares about
 
 `kv_bytes_per_token()` and `kv_geometry()` are the attention properties that cross the seam. Worked
@@ -219,11 +253,13 @@ from the real configs:
 | Mixtral-8x7B | gqa | `2 × 8 × 128` = **2048** | 32 | 131 KB | **4.3 GB** |
 | GLM-5.2 | mla+dsa | `(512 + 64) + 128` = **704** | 78 | 107 KB | **3.5 GB** |
 | Kimi-K3 | mla+kda | `512 + 64` = **576**, on **24 of 93** layers | 24 (+69 stateful) | 27 KB | **1.1 GB** = 906 MB + 232 MB fixed |
+| Qwen3.8-2.4T-A95B | gqa+gdn | `2 × 4 × 256` = **2048**, on **23 of 92** layers | 23 (+69 stateful) | 92 KB | **3.3 GB** = 2.9 GB + 284 MB fixed |
 
-**One row in that table is not linear in context.** Kimi-K3's 69 linear layers hold a
+**TWO rows in that table are not linear in context**, and both are hybrids. Kimi-K3's 69 linear layers hold a
 `n_heads × head_dim × head_dim` recurrent matrix and a short convolution window each — present in
 full at zero tokens and unchanged at a million. So its per-sequence cost is `growth × context +
-constant`, and the constant is the larger term below ~17k tokens. `kv_bytes_for_context` exists for
+constant`, and the constant is the larger term below ~17k tokens. Qwen3.8's crossover is 1054
+tokens, computed the same way. `kv_bytes_for_context` exists for
 exactly this: a per-token figure multiplied by context is wrong in one direction at short context
 and the other at long. (Figures above follow this table's fp16 convention; the engine's cache is
 fp32, so the real allocations are double — see D45.)
@@ -275,7 +311,8 @@ like an unrelated bug.
 | `has_gate` | bool | |
 | `expert_intermediate` | int | `moe_intermediate_size` |
 | `dense_intermediate` | int | For `layer_kinds == "dense"` layers |
-| `shared_intermediate` | int | |
+| `shared_intermediate` | int | Already carries the COUNT — shared experts are fused into one set of tensors. Stated by the Qwen families and derived as `moe_intermediate × n_shared` by DeepSeek; a config stating only the width implies exactly one |
+| `shared_expert_gate` | bool | Scalar sigmoid gate on the whole shared branch: `out += sigmoid(w · x) · shared(x)` for a `[1, d_model]` row. Family knowledge — no config key states it |
 | `swiglu_limit` | float | V4 clamps gate above and up symmetrically before SwiGLU |
 | `expert_layout` | enum | `interleaved_gud` — gate/up/down interleaved per expert (§5.3 of architecture.md) |
 | `routed_expert_hidden` | int | **Latent MoE.** Width the ROUTED experts operate at; 0 = `d_model`. `bytes_per_token` is linear in it |

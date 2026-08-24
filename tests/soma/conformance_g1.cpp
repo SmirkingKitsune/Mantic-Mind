@@ -29,6 +29,7 @@
 //
 // Usage: conformance_g1 <fixtures_dir> [fixture ...]
 
+#include "soma/attention_backend.hpp"
 #include "soma/f32_model.hpp"
 #include "soma/quant_format.hpp"
 
@@ -88,6 +89,41 @@ constexpr float kMaxAmplification = 6.0f;
 /// hundred-fold amplification a packing or stride bug produces, which is what
 /// this gate is for.
 constexpr float kLatentMoeAmplification = 12.0f;
+
+/// The allowance for a stack carrying RECURRENT state, derived the same way.
+///
+/// A softmax-attention layer re-normalizes every step, so a perturbed key
+/// contributes a bounded share of one token's output and the next token starts
+/// over. A delta-rule linear layer does not: its state persists, and its update
+/// is an error-correcting residual `v - S^T k` — a difference of two similar
+/// quantities, which is where relative error grows rather than averages.
+///
+/// Detected from the CACHE rather than from the family, because that is what
+/// makes it structural: a stack with recurrent layers is exactly a stack whose
+/// per-sequence cache is non-empty at ZERO context. No family name appears, and
+/// a future recurrent family gets the right bound without editing this.
+///
+/// Measured on Qwen3.5-MoE-Tiny with the same weights and the same sweep, and
+/// the controls say it is the recurrence:
+///
+///     3 of 4 layers linear    q8_0 13.89   q6_g 7.80   q4_g 5.44
+///     2 of 4 layers linear    q8_0  8.71   q6_g 5.79   q4_g 4.16
+///     3 of 4, no k/v broadcast q8_0 9.72   q6_g 4.80   q4_g 3.39
+///
+/// Halving the recurrent fraction nearly halves the excess, and removing the
+/// 8-way key/value broadcast — which makes one key head's perturbation
+/// common-mode across the eight value heads sharing it — removes most of the
+/// rest. Both are properties of the architecture, not of the implementation.
+///
+/// As with the latent-MoE bound, the figure RISES as precision improves because
+/// `amp` is a ratio: at q4_g this family sits at 5.44 and passes the DEFAULT
+/// bound. Only the fine quantizations trip it, where the codec error is small
+/// enough that the model's own noise floor dominates the quotient.
+///
+/// 16.0 covers the measured maximum with the same margin the latent-MoE bound
+/// uses, and still catches the hundred-fold amplification a packing or stride
+/// bug produces, which is what this gate is for.
+constexpr float kRecurrentStateAmplification = 16.0f;
 
 soma::QuantMap all_f32() { return {}; }
 
@@ -398,9 +434,26 @@ int main(int argc, char** argv) {
                                     ? codec_rel_rms(cfg.probe_dtype, cfg.probe_group)
                                     : 0.0f;
             const float amp = (codec > 0.0f) ? o.rel_logit_err / codec : 0.0f;
+            // A cache that is non-empty before a single token has been seen is
+            // a recurrent state. See kRecurrentStateAmplification.
+            const auto* attn = soma::resolve_attention_backend(ref.arch.attention.family);
+            const bool recurrent = attn != nullptr && attn->kv_bytes_for_context != nullptr &&
+                                   attn->kv_bytes_for_context(ref.arch, 0) > 0;
+            // Latent FIRST, and not because it is more important.
+            //
+            // `kLatentMoeAmplification` was measured on Kimi-Linear-Tiny, which
+            // is ALSO a recurrent stack — so 12.0 is already an empirical bound
+            // for "recurrent AND latent" together. Letting the recurrent
+            // allowance win there would raise that model's bound to 16.0 and
+            // loosen a gate its own measurement says it does not need, purely as
+            // a side effect of a second recurrent family arriving.
+            //
+            // The recurrent allowance is therefore for a recurrent stack with NO
+            // latent MoE, which is the thing that was measured for it.
             const float bound = (ref.arch.ffn.routed_expert_hidden != 0)
                                     ? kLatentMoeAmplification
-                                    : kMaxAmplification;
+                                : recurrent ? kRecurrentStateAmplification
+                                            : kMaxAmplification;
             const bool amp_ok = (codec == 0.0f) || (amp <= bound);
             if (!amp_ok) ++failures;
 

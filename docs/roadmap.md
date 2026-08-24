@@ -3861,6 +3861,164 @@ selects everything and DSA degenerates to dense MLA — so a tiny fixture will p
 indexer works. The oracle needs a prompt longer than 2048 tokens, or a shrunk `index_topk`, and shrinking
 it is the better choice since a tiny-random model with a 4k prompt is otherwise cheap to run.
 
+## Qwen3.5-MoE: the fifth family, and the second hybrid
+
+`Qwen/Qwen3.8-2.4T-A95B` — 92 layers, d_model 8192, 512 routed experts at top-10, 262144 context,
+**4.89 TB** of `.safetensors` across 213 shards. 2.446 T parameters, ~95 B active.
+
+```
+attention_family  gqa+gdn        n_layers 92 (all MoE, no dense prefix)
+                                 23 full-attention (GQA) + 69 linear (Gated DeltaNet)
+n_experts         512            top_k 10     shared 1 (GATED)
+active_fraction   0.019531       <- 10/512
+routed width      8192           <- d_model; no latent MoE
+arch_supported    true           <- oracle-graded, see below
+verdict           <economic>     <- 29.4 GB/token at q4_g: ~29 GB/s to reach 1 tok/s
+```
+
+It arrived the same way Kimi-K3 did — adapted and planned while unservable, then implemented, then
+GRADED — and, as with Kimi, the grading is where the real defect was found.
+
+### It is a hybrid, and it is not the hybrid we already had
+
+The temptation was to make `MlaKda` a mode. The two families share a SHAPE — a minority of cached
+layers interleaved with a majority of recurrent ones — and no arithmetic:
+
+|  | MlaKda (Kimi-K3) | GqaGdn (Qwen3.5) |
+|---|---|---|
+| full layers | MLA, latent KV | GQA, full K and V planes |
+| full-layer gate | own `d × h·v_head` tensor | FUSED into `q_proj` at double width |
+| rotation | none (NoPE) | first quarter of each head |
+| linear decay | per CHANNEL (diagonal) | per HEAD (scalar) |
+| linear head count | one, shared by q/k/v | 16 for q/k, 128 for v |
+| convolution | three, one per projection | one, over q ++ k ++ v |
+| layer-split convention | ONE-based lists | ZERO-based `layer_types` |
+
+The last row is the one worth staring at. Two hybrids state their splits in opposite conventions,
+and a reader who has just finished the other one is primed for exactly the wrong answer. Qwen3.5's
+`layer_types[i]` names layer `i` — but its FALLBACK, used when the list is absent, is
+`(i + 1) % full_attention_interval`, a one-based stride producing a zero-based list. Both readings
+are transcribed from upstream rather than re-derived, and the plan test asserts they agree.
+
+### The cache arithmetic, again, and again affine
+
+23 full layers cache `2 × 4 × 256` floats per token — 184 KiB/token for the stack. The 69 linear
+layers hold `128 × 128 × 128` recurrent floats plus a `20480 × 3` convolution window each: **568.2
+MiB between them, present in full at zero tokens and unchanged at 262144.**
+
+| | growth | constant | at 262144 |
+|---|---|---|---|
+| as GQA would size it (92 layers) | 736 KiB/token | — | 184.0 GiB |
+| the truth | 184 KiB/token | 568.2 MiB | **46.55 GiB** |
+
+A factor of **3.95** on the quantity the verdict turns on, in the pessimistic direction — the
+planner would refuse a model that fits. And the crossover runs the other way at short context:
+below **1054 tokens** this stack wants MORE per-sequence memory than an all-full-attention stack of
+the same shape. Exact, not approximate: `595771392 / (69 × 8192)`.
+
+### What the oracle caught, and no invariant would have
+
+`Qwen3_5MoeRMSNorm.forward` is `x_hat * (1.0 + weight)`, not `x_hat * weight`.
+
+That is Gemma's convention, it is the first time it has appeared here, and the checkpoint ships its
+norm weights **centred on zero** to match — `_init_weights` calls `init.zeros_` and says why in a
+comment. Read as the plain convention, every layer norm, q/k norm and final norm in the model scales
+its output by a weight near zero instead of near one. Nothing fails to load: the tensor is present,
+the right shape, and fully populated. The logits were wrong at layer 0 by 1.9e+00 against an input
+that matched to 0.0.
+
+`RmsNormScale` is now IR, threaded to the kernel as a weight OFFSET (0 or 1) defaulted to 0 — so
+every call written before the second convention existed keeps its behaviour, rather than every call
+site becoming a place to get it wrong. It is per model but NOT per norm class: the gated norm inside
+this family's own linear block is a different class that initializes to ones and applies `w`
+plainly, so `arch::gdn::gated_rmsnorm` deliberately does not consult it.
+
+### The fixture was not this architecture
+
+Fixing the engine exposed the fixture. `make_oracle.py` initializes every rank-≤1 parameter as
+"~1 if the name contains 'norm', else ~0", which for this family got three things wrong at once:
+`A_log` (should be `log(U(0,16))`), `dt_bias` (ones), and the one-plus norm weights (zeros). The
+result carried far more recurrent memory than any real checkpoint and scaled every norm by ~2.
+
+Both sides of the comparison saw the same weights, so this was never a correctness problem — it was
+a REPRESENTATIVENESS problem, and it showed up as numbers:
+
+| | G0 max dlogit | G1 amp @q8_0 | @q6_g | @q4_g |
+|---|---|---|---|---|
+| generic init | 2.15e-05 | 22–32 | 16.2 | 10.1 |
+| the model's own `_init_weights` | **4.58e-06** | 13.9 | 7.8 | 5.4 |
+
+`rank1_override` is keyed on `model_type`, not on the parameter name: `A_log` also exists on
+`kimi_linear`, whose fixture is committed and whose oracle was measured under the generic rule.
+Regenerating that one is a decision to take deliberately, not a side effect of adding a family.
+
+### Recurrent state amplifies quantization error, and that is structural
+
+What remained after the fixture was fixed still exceeded G1's default 6.0 bound at fine
+quantizations. The controls say it is the recurrence:
+
+| variant | q8_0 g32 | q6_g | q4_g |
+|---|---|---|---|
+| 3 of 4 layers linear | 13.89 | 7.80 | 5.44 |
+| 2 of 4 layers linear | 8.71 | 5.79 | 4.16 |
+| 3 of 4, no k/v broadcast | 9.72 | 4.80 | 3.39 |
+
+Halving the recurrent fraction nearly halves the excess; removing the 8-way key/value broadcast —
+which makes one key head's perturbation common-mode across the eight value heads sharing it —
+removes most of the rest. A softmax layer re-normalizes every step and starts the next token over; a
+delta-rule layer's state persists and its update is an error-correcting residual `v − Sᵀk`, a
+difference of two similar quantities. At q4_g this family sits at 5.44 and passes the DEFAULT bound:
+only the fine quantizations trip it, where the codec error is small enough that the model's own
+noise floor dominates the quotient.
+
+`kRecurrentStateAmplification` is detected from the CACHE, not from the family — a recurrent stack
+is exactly one whose per-sequence cache is non-empty at ZERO context. The latent-MoE bound is
+checked FIRST, because it was measured on Kimi, which is also recurrent; letting the new allowance
+win there would loosen a gate its own measurement says it does not need.
+
+### Graded
+
+Every level, against `tests/fixtures/tiny/Qwen3.5-MoE-Tiny`, built from transformers' own
+`modeling_qwen3_5_moe.py` — pure torch, CPU, no `fla` and no CUDA, which makes this family markedly
+cheaper to grade than Kimi was:
+
+| gate | result |
+|---|---|
+| G0 teacher-forced, 512 positions | **4.58e-06**, 256 greedy tokens exact |
+| G1 quantized sweep | no hard failures, 5.44 amp at q4_g |
+| G2 container round-trip | **0.00e+00** container-loaded vs source-loaded |
+| G2 resident sizing vs real tensors | **1.00x** |
+| G4 cached decode vs prefill | **8.05e-07** |
+| gdn_kernel prefill vs stepwise | **0** (bit-identical) |
+
+**No `--gdn-mode` flag was needed, and that is a fact about the reference rather than about Soma.**
+Kimi's fixture had to pin fla's `fused_recurrent` kernel because fla's chunked and recurrent kernels
+disagree with EACH OTHER by ~6e-04 — no useful tolerance exists against that. Transformers'
+`torch_chunk_gated_delta_rule` and `torch_recurrent_gated_delta_rule` were measured against each
+other at 512 positions: **1.28e-06**. The oracle grades production prefill directly.
+
+### What is described but not served
+
+The checkpoint carries a one-layer multi-token-prediction head under a TOP-LEVEL `mtp.` prefix —
+`mtp.fc`, `mtp.layers.0.*`, `mtp.norm`, `mtp.pre_fc_norm_*`. transformers 5.15.1 does not implement
+it and neither does Soma. It is recorded as `SpeculativeMethod::Mtp` with `source_declared` true and
+`present` false, and excluded by the converter with its own rule: GLM-5.2's MTP head is a
+`model.layers.<N>` name caught by layer INDEX, and no substring identifies it; Qwen3.5's is a prefix
+that no layer-index rule can see. Two conventions, one rule each.
+
+### The shared expert the Qwen families never had
+
+`f32_bind_layer` and the planner both gate the shared expert on `router.n_shared_experts > 0`.
+DeepSeek states that count and derives the width; Qwen2-MoE and Qwen3.5 state the WIDTH
+(`shared_expert_intermediate_size`) and state no count at all — so the branch did not exist, on
+models that have one on every MoE layer. Nothing failed to load; the FFN was simply missing a term.
+
+The adapter now infers a count of one from a stated width, which is the converse of the rule already
+there. This **changes `arch_hash` for any `qwen2_moe` container admitted before now**, and that is
+correct: those containers describe a model missing an FFN branch.
+
+---
+
 ## Cross-cutting: CI from day one
 
 Established at G0, extended each gate. Current CI is 3 Release jobs invoking raw `cmake`, one CTest

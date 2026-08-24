@@ -41,6 +41,7 @@ set(SOMA_ARCH_HEADERS
     soma/arch/gqa.hpp
     soma/arch/mla.hpp
     soma/arch/kda.hpp
+    soma/arch/gdn.hpp
     soma/arch/compressed_sparse.hpp
     soma/arch/deepseek_dspark.hpp
 )
@@ -88,6 +89,7 @@ set(MM_SOMA_SOURCES
     arch/gqa.cpp
     arch/mla.cpp
     arch/kda.cpp
+    arch/gdn.cpp
     arch/compressed_sparse.cpp
     arch/deepseek_dsml.cpp
     arch/deepseek_dspark.cpp
@@ -628,6 +630,21 @@ if(BUILD_TESTING)
                    ${CMAKE_SOURCE_DIR}/tests/soma/kimi_k3_plan.cpp)
     target_link_libraries(soma_kimi_k3_plan PRIVATE mm_soma)
     add_test(NAME soma_kimi_k3_plan COMMAND soma_kimi_k3_plan)
+
+    # Qwen3.5-MoE: the SECOND hybrid — GQA full layers with a fused output gate
+    # and partial rope, Gated DeltaNet linear layers whose state is indexed by a
+    # different head count than their key projection. Config-only for the same
+    # reason as Kimi's above, and more so: the checkpoint is 4.89 TB.
+    add_executable(soma_qwen3_5_moe_plan
+                   ${CMAKE_SOURCE_DIR}/tests/soma/qwen3_5_moe_plan.cpp)
+    target_link_libraries(soma_qwen3_5_moe_plan PRIVATE mm_soma)
+    add_test(NAME soma_qwen3_5_moe_plan COMMAND soma_qwen3_5_moe_plan)
+
+    # The four Gated DeltaNet operators in isolation, plus the property the
+    # oracle cannot reach: prefill and stepwise decode are the same recurrence.
+    add_executable(soma_gdn_kernel ${CMAKE_SOURCE_DIR}/tests/soma/gdn_kernel.cpp)
+    target_link_libraries(soma_gdn_kernel PRIVATE mm_soma)
+    add_test(NAME soma_gdn_kernel COMMAND soma_gdn_kernel)
 
     # ── G6 telemetry ──────────────────────────────────────────────────────────
     # bucket_heat() is pure, so the downsampling claims are checked without a

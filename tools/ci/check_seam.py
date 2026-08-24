@@ -53,7 +53,7 @@ from pathlib import Path
 # every family shares and merely parameterizes (softmax, rope)?
 ARCH_TOKENS = [
     # attention families
-    "mla", "gqa", "mha", "dsa", "kda",
+    "mla", "gqa", "mha", "dsa", "kda", "gdn",
     # family-specific mechanisms with no cross-family analogue
     "absorb", "lora", "yarn",
     # reference checkpoints / model families

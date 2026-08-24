@@ -49,6 +49,21 @@ enum class AttentionFamily : std::uint8_t {
     /// family in `arch_hash` — `to_string` is — but the enum is serialized
     /// nowhere it can be reordered safely, and appending costs nothing.
     MlaKda,
+
+    /// The SECOND hybrid, and it is not a spelling variant of the first.
+    ///
+    /// Both interleave a minority of full-attention layers with a majority of
+    /// linear ones, and there the resemblance stops. `MlaKda`'s full layers are
+    /// MLA and its linear layers decay per CHANNEL; this family's full layers
+    /// are ordinary GQA — output-gated and only partially rotated — and its
+    /// linear layers decay by one SCALAR per head.
+    ///
+    /// Folding the two into one `Hybrid` value was considered and rejected: the
+    /// cache layouts differ (latent versus full K/V), the recurrent state is
+    /// indexed by a different head count than the key projection, and
+    /// `arch_hash` would then be unable to distinguish two models that share a
+    /// layer split and nothing else.
+    GqaGdn,
 };
 
 /// Whether a layer attends over a cache or carries a recurrent state.
@@ -73,6 +88,26 @@ enum class LayerKind : std::uint8_t { Dense = 0, Moe };
 /// Both report `"qk_norm": true` upstream. Reading it as one bit produces a
 /// model that runs, converges to plausible logits, and is wrong.
 enum class QkNormKind : std::uint8_t { None = 0, PerHead, FullWidth };
+
+/// How an RMSNorm applies its learned scale. NOT a detail, and NOT stated
+/// anywhere in config.json.
+///
+///   Weight          `x_hat * w`         — Llama, Qwen3-MoE, DeepSeek, Mixtral…
+///   OnePlusWeight   `x_hat * (1 + w)`   — Gemma's convention, and Qwen3.5's
+///
+/// The second form ships its weights centred on ZERO, so a checkpoint written
+/// for it and read as the first is scaled by `w` instead of `1 + w` — near zero
+/// where it should be near one. Nothing fails: the shapes agree, the tensor is
+/// present and fully populated, and the model produces finite logits that are
+/// wrong from the first layer onward.
+///
+/// This has to be per model rather than per norm SITE, but not per norm CLASS:
+/// Qwen3.5 uses `Qwen3_5MoeRMSNorm` (one-plus) for its layer norms, q/k norms
+/// and final norm, while the gated norm inside its linear-attention block is a
+/// different class that uses the plain form and initializes to ones. A backend
+/// that owns a gated norm therefore does NOT consult this — see
+/// `arch::gdn::gated_rmsnorm`.
+enum class RmsNormScale : std::uint8_t { Weight = 0, OnePlusWeight };
 enum class ScoreFn : std::uint8_t { Softmax = 0, Sigmoid, SqrtSoftplus };
 /// Gated FFN nonlinearity.
 ///
@@ -199,6 +234,66 @@ struct KdaSpec {
     }
 };
 
+/// Present iff `AttentionSpec::family` is GqaGdn.
+///
+/// Gated DeltaNet: delta-rule linear attention whose forget gate is ONE SCALAR
+/// PER HEAD, broadcast across the whole state matrix. That is the difference
+/// from `KdaSpec`, whose gate is per channel and therefore decays the state by a
+/// diagonal matrix. Same recurrence shape, different operator — and the scalar
+/// case is not "KDA with equal channels" in any way a reader should rely on,
+/// because the two families also disagree about head counts (below).
+///
+/// **The key and value head counts differ, and the state follows the VALUE
+/// count.** Qwen3.5 projects 16 key heads and 128 value heads, then
+/// `repeat_interleave`s q and k by 8 so the recurrence runs 128-wide. A reader
+/// who sizes the state from the key heads — the projection widths are right
+/// there and 16 is the number the k/q tensors carry — undercounts the
+/// per-sequence state by 8x. On the 2.4T checkpoint that is 69 MiB reported
+/// against 552 MiB actual, in the optimistic direction, on the exact quantity
+/// the verdict turns on.
+struct GdnSpec {
+    /// Heads the q and k projections produce, BEFORE the broadcast.
+    std::uint32_t n_k_heads = 0;
+    /// Heads the recurrence and the value projection run at. A multiple of
+    /// `n_k_heads`.
+    std::uint32_t n_v_heads = 0;
+    std::uint32_t head_k_dim = 0;
+    std::uint32_t head_v_dim = 0;
+
+    /// Short causal depthwise convolution applied to the CONCATENATION of q, k
+    /// and v — one convolution over `conv_width()` channels, not three. The
+    /// carried state is `conv_kernel - 1` positions wide.
+    std::uint32_t conv_kernel = 0;
+
+    /// Length == n_layers when non-empty.
+    std::vector<AttnLayerKind> layer_kinds;
+
+    std::uint32_t key_dim() const noexcept { return n_k_heads * head_k_dim; }
+    std::uint32_t value_dim() const noexcept { return n_v_heads * head_v_dim; }
+
+    /// Channels the depthwise convolution spans: q ++ k ++ v.
+    std::uint32_t conv_width() const noexcept { return 2 * key_dim() + value_dim(); }
+
+    /// Floats in one layer's recurrent state: `n_v_heads x head_k_dim x head_v_dim`.
+    /// Constant in context length — the whole point of the family.
+    std::uint64_t recurrent_elems() const noexcept {
+        return static_cast<std::uint64_t>(n_v_heads) * head_k_dim * head_v_dim;
+    }
+
+    std::uint32_t n_linear_layers() const noexcept {
+        std::uint32_t n = 0;
+        for (const auto k : layer_kinds)
+            if (k == AttnLayerKind::Linear) ++n;
+        return n;
+    }
+    std::uint32_t n_full_layers() const noexcept {
+        std::uint32_t n = 0;
+        for (const auto k : layer_kinds)
+            if (k == AttnLayerKind::Full) ++n;
+        return n;
+    }
+};
+
 /// Which layers own a sparse-attention indexer.
 ///
 /// `Full` computes an index; `Shared` reuses the one the nearest preceding
@@ -283,7 +378,13 @@ struct HyperConnectionSpec {
 /// container metadata proves all DSpark payloads were converted. Keeping the
 /// two separate prevents an old autoregressive-only container from advertising
 /// a draft model it cannot load.
-enum class SpeculativeMethod : std::uint8_t { None = 0, DSpark };
+/// `Mtp` is a plain multi-token-prediction head — one decoder layer fed by a
+/// projection of `[embedding ++ hidden]`, as DeepSeek-V3 and Qwen3.5 ship it. It
+/// is here so that a checkpoint carrying `mtp.*` tensors can be DESCRIBED as
+/// carrying them; `SpeculativeSpec::present` stays false until something can run
+/// one. Silently ignoring the tensors would convert a 4.9 TB checkpoint while
+/// dropping a head the operator can see in the index.
+enum class SpeculativeMethod : std::uint8_t { None = 0, DSpark, Mtp };
 
 struct SpeculativeSpec {
     SpeculativeMethod method = SpeculativeMethod::None;
@@ -336,7 +437,29 @@ struct AttentionSpec {
     MlaSpec mla{}; ///< meaningful only for Mla/MlaDsa
     DsaSpec dsa{}; ///< meaningful only for MlaDsa
     KdaSpec kda{}; ///< meaningful only for MlaKda
+    GdnSpec gdn{}; ///< meaningful only for GqaGdn
     CompressedAttentionSpec compressed{}; ///< CompressedSparse only
+
+    /// Sigmoid output gate on the full-attention block, with the gate projection
+    /// FUSED INTO `q_proj` — which is why this is not `MlaSpec::output_gate`
+    /// spelled for a second family.
+    ///
+    /// MLA's gate is its own `d_model x (n_heads * v_head_dim)` tensor. This one
+    /// has no tensor of its own at all: `q_proj` is emitted at twice the usual
+    /// width and each head's slice is `[query | gate]`, read off with a chunk.
+    ///
+    /// Two consequences, and both have bitten this codebase's ancestors:
+    ///
+    ///   * SIZING. `q_proj` is `d_model x (2 * n_heads * head_dim)`. A planner
+    ///     that charges the ordinary width under-reports resident weight by one
+    ///     `d_model x n_heads x head_dim` matrix per full layer.
+    ///   * LAYOUT. The split is PER HEAD and interleaved across heads, not
+    ///     [all queries | all gates]. Upstream views the projection as
+    ///     `[..., n_heads, 2 * head_dim]` and chunks the last axis, so head `h`
+    ///     owns rows `[2*h*head_dim, (2*h+2)*head_dim)` with the query first.
+    ///     Reading it as two contiguous halves runs the model with every head's
+    ///     gate taken from a different head — finite, plausible, wrong.
+    bool fused_output_gate = false;
 };
 
 struct RouterSpec {
@@ -358,6 +481,16 @@ struct FfnSpec {
     std::uint32_t expert_intermediate = 0;
     std::uint32_t dense_intermediate = 0;
     std::uint32_t shared_intermediate = 0;
+
+    /// Scalar sigmoid gate on the SHARED expert's contribution:
+    /// `out += sigmoid(w · x) * shared(x)` for a `[1, d_model]` projection.
+    ///
+    /// A bool and not a width, because the tensor is one row — the cost is
+    /// nothing and the semantics are everything. Omitting it adds the shared
+    /// expert at full strength on every token, which is a scale error of up to
+    /// 2x on one of the two FFN branches: finite, fluent, and not the model.
+    bool shared_expert_gate = false;
+
     float swiglu_limit = 0.0f;
     ExpertLayout expert_layout = ExpertLayout::InterleavedGateUpDown;
 
@@ -493,6 +626,9 @@ struct ArchIr {
     /// so it lives here rather than being threaded through each of them.
     float rms_norm_eps = 1e-6f;
 
+    /// Which scale convention those same norms use. See RmsNormScale.
+    RmsNormScale rms_norm_scale = RmsNormScale::Weight;
+
     Topology topology{};
     AttentionSpec attention{};
     RouterSpec router{};
@@ -516,6 +652,17 @@ struct ArchIr {
     /// second site cannot forget the fallback and charge zero.
     std::uint32_t routed_expert_width() const noexcept {
         return ffn.routed_expert_hidden != 0 ? ffn.routed_expert_hidden : topology.d_model;
+    }
+
+    /// What to ADD to every RMSNorm weight before applying it: 1 for the
+    /// one-plus convention, 0 otherwise.
+    ///
+    /// Expressed as an offset rather than as a branch at each call site so that
+    /// the kernel stays one expression, and so a site that forgets to ask gets
+    /// the pre-existing behaviour rather than a compile error it might silence
+    /// with the wrong answer.
+    float rms_norm_weight_offset() const noexcept {
+        return rms_norm_scale == RmsNormScale::OnePlusWeight ? 1.0f : 0.0f;
     }
 };
 

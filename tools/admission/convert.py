@@ -82,6 +82,27 @@ DENSE_SUFFIXES = (
     # absent until now, so the leading layers of every DeepSeek-family model were
     # dropped along with the attention.
     "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight",
+    # ── Gated DeltaNet linear attention ──
+    #
+    # A hybrid stack's LINEAR layers, under `linear_attn` rather than
+    # `self_attn` — which is why none of the attention suffixes above covers
+    # them and why, before this, three quarters of a Qwen3.5 checkpoint's token
+    # mixers were unaccounted for.
+    #
+    # `A_log` and `dt_bias` are bare nn.Parameters and carry no `.weight`
+    # suffix; `conv1d.weight` has no bias sibling, because this family's
+    # convolution is built `bias=False`. All of them are small, resident, and
+    # kept at F32 — the recurrence reads every one of them on every token.
+    "linear_attn.in_proj_qkv.weight", "linear_attn.in_proj_z.weight",
+    "linear_attn.in_proj_b.weight", "linear_attn.in_proj_a.weight",
+    "linear_attn.conv1d.weight", "linear_attn.A_log", "linear_attn.dt_bias",
+    "linear_attn.norm.weight", "linear_attn.out_proj.weight",
+    # ── gated shared expert ──
+    #
+    # A SIBLING of the shared expert, not part of it: `mlp.shared_expert_gate`
+    # against `mlp.shared_expert.*`. One row, and it decides how much of the
+    # whole shared branch reaches the residual stream.
+    "mlp.shared_expert_gate.weight",
 )
 
 # Named exclusions, so "unclaimed" below means genuinely unaccounted for.
@@ -99,10 +120,12 @@ IGNORED_PATTERNS = (
     ".experts.",              # routed experts: written to the expert payload
     "shared_experts.",        # copied separately, below
     "rotary_emb.inv_freq",    # derived at load, not a weight
-    # NOTE: multi-token-prediction heads are excluded by LAYER INDEX in
-    # is_ignored() below, not here. They are ordinary `model.layers.<N>.*` names
-    # with N >= num_hidden_layers, so no substring identifies them — a ".mtp"
-    # entry sat here matching nothing until GLM-5.2's layer 78 proved it.
+    # NOTE: multi-token-prediction heads are excluded in is_ignored() below, not
+    # here, and they need TWO rules because the checkpoints spell them two ways.
+    # GLM-5.2's is an ordinary `model.layers.<N>.*` name with
+    # N >= num_hidden_layers, so no substring identifies it — a ".mtp" entry sat
+    # here matching nothing until its layer 78 proved it. Qwen3.5's is a
+    # top-level `mtp.` PREFIX, which no layer-index rule can see.
 )
 
 
@@ -430,6 +453,13 @@ def main(argv: list[str]) -> int:
         return 3
 
     moe_block = "block_sparse_moe" if model_type == "mixtral" else "mlp"
+    # SINGULAR for the Qwen families, plural everywhere else. Mirrors
+    # `TensorNaming::shared_block` in src/soma/arch_ir.cpp — one character, and
+    # getting it wrong drops the shared expert from the container without a word
+    # because the copy loop simply finds no tensor of that name.
+    shared_block = ("mlp.shared_expert"
+                    if model_type in ("qwen3_5_moe_text", "qwen3_5_moe", "qwen2_moe")
+                    else f"{moe_block}.shared_experts")
     names = ({"gate": "w1.weight", "up": "w3.weight", "down": "w2.weight"}
              if model_type == "mixtral"
              else {"gate": "gate_proj.weight", "up": "up_proj.weight",
@@ -571,7 +601,7 @@ def main(argv: list[str]) -> int:
     claimed: list[str] = list(TOP_LEVEL_TENSORS)
     for layer in range(n_layers):
         claimed += [f"model.layers.{layer}.{suf}" for suf in DENSE_SUFFIXES]
-        claimed += [f"model.layers.{layer}.{moe_block}.shared_experts.{s}.weight"
+        claimed += [f"model.layers.{layer}.{shared_block}.{s}.weight"
                     for s in ("gate_proj", "up_proj", "down_proj")]
     claimed_set = set(claimed)
 
@@ -584,6 +614,17 @@ def main(argv: list[str]) -> int:
         # block, its own experts, and the MTP-specific eh_proj/enorm/hnorm — 791
         # tensors in all. It is identified by its layer INDEX, which is why a
         # substring rule like ".mtp" matched none of it.
+        # …and the OTHER spelling. Qwen3.5 hangs its MTP head off a TOP-LEVEL
+        # `mtp.` prefix — `mtp.fc`, `mtp.layers.0.*`, `mtp.norm`,
+        # `mtp.pre_fc_norm_*` — which no `model.layers.<N>` rule can see. The
+        # comment above says a substring matched none of GLM's; here a prefix
+        # matches all of Qwen3.5's, and the two conventions need one rule each.
+        #
+        # Excluded rather than converted because nothing can serve it: the IR
+        # records the head as `source_declared` with `present` false, so the plan
+        # names it and the engine never claims to run it.
+        if name.startswith("mtp."):
+            return True
         m = re.match(r"model\.layers\.(\d+)\.", name)
         return m is not None and int(m.group(1)) >= n_layers
 

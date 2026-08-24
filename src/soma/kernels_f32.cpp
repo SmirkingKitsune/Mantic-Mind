@@ -93,7 +93,8 @@ void rmsnorm_into(std::span<const float> x,
                   std::span<const float> weight,
                   std::uint32_t n,
                   float eps,
-                  std::span<float> out) noexcept {
+                  std::span<float> out,
+                  float weight_offset) noexcept {
     float sumsq = 0.0f;
     if (simd::available()) {
         sumsq = simd::sumsq(x.data(), n);
@@ -106,14 +107,15 @@ void rmsnorm_into(std::span<const float> x,
     // reduction, so the compiler already vectorises it and an intrinsic version
     // would only be a second place for the expression to drift from HF's.
     for (std::uint32_t i = 0; i < n; ++i)
-        out[i] = x[i] * scale * weight[i];
+        out[i] = x[i] * scale * (weight[i] + weight_offset);
 }
 
 void rmsnorm(std::span<float> x,
              std::span<const float> weight,
              std::uint32_t n,
-             float eps) noexcept {
-    rmsnorm_into(x, weight, n, eps, x);
+             float eps,
+             float weight_offset) noexcept {
+    rmsnorm_into(x, weight, n, eps, x, weight_offset);
 }
 
 void softmax(std::span<float> x, std::uint32_t n) noexcept {

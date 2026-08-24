@@ -346,6 +346,85 @@ def shrink_kimi_linear(cfg: dict[str, Any], layers: int) -> None:
         cfg["attn_res_block_size"] = max(2, layers // 2)
 
 
+def shrink_qwen3_5_moe(cfg: dict[str, Any], layers: int) -> None:
+    """Shrink the hybrid GDN/GQA stack. Four properties must survive.
+
+    THE HYBRID SPLIT, and it is ZERO-BASED here — the opposite of
+    `shrink_kimi_linear`'s one-based lists. `layer_types[i]` names layer `i`. The
+    source list has 92 entries and the fixture has four, so it is regenerated
+    rather than truncated, from the same rule upstream uses when the list is
+    absent: `"linear_attention" if (i + 1) % interval else "full_attention"`.
+    That is a ONE-based stride producing a ZERO-based list, which is precisely
+    the confusion worth pinning, and at four layers it yields three linear and a
+    full one last — the same tail as production, where layer 91 is full.
+
+    THE TWO LINEAR HEAD COUNTS. `linear_num_value_heads / linear_num_key_heads`
+    is 8 upstream, and that ratio IS the `repeat_interleave` broadcast. Collapsing
+    it to 1 would leave the broadcast dead and let an implementation that sizes
+    the recurrent state from the key heads pass — an 8x under-count that nothing
+    else in the fixture would catch. Preserved exactly.
+
+    THE FUSED OUTPUT GATE. `attn_output_gate` stays true, so `q_proj` keeps its
+    double width and the per-head `[query | gate]` interleave that a
+    contiguous-halves reading gets wrong.
+
+    THE PARTIAL ROTATION. `partial_rotary_factor` stays 0.25, and `head_dim` is
+    chosen so `int(head_dim * 0.25)` is a positive EVEN number of channels — at
+    TARGET_HEAD_DIM 16 that is 4. A factor of 1.0, or a head_dim that rounded the
+    product to zero, would rotate the whole head or none of it and the pass-through
+    half would go untested.
+    """
+    interval = int(cfg.get("full_attention_interval", 4) or 4)
+    # At least one of each kind must survive, or the fixture is not a hybrid.
+    if interval > layers:
+        interval = layers
+    if interval < 2:
+        raise SystemExit(
+            f"  REFUSED: full_attention_interval {interval} at {layers} layers leaves "
+            f"no linear layer. Raise --layers.")
+    cfg["layer_types"] = [
+        "linear_attention" if (i + 1) % interval else "full_attention"
+        for i in range(layers)
+    ]
+    cfg["full_attention_interval"] = interval
+    kinds = set(cfg["layer_types"])
+    if len(kinds) < 2:
+        raise SystemExit(
+            f"  REFUSED: {layers} layers at interval {interval} yields only {kinds}; "
+            f"a single-kind stack is not a hybrid.")
+
+    # The broadcast ratio, preserved; the widths, shrunk. head_k_dim and
+    # head_v_dim are equal upstream (128/128) and stay equal.
+    n_k = int(cfg.get("linear_num_key_heads", 2) or 2)
+    n_v = int(cfg.get("linear_num_value_heads", n_k) or n_k)
+    ratio = max(1, n_v // max(1, n_k))
+    cfg["linear_num_key_heads"] = 2
+    cfg["linear_num_value_heads"] = 2 * ratio
+    cfg["linear_key_head_dim"] = TARGET_HEAD_DIM
+    cfg["linear_value_head_dim"] = TARGET_HEAD_DIM
+    # Semantics, verbatim: the convolution window length. Kernel 4 carries three
+    # positions of state; kernel 1 would carry none and delete the mechanism.
+    cfg.setdefault("linear_conv_kernel_dim", 4)
+    if int(cfg["linear_conv_kernel_dim"]) < 2:
+        cfg["linear_conv_kernel_dim"] = 4
+
+    # `int(head_dim * factor)` must be even and non-zero. shrink_attention has
+    # already set head_dim to TARGET_HEAD_DIM by the time this runs.
+    factor = float(cfg.get("partial_rotary_factor", 1.0) or 1.0)
+    head_dim = int(cfg.get("head_dim") or TARGET_HEAD_DIM)
+    rotary = int(head_dim * factor)
+    if rotary < 2 or rotary % 2:
+        raise SystemExit(
+            f"  REFUSED: partial_rotary_factor {factor} on head_dim {head_dim} gives "
+            f"{rotary} rotary channels; the fixture would test no rotation or an "
+            f"odd split.")
+    # Mirrored into the nested block, which is the copy
+    # `compute_default_rope_parameters` actually reads.
+    rope = cfg.get("rope_parameters")
+    if isinstance(rope, dict):
+        rope["partial_rotary_factor"] = factor
+
+
 def shrink_moe(cfg: dict[str, Any]) -> None:
     """Shrink expert counts and widths, preserving every routing semantic."""
     ekey = _first_present(cfg, EXPERT_COUNT_KEYS)
@@ -409,6 +488,10 @@ def shrink_config(raw: dict[str, Any], layers: int, experts: int) -> dict[str, A
             # After shrink_mla, which owns the FULL-attention layers' dims and
             # settles hidden_size — the latent MoE width is derived from it.
             shrink_kimi_linear(cfg, layers)
+        elif cfg.get("model_type") in ("qwen3_5_moe_text", "qwen3_5_moe"):
+            # After shrink_attention, which owns this hybrid's FULL-attention
+            # dims: the rotary-width check below reads the head_dim it settled.
+            shrink_qwen3_5_moe(cfg, layers)
     shrink_moe(cfg)
 
     _shrink(cfg, "vocab_size", TARGET_VOCAB)
@@ -447,6 +530,56 @@ def shrink_config(raw: dict[str, Any], layers: int, experts: int) -> dict[str, A
     cfg["torch_dtype"] = "float32"  # G0 is the fp32 path
     cfg["use_cache"] = True
     return cfg
+
+
+def rank1_override(model_type: str, name: str):
+    """A family-specific initializer for one rank-<=1 parameter, or None.
+
+    The generic rule below — "~1 if the name contains 'norm', else ~0" — is a
+    good default and it is WRONG whenever a family's own `_init_weights` says
+    something else about a parameter whose DISTRIBUTION is architecture rather
+    than noise. The fixture rule is "shrink dimensions, preserve semantics", and
+    an initializer that changes what the operator does is a semantic.
+
+    Keyed on `model_type` rather than on the parameter name alone, and that is
+    deliberate: `A_log` also exists on `kimi_linear`, whose fixture is committed
+    and whose oracle was measured under the generic rule. Regenerating it under a
+    new rule is a decision to make on purpose, not a side effect of adding a
+    family.
+
+    Qwen3.5's three, all from `Qwen3_5MoePreTrainedModel._init_weights`:
+
+      A_log     `log(uniform(0, 16))`, so `exp(A_log)` spans (0, 16). The generic
+                rule gives ~0, hence `exp(A_log) ~ 1` — a decay per token of
+                `exp(-softplus(a))` instead of `exp(-8 * softplus(a))`. Orders of
+                magnitude more memory in the recurrent state than any real
+                checkpoint has, which is not this architecture and is far nastier
+                numerically.
+      dt_bias   ones, not zeros. It is the bias INSIDE the softplus, so zeroing
+                it shifts every gate.
+      RMSNorm   ZEROS, because this family's norm applies `(1 + weight)`. The
+                weight is a-centred-on-zero; the generic rule centres it on one
+                and every norm in the fixture then scales by ~2. Two norms per
+                layer of a model that is supposed to scale by ~1.
+    """
+    if model_type not in ("qwen3_5_moe_text", "qwen3_5_moe"):
+        return None
+    import torch  # late, like main()'s, so --help works without it installed
+
+    lower = name.lower()
+    if lower.endswith("a_log"):
+        return lambda p, gen: p.copy_(
+            torch.empty_like(p).uniform_(0.0, 16.0, generator=gen).log_())
+    if lower.endswith("dt_bias"):
+        return lambda p, gen: p.copy_(
+            torch.ones_like(p) + torch.empty_like(p).uniform_(-0.02, 0.02, generator=gen))
+    if "norm" in lower and not lower.endswith("linear_attn.norm.weight"):
+        # `linear_attn.norm` is `Qwen3_5MoeRMSNormGated`, a DIFFERENT class that
+        # initializes to ones and applies `weight` plainly. Same model, two norm
+        # conventions — so this cannot be decided by the substring "norm" alone.
+        return lambda p, gen: p.copy_(
+            torch.zeros_like(p) + torch.empty_like(p).uniform_(-0.02, 0.02, generator=gen))
+    return None
 
 
 def layer_kinds(cfg: dict[str, Any]) -> list[str]:
@@ -742,6 +875,8 @@ def main(argv: list[str]) -> int:
         for name, p in sorted(model.named_parameters()):
             if p.dim() >= 2:
                 p.copy_(torch.empty_like(p).uniform_(-0.08, 0.08, generator=gen))
+            elif (rule := rank1_override(model_type, name)) is not None:
+                rule(p, gen)
             else:
                 # Norms initialize to ~1, biases to ~0. Perturbed so a dropped
                 # norm weight cannot pass by multiplying by exactly 1.

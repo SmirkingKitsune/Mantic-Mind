@@ -228,7 +228,21 @@ def dump_reference(fixture: Path, out: Path, positions: int) -> None:
     for i, layer in enumerate(layers):
         if not is_v4:
             handles.append(layer.register_forward_hook(layer_hook(i), with_kwargs=False))
-            handles.append(layer.self_attn.register_forward_hook(attn_hook(i)))
+            # `self_attn` OR `linear_attn`. A hybrid stack whose two kinds live
+            # under different module names has neither on every layer — Qwen3.5
+            # calls its Gated DeltaNet block `linear_attn`, and hooking only
+            # `self_attn` raised AttributeError on layer 0 rather than dumping
+            # three quarters of the model. Kimi does not have this problem
+            # because it names both halves `self_attn`, which is exactly why the
+            # assumption survived until now.
+            mixer = getattr(layer, "self_attn", None)
+            if mixer is None:
+                mixer = getattr(layer, "linear_attn", None)
+            if mixer is None:
+                raise SystemExit(
+                    f"layer {i} has neither `self_attn` nor `linear_attn`; this dumper "
+                    f"does not know where its token mixer lives")
+            handles.append(mixer.register_forward_hook(attn_hook(i)))
         else:
             handles.append(layer.attn_hc.register_forward_hook(v4_hc_hook(i, "attn")))
             handles.append(layer.self_attn.register_forward_hook(v4_attn_hook(i)))
@@ -243,7 +257,12 @@ def dump_reference(fixture: Path, out: Path, positions: int) -> None:
                     handles.append(indexer.scorer.register_forward_pre_hook(
                         v4_indexer_pre_hook(i)))
         for attr, when in SUB:
-            mod = getattr(layer.self_attn, attr, None)
+            # `mixer`, not `layer.self_attn` — see the hook registration above.
+            # The sub-taps are all projection names from the full-attention
+            # families, so on a linear layer every one of them is simply absent
+            # and the loop skips, which is the correct outcome rather than a
+            # missing tap.
+            mod = getattr(mixer, attr, None) if not is_v4 else getattr(layer.self_attn, attr, None)
             if mod is None:
                 continue   # absent on this family (e.g. q_a/q_b vs q_proj)
             tap = ENGINE_NAME[attr]

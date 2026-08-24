@@ -305,6 +305,16 @@ void F32Workspace::reserve(const ArchIr& arch, std::uint32_t max_tokens) {
     q.assign(t * hq, 0.0f);
     k.assign(t * hkv, 0.0f);
     v.assign(t * hkv, 0.0f);
+    // Allocated only for the families that fuse the gate into q_proj. Sized
+    // unconditionally to zero otherwise, so `empty()` is a reliable test and no
+    // other family pays for the buffer.
+    if (arch.attention.fused_output_gate) {
+        q_raw.assign(t * 2 * hq, 0.0f);
+        attn_gate.assign(t * hq, 0.0f);
+    } else {
+        q_raw.clear();
+        attn_gate.clear();
+    }
     // One row per worker; ensure_score_scratch() grows this if the pool is
     // larger than one. Sized here too so the serial path needs no pool at all.
     scores.assign(t, 0.0f);
@@ -634,6 +644,20 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
                                              lw.shared_down);
                     !s.ok())
                     return s;
+
+                // The scalar branch gate. A SIBLING of the shared block, not a
+                // member of it: upstream names it `mlp.shared_expert_gate` while
+                // the expert itself is `mlp.shared_expert.*`, so it hangs off the
+                // MoE block rather off the shared one.
+                if (arch.ffn.shared_expert_gate) {
+                    if (auto s = bind_weight_optional(out,
+                                                      p + arch.naming.moe_block +
+                                                          ".shared_expert_gate.weight",
+                                                      TensorRole::SharedExpert,
+                                                      lw.shared_scale);
+                        !s.ok())
+                        return s;
+                }
             }
         } else {
             // SharedExpert, NOT the Expert* roles.
@@ -1157,7 +1181,8 @@ Status forward_impl(const F32Model& model,
                               lw.input_norm,
                               d,
                               arch.rms_norm_eps,
-                              std::span<float>(ws.normed).subspan(off, d));
+                              std::span<float>(ws.normed).subspan(off, d),
+                              arch.rms_norm_weight_offset());
         }
         const auto arc =
             rows.empty()
@@ -1195,7 +1220,8 @@ Status forward_impl(const F32Model& model,
                               lw.post_attn_norm,
                               d,
                               arch.rms_norm_eps,
-                              std::span<float>(ws.normed).subspan(off, d));
+                              std::span<float>(ws.normed).subspan(off, d),
+                              arch.rms_norm_weight_offset());
         }
 
         if (lw.kind == LayerKind::Dense) {
@@ -1421,6 +1447,22 @@ Status forward_impl(const F32Model& model,
                 // The shared expert reads the FULL-WIDTH input, not the latent
                 // one, and adds into the up-projected result. It is outside the
                 // latent space entirely.
+                // The branch gate, when this family has one, rides in as the
+                // CONTRIBUTION WEIGHT rather than as a separate pass over the
+                // output. `apply_glu_expert` already scales what it accumulates,
+                // which is exactly `sigmoid(w · x) * shared(x)` — and doing it
+                // this way means the gated and ungated families share one code
+                // path instead of two that must agree.
+                std::vector<float> scale;
+                if (!lw.shared_scale.empty()) {
+                    scale.assign(n, 0.0f);
+                    soma::matmul(lw.shared_scale,
+                                 std::span<const float>(ws.normed.data(),
+                                                        static_cast<std::size_t>(n) * d),
+                                 n,
+                                 std::span<float>(scale));
+                    for (auto& s : scale) s = 1.0f / (1.0f + std::exp(-s));
+                }
                 for (std::uint32_t t = 0; t < n; ++t) {
                     const auto off = static_cast<std::size_t>(t) * d;
                     apply_glu_expert(arch,
@@ -1430,7 +1472,7 @@ Status forward_impl(const F32Model& model,
                                      ws.normed.data() + off,
                                      d,
                                      arch.ffn.shared_intermediate,
-                                     1.0f,
+                                     scale.empty() ? 1.0f : scale[t],
                                      ws.worker_ffn(0),
                                      ws.attn_out.data() + off);
                 }
@@ -1480,7 +1522,8 @@ Status forward_impl(const F32Model& model,
                           model.out_norm,
                           d,
                           arch.rms_norm_eps,
-                          std::span<float>(ws.normed).subspan(off, d));
+                          std::span<float>(ws.normed).subspan(off, d),
+                          arch.rms_norm_weight_offset());
         matvec(model.out_head,
                std::span<const float>(ws.normed).subspan(off, d),
                std::span<float>(out_logits).subspan(static_cast<std::size_t>(t) * vocab, vocab));

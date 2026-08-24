@@ -166,6 +166,21 @@ struct FamilyTraits {
     float default_rms_eps = 1e-6f;
 
     TensorNaming naming{};
+
+    /// The shared expert is scaled by a learned scalar gate, and config.json
+    /// never says so. `Qwen2MoeSparseMoeBlock` and `Qwen3_5MoeSparseMoeBlock`
+    /// both build a `shared_expert_gate` Linear unconditionally alongside the
+    /// shared expert; DeepSeek's adds its shared expert ungated. Same category
+    /// as `force_normalize_topk` — family knowledge with no key to read.
+    ///
+    /// Trailing, so every existing aggregate initializer above stays valid.
+    bool gated_shared_expert = false;
+
+    /// `x_hat * w` or `x_hat * (1 + w)`. Family knowledge with no key to read,
+    /// and the most quietly destructive of the three flags here: a one-plus
+    /// checkpoint's norm weights are centred on ZERO, so reading them plainly
+    /// multiplies every normalized activation by roughly nothing. Also trailing.
+    RmsNormScale rms_norm_scale = RmsNormScale::Weight;
 };
 
 TensorNaming mixtral_naming() {
@@ -199,6 +214,16 @@ TensorNaming kimi_naming() {
     n.expert_gate = "w1.weight"; // KimiBlockSparseMLP: w1 = gate
     n.expert_up = "w3.weight";   //                     w3 = up
     n.expert_down = "w2.weight"; //                     w2 = down
+    return n;
+}
+
+TensorNaming qwen3_5_naming() {
+    TensorNaming n;
+    // SINGULAR. Qwen2-MoE and Qwen3.5 spell it `mlp.shared_expert`; DeepSeek and
+    // the TensorNaming default spell it `mlp.shared_experts`. One character, and
+    // the tensor simply does not bind — which at least fails loudly, unlike most
+    // of the hazards in this file.
+    n.shared_block = "mlp.shared_expert";
     return n;
 }
 
@@ -265,6 +290,37 @@ FamilyTraits traits_for(const std::string& model_type) {
         // the blocks separately instead of a single family switch.
         return {AttentionFamily::MlaKda, QkNormKind::None, true, false, 1e-6f, kimi_naming()};
     }
+    if (model_type == "qwen3_5_moe_text" || model_type == "qwen3_5_moe") {
+        // The second hybrid, and deliberately NOT routed through `MlaKda`.
+        //
+        // 69 of 92 layers are Gated DeltaNet — a fixed-size recurrent state; the
+        // other 23 are ordinary GQA, 64 heads over 4 kv-heads, output-gated and
+        // rotated over only the first quarter of each head. Nothing about the
+        // full half is MLA, so the two hybrids share a SHAPE and no arithmetic.
+        //
+        // `force_normalize_topk` because `Qwen3_5MoeTopKRouter` divides the
+        // top-k probabilities by their sum unconditionally and the config
+        // carries no `norm_topk_prob` to say so — the same trap Mixtral sets,
+        // and reading the absent key as false mis-scales every expert.
+        //
+        // `qwen3_5_moe` is accepted alongside the text-only spelling because the
+        // multimodal wrapper's `model_type` is that, with the language model
+        // under `text_config`; the hoist above lands here either way.
+        return {AttentionFamily::GqaGdn,
+                QkNormKind::PerHead,
+                true,
+                true,
+                1e-6f,
+                qwen3_5_naming(),
+                /*gated_shared_expert=*/true,
+                // `Qwen3_5MoeRMSNorm.forward` is `x_hat * (1.0 + weight)` with
+                // `weight` a zeros-initialized Parameter — Gemma's convention,
+                // and the first family here to use it. Its GATED norm is a
+                // different class using the plain form, which is why this is a
+                // model-level property that `arch::gdn::gated_rmsnorm`
+                // deliberately does not consult.
+                RmsNormScale::OnePlusWeight};
+    }
     if (model_type == "deepseek_v4") {
         return {AttentionFamily::CompressedSparse,
                 QkNormKind::FullWidth,
@@ -303,6 +359,8 @@ const char* to_string(AttentionFamily family) noexcept {
         return "compressed+sparse";
     case AttentionFamily::MlaKda:
         return "mla+kda";
+    case AttentionFamily::GqaGdn:
+        return "gqa+gdn";
     }
     return "unknown";
 }
@@ -359,8 +417,9 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
     if (!traits.supported) {
         return {StatusCode::Unsupported,
                 "no adapter for model_type '" + model_type +
-                    "'; supported: olmoe, qwen3_moe, qwen2_moe, mixtral, deepseek_v2, "
-                    "deepseek_v3, deepseek_v4, glm_moe_dsa, kimi_k3, kimi_linear"};
+                    "'; supported: olmoe, qwen3_moe, qwen2_moe, qwen3_5_moe, "
+                    "qwen3_5_moe_text, mixtral, deepseek_v2, deepseek_v3, deepseek_v4, "
+                    "glm_moe_dsa, kimi_k3, kimi_linear"};
     }
 
     out = ArchIr{};
@@ -408,6 +467,7 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
     // Family default when the key is absent — NOT a global constant.
     out.rms_norm_eps = get_or<float>(
         j, "rms_norm_eps", get_or<float>(j, "layer_norm_eps", traits.default_rms_eps));
+    out.rms_norm_scale = traits.rms_norm_scale;
     out.naming = traits.naming;
 
     out.topology.n_layers = get_or<std::uint32_t>(j, "num_hidden_layers", 0);
@@ -611,6 +671,118 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
         }
     }
 
+    // ── GDN ──────────────────────────────────────────────────────────────────
+    //
+    // The layer split is a per-layer LIST and it is ZERO-based, which is the
+    // exact opposite of KDA's hazard above: `layer_types[i]` names layer `i`, so
+    // reading it plainly is right and there is nothing to convert.
+    //
+    // The trap is the FALLBACK. With `layer_types` absent, upstream synthesizes
+    // `"linear_attention" if (i + 1) % interval else "full_attention"` — a
+    // one-based stride producing full layers at zero-based 3, 7, 11 … The
+    // obvious `i % interval == 0` reading places them at 0, 4, 8 … instead,
+    // which shifts every layer's kind by three and binds `linear_attn` tensors
+    // into `self_attn` blocks. Transcribed rather than reinvented, and the
+    // stated list wins whenever it exists.
+    if (attn.family == AttentionFamily::GqaGdn) {
+        auto& gdn = attn.gdn;
+        gdn.n_k_heads = get_or<std::uint32_t>(j, "linear_num_key_heads", 0);
+        gdn.n_v_heads = get_or<std::uint32_t>(j, "linear_num_value_heads", 0);
+        gdn.head_k_dim = get_or<std::uint32_t>(j, "linear_key_head_dim", 0);
+        gdn.head_v_dim = get_or<std::uint32_t>(j, "linear_value_head_dim", 0);
+        gdn.conv_kernel = get_or<std::uint32_t>(j, "linear_conv_kernel_dim", 0);
+
+        if (gdn.n_k_heads == 0 || gdn.n_v_heads == 0 || gdn.head_k_dim == 0 ||
+            gdn.head_v_dim == 0 || gdn.conv_kernel == 0) {
+            return {StatusCode::InvalidArgument,
+                    "hybrid linear attention has a zero dimension (linear_num_key_heads, "
+                    "linear_num_value_heads, linear_key_head_dim, linear_value_head_dim, "
+                    "linear_conv_kernel_dim)"};
+        }
+        // q and k are broadcast to the value head count by `repeat_interleave`,
+        // which is only defined for an exact multiple. A config that is not one
+        // would run the recurrence over a head count that matches neither
+        // projection.
+        if (gdn.n_v_heads % gdn.n_k_heads != 0) {
+            return {StatusCode::InvalidArgument,
+                    "linear_num_value_heads " + std::to_string(gdn.n_v_heads) +
+                        " is not a multiple of linear_num_key_heads " +
+                        std::to_string(gdn.n_k_heads)};
+        }
+
+        const auto n_layers = out.topology.n_layers;
+        gdn.layer_kinds.clear();
+        if (const auto it = j.find("layer_types"); it != j.end() && it->is_array()) {
+            if (it->size() != n_layers) {
+                return {StatusCode::InvalidArgument,
+                        "layer_types has " + std::to_string(it->size()) + " entries for " +
+                            std::to_string(n_layers) + " layers"};
+            }
+            gdn.layer_kinds.reserve(n_layers);
+            for (const auto& v : *it) {
+                const auto name = v.is_string() ? v.get<std::string>() : std::string{};
+                if (name == "linear_attention") {
+                    gdn.layer_kinds.push_back(AttnLayerKind::Linear);
+                } else if (name == "full_attention") {
+                    gdn.layer_kinds.push_back(AttnLayerKind::Full);
+                } else {
+                    // Not defaulted. `sliding_attention` is a real value in this
+                    // slot for other Qwen configs, and quietly calling it Full
+                    // would size a full cache for a windowed layer.
+                    return {StatusCode::Unsupported,
+                            "layer_types contains unsupported kind '" + name + "'"};
+                }
+            }
+        } else {
+            const auto interval = get_or<std::uint32_t>(j, "full_attention_interval", 4);
+            if (interval == 0) {
+                return {StatusCode::InvalidArgument, "full_attention_interval is zero"};
+            }
+            gdn.layer_kinds.reserve(n_layers);
+            for (std::uint32_t i = 0; i < n_layers; ++i) {
+                gdn.layer_kinds.push_back((i + 1) % interval == 0 ? AttnLayerKind::Full
+                                                                  : AttnLayerKind::Linear);
+            }
+        }
+        if (gdn.n_full_layers() == 0) {
+            return {StatusCode::InvalidArgument,
+                    "hybrid stack has no full-attention layer, so nothing carries a KV cache"};
+        }
+
+        // The gate rides inside `q_proj` at double width; see
+        // AttentionSpec::fused_output_gate for why that is a sizing fact and not
+        // a style note.
+        attn.fused_output_gate = get_or<bool>(j, "attn_output_gate", false);
+
+        // Only the leading `head_dim * partial_rotary_factor` channels rotate;
+        // the rest pass through. Truncated, not rounded — upstream computes
+        // `int(head_dim * partial_rotary_factor)`, and at 256 x 0.25 the two
+        // agree, which is exactly why a rounding difference here would survive
+        // this checkpoint and surface on the next one.
+        //
+        // Stated in two places by this config; the nested copy is the one
+        // `compute_default_rope_parameters` reads, so it wins.
+        float rotary_factor = get_or<float>(j, "partial_rotary_factor", 1.0f);
+        if (const auto it = j.find("rope_parameters"); it != j.end() && it->is_object()) {
+            rotary_factor = get_or<float>(*it, "partial_rotary_factor", rotary_factor);
+        }
+        if (rotary_factor <= 0.0f || rotary_factor > 1.0f) {
+            return {StatusCode::InvalidArgument,
+                    "partial_rotary_factor " + std::to_string(rotary_factor) +
+                        " is outside (0, 1]"};
+        }
+        const auto rotary_dim =
+            static_cast<std::uint32_t>(static_cast<float>(attn.head_dim) * rotary_factor);
+        if (rotary_dim == 0 || rotary_dim % 2 != 0) {
+            return {StatusCode::InvalidArgument,
+                    "partial rotary width " + std::to_string(rotary_dim) +
+                        " is not a positive even number of channels"};
+        }
+        // `partial_dim == head_dim` and "full rope" are the same rotation, and
+        // recording the width either way keeps one meaning for the field.
+        attn.rope.partial_dim = rotary_dim;
+    }
+
     out.block_residual.block_size = get_or<std::uint32_t>(j, "attn_res_block_size", 0);
 
     if (attn.family == AttentionFamily::CompressedSparse) {
@@ -737,6 +909,28 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
     if (ffn.shared_intermediate == 0 && router.n_shared_experts > 0) {
         ffn.shared_intermediate = ffn.expert_intermediate * router.n_shared_experts;
     }
+    // ...and the CONVERSE, which was missing and cost the Qwen families their
+    // shared expert entirely.
+    //
+    // DeepSeek states the count and derives the width; Qwen2-MoE and Qwen3.5
+    // state the WIDTH and never state a count at all. Both `f32_bind_layer` and
+    // the planner gate the shared expert on `n_shared_experts > 0`, so a
+    // width-only config bound no shared tensors and charged no shared bytes —
+    // the branch simply did not exist, on a model that has one on every MoE
+    // layer. Nothing failed to load; the FFN was just missing a term.
+    //
+    // One, not more: `shared_intermediate` is the FUSED width of however many
+    // shared experts there are (see the planner's note on why multiplying by the
+    // count again squares it), and a config that states only a width describes
+    // exactly one such fused block.
+    //
+    // This CHANGES arch_hash for any qwen2_moe container admitted before now,
+    // which is correct — those containers describe a model missing an FFN
+    // branch, and re-admitting them is the point.
+    if (router.n_shared_experts == 0 && ffn.shared_intermediate > 0) {
+        router.n_shared_experts = 1;
+    }
+    ffn.shared_expert_gate = traits.gated_shared_expert && router.n_shared_experts > 0;
     ffn.expert_layout = ExpertLayout::InterleavedGateUpDown;
     ffn.swiglu_limit = get_or<float>(j, "swiglu_limit", 0.0f);
 
@@ -770,6 +964,26 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
         }
         d.n_layers = static_cast<std::uint32_t>(d.target_layer_ids.size());
         d.source_declared = d.n_layers > 0 || d.trained_block_size > 0 || d.markov_rank > 0;
+    }
+
+    // Qwen3.5 carries a one-layer multi-token-prediction head under a `mtp.*`
+    // prefix — `mtp.fc`, one ordinary decoder layer, and two pre-projection
+    // norms. transformers 5.15.1 does not implement it, and neither does Soma.
+    //
+    // Recorded anyway, because the alternative is silence. `mtp.*` is a
+    // TOP-LEVEL prefix, not a `model.layers.<N>` name, so it is invisible to the
+    // layer-index rule that excludes GLM-5.2's MTP layer and the converter has
+    // to be told about it either way. An operator can see the head in the
+    // checkpoint index; a plan that never mentions it is the plan being quiet
+    // about a real part of the model. `present` stays false — see
+    // SpeculativeSpec — so nothing advertises a draft it cannot run.
+    if (attn.family == AttentionFamily::GqaGdn) {
+        if (const auto n = get_or<std::uint32_t>(j, "mtp_num_hidden_layers", 0); n > 0) {
+            auto& d = out.speculative;
+            d.method = SpeculativeMethod::Mtp;
+            d.n_layers = n;
+            d.source_declared = true;
+        }
     }
 
     // G0/G1 read fp32 HF checkpoints directly; requantization happens at
@@ -829,6 +1043,39 @@ Status validate_arch_ir(const ArchIr& ir) {
         if (m.kv_lora_rank == 0 || m.qk_nope_head_dim == 0 || m.v_head_dim == 0) {
             return {StatusCode::InvalidArgument,
                     "hybrid full-attention layers have no MLA dimensions"};
+        }
+    }
+    if (ir.attention.family == AttentionFamily::GqaGdn) {
+        const auto& g = ir.attention.gdn;
+        if (g.layer_kinds.size() != ir.topology.n_layers) {
+            return {StatusCode::InvalidArgument,
+                    "gdn layer_kinds has " + std::to_string(g.layer_kinds.size()) +
+                        " entries for " + std::to_string(ir.topology.n_layers) + " layers"};
+        }
+        if (g.n_k_heads == 0 || g.n_v_heads == 0 || g.head_k_dim == 0 || g.head_v_dim == 0 ||
+            g.conv_kernel < 2) {
+            return {StatusCode::InvalidArgument, "hybrid linear attention is incomplete"};
+        }
+        if (g.n_v_heads % g.n_k_heads != 0) {
+            return {StatusCode::InvalidArgument,
+                    "gdn value heads " + std::to_string(g.n_v_heads) +
+                        " is not a multiple of key heads " + std::to_string(g.n_k_heads)};
+        }
+        // Same reason as the hybrid above: no full-attention layer means no KV
+        // cache anywhere, and the planner would report the context as free.
+        if (g.n_full_layers() == 0) {
+            return {StatusCode::InvalidArgument,
+                    "hybrid stack has no full-attention layer"};
+        }
+        // The full-attention layers are GQA, so the rotation must be a real
+        // even-width slice of a real head. A zero here would rotate nothing on
+        // a model whose long-context behaviour is entirely positional.
+        const auto rot = ir.attention.rope.partial_dim;
+        if (rot == 0 || rot > ir.attention.head_dim || rot % 2 != 0) {
+            return {StatusCode::InvalidArgument,
+                    "gdn full-attention rotary width " + std::to_string(rot) +
+                        " is not an even slice of head_dim " +
+                        std::to_string(ir.attention.head_dim)};
         }
     }
     if (ir.ffn.routed_expert_hidden != 0 && ir.n_moe_layers() > 0 &&
@@ -1067,6 +1314,24 @@ Status compute_arch_hash(const ArchIr& ir, std::string& out_hash) {
         for (const auto kind : k.layer_kinds) canon << (kind == AttnLayerKind::Linear ? 'l' : 'f');
         canon << "|blkres=" << ir.block_residual.block_size;
     }
+    // GDN, on the same conditional terms and for the same reason. Three of these
+    // are load-bearing in ways the shared `|h=|kv=|hd=` prefix above cannot
+    // carry:
+    //
+    //   * the key/value head SPLIT, because it sets the recurrent state size and
+    //     two configs agreeing on everything else but this are two models;
+    //   * the rotary WIDTH, which the general `|rope=` term omits — it hashes
+    //     theta and the scaling kind only, so a checkpoint rotating 64 of 256
+    //     channels and one rotating all 256 would otherwise hash identically;
+    //   * the fused output gate, which doubles `q_proj` and changes what the
+    //     block computes.
+    if (ir.attention.family == AttentionFamily::GqaGdn) {
+        const auto& g = ir.attention.gdn;
+        canon << "|gdn=" << g.n_k_heads << ':' << g.n_v_heads << ':' << g.head_k_dim << ':'
+              << g.head_v_dim << ':' << g.conv_kernel << ':' << ir.attention.rope.partial_dim
+              << ':' << ir.attention.fused_output_gate << ':' << ir.ffn.shared_expert_gate << ':';
+        for (const auto kind : g.layer_kinds) canon << (kind == AttnLayerKind::Linear ? 'l' : 'f');
+    }
     // The latent width, and the activation's parameters, are model identity: two
     // checkpoints differing only in `situ_beta` are two different models, and
     // the expert width decides what a converted expert's bytes even mean.
@@ -1074,6 +1339,11 @@ Status compute_arch_hash(const ArchIr& ir, std::string& out_hash) {
     // Both conditional, so a family that has neither hashes exactly as before.
     if (ir.ffn.routed_expert_hidden != 0) {
         canon << "|latent=" << ir.ffn.routed_expert_hidden << ':' << ir.ffn.routed_expert_norm;
+    }
+    // Conditional, like everything else added after the fact: a model using the
+    // plain convention hashes exactly as it did before this field existed.
+    if (ir.rms_norm_scale != RmsNormScale::Weight) {
+        canon << "|normscale=" << static_cast<int>(ir.rms_norm_scale);
     }
     if (ir.ffn.activation == Activation::Situ) {
         canon << "|situ=" << ir.ffn.situ_beta << ':' << ir.ffn.situ_linear_beta;

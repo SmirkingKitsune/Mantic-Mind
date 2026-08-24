@@ -9,6 +9,7 @@
 // of resolving to a descriptor is that the hot path never asks the question
 // again.
 
+#include "soma/arch/gdn.hpp"
 #include "soma/arch/gqa.hpp"
 #include "soma/arch/kda.hpp"
 #include "soma/arch/mla.hpp"
@@ -79,6 +80,32 @@ const F32Backend* resolve_f32_backend(const ArchIr& arch) noexcept {
         // written by the same author was ever going to catch.
         return &arch::kda::f32_backend();
 
+    case AttentionFamily::GqaGdn:
+        // SERVABLE, and — as with MlaKda — this line moved only once there was
+        // evidence for it.
+        //
+        // There was never a near-enough backend to borrow. Routing this to `gqa`
+        // would run 69 of 92 layers as dense softmax attention over a cache they
+        // do not have; routing it to `kda` would apply a per-channel decay to a
+        // per-head gate and index the recurrent state by the wrong head count.
+        // Both produce finite, fluent, different models.
+        //
+        // `tests/fixtures/tiny/Qwen3.5-MoE-Tiny` is the oracle, built by
+        // transformers' own `modeling_qwen3_5_moe.py` — pure torch on the CPU,
+        // with no `fla` and no CUDA, which is what makes this family cheaper to
+        // grade than the last hybrid was. Soma matches it at 4.58e-06 over 512
+        // teacher-forced positions with 256 greedy tokens exact.
+        //
+        // It was worth waiting for. The oracle found a defect on the first run
+        // that no internal invariant would ever have caught:
+        // `Qwen3_5MoeRMSNorm` applies `x_hat * (1 + weight)`, not `x_hat *
+        // weight`. Every norm in the model — layer norms, q/k norms, the final
+        // norm, but NOT the gated norm inside the linear block, which is a
+        // different class using the plain form — was scaled by a weight centred
+        // on zero instead of on one. Nothing failed to load, every shape agreed,
+        // and the logits were wrong from layer 0 at 1.9e+00.
+        return &arch::gdn::f32_backend();
+
     case AttentionFamily::Unknown:
         return nullptr;
     }
@@ -90,6 +117,12 @@ const SpeculativeBackend* resolve_speculative_backend(const ArchIr& arch) noexce
     switch (arch.speculative.method) {
     case SpeculativeMethod::DSpark:
         return &arch::deepseek_dspark::backend();
+    case SpeculativeMethod::Mtp:
+        // Unreachable in practice — the guard above returns on `!present`, and
+        // nothing sets `present` for a plain MTP head. Spelled out rather than
+        // left to the trailing `return nullptr` so that the day something DOES
+        // implement one, this switch is where the compiler points.
+        return nullptr;
     case SpeculativeMethod::None:
         return nullptr;
     }
@@ -131,6 +164,19 @@ const AttentionBackend* resolve_attention_backend(AttentionFamily family) noexce
         // refuse a model that fits — a wrong answer arrived at confidently,
         // rather than the honest "not yet" that `resolve_f32_backend` returns.
         return &arch::kda::attention_backend();
+
+    case AttentionFamily::GqaGdn:
+        // Its OWN backend, and — as with MlaKda — that is precisely why a family
+        // that cannot yet execute still needs one here.
+        //
+        // GQA's sizing would charge 92 layers of full K/V for a stack that has
+        // 23, and charge nothing for the 69 recurrent states that exist whether
+        // or not anything can run them. At the reference config's 262144 context
+        // that is 184.0 GiB against 46.55 GiB — a 3.95x over-count on the quantity
+        // the verdict turns on, so the planner would refuse a model that fits. A
+        // wrong answer arrived at confidently, rather than the honest "not yet"
+        // that `resolve_f32_backend` returns.
+        return &arch::gdn::attention_backend();
 
     case AttentionFamily::Unknown:
         return nullptr;
