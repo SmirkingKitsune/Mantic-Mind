@@ -69,6 +69,32 @@ void swiglu(std::span<const float> gate,
             std::uint32_t n,
             std::span<float> out) noexcept;
 
+/// SwiGLU-OAI: out = (up + 1) * gate * sigmoid(alpha * gate).
+///
+/// OpenAI's clamped GLU, as gpt-oss ships it and MiniMax-M3 reuses it. The
+/// CLAMPS are not here -- callers apply `FfnSpec::swiglu_limit` to both halves
+/// before this, exactly as they already do for `swiglu`, so the one place that
+/// knows the limit stays the one place.
+///
+/// What IS here is the pair of terms that make this a different function rather
+/// than a parameterization of `swiglu`:
+///
+///   alpha    inside the sigmoid. At 1 this is `gate * sigmoid(gate)` -- SiLU,
+///            i.e. exactly `swiglu`. At the reference checkpoint's 1.702 it is
+///            the logistic approximation to GELU, which is a visibly different
+///            curve, not a rescaling of the same one.
+///   up + 1   on the linear half. An up projection of exactly ZERO passes the
+///            gate through at full strength instead of silencing the unit, so
+///            the two forms disagree most where the model is least active.
+///
+/// A math primitive parameterized by IR data, like `situ_glu`. Nothing here
+/// names an architecture.
+void swiglu_oai(std::span<const float> gate,
+                std::span<const float> up,
+                std::uint32_t n,
+                float alpha,
+                std::span<float> out) noexcept;
+
 /// GeGLU (tanh approximation, matching HF's gelu_pytorch_tanh).
 void geglu(std::span<const float> gate,
            std::span<const float> up,

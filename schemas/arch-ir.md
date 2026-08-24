@@ -78,7 +78,7 @@ three different ways; resolving that at admission means the core never has to.
 
 | Field | Type | Notes |
 |---|---|---|
-| `family` | enum | `mha` \| `gqa` \| `mla` \| `mla+dsa` \| `mla+kda` \| `gqa+gdn` \| `compressed+sparse` — **selects the backend** |
+| `family` | enum | `mha` \| `gqa` \| `mla` \| `mla+dsa` \| `mla+kda` \| `gqa+gdn` \| `gqa+bsa` \| `compressed+sparse` — **selects the backend** |
 | `n_heads` | int | |
 | `n_kv_heads` | int | `gqa`/`mha` |
 | `head_dim` | int | |
@@ -91,6 +91,7 @@ three different ways; resolving that at admission means the core never has to.
 | `dsa` | object \| null | Present iff `family` is `mla+dsa` |
 | `kda` | object \| null | Present iff `family` is `mla+kda` |
 | `gdn` | object \| null | Present iff `family` is `gqa+gdn` |
+| `bsa` | object \| null | Present iff `family` is `gqa+bsa` |
 | `fused_output_gate` | bool | Sigmoid gate on the full-attention block whose projection rides INSIDE `q_proj` at double width — no tensor of its own, and the split is per head |
 | `compressed` | object \| null | Schema v2; present iff `family` is `compressed+sparse` |
 
@@ -241,6 +242,39 @@ producing full layers at zero-based 3, 7, 11 … The natural `i % interval == 0`
 at 0, 4, 8 … instead, shifting every layer's kind by three and binding `linear_attn` tensors into
 `self_attn` blocks. Two hybrids, two conventions, and each states its own.
 
+### `bsa` sub-object — block-sparse key selection
+
+Present iff `family` is `gqa+bsa`. Part of `arch_hash`, for the same reason `dsa` is: which layers
+select, and how coarsely, is what the model IS.
+
+| Field | Notes |
+|---|---|
+| `n_index_heads` | Heads on the indexer's QUERY side. Equal to `n_kv_heads` on MiniMax-M3, and not by accident — each one produces the selection for one GQA group, so query head `h` obeys indexer head `h / (n_heads / n_index_heads)` |
+| `index_head_dim` | Channels per indexer head, and the width of the single cached key |
+| `block_size` | Keys pooled into one scored block. The pool is a **max** |
+| `topk_blocks` | Blocks a query may attend |
+| `local_blocks` | Blocks ending at the query's own, forced visible. Applied by writing `+inf` into their scores BEFORE the top-k, so they CONSUME slots rather than adding to them |
+| `layer_kinds` | Per layer: `full` (owns an indexer) \| `none` (dense GQA). Length `n_layers`, authoritative. `shared` never appears — this family has no IndexShare |
+
+**Selection is per BLOCK, and every statement about this family has to be in those units.** A query
+sees `topk_blocks × block_size` keys: on MiniMax-M3, 16 × 128 = **2048**. A reader who transcribes
+DSA's per-key top-k selects 16 keys where the model selects 2048 — finite, fluent, and attending to
+a thousandth of what it should. `BsaSpec::visible_keys()` exists so that multiplication happens in
+one place.
+
+**Below `topk_blocks × block_size` tokens, the sparse path is bit-identical to dense.** Top-k selects
+every block there is, so any evaluation shorter than the span measures nothing about selection. This
+is the same threshold `dsa`'s `index_topk` sets and it is why the tiny fixture shrinks both terms to
+4 × 16 = 64: at that span, 448 of the oracle's 512 positions are genuinely sparse, and a dense
+implementation of the same weights diverges by **7.8e-01 max|logit|** and picks a different argmax at
+217 of the 512.
+
+**The indexer's key is CACHED, one head wide.** `k_proj` is `d_model → index_head_dim` and every
+indexer head scores against that same key. Like DSA's, it depends on a past token's hidden state at
+that layer and cannot be recomputed later — so it must be stored. Unlike DSA's, there is no empty V
+plane to put it in, because this family uses both; it rides in the **K plane's tail**, `[K | index_k]`
+per position. Sizing it per indexer head overstates the extra plane fourfold.
+
 ### KV cost — the number the planner actually cares about
 
 `kv_bytes_per_token()` and `kv_geometry()` are the attention properties that cross the seam. Worked
@@ -254,6 +288,7 @@ from the real configs:
 | GLM-5.2 | mla+dsa | `(512 + 64) + 128` = **704** | 78 | 107 KB | **3.5 GB** |
 | Kimi-K3 | mla+kda | `512 + 64` = **576**, on **24 of 93** layers | 24 (+69 stateful) | 27 KB | **1.1 GB** = 906 MB + 232 MB fixed |
 | Qwen3.8-2.4T-A95B | gqa+gdn | `2 × 4 × 256` = **2048**, on **23 of 92** layers | 23 (+69 stateful) | 92 KB | **3.3 GB** = 2.9 GB + 284 MB fixed |
+| MiniMax-M3 | gqa+bsa | `2 × 4 × 128 + 128` = **1152** | 60 | 135 KB | **4.4 GB** |
 
 **TWO rows in that table are not linear in context**, and both are hybrids. Kimi-K3's 69 linear layers hold a
 `n_heads × head_dim × head_dim` recurrent matrix and a short convolution window each — present in
@@ -271,6 +306,14 @@ per-head K and V, so both planes are `n_kv_heads * head_dim`. MLA stores a compr
 DERIVES V from it, so its V plane is **zero**. DSA is the exception: its indexer key must be cached,
 because it depends on a past token's hidden state at that layer and cannot be recomputed at a later
 step, so the otherwise-dead plane is exactly where it goes (roadmap D35, D37).
+
+`gqa+bsa` has the same requirement and no free plane to satisfy it, so its indexer key WIDENS the K
+plane instead: `k_floats = n_kv_heads × head_dim + index_head_dim`, `v_floats = n_kv_heads ×
+head_dim`. The geometry is uniform across layers because `KvCache` allocates one, so MiniMax-M3's
+three non-indexed leading layers own a slot they never write — 3 of 60 layers at 128 of 1152 floats,
+0.6% of the cache, reported as ALLOCATED rather than as needed. Omitting the plane entirely is the
+alternative that matters: at the model's stated 1M context that is 240 GiB reported against 270 GiB
+real, understated by **30 GiB** on the quantity the verdict turns on.
 
 On GLM-5.2 at 4k context with 4 slots that correction is 5.89 GB down to 3.60 GB, and the reclaimed
 2.29 GB goes to the expert cache. DeepSeek-V2-Lite and Moonlight lose their second plane outright.
@@ -297,7 +340,7 @@ like an unrelated bug.
 | `score_fn` | enum | `softmax` \| `sigmoid` \| `sqrtsoftplus` (computes `sqrt(softplus(x))`) |
 | `normalize_topk` | bool | `norm_topk_prob` |
 | `routed_scaling_factor` | float | |
-| `bias_correction` | bool | Per-expert bias added before top-k (V3-style) |
+| `bias_correction` | bool | Per-expert bias added before top-k (V3-style). Declared as `topk_method: noaux_tc` by the DeepSeek families and as `use_routing_bias: true` by MiniMax-M3, which names no method at all |
 | `n_groups` | int | Group-limited routing; 1 = ungrouped |
 | `topk_group` | int | |
 | `n_shared_experts` | int | 0 = none |
@@ -307,17 +350,39 @@ like an unrelated bug.
 
 | Field | Type | Notes |
 |---|---|---|
-| `activation` | enum | `swiglu` \| `geglu` \| `relu2` \| `situ` |
+| `activation` | enum | `swiglu` \| `geglu` \| `relu2` \| `situ` \| `swiglu-oai` |
 | `has_gate` | bool | |
 | `expert_intermediate` | int | `moe_intermediate_size` |
 | `dense_intermediate` | int | For `layer_kinds == "dense"` layers |
 | `shared_intermediate` | int | Already carries the COUNT — shared experts are fused into one set of tensors. Stated by the Qwen families and derived as `moe_intermediate × n_shared` by DeepSeek; a config stating only the width implies exactly one |
 | `shared_expert_gate` | bool | Scalar sigmoid gate on the whole shared branch: `out += sigmoid(w · x) · shared(x)` for a `[1, d_model]` row. Family knowledge — no config key states it |
-| `swiglu_limit` | float | V4 clamps gate above and up symmetrically before SwiGLU |
+| `swiglu_limit` | float | Clamps gate above and up symmetrically before the GLU. V4 and `swiglu-oai` both use it |
+| `swiglu_alpha` | float | `swiglu-oai` only: the gain inside the sigmoid. **Defaults to 1**, the value at which the gate half degenerates to SiLU — not to any family's constant |
 | `expert_layout` | enum | `interleaved_gud` — gate/up/down interleaved per expert (§5.3 of architecture.md) |
 | `routed_expert_hidden` | int | **Latent MoE.** Width the ROUTED experts operate at; 0 = `d_model`. `bytes_per_token` is linear in it |
 | `routed_expert_norm` | bool | RMSNorm on the COMBINED top-k output, before the up-projection — not per expert, which is why it cannot be folded into the expert weights |
 | `situ_beta`, `situ_linear_beta` | float | `situ` only; a stated 0 for the linear beta means the up half is NOT transformed |
+
+**`swiglu-oai` is NOT `swiglu` with a limit.** The clamping was already expressible that way; the two
+terms that are not are the `alpha` inside the sigmoid and the `+1` on the linear half:
+
+```
+gate = clamp(gate, max=limit);  up = clamp(up, -limit, limit)
+out  = (up + 1) · gate · sigmoid(alpha · gate)
+```
+
+At MiniMax-M3's `alpha = 1.702` the gate half is the logistic approximation to GELU rather than SiLU
+— a visibly different curve, not a rescaling of one — and the `+1` means an up projection of exactly
+zero passes the gate through at full strength instead of silencing the unit, so the two forms
+disagree most where the model is least active. A checkpoint read as plain `swiglu` runs and produces
+finite logits for a different function on every token of every layer.
+
+**The activation is not always readable from `hidden_act`.** MiniMax-M3's checkpoint declares
+`"swigluoai"`, and `MiniMaxM3VLTextConfig.__post_init__` then OVERWRITES it with `"silu"` — the gate
+is computed inline from `swiglu_alpha`/`swiglu_limit`, and `hidden_act` has to stay a real `ACT2FN`
+key. So the production config and a config re-saved by `transformers` disagree about that field while
+describing the same model, and the adapter states the activation for the family rather than reading
+it.
 
 Schema v2 also carries `hyper_connections = { multiplier, sinkhorn_iters, eps }`. V4 uses four
 streams, with learned block pre/post controls and a Sinkhorn-normalized stream mixing matrix at both
@@ -489,6 +554,15 @@ Admission rejects a document that fails any of:
   no MLA dimensions for the layers that do
 - `routed_expert_hidden > d_model` — a latent MoE projects DOWN; wider than the residual stream is
   not a latent space, and taking it at face value inflates every expert
+- `gqa+bsa` with `len(bsa.layer_kinds) != n_layers`, no `full` layer (the family is then plain GQA
+  wearing its name, and would be charged for an indexer plane nothing writes),
+  `n_heads % n_index_heads != 0` (some query heads would have no indexer head to obey),
+  `local_blocks > topk_blocks` (a local guarantee that cannot be satisfied, since upstream forces
+  those blocks THROUGH the score and the furthest are silently dropped), or
+  `index_head_dim < rope.partial_dim` — upstream slices the rope table at `cos[..., :index_head_dim]`,
+  and a narrower head truncates it mid-frequency, pairing channels with rotations that are not
+  theirs. No checkpoint in the wild does this, and reproducing it would mean grading Soma against a
+  reference bug
 - tokenizer round-trip mismatch
 - any `economics` field absent (profiling did not complete)
 

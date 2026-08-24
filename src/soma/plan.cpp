@@ -106,6 +106,9 @@ Status compute_plan(const ArchIr& arch, const HostBudget& budget, PlanDocument& 
                                        bytes_for(arch, ew, fi, TensorRole::ExpertDown);
 
     out.attention_family = to_string(arch.attention.family);
+    out.modality = to_string(arch.modality.modality);
+    out.vision_layers = arch.modality.vision_layers;
+    out.vision_hidden = arch.modality.vision_hidden;
     out.n_layers = n_layers;
     out.n_moe_layers = n_moe;
     out.n_experts = n_experts;
@@ -447,6 +450,9 @@ Status serialize_plan(const PlanDocument& plan, std::string& out_json) {
       // have to inspect the architecture IR to learn what it is looking at. Control's
       // registry denormalizes exactly these, and the plan is its only view.
       << "  \"attention_family\": \"" << plan.attention_family << "\",\n"
+      << "  \"modality\": \"" << plan.modality << "\",\n"
+      << "  \"vision_layers\": " << plan.vision_layers << ",\n"
+      << "  \"vision_hidden\": " << plan.vision_hidden << ",\n"
       << "  \"n_layers\": " << plan.n_layers << ",\n"
       << "  \"n_moe_layers\": " << plan.n_moe_layers << ",\n"
       << "  \"n_experts\": " << plan.n_experts << ",\n"

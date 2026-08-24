@@ -176,6 +176,25 @@ void relu2_glu(std::span<const float> gate,
     }
 }
 
+void swiglu_oai(std::span<const float> gate,
+                std::span<const float> up,
+                std::uint32_t n,
+                float alpha,
+                std::span<float> out) noexcept {
+    // Transcribed from `MiniMaxM3VLDenseMLP.forward`, term for term:
+    //
+    //     glu = gate * torch.sigmoid(gate * self.swiglu_alpha)
+    //     return self.down_proj((up + 1.0) * glu)
+    //
+    // The clamps upstream applies immediately before this have already been
+    // applied by the caller -- see the header.
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const float g = gate[i];
+        const float sig = 1.0f / (1.0f + std::exp(-alpha * g));
+        out[i] = (up[i] + 1.0f) * (g * sig);
+    }
+}
+
 void situ_glu(std::span<const float> gate,
               std::span<const float> up,
               std::uint32_t n,

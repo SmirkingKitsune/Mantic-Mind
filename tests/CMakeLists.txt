@@ -167,9 +167,21 @@ if(Python3_Interpreter_FOUND)
                      "${CMAKE_SOURCE_DIR}/tools/ci/check_verify_payload.py"
                      "${CMAKE_CURRENT_BINARY_DIR}/verify_payload_tmp")
 
+    # MiniMax-M3's production checkpoint spells its tensors differently from
+    # every fixture, and convert.py is the only thing that reconciles them. The
+    # 59 shards that would exercise that map are most of a terabyte, so this
+    # manufactures the input: it rewrites the committed fixture INTO the
+    # production dialect, converts both, and asserts the two containers describe
+    # the same weights. Skips itself when numpy/safetensors are absent.
+    add_test(NAME mm_minimax_dialect
+             COMMAND "${MM_ADMISSION_PY}"
+                     "${CMAKE_SOURCE_DIR}/tools/ci/check_minimax_dialect.py"
+                     "${CMAKE_SOURCE_DIR}"
+                     "${CMAKE_CURRENT_BINARY_DIR}/minimax_dialect_tmp")
+
     # 77 is ctest's conventional "skipped". Without this a missing dependency
     # exits 0 and reads as Passed, which is how mm_fused_experts ran nothing for
     # its whole existence while showing green.
-    set_tests_properties(mm_fused_experts mm_verify_payload PROPERTIES
+    set_tests_properties(mm_fused_experts mm_verify_payload mm_minimax_dialect PROPERTIES
                          SKIP_RETURN_CODE 77)
 endif()

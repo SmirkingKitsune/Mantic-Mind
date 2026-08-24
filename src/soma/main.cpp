@@ -705,6 +705,19 @@ int cmd_plan(int argc, char** argv) {
                   << "routed       " << (doc.total_routed_bytes >> 20) << " MiB\n"
                   << "bytes/token  " << (doc.bytes_per_token >> 20) << " MiB\n"
                   << "max_batch    " << doc.max_batch << "\n";
+        // Only when it is not plain text, and never silently.
+        //
+        // Soma serves the text stack. Doing that with a vision-capable
+        // checkpoint is legitimate; doing it WITHOUT SAYING SO is a model
+        // answering about an image it never received, and nothing
+        // downstream can tell that apart from a model that simply got the
+        // answer wrong.
+        if (doc.modality != "text") {
+            std::cout << "modality     " << doc.modality
+                      << "   (SERVED TEXT-ONLY; the " << doc.vision_layers
+                      << "-layer, " << doc.vision_hidden
+                      << "-wide vision tower is neither converted nor served)\n";
+        }
     }
     return 0;
 }

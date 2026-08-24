@@ -1,0 +1,46 @@
+{
+  "attn_implementation": null,
+  "device": "cpu",
+  "fixture_version": 1,
+  "generate": 256,
+  "greedy_first_16": [
+    378,
+    118,
+    118,
+    118,
+    118,
+    118,
+    118,
+    118,
+    118,
+    118,
+    118,
+    118,
+    118,
+    118,
+    118,
+    118
+  ],
+  "implementation": "native",
+  "kda_mode": null,
+  "layer_kinds": [
+    "dense",
+    "moe",
+    "moe",
+    "moe"
+  ],
+  "n_params": 713504,
+  "numpy_version": "2.5.2",
+  "positions": 512,
+  "seed": 20260727,
+  "slug": "MiniMax-M3-Tiny",
+  "source": "C:/Users/RyanM/AppData/Local/Temp/claude/Z--AI-Ubiquitious-Memories-Mantic-Mind/2e74aca3-9c42-4c82-a654-404b522c9ca9/scratchpad/m3text",
+  "source_architectures": [
+    "MiniMaxM3SparseForCausalLM"
+  ],
+  "source_model_type": "minimax_m3_vl_text",
+  "tf_logits_sha256": "bf3dddce1aa9dbfb51e03378e03aa6ac2674aac00d64d52794a4e663d84e9ae0",
+  "torch_version": "2.13.0+cpu",
+  "transformers_version": "5.15.1",
+  "weights_sha256": "6e429ad96482db4188fba560ab618e0bbec1e8521a3a12a38aab3a2aa1aae659"
+}

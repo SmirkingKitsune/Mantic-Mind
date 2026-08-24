@@ -640,6 +640,14 @@ if(BUILD_TESTING)
     target_link_libraries(soma_qwen3_5_moe_plan PRIVATE mm_soma)
     add_test(NAME soma_qwen3_5_moe_plan COMMAND soma_qwen3_5_moe_plan)
 
+    # Block-sparse GQA, planned from the REAL MiniMaxAI/MiniMax-M3 config: the
+    # multimodal wrapper, the list-valued `moe_layer_freq`, both spellings of the
+    # indexer, and the extra cache plane its key rides in.
+    add_executable(soma_minimax_m3_plan
+                   ${CMAKE_SOURCE_DIR}/tests/soma/minimax_m3_plan.cpp)
+    target_link_libraries(soma_minimax_m3_plan PRIVATE mm_soma)
+    add_test(NAME soma_minimax_m3_plan COMMAND soma_minimax_m3_plan)
+
     # The four Gated DeltaNet operators in isolation, plus the property the
     # oracle cannot reach: prefill and stepwise decode are the same recurrence.
     add_executable(soma_gdn_kernel ${CMAKE_SOURCE_DIR}/tests/soma/gdn_kernel.cpp)

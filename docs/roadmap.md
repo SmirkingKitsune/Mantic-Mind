@@ -4019,6 +4019,185 @@ correct: those containers describe a model missing an FFN branch.
 
 ---
 
+## MiniMax-M3: the sixth family, and the first block-sparse one
+
+`MiniMaxAI/MiniMax-M3` — 60 layers, d_model 6144, 128 routed experts at top-4, 1048576 context,
+**893 GB** of `.safetensors` across 59 shards. A multimodal wrapper: the text stack sits under
+`text_config` and `language_model.`, beside a 32-layer CLIP tower Soma neither converts nor serves.
+
+```
+attention_family  gqa+bsa        n_layers 60 (3 dense + 57 MoE)
+                                 3 dense-attention + 57 block-sparse (Lightning Indexer)
+n_experts         128            top_k 4      shared 1 (UNGATED)
+active_fraction   0.03125        <- 4/128
+routed width      6144           <- d_model; no latent MoE
+modality          vision+text    <- SERVED TEXT-ONLY, and the plan says so
+arch_supported    true           <- oracle-graded from the first commit, see below
+verdict           <economic>     <- 7.64 GiB/token at q4_g/q6_g g128, so 1 tok/s
+                                    needs ~8.2 GB/s sustained; 244 GiB routed,
+                                    48.6 GiB resident, 4.2 GiB KV at 4k x 4 slots
+```
+
+Measured, not estimated: `soma plan --quant q4_g --expert-down q6_g --group 128` against the
+published config. On a host with a 2 GB/s disk that is 0.15 tok/s and the verdict is `reject` — an
+ECONOMIC verdict, and a property of `(model, quantization, host)` rather than of the model, exactly
+as §8 of the IR spec insists. The same weights on a faster array, or at a coarser quantization, get
+a different answer.
+
+It did NOT arrive the way GLM-5.2, Kimi-K3 and Qwen3.5 did. Those three were adapted and planned
+while unservable, and `resolve_f32_backend` returned nullptr until an oracle existed. This one had
+its oracle before the switch statement was touched, which is the same bar reached in a different
+order — and the reason it could be is that the family needed no new backend to grade.
+
+### It is GQA, and the selector is the architecture
+
+Every projection, both qk-norms, the partial rotation and the score loop are GQA's. What differs is
+which keys the softmax is allowed to see. So it shares `arch::gqa` the way MHA does and the way
+MLA+DSA shares `arch::mla` — one implementation, a family branch resolved once per call, and no
+second copy of one arithmetic to keep in agreement by hand.
+
+**The trap is that routing it to plain `Gqa` would run.** 57 of 60 layers would attend the whole
+prefix instead of 16 blocks of it, and below 2048 tokens that is not merely close — it is
+BIT-IDENTICAL, because top-k over fewer blocks than `topk_blocks` selects all of them. A short-prompt
+smoke test passes. Measured on the tiny fixture with the selection widened to cover the sequence:
+positions below the span agree to **3.6e-07** and the rest diverge to **7.8e-01 max|logit|**, with a
+different argmax at **217 of 512** positions.
+
+### Blocks, not keys
+
+|  | MlaDsa (GLM-5.2) | GqaBsa (MiniMax-M3) |
+|---|---|---|
+| base family | MLA, latent KV | GQA, full K and V planes |
+| selection unit | individual KEY | BLOCK of `block_size` keys |
+| how many | `index_topk` = 2048 keys | `topk_blocks × block_size` = 16 × 128 = 2048 keys |
+| pooling | none | **max** over the block |
+| indexer key head count | one | one |
+| where the indexer key is cached | the empty V plane | the K plane's TAIL — V is in use |
+| IndexShare | yes, 57 of 78 layers borrow | no, every sparse layer owns its weights |
+| forced-visible | none | the query's own block, via `+inf` BEFORE the top-k |
+
+The two selection counts landing on the same 2048 is a coincidence and a dangerous one: a reader who
+transcribes DSA's per-key top-k here selects **16** keys, not 2048, and the arithmetic looks right at
+a glance. `BsaSpec::visible_keys()` exists so the multiplication happens in one place.
+
+The `+inf` mechanism is the other thing worth stating. The local blocks are forced through the SCORE
+rather than appended to the selection, so they CONSUME top-k slots — a query sees `topk_blocks`
+blocks, never `topk_blocks + local_blocks`. Appending them would attend to the query's own block
+twice, and the deployment kernel this format feeds reads its list sequentially, so a repeat is a
+double count rather than a no-op.
+
+### The extra cache plane
+
+The indexer's key depends on a past token's hidden state at that layer and cannot be recomputed
+later, so it must be stored — the same argument DSA's makes. DSA had an empty V plane to put it in.
+This family uses both planes, so the key widens K instead: `[K | index_k]` per position,
+`k_floats = n_kv_heads × head_dim + index_head_dim`.
+
+ONE key per position, not `n_index_heads` of them: `k_proj` is `d_model → index_head_dim` and every
+indexer head scores against the same key. Confirmed against the shard headers —
+`self_attn.index_k_proj.weight` is `[128, 6144]` where `index_q_proj` is `[512, 6144]`. The per-head
+reading would overstate the plane fourfold.
+
+At the stated 1M context the plane is **30 GiB** — 270 GiB against the 240 GiB a plain-GQA reading
+gives. `KvCache` allocates one geometry for the whole stack, so the three non-indexed leading layers
+own a slot they never write: 0.6% of the cache, reported as allocated rather than as needed, because
+what the planner has to predict is the allocation.
+
+### Four config readings that each produce a working, wrong model
+
+**`moe_layer_freq` is a LIST here.** Every family before this states it as a stride, and
+`resolve_layer_kinds` read only the scalar form. Read that way the key is silently skipped, the three
+dense layers become MoE, and `bytes_per_token` gains three layers of routed experts — 2.7 TB of
+over-count on the quantity the verdict is computed from. The converter had the same gap and failed
+LOUDLY on it ("no expert tensors at model.layers.0..."), which is how it was found.
+
+**`intermediate_size` is the EXPERT width and `dense_intermediate_size` is not.** First family to
+state the two separately; every earlier one falls back to the shared key. Reading only it sizes the
+three dense layers at 3072 instead of 12288.
+
+**`use_routing_bias: true` with no `topk_method`.** `bias_correction` was derived solely from
+`topk_method == "noaux_tc"`, so this read false on a router that adds `e_score_correction_bias`
+before its top-k. The tensor is present and binds either way; a different set of experts simply
+fires. Measured on the fixture: the bias changes the selected set on **42% of (token, layer) pairs**.
+
+**`hidden_act` cannot be trusted for this family.** The checkpoint declares `"swigluoai"` and
+`MiniMaxM3VLTextConfig.__post_init__` OVERWRITES it with `"silu"`, because the gate is computed
+inline from `swiglu_alpha`/`swiglu_limit` and `hidden_act` has to stay a real `ACT2FN` key. So the
+production config and a transformers-resaved one disagree about that field while describing the same
+model — and the resaved one is exactly what the fixture is. The activation is stated for the family
+instead. `SwiGluOai` is `(up + 1) · gate · sigmoid(alpha · gate)` over clamped halves, and it is not
+`SwiGlu` with a limit: at `alpha = 1.702` the gate half is the logistic approximation to GELU, and
+the `+1` means a zero up-projection passes the gate through instead of silencing the unit.
+
+### The dialect nobody else speaks
+
+The 59 production shards do not carry the names `transformers` emits. The text stack is under
+`language_model.`, the MoE block is `block_sparse_moe` (while the three DENSE layers are still
+`mlp`), the selection bias hangs off the block rather than the gate, the experts are Mixtral-spelled
+`w1/w3/w2` per expert, and the four indexer tensors are `index_q_proj` rather than `indexer.q_proj`.
+
+**The rewrite lives in `convert.py`, not in the loader — which inverts DeepSeek-V4's choice.** V4
+binds its production names because those are the ones its own pinned reference implementation uses,
+so binding them kept ONE contract and the fixture was normalized to match (`native_to_soma.json`).
+MiniMax-M3's production names are used by no reference implementation at all: binding them would mean
+the fixture — the only thing that can prove the engine right — was reached through a hand-written map
+that nothing validates. So the map lives where the completeness check turns a wrong entry into a
+refusal.
+
+That map is the one thing in this family the conformance ladder cannot reach, because the fixture
+speaks the other dialect. `tools/ci/check_minimax_dialect.py` (ctest `mm_minimax_dialect`)
+manufactures the missing input: it rewrites the committed fixture INTO the production dialect —
+splitting the fused projections, prefixing the stack, bolting on a token vision tower — converts
+both, and asserts the two containers describe the same weights, with the expert payloads
+**byte-identical**. That last assertion is what proves `w1/w3/w2 → gate/up/down` is the right
+permutation and not a plausible wrong one.
+
+A blanket substring rewrite was written first and was wrong in the invertible direction:
+`block_sparse_moe → mlp` is unambiguous going forward and its inverse turns `mlp.gate_proj.weight` —
+a real dense-layer tensor, present under that exact name in BOTH dialects — into a name that exists
+nowhere. The map is a suffix table for that reason.
+
+### Text-only, and it says so
+
+`ModalitySpec` has recorded modality since it was written, and **nothing ever reported it**. So the
+one thing it exists to prevent — a vision-capable checkpoint served text-only without saying so — was
+exactly what would have happened: the IR knew, and every surface an operator can see said "text".
+
+`soma plan` now carries `modality`, `vision_layers` and `vision_hidden`, and the CLI prints a line
+whenever the modality is not plain text. The container keeps its `config.json` verbatim, tower and
+all, so the declaration survives conversion rather than being quietly dropped with the weights.
+
+### Graded
+
+`tests/fixtures/tiny/MiniMax-M3-Tiny`, built from transformers 5.15.1's own
+`modeling_minimax_m3_vl.py` — pure torch on the CPU, no `fla`, no Triton, no GPU, which makes this
+family cheaper to grade than either hybrid was.
+
+| Gate | Result |
+|---|---|
+| G0 teacher-forced, 512 positions | **1.22e-06** max, 5.51e-07 at position 0, 1.66e-07 mean |
+| G0 greedy, 256 tokens | token-exact |
+| G1 quantized | no hard failures; amplification 2.75–4.84 across six configurations |
+| Cached decode vs teacher-forced, 128 positions | **3.58e-07** |
+
+The fixture shrinks `index_topk_blocks × index_block_size` from 16 × 128 to 4 × 16, so 448 of the 512
+positions are genuinely sparse. Without that shrink the oracle would select every block there is and
+grade a dense implementation as correct — the same trap DSA's `index_topk` sets, and the reason
+`shrink_dsa` exists.
+
+The cached-decode figure is the one that covers the second implementation: G0 exercises the
+whole-sequence path, and the indexer key caching and per-row selection only run under `attention_kv`.
+The chain is `cached decode ≡ teacher-forced ≡ transformers`.
+
+**No defect survived to be found by the oracle**, which breaks the pattern of the three families
+before it. That is not a claim that the implementation was written more carefully; it is a
+consequence of the family needing no new arithmetic. The two hybrids each introduced a recurrence
+with its own gate semantics, and both defects the oracle caught were in that new arithmetic. Here the
+only new code is a selection mask in front of an already-graded score loop, and a wrong mask does not
+produce a subtly different model — it produces a 7.8e-01 one.
+
+---
+
 ## Cross-cutting: CI from day one
 
 Established at G0, extended each gate. Current CI is 3 Release jobs invoking raw `cmake`, one CTest

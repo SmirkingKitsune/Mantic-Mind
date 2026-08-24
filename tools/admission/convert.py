@@ -76,12 +76,30 @@ DENSE_SUFFIXES = (
     "self_attn.indexer.wk.weight", "self_attn.indexer.wq_b.weight",
     "self_attn.indexer.weights_proj.weight",
     "self_attn.indexer.k_norm.weight", "self_attn.indexer.k_norm.bias",
+    # ── block-sparse indexer ──
+    #
+    # Only `minimax_m3_sparse` layers carry these; the leading dense-attention
+    # layers ship none, so their absence is correct rather than missing.
+    #
+    # SOMA spellings, which for this family are not the checkpoint's -- see
+    # SOURCE_DIALECTS. `indexer.k_proj` is ONE head wide against
+    # `indexer.q_proj`'s four, which is not a typo: every indexer head scores its
+    # own query against the same shared key.
+    "self_attn.indexer.q_proj.weight", "self_attn.indexer.k_proj.weight",
+    "self_attn.indexer.q_norm.weight", "self_attn.indexer.k_norm.weight",
     # ── dense-layer FFN ──
     #
     # `first_k_dense_replace` layers carry a plain MLP instead of experts. Also
     # absent until now, so the leading layers of every DeepSeek-family model were
     # dropped along with the attention.
     "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight",
+    # ...and the FUSED spelling of the same thing, which recent `transformers`
+    # emits for any family whose MLP is built as `Linear(hidden, 2 * inter)`.
+    # `[2 * inter, hidden]`, gate rows first -- the rank-2 twin of the rank-3
+    # expert layout below, and copied VERBATIM rather than split, because
+    # `bind_fused_glu` in the loader reads it directly. Splitting here would mean
+    # two writers of one layout that the container round-trip cannot compare.
+    "mlp.gate_up_proj.weight",
     # ── Gated DeltaNet linear attention ──
     #
     # A hybrid stack's LINEAR layers, under `linear_attn` rather than
@@ -129,11 +147,114 @@ IGNORED_PATTERNS = (
 )
 
 
+# Checkpoints whose tensor names are not the ones `transformers` produces, and
+# the exact map that makes them so.
+#
+# THE ENGINE BINDS ONE DIALECT and this is where a checkpoint joins it. Soma's
+# loader knows the names `transformers` emits, because that is what every tiny
+# fixture carries and therefore what the whole conformance ladder is graded
+# against. MiniMax-M3's 59 production shards carry something else: the text stack
+# under a `language_model.` prefix, `block_sparse_moe` where the modeling code
+# says `mlp`, a selection bias that hangs off the BLOCK rather than the gate, and
+# four indexer tensors spelled `index_q_proj` rather than `indexer.q_proj`.
+#
+# This DIVERGES from how DeepSeek-V4 was handled, deliberately. There, Soma binds
+# the production names and the fixture is normalized to match
+# (`native_to_soma.json`), on the grounds that the production shards are what has
+# to work. The same reasoning inverts here: V4's production names are the ones
+# its own pinned reference implementation uses, so binding them kept ONE
+# contract, whereas MiniMax-M3's production names are used by no reference
+# implementation at all. Binding them would mean the fixture -- the only thing
+# that can prove the engine right -- was reached through a hand-written map that
+# nothing validates. So the rewrite happens here, where the completeness check
+# below turns a wrong entry into a refusal instead of a dropped tensor.
+#
+# A SUFFIX MAP, not a substring rewrite, and that distinction is the whole reason
+# this table looks verbose. `block_sparse_moe -> mlp` is unambiguous going
+# forward and is NOT invertible: in the production checkpoint the MoE layers say
+# `block_sparse_moe` while the three dense layers say `mlp`, so a blanket inverse
+# turns `mlp.gate_proj.weight` -- a real dense-layer tensor, present under that
+# exact name in both dialects -- into a `block_sparse_moe.gate_proj.weight` that
+# exists nowhere. The completeness check would then refuse a healthy checkpoint,
+# and a slightly luckier version of the same mistake would drop three layers'
+# FFN in silence.
+SOURCE_DIALECTS = {
+    "minimax_m3_vl": {
+        # The text stack, lifted out of the multimodal wrapper.
+        "prefix": "language_model.",
+        # soma suffix -> source suffix, for names below `model.layers.<N>.`.
+        # Anything absent is identical in both dialects.
+        "suffixes": {
+            "mlp.gate.weight": "block_sparse_moe.gate.weight",
+            "mlp.gate.e_score_correction_bias":
+                "block_sparse_moe.e_score_correction_bias",
+            "self_attn.indexer.q_proj.weight": "self_attn.index_q_proj.weight",
+            "self_attn.indexer.k_proj.weight": "self_attn.index_k_proj.weight",
+            "self_attn.indexer.q_norm.weight": "self_attn.index_q_norm.weight",
+            "self_attn.indexer.k_norm.weight": "self_attn.index_k_norm.weight",
+        },
+        # The half Soma does not serve. Named by module prefix rather than left
+        # to a wildcard, so a tower that grows a new module kind lands in
+        # `unclaimed` and refuses instead of disappearing.
+        "drop": ("vision_tower.", "multi_modal_projector.", "patch_merge_mlp."),
+        # SOURCE spellings for the blocks the expert reader walks by hand.
+        "moe_block": "block_sparse_moe",
+        "shared_block": "block_sparse_moe.shared_experts",
+        # Mixtral's expert spelling, on a model that is not Mixtral.
+        "experts": {"gate": "w1.weight", "up": "w3.weight", "down": "w2.weight"},
+    },
+}
+
+_LAYER_RE = re.compile(r"^(model\.layers\.\d+\.)(.*)$")
+
+
+def dialect_for(model_type: str | None) -> dict:
+    """The source dialect for this checkpoint, or the identity."""
+    return SOURCE_DIALECTS.get(model_type or "", {})
+
+
+def to_soma_name(name: str, dialect: dict) -> str:
+    """SOURCE tensor name -> the name Soma's loader binds."""
+    if not dialect:
+        return name
+    prefix = dialect.get("prefix", "")
+    if prefix and name.startswith(prefix):
+        name = name[len(prefix):]
+    m = _LAYER_RE.match(name)
+    if m is None:
+        return name
+    head, suffix = m.groups()
+    for soma_suffix, source_suffix in dialect.get("suffixes", {}).items():
+        if suffix == source_suffix:
+            return head + soma_suffix
+    # Prefix rules, for the blocks that carry a variable tail: experts and the
+    # shared expert. Matched on the block name alone so `experts.<i>.w1.weight`
+    # and `shared_experts.down_proj.weight` both land without enumerating them.
+    src_moe = dialect.get("moe_block")
+    if src_moe and suffix.startswith(src_moe + "."):
+        return head + "mlp." + suffix[len(src_moe) + 1:]
+    return head + suffix
+
+
+def to_source_name(name: str, dialect: dict) -> str:
+    """The inverse, for building the list of names to ask the shards for."""
+    if not dialect:
+        return name
+    m = _LAYER_RE.match(name)
+    if m is None:
+        return dialect.get("prefix", "") + name
+    head, suffix = m.groups()
+    mapped = dialect.get("suffixes", {}).get(suffix)
+    if mapped is None:
+        mapped = suffix
+    return dialect.get("prefix", "") + head + mapped
+
+
 def align_up(n: int) -> int:
     return (n + ALIGN - 1) & ~(ALIGN - 1)
 
 
-def fused_expert_diagnosis(get, layer: int, moe_block: str) -> str | None:
+def fused_expert_diagnosis(get, layer: int, moe_block: str, src_prefix: str = "") -> str | None:
     """Is this checkpoint using the FUSED expert layout, rather than missing a tensor?
 
     "missing model.layers.0.mlp.experts.0.gate_proj.weight" sends a reader
@@ -145,7 +266,10 @@ def fused_expert_diagnosis(get, layer: int, moe_block: str) -> str | None:
     Naming the real problem is the whole of this function. Reading the layout is
     deliberately NOT attempted; see the message it produces.
     """
-    prefix = f"model.layers.{layer}.{moe_block}.experts."
+    # SOURCE names. A dialect that nests the text stack (MiniMax-M3 under
+    # `language_model.`) makes every one of these miss without it, and the
+    # symptom is "no expert tensors" on a checkpoint that has 7296 of them.
+    prefix = f"{src_prefix}model.layers.{layer}.{moe_block}.experts."
     fused = [(n, tuple(t.shape))
              for n in (prefix + "gate_up_proj", prefix + "down_proj",
                        prefix + "gate_proj", prefix + "up_proj")
@@ -167,7 +291,7 @@ def fused_expert_diagnosis(get, layer: int, moe_block: str) -> str | None:
     ])
 
 
-def expert_reader(get, layer: int, moe_block: str, names: dict):
+def expert_reader(get, layer: int, moe_block: str, names: dict, src_prefix: str = ""):
     """Return `(read(expert, role) -> tensor | None, layout_name)` for one layer.
 
     Two layouts exist in the wild and this reads both.
@@ -194,7 +318,10 @@ def expert_reader(get, layer: int, moe_block: str, names: dict):
     Resolved once per layer, not per expert: the fused tensor covers all of them,
     and `get()` copies plus dtype-converts on every call.
     """
-    prefix = f"model.layers.{layer}.{moe_block}.experts."
+    # SOURCE names. A dialect that nests the text stack (MiniMax-M3 under
+    # `language_model.`) makes every one of these miss without it, and the
+    # symptom is "no expert tensors" on a checkpoint that has 7296 of them.
+    prefix = f"{src_prefix}model.layers.{layer}.{moe_block}.experts."
 
     if get(prefix + "0." + names["gate"]) is not None:
         def read_per_expert(e: int, role: str):
@@ -230,6 +357,16 @@ def layer_kinds(cfg: dict, n_layers: int) -> list[str]:
     reads the wrong expert for every layer after the first dense one.
     """
     kinds = ["moe"] * n_layers
+
+    # A STATED per-layer list wins over any derivation -- the same rule, in the
+    # same order, as resolve_layer_kinds() in the engine. GLM-5.2 ships this and
+    # the derivation below happens to agree with it; MiniMax-M3 ships a pattern
+    # ("the first three are dense") that no stride expresses at all.
+    explicit = cfg.get("mlp_layer_types")
+    if isinstance(explicit, list) and len(explicit) >= n_layers:
+        return ["moe" if str(t) in ("sparse", "moe", "hash_moe") else "dense"
+                for t in explicit[:n_layers]]
+
     first_dense = int(cfg.get("first_k_dense_replace", 0) or 0)
     for i in range(min(first_dense, n_layers)):
         kinds[i] = "dense"
@@ -245,6 +382,13 @@ def layer_kinds(cfg: dict, n_layers: int) -> list[str]:
         elif step > 1 and i % step != 0:
             kinds[i] = "dense"
         elif isinstance(freq, int) and freq > 1 and i % freq != 0:
+            kinds[i] = "dense"
+        # `moe_layer_freq` is TWO things under one key: a scalar STRIDE, or a
+        # per-layer 0/1 MASK. Reading only the scalar leaves every layer marked
+        # MoE, and the converter then asks a dense layer for experts it does not
+        # have -- which is exactly the "no expert tensors at
+        # model.layers.0.mlp.experts.*" this branch exists to prevent.
+        elif isinstance(freq, list) and i < len(freq) and not freq[i]:
             kinds[i] = "dense"
     return kinds
 
@@ -410,8 +554,25 @@ def main(argv: list[str]) -> int:
     # Refusing here is also cheap in the way that matters: these checkpoints run
     # to a terabyte and more, and the alternative is discovering the problem
     # after hours of reading.
+    dialect = dialect_for(model_type)
     text_cfg = cfg.get("text_config")
-    if isinstance(text_cfg, dict):
+    if isinstance(text_cfg, dict) and dialect:
+        # A wrapper this converter KNOWS how to take the text stack out of.
+        #
+        # The refusal below is still right for every other multimodal
+        # checkpoint, and the difference is not that this one is special -- it is
+        # that SOURCE_DIALECTS states exactly which tensors belong to the tower,
+        # so dropping them is a decision on the record rather than an accident.
+        #
+        # The vision half is still DECLARED: `config.json` is copied into the
+        # container verbatim below, so the IR reports `vision+text` and the plan
+        # says which half it is serving. A container that quietly claimed to be a
+        # text model would be a model answering about images it never received.
+        print(f"  text-only: {src.name} is a multimodal wrapper (model_type "
+              f"{model_type!r}); converting the language model under "
+              f"'text_config' and dropping the vision tower.")
+        cfg.update(text_cfg)
+    elif isinstance(text_cfg, dict):
         inner = text_cfg.get("model_type", "?")
         print(f"  REFUSED  {src.name}: multimodal wrapper (model_type "
               f"{model_type!r}, language model nested under 'text_config' as "
@@ -452,18 +613,26 @@ def main(argv: list[str]) -> int:
         print(f"  REFUSED  {src.name}: no routed experts; nothing to stream")
         return 3
 
-    moe_block = "block_sparse_moe" if model_type == "mixtral" else "mlp"
+    # SOURCE spellings, which is what `get()` is asked for. `to_soma_name`
+    # rewrites them on the way into the container.
+    src_prefix = dialect.get("prefix", "")
+    moe_block = dialect.get(
+        "moe_block", "block_sparse_moe" if model_type == "mixtral" else "mlp")
     # SINGULAR for the Qwen families, plural everywhere else. Mirrors
     # `TensorNaming::shared_block` in src/soma/arch_ir.cpp — one character, and
     # getting it wrong drops the shared expert from the container without a word
     # because the copy loop simply finds no tensor of that name.
-    shared_block = ("mlp.shared_expert"
-                    if model_type in ("qwen3_5_moe_text", "qwen3_5_moe", "qwen2_moe")
-                    else f"{moe_block}.shared_experts")
-    names = ({"gate": "w1.weight", "up": "w3.weight", "down": "w2.weight"}
-             if model_type == "mixtral"
-             else {"gate": "gate_proj.weight", "up": "up_proj.weight",
-                   "down": "down_proj.weight"})
+    shared_block = dialect.get(
+        "shared_block",
+        "mlp.shared_expert"
+        if model_type in ("qwen3_5_moe_text", "qwen3_5_moe", "qwen2_moe")
+        else f"{moe_block}.shared_experts")
+    names = dialect.get(
+        "experts",
+        {"gate": "w1.weight", "up": "w3.weight", "down": "w2.weight"}
+        if model_type == "mixtral"
+        else {"gate": "gate_proj.weight", "up": "up_proj.weight",
+              "down": "down_proj.weight"})
 
     dt_gate = args.quant
     dt_up = args.quant
@@ -598,16 +767,33 @@ def main(argv: list[str]) -> int:
     # up asserting something the copy loop does not do. Ordered rather than a set
     # so dense.safetensors is byte-reproducible — mm_fused_experts compares two
     # conversions byte for byte and set iteration order would break it.
-    claimed: list[str] = list(TOP_LEVEL_TENSORS)
+    # SOURCE names throughout -- these are what `get()` is asked for and what the
+    # completeness check compares against the shard index. Container names come
+    # from `to_soma_name` at copy time.
+    #
+    # DENSE_SUFFIXES holds SOMA spellings, so the dialect is inverted here rather
+    # than the list being duplicated per dialect. `shared_block` is already a
+    # source spelling and is joined AFTER the inversion for that reason.
+    claimed: list[str] = [to_source_name(n, dialect) for n in TOP_LEVEL_TENSORS]
     for layer in range(n_layers):
-        claimed += [f"model.layers.{layer}.{suf}" for suf in DENSE_SUFFIXES]
-        claimed += [f"model.layers.{layer}.{shared_block}.{s}.weight"
-                    for s in ("gate_proj", "up_proj", "down_proj")]
+        claimed += [to_source_name(f"model.layers.{layer}.{suf}", dialect)
+                    for suf in DENSE_SUFFIXES]
+        claimed += [src_prefix +
+                    f"model.layers.{layer}.{shared_block}.{s}.weight"
+                    for s in ("gate_proj", "up_proj", "down_proj", "gate_up_proj")]
     claimed_set = set(claimed)
 
     def is_ignored(name: str) -> bool:
         if any(p in name for p in IGNORED_PATTERNS):
             return True
+        # The vision half of a multimodal wrapper, by module prefix.
+        if any(name.startswith(d) for d in dialect.get("drop", ())):
+            return True
+        # The rules below are written against SOMA names, so a dialect that
+        # prefixes its stack has that prefix removed first. Without this the
+        # layer-index regex matches nothing and a wrapper's MTP layers land in
+        # `unclaimed` rather than being ignored.
+        name = to_soma_name(name, dialect)
         # Layers at or beyond num_hidden_layers are MULTI-TOKEN-PREDICTION heads,
         # not part of the served stack. GLM-5.2 declares
         # num_nextn_predict_layers=1 and ships layer 78 with a complete attention
@@ -712,18 +898,19 @@ def main(argv: list[str]) -> int:
             # Zero-length slots keep the (layer, expert) index arithmetic intact.
             index.extend((shard_idx, shard_off, 0) for _ in range(n_experts))
             continue
-        read, layout = expert_reader(get, layer, moe_block, names)
+        read, layout = expert_reader(get, layer, moe_block, names, src_prefix)
         if read is None:
             fh.close()
-            fused = fused_expert_diagnosis(get, layer, moe_block)
+            fused = fused_expert_diagnosis(get, layer, moe_block, src_prefix)
             print(f"  REFUSED  {fused}" if fused else
-                  f"  REFUSED  no expert tensors at model.layers.{layer}.{moe_block}.experts.*")
+                  f"  REFUSED  no expert tensors at "
+                  f"{src_prefix}model.layers.{layer}.{moe_block}.experts.*")
             return 3
         if layer == first_moe_layer:
             print(f"    expert layout: {layout}")
 
         for e in range(n_experts):
-            base = f"model.layers.{layer}.{moe_block}.experts.{e}."
+            base = f"{src_prefix}model.layers.{layer}.{moe_block}.experts.{e}."
             blob = bytearray()
             for role, dt in (("gate", dt_gate), ("up", dt_up), ("down", dt_down)):
                 t = read(e, role)
@@ -768,7 +955,7 @@ def main(argv: list[str]) -> int:
     for name in claimed:
         t = get(name)
         if t is not None:
-            dense[name] = t
+            dense[to_soma_name(name, dialect)] = t
 
     save_file(dense, str(out_dir / "dense.safetensors"))
 
@@ -792,6 +979,10 @@ def main(argv: list[str]) -> int:
     # config.json in the directory it is pointed at, so a container without one
     # cannot be opened at all.
     import shutil
+    # VERBATIM, including `vision_config` for a wrapper. The IR then reports
+    # `vision+text` and the plan states which half is being served -- which is
+    # the whole job of ModalitySpec, and the opposite of what writing a
+    # text-only config here would achieve.
     shutil.copy2(src / "config.json", out_dir / "config.json")
 
     meta = {

@@ -173,6 +173,60 @@ Status bind_block(F32Model& model,
     return {};
 }
 
+/// The FUSED layout for a SINGLE, always-active FFN -- a dense layer's MLP or a
+/// shared expert.
+///
+/// `gate_up_proj` is `[2 * inter, d_model]` and the split is contiguous ROWS,
+/// gate first: upstream builds it as `Linear(hidden, 2 * inter)` and applies it
+/// as `gate_up.chunk(2, dim=-1)`, so the two halves of the OUTPUT are the two
+/// halves of the weight's rows.
+///
+/// The rank-3 expert reader is the same idea one dimension up, and this is
+/// deliberately NOT folded into it: that one indexes experts and this one does
+/// not, and the shape check is what catches a checkpoint whose config lies about
+/// its width. Sharing them would mean a rank check that accepts either, which is
+/// how a `[E, 2*inter, d]` tensor gets read as a `[2*inter, d]` one.
+///
+/// Returns NotFound rather than an error when the tensor is absent, because the
+/// per-projection layout is equally valid and the caller tries that next.
+Status bind_fused_glu(F32Model& model,
+                      const std::string& prefix,
+                      std::uint32_t d_model,
+                      std::uint32_t inter,
+                      TensorRole role,
+                      WeightRef& gate,
+                      WeightRef& up,
+                      WeightRef& down) {
+    const auto* gu = model.weights.find(prefix + "gate_up_proj.weight");
+    const auto* dn = model.weights.find(prefix + "down_proj.weight");
+    if (gu == nullptr || dn == nullptr) return {StatusCode::NotFound, "not the fused layout"};
+
+    const auto where = prefix + "gate_up_proj.weight: ";
+    if (gu->rank() != 2 || dn->rank() != 2) {
+        return {StatusCode::InvalidArgument, where + "expected rank-2 gate_up_proj and down_proj"};
+    }
+    if (gu->dtype != DType::F32 || dn->dtype != DType::F32) {
+        return {StatusCode::Unsupported, where + "not fp32 in the checkpoint"};
+    }
+    if (gu->dim(0) != 2 * static_cast<std::int64_t>(inter) || gu->dim(1) != d_model ||
+        dn->dim(0) != d_model || dn->dim(1) != inter) {
+        return {StatusCode::InvalidArgument,
+                where + "shapes [" + std::to_string(gu->dim(0)) + "," +
+                    std::to_string(gu->dim(1)) + "] / [" + std::to_string(dn->dim(0)) + "," +
+                    std::to_string(dn->dim(1)) + "] disagree with the IR's " +
+                    std::to_string(inter) + " intermediate x " + std::to_string(d_model) +
+                    " d_model"};
+    }
+
+    const auto src = gu->f32();
+    const auto half = static_cast<std::size_t>(inter) * d_model;
+    if (auto s = bind_block(model, src.subspan(0, half), inter, d_model, role, gate); !s.ok())
+        return s;
+    if (auto s = bind_block(model, src.subspan(half, half), inter, d_model, role, up); !s.ok())
+        return s;
+    return bind_block(model, dn->f32(), d_model, inter, role, down);
+}
+
 /// The FUSED expert layout: every expert stacked into one rank-3 tensor.
 ///
 /// Shapes are checked against the IR rather than inferred from the tensor, so a
@@ -624,26 +678,45 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
                 }
             }
             if (arch.router.n_shared_experts > 0) {
-                if (auto s =
-                        bind_weight_optional(out,
-                                             p + arch.naming.shared_block + ".gate_proj.weight",
-                                             TensorRole::SharedExpert,
-                                             lw.shared_gate);
-                    !s.ok())
-                    return s;
-                if (auto s = bind_weight_optional(out,
-                                                  p + arch.naming.shared_block + ".up_proj.weight",
-                                                  TensorRole::SharedExpert,
-                                                  lw.shared_up);
-                    !s.ok())
-                    return s;
-                if (auto s =
-                        bind_weight_optional(out,
-                                             p + arch.naming.shared_block + ".down_proj.weight",
-                                             TensorRole::SharedExpert,
-                                             lw.shared_down);
-                    !s.ok())
-                    return s;
+                // The shared expert is fused on the same families whose routed
+                // experts are, and for the same reason: it is a `DenseMLP` built
+                // by the same constructor. Tried FIRST so that a checkpoint
+                // carrying both layouts -- none does, but nothing prevents it --
+                // resolves the same way the routed experts above do.
+                const auto shared_fused =
+                    bind_fused_glu(out,
+                                   p + arch.naming.shared_block + '.',
+                                   arch.topology.d_model,
+                                   arch.ffn.shared_intermediate,
+                                   TensorRole::SharedExpert,
+                                   lw.shared_gate,
+                                   lw.shared_up,
+                                   lw.shared_down);
+                if (!shared_fused.ok() && shared_fused.code() != StatusCode::NotFound) {
+                    return shared_fused;
+                }
+                if (!shared_fused.ok()) {
+                    if (auto s =
+                            bind_weight_optional(out,
+                                                 p + arch.naming.shared_block + ".gate_proj.weight",
+                                                 TensorRole::SharedExpert,
+                                                 lw.shared_gate);
+                        !s.ok())
+                        return s;
+                    if (auto s = bind_weight_optional(out,
+                                                      p + arch.naming.shared_block + ".up_proj.weight",
+                                                      TensorRole::SharedExpert,
+                                                      lw.shared_up);
+                        !s.ok())
+                        return s;
+                    if (auto s =
+                            bind_weight_optional(out,
+                                                 p + arch.naming.shared_block + ".down_proj.weight",
+                                                 TensorRole::SharedExpert,
+                                                 lw.shared_down);
+                        !s.ok())
+                        return s;
+                }
 
                 // The scalar branch gate. A SIBLING of the shared block, not a
                 // member of it: upstream names it `mlp.shared_expert_gate` while
@@ -679,24 +752,43 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
             // The container is the authority here: it is what production serves.
             // These two roles are the "always-active FFN, resident, F32" family,
             // and the loader agreeing with the converter about that is the point.
-            if (auto s = bind_weight(out,
-                                     p + arch.naming.dense_block + ".gate_proj.weight",
-                                     TensorRole::SharedExpert,
-                                     lw.dense_gate);
-                !s.ok())
-                return s;
-            if (auto s = bind_weight(out,
-                                     p + arch.naming.dense_block + ".up_proj.weight",
-                                     TensorRole::SharedExpert,
-                                     lw.dense_up);
-                !s.ok())
-                return s;
-            if (auto s = bind_weight(out,
-                                     p + arch.naming.dense_block + ".down_proj.weight",
-                                     TensorRole::SharedExpert,
-                                     lw.dense_down);
-                !s.ok())
-                return s;
+            // Fused first, per-projection second -- see bind_fused_glu. A dense
+            // layer's width is `ffn.dense_intermediate`, which is NOT
+            // `expert_intermediate` on a family that states the two separately:
+            // MiniMax-M3's dense layers are 12288 wide against its experts'
+            // 3072, and binding one against the other's width fails the shape
+            // check here rather than reading four times the rows it should.
+            const auto dense_fused = bind_fused_glu(out,
+                                                    p + arch.naming.dense_block + '.',
+                                                    arch.topology.d_model,
+                                                    arch.ffn.dense_intermediate,
+                                                    TensorRole::SharedExpert,
+                                                    lw.dense_gate,
+                                                    lw.dense_up,
+                                                    lw.dense_down);
+            if (!dense_fused.ok() && dense_fused.code() != StatusCode::NotFound) {
+                return dense_fused;
+            }
+            if (!dense_fused.ok()) {
+                if (auto s = bind_weight(out,
+                                         p + arch.naming.dense_block + ".gate_proj.weight",
+                                         TensorRole::SharedExpert,
+                                         lw.dense_gate);
+                    !s.ok())
+                    return s;
+                if (auto s = bind_weight(out,
+                                         p + arch.naming.dense_block + ".up_proj.weight",
+                                         TensorRole::SharedExpert,
+                                         lw.dense_up);
+                    !s.ok())
+                    return s;
+                if (auto s = bind_weight(out,
+                                         p + arch.naming.dense_block + ".down_proj.weight",
+                                         TensorRole::SharedExpert,
+                                         lw.dense_down);
+                    !s.ok())
+                    return s;
+            }
         }
     }
 
@@ -816,6 +908,9 @@ void apply_glu_expert_tile(const ArchIr& arch,
         case Activation::Situ:
             f32::situ_glu(g, u, inter, arch.ffn.situ_beta, arch.ffn.situ_linear_beta, a);
             break;
+        case Activation::SwiGluOai:
+            f32::swiglu_oai(g, u, inter, arch.ffn.swiglu_alpha, a);
+            break;
         }
     }
 
@@ -869,6 +964,9 @@ void apply_glu_expert(const ArchIr& arch,
     case Activation::Situ:
         f32::situ_glu(
             s.gate, s.up, inter, arch.ffn.situ_beta, arch.ffn.situ_linear_beta, s.act);
+        break;
+    case Activation::SwiGluOai:
+        f32::swiglu_oai(s.gate, s.up, inter, arch.ffn.swiglu_alpha, s.act);
         break;
     }
 

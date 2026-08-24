@@ -64,6 +64,29 @@ enum class AttentionFamily : std::uint8_t {
     /// `arch_hash` would then be unable to distinguish two models that share a
     /// layer split and nothing else.
     GqaGdn,
+
+    /// Ordinary GQA whose key SELECTION is block-sparse: a small indexer scores
+    /// every key, max-pools those scores into fixed-size blocks, and each query
+    /// attends only to the top-scoring blocks.
+    ///
+    /// The relationship to `MlaDsa` is exact and worth stating, because it is
+    /// what decides the sizing: both are "a full-attention family plus a learned
+    /// selector", both leave the KV cache holding EVERY token, and both add an
+    /// indexer key that must itself be cached. Two things differ.
+    ///
+    ///   * The base family. DSA selects over MLA's latent cache; this selects
+    ///     over per-head K and V. Nothing about the attention arithmetic is
+    ///     shared, which is why this resolves to the GQA backend and not MLA's.
+    ///   * The GRANULARITY. DSA keeps the top `index_topk` individual keys; this
+    ///     keeps the top `topk_blocks` BLOCKS of `block_size` keys. A reader who
+    ///     transcribes DSA's per-key top-k here selects `topk_blocks` keys where
+    ///     the model selects `topk_blocks * block_size` of them — on MiniMax-M3,
+    ///     16 against 2048. Finite, fluent, and attending to a thousandth of
+    ///     what it should.
+    ///
+    /// Appended, like every value after `CompressedSparse`, because the enum is
+    /// serialized nowhere it can be reordered safely.
+    GqaBsa,
 };
 
 /// Whether a layer attends over a cache or carries a recurrent state.
@@ -115,7 +138,18 @@ enum class ScoreFn : std::uint8_t { Softmax = 0, Sigmoid, SqrtSoftplus };
 /// parameterized by `FfnSpec::situ_beta` and `situ_linear_beta`. It is a math
 /// primitive selected by a family, not an architecture — same category as
 /// SwiGlu, and core kernels may name it.
-enum class Activation : std::uint8_t { SwiGlu = 0, GeGlu, Relu2, Situ };
+///
+/// `SwiGluOai` is OpenAI's clamped variant, as gpt-oss ships it and MiniMax-M3
+/// reuses it: `(up + 1) * gate * sigmoid(alpha * gate)` over a gate clamped
+/// above at `FfnSpec::swiglu_limit` and an up clamped to both sides of it.
+/// It is NOT `SwiGlu` with a limit — the clamping was already expressible that
+/// way, and the two terms that are not are the `alpha` inside the sigmoid and
+/// the `+1` on the linear half. At alpha 1.702 the gate half is a scaled sigmoid
+/// rather than SiLU, and the `+1` means an up projection of exactly zero passes
+/// the gate through instead of silencing it. A checkpoint read as plain SwiGlu
+/// therefore runs, produces finite logits, and is a different function on every
+/// token.
+enum class Activation : std::uint8_t { SwiGlu = 0, GeGlu, Relu2, Situ, SwiGluOai };
 
 /// What the checkpoint accepts as INPUT. Not a serving capability.
 ///
@@ -338,6 +372,90 @@ struct DsaSpec {
     }
 };
 
+/// Present iff `AttentionSpec::family` is GqaBsa.
+///
+/// The "Lightning Indexer": a small scoring branch that decides, per query,
+/// which BLOCKS of keys the real attention is allowed to see. It has a query
+/// projection, a single-head key projection, two norms and nothing else — no
+/// value projection and no residual output, so it contributes to selection only.
+///
+/// **Selection is per block, and the block is the unit that everything else
+/// counts in.** `topk_blocks` blocks of `block_size` keys each is
+/// `topk_blocks * block_size` visible keys, and every arithmetic statement about
+/// this family has to be written in those terms. Use `visible_keys()` rather
+/// than multiplying at the call site, so the one place that can get the units
+/// wrong is here.
+///
+/// Two consequences the planner and the backend each depend on:
+///
+///   * The KV cache is UNCHANGED. Every token's K and V is still stored, because
+///     a later query may select the block it lives in. Sparsity buys arithmetic,
+///     not memory — the same bargain DSA strikes.
+///   * The indexer's KEYS must themselves be cached, at `index_head_dim` floats
+///     per token per indexed layer. One head, not `n_index_heads`: the key
+///     projection is `d_model -> index_head_dim` and every indexer head scores
+///     against that same key. Sizing it per head over-counts the extra cache
+///     plane by `n_index_heads` — 4x on MiniMax-M3 — on a quantity that is added
+///     to the one the verdict turns on.
+struct BsaSpec {
+    /// Heads on the QUERY side of the indexer. Equal to `n_kv_heads` on the
+    /// reference checkpoint, and that is not a coincidence: each indexer head
+    /// produces the selection for one GQA group, so query head `h` obeys
+    /// indexer head `h / (n_heads / n_index_heads)`.
+    std::uint32_t n_index_heads = 0;
+
+    /// Channels per indexer head, and the width of the single cached key.
+    std::uint32_t index_head_dim = 0;
+
+    /// Keys pooled into one scored block. The pooling is a MAX, not a mean —
+    /// a block is kept if its best key is good, so one strong key carries the
+    /// 127 around it.
+    std::uint32_t block_size = 0;
+
+    /// Blocks a query may attend, before the local guarantee below.
+    std::uint32_t topk_blocks = 0;
+
+    /// Blocks ending at the query's own, forced visible whatever they scored.
+    ///
+    /// Upstream implements this by writing `+inf` into their scores BEFORE the
+    /// top-k, which is why they consume top-k slots rather than adding to them:
+    /// the number of visible blocks is `topk_blocks`, not
+    /// `topk_blocks + local_blocks`. Adding them would over-report the visible
+    /// key count and, worse, an implementation that appended them would attend
+    /// to a block twice.
+    std::uint32_t local_blocks = 0;
+
+    /// Length == n_layers when non-empty. `Full` owns an indexer and selects;
+    /// `None` is ordinary dense GQA over the whole prefix.
+    ///
+    /// `Shared` never appears. This family has no IndexShare — every sparse
+    /// layer carries its own indexer weights — and the enum is reused rather
+    /// than duplicated because the QUESTION is the same one DSA asks.
+    std::vector<IndexerKind> layer_kinds;
+
+    /// Layers that own an indexer, i.e. `Full` count.
+    std::uint32_t n_indexed_layers() const noexcept {
+        std::uint32_t n = 0;
+        for (const auto k : layer_kinds)
+            if (k == IndexerKind::Full) ++n;
+        return n;
+    }
+
+    /// Keys one query may attend at a context of `n_keys`, INCLUDING the local
+    /// guarantee, which is inside `topk_blocks` rather than added to it.
+    ///
+    /// Ceilings at `n_keys`, and that ceiling is the number that decides whether
+    /// a test of this family means anything: below `topk_blocks * block_size`
+    /// tokens the selection keeps everything and the sparse path is
+    /// bit-identical to dense attention. On MiniMax-M3 that threshold is 2048
+    /// tokens — so a fixture evaluated at 512 positions measures nothing about
+    /// sparsity unless `block_size` and `topk_blocks` are shrunk with it.
+    std::uint64_t visible_keys(std::uint64_t n_keys) const noexcept {
+        const auto span = static_cast<std::uint64_t>(topk_blocks) * block_size;
+        return (span == 0 || span > n_keys) ? n_keys : span;
+    }
+};
+
 /// Hybrid compressed/sparse attention used by v2 Architecture IR models.
 ///
 /// Unlike DSA, compression changes both the cache representation and the set of
@@ -438,6 +556,7 @@ struct AttentionSpec {
     DsaSpec dsa{}; ///< meaningful only for MlaDsa
     KdaSpec kda{}; ///< meaningful only for MlaKda
     GdnSpec gdn{}; ///< meaningful only for GqaGdn
+    BsaSpec bsa{}; ///< meaningful only for GqaBsa
     CompressedAttentionSpec compressed{}; ///< CompressedSparse only
 
     /// Sigmoid output gate on the full-attention block, with the gate projection
@@ -492,6 +611,17 @@ struct FfnSpec {
     bool shared_expert_gate = false;
 
     float swiglu_limit = 0.0f;
+
+    /// Sigmoid gain inside `Activation::SwiGluOai`, and meaningless for every
+    /// other activation.
+    ///
+    /// Defaults to 1 rather than to the reference checkpoint's 1.702, because
+    /// 1 is the value at which the gate half degenerates to SiLU — so a config
+    /// that omits it gets the nearest well-defined thing rather than another
+    /// family's constant. It is model identity and hashed as such: two
+    /// checkpoints differing only here are two different models.
+    float swiglu_alpha = 1.0f;
+
     ExpertLayout expert_layout = ExpertLayout::InterleavedGateUpDown;
 
     /// Width the ROUTED experts operate at, when it is not `d_model`.

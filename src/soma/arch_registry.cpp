@@ -29,6 +29,30 @@ const F32Backend* resolve_f32_backend(const ArchIr& arch) noexcept {
         // no behavioural gain.
         return &arch::gqa::f32_backend();
 
+    case AttentionFamily::GqaBsa:
+        // The SAME backend, for the same reason MHA shares it: block sparsity
+        // changes which keys the softmax sees and nothing else. Every
+        // projection, both qk-norms, the partial rotation and the score loop are
+        // GQA's, and `arch::gqa` branches on the family internally to consult a
+        // per-block visibility mask before the dot product.
+        //
+        // The precedent is `MlaDsa` two cases down, and so is the hazard: this
+        // line pointing at a family with no selector would run MiniMax-M3 as
+        // DENSE attention over 57 of its 60 layers. Finite, fluent, exact below
+        // 2048 tokens where top-k selects everything anyway, and a different
+        // model beyond that -- which is the worst shape a defect can take,
+        // because a short-prompt smoke test passes.
+        //
+        // It says `gqa` from the start rather than nullptr, and that is a claim
+        // about evidence rather than confidence: `tests/fixtures/tiny/MiniMax-M3-Tiny`
+        // is an oracle built by transformers 5.15.1's own
+        // `modeling_minimax_m3_vl.py` -- pure torch on the CPU, no Triton and no
+        // CUDA -- and its indexer, block pooling and top-k are shrunk so that
+        // the fixture's 512 positions sit well past `topk_blocks * block_size`.
+        // Below that threshold the sparse path is bit-identical to dense and the
+        // fixture would have graded nothing.
+        return &arch::gqa::f32_backend();
+
     case AttentionFamily::Mla:
         return &arch::mla::f32_backend();
 
@@ -134,6 +158,19 @@ const AttentionBackend* resolve_attention_backend(AttentionFamily family) noexce
     case AttentionFamily::Mha:
     case AttentionFamily::Gqa:
         return &arch::gqa::attention_backend();
+    case AttentionFamily::GqaBsa:
+        // GQA's sizing plus the indexer's, which is why this is not simply the
+        // `Gqa` case falling through.
+        //
+        // Two corrections ride on it, in opposite directions, and both land on
+        // the quantity the verdict is computed from. The K plane is WIDER than
+        // GQA's by `index_head_dim` per position, because the indexer's key must
+        // be cached; and the resident half is larger by a query projection, a
+        // key projection and two norms on every indexed layer. Sharing GQA's
+        // descriptor would under-report the first by 128 floats per token per
+        // layer and the second by ~3.9 M parameters across 57 layers.
+        return &arch::gqa::attention_backend();
+
     case AttentionFamily::Mla:
         return &arch::mla::attention_backend();
 

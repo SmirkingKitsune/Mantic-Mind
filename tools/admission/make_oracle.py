@@ -66,7 +66,8 @@ EXPERT_COUNT_KEYS = ("num_experts", "num_local_experts", "n_routed_experts")
 # never exercise the router at all.
 TOPK_KEYS = ("num_experts_per_tok", "num_experts_per_token")
 MOE_INTERMEDIATE_KEYS = ("moe_intermediate_size",)
-SHARED_INTERMEDIATE_KEYS = ("shared_expert_intermediate_size",)
+# MiniMax-M3 spells it `shared_intermediate_size`; Qwen prefixes it `expert_`.
+SHARED_INTERMEDIATE_KEYS = ("shared_expert_intermediate_size", "shared_intermediate_size")
 
 # MLA latent dims. Shrunk coherently or the projections do not compose.
 MLA_KEYS = {
@@ -425,6 +426,109 @@ def shrink_qwen3_5_moe(cfg: dict[str, Any], layers: int) -> None:
         rope["partial_rotary_factor"] = factor
 
 
+def shrink_minimax_m3(cfg: dict[str, Any], layers: int) -> None:
+    """Shrink the block-sparse GQA stack. Five properties must survive.
+
+    THE SPARSITY MUST ACTUALLY BITE. This is the one that makes the fixture worth
+    running, and it is easy to get silently wrong. A query sees
+    `index_topk_blocks * index_block_size` keys, so at production's 16 x 128 =
+    2048 any evaluation shorter than 2048 positions selects EVERY block and the
+    sparse path is bit-identical to dense. A fixture that kept those values would
+    pass against a completely dense implementation. Shrunk to 4 x 16 = 64, so 448
+    of the oracle's 512 positions are genuinely sparse.
+
+    THE INDEXER'S KEY IS SINGLE-HEADED while its query is not. `index_n_heads` is
+    kept equal to the shrunken `num_key_value_heads`, preserving upstream's
+    "one selection per GQA group" -- collapsing it to 1 would leave every query
+    head reading the same selection and hide a wrong group mapping entirely.
+
+    THE LOCAL GUARANTEE. `index_local_blocks` stays 1, so the query's own block is
+    forced visible through the score rather than appended to the selection. At 0
+    a query could be denied its own key; at 2 it would consume a second top-k
+    slot, and both are observable at these dimensions.
+
+    THE DENSE PREFIX, and it is TWO lists that must agree. Upstream's leading
+    three layers are dense in attention (`layer_types`) AND dense in MLP
+    (`mlp_layer_types`), and the two are generated from the same source lists.
+    Scaled to a single leading layer here so that four layers still leave three
+    sparse ones; generated together, because a fixture whose attention prefix and
+    MLP prefix disagreed would be a model no config can express.
+
+    THE ROTATION. `partial_rotary_factor` stays 0.5 and `head_dim` is
+    TARGET_HEAD_DIM 16, so `int(16 * 0.5) == 8` channels rotate and 8 pass
+    through. `rotary_dim` is rewritten to match rather than left at the source's
+    64 -- the adapter cross-checks the two and refuses a config that states both
+    and disagrees, which is exactly the check this fixture should not trip.
+
+    `index_head_dim` is kept at `head_dim`, as upstream keeps both at 128. It must
+    not fall below the rotary width: upstream slices the rope table at
+    `cos[..., :index_head_dim]`, and a narrower head would truncate it
+    mid-frequency. `validate_arch_ir` refuses that rather than reproducing it.
+    """
+    head_dim = int(cfg.get("head_dim") or TARGET_HEAD_DIM)
+    factor = float(cfg.get("partial_rotary_factor", 1.0) or 1.0)
+    rotary = int(head_dim * factor)
+    if rotary < 2 or rotary % 2:
+        raise SystemExit(
+            f"  REFUSED: partial_rotary_factor {factor} on head_dim {head_dim} gives "
+            f"{rotary} rotary channels; the fixture would test no rotation or an "
+            f"odd split.")
+    # Stated twice upstream and cross-checked by the adapter, so both move.
+    cfg["rotary_dim"] = rotary
+    rope = cfg.get("rope_parameters")
+    if isinstance(rope, dict):
+        rope["partial_rotary_factor"] = factor
+
+    # The two per-layer lists, generated together from one prefix length.
+    n_dense = max(1, min(int(cfg.get("first_k_dense_replace", 1) or 1), layers - 1))
+    source_types = cfg.get("layer_types")
+    if isinstance(source_types, list) and source_types:
+        # Preserve the SOURCE's prefix length where it fits, so the fixture keeps
+        # the shape of the real stack rather than a number invented here.
+        leading = sum(1 for t in source_types if str(t) == "full_attention")
+        n_dense = max(1, min(leading, layers - 1))
+    cfg["layer_types"] = ["full_attention" if i < n_dense else "minimax_m3_sparse"
+                          for i in range(layers)]
+    cfg["mlp_layer_types"] = ["dense" if i < n_dense else "sparse" for i in range(layers)]
+    # The nested spelling the production checkpoint ships. Rewritten rather than
+    # dropped so the fixture's config still round-trips through the adapter's
+    # nested branch if anything reads it, and so the two spellings cannot
+    # disagree about the same stack.
+    sparse_cfg = cfg.get("sparse_attention_config")
+    if isinstance(sparse_cfg, dict):
+        freq = [0 if i < n_dense else 1 for i in range(layers)]
+        sparse_cfg["sparse_attention_freq"] = freq
+        sparse_cfg["sparse_disable_index_value"] = list(freq)
+    # `moe_layer_freq` is the list form, and it must agree with mlp_layer_types.
+    if isinstance(cfg.get("moe_layer_freq"), list):
+        cfg["moe_layer_freq"] = [0 if i < n_dense else 1 for i in range(layers)]
+
+    kv = int(cfg.get("num_key_value_heads", TARGET_KV_HEADS) or TARGET_KV_HEADS)
+    flat = {
+        "index_n_heads": kv,          # one selection per GQA group, as upstream
+        "index_head_dim": head_dim,   # == head_dim upstream, and >= rotary
+        "index_block_size": 16,
+        "index_topk_blocks": 4,       # 4 x 16 = 64 visible keys of 512 positions
+        "index_local_blocks": int(cfg.get("index_local_blocks", 1) or 1),
+    }
+    cfg.update(flat)
+    if isinstance(sparse_cfg, dict):
+        sparse_cfg.update({
+            "sparse_num_index_heads": flat["index_n_heads"],
+            "sparse_index_dim": flat["index_head_dim"],
+            "sparse_block_size": flat["index_block_size"],
+            "sparse_topk_blocks": flat["index_topk_blocks"],
+            "sparse_local_block": flat["index_local_blocks"],
+        })
+
+    # THREE FFN widths, and `shrink_moe` cannot resolve them because this is the
+    # only family where `intermediate_size` is the EXPERT width rather than the
+    # dense one. Set here, before shrink_moe runs, and re-asserted after it.
+    _shrink(cfg, "intermediate_size", TARGET_MOE_INTERMEDIATE)
+    _shrink(cfg, "dense_intermediate_size", TARGET_DENSE_INTERMEDIATE)
+    _shrink(cfg, "shared_intermediate_size", TARGET_SHARED_INTERMEDIATE)
+
+
 def shrink_moe(cfg: dict[str, Any]) -> None:
     """Shrink expert counts and widths, preserving every routing semantic."""
     ekey = _first_present(cfg, EXPERT_COUNT_KEYS)
@@ -492,7 +596,22 @@ def shrink_config(raw: dict[str, Any], layers: int, experts: int) -> dict[str, A
             # After shrink_attention, which owns this hybrid's FULL-attention
             # dims: the rotary-width check below reads the head_dim it settled.
             shrink_qwen3_5_moe(cfg, layers)
+        elif cfg.get("model_type") in ("minimax_m3_vl_text", "minimax_m3_vl"):
+            # After shrink_attention for the same reason -- the rotary check and
+            # `index_head_dim` both read the head_dim it settled -- and after it
+            # sets num_key_value_heads, which `index_n_heads` mirrors.
+            shrink_minimax_m3(cfg, layers)
+    is_minimax = cfg.get("model_type") in ("minimax_m3_vl_text", "minimax_m3_vl")
+    expert_width = cfg.get("intermediate_size") if is_minimax else None
     shrink_moe(cfg)
+    if expert_width is not None:
+        # `shrink_moe` reads `intermediate_size` as the DENSE width whenever a
+        # family states no `moe_intermediate_size`, which is right for Mixtral and
+        # OLMoE and wrong here: this family states `dense_intermediate_size`
+        # separately and `intermediate_size` IS the expert width. Restored rather
+        # than special-cased inside shrink_moe, so the rule that function encodes
+        # stays one rule.
+        cfg["intermediate_size"] = expert_width
 
     _shrink(cfg, "vocab_size", TARGET_VOCAB)
     _shrink(cfg, "max_position_embeddings", TARGET_MAX_POS)
@@ -547,6 +666,9 @@ def rank1_override(model_type: str, name: str):
     new rule is a decision to make on purpose, not a side effect of adding a
     family.
 
+    MiniMax-M3's one, from `MiniMaxM3VLPreTrainedModel._init_weights`: every
+    RMSNorm weight is ZEROS, because `MiniMaxM3VLRMSNorm` applies `(1 + weight)`.
+
     Qwen3.5's three, all from `Qwen3_5MoePreTrainedModel._init_weights`:
 
       A_log     `log(uniform(0, 16))`, so `exp(A_log)` spans (0, 16). The generic
@@ -562,6 +684,24 @@ def rank1_override(model_type: str, name: str):
                 and every norm in the fixture then scales by ~2. Two norms per
                 layer of a model that is supposed to scale by ~1.
     """
+    if model_type in ("minimax_m3_vl_text", "minimax_m3_vl"):
+        import torch  # late, like main()'s, so --help works without it installed
+
+        # EVERY norm in this model is `MiniMaxM3VLRMSNorm`, which applies
+        # `x_hat * (1 + weight)` from a zeros-initialized Parameter -- Gemma's
+        # convention. Unlike Qwen3.5 there is no second norm class to carve out:
+        # the layer norms, the q/k norms, the INDEXER's q/k norms and the final
+        # norm are all the same class, so the rule is unconditional.
+        #
+        # Under the generic rule ("~1 for anything named norm") every one of them
+        # would scale by ~2 instead of ~1. That is not a small fixture artefact:
+        # it compounds through 4 layers and would set the tolerance for a defect
+        # class this fixture exists to detect.
+        if "norm" in name.lower():
+            return lambda p, gen: p.copy_(
+                torch.zeros_like(p) + torch.empty_like(p).uniform_(-0.02, 0.02, generator=gen))
+        return None
+
     if model_type not in ("qwen3_5_moe_text", "qwen3_5_moe"):
         return None
     import torch  # late, like main()'s, so --help works without it installed

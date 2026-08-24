@@ -53,12 +53,12 @@ from pathlib import Path
 # every family shares and merely parameterizes (softmax, rope)?
 ARCH_TOKENS = [
     # attention families
-    "mla", "gqa", "mha", "dsa", "kda", "gdn",
+    "mla", "gqa", "mha", "dsa", "kda", "gdn", "bsa",
     # family-specific mechanisms with no cross-family analogue
     "absorb", "lora", "yarn",
     # reference checkpoints / model families
     "deepseek", "qwen", "mixtral", "olmoe", "granite", "gptoss", "llama",
-    "kimi",
+    "kimi", "minimax",
 ]
 
 _ARCH_TOKEN_SET = frozenset(ARCH_TOKENS)

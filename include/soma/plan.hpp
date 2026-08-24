@@ -116,7 +116,23 @@ struct PlanDocument {
     /// not need to inspect the architecture IR to learn what it is looking at. Control's
     /// registry denormalizes exactly these for its queries and its TUI, and the
     /// plan is the only view of the model it has.
-    std::string attention_family; ///< mha | gqa | mla | mla+dsa
+    std::string attention_family; ///< mha | gqa | mla | mla+dsa | gqa+bsa | ...
+
+    /// What the CHECKPOINT accepts, against what Soma will serve.
+    ///
+    /// `ModalitySpec` has recorded this since it was written and nothing ever
+    /// reported it, so the one thing it exists to prevent -- a vision-capable
+    /// checkpoint served text-only WITHOUT SAYING SO -- was exactly what
+    /// happened. The IR knew; every surface an operator can see said "text".
+    ///
+    /// Soma serves the text stack and only the text stack. That is a legitimate
+    /// thing to do with a multimodal checkpoint and an illegitimate thing to do
+    /// quietly, which is the whole distinction: a model answering about an image
+    /// it never received produces a confident, fluent, wrong answer, and no
+    /// downstream check can tell.
+    std::string modality; ///< text | vision+text
+    std::uint32_t vision_layers = 0;
+    std::uint32_t vision_hidden = 0;
     std::uint32_t n_layers = 0;
     std::uint32_t n_moe_layers = 0;
     std::uint32_t n_experts = 0;

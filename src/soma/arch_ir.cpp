@@ -18,6 +18,25 @@ namespace {
 constexpr std::array kExpertCountKeys = {"num_experts", "num_local_experts", "n_routed_experts"};
 constexpr std::array kMoeIntermediateKeys = {"moe_intermediate_size"};
 
+// The DENSE layers' FFN width, when a family states it separately from
+// `intermediate_size`.
+//
+// Every family before MiniMax-M3 had one FFN width per layer kind and spelled it
+// `intermediate_size`, so "dense width" and "expert width" fell out of the same
+// key. M3 splits them: `intermediate_size` 3072 is what a ROUTED expert runs at
+// and `dense_intermediate_size` 12288 is what its three leading dense layers do.
+// Reading only the shared key sizes those layers at a quarter of their real
+// width -- the tensors then fail to bind, which is loud, but the PLANNER binds
+// nothing and would have under-reported the resident half by ~1.1 GB per layer
+// on the production checkpoint.
+constexpr std::array kDenseIntermediateKeys = {"dense_intermediate_size"};
+
+// Qwen2-MoE and Qwen3.5 say `shared_expert_intermediate_size`; MiniMax-M3 says
+// `shared_intermediate_size`. Same quantity, and the DeepSeek families state
+// neither and derive it from the count instead (below).
+constexpr std::array kSharedIntermediateKeys = {"shared_expert_intermediate_size",
+                                                "shared_intermediate_size"};
+
 // Kimi spells the DeepSeek router's every field differently while meaning
 // exactly the same thing — it says so itself, in a comment mapping
 // `num_experts_per_token -> num_experts_per_tok` and three more. Reading only
@@ -60,6 +79,29 @@ const json* find_first(const json& j, const auto& keys) {
 std::vector<LayerKind> resolve_layer_kinds(const json& j, std::uint32_t n_layers) {
     std::vector<LayerKind> kinds(n_layers, LayerKind::Moe);
 
+    // A STATED per-layer list wins over any derivation, for the same reason
+    // Topology::layer_kinds exists at all: a stride plus an offset is a
+    // re-derivation waiting to disagree with the weights.
+    //
+    // GLM-5.2 ships `mlp_layer_types` and the derivation below happens to agree
+    // with it — `first_k_dense_replace: 3` with `moe_layer_freq: 1` reproduces
+    // its three-dense prefix exactly — so reading it changes no existing
+    // container's arch_hash. That agreement is precisely why the explicit list
+    // should win anyway: a family with an IRREGULAR pattern would be silently
+    // mis-derived and nothing would notice.
+    if (const auto it = j.find("mlp_layer_types"); it != j.end() && it->is_array()) {
+        if (it->size() >= n_layers) {
+            for (std::uint32_t i = 0; i < n_layers; ++i) {
+                const auto& v = (*it)[i];
+                const auto name = v.is_string() ? v.get<std::string>() : std::string{};
+                kinds[i] = (name == "sparse" || name == "moe" || name == "hash_moe")
+                               ? LayerKind::Moe
+                               : LayerKind::Dense;
+            }
+            return kinds;
+        }
+    }
+
     const auto first_dense = get_or<std::uint32_t>(j, "first_k_dense_replace", 0);
     for (std::uint32_t i = 0; i < std::min(first_dense, n_layers); ++i) {
         kinds[i] = LayerKind::Dense;
@@ -73,15 +115,43 @@ std::vector<LayerKind> resolve_layer_kinds(const json& j, std::uint32_t n_layers
             mlp_only.push_back(v.get<std::uint32_t>());
     }
 
+    // `moe_layer_freq` is TWO different things under one key, and reading only
+    // the scalar form is how a 57-MoE-layer model becomes a 60-MoE-layer one.
+    //
+    //   scalar  a STRIDE: layer i is MoE when `i % freq == 0`.
+    //   list    a per-layer MASK, one 0/1 per layer, `i` naming layer `i`.
+    //
+    // DeepSeek's config class accepts both and MiniMax-M3 ships the list — 3
+    // zeros then 57 ones. Read as a scalar the list simply fails the
+    // `is_number_integer` test, `freq` stays 1, and the dense prefix vanishes:
+    // every layer is called MoE, the three dense layers' `gate_up_proj` is never
+    // bound, and the model asks for experts that are not there. That at least
+    // fails loudly at bind time — but the PLANNER runs first and does not bind
+    // anything, so `bytes_per_token` is over-reported by three layers' worth of
+    // routed experts on the exact quantity the verdict is computed from.
     std::uint32_t freq = 1;
-    if (const auto it = j.find("moe_layer_freq"); it != j.end() && it->is_number_integer()) {
-        freq = std::max<std::uint32_t>(1, it->get<std::uint32_t>());
+    std::vector<std::uint8_t> freq_mask;
+    if (const auto it = j.find("moe_layer_freq"); it != j.end()) {
+        if (it->is_number_integer()) {
+            freq = std::max<std::uint32_t>(1, it->get<std::uint32_t>());
+        } else if (it->is_array()) {
+            freq_mask.reserve(it->size());
+            for (const auto& v : *it) {
+                freq_mask.push_back(v.is_number() && v.get<double>() != 0.0 ? 1u : 0u);
+            }
+        }
     }
 
     for (std::uint32_t i = 0; i < n_layers; ++i) {
         if (kinds[i] == LayerKind::Dense) continue;
         const bool only_mlp = std::find(mlp_only.begin(), mlp_only.end(), i) != mlp_only.end();
-        if (only_mlp || (step > 1 && i % step != 0) || (freq > 1 && i % freq != 0)) {
+        // A mask SHORTER than the stack leaves the unnamed tail alone rather
+        // than defaulting it dense: the tail is already Moe, and inventing an
+        // answer for a layer the config did not describe is worse than
+        // inheriting the default the rest of this function assumes.
+        const bool masked_off = i < freq_mask.size() && freq_mask[i] == 0u;
+        if (only_mlp || masked_off || (step > 1 && i % step != 0) ||
+            (freq > 1 && i % freq != 0)) {
             kinds[i] = LayerKind::Dense;
         }
     }
@@ -321,6 +391,53 @@ FamilyTraits traits_for(const std::string& model_type) {
                 // deliberately does not consult.
                 RmsNormScale::OnePlusWeight};
     }
+    if (model_type == "minimax_m3_vl" || model_type == "minimax_m3_vl_text") {
+        // GQA whose key SELECTION is block-sparse. NOT a spelling of MlaDsa, and
+        // not plain Gqa either.
+        //
+        // Routing it to `Gqa` is the tempting shortcut — the projections, the
+        // head ratio, the qk-norm and the partial rotation are all ordinary, and
+        // it would run. It would run DENSE: 57 of 60 layers attending over the
+        // whole prefix instead of 16 blocks of it. Correct-looking at short
+        // context, because top-k over fewer than 2048 tokens selects everything,
+        // and progressively a different model beyond that. Exactly the failure
+        // `MlaDsa` was held back for.
+        //
+        // Three traits below have no key in config.json to read, and each was
+        // taken from `modeling_minimax_m3_vl.py` rather than guessed:
+        //
+        //   force_normalize_topk  `MiniMaxM3VLTopKRouter.forward` ends
+        //                         `top_k_weights /= top_k_weights.sum(...)`
+        //                         unconditionally, and the config carries no
+        //                         `norm_topk_prob`. Reading the absent key as
+        //                         false leaves four sigmoid probabilities
+        //                         summing to anything, then multiplies the lot
+        //                         by `routed_scaling_factor` 2.0 — the same trap
+        //                         Mixtral sets, with a factor of two on top.
+        //   rms_norm_scale        `MiniMaxM3VLRMSNorm` is Gemma's `x_hat *
+        //                         (1 + w)` with a zeros-initialized weight. The
+        //                         config DOES say so (`use_gemma_norm: true`),
+        //                         which makes this the first family here whose
+        //                         convention is stated — but it is family
+        //                         knowledge for the text-only spelling too, and
+        //                         one source is better than two.
+        //   qk_norm               per head: `q_norm` is `RMSNorm(head_dim)`
+        //                         applied to a `[..., n_heads, head_dim]` view.
+        //
+        // Naming is the DEFAULT, deliberately: `mlp`, `mlp.shared_experts`,
+        // `gate.weight`. What is not default is that the dense, shared and
+        // routed FFNs all carry a FUSED `gate_up_proj` rather than separate
+        // gate/up projections — a layout fact the loader probes for rather than
+        // a name TensorNaming could hold.
+        return {AttentionFamily::GqaBsa,
+                QkNormKind::PerHead,
+                true,
+                /*force_normalize_topk=*/true,
+                1e-6f,
+                {},
+                /*gated_shared_expert=*/false,
+                RmsNormScale::OnePlusWeight};
+    }
     if (model_type == "deepseek_v4") {
         return {AttentionFamily::CompressedSparse,
                 QkNormKind::FullWidth,
@@ -361,6 +478,8 @@ const char* to_string(AttentionFamily family) noexcept {
         return "mla+kda";
     case AttentionFamily::GqaGdn:
         return "gqa+gdn";
+    case AttentionFamily::GqaBsa:
+        return "gqa+bsa";
     }
     return "unknown";
 }
@@ -375,6 +494,8 @@ const char* to_string(Activation activation) noexcept {
         return "relu2";
     case Activation::Situ:
         return "situ";
+    case Activation::SwiGluOai:
+        return "swiglu-oai";
     }
     return "unknown";
 }
@@ -419,7 +540,8 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
                 "no adapter for model_type '" + model_type +
                     "'; supported: olmoe, qwen3_moe, qwen2_moe, qwen3_5_moe, "
                     "qwen3_5_moe_text, mixtral, deepseek_v2, deepseek_v3, deepseek_v4, "
-                    "glm_moe_dsa, kimi_k3, kimi_linear"};
+                    "glm_moe_dsa, kimi_k3, kimi_linear, minimax_m3_vl, "
+                    "minimax_m3_vl_text"};
     }
 
     out = ArchIr{};
@@ -447,10 +569,22 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
     if (const auto it = j.find("vision_config"); it != j.end() && it->is_object()) {
         auto& mm = out.modality;
         mm.modality = Modality::VisionText;
-        mm.media_placeholder_token_id =
-            get_or<std::uint32_t>(j, "media_placeholder_token_id", 0);
-        mm.vision_layers = get_or<std::uint32_t>(*it, "vt_num_hidden_layers", 0);
-        mm.vision_hidden = get_or<std::uint32_t>(*it, "vt_hidden_size", 0);
+        // Two spellings, and the `vt_`-prefixed one is tried FIRST so that no
+        // checkpoint already described here changes its arch_hash.
+        //
+        // Kimi-K3 prefixes the tower's dimensions inside `vision_config`;
+        // MiniMax-M3 states them plainly, because its `vision_config` is a whole
+        // nested config object of its own rather than a flat block. Reading only
+        // the prefixed form left the second family reporting a 0-layer,
+        // 0-wide tower — which validates, plans, and tells the operator the
+        // model is text-only when it is not. That is the one thing
+        // `ModalitySpec` exists to prevent.
+        mm.media_placeholder_token_id = get_or<std::uint32_t>(
+            j, "media_placeholder_token_id", get_or<std::uint32_t>(j, "image_token_index", 0));
+        mm.vision_layers = get_or<std::uint32_t>(
+            *it, "vt_num_hidden_layers", get_or<std::uint32_t>(*it, "num_hidden_layers", 0));
+        mm.vision_hidden = get_or<std::uint32_t>(
+            *it, "vt_hidden_size", get_or<std::uint32_t>(*it, "hidden_size", 0));
         mm.vision_patch_size = get_or<std::uint32_t>(*it, "patch_size", 0);
     }
     if (const auto it = j.find("text_config"); it != j.end() && it->is_object()) {
@@ -783,6 +917,168 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
         attn.rope.partial_dim = rotary_dim;
     }
 
+    // -- BSA ------------------------------------------------------------------
+    //
+    // Block-sparse key selection over ordinary GQA. Two spellings reach here and
+    // both are read, because the checkpoint on the Hub and the config class that
+    // loads it disagree about which one is canonical.
+    //
+    //   nested   `sparse_attention_config: {sparse_num_index_heads,
+    //            sparse_index_dim, sparse_block_size, sparse_topk_blocks,
+    //            sparse_local_block, sparse_attention_freq}` -- what MiniMax-M3
+    //            ships.
+    //   flat     `index_n_heads, index_head_dim, index_block_size,
+    //            index_topk_blocks, index_local_blocks, layer_types` -- what
+    //            `MiniMaxM3VLTextConfig.__post_init__` rewrites it into, and
+    //            therefore what a config re-saved by transformers carries.
+    //
+    // The flat form WINS where both exist, for the same reason the nested
+    // `rope_parameters` wins over a top-level `rope_theta`: it is the value the
+    // reference implementation actually executes against. The tiny fixture is
+    // saved by transformers and carries only the flat form; the production
+    // checkpoint carries only the nested one. Reading one spelling would have
+    // meant the fixture and the model it stands for were not the same family.
+    if (attn.family == AttentionFamily::GqaBsa) {
+        auto& b = attn.bsa;
+        const json* sparse = nullptr;
+        if (const auto it = j.find("sparse_attention_config");
+            it != j.end() && it->is_object()) {
+            sparse = &(*it);
+        }
+        const auto nested = [&](const char* key, std::uint32_t fallback) {
+            return sparse != nullptr ? get_or<std::uint32_t>(*sparse, key, fallback) : fallback;
+        };
+
+        b.n_index_heads =
+            get_or<std::uint32_t>(j, "index_n_heads", nested("sparse_num_index_heads", 0));
+        b.index_head_dim =
+            get_or<std::uint32_t>(j, "index_head_dim", nested("sparse_index_dim", 0));
+        b.block_size =
+            get_or<std::uint32_t>(j, "index_block_size", nested("sparse_block_size", 0));
+        b.topk_blocks =
+            get_or<std::uint32_t>(j, "index_topk_blocks", nested("sparse_topk_blocks", 0));
+        // Zero is a REAL value here -- no forced-local block at all -- so it is
+        // not folded into the "absent means broken" check the four above get.
+        b.local_blocks =
+            get_or<std::uint32_t>(j, "index_local_blocks", nested("sparse_local_block", 0));
+
+        if (b.n_index_heads == 0 || b.index_head_dim == 0 || b.block_size == 0 ||
+            b.topk_blocks == 0) {
+            return {StatusCode::InvalidArgument,
+                    "block-sparse attention has a zero dimension (index_n_heads, "
+                    "index_head_dim, index_block_size, index_topk_blocks)"};
+        }
+
+        // Which layers own an indexer. Stated per layer, ZERO-based, and stated
+        // twice -- `layer_types` naming the kind, `sparse_attention_freq` as a
+        // 0/1 mask. Same argument as `Topology::layer_kinds`: a stride
+        // re-derived downstream is a disagreement waiting to happen, and here
+        // there is no stride to re-derive from anyway -- the pattern is "the
+        // first three are dense, the rest are sparse", which no interval
+        // expresses.
+        const auto n_layers = out.topology.n_layers;
+        b.layer_kinds.clear();
+        if (const auto it = j.find("layer_types"); it != j.end() && it->is_array()) {
+            if (it->size() != n_layers) {
+                return {StatusCode::InvalidArgument,
+                        "layer_types has " + std::to_string(it->size()) + " entries for " +
+                            std::to_string(n_layers) + " layers"};
+            }
+            b.layer_kinds.reserve(n_layers);
+            for (const auto& v : *it) {
+                const auto name = v.is_string() ? v.get<std::string>() : std::string{};
+                if (name == "minimax_m3_sparse") {
+                    b.layer_kinds.push_back(IndexerKind::Full);
+                } else if (name == "full_attention") {
+                    b.layer_kinds.push_back(IndexerKind::None);
+                } else {
+                    // Not defaulted, for the reason the GDN adapter gives:
+                    // `sliding_attention` is a real value in this slot for other
+                    // configs, and quietly calling it dense would attend over a
+                    // prefix a windowed layer cannot see.
+                    return {StatusCode::Unsupported,
+                            "layer_types contains unsupported kind '" + name + "'"};
+                }
+            }
+        } else if (sparse != nullptr) {
+            if (const auto freq = sparse->find("sparse_attention_freq");
+                freq != sparse->end() && freq->is_array()) {
+                if (freq->size() != n_layers) {
+                    return {StatusCode::InvalidArgument,
+                            "sparse_attention_freq has " + std::to_string(freq->size()) +
+                                " entries for " + std::to_string(n_layers) + " layers"};
+                }
+                b.layer_kinds.reserve(n_layers);
+                for (const auto& v : *freq) {
+                    b.layer_kinds.push_back(v.is_number() && v.get<double>() != 0.0
+                                                ? IndexerKind::Full
+                                                : IndexerKind::None);
+                }
+            }
+        }
+        if (b.layer_kinds.empty()) {
+            // Refused rather than defaulted either way. "All dense" is a model
+            // that runs and is not this one; "all sparse" binds indexer tensors
+            // the leading layers do not have. Both are decisions the config is
+            // supposed to make, and neither is one to make on its behalf.
+            return {StatusCode::InvalidArgument,
+                    "block-sparse attention declared with neither layer_types nor "
+                    "sparse_attention_config.sparse_attention_freq"};
+        }
+        if (b.n_indexed_layers() == 0) {
+            return {StatusCode::InvalidArgument,
+                    "no layer owns a block-sparse indexer, so the family is plain gqa"};
+        }
+        // One selection per GQA group: query head `h` obeys indexer head
+        // `h / (n_heads / n_index_heads)`. A count that does not divide the query
+        // heads has no such mapping, and the plausible repair -- reusing head 0
+        // for the remainder -- would silently give some heads another group's
+        // blocks.
+        if (attn.n_heads % b.n_index_heads != 0) {
+            return {StatusCode::InvalidArgument,
+                    "n_heads " + std::to_string(attn.n_heads) +
+                        " is not a multiple of index_n_heads " +
+                        std::to_string(b.n_index_heads)};
+        }
+
+        // The rotation, which this family states TWICE and whose two statements
+        // agree -- verified against transformers 5.15.1, where `rope_parameters`
+        // resolves to `{rope_theta: 5e6, partial_rotary_factor: 0.5}` and
+        // `compute_default_rope_parameters` therefore rotates
+        // `int(128 * 0.5) == 64` of each 128-wide head.
+        //
+        // `partial_rotary_factor` is the one the rope reads; `rotary_dim` is a
+        // declared field nothing in the rope path consults. So the factor wins
+        // and `rotary_dim` is a CROSS-CHECK rather than a second source: a config
+        // where they disagree has two opinions about the single quantity that
+        // decides whether this model's long-context behaviour is right, and
+        // picking one would be answering that by coin flip.
+        float rotary_factor = get_or<float>(j, "partial_rotary_factor", 1.0f);
+        if (const auto it = j.find("rope_parameters"); it != j.end() && it->is_object()) {
+            rotary_factor = get_or<float>(*it, "partial_rotary_factor", rotary_factor);
+        }
+        if (rotary_factor <= 0.0f || rotary_factor > 1.0f) {
+            return {StatusCode::InvalidArgument,
+                    "partial_rotary_factor " + std::to_string(rotary_factor) +
+                        " is outside (0, 1]"};
+        }
+        const auto rotary =
+            static_cast<std::uint32_t>(static_cast<float>(attn.head_dim) * rotary_factor);
+        if (rotary == 0 || rotary % 2 != 0) {
+            return {StatusCode::InvalidArgument,
+                    "partial rotary width " + std::to_string(rotary) +
+                        " is not a positive even number of channels"};
+        }
+        if (const auto stated = get_or<std::uint32_t>(j, "rotary_dim", 0);
+            stated != 0 && stated != rotary) {
+            return {StatusCode::InvalidArgument,
+                    "rotary_dim " + std::to_string(stated) + " disagrees with head_dim " +
+                        std::to_string(attn.head_dim) + " x partial_rotary_factor " +
+                        std::to_string(rotary_factor)};
+        }
+        attn.rope.partial_dim = rotary;
+    }
+
     out.block_residual.block_size = get_or<std::uint32_t>(j, "attn_res_block_size", 0);
 
     if (attn.family == AttentionFamily::CompressedSparse) {
@@ -856,7 +1152,16 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
     router.normalize_topk =
         traits.force_normalize_topk || (norm != nullptr && norm->is_boolean() && norm->get<bool>());
     router.routed_scaling_factor = get_or<float>(j, "routed_scaling_factor", 1.0f);
-    router.bias_correction = (get_or<std::string>(j, "topk_method", "greedy") == "noaux_tc");
+    // Two ways of declaring the same mechanism: a per-expert bias that steers
+    // SELECTION and never reaches the retained weights.
+    //
+    // DeepSeek names the algorithm (`topk_method: noaux_tc`); MiniMax-M3 states
+    // the fact (`use_routing_bias: true`) and names no method at all. Reading
+    // only the method leaves `bias_correction` false on a model whose router
+    // adds `e_score_correction_bias` before its top-k -- the tensor is present
+    // and bound, so nothing fails; a different set of experts simply fires.
+    router.bias_correction = (get_or<std::string>(j, "topk_method", "greedy") == "noaux_tc") ||
+                             get_or<bool>(j, "use_routing_bias", false);
     router.n_groups = 1;
     if (const json* g = find_first(j, kExpertGroupKeys))
         router.n_groups = std::max<std::uint32_t>(1, g->get<std::uint32_t>());
@@ -875,6 +1180,8 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
         ffn.activation = Activation::GeGlu;
     } else if (act == "relu2") {
         ffn.activation = Activation::Relu2;
+    } else if (act == "swigluoai") {
+        ffn.activation = Activation::SwiGluOai;
     } else if (act == "situ") {
         ffn.activation = Activation::Situ;
         // `beta or 1.0` upstream: a stated 0 is treated as absent, because
@@ -889,13 +1196,23 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
         return {StatusCode::Unsupported, "unsupported hidden_act '" + act + "'"};
     }
     ffn.has_gate = true;
-    ffn.dense_intermediate = get_or<std::uint32_t>(j, "intermediate_size", 0);
+    // The shared spelling, and the base both widths fall back to.
+    const auto intermediate = get_or<std::uint32_t>(j, "intermediate_size", 0);
+    // A family that states the dense width separately wins; every family that
+    // does not gets `intermediate_size`, exactly as before this key existed --
+    // which is why no existing container's arch_hash moves.
+    ffn.dense_intermediate = intermediate;
+    if (const json* dn = find_first(j, kDenseIntermediateKeys)) {
+        ffn.dense_intermediate = dn->get<std::uint32_t>();
+    }
     if (const json* m = find_first(j, kMoeIntermediateKeys)) {
         ffn.expert_intermediate = m->get<std::uint32_t>();
     } else {
         // Mixtral and OLMoE have no moe_intermediate_size: intermediate_size IS
-        // the expert width.
-        ffn.expert_intermediate = ffn.dense_intermediate;
+        // the expert width. Read from `intermediate` rather than from
+        // `dense_intermediate`, which is the same number for them and is NOT for
+        // a family that states a separate dense width.
+        ffn.expert_intermediate = intermediate;
     }
     // Two families, two ways of saying the same thing.
     //
@@ -905,7 +1222,10 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
     // zero — the tensors bind, the width is wrong, and the logits come out
     // finite and off by ~0.1 mean, which reads as a subtle attention bug rather
     // than a config one.
-    ffn.shared_intermediate = get_or<std::uint32_t>(j, "shared_expert_intermediate_size", 0);
+    ffn.shared_intermediate = 0;
+    if (const json* sw = find_first(j, kSharedIntermediateKeys)) {
+        ffn.shared_intermediate = sw->get<std::uint32_t>();
+    }
     if (ffn.shared_intermediate == 0 && router.n_shared_experts > 0) {
         ffn.shared_intermediate = ffn.expert_intermediate * router.n_shared_experts;
     }
@@ -933,6 +1253,25 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
     ffn.shared_expert_gate = traits.gated_shared_expert && router.n_shared_experts > 0;
     ffn.expert_layout = ExpertLayout::InterleavedGateUpDown;
     ffn.swiglu_limit = get_or<float>(j, "swiglu_limit", 0.0f);
+    // Defaults to 1 -- the value at which the gate half degenerates to SiLU --
+    // rather than to any family's constant. See FfnSpec::swiglu_alpha.
+    ffn.swiglu_alpha = get_or<float>(j, "swiglu_alpha", 1.0f);
+
+    // The activation is FAMILY knowledge for this one, and `hidden_act` is not
+    // merely unhelpful here -- it is actively misleading.
+    //
+    // MiniMax-M3's checkpoint declares `"hidden_act": "swigluoai"`, which the
+    // clause above reads correctly. But `MiniMaxM3VLTextConfig.__post_init__`
+    // OVERWRITES it with `"silu"` and says why: the gate is computed inline from
+    // `swiglu_alpha`/`swiglu_limit`, and `hidden_act` has to stay a real ACT2FN
+    // key. So a config re-saved by transformers -- which is exactly what the
+    // tiny fixture is -- carries "silu" and would select plain SwiGLU: no alpha
+    // inside the sigmoid, no `+1` on the linear half, a different function on
+    // every token of every layer, and a fixture that is not the model it stands
+    // for. Stated here so that both spellings land on the same architecture.
+    if (attn.family == AttentionFamily::GqaBsa) {
+        ffn.activation = Activation::SwiGluOai;
+    }
 
     // Latent MoE: the routed experts live in a NARROWER space than the residual
     // stream. Recorded only when it actually differs, so that a config stating
@@ -982,6 +1321,29 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
             auto& d = out.speculative;
             d.method = SpeculativeMethod::Mtp;
             d.n_layers = n;
+            d.source_declared = true;
+        }
+    }
+
+    // MiniMax-M3 carries one too, and states its size with two keys that mean
+    // different things: `num_mtp_modules` 7 is how many draft heads were
+    // TRAINED, `num_nextn_predict_layers` 1 is how many decoder layers each one
+    // is. The layer count is the one comparable to the field above and to
+    // GLM-5.2's, so it is what `n_layers` records; the module count would make
+    // this head look seven times the size it is.
+    //
+    // Transformers ignores the tensors outright
+    // (`_keys_to_ignore_on_load_unexpected = [r"(^|\.)mtp\..*"]`) and so does
+    // Soma. Recorded anyway rather than silently dropped: an operator can see
+    // `mtp.*` in the checkpoint index, and `present` stays false so nothing
+    // advertises a draft model it cannot run.
+    if (attn.family == AttentionFamily::GqaBsa) {
+        const auto modules = get_or<std::uint32_t>(j, "num_mtp_modules", 0);
+        const auto per_module = get_or<std::uint32_t>(j, "num_nextn_predict_layers", 0);
+        if (modules > 0 || per_module > 0) {
+            auto& d = out.speculative;
+            d.method = SpeculativeMethod::Mtp;
+            d.n_layers = per_module;
             d.source_declared = true;
         }
     }
@@ -1076,6 +1438,60 @@ Status validate_arch_ir(const ArchIr& ir) {
                     "gdn full-attention rotary width " + std::to_string(rot) +
                         " is not an even slice of head_dim " +
                         std::to_string(ir.attention.head_dim)};
+        }
+    }
+    if (ir.attention.family == AttentionFamily::GqaBsa) {
+        const auto& b = ir.attention.bsa;
+        if (b.layer_kinds.size() != ir.topology.n_layers) {
+            return {StatusCode::InvalidArgument,
+                    "bsa layer_kinds has " + std::to_string(b.layer_kinds.size()) +
+                        " entries for " + std::to_string(ir.topology.n_layers) + " layers"};
+        }
+        if (b.n_index_heads == 0 || b.index_head_dim == 0 || b.block_size == 0 ||
+            b.topk_blocks == 0) {
+            return {StatusCode::InvalidArgument, "block-sparse attention is incomplete"};
+        }
+        if (ir.attention.n_heads % b.n_index_heads != 0) {
+            return {StatusCode::InvalidArgument,
+                    "n_heads " + std::to_string(ir.attention.n_heads) +
+                        " is not a multiple of index_n_heads " +
+                        std::to_string(b.n_index_heads)};
+        }
+        // No indexed layer means the model is plain GQA and this family is a
+        // mislabel -- which matters because the mislabel is in the OPTIMISTIC
+        // direction for arithmetic and the pessimistic one for cache: the
+        // planner would charge an indexer key plane nothing writes.
+        if (b.n_indexed_layers() == 0) {
+            return {StatusCode::InvalidArgument, "no layer owns a block-sparse indexer"};
+        }
+        // A local guarantee wider than the selection cannot be satisfied:
+        // upstream forces the local blocks by writing `+inf` into their scores
+        // BEFORE a top-k of `topk_blocks`, so more local blocks than slots would
+        // silently drop the furthest of them rather than growing the selection.
+        if (b.local_blocks > b.topk_blocks) {
+            return {StatusCode::InvalidArgument,
+                    "index_local_blocks " + std::to_string(b.local_blocks) +
+                        " exceeds index_topk_blocks " + std::to_string(b.topk_blocks)};
+        }
+        // The indexer rotates the same slice the main attention does, so the
+        // slice must be real and must fit inside the indexer's own head.
+        const auto rot = ir.attention.rope.partial_dim;
+        if (rot == 0 || rot > ir.attention.head_dim || rot % 2 != 0) {
+            return {StatusCode::InvalidArgument,
+                    "bsa rotary width " + std::to_string(rot) +
+                        " is not an even slice of head_dim " +
+                        std::to_string(ir.attention.head_dim)};
+        }
+        if (rot > b.index_head_dim) {
+            // Upstream slices the rope table as `cos[..., :index_head_dim]`, so a
+            // narrower indexer head would truncate the table mid-frequency and
+            // pair channels with rotations that are not theirs. It runs. It is
+            // not a rotation. Refused rather than transcribed, because no
+            // checkpoint in the wild does this and a fixture that did would be
+            // grading Soma against a reference bug.
+            return {StatusCode::Unsupported,
+                    "index_head_dim " + std::to_string(b.index_head_dim) +
+                        " is narrower than the rotary width " + std::to_string(rot)};
         }
     }
     if (ir.ffn.routed_expert_hidden != 0 && ir.n_moe_layers() > 0 &&
@@ -1331,6 +1747,36 @@ Status compute_arch_hash(const ArchIr& ir, std::string& out_hash) {
               << g.head_v_dim << ':' << g.conv_kernel << ':' << ir.attention.rope.partial_dim
               << ':' << ir.attention.fused_output_gate << ':' << ir.ffn.shared_expert_gate << ':';
         for (const auto kind : g.layer_kinds) canon << (kind == AttnLayerKind::Linear ? 'l' : 'f');
+    }
+    // BSA, on the same conditional terms as DSA, KDA and GDN above: emitted only
+    // for this family, so no existing container's hash moves.
+    //
+    // Every term is load-bearing and none is carried by the shared `|h=|kv=|hd=`
+    // prefix:
+    //
+    //   * the four indexer dimensions, because two configs agreeing on
+    //     everything else and disagreeing on `block_size` select different keys
+    //     and are different models;
+    //   * `local_blocks`, which decides whether a query can see its own block at
+    //     all when the indexer scores it badly;
+    //   * the rotary WIDTH, which the general `|rope=` term omits -- it hashes
+    //     theta and the scaling kind only, so rotating 64 of 128 channels and
+    //     rotating all 128 would otherwise hash identically;
+    //   * the per-layer indexer map, for the reason DSA's is hashed: a KV
+    //     checkpoint written under one split must never replay under another.
+    if (ir.attention.family == AttentionFamily::GqaBsa) {
+        const auto& b = ir.attention.bsa;
+        canon << "|bsa=" << b.n_index_heads << ':' << b.index_head_dim << ':' << b.block_size
+              << ':' << b.topk_blocks << ':' << b.local_blocks << ':'
+              << ir.attention.rope.partial_dim << ':';
+        for (const auto k : b.layer_kinds) canon << (k == IndexerKind::Full ? 'f' : '-');
+    }
+    // The clamped-SwiGLU parameters, on the same conditional terms as `situ`
+    // below. `swiglu_limit` is hashed unconditionally for CompressedSparse
+    // already; this covers the alpha, which nothing else does -- and two
+    // checkpoints differing only in it compute a different gate on every token.
+    if (ir.ffn.activation == Activation::SwiGluOai) {
+        canon << "|oai=" << ir.ffn.swiglu_alpha << ':' << ir.ffn.swiglu_limit;
     }
     // The latent width, and the activation's parameters, are model identity: two
     // checkpoints differing only in `situ_beta` are two different models, and
