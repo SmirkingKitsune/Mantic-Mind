@@ -16,7 +16,9 @@
 namespace soma::arch::kda {
 namespace {
 
-std::size_t align64(std::size_t n) noexcept { return (n + 63u) & ~std::size_t{63u}; }
+std::size_t align64(std::size_t n) noexcept {
+    return (n + 63u) & ~std::size_t{63u};
+}
 
 /// Elements one full-attention layer caches per token.
 ///
@@ -55,8 +57,8 @@ LayerRegion region_for(const ArchIr& arch,
                        std::uint32_t context,
                        std::size_t base) noexcept {
     const auto& kda = arch.attention.kda;
-    const bool linear = layer < kda.layer_kinds.size() &&
-                        kda.layer_kinds[layer] == AttnLayerKind::Linear;
+    const bool linear =
+        layer < kda.layer_kinds.size() && kda.layer_kinds[layer] == AttnLayerKind::Linear;
 
     LayerRegion r;
     std::size_t at = align64(base);
@@ -69,7 +71,7 @@ LayerRegion region_for(const ArchIr& arch,
     } else {
         r.latent = at;
         at = align64(at + static_cast<std::size_t>(latent_floats_per_token(arch)) * context *
-                     sizeof(float));
+                              sizeof(float));
         r.recurrent = at; // zero-length: this layer carries no recurrent state
         r.conv = at;
     }
@@ -174,7 +176,9 @@ std::uint64_t resident_weight_bytes(const ArchIr& arch,
            n_linear * linear_layer_weight_bytes(arch, sizer);
 }
 
-inline float sigmoidf(float x) noexcept { return 1.0f / (1.0f + std::exp(-x)); }
+inline float sigmoidf(float x) noexcept {
+    return 1.0f / (1.0f + std::exp(-x));
+}
 
 /// log(1 + e^x), guarded. The naive form overflows for large x and loses the
 /// whole value to rounding for very negative x; both are reachable here because
@@ -262,8 +266,7 @@ void gate(const ArchIr& arch,
             // Unbounded: `-exp(A_log) * softplus(x)` can decay arbitrarily hard.
             // Substituting one for the other keeps every shape and every sign
             // and changes how long the model remembers.
-            out[i] = k.has_gate_bound ? k.gate_lower_bound * sigmoidf(a * x)
-                                      : -a * softplusf(x);
+            out[i] = k.has_gate_bound ? k.gate_lower_bound * sigmoidf(a * x) : -a * softplusf(x);
         }
     }
 }
@@ -285,11 +288,13 @@ void short_conv(std::uint32_t width,
         // runs oldest-first and the last tap is the newest input. Reversing it
         // is a different filter that is equally finite.
         float acc = bias != nullptr ? bias[c] : 0.0f;
-        for (std::uint32_t j = 0; j < carried; ++j) acc += w[j] * win[j];
+        for (std::uint32_t j = 0; j < carried; ++j)
+            acc += w[j] * win[j];
         acc += w[carried] * x[c];
         // Shift after accumulating, never before: the window must hold the
         // inputs BEFORE this token while it is being read.
-        for (std::uint32_t j = 0; j + 1 < carried; ++j) win[j] = win[j + 1];
+        for (std::uint32_t j = 0; j + 1 < carried; ++j)
+            win[j] = win[j + 1];
         if (carried > 0) win[carried - 1] = x[c];
         out[c] = acc * sigmoidf(acc); // SiLU
     }
@@ -338,7 +343,8 @@ void step(const ArchIr& arch,
         // Fused into one pass over S, so the state is read once. `pred` is
         // accumulated against the decayed values as they are written.
         float* const pred = scratch;
-        for (std::uint32_t j = 0; j < D; ++j) pred[j] = 0.0f;
+        for (std::uint32_t j = 0; j < D; ++j)
+            pred[j] = 0.0f;
         for (std::uint32_t i = 0; i < D; ++i) {
             const float decay = std::exp(gh[i]);
             const float ki = kh[i] * kn;
@@ -353,18 +359,21 @@ void step(const ArchIr& arch,
             const float bk = beta * kh[i] * kn;
             if (bk == 0.0f) continue;
             float* row = S + static_cast<std::size_t>(i) * D;
-            for (std::uint32_t j = 0; j < D; ++j) row[j] += bk * (vh[j] - pred[j]);
+            for (std::uint32_t j = 0; j < D; ++j)
+                row[j] += bk * (vh[j] - pred[j]);
         }
         // 4. Read out from the UPDATED state. Reading before the update loses
         //    the current token entirely — and only for the current token, so it
         //    survives every aggregate check and fails on exact-match ones.
         float* const oh = out + off;
-        for (std::uint32_t j = 0; j < D; ++j) oh[j] = 0.0f;
+        for (std::uint32_t j = 0; j < D; ++j)
+            oh[j] = 0.0f;
         for (std::uint32_t i = 0; i < D; ++i) {
             const float qi = qh[i] * qn * scale;
             if (qi == 0.0f) continue;
             const float* row = S + static_cast<std::size_t>(i) * D;
-            for (std::uint32_t j = 0; j < D; ++j) oh[j] += qi * row[j];
+            for (std::uint32_t j = 0; j < D; ++j)
+                oh[j] += qi * row[j];
         }
     }
 }
@@ -382,7 +391,8 @@ void gated_rmsnorm(const ArchIr& arch,
         // Per HEAD, not over the flattened projection: the norm weight is
         // [head_dim]. Normalising across all heads together would couple them.
         float ss = 0.0f;
-        for (std::uint32_t i = 0; i < D; ++i) ss += x[off + i] * x[off + i];
+        for (std::uint32_t i = 0; i < D; ++i)
+            ss += x[off + i] * x[off + i];
         const float inv = 1.0f / std::sqrt(ss / static_cast<float>(D) + eps);
         for (std::uint32_t i = 0; i < D; ++i) {
             // normalize -> weight -> gate. `fla` gates AFTER the norm; Mamba's
@@ -410,7 +420,8 @@ StatusCode bind_res_score(const soma::LayerBindCtx& ctx,
     }
     if (nw.size() < d || pw.size() < d) return StatusCode::InvalidArgument;
     out.resize(d);
-    for (std::uint32_t i = 0; i < d; ++i) out[i] = nw[i] * pw[i];
+    for (std::uint32_t i = 0; i < d; ++i)
+        out[i] = nw[i] * pw[i];
     return StatusCode::Ok;
 }
 
@@ -742,7 +753,6 @@ StatusCode f32_attention_kv(const ArchIr& arch,
     return StatusCode::Ok;
 }
 
-
 // ── block residual ───────────────────────────────────────────────────────────
 //
 // Every `block_size`-th layer pushes a copy of the residual stream onto a
@@ -759,9 +769,7 @@ StatusCode f32_attention_kv(const ArchIr& arch,
 
 namespace {
 
-BlockResidualState& state_for(const ArchIr& arch,
-                              std::uint32_t n_tokens,
-                              soma::F32Workspace& ws) {
+BlockResidualState& state_for(const ArchIr& arch, std::uint32_t n_tokens, soma::F32Workspace& ws) {
     auto* st = ws.arch_state.as<BlockResidualState>();
     if (st == nullptr) {
         st = new BlockResidualState();
@@ -787,11 +795,11 @@ void mix_block_residual(const BlockResidualState& st,
                         float* out) noexcept {
     const auto d = st.width;
     const auto B = st.n_blocks;
-    const auto max_blocks = st.stack.empty() || st.n_tokens == 0
-                                ? 0u
-                                : static_cast<std::uint32_t>(st.stack.size() /
-                                                             (static_cast<std::size_t>(st.n_tokens) *
-                                                              d));
+    const auto max_blocks =
+        st.stack.empty() || st.n_tokens == 0
+            ? 0u
+            : static_cast<std::uint32_t>(st.stack.size() /
+                                         (static_cast<std::size_t>(st.n_tokens) * d));
     std::vector<float> scores(static_cast<std::size_t>(B) + 1);
     // ALIAS-SAFE by construction, because one caller genuinely aliases: the
     // final mix passes `hidden` as both the prefix candidate and the output.
@@ -815,10 +823,12 @@ void mix_block_residual(const BlockResidualState& st,
         for (std::uint32_t ci = 0; ci <= B; ++ci) {
             const float* v = candidate(ci);
             float ss = 0.0f;
-            for (std::uint32_t i = 0; i < d; ++i) ss += v[i] * v[i];
+            for (std::uint32_t i = 0; i < d; ++i)
+                ss += v[i] * v[i];
             const float inv = 1.0f / std::sqrt(ss / static_cast<float>(d) + eps);
             float acc = 0.0f;
-            for (std::uint32_t i = 0; i < d; ++i) acc += v[i] * inv * score[i];
+            for (std::uint32_t i = 0; i < d; ++i)
+                acc += v[i] * inv * score[i];
             scores[ci] = acc;
             if (acc > best) best = acc;
         }
@@ -833,7 +843,8 @@ void mix_block_residual(const BlockResidualState& st,
             // The RAW candidate, not the normalized one used for scoring.
             const float* v = candidate(ci);
             const float p = scores[ci] * norm;
-            for (std::uint32_t i = 0; i < d; ++i) blend[i] += p * v[i];
+            for (std::uint32_t i = 0; i < d; ++i)
+                blend[i] += p * v[i];
         }
         // Written only once every candidate has been read.
         std::copy_n(blend.data(), d, out + static_cast<std::size_t>(tok) * d);
@@ -855,7 +866,8 @@ StatusCode f32_bind_model(const ArchIr& arch,
     }
     if (nw.size() < d || pw.size() < d) return StatusCode::InvalidArgument;
     m->out_res_score.resize(d);
-    for (std::uint32_t i = 0; i < d; ++i) m->out_res_score[i] = nw[i] * pw[i];
+    for (std::uint32_t i = 0; i < d; ++i)
+        m->out_res_score[i] = nw[i] * pw[i];
     return StatusCode::Ok;
 }
 
@@ -926,12 +938,14 @@ StatusCode f32_merge_attention(const ArchIr& arch,
     const auto d = arch.topology.d_model;
     const auto span = static_cast<std::size_t>(n_tokens) * d;
     if (arch.block_residual.block_size == 0) {
-        for (std::size_t i = 0; i < span; ++i) hidden[i] += branch[i];
+        for (std::size_t i = 0; i < span; ++i)
+            hidden[i] += branch[i];
         return StatusCode::Ok;
     }
     auto& st = state_for(arch, n_tokens, ws);
     if (st.prefix_valid) {
-        for (std::size_t i = 0; i < span; ++i) st.prefix[i] += branch[i];
+        for (std::size_t i = 0; i < span; ++i)
+            st.prefix[i] += branch[i];
     } else {
         std::copy_n(branch, span, st.prefix.begin());
         st.prefix_valid = true;
@@ -965,11 +979,13 @@ StatusCode f32_merge_ffn(const ArchIr& arch,
     const auto d = arch.topology.d_model;
     const auto span = static_cast<std::size_t>(n_tokens) * d;
     if (arch.block_residual.block_size == 0) {
-        for (std::size_t i = 0; i < span; ++i) hidden[i] += branch[i];
+        for (std::size_t i = 0; i < span; ++i)
+            hidden[i] += branch[i];
         return StatusCode::Ok;
     }
     auto& st = state_for(arch, n_tokens, ws);
-    for (std::size_t i = 0; i < span; ++i) st.prefix[i] += branch[i];
+    for (std::size_t i = 0; i < span; ++i)
+        st.prefix[i] += branch[i];
     std::copy_n(st.prefix.data(), span, hidden);
     return StatusCode::Ok;
 }

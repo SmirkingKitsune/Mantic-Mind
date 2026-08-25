@@ -113,8 +113,8 @@ std::string official_json(const ordered_json& value) {
         bool first = true;
         for (auto it = value.begin(); it != value.end(); ++it) {
             if (!first) out += ", ";
-            out += ordered_json(it.key()).dump(
-                -1, ' ', false, ordered_json::error_handler_t::strict);
+            out +=
+                ordered_json(it.key()).dump(-1, ' ', false, ordered_json::error_handler_t::strict);
             out += ": ";
             out += official_json(*it);
             first = false;
@@ -183,9 +183,7 @@ Status render_call(const ordered_json& call, std::string& out) {
     return {};
 }
 
-Status preprocess(const ordered_json& request,
-                  ordered_json& messages,
-                  bool include_tools) {
+Status preprocess(const ordered_json& request, ordered_json& messages, bool include_tools) {
     messages = request.at("messages");
     if (messages.empty()) return bad("messages[] must not be empty");
 
@@ -193,8 +191,8 @@ Status preprocess(const ordered_json& request,
                             !request["tools"].is_null() && !request["tools"].empty();
     if (have_tools && !request["tools"].is_array()) return bad("tools must be an array");
 
-    const bool have_format = request.contains("response_format") &&
-                             !request["response_format"].is_null();
+    const bool have_format =
+        request.contains("response_format") && !request["response_format"].is_null();
     if (have_tools || have_format) {
         std::size_t target = messages.size();
         for (std::size_t i = 0; i < messages.size(); ++i) {
@@ -213,8 +211,7 @@ Status preprocess(const ordered_json& request,
             }
         }
         if (target == messages.size()) {
-            messages.insert(
-                messages.begin(), ordered_json{{"role", "system"}, {"content", ""}});
+            messages.insert(messages.begin(), ordered_json{{"role", "system"}, {"content", ""}});
             target = 0;
         }
         if (have_tools) messages[target]["tools"] = request["tools"];
@@ -237,8 +234,7 @@ Status preprocess(const ordered_json& request,
                 merged.back()["content_blocks"].push_back(std::move(block));
             } else {
                 merged.push_back(ordered_json{
-                    {"role", "user"},
-                    {"content_blocks", ordered_json::array({std::move(block)})}});
+                    {"role", "user"}, {"content_blocks", ordered_json::array({std::move(block)})}});
             }
             continue;
         }
@@ -285,11 +281,11 @@ Status preprocess(const ordered_json& request,
                 tool_results.begin(),
                 tool_results.end(),
                 [&](const ordered_json& a, const ordered_json& b) {
-                const auto ai = call_order.find(a.value("tool_use_id", std::string{}));
-                const auto bi = call_order.find(b.value("tool_use_id", std::string{}));
-                const auto av = ai == call_order.end() ? call_order.size() : ai->second;
-                const auto bv = bi == call_order.end() ? call_order.size() : bi->second;
-                return av < bv;
+                    const auto ai = call_order.find(a.value("tool_use_id", std::string{}));
+                    const auto bi = call_order.find(b.value("tool_use_id", std::string{}));
+                    const auto av = ai == call_order.end() ? call_order.size() : ai->second;
+                    const auto bv = bi == call_order.end() ? call_order.size() : bi->second;
+                    return av < bv;
                 });
             std::size_t result = 0;
             for (auto& block : blocks) {
@@ -302,10 +298,10 @@ Status preprocess(const ordered_json& request,
     return {};
 }
 
-Status encode(const ordered_json& request,
-              std::string& prompt,
-              PromptCodecState& state) noexcept {
+Status
+encode(std::string_view request_json, std::string& prompt, PromptCodecState& state) noexcept {
     try {
+        const auto request = ordered_json::parse(request_json);
         if (!request.contains("messages") || !request["messages"].is_array()) {
             return bad("messages[] is required");
         }
@@ -313,10 +309,12 @@ Status encode(const ordered_json& request,
         bool include_tools = true;
         if (request.contains("tool_choice")) {
             if (!request["tool_choice"].is_string()) {
-                return bad("tool_choice required/named forcing is not defined by the model protocol");
+                return bad(
+                    "tool_choice required/named forcing is not defined by the model protocol");
             }
             const auto choice = request["tool_choice"].get<std::string>();
-            if (choice == "none") include_tools = false;
+            if (choice == "none")
+                include_tools = false;
             else if (choice != "auto") {
                 return bad("tool_choice must be omitted, 'auto', or 'none'");
             }
@@ -365,8 +363,9 @@ Status encode(const ordered_json& request,
                     prompt += "\n\n" + render_tools(msg["tools"]);
                 }
                 if (msg.contains("response_format") && !msg["response_format"].is_null()) {
-                    prompt += "\n\n## Response Format:\n\nYou MUST strictly adhere to the following "
-                              "schema to reply:\n";
+                    prompt +=
+                        "\n\n## Response Format:\n\nYou MUST strictly adhere to the following "
+                        "schema to reply:\n";
                     prompt += official_json(msg["response_format"]);
                 }
             } else if (role == "developer") {
@@ -377,8 +376,9 @@ Status encode(const ordered_json& request,
                     prompt += "\n\n" + render_tools(msg["tools"]);
                 }
                 if (msg.contains("response_format") && !msg["response_format"].is_null()) {
-                    prompt += "\n\n## Response Format:\n\nYou MUST strictly adhere to the following "
-                              "schema to reply:\n";
+                    prompt +=
+                        "\n\n## Response Format:\n\nYou MUST strictly adhere to the following "
+                        "schema to reply:\n";
                     prompt += official_json(msg["response_format"]);
                 }
             } else if (role == "user") {
@@ -457,12 +457,15 @@ std::string call_id(std::string_view completion, std::size_t ordinal) {
     SHA256(reinterpret_cast<const unsigned char*>(material.data()), material.size(), digest.data());
     std::ostringstream out;
     out << "call_" << std::hex << std::setfill('0');
-    for (std::size_t i = 0; i < 12; ++i) out << std::setw(2) << unsigned(digest[i]);
+    for (std::size_t i = 0; i < 12; ++i)
+        out << std::setw(2) << unsigned(digest[i]);
     return out.str();
 }
 
-Status parse_calls(std::string_view text, std::string_view completion, json& calls) {
-    calls = json::array();
+Status parse_calls(std::string_view text,
+                   std::string_view completion,
+                   std::vector<PromptToolCall>& calls) {
+    calls.clear();
     std::size_t pos = 0;
     while (pos < text.size()) {
         if (text.substr(pos, kToolEnd.size()) == kToolEnd) {
@@ -516,18 +519,14 @@ Status parse_calls(std::string_view text, std::string_view completion, json& cal
         pos += kInvokeEnd.size();
         if (text.substr(pos, 1) == "\n") ++pos;
 
-        json call;
-        call["id"] = call_id(completion, calls.size());
-        call["type"] = "function";
-        call["function"] = json{{"name", name}, {"arguments", official_json(args)}};
-        calls.push_back(std::move(call));
+        calls.push_back(
+            PromptToolCall{call_id(completion, calls.size()), name, official_json(args)});
     }
     return protocol("missing tool_calls closing element");
 }
 
 bool contains_reserved(std::string_view text) {
-    return text.find(kBos) != std::string_view::npos ||
-           text.find(kEos) != std::string_view::npos ||
+    return text.find(kBos) != std::string_view::npos || text.find(kEos) != std::string_view::npos ||
            text.find(kThinkOpen) != std::string_view::npos ||
            text.find(kThinkClose) != std::string_view::npos ||
            text.find(kDsml) != std::string_view::npos;
@@ -537,23 +536,20 @@ Status parse(std::string_view completion,
              const PromptCodecState& state,
              bool final,
              bool ended_by_stop,
-             json& message) noexcept {
+             PromptMessage& message) noexcept {
     try {
-        message = json{{"role", "assistant"},
-                       {"content", ""},
-                       {"reasoning_content", ""},
-                       {"tool_calls", json::array()}};
+        message = {};
         std::size_t pos = 0;
         if (state.mode) {
             const auto close = completion.find(kThinkClose);
             if (close == std::string_view::npos) {
                 if (final) return protocol("thinking completion is missing </think>");
-                message["reasoning_content"] = stable_before_marker(completion, kThinkClose);
+                message.reasoning_content = stable_before_marker(completion, kThinkClose);
                 return {};
             }
             const auto reasoning = completion.substr(0, close);
             if (contains_reserved(reasoning)) return protocol("special token in reasoning content");
-            message["reasoning_content"] = reasoning;
+            message.reasoning_content = reasoning;
             pos = close + kThinkClose.size();
         }
 
@@ -562,9 +558,9 @@ Status parse(std::string_view completion,
         if (tool == std::string_view::npos) {
             if (final) {
                 if (contains_reserved(body)) return protocol("unexpected special token in content");
-                message["content"] = body;
+                message.content = body;
             } else {
-                message["content"] = stable_before_marker(body, kToolStart);
+                message.content = stable_before_marker(body, kToolStart);
             }
             (void)ended_by_stop;
             return {};
@@ -572,7 +568,7 @@ Status parse(std::string_view completion,
 
         const auto content = body.substr(0, tool);
         if (contains_reserved(content)) return protocol("special token in content");
-        message["content"] = content;
+        message.content = content;
         if (!final) {
             // Tool calls are emitted only after the complete block validates.
             // This prevents a malformed invocation from becoming a fabricated
@@ -581,9 +577,9 @@ Status parse(std::string_view completion,
             if (rest.find(kToolEnd) == std::string_view::npos) return {};
         }
         const auto call_text = body.substr(tool + kToolStart.size());
-        if (auto st = parse_calls(call_text, completion, message["tool_calls"]); !st.ok()) {
+        if (auto st = parse_calls(call_text, completion, message.tool_calls); !st.ok()) {
             if (!final) {
-                message["tool_calls"] = json::array();
+                message.tool_calls.clear();
                 return {};
             }
             return st;

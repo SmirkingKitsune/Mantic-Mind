@@ -150,8 +150,7 @@ std::vector<LayerKind> resolve_layer_kinds(const json& j, std::uint32_t n_layers
         // answer for a layer the config did not describe is worse than
         // inheriting the default the rest of this function assumes.
         const bool masked_off = i < freq_mask.size() && freq_mask[i] == 0u;
-        if (only_mlp || masked_off || (step > 1 && i % step != 0) ||
-            (freq > 1 && i % freq != 0)) {
+        if (only_mlp || masked_off || (step > 1 && i % step != 0) || (freq > 1 && i % freq != 0)) {
             kinds[i] = LayerKind::Dense;
         }
     }
@@ -278,7 +277,7 @@ TensorNaming compressed_sparse_naming() {
 TensorNaming kimi_naming() {
     TensorNaming n;
     n.moe_block = "block_sparse_moe";
-    n.dense_block = "mlp";                            // KimiMLP: gate/up/down
+    n.dense_block = "mlp";                              // KimiMLP: gate/up/down
     n.shared_block = "block_sparse_moe.shared_experts"; // KimiMLP too
     n.router = "gate.weight";
     n.expert_gate = "w1.weight"; // KimiBlockSparseMLP: w1 = gate
@@ -609,8 +608,7 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
     out.topology.vocab_size = get_or<std::uint32_t>(j, "vocab_size", 0);
     out.topology.first_k_dense = get_or<std::uint32_t>(j, "first_k_dense_replace", 0);
     out.topology.tie_word_embeddings = get_or<bool>(j, "tie_word_embeddings", false);
-    out.topology.max_position_embeddings =
-        get_or<std::uint32_t>(j, "max_position_embeddings", 0);
+    out.topology.max_position_embeddings = get_or<std::uint32_t>(j, "max_position_embeddings", 0);
     if (const auto it = j.find("eos_token_id"); it != j.end() && !it->is_null()) {
         if (it->is_array()) {
             for (const auto& token : *it) {
@@ -941,8 +939,7 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
     if (attn.family == AttentionFamily::GqaBsa) {
         auto& b = attn.bsa;
         const json* sparse = nullptr;
-        if (const auto it = j.find("sparse_attention_config");
-            it != j.end() && it->is_object()) {
+        if (const auto it = j.find("sparse_attention_config"); it != j.end() && it->is_object()) {
             sparse = &(*it);
         }
         const auto nested = [&](const char* key, std::uint32_t fallback) {
@@ -953,8 +950,7 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
             get_or<std::uint32_t>(j, "index_n_heads", nested("sparse_num_index_heads", 0));
         b.index_head_dim =
             get_or<std::uint32_t>(j, "index_head_dim", nested("sparse_index_dim", 0));
-        b.block_size =
-            get_or<std::uint32_t>(j, "index_block_size", nested("sparse_block_size", 0));
+        b.block_size = get_or<std::uint32_t>(j, "index_block_size", nested("sparse_block_size", 0));
         b.topk_blocks =
             get_or<std::uint32_t>(j, "index_topk_blocks", nested("sparse_topk_blocks", 0));
         // Zero is a REAL value here -- no forced-local block at all -- so it is
@@ -1037,8 +1033,7 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
         if (attn.n_heads % b.n_index_heads != 0) {
             return {StatusCode::InvalidArgument,
                     "n_heads " + std::to_string(attn.n_heads) +
-                        " is not a multiple of index_n_heads " +
-                        std::to_string(b.n_index_heads)};
+                        " is not a multiple of index_n_heads " + std::to_string(b.n_index_heads)};
         }
 
         // The rotation, which this family states TWICE and whose two statements
@@ -1091,10 +1086,8 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
         c.index_head_dim = get_or<std::uint32_t>(j, "index_head_dim", 0);
         c.index_topk = get_or<std::uint32_t>(j, "index_topk", 0);
         c.compress_rope_theta = get_or<float>(j, "compress_rope_theta", 10000.0f);
-        c.semantic_fp8_quant_dequant =
-            get_or<bool>(j, "semantic_fp8_quant_dequant", true);
-        c.semantic_fp4_quant_dequant =
-            get_or<bool>(j, "semantic_fp4_quant_dequant", true);
+        c.semantic_fp8_quant_dequant = get_or<bool>(j, "semantic_fp8_quant_dequant", true);
+        c.semantic_fp4_quant_dequant = get_or<bool>(j, "semantic_fp4_quant_dequant", true);
         if (const auto it = j.find("compress_ratios"); it != j.end() && it->is_array()) {
             c.compress_ratios.reserve(out.topology.n_layers);
             for (std::size_t i = 0; i < it->size() && i < out.topology.n_layers; ++i) {
@@ -1144,10 +1137,10 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
     if (const json* k = find_first(j, kTopKKeys)) router.top_k = k->get<std::uint32_t>();
     const json* score = find_first(j, kScoringKeys);
     const auto scoring = (score != nullptr && score->is_string()) ? score->get<std::string>()
-                                                                 : std::string("softmax");
-    router.score_fn = scoring == "sigmoid"       ? ScoreFn::Sigmoid
+                                                                  : std::string("softmax");
+    router.score_fn = scoring == "sigmoid"        ? ScoreFn::Sigmoid
                       : scoring == "sqrtsoftplus" ? ScoreFn::SqrtSoftplus
-                                                   : ScoreFn::Softmax;
+                                                  : ScoreFn::Softmax;
     const json* norm = find_first(j, kNormTopkKeys);
     router.normalize_topk =
         traits.force_normalize_topk || (norm != nullptr && norm->is_boolean() && norm->get<bool>());
@@ -1297,9 +1290,9 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
         d.trained_block_size = get_or<std::uint32_t>(j, "dspark_block_size", 0);
         d.noise_token_id = get_or<TokenId>(j, "dspark_noise_token_id", 0);
         d.markov_rank = get_or<std::uint32_t>(j, "dspark_markov_rank", 0);
-        if (const auto it = j.find("dspark_target_layer_ids");
-            it != j.end() && it->is_array()) {
-            for (const auto& layer : *it) d.target_layer_ids.push_back(layer.get<LayerIndex>());
+        if (const auto it = j.find("dspark_target_layer_ids"); it != j.end() && it->is_array()) {
+            for (const auto& layer : *it)
+                d.target_layer_ids.push_back(layer.get<LayerIndex>());
         }
         d.n_layers = static_cast<std::uint32_t>(d.target_layer_ids.size());
         d.source_declared = d.n_layers > 0 || d.trained_block_size > 0 || d.markov_rank > 0;
@@ -1356,11 +1349,9 @@ Status adapt_hf_config(std::string_view text, ArchIr& out) {
 }
 
 Status validate_arch_ir(const ArchIr& ir) {
-    if (ir.schema_version != kArchIrSchemaVersion &&
-        ir.schema_version != kArchIrSchemaVersionV2) {
+    if (ir.schema_version != kArchIrSchemaVersion && ir.schema_version != kArchIrSchemaVersionV2) {
         return {StatusCode::VersionMismatch,
-                "arch IR schema " + std::to_string(ir.schema_version) +
-                    " is not supported"};
+                "arch IR schema " + std::to_string(ir.schema_version) + " is not supported"};
     }
     if (ir.topology.n_layers == 0 || ir.topology.d_model == 0 || ir.topology.vocab_size == 0) {
         return {StatusCode::InvalidArgument, "topology has a zero dimension"};
@@ -1395,8 +1386,7 @@ Status validate_arch_ir(const ArchIr& ir) {
         // would report as a free context and the checkpoint reader as an empty
         // cache. Both are wrong in the optimistic direction.
         if (k.n_full_layers() == 0) {
-            return {StatusCode::InvalidArgument,
-                    "hybrid stack has no full-attention layer"};
+            return {StatusCode::InvalidArgument, "hybrid stack has no full-attention layer"};
         }
         // The full-attention layers are MLA, so their dimensions must be real.
         // A hybrid that reached here with a zero kv_lora_rank would size a
@@ -1426,8 +1416,7 @@ Status validate_arch_ir(const ArchIr& ir) {
         // Same reason as the hybrid above: no full-attention layer means no KV
         // cache anywhere, and the planner would report the context as free.
         if (g.n_full_layers() == 0) {
-            return {StatusCode::InvalidArgument,
-                    "hybrid stack has no full-attention layer"};
+            return {StatusCode::InvalidArgument, "hybrid stack has no full-attention layer"};
         }
         // The full-attention layers are GQA, so the rotation must be a real
         // even-width slice of a real head. A zero here would rotate nothing on
@@ -1454,8 +1443,7 @@ Status validate_arch_ir(const ArchIr& ir) {
         if (ir.attention.n_heads % b.n_index_heads != 0) {
             return {StatusCode::InvalidArgument,
                     "n_heads " + std::to_string(ir.attention.n_heads) +
-                        " is not a multiple of index_n_heads " +
-                        std::to_string(b.n_index_heads)};
+                        " is not a multiple of index_n_heads " + std::to_string(b.n_index_heads)};
         }
         // No indexed layer means the model is plain GQA and this family is a
         // mislabel -- which matters because the mislabel is in the OPTIMISTIC
@@ -1514,9 +1502,9 @@ Status validate_arch_ir(const ArchIr& ir) {
                         " entries for " + std::to_string(ir.topology.n_layers) + " layers"};
         }
         if (c.q_lora_rank == 0 || c.rope_head_dim == 0 || c.rope_head_dim > ir.attention.head_dim ||
-            c.o_groups == 0 || ir.attention.n_heads % c.o_groups != 0 ||
-            c.o_lora_rank == 0 || c.index_n_heads == 0 || c.index_head_dim == 0 ||
-            c.index_topk == 0 || ir.attention.sliding_window == 0) {
+            c.o_groups == 0 || ir.attention.n_heads % c.o_groups != 0 || c.o_lora_rank == 0 ||
+            c.index_n_heads == 0 || c.index_head_dim == 0 || c.index_topk == 0 ||
+            ir.attention.sliding_window == 0) {
             return {StatusCode::InvalidArgument, "compressed sparse attention is incomplete"};
         }
         for (const auto ratio : c.compress_ratios) {
@@ -1669,8 +1657,7 @@ Status apply_container_quant(std::string_view meta_json, ArchIr& io) {
         d.routed_bytes = j.value("dspark_total_expert_bytes", std::uint64_t{0});
         d.resident_bytes = j.value("dspark_resident_bytes", std::uint64_t{0});
         d.expert_bytes = j.value("dspark_expert_bytes", std::uint64_t{0});
-        d.kv_bytes_per_sequence =
-            j.value("dspark_kv_bytes_per_sequence", std::uint64_t{0});
+        d.kv_bytes_per_sequence = j.value("dspark_kv_bytes_per_sequence", std::uint64_t{0});
         d.profiled_speedup = j.value("dspark_profiled_speedup", 0.0f);
         set(io.quantization.draft_head,
             j.value("dtype_dspark", j.value("dtype_dense", std::string{})));
@@ -1727,7 +1714,8 @@ Status compute_arch_hash(const ArchIr& ir, std::string& out_hash) {
         canon << "|kda=" << k.n_heads << ':' << k.head_dim << ':' << k.conv_kernel << ':'
               << k.has_gate_bound << ':' << k.gate_lower_bound << ':' << k.full_rank_gate << ':'
               << ir.attention.mla.nope << ':' << ir.attention.mla.output_gate << ':';
-        for (const auto kind : k.layer_kinds) canon << (kind == AttnLayerKind::Linear ? 'l' : 'f');
+        for (const auto kind : k.layer_kinds)
+            canon << (kind == AttnLayerKind::Linear ? 'l' : 'f');
         canon << "|blkres=" << ir.block_residual.block_size;
     }
     // GDN, on the same conditional terms and for the same reason. Three of these
@@ -1744,9 +1732,10 @@ Status compute_arch_hash(const ArchIr& ir, std::string& out_hash) {
     if (ir.attention.family == AttentionFamily::GqaGdn) {
         const auto& g = ir.attention.gdn;
         canon << "|gdn=" << g.n_k_heads << ':' << g.n_v_heads << ':' << g.head_k_dim << ':'
-              << g.head_v_dim << ':' << g.conv_kernel << ':' << ir.attention.rope.partial_dim
-              << ':' << ir.attention.fused_output_gate << ':' << ir.ffn.shared_expert_gate << ':';
-        for (const auto kind : g.layer_kinds) canon << (kind == AttnLayerKind::Linear ? 'l' : 'f');
+              << g.head_v_dim << ':' << g.conv_kernel << ':' << ir.attention.rope.partial_dim << ':'
+              << ir.attention.fused_output_gate << ':' << ir.ffn.shared_expert_gate << ':';
+        for (const auto kind : g.layer_kinds)
+            canon << (kind == AttnLayerKind::Linear ? 'l' : 'f');
     }
     // BSA, on the same conditional terms as DSA, KDA and GDN above: emitted only
     // for this family, so no existing container's hash moves.
@@ -1766,10 +1755,11 @@ Status compute_arch_hash(const ArchIr& ir, std::string& out_hash) {
     //     checkpoint written under one split must never replay under another.
     if (ir.attention.family == AttentionFamily::GqaBsa) {
         const auto& b = ir.attention.bsa;
-        canon << "|bsa=" << b.n_index_heads << ':' << b.index_head_dim << ':' << b.block_size
-              << ':' << b.topk_blocks << ':' << b.local_blocks << ':'
-              << ir.attention.rope.partial_dim << ':';
-        for (const auto k : b.layer_kinds) canon << (k == IndexerKind::Full ? 'f' : '-');
+        canon << "|bsa=" << b.n_index_heads << ':' << b.index_head_dim << ':' << b.block_size << ':'
+              << b.topk_blocks << ':' << b.local_blocks << ':' << ir.attention.rope.partial_dim
+              << ':';
+        for (const auto k : b.layer_kinds)
+            canon << (k == IndexerKind::Full ? 'f' : '-');
     }
     // The clamped-SwiGLU parameters, on the same conditional terms as `situ`
     // below. `swiglu_limit` is hashed unconditionally for CompressedSparse
@@ -1803,15 +1793,17 @@ Status compute_arch_hash(const ArchIr& ir, std::string& out_hash) {
         const auto& c = ir.attention.compressed;
         canon << "|csa=" << c.q_lora_rank << ':' << c.rope_head_dim << ':' << c.o_groups << ':'
               << c.o_lora_rank << ':' << c.index_n_heads << ':' << c.index_head_dim << ':'
-              << c.index_topk << ':' << c.compress_rope_theta << ':'
-              << c.semantic_fp8_quant_dequant << ':' << c.semantic_fp4_quant_dequant << ':';
-        for (const auto ratio : c.compress_ratios) canon << ratio << ',';
+              << c.index_topk << ':' << c.compress_rope_theta << ':' << c.semantic_fp8_quant_dequant
+              << ':' << c.semantic_fp4_quant_dequant << ':';
+        for (const auto ratio : c.compress_ratios)
+            canon << ratio << ',';
         canon << "|hc=" << ir.hyper_connections.multiplier << ':'
               << ir.hyper_connections.sinkhorn_iters << ':' << ir.hyper_connections.eps
               << "|hash=" << ir.router.n_hash_layers << "|limit=" << ir.ffn.swiglu_limit
               << "|maxctx=" << ir.topology.max_position_embeddings;
         canon << "|eos=";
-        for (const auto token : ir.topology.eos_token_ids) canon << token << ',';
+        for (const auto token : ir.topology.eos_token_ids)
+            canon << token << ',';
     }
 
     // Conditional for backwards compatibility: merely adding DSpark support to
@@ -1819,11 +1811,12 @@ Status compute_arch_hash(const ArchIr& ir, std::string& out_hash) {
     // `dspark: omitted`. A capable container necessarily has a different hash.
     if (ir.speculative.present) {
         const auto& d = ir.speculative;
-        canon << "|dspark=" << d.n_layers << ':' << d.trained_block_size << ':'
-              << d.noise_token_id << ':' << d.markov_rank << ':' << d.confidence_head << ':';
-        for (const auto layer : d.target_layer_ids) canon << layer << ',';
-        canon << ':' << d.routed_bytes << ':' << d.resident_bytes << ':' << d.expert_bytes
-              << ':' << d.kv_bytes_per_sequence;
+        canon << "|dspark=" << d.n_layers << ':' << d.trained_block_size << ':' << d.noise_token_id
+              << ':' << d.markov_rank << ':' << d.confidence_head << ':';
+        for (const auto layer : d.target_layer_ids)
+            canon << layer << ',';
+        canon << ':' << d.routed_bytes << ':' << d.resident_bytes << ':' << d.expert_bytes << ':'
+              << d.kv_bytes_per_sequence;
     }
 
     // The WHOLE quant map, every role, dtype AND group.

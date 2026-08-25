@@ -209,13 +209,13 @@ struct F32HybridWeights {
     soma::WeightRef q_proj, k_proj, v_proj;
     std::span<const float> q_conv_w, k_conv_w, v_conv_w;
     std::span<const float> q_conv_b, k_conv_b, v_conv_b; ///< may be empty
-    std::span<const float> a_log;   ///< [n_heads]
-    std::span<const float> dt_bias; ///< [n_heads * head_dim]
+    std::span<const float> a_log;                        ///< [n_heads]
+    std::span<const float> dt_bias;                      ///< [n_heads * head_dim]
     soma::WeightRef f_a_proj, f_b_proj;
     soma::WeightRef b_proj;
-    soma::WeightRef g_proj;           ///< full-rank output gate
+    soma::WeightRef g_proj;             ///< full-rank output gate
     soma::WeightRef g_a_proj, g_b_proj; ///< low-rank output gate
-    std::span<const float> o_norm;    ///< [head_dim]
+    std::span<const float> o_norm;      ///< [head_dim]
     soma::WeightRef o_proj;
 
     // ── block residual, on EVERY layer kind ──────────────────────────────────

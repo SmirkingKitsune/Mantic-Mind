@@ -90,8 +90,7 @@ struct KvCheckpointStore::Impl {
     }
 
     Status gate(const KvCheckpointHeader& h) const {
-        if (h.version != kKvCheckpointVersion &&
-            h.version != kKvCheckpointVersionSpeculative) {
+        if (h.version != kKvCheckpointVersion && h.version != kKvCheckpointVersionSpeculative) {
             return {StatusCode::VersionMismatch,
                     "unsupported checkpoint version " + std::to_string(h.version)};
         }
@@ -177,7 +176,8 @@ KvCheckpointStore::save(const std::string& key, const KvCache& kv, const SeqPers
                 kv.capacity(),
                 len,
                 opaque_payload);
-            !st.ok()) return st;
+            !st.ok())
+            return st;
     }
     const auto cache_payload_bytes = kv.is_opaque()
                                          ? static_cast<std::uint64_t>(opaque_payload.size())
@@ -187,8 +187,8 @@ KvCheckpointStore::save(const std::string& key, const KvCache& kv, const SeqPers
     buf.reserve(static_cast<std::size_t>(cache_payload_bytes) + 256);
     for (const char c : kMagic)
         buf.push_back(static_cast<std::byte>(c));
-    const auto version = state.auxiliary.empty() ? kKvCheckpointVersion
-                                                  : kKvCheckpointVersionSpeculative;
+    const auto version =
+        state.auxiliary.empty() ? kKvCheckpointVersion : kKvCheckpointVersionSpeculative;
     put_u32(buf, version);
     put_str(buf, im.arch.arch_hash);
     put_u32(buf, im.format_id);
@@ -281,8 +281,7 @@ Status KvCheckpointStore::load(const std::string& key, KvCache& kv, SeqPersistSt
     out.rng_state = h.rng_state;
     if (h.auxiliary_bytes > 0) {
         if (h.auxiliary_at > raw.size() || h.auxiliary_bytes > raw.size() - h.auxiliary_at) {
-            return {StatusCode::InvalidArgument,
-                    "checkpoint auxiliary state is truncated"};
+            return {StatusCode::InvalidArgument, "checkpoint auxiliary state is truncated"};
         }
         out.auxiliary.assign(raw.begin() + h.auxiliary_at,
                              raw.begin() + h.auxiliary_at + h.auxiliary_bytes);
@@ -298,8 +297,7 @@ Status KvCheckpointStore::load(const std::string& key, KvCache& kv, SeqPersistSt
             return {StatusCode::InvalidArgument, "opaque checkpoint exceeds destination capacity"};
         }
         if (raw.size() - at < h.payload_bytes) {
-            return {StatusCode::InvalidArgument,
-                    "opaque checkpoint payload is truncated"};
+            return {StatusCode::InvalidArgument, "opaque checkpoint payload is truncated"};
         }
         if (im.attention == nullptr || im.attention->restore_kv == nullptr) {
             return {StatusCode::Unsupported,
@@ -312,7 +310,8 @@ Status KvCheckpointStore::load(const std::string& key, KvCache& kv, SeqPersistSt
                 h.length_tokens,
                 std::span<std::byte>(kv.opaque_data(), kv.opaque_size()),
                 kv.capacity());
-            !st.ok()) return st;
+            !st.ok())
+            return st;
         return kv.set_length(h.length_tokens);
     }
     if (k_hkv == 0 || layers == 0) {

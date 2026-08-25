@@ -374,13 +374,19 @@ struct SafeTensors::Impl {
             TensorView tv;
             tv.name = name;
             const auto dtype = entry.value("dtype", std::string{});
-            if (dtype == "f32") tv.dtype = DType::F32;
-            else if (dtype == "q8_0") tv.dtype = DType::Q8_0;
-            else if (dtype == "q4_0") tv.dtype = DType::Q4_0;
-            else if (dtype == "q4_g") tv.dtype = DType::Q4_G;
-            else if (dtype == "q6_g") tv.dtype = DType::Q6_G;
+            if (dtype == "f32")
+                tv.dtype = DType::F32;
+            else if (dtype == "q8_0")
+                tv.dtype = DType::Q8_0;
+            else if (dtype == "q4_0")
+                tv.dtype = DType::Q4_0;
+            else if (dtype == "q4_g")
+                tv.dtype = DType::Q4_G;
+            else if (dtype == "q6_g")
+                tv.dtype = DType::Q6_G;
             else
-                return {StatusCode::Unsupported, name + ": unsupported qweight dtype '" + dtype + "'"};
+                return {StatusCode::Unsupported,
+                        name + ": unsupported qweight dtype '" + dtype + "'"};
             tv.group = entry.value("group", 0u);
             if (!entry.contains("shape") || !entry["shape"].is_array() ||
                 entry["shape"].size() != 2) {
@@ -406,8 +412,8 @@ struct SafeTensors::Impl {
                                                      tv.group);
             if (length != want) {
                 return {StatusCode::InvalidArgument,
-                        name + ": qweight has " + std::to_string(length) +
-                            " bytes; expected " + std::to_string(want)};
+                        name + ": qweight has " + std::to_string(length) + " bytes; expected " +
+                            std::to_string(want)};
             }
             tv.bytes = CByteSpan(buf.data() + off, static_cast<std::size_t>(length));
             bytes_loaded += length;
@@ -466,12 +472,10 @@ Status SafeTensors::open_dir(const std::string& dir) {
         // separate on disk so an interrupted augmentation cannot damage the
         // base container; once metadata advertises the capability the loader
         // unions both namespaces into the same immutable tensor table.
-        if (const fs::path index = root / "dspark.safetensors.index.json";
-            fs::exists(index, ec)) {
+        if (const fs::path index = root / "dspark.safetensors.index.json"; fs::exists(index, ec)) {
             if (auto st = impl_->ingest_index(root, index); !st.ok()) return st;
         }
-        if (const fs::path qindex = root / "dspark.qweights.index.json";
-            fs::exists(qindex, ec)) {
+        if (const fs::path qindex = root / "dspark.qweights.index.json"; fs::exists(qindex, ec)) {
             if (auto st = impl_->ingest_quant_index(root, qindex); !st.ok()) return st;
         }
         return {};

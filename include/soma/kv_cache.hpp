@@ -37,7 +37,9 @@ public:
     void capture(std::uint32_t row, std::byte* destination, std::size_t bytes);
     void rollback_from(std::uint32_t first_row) noexcept;
     void clear() noexcept;
+
     bool active() const noexcept { return active_; }
+
     std::size_t journal_bytes() const noexcept { return saved_.size(); }
 
 private:
@@ -47,6 +49,7 @@ private:
         std::size_t offset = 0;
         std::size_t bytes = 0;
     };
+
     std::vector<Entry> entries_;
     std::vector<std::byte> saved_;
     std::uint32_t max_rows_ = 0;
@@ -95,6 +98,7 @@ public:
     Status begin_tentative(std::uint32_t max_rows);
     Status commit_tentative_prefix(std::uint32_t accepted_rows);
     void abort_tentative() noexcept;
+
     KvTransaction* transaction() noexcept {
         return transaction_.active() ? &transaction_ : nullptr;
     }
@@ -116,8 +120,11 @@ public:
     }
 
     bool is_opaque() const noexcept { return !opaque_.empty(); }
+
     std::byte* opaque_data() noexcept { return opaque_.data(); }
+
     const std::byte* opaque_data() const noexcept { return opaque_.data(); }
+
     std::size_t opaque_size() const noexcept { return opaque_.size(); }
 
     /// Floats per position, per plane. Checkpointing needs both to walk live

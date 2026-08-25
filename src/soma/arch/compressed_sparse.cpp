@@ -97,8 +97,7 @@ float fp8_e4m3_round(float x) noexcept {
     // TileLang's cast to E4M3 follows the hardware conversion mode: round to
     // nearest, ties to even.  Spell it out rather than inheriting a process-wide
     // floating-point rounding mode which another library could have changed.
-    if (a < 1.0f / 64.0f)
-        return sign * round_nearest_even_nonnegative(a / kSubStep) * kSubStep;
+    if (a < 1.0f / 64.0f) return sign * round_nearest_even_nonnegative(a / kSubStep) * kSubStep;
     const int e = static_cast<int>(std::floor(std::log2(a)));
     const float step = std::ldexp(1.0f, e - 3);
     a = round_nearest_even_nonnegative(a / step) * step;
@@ -109,7 +108,8 @@ void fake_fp8(std::span<float> x, std::uint32_t group = 64) noexcept {
     for (std::size_t off = 0; off < x.size(); off += group) {
         const auto n = std::min<std::size_t>(group, x.size() - off);
         float amax = 1e-4f;
-        for (std::size_t i = 0; i < n; ++i) amax = std::max(amax, std::abs(x[off + i]));
+        for (std::size_t i = 0; i < n; ++i)
+            amax = std::max(amax, std::abs(x[off + i]));
         const float scale = std::exp2(std::ceil(std::log2(amax / 448.0f)));
         for (std::size_t i = 0; i < n; ++i)
             x[off + i] = bf16_round(fp8_e4m3_round(x[off + i] / scale) * scale);
@@ -117,12 +117,12 @@ void fake_fp8(std::span<float> x, std::uint32_t group = 64) noexcept {
 }
 
 void fake_fp4(std::span<float> x, std::uint32_t group = 32) noexcept {
-    static constexpr std::array<float, 8> kLevels{0.0f, 0.5f, 1.0f, 1.5f,
-                                                  2.0f, 3.0f, 4.0f, 6.0f};
+    static constexpr std::array<float, 8> kLevels{0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
     for (std::size_t off = 0; off < x.size(); off += group) {
         const auto n = std::min<std::size_t>(group, x.size() - off);
         float amax = std::ldexp(6.0f, -126);
-        for (std::size_t i = 0; i < n; ++i) amax = std::max(amax, std::abs(x[off + i]));
+        for (std::size_t i = 0; i < n; ++i)
+            amax = std::max(amax, std::abs(x[off + i]));
         const float scale = std::exp2(std::ceil(std::log2(amax / 6.0f)));
         for (std::size_t i = 0; i < n; ++i) {
             const float a = std::abs(x[off + i] / scale);
@@ -130,12 +130,10 @@ void fake_fp4(std::span<float> x, std::uint32_t group = 32) noexcept {
             for (std::size_t level = 1; level < kLevels.size(); ++level) {
                 const float candidate = std::abs(kLevels[level] - a);
                 const float incumbent = std::abs(kLevels[best] - a);
-                if (candidate < incumbent ||
-                    (candidate == incumbent && (level & 1u) == 0u))
+                if (candidate < incumbent || (candidate == incumbent && (level & 1u) == 0u))
                     best = level;
             }
-            x[off + i] =
-                bf16_round(std::copysign(kLevels[best] * scale, x[off + i]));
+            x[off + i] = bf16_round(std::copysign(kLevels[best] * scale, x[off + i]));
         }
     }
 }
@@ -152,14 +150,17 @@ void hadamard(std::span<float> x) noexcept {
         }
     }
     const float scale = 1.0f / std::sqrt(static_cast<float>(n));
-    for (float& v : x) v = bf16_round(v * scale);
+    for (float& v : x)
+        v = bf16_round(v * scale);
 }
 
 void rmsnorm_unweighted(std::span<float> x, float eps) noexcept {
     double ss = 0.0;
-    for (const float v : x) ss += static_cast<double>(v) * v;
+    for (const float v : x)
+        ss += static_cast<double>(v) * v;
     const float scale = 1.0f / std::sqrt(static_cast<float>(ss / x.size()) + eps);
-    for (float& v : x) v *= scale;
+    for (float& v : x)
+        v *= scale;
 }
 
 void rope(std::span<float> x,
@@ -178,8 +179,8 @@ void rope(std::span<float> x,
     int low = 0, high = -1;
     if (original > 0) {
         low = std::max(0, static_cast<int>(std::floor(corr_dim(beta_fast))));
-        high = std::min(static_cast<int>(dim) - 1,
-                        static_cast<int>(std::ceil(corr_dim(beta_slow))));
+        high =
+            std::min(static_cast<int>(dim) - 1, static_cast<int>(std::ceil(corr_dim(beta_slow))));
     }
     for (std::uint32_t i = 0; i < dim / 2; ++i) {
         float freq = std::pow(base, -2.0f * i / dim);
@@ -205,24 +206,16 @@ StatusCode bind_compressor(const ArchIr&,
                            const std::string& prefix,
                            CompressorWeights& out) noexcept {
     if (!bind_layer_f32(ctx, (prefix + "ape").c_str(), out.ape).ok() ||
-        !bind_layer_weight(ctx,
-                           (prefix + "wkv.weight").c_str(),
-                           TensorRole::AttnProj,
-                           out.wkv)
+        !bind_layer_weight(ctx, (prefix + "wkv.weight").c_str(), TensorRole::AttnProj, out.wkv)
              .ok() ||
-        !bind_layer_weight(ctx,
-                           (prefix + "wgate.weight").c_str(),
-                           TensorRole::AttnProj,
-                           out.wgate)
+        !bind_layer_weight(ctx, (prefix + "wgate.weight").c_str(), TensorRole::AttnProj, out.wgate)
              .ok() ||
         !bind_layer_f32(ctx, (prefix + "norm.weight").c_str(), out.norm).ok())
         return StatusCode::NotFound;
     return StatusCode::Ok;
 }
 
-StatusCode bind_layer(const ArchIr& arch,
-                      const LayerBindCtx& ctx,
-                      ArchLayerPayload& out) noexcept {
+StatusCode bind_layer(const ArchIr& arch, const LayerBindCtx& ctx, ArchLayerPayload& out) noexcept {
     auto* p = new LayerPayload();
     const auto fail = [&]() {
         delete p;
@@ -241,20 +234,16 @@ StatusCode bind_layer(const ArchIr& arch,
         return fail();
     const auto ratio = arch.attention.compressed.compress_ratios[ctx.layer];
     if (ratio == 4) {
-        if (!bind_layer_weight(ctx,
-                               "self_attn.indexer.wq_b.weight",
-                               TensorRole::AttnProj,
-                               p->indexer.wq_b)
+        if (!bind_layer_weight(
+                 ctx, "self_attn.indexer.wq_b.weight", TensorRole::AttnProj, p->indexer.wq_b)
                  .ok() ||
             !bind_layer_weight(ctx,
                                "self_attn.indexer.weights_proj.weight",
                                TensorRole::AttnProj,
                                p->indexer.weights_proj)
                  .ok() ||
-            bind_compressor(arch,
-                            ctx,
-                            "self_attn.indexer.compressor.",
-                            p->indexer.compressor) != StatusCode::Ok)
+            bind_compressor(arch, ctx, "self_attn.indexer.compressor.", p->indexer.compressor) !=
+                StatusCode::Ok)
             return fail();
     }
     if (!bind_layer_f32(ctx, "hc_attn_fn", p->hc_attn_fn).ok() ||
@@ -273,9 +262,7 @@ StatusCode bind_layer(const ArchIr& arch,
     return StatusCode::Ok;
 }
 
-StatusCode bind_model(const ArchIr&,
-                      const ModelBindCtx& ctx,
-                      ArchLayerPayload& out) noexcept {
+StatusCode bind_model(const ArchIr&, const ModelBindCtx& ctx, ArchLayerPayload& out) noexcept {
     auto* p = new ModelPayload();
     if (!bind_model_f32(ctx, "model.hc_head_fn", p->hc_head_fn).ok() ||
         !bind_model_f32(ctx, "model.hc_head_base", p->hc_head_base).ok() ||
@@ -332,26 +319,29 @@ StatusCode hc_pre(const ArchIr& arch,
     for (std::uint32_t t = 0; t < n_tokens; ++t) {
         const float* streams = st->streams.data() + static_cast<std::size_t>(t) * flat;
         double ss = 0.0;
-        for (std::uint32_t i = 0; i < flat; ++i) ss += static_cast<double>(streams[i]) * streams[i];
+        for (std::uint32_t i = 0; i < flat; ++i)
+            ss += static_cast<double>(streams[i]) * streams[i];
         const float rsqrt = 1.0f / std::sqrt(static_cast<float>(ss / flat) + arch.rms_norm_eps);
         for (std::uint32_t m = 0; m < mix; ++m) {
             double acc = 0.0;
             const float* row = fn.data() + static_cast<std::size_t>(m) * flat;
-            for (std::uint32_t i = 0; i < flat; ++i) acc += static_cast<double>(row[i]) * streams[i];
+            for (std::uint32_t i = 0; i < flat; ++i)
+                acc += static_cast<double>(row[i]) * streams[i];
             mixes[m] = static_cast<float>(acc) * rsqrt;
         }
 
         float* post = st->post.data() + static_cast<std::size_t>(t) * hc;
         float* comb = st->comb.data() + static_cast<std::size_t>(t) * hc * hc;
         for (std::uint32_t h = 0; h < hc; ++h) {
-            const float pre = sigmoid(mixes[h] * scale[0] + base[h]) +
-                              arch.hyper_connections.eps;
+            const float pre = sigmoid(mixes[h] * scale[0] + base[h]) + arch.hyper_connections.eps;
             post[h] = 2.0f * sigmoid(mixes[hc + h] * scale[1] + base[hc + h]);
             const float* src = streams + static_cast<std::size_t>(h) * d;
             float* dst = hidden + static_cast<std::size_t>(t) * d;
-            for (std::uint32_t i = 0; i < d; ++i) dst[i] += (h == 0 ? 0.0f : pre * src[i]);
+            for (std::uint32_t i = 0; i < d; ++i)
+                dst[i] += (h == 0 ? 0.0f : pre * src[i]);
             if (h == 0)
-                for (std::uint32_t i = 0; i < d; ++i) dst[i] = pre * src[i];
+                for (std::uint32_t i = 0; i < d; ++i)
+                    dst[i] = pre * src[i];
         }
 
         for (std::uint32_t r = 0; r < hc; ++r) {
@@ -362,23 +352,28 @@ StatusCode hc_pre(const ArchIr& arch,
                 mx = std::max(mx, matrix[k]);
             }
             float sum = 0.0f;
-            for (std::uint32_t c = 0; c < hc; ++c) sum += std::exp(matrix[r * hc + c] - mx);
             for (std::uint32_t c = 0; c < hc; ++c)
-                matrix[r * hc + c] = std::exp(matrix[r * hc + c] - mx) / sum +
-                                      arch.hyper_connections.eps;
+                sum += std::exp(matrix[r * hc + c] - mx);
+            for (std::uint32_t c = 0; c < hc; ++c)
+                matrix[r * hc + c] =
+                    std::exp(matrix[r * hc + c] - mx) / sum + arch.hyper_connections.eps;
         }
         const auto normalize_cols = [&]() {
             for (std::uint32_t c = 0; c < hc; ++c) {
                 float sum = arch.hyper_connections.eps;
-                for (std::uint32_t r = 0; r < hc; ++r) sum += matrix[r * hc + c];
-                for (std::uint32_t r = 0; r < hc; ++r) matrix[r * hc + c] /= sum;
+                for (std::uint32_t r = 0; r < hc; ++r)
+                    sum += matrix[r * hc + c];
+                for (std::uint32_t r = 0; r < hc; ++r)
+                    matrix[r * hc + c] /= sum;
             }
         };
         const auto normalize_rows = [&]() {
             for (std::uint32_t r = 0; r < hc; ++r) {
                 float sum = arch.hyper_connections.eps;
-                for (std::uint32_t c = 0; c < hc; ++c) sum += matrix[r * hc + c];
-                for (std::uint32_t c = 0; c < hc; ++c) matrix[r * hc + c] /= sum;
+                for (std::uint32_t c = 0; c < hc; ++c)
+                    sum += matrix[r * hc + c];
+                for (std::uint32_t c = 0; c < hc; ++c)
+                    matrix[r * hc + c] /= sum;
             }
         };
         normalize_cols();
@@ -407,9 +402,11 @@ StatusCode hc_merge(const ArchIr&,
         for (std::uint32_t o = 0; o < hc; ++o) {
             float* dst = next.data() + (static_cast<std::size_t>(t) * hc + o) * d;
             for (std::uint32_t k = 0; k < d; ++k) {
-                double v = static_cast<double>(post[o]) * branch[static_cast<std::size_t>(t) * d + k];
+                double v =
+                    static_cast<double>(post[o]) * branch[static_cast<std::size_t>(t) * d + k];
                 for (std::uint32_t i = 0; i < hc; ++i)
-                    v += static_cast<double>(comb[o * hc + i]) * old[static_cast<std::size_t>(i) * d + k];
+                    v += static_cast<double>(comb[o * hc + i]) *
+                         old[static_cast<std::size_t>(i) * d + k];
                 dst[k] = static_cast<float>(v);
             }
         }
@@ -491,14 +488,12 @@ StatusCode export_layer_hidden(const ArchIr& arch,
                                float* out) noexcept {
     const auto* st = ws.arch_state.as<ForwardState>();
     if (st == nullptr || out == nullptr || st->n_tokens != n ||
-        st->d_model != arch.topology.d_model ||
-        st->hc != arch.hyper_connections.multiplier) {
+        st->d_model != arch.topology.d_model || st->hc != arch.hyper_connections.multiplier) {
         return StatusCode::InvalidArgument;
     }
     const auto d = st->d_model, hc = st->hc;
     for (std::uint32_t t = 0; t < n; ++t) {
-        const float* streams = st->streams.data() +
-                               static_cast<std::size_t>(t) * hc * d;
+        const float* streams = st->streams.data() + static_cast<std::size_t>(t) * hc * d;
         float* dst = out + static_cast<std::size_t>(t) * d;
         for (std::uint32_t k = 0; k < d; ++k) {
             double sum = 0.0;
@@ -519,19 +514,20 @@ StatusCode end_forward(const ArchIr& arch,
     auto* st = ws.arch_state.as<ForwardState>();
     if (p == nullptr || st == nullptr || p->hc_head_scale.empty()) return StatusCode::Internal;
     const auto d = st->d_model, hc = st->hc, flat = hc * d;
-    if (p->hc_head_fn.size() != static_cast<std::size_t>(hc) * flat ||
-        p->hc_head_base.size() != hc)
+    if (p->hc_head_fn.size() != static_cast<std::size_t>(hc) * flat || p->hc_head_base.size() != hc)
         return StatusCode::InvalidArgument;
     for (std::uint32_t t = 0; t < n; ++t) {
         const float* streams = st->streams.data() + static_cast<std::size_t>(t) * flat;
         double ss = 0.0;
-        for (std::uint32_t i = 0; i < flat; ++i) ss += static_cast<double>(streams[i]) * streams[i];
+        for (std::uint32_t i = 0; i < flat; ++i)
+            ss += static_cast<double>(streams[i]) * streams[i];
         const float rsqrt = 1.0f / std::sqrt(static_cast<float>(ss / flat) + arch.rms_norm_eps);
         std::fill_n(hidden + static_cast<std::size_t>(t) * d, d, 0.0f);
         for (std::uint32_t h = 0; h < hc; ++h) {
             double mix = 0.0;
             const float* row = p->hc_head_fn.data() + static_cast<std::size_t>(h) * flat;
-            for (std::uint32_t i = 0; i < flat; ++i) mix += static_cast<double>(row[i]) * streams[i];
+            for (std::uint32_t i = 0; i < flat; ++i)
+                mix += static_cast<double>(row[i]) * streams[i];
             const float pre = sigmoid(static_cast<float>(mix) * rsqrt * p->hc_head_scale[0] +
                                       p->hc_head_base[h]) +
                               arch.hyper_connections.eps;
@@ -566,12 +562,14 @@ StatusCode route(const ArchIr& arch,
             const auto id = input_tokens[t];
             if (id >= arch.topology.vocab_size) return StatusCode::InvalidArgument;
             for (std::uint32_t k = 0; k < K; ++k)
-                ids[k] = static_cast<std::uint32_t>(p->tid2eid[static_cast<std::size_t>(id) * K + k]);
+                ids[k] =
+                    static_cast<std::uint32_t>(p->tid2eid[static_cast<std::size_t>(id) * K + k]);
         } else {
             f32::top_k(selected, E, K, ids, values);
         }
         float sum = 0.0f;
-        for (std::uint32_t k = 0; k < K; ++k) sum += original[ids[k]];
+        for (std::uint32_t k = 0; k < K; ++k)
+            sum += original[ids[k]];
         for (std::uint32_t k = 0; k < K; ++k) {
             out_ids[static_cast<std::size_t>(t) * K + k] = ids[k];
             out_weights[static_cast<std::size_t>(t) * K + k] =
@@ -593,7 +591,8 @@ std::vector<float> compress_sequence(const ArchIr& arch,
     const auto coff = ratio == 4 ? 2u : 1u;
     std::vector<float> values(static_cast<std::size_t>(n_tokens) * coff * head_dim);
     std::vector<float> scores(values.size());
-    matmul(w.wkv, std::span<const float>(x, static_cast<std::size_t>(n_tokens) * d), n_tokens, values);
+    matmul(
+        w.wkv, std::span<const float>(x, static_cast<std::size_t>(n_tokens) * d), n_tokens, values);
     matmul(w.wgate,
            std::span<const float>(x, static_cast<std::size_t>(n_tokens) * d),
            n_tokens,
@@ -620,7 +619,8 @@ std::vector<float> compress_sequence(const ArchIr& arch,
             }
             const float mx = *std::max_element(logits.begin(), logits.begin() + nc);
             float denom = 0.0f;
-            for (std::uint32_t i = 0; i < nc; ++i) denom += std::exp(logits[i] - mx);
+            for (std::uint32_t i = 0; i < nc; ++i)
+                denom += std::exp(logits[i] - mx);
             double acc = 0.0;
             std::uint32_t i = 0;
             if (coff == 2 && b > 0) {
@@ -678,7 +678,8 @@ StatusCode attention(const ArchIr& arch,
     const auto factor = arch.attention.rope.scaling.factor;
 
     std::vector<float> qlow(static_cast<std::size_t>(n_tokens) * qr);
-    matmul(p->wq_a, std::span<const float>(x, static_cast<std::size_t>(n_tokens) * d), n_tokens, qlow);
+    matmul(
+        p->wq_a, std::span<const float>(x, static_cast<std::size_t>(n_tokens) * d), n_tokens, qlow);
     for (std::uint32_t t = 0; t < n_tokens; ++t)
         f32::rmsnorm(std::span<float>(qlow).subspan(static_cast<std::size_t>(t) * qr, qr),
                      p->q_norm,
@@ -698,7 +699,8 @@ StatusCode attention(const ArchIr& arch,
                  arch.attention.rope.scaling.beta_slow);
         }
     }
-    matmul(p->wkv, std::span<const float>(x, static_cast<std::size_t>(n_tokens) * d), n_tokens, ws.k);
+    matmul(
+        p->wkv, std::span<const float>(x, static_cast<std::size_t>(n_tokens) * d), n_tokens, ws.k);
     for (std::uint32_t t = 0; t < n_tokens; ++t) {
         float* kv = ws.k.data() + static_cast<std::size_t>(t) * D;
         f32::rmsnorm(std::span<float>(kv, D), p->kv_norm, D, arch.rms_norm_eps);
@@ -711,12 +713,12 @@ StatusCode attention(const ArchIr& arch,
              arch.attention.rope.scaling.beta_slow);
         if (c.semantic_fp8_quant_dequant) {
             fake_fp8(std::span<float>(kv, D - rd));
-            for (std::uint32_t k = D - rd; k < D; ++k) kv[k] = bf16_round(kv[k]);
+            for (std::uint32_t k = D - rd; k < D; ++k)
+                kv[k] = bf16_round(kv[k]);
         }
     }
 
-    auto compressed =
-        compress_sequence(arch, p->compressor, ratio, D, false, x, n_tokens);
+    auto compressed = compress_sequence(arch, p->compressor, ratio, D, false, x, n_tokens);
     if (!compressed.empty())
         ws.sink(ws.current_layer, "compressor_kv", compressed.data(), compressed.size());
     std::vector<std::vector<std::uint32_t>> chosen(n_tokens);
@@ -757,11 +759,10 @@ StatusCode attention(const ArchIr& arch,
                 double score = 0.0;
                 for (std::uint32_t h = 0; h < IH; ++h) {
                     const float* q = iq.data() + (static_cast<std::size_t>(t) * IH + h) * ID;
-                    const float dot = f32::dot(std::span<const float>(q, ID),
-                                               std::span<const float>(ikv.data() +
-                                                                          static_cast<std::size_t>(k) * ID,
-                                                                      ID),
-                                               ID);
+                    const float dot = f32::dot(
+                        std::span<const float>(q, ID),
+                        std::span<const float>(ikv.data() + static_cast<std::size_t>(k) * ID, ID),
+                        ID);
                     score += std::max(0.0f, dot) * iw[static_cast<std::size_t>(t) * IH + h] *
                              weight_scale;
                 }
@@ -780,15 +781,17 @@ StatusCode attention(const ArchIr& arch,
     std::vector<float> logits;
     for (std::uint32_t t = 0; t < n_tokens; ++t) {
         keys.clear();
-        const auto first = t + 1 > arch.attention.sliding_window
-                               ? t + 1 - arch.attention.sliding_window
-                               : 0;
-        for (std::uint32_t k = first; k <= t; ++k) keys.push_back(k);
+        const auto first =
+            t + 1 > arch.attention.sliding_window ? t + 1 - arch.attention.sliding_window : 0;
+        for (std::uint32_t k = first; k <= t; ++k)
+            keys.push_back(k);
         const auto eligible = (t + 1) / ratio;
         if (ratio == 4) {
-            for (const auto k : chosen[t]) keys.push_back(n_tokens + k);
+            for (const auto k : chosen[t])
+                keys.push_back(n_tokens + k);
         } else {
-            for (std::uint32_t k = 0; k < eligible; ++k) keys.push_back(n_tokens + k);
+            for (std::uint32_t k = 0; k < eligible; ++k)
+                keys.push_back(n_tokens + k);
         }
         logits.resize(keys.size());
         for (std::uint32_t h = 0; h < H; ++h) {
@@ -798,22 +801,22 @@ StatusCode attention(const ArchIr& arch,
             float mx = p->attn_sink[h];
             for (std::size_t i = 0; i < keys.size(); ++i) {
                 const auto k = keys[i];
-                const float* kv = k < n_tokens ? ws.k.data() + static_cast<std::size_t>(k) * D
-                                               : compressed.data() +
-                                                     static_cast<std::size_t>(k - n_tokens) * D;
-                logits[i] = f32::dot(std::span<const float>(q, D),
-                                     std::span<const float>(kv, D),
-                                     D) *
-                            softmax_scale;
+                const float* kv =
+                    k < n_tokens ? ws.k.data() + static_cast<std::size_t>(k) * D
+                                 : compressed.data() + static_cast<std::size_t>(k - n_tokens) * D;
+                logits[i] =
+                    f32::dot(std::span<const float>(q, D), std::span<const float>(kv, D), D) *
+                    softmax_scale;
                 mx = std::max(mx, logits[i]);
             }
             float denom = std::exp(p->attn_sink[h] - mx);
-            for (const float v : logits) denom += std::exp(v - mx);
+            for (const float v : logits)
+                denom += std::exp(v - mx);
             for (std::size_t i = 0; i < keys.size(); ++i) {
                 const auto k = keys[i];
-                const float* kv = k < n_tokens ? ws.k.data() + static_cast<std::size_t>(k) * D
-                                               : compressed.data() +
-                                                     static_cast<std::size_t>(k - n_tokens) * D;
+                const float* kv =
+                    k < n_tokens ? ws.k.data() + static_cast<std::size_t>(k) * D
+                                 : compressed.data() + static_cast<std::size_t>(k - n_tokens) * D;
                 f32::axpy(std::exp(logits[i] - mx) / denom,
                           std::span<const float>(kv, D),
                           D,
@@ -846,7 +849,9 @@ StatusCode attention(const ArchIr& arch,
     return StatusCode::Ok;
 }
 
-std::size_t align64(std::size_t n) noexcept { return (n + 63u) & ~std::size_t{63u}; }
+std::size_t align64(std::size_t n) noexcept {
+    return (n + 63u) & ~std::size_t{63u};
+}
 
 struct LayerRegion {
     std::size_t window = 0;
@@ -859,10 +864,8 @@ struct LayerRegion {
     std::size_t end = 0;
 };
 
-LayerRegion region_for(const ArchIr& arch,
-                       std::uint32_t layer,
-                       std::uint32_t ctx,
-                       std::size_t base) noexcept {
+LayerRegion
+region_for(const ArchIr& arch, std::uint32_t layer, std::uint32_t ctx, std::size_t base) noexcept {
     const auto& c = arch.attention.compressed;
     const auto D = arch.attention.head_dim, ID = c.index_head_dim;
     const auto ratio = c.compress_ratios[layer], coff = ratio == 4 ? 2u : 1u;
@@ -956,8 +959,8 @@ Status serialize_kv(const ArchIr& arch,
             if (partial > 0) {
                 const auto offset = static_cast<std::size_t>(ratio) * row_bytes;
                 const auto bytes = static_cast<std::size_t>(partial) * row_bytes;
-                if (!append(values_at + offset, bytes) ||
-                    !append(scores_at + offset, bytes)) return false;
+                if (!append(values_at + offset, bytes) || !append(scores_at + offset, bytes))
+                    return false;
             }
             return true;
         };
@@ -976,29 +979,18 @@ Status serialize_kv(const ArchIr& arch,
                 }
             }
             const auto completed = length / ratio;
-            if (!append(reg.compressed,
-                        static_cast<std::size_t>(completed) * D * 2)) {
+            if (!append(reg.compressed, static_cast<std::size_t>(completed) * D * 2)) {
                 return {StatusCode::InvalidArgument, "opaque compressed history is truncated"};
             }
-            if (ratio == 4 &&
-                !append(reg.index, static_cast<std::size_t>(completed) * ID * 2)) {
+            if (ratio == 4 && !append(reg.index, static_cast<std::size_t>(completed) * ID * 2)) {
                 return {StatusCode::InvalidArgument, "opaque index history is truncated"};
             }
-            if (!append_live_carry(reg.state_values,
-                                   reg.state_scores,
-                                   ratio,
-                                   coff,
-                                   D)) {
+            if (!append_live_carry(reg.state_values, reg.state_scores, ratio, coff, D)) {
                 return {StatusCode::InvalidArgument, "opaque compressor carry is truncated"};
             }
             if (ratio == 4 &&
-                !append_live_carry(reg.index_state_values,
-                                   reg.index_state_scores,
-                                   4,
-                                   2,
-                                   ID)) {
-                return {StatusCode::InvalidArgument,
-                        "opaque index compressor carry is truncated"};
+                !append_live_carry(reg.index_state_values, reg.index_state_scores, 4, 2, ID)) {
+                return {StatusCode::InvalidArgument, "opaque index compressor carry is truncated"};
             }
         }
         return {};
@@ -1021,8 +1013,9 @@ Status restore_kv(const ArchIr& arch,
     const auto W = arch.attention.sliding_window;
     std::size_t cursor = 0;
     const auto take = [&](std::size_t at, std::size_t bytes) -> bool {
-        if (cursor > payload.size() || bytes > payload.size() - cursor ||
-            at > destination.size() || bytes > destination.size() - at) return false;
+        if (cursor > payload.size() || bytes > payload.size() - cursor || at > destination.size() ||
+            bytes > destination.size() - at)
+            return false;
         std::copy_n(payload.data() + cursor, bytes, destination.data() + at);
         cursor += bytes;
         return true;
@@ -1034,9 +1027,8 @@ Status restore_kv(const ArchIr& arch,
                                      std::uint32_t hd) -> bool {
         const auto rows = static_cast<std::size_t>(coff) * ratio;
         const auto row_floats = static_cast<std::size_t>(coff) * hd;
-        std::fill_n(reinterpret_cast<float*>(destination.data() + values_at),
-                    rows * row_floats,
-                    0.0f);
+        std::fill_n(
+            reinterpret_cast<float*>(destination.data() + values_at), rows * row_floats, 0.0f);
         std::fill_n(reinterpret_cast<float*>(destination.data() + scores_at),
                     rows * row_floats,
                     -std::numeric_limits<float>::infinity());
@@ -1054,8 +1046,7 @@ Status restore_kv(const ArchIr& arch,
         if (partial > 0) {
             const auto offset = static_cast<std::size_t>(ratio) * row_bytes;
             const auto bytes = static_cast<std::size_t>(partial) * row_bytes;
-            if (!take(values_at + offset, bytes) ||
-                !take(scores_at + offset, bytes)) return false;
+            if (!take(values_at + offset, bytes) || !take(scores_at + offset, bytes)) return false;
         }
         return true;
     };
@@ -1075,28 +1066,17 @@ Status restore_kv(const ArchIr& arch,
         }
         const auto completed = length / ratio;
         if (!take(reg.compressed, static_cast<std::size_t>(completed) * D * 2)) {
-            return {StatusCode::InvalidArgument,
-                    "opaque compressed-history payload is truncated"};
+            return {StatusCode::InvalidArgument, "opaque compressed-history payload is truncated"};
         }
         if (ratio == 4 && !take(reg.index, static_cast<std::size_t>(completed) * ID * 2)) {
             return {StatusCode::InvalidArgument, "opaque index-history payload is truncated"};
         }
-        if (!take_live_carry(reg.state_values,
-                             reg.state_scores,
-                             ratio,
-                             coff,
-                             D)) {
-            return {StatusCode::InvalidArgument,
-                    "opaque compressor-carry payload is truncated"};
+        if (!take_live_carry(reg.state_values, reg.state_scores, ratio, coff, D)) {
+            return {StatusCode::InvalidArgument, "opaque compressor-carry payload is truncated"};
         }
         if (ratio == 4 &&
-            !take_live_carry(reg.index_state_values,
-                             reg.index_state_scores,
-                             4,
-                             2,
-                             ID)) {
-            return {StatusCode::InvalidArgument,
-                    "opaque index-carry payload is truncated"};
+            !take_live_carry(reg.index_state_values, reg.index_state_scores, 4, 2, ID)) {
+            return {StatusCode::InvalidArgument, "opaque index-carry payload is truncated"};
         }
     }
     if (cursor != payload.size()) {
@@ -1117,12 +1097,14 @@ float from_bf16(std::uint16_t x) noexcept {
 
 void store_bf16(std::byte* dst, std::span<const float> src) noexcept {
     auto* p = reinterpret_cast<std::uint16_t*>(dst);
-    for (std::size_t i = 0; i < src.size(); ++i) p[i] = to_bf16(src[i]);
+    for (std::size_t i = 0; i < src.size(); ++i)
+        p[i] = to_bf16(src[i]);
 }
 
 void load_bf16(const std::byte* src, std::span<float> dst) noexcept {
     const auto* p = reinterpret_cast<const std::uint16_t*>(src);
-    for (std::size_t i = 0; i < dst.size(); ++i) dst[i] = from_bf16(p[i]);
+    for (std::size_t i = 0; i < dst.size(); ++i)
+        dst[i] = from_bf16(p[i]);
 }
 
 bool update_compressor(const ArchIr& arch,
@@ -1156,12 +1138,13 @@ bool update_compressor(const ArchIr& arch,
         }
         const auto col = (coff == 2 ? hd : 0u) + k;
         for (std::uint32_t r = 0; r < ratio; ++r)
-            logits[nc++] = state_scores[static_cast<std::size_t>((coff == 2 ? ratio : 0u) + r) *
-                                             coff * hd +
-                                         col];
+            logits[nc++] =
+                state_scores[static_cast<std::size_t>((coff == 2 ? ratio : 0u) + r) * coff * hd +
+                             col];
         const float mx = *std::max_element(logits.begin(), logits.begin() + nc);
         float sum = 0.0f;
-        for (std::uint32_t i = 0; i < nc; ++i) sum += std::exp(logits[i] - mx);
+        for (std::uint32_t i = 0; i < nc; ++i)
+            sum += std::exp(logits[i] - mx);
         double acc = 0.0;
         std::uint32_t i = 0;
         if (coff == 2) {
@@ -1253,9 +1236,8 @@ StatusCode attention_kv(const ArchIr& arch,
                 const auto index_floats = static_cast<std::size_t>(2) * 4 * 2 * c.index_head_dim;
                 journal(reg.index_state_values, index_floats * sizeof(float));
                 journal(reg.index_state_scores, index_floats * sizeof(float));
-                std::fill_n(reinterpret_cast<float*>(base + reg.index_state_values),
-                            index_floats,
-                            0.0f);
+                std::fill_n(
+                    reinterpret_cast<float*>(base + reg.index_state_values), index_floats, 0.0f);
                 std::fill_n(reinterpret_cast<float*>(base + reg.index_state_scores),
                             index_floats,
                             -std::numeric_limits<float>::infinity());
@@ -1287,9 +1269,8 @@ StatusCode attention_kv(const ArchIr& arch,
              arch.attention.rope.scaling.beta_fast,
              arch.attention.rope.scaling.beta_slow);
         if (c.semantic_fp8_quant_dequant) fake_fp8(std::span<float>(kv).first(D - rd));
-        const auto window_at = reg.window +
-                               static_cast<std::size_t>(row.pos %
-                                                        arch.attention.sliding_window) * D * 2;
+        const auto window_at =
+            reg.window + static_cast<std::size_t>(row.pos % arch.attention.sliding_window) * D * 2;
         journal(window_at, static_cast<std::size_t>(D) * 2);
         store_bf16(base + window_at, kv);
         const auto coff = ratio == 4 ? 2u : 1u;
@@ -1333,7 +1314,8 @@ StatusCode attention_kv(const ArchIr& arch,
                               base + reg.index);
             const auto eligible = (row.pos + 1) / 4;
             if (eligible > 0) {
-                std::vector<float> iq(static_cast<std::size_t>(IH) * ID), iw(IH), ikv(ID), scores(eligible);
+                std::vector<float> iq(static_cast<std::size_t>(IH) * ID), iw(IH), ikv(ID),
+                    scores(eligible);
                 matvec(p->indexer.wq_b, qlow, iq);
                 matvec(p->indexer.weights_proj, std::span<const float>(xr, d), iw);
                 const float scale = 1.0f / std::sqrt(static_cast<float>(ID * IH));
@@ -1355,13 +1337,13 @@ StatusCode attention_kv(const ArchIr& arch,
                     load_bf16(base + reg.index + static_cast<std::size_t>(k) * ID * 2, ikv);
                     double score = 0.0;
                     for (std::uint32_t h = 0; h < IH; ++h)
-                        score += std::max(0.0f,
-                                          f32::dot(std::span<const float>(iq.data() +
-                                                                              static_cast<std::size_t>(h) * ID,
-                                                                          ID),
-                                                   ikv,
-                                                   ID)) *
-                                 iw[h] * scale;
+                        score +=
+                            std::max(0.0f,
+                                     f32::dot(std::span<const float>(
+                                                  iq.data() + static_cast<std::size_t>(h) * ID, ID),
+                                              ikv,
+                                              ID)) *
+                            iw[h] * scale;
                     scores[k] = static_cast<float>(score);
                 }
                 const auto take = std::min<std::uint32_t>(eligible, c.index_topk);
@@ -1376,8 +1358,8 @@ StatusCode attention_kv(const ArchIr& arch,
                                    ? row.pos + 1 - arch.attention.sliding_window
                                    : 0;
         const auto nwin = row.pos - win_first + 1;
-        const auto ncomp = ratio == 4 ? static_cast<std::uint32_t>(chosen.size())
-                                     : (row.pos + 1) / ratio;
+        const auto ncomp =
+            ratio == 4 ? static_cast<std::uint32_t>(chosen.size()) : (row.pos + 1) / ratio;
         logits.resize(nwin + ncomp);
         for (std::uint32_t h = 0; h < H; ++h) {
             const float* qh = q.data() + static_cast<std::size_t>(h) * D;
@@ -1399,7 +1381,8 @@ StatusCode attention_kv(const ArchIr& arch,
                 mx = std::max(mx, logits[at]);
             }
             float denom = std::exp(p->attn_sink[h] - mx);
-            for (const float v : logits) denom += std::exp(v - mx);
+            for (const float v : logits)
+                denom += std::exp(v - mx);
             at = 0;
             for (std::uint32_t pos = win_first; pos <= row.pos; ++pos, ++at) {
                 load_bf16(base + reg.window +
@@ -1427,12 +1410,10 @@ StatusCode attention_kv(const ArchIr& arch,
             const auto wg = row_block(p->wo_a, g * R, R);
             matvec(wg,
                    std::span<const float>(heads).subspan(static_cast<std::size_t>(g) * hpg * D,
-                                                        hpg * D),
+                                                         hpg * D),
                    std::span<float>(low).subspan(static_cast<std::size_t>(g) * R, R));
         }
-        matvec(p->wo_b,
-               low,
-               std::span<float>(out + static_cast<std::size_t>(rix) * d, d));
+        matvec(p->wo_b, low, std::span<float>(out + static_cast<std::size_t>(rix) * d, d));
     }
     return StatusCode::Ok;
 }

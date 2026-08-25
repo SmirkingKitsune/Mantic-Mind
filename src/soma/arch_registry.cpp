@@ -9,12 +9,12 @@
 // of resolving to a descriptor is that the hot path never asks the question
 // again.
 
+#include "soma/arch/compressed_sparse.hpp"
+#include "soma/arch/deepseek_dspark.hpp"
 #include "soma/arch/gdn.hpp"
 #include "soma/arch/gqa.hpp"
 #include "soma/arch/kda.hpp"
 #include "soma/arch/mla.hpp"
-#include "soma/arch/compressed_sparse.hpp"
-#include "soma/arch/deepseek_dspark.hpp"
 #include "soma/f32_model.hpp"
 
 namespace soma {

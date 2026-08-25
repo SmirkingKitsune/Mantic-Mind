@@ -118,9 +118,7 @@ void project_q(const ArchIr& arch,
 /// model: gating the o_proj OUTPUT would apply an `n_heads * head_dim`-wide mask
 /// to a `d_model`-wide vector, and gating the queries instead would change what
 /// attention attends to rather than how much of it survives.
-void apply_output_gate(const ArchIr& arch,
-                       std::uint32_t n_rows,
-                       soma::F32Workspace& ws) noexcept {
+void apply_output_gate(const ArchIr& arch, std::uint32_t n_rows, soma::F32Workspace& ws) noexcept {
     if (!arch.attention.fused_output_gate) return;
     const auto hq = arch.attention.n_heads * arch.attention.head_dim;
     const auto span = static_cast<std::size_t>(n_rows) * hq;
@@ -129,240 +127,236 @@ void apply_output_gate(const ArchIr& arch,
     }
 }
 
-    // ── block-sparse key selection ───────────────────────────────────────────────
-    //
-    // The "Lightning Indexer". A small scoring branch decides, per query and per GQA
-    // group, which BLOCKS of keys the softmax below is allowed to see. Everything
-    // else about attention is unchanged — same projections, same norms, same
-    // rotation, same score loop — which is why this lives here rather than in a
-    // backend of its own.
-    //
-    // Transcribed from `MiniMaxM3VLIndexer.forward` and `build_block_mask` in
-    // transformers 5.15.1, and the four places a plausible reading differs from
-    // theirs are marked below. Each of them produces a model that runs.
+// ── block-sparse key selection ───────────────────────────────────────────────
+//
+// The "Lightning Indexer". A small scoring branch decides, per query and per GQA
+// group, which BLOCKS of keys the softmax below is allowed to see. Everything
+// else about attention is unchanged — same projections, same norms, same
+// rotation, same score loop — which is why this lives here rather than in a
+// backend of its own.
+//
+// Transcribed from `MiniMaxM3VLIndexer.forward` and `build_block_mask` in
+// transformers 5.15.1, and the four places a plausible reading differs from
+// theirs are marked below. Each of them produces a model that runs.
 
-    /// Positive and negative infinity, named because both are load-bearing VALUES
-    /// here rather than error states: `-inf` marks a block no key can reach and is
-    /// what `topk` sorts to the end, and `+inf` is how a forced-local block wins a
-    /// slot rather than being appended to the selection.
-    constexpr float kNegInf = -std::numeric_limits<float>::infinity();
-    constexpr float kPosInf = std::numeric_limits<float>::infinity();
+/// Positive and negative infinity, named because both are load-bearing VALUES
+/// here rather than error states: `-inf` marks a block no key can reach and is
+/// what `topk` sorts to the end, and `+inf` is how a forced-local block wins a
+/// slot rather than being appended to the selection.
+constexpr float kNegInf = -std::numeric_limits<float>::infinity();
+constexpr float kPosInf = std::numeric_limits<float>::infinity();
 
-    /// Per-forward scratch for the indexer, carried in `F32Workspace::arch_state`.
-    ///
-    /// The same opaque idiom `arch::mla` uses for its DSA selection, and for the same
-    /// reason: this outlives one layer but not one forward, the core must not learn
-    /// what is in it, and a `std::vector` allocated in the middle of a 60-layer
-    /// forward is exactly the sort of thing that only looks free.
-    ///
-    /// Unlike DSA's, this is scratch and NOT shared state. Every indexed layer
-    /// recomputes its own selection from its own weights — this family has no
-    /// IndexShare — so a stale payload from a previous prompt can only be the wrong
-    /// SIZE, never the wrong contents. It is resized and refilled on every use
-    /// regardless.
-    struct BsaScratch {
-        std::vector<float> q;          ///< [rows, n_index_heads * index_head_dim]
-        std::vector<float> k;          ///< [rows, index_head_dim] — one head
-        std::vector<float> block;      ///< [n_workers, n_blocks] block scores
-        std::vector<float> topv;       ///< [n_workers, n_blocks]
-        std::vector<std::uint32_t> topi; ///< [n_workers, n_blocks]
-        std::vector<std::uint8_t> keep;  ///< [rows, n_index_heads, n_blocks]
-        std::vector<std::uint32_t> pos;  ///< [rows] absolute positions
-        std::uint32_t n_blocks = 0;
+/// Per-forward scratch for the indexer, carried in `F32Workspace::arch_state`.
+///
+/// The same opaque idiom `arch::mla` uses for its DSA selection, and for the same
+/// reason: this outlives one layer but not one forward, the core must not learn
+/// what is in it, and a `std::vector` allocated in the middle of a 60-layer
+/// forward is exactly the sort of thing that only looks free.
+///
+/// Unlike DSA's, this is scratch and NOT shared state. Every indexed layer
+/// recomputes its own selection from its own weights — this family has no
+/// IndexShare — so a stale payload from a previous prompt can only be the wrong
+/// SIZE, never the wrong contents. It is resized and refilled on every use
+/// regardless.
+struct BsaScratch {
+    std::vector<float> q;            ///< [rows, n_index_heads * index_head_dim]
+    std::vector<float> k;            ///< [rows, index_head_dim] — one head
+    std::vector<float> block;        ///< [n_workers, n_blocks] block scores
+    std::vector<float> topv;         ///< [n_workers, n_blocks]
+    std::vector<std::uint32_t> topi; ///< [n_workers, n_blocks]
+    std::vector<std::uint8_t> keep;  ///< [rows, n_index_heads, n_blocks]
+    std::vector<std::uint32_t> pos;  ///< [rows] absolute positions
+    std::uint32_t n_blocks = 0;
 
-        /// Row `r`, indexer head `h`: one byte per key block, 1 = visible.
-        std::uint8_t* row(std::uint32_t r, std::uint32_t h, std::uint32_t heads) noexcept {
-            return keep.data() +
-                   ((static_cast<std::size_t>(r) * heads) + h) * n_blocks;
-        }
-        const std::uint8_t* row(std::uint32_t r, std::uint32_t h, std::uint32_t heads) const noexcept {
-            return keep.data() +
-                   ((static_cast<std::size_t>(r) * heads) + h) * n_blocks;
-        }
-    };
-
-    BsaScratch& bsa_scratch(soma::F32Workspace& ws) {
-        if (ws.arch_state.empty()) {
-            ws.arch_state.adopt(new BsaScratch(), [](void* p) { delete static_cast<BsaScratch*>(p); });
-        }
-        return *ws.arch_state.as<BsaScratch>();
+    /// Row `r`, indexer head `h`: one byte per key block, 1 = visible.
+    std::uint8_t* row(std::uint32_t r, std::uint32_t h, std::uint32_t heads) noexcept {
+        return keep.data() + ((static_cast<std::size_t>(r) * heads) + h) * n_blocks;
     }
 
-    /// Project, normalize and rotate the indexer's queries and this row's key.
-    ///
-    /// `positions[r]` is the ABSOLUTE position of row `r`, which for the cached path
-    /// is `KvRow::pos` and not the row's index in the batch — the same distinction
-    /// the main attention makes, and wrong here in the same way: finite, plausible,
-    /// and rotated as if every row were at the head of the sequence.
-    void bsa_project(const ArchIr& arch,
-                     const F32AttnWeights& aw,
-                     std::span<const float> xs,
-                     std::uint32_t n_rows,
-                     const std::uint32_t* positions,
-                     BsaScratch& sc) noexcept {
-        const auto& b = arch.attention.bsa;
-        const auto H = b.n_index_heads;
-        const auto D = b.index_head_dim;
-        const auto eps = arch.rms_norm_eps;
-        const auto offset = arch.rms_norm_weight_offset();
-
-        sc.q.resize(static_cast<std::size_t>(n_rows) * H * D);
-        sc.k.resize(static_cast<std::size_t>(n_rows) * D);
-        soma::matmul(aw.idx.q_proj, xs, n_rows, sc.q);
-        soma::matmul(aw.idx.k_proj, xs, n_rows, sc.k);
-
-        // The rotation is the MAIN attention's slice, not a slice of the indexer's
-        // own head. Upstream passes `cos[..., :self.head_dim]` into the shared
-        // `apply_rotary_pos_emb`, which then rotates `cos.shape[-1]` channels — and
-        // `cos` is only `partial_dim` wide to begin with, so slicing it at the wider
-        // index_head_dim is a no-op. `validate_arch_ir` refuses the narrower case
-        // rather than transcribing what that slice would do.
-        const auto& rope = arch.attention.rope;
-        const auto rotary = (rope.partial_dim > 0) ? rope.partial_dim : D;
-
-        for (std::uint32_t r = 0; r < n_rows; ++r) {
-            auto qr = std::span<float>(sc.q).subspan(static_cast<std::size_t>(r) * H * D,
-                                                     static_cast<std::size_t>(H) * D);
-            auto kr = std::span<float>(sc.k).subspan(static_cast<std::size_t>(r) * D, D);
-            // PER HEAD, both of them. `q_norm` and `k_norm` are `RMSNorm(head_dim)`
-            // applied to a `[..., heads, head_dim]` view, so the key's single head
-            // normalizes over D exactly as each of the query's H heads does.
-            for (std::uint32_t h = 0; h < H; ++h) {
-                f32::rmsnorm(qr.subspan(static_cast<std::size_t>(h) * D, D),
-                             aw.idx.q_norm,
-                             D,
-                             eps,
-                             offset);
-            }
-            f32::rmsnorm(kr, aw.idx.k_norm, D, eps, offset);
-
-            const auto p = positions[r];
-            if (rope.interleaved) {
-                f32::rope_interleaved(qr, H, D, p, rope.theta, rotary);
-                f32::rope_interleaved(kr, 1, D, p, rope.theta, rotary);
-            } else {
-                f32::rope_neox(qr, H, D, p, rope.theta, rotary);
-                f32::rope_neox(kr, 1, D, p, rope.theta, rotary);
-            }
-        }
+    const std::uint8_t* row(std::uint32_t r, std::uint32_t h, std::uint32_t heads) const noexcept {
+        return keep.data() + ((static_cast<std::size_t>(r) * heads) + h) * n_blocks;
     }
+};
 
-    /// Walk the key positions one query may attend, in ascending order.
-    ///
-    /// `keep == nullptr` is DENSE and is the whole of what plain GQA and MHA do
-    /// here: the visible set is `[lo, hi)` and there is no mask to consult. The
-    /// branch resolves once per (row, head), never per key, so the families that
-    /// predate block sparsity walk exactly the loop they always did.
-    ///
-    /// The sparse walk iterates BLOCKS and then the keys inside each, rather
-    /// than every key with a per-key mask test. That is not a micro-optimization
-    /// — it is what makes the family pay off. A per-key test still touches every
-    /// cached position, so the loop would stay O(context) and block sparsity
-    /// would buy nothing but a smaller softmax.
-    ///
-    /// Ascending, and both callers rely on it: the scores are written in this
-    /// order and read back in the same one, so a block walk that visited blocks
-    /// out of order would pair every score with the wrong value vector.
-    /// `top_k` returns indices by descending SCORE, which is precisely why the
-    /// mask is a per-block flag here rather than the packed index list upstream
-    /// hands its kernel.
-    template <class Fn>
-    void visit_visible(const std::uint8_t* keep,
-                       std::uint32_t lo,
-                       std::uint32_t hi,
-                       std::uint32_t block_size,
-                       Fn&& fn) noexcept {
-        if (keep == nullptr) {
-            for (std::uint32_t j = lo; j < hi; ++j) fn(j);
-            return;
-        }
-        const std::uint32_t n_blocks = (hi + block_size - 1) / block_size;
-        for (std::uint32_t b = 0; b < n_blocks; ++b) {
-            if (keep[b] == 0) continue;
-            const auto begin = std::max(lo, b * block_size);
-            const auto end = std::min(hi, (b + 1) * block_size);
-            for (std::uint32_t j = begin; j < end; ++j) fn(j);
-        }
+BsaScratch& bsa_scratch(soma::F32Workspace& ws) {
+    if (ws.arch_state.empty()) {
+        ws.arch_state.adopt(new BsaScratch(), [](void* p) { delete static_cast<BsaScratch*>(p); });
     }
+    return *ws.arch_state.as<BsaScratch>();
+}
 
-    /// Fill `sc.keep` for one row: which key blocks this query may attend.
-    ///
-    /// `key_at(j)` yields the cached indexer key for absolute position `j`, so the
-    /// same routine serves the whole-sequence path (keys in `sc.k`) and the cached
-    /// path (keys in the KV cache's tail) without either learning about the other.
-    template <class KeyAt>
-    void bsa_select_row(const ArchIr& arch,
-                        const BsaScratch& sc,
-                        std::uint32_t r,
-                        std::uint32_t pos,
-                        std::uint32_t lo,
-                        std::uint32_t hi,
-                        KeyAt key_at,
-                        float* block_scores,
-                        float* top_values,
-                        std::uint32_t* top_indices,
-                        std::uint8_t* keep_base) noexcept {
-        const auto& b = arch.attention.bsa;
-        const auto H = b.n_index_heads;
-        const auto D = b.index_head_dim;
-        const auto bs = b.block_size;
+/// Project, normalize and rotate the indexer's queries and this row's key.
+///
+/// `positions[r]` is the ABSOLUTE position of row `r`, which for the cached path
+/// is `KvRow::pos` and not the row's index in the batch — the same distinction
+/// the main attention makes, and wrong here in the same way: finite, plausible,
+/// and rotated as if every row were at the head of the sequence.
+void bsa_project(const ArchIr& arch,
+                 const F32AttnWeights& aw,
+                 std::span<const float> xs,
+                 std::uint32_t n_rows,
+                 const std::uint32_t* positions,
+                 BsaScratch& sc) noexcept {
+    const auto& b = arch.attention.bsa;
+    const auto H = b.n_index_heads;
+    const auto D = b.index_head_dim;
+    const auto eps = arch.rms_norm_eps;
+    const auto offset = arch.rms_norm_weight_offset();
 
-        // Blocks are anchored to ABSOLUTE key slots, not to the visible range: block
-        // `n` covers positions `[n*bs, (n+1)*bs)` whatever `lo` is. Deriving them
-        // from `j - lo` instead would shift every boundary once a sliding window or
-        // a chunked prefill made `lo` non-zero, and the selection would no longer
-        // agree with the one the same prompt got at full length.
-        const std::uint32_t n_blocks = (hi + bs - 1) / bs;
+    sc.q.resize(static_cast<std::size_t>(n_rows) * H * D);
+    sc.k.resize(static_cast<std::size_t>(n_rows) * D);
+    soma::matmul(aw.idx.q_proj, xs, n_rows, sc.q);
+    soma::matmul(aw.idx.k_proj, xs, n_rows, sc.k);
 
+    // The rotation is the MAIN attention's slice, not a slice of the indexer's
+    // own head. Upstream passes `cos[..., :self.head_dim]` into the shared
+    // `apply_rotary_pos_emb`, which then rotates `cos.shape[-1]` channels — and
+    // `cos` is only `partial_dim` wide to begin with, so slicing it at the wider
+    // index_head_dim is a no-op. `validate_arch_ir` refuses the narrower case
+    // rather than transcribing what that slice would do.
+    const auto& rope = arch.attention.rope;
+    const auto rotary = (rope.partial_dim > 0) ? rope.partial_dim : D;
+
+    for (std::uint32_t r = 0; r < n_rows; ++r) {
+        auto qr = std::span<float>(sc.q).subspan(static_cast<std::size_t>(r) * H * D,
+                                                 static_cast<std::size_t>(H) * D);
+        auto kr = std::span<float>(sc.k).subspan(static_cast<std::size_t>(r) * D, D);
+        // PER HEAD, both of them. `q_norm` and `k_norm` are `RMSNorm(head_dim)`
+        // applied to a `[..., heads, head_dim]` view, so the key's single head
+        // normalizes over D exactly as each of the query's H heads does.
         for (std::uint32_t h = 0; h < H; ++h) {
-            const float* qv = sc.q.data() +
-                              (static_cast<std::size_t>(r) * H + h) * D;
-            std::fill_n(block_scores, n_blocks, kNegInf);
+            f32::rmsnorm(
+                qr.subspan(static_cast<std::size_t>(h) * D, D), aw.idx.q_norm, D, eps, offset);
+        }
+        f32::rmsnorm(kr, aw.idx.k_norm, D, eps, offset);
 
-            // MAX-pooled, not summed or averaged. A block is worth attending if its
-            // BEST key is — one strong key carries the `block_size - 1` around it,
-            // which is the whole premise of scoring at block granularity.
-            for (std::uint32_t j = lo; j < hi; ++j) {
-                const float s = f32::dot(std::span<const float>(qv, D),
-                                         std::span<const float>(key_at(j), D),
-                                         D);
-                const auto blk = j / bs;
-                if (s > block_scores[blk]) block_scores[blk] = s;
-            }
-
-            // The local guarantee, applied by OVERWRITING the score with +inf rather
-            // than by adding these blocks to the selection afterwards.
-            //
-            // That is upstream's mechanism and it is not an implementation detail:
-            // forcing them through the score means they consume top-k slots, so a
-            // query sees `topk_blocks` blocks and not `topk_blocks + local_blocks`.
-            // Appending them instead would attend to the query's own block twice —
-            // and the deployment kernel this format feeds reads the list
-            // sequentially, so a repeat is a double count rather than a no-op.
-            for (std::uint32_t i = 0; i < b.local_blocks; ++i) {
-                const auto qb = pos / bs;
-                const auto blk = (qb >= i) ? (qb - i) : 0u;
-                if (blk < n_blocks) block_scores[blk] = kPosInf;
-            }
-
-            const auto k = std::min(b.topk_blocks, n_blocks);
-            f32::top_k(std::span<const float>(block_scores, n_blocks),
-                       n_blocks,
-                       k,
-                       std::span<std::uint32_t>(top_indices, k),
-                       std::span<float>(top_values, k));
-
-            std::uint8_t* keep = keep_base + (static_cast<std::size_t>(r) * H + h) * sc.n_blocks;
-            std::fill_n(keep, sc.n_blocks, std::uint8_t{0});
-            for (std::uint32_t i = 0; i < k; ++i) {
-                // A `-inf` slot is a block no visible key reaches: future, or empty
-                // because the prefix is shorter than the block grid. Upstream tags
-                // these `-1` and the kernel skips them. Keeping them instead would
-                // let a query attend past its own position.
-                if (top_values[i] != kNegInf) keep[top_indices[i]] = 1;
-            }
+        const auto p = positions[r];
+        if (rope.interleaved) {
+            f32::rope_interleaved(qr, H, D, p, rope.theta, rotary);
+            f32::rope_interleaved(kr, 1, D, p, rope.theta, rotary);
+        } else {
+            f32::rope_neox(qr, H, D, p, rope.theta, rotary);
+            f32::rope_neox(kr, 1, D, p, rope.theta, rotary);
         }
     }
+}
+
+/// Walk the key positions one query may attend, in ascending order.
+///
+/// `keep == nullptr` is DENSE and is the whole of what plain GQA and MHA do
+/// here: the visible set is `[lo, hi)` and there is no mask to consult. The
+/// branch resolves once per (row, head), never per key, so the families that
+/// predate block sparsity walk exactly the loop they always did.
+///
+/// The sparse walk iterates BLOCKS and then the keys inside each, rather
+/// than every key with a per-key mask test. That is not a micro-optimization
+/// — it is what makes the family pay off. A per-key test still touches every
+/// cached position, so the loop would stay O(context) and block sparsity
+/// would buy nothing but a smaller softmax.
+///
+/// Ascending, and both callers rely on it: the scores are written in this
+/// order and read back in the same one, so a block walk that visited blocks
+/// out of order would pair every score with the wrong value vector.
+/// `top_k` returns indices by descending SCORE, which is precisely why the
+/// mask is a per-block flag here rather than the packed index list upstream
+/// hands its kernel.
+template <class Fn>
+void visit_visible(const std::uint8_t* keep,
+                   std::uint32_t lo,
+                   std::uint32_t hi,
+                   std::uint32_t block_size,
+                   Fn&& fn) noexcept {
+    if (keep == nullptr) {
+        for (std::uint32_t j = lo; j < hi; ++j)
+            fn(j);
+        return;
+    }
+    const std::uint32_t n_blocks = (hi + block_size - 1) / block_size;
+    for (std::uint32_t b = 0; b < n_blocks; ++b) {
+        if (keep[b] == 0) continue;
+        const auto begin = std::max(lo, b * block_size);
+        const auto end = std::min(hi, (b + 1) * block_size);
+        for (std::uint32_t j = begin; j < end; ++j)
+            fn(j);
+    }
+}
+
+/// Fill `sc.keep` for one row: which key blocks this query may attend.
+///
+/// `key_at(j)` yields the cached indexer key for absolute position `j`, so the
+/// same routine serves the whole-sequence path (keys in `sc.k`) and the cached
+/// path (keys in the KV cache's tail) without either learning about the other.
+template <class KeyAt>
+void bsa_select_row(const ArchIr& arch,
+                    const BsaScratch& sc,
+                    std::uint32_t r,
+                    std::uint32_t pos,
+                    std::uint32_t lo,
+                    std::uint32_t hi,
+                    KeyAt key_at,
+                    float* block_scores,
+                    float* top_values,
+                    std::uint32_t* top_indices,
+                    std::uint8_t* keep_base) noexcept {
+    const auto& b = arch.attention.bsa;
+    const auto H = b.n_index_heads;
+    const auto D = b.index_head_dim;
+    const auto bs = b.block_size;
+
+    // Blocks are anchored to ABSOLUTE key slots, not to the visible range: block
+    // `n` covers positions `[n*bs, (n+1)*bs)` whatever `lo` is. Deriving them
+    // from `j - lo` instead would shift every boundary once a sliding window or
+    // a chunked prefill made `lo` non-zero, and the selection would no longer
+    // agree with the one the same prompt got at full length.
+    const std::uint32_t n_blocks = (hi + bs - 1) / bs;
+
+    for (std::uint32_t h = 0; h < H; ++h) {
+        const float* qv = sc.q.data() + (static_cast<std::size_t>(r) * H + h) * D;
+        std::fill_n(block_scores, n_blocks, kNegInf);
+
+        // MAX-pooled, not summed or averaged. A block is worth attending if its
+        // BEST key is — one strong key carries the `block_size - 1` around it,
+        // which is the whole premise of scoring at block granularity.
+        for (std::uint32_t j = lo; j < hi; ++j) {
+            const float s =
+                f32::dot(std::span<const float>(qv, D), std::span<const float>(key_at(j), D), D);
+            const auto blk = j / bs;
+            if (s > block_scores[blk]) block_scores[blk] = s;
+        }
+
+        // The local guarantee, applied by OVERWRITING the score with +inf rather
+        // than by adding these blocks to the selection afterwards.
+        //
+        // That is upstream's mechanism and it is not an implementation detail:
+        // forcing them through the score means they consume top-k slots, so a
+        // query sees `topk_blocks` blocks and not `topk_blocks + local_blocks`.
+        // Appending them instead would attend to the query's own block twice —
+        // and the deployment kernel this format feeds reads the list
+        // sequentially, so a repeat is a double count rather than a no-op.
+        for (std::uint32_t i = 0; i < b.local_blocks; ++i) {
+            const auto qb = pos / bs;
+            const auto blk = (qb >= i) ? (qb - i) : 0u;
+            if (blk < n_blocks) block_scores[blk] = kPosInf;
+        }
+
+        const auto k = std::min(b.topk_blocks, n_blocks);
+        f32::top_k(std::span<const float>(block_scores, n_blocks),
+                   n_blocks,
+                   k,
+                   std::span<std::uint32_t>(top_indices, k),
+                   std::span<float>(top_values, k));
+
+        std::uint8_t* keep = keep_base + (static_cast<std::size_t>(r) * H + h) * sc.n_blocks;
+        std::fill_n(keep, sc.n_blocks, std::uint8_t{0});
+        for (std::uint32_t i = 0; i < k; ++i) {
+            // A `-inf` slot is a block no visible key reaches: future, or empty
+            // because the prefix is shorter than the block grid. Upstream tags
+            // these `-1` and the kernel skips them. Keeping them instead would
+            // let a query attend past its own position.
+            if (top_values[i] != kNegInf) keep[top_indices[i]] = 1;
+        }
+    }
+}
 
 } // namespace
 
@@ -441,10 +435,8 @@ StatusCode f32_bind_layer(const ArchIr& arch,
                 !soma::bind_layer_weight(
                      ctx, "self_attn.indexer.k_proj.weight", TensorRole::AttnProj, w->idx.k_proj)
                      .ok() ||
-                !soma::bind_layer_f32(ctx, "self_attn.indexer.q_norm.weight", w->idx.q_norm)
-                     .ok() ||
-                !soma::bind_layer_f32(ctx, "self_attn.indexer.k_norm.weight", w->idx.k_norm)
-                     .ok()) {
+                !soma::bind_layer_f32(ctx, "self_attn.indexer.q_norm.weight", w->idx.q_norm).ok() ||
+                !soma::bind_layer_f32(ctx, "self_attn.indexer.k_norm.weight", w->idx.k_norm).ok()) {
                 return StatusCode::NotFound;
             }
             // The key projection is SINGLE-HEADED and the query projection is
@@ -967,9 +959,8 @@ soma::KvGeometry f32_kv_geometry(const ArchIr& arch) noexcept {
     // `d_model -> index_head_dim` and every indexer head scores against that
     // same key; sizing it per head would over-allocate this plane fourfold on
     // the reference checkpoint.
-    const auto index = (arch.attention.family == AttentionFamily::GqaBsa)
-                           ? arch.attention.bsa.index_head_dim
-                           : 0u;
+    const auto index =
+        (arch.attention.family == AttentionFamily::GqaBsa) ? arch.attention.bsa.index_head_dim : 0u;
     return soma::KvGeometry{hkv + index, hkv};
 }
 

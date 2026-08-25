@@ -51,7 +51,6 @@
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
-using ordered_json = nlohmann::ordered_json;
 
 namespace soma {
 
@@ -574,8 +573,7 @@ struct ServeServer::Impl {
             // Existing generic families retain their byte-identical generation
             // behavior; V4's codec stops on EOS before it can enter protocol
             // parsing or public content.
-            if (prompt_codec != nullptr)
-                req.stop_token_ids = model.arch.topology.eos_token_ids;
+            if (prompt_codec != nullptr) req.stop_token_ids = model.arch.topology.eos_token_ids;
             // Cross-PROCESS warm reopen: if this conversation was checkpointed
             // before the engine was stopped, attach that cache. Same mechanism,
             // one tier up — see kv_checkpoint.hpp's "one format, three callers".
@@ -614,8 +612,8 @@ struct ServeServer::Impl {
         // presents as a failed request rather than a hung connection, not as a
         // generation limit. A step-loop fault reaches the waiter through
         // fail_all() long before this fires.
-        const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::seconds(cfg.generation_timeout_seconds);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(cfg.generation_timeout_seconds);
         Status result;
         {
             std::unique_lock<std::mutex> lk(waiter->mu);
@@ -936,7 +934,8 @@ Status ServeServer::open(const ServeConfig& config) {
     if (auto st = compute_plan(resolved, host, im.plan_doc); !st.ok()) return st;
     const auto available = host.ram_free_bytes ? host.ram_free_bytes : host.ram_total_bytes;
     const auto committed = im.plan_doc.dense_resident_bytes + im.plan_doc.kv_bytes_at_ctx;
-    if (resolved.schema_version >= kArchIrSchemaVersionV2 && available > 0 && committed > available) {
+    if (resolved.schema_version >= kArchIrSchemaVersionV2 && available > 0 &&
+        committed > available) {
         return {StatusCode::CapacityPressure, im.plan_doc.verdict_reason};
     }
     if (auto st = load_f32_model(config.model_dir, im.model, resolved.quantization); !st.ok()) {
@@ -966,8 +965,7 @@ Status ServeServer::open(const ServeConfig& config) {
                 : (config.ram_budget_bytes ? config.ram_budget_bytes : (2ull << 30));
         if (im.speculative_selected && resolved.topology.n_layers > 0) {
             b.ram_expert_cache_bytes = b.ram_expert_cache_bytes * resolved.topology.n_layers /
-                                       (resolved.topology.n_layers +
-                                        resolved.speculative.n_layers);
+                                       (resolved.topology.n_layers + resolved.speculative.n_layers);
         }
         b.pin_bytes = config.pin_bytes;
         if (auto st = im.memory.open(im.model.arch, im.store, b); !st.ok()) return st;
@@ -1205,13 +1203,8 @@ Status ServeServer::open(const ServeConfig& config) {
         "/v1/chat/completions",
         [this, served](const httplib::Request& req, httplib::Response& res) {
             json body;
-            ordered_json ordered_body;
             try {
-                // Keep an ordered parse for model protocols which serialize
-                // request-owned schemas into the prompt. The ordinary json
-                // copy preserves the existing generic HTTP behavior.
-                ordered_body = ordered_json::parse(req.body);
-                body = ordered_body;
+                body = json::parse(req.body);
             } catch (const std::exception& e) {
                 res.status = http_status_for(ServeError::BadRequest);
                 res.set_content(error_body(ServeError::BadRequest, e.what()), "application/json");
@@ -1228,7 +1221,7 @@ Status ServeServer::open(const ServeConfig& config) {
             PromptCodecState codec_state;
             ServeError err = ServeError::None;
             if (impl_->prompt_codec) {
-                if (auto st = impl_->prompt_codec->encode(ordered_body, prompt, codec_state);
+                if (auto st = impl_->prompt_codec->encode(req.body, prompt, codec_state);
                     !st.ok()) {
                     err = st.code() == StatusCode::Unsupported ? ServeError::UnsupportedContent
                                                                : ServeError::BadRequest;
@@ -1265,16 +1258,14 @@ Status ServeServer::open(const ServeConfig& config) {
                 std::string text;
                 std::vector<TokenId> token_ids;
                 FinishReason finish = FinishReason::Length;
-                if (auto st =
-                        impl_->generate(
-                            prompt,
-                            max_tokens,
-                            sampler,
-                            conversation,
-                            nullptr,
-                            text,
-                            return_token_ids ? &token_ids : nullptr,
-                            finish);
+                if (auto st = impl_->generate(prompt,
+                                              max_tokens,
+                                              sampler,
+                                              conversation,
+                                              nullptr,
+                                              text,
+                                              return_token_ids ? &token_ids : nullptr,
+                                              finish);
                     !st.ok()) {
                     const auto kind = (st.code() == StatusCode::CapacityPressure)
                                           ? ServeError::CapacityPressure
@@ -1289,22 +1280,35 @@ Status ServeServer::open(const ServeConfig& config) {
                 json message{{"role", "assistant"}, {"content", text}};
                 std::string finish_name = finish == FinishReason::Stop ? "stop" : "length";
                 if (impl_->prompt_codec) {
+                    PromptMessage parsed_message;
                     if (auto st = impl_->prompt_codec->parse(
-                            text, codec_state, true, finish == FinishReason::Stop, message);
+                            text, codec_state, true, finish == FinishReason::Stop, parsed_message);
                         !st.ok()) {
                         res.status = http_status_for(ServeError::ProtocolError);
                         res.set_content(error_body(ServeError::ProtocolError, st.message()),
                                         "application/json");
                         return;
                     }
-                    if (message.contains("tool_calls") && !message["tool_calls"].empty()) {
+                    json calls = json::array();
+                    for (const auto& call : parsed_message.tool_calls) {
+                        calls.push_back(
+                            json{{"id", call.id},
+                                 {"type", "function"},
+                                 {"function",
+                                  json{{"name", call.name}, {"arguments", call.arguments}}}});
+                    }
+                    message =
+                        json{{"role", "assistant"},
+                             {"content", std::move(parsed_message.content)},
+                             {"reasoning_content", std::move(parsed_message.reasoning_content)},
+                             {"tool_calls", std::move(calls)}};
+                    if (!parsed_message.tool_calls.empty()) {
                         finish_name = "tool_calls";
                     }
                 }
-                out["choices"] =
-                    json::array({json{{"index", 0},
-                                      {"message", std::move(message)},
-                                      {"finish_reason", finish_name}}});
+                out["choices"] = json::array({json{{"index", 0},
+                                                   {"message", std::move(message)},
+                                                   {"finish_reason", finish_name}}});
                 if (return_token_ids) out["soma_token_ids"] = std::move(token_ids);
                 res.set_content(out.dump(), "application/json");
                 return;
@@ -1338,33 +1342,37 @@ Status ServeServer::open(const ServeConfig& config) {
                     Status codec_error;
 
                     const auto emit_parsed = [&](bool final, bool stopped) -> Status {
-                        json message;
+                        PromptMessage message;
                         if (auto parsed = impl_->prompt_codec->parse(
                                 raw, codec_state, final, stopped, message);
-                            !parsed.ok()) return parsed;
+                            !parsed.ok())
+                            return parsed;
 
-                        const auto reasoning = message.value("reasoning_content", std::string{});
-                        const auto content = message.value("content", std::string{});
+                        const auto& reasoning = message.reasoning_content;
+                        const auto& content = message.content;
                         if (reasoning.size() < reasoning_sent || content.size() < content_sent) {
                             return {StatusCode::Internal,
                                     "prompt codec produced a non-monotonic streaming prefix"};
                         }
                         if (reasoning.size() > reasoning_sent) {
-                            send_delta(json{{"reasoning_content",
-                                             reasoning.substr(reasoning_sent)}});
+                            send_delta(
+                                json{{"reasoning_content", reasoning.substr(reasoning_sent)}});
                             reasoning_sent = reasoning.size();
                         }
                         if (content.size() > content_sent) {
                             send_delta(json{{"content", content.substr(content_sent)}});
                             content_sent = content.size();
                         }
-                        if (!calls_sent && message.contains("tool_calls") &&
-                            !message["tool_calls"].empty()) {
+                        if (!calls_sent && !message.tool_calls.empty()) {
                             json deltas = json::array();
-                            for (std::size_t i = 0; i < message["tool_calls"].size(); ++i) {
-                                auto call = message["tool_calls"][i];
-                                call["index"] = i;
-                                deltas.push_back(std::move(call));
+                            for (std::size_t i = 0; i < message.tool_calls.size(); ++i) {
+                                const auto& call = message.tool_calls[i];
+                                deltas.push_back(json{
+                                    {"index", i},
+                                    {"id", call.id},
+                                    {"type", "function"},
+                                    {"function",
+                                     json{{"name", call.name}, {"arguments", call.arguments}}}});
                             }
                             send_delta(json{{"tool_calls", std::move(deltas)}});
                             calls_sent = true;
@@ -1414,8 +1422,8 @@ Status ServeServer::open(const ServeConfig& config) {
                         json chunk;
                         chunk["object"] = "chat.completion.chunk";
                         chunk["model"] = served;
-                        chunk["choices"] = json::array(
-                            {json{{"index", 0}, {"delta", json::object()}, {"finish_reason", reason}}});
+                        chunk["choices"] = json::array({json{
+                            {"index", 0}, {"delta", json::object()}, {"finish_reason", reason}}});
                         (void)send(chunk);
                     }
                     const std::string done = "data: [DONE]\n\n";
@@ -1494,14 +1502,18 @@ Status parse_serve_config(int argc, const char* const* argv, ServeConfig& out) {
     }
     out.quant_dense = env_or("SOMA_QUANT_DENSE", out.quant_dense);
     const auto parse_speculative = [](const std::string& value, SpeculativeMode& mode) {
-        if (value == "off") mode = SpeculativeMode::Off;
-        else if (value == "auto") mode = SpeculativeMode::Auto;
-        else if (value == "dspark") mode = SpeculativeMode::Required;
-        else return false;
+        if (value == "off")
+            mode = SpeculativeMode::Off;
+        else if (value == "auto")
+            mode = SpeculativeMode::Auto;
+        else if (value == "dspark")
+            mode = SpeculativeMode::Required;
+        else
+            return false;
         return true;
     };
-    if (const auto s = env_or("SOMA_SPECULATIVE", ""); !s.empty() &&
-        !parse_speculative(s, out.speculative)) {
+    if (const auto s = env_or("SOMA_SPECULATIVE", "");
+        !s.empty() && !parse_speculative(s, out.speculative)) {
         return {StatusCode::InvalidArgument, "SOMA_SPECULATIVE wants off, auto, or dspark"};
     }
     if (const auto n = env_or("SOMA_SPECULATIVE_TOKENS", ""); !n.empty())
@@ -1532,8 +1544,7 @@ Status parse_serve_config(int argc, const char* const* argv, ServeConfig& out) {
             out.max_batch = static_cast<std::uint32_t>(std::stoul(argv[++i]));
         else if (a == "--speculative" && i + 1 < argc) {
             if (!parse_speculative(argv[++i], out.speculative)) {
-                return {StatusCode::InvalidArgument,
-                        "--speculative wants off, auto, or dspark"};
+                return {StatusCode::InvalidArgument, "--speculative wants off, auto, or dspark"};
             }
         } else if (a == "--speculative-tokens" && i + 1 < argc)
             out.speculative_tokens = static_cast<std::uint32_t>(std::stoul(argv[++i]));

@@ -223,10 +223,10 @@ struct F32HybridWeights {
     arch::gqa::F32AttnWeights full;
 
     /// Linear layers.
-    soma::WeightRef in_proj_qkv; ///< [2*key_dim + value_dim, d_model], FUSED
-    soma::WeightRef in_proj_z;   ///< [value_dim, d_model]
-    soma::WeightRef in_proj_b;   ///< [n_v_heads, d_model]
-    soma::WeightRef in_proj_a;   ///< [n_v_heads, d_model]
+    soma::WeightRef in_proj_qkv;    ///< [2*key_dim + value_dim, d_model], FUSED
+    soma::WeightRef in_proj_z;      ///< [value_dim, d_model]
+    soma::WeightRef in_proj_b;      ///< [n_v_heads, d_model]
+    soma::WeightRef in_proj_a;      ///< [n_v_heads, d_model]
     std::span<const float> conv_w;  ///< [conv_width][conv_kernel]
     std::span<const float> a_log;   ///< [n_v_heads]
     std::span<const float> dt_bias; ///< [n_v_heads]

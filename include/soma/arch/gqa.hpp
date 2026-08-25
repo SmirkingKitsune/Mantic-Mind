@@ -111,8 +111,8 @@ struct F32AttnWeights {
     /// would both fail the shape check and, if it did not, cache four times the
     /// bytes per token.
     struct Indexer {
-        soma::WeightRef q_proj; ///< [n_index_heads * index_head_dim, d_model]
-        soma::WeightRef k_proj; ///< [index_head_dim, d_model] — one head
+        soma::WeightRef q_proj;                ///< [n_index_heads * index_head_dim, d_model]
+        soma::WeightRef k_proj;                ///< [index_head_dim, d_model] — one head
         std::span<const float> q_norm, k_norm; ///< index_head_dim each
     } idx;
 
@@ -173,8 +173,7 @@ soma::KvGeometry f32_kv_geometry(const ArchIr& arch) noexcept;
 /// `n_layers * weight_bytes_per_layer` verbatim for GQA and MHA, which have no
 /// indexer — the two paths agree to the byte on every family that predates this
 /// one.
-std::uint64_t resident_weight_bytes(const ArchIr& arch,
-                                    AttentionBackend::ByteSizer sizer) noexcept;
+std::uint64_t resident_weight_bytes(const ArchIr& arch, AttentionBackend::ByteSizer sizer) noexcept;
 
 const soma::F32Backend& f32_backend() noexcept;
 

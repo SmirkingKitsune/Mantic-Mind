@@ -713,9 +713,8 @@ int cmd_plan(int argc, char** argv) {
         // downstream can tell that apart from a model that simply got the
         // answer wrong.
         if (doc.modality != "text") {
-            std::cout << "modality     " << doc.modality
-                      << "   (SERVED TEXT-ONLY; the " << doc.vision_layers
-                      << "-layer, " << doc.vision_hidden
+            std::cout << "modality     " << doc.modality << "   (SERVED TEXT-ONLY; the "
+                      << doc.vision_layers << "-layer, " << doc.vision_hidden
                       << "-wide vision tower is neither converted nor served)\n";
         }
     }

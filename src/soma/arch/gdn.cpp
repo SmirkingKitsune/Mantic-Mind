@@ -13,10 +13,17 @@
 namespace soma::arch::gdn {
 namespace {
 
-std::size_t align64(std::size_t n) noexcept { return (n + 63u) & ~std::size_t{63u}; }
+std::size_t align64(std::size_t n) noexcept {
+    return (n + 63u) & ~std::size_t{63u};
+}
 
-inline float sigmoidf(float x) noexcept { return 1.0f / (1.0f + std::exp(-x)); }
-inline float siluf(float x) noexcept { return x * sigmoidf(x); }
+inline float sigmoidf(float x) noexcept {
+    return 1.0f / (1.0f + std::exp(-x));
+}
+
+inline float siluf(float x) noexcept {
+    return x * sigmoidf(x);
+}
 
 /// log(1 + e^x), guarded. The naive form overflows for large x and loses the
 /// whole value to rounding for very negative x; both are reachable because
@@ -252,13 +259,15 @@ void short_conv(std::uint32_t width,
         // for a kernel of 4 is a plausible-looking smear over the wrong three
         // positions.
         float acc = 0.0f;
-        for (std::uint32_t i = 0; i < carried; ++i) acc += s[i] * w[i];
+        for (std::uint32_t i = 0; i < carried; ++i)
+            acc += s[i] * w[i];
         acc += x[c] * w[carried];
 
         // Advance: drop the oldest, append the current input (NOT the output —
         // the convolution is over the projection, and feeding its own activated
         // result back would make this an IIR filter).
-        for (std::uint32_t i = 0; i + 1 < carried; ++i) s[i] = s[i + 1];
+        for (std::uint32_t i = 0; i + 1 < carried; ++i)
+            s[i] = s[i + 1];
         if (carried > 0) s[carried - 1] = x[c];
 
         out[c] = siluf(acc);
@@ -313,7 +322,8 @@ void step(const ArchIr& arch,
 
         // 1. Decay the whole state by one scalar.
         const auto n = static_cast<std::size_t>(dk) * dv;
-        for (std::size_t i = 0; i < n; ++i) sh[i] *= decay;
+        for (std::size_t i = 0; i < n; ++i)
+            sh[i] *= decay;
 
         // 2. Predict from the DECAYED state: kv_mem = S^T k.
         std::fill_n(scratch, dv, 0.0f);
@@ -321,16 +331,19 @@ void step(const ArchIr& arch,
             const float ki = kh_ptr[i] * kinv;
             if (ki == 0.0f) continue;
             const float* row = sh + static_cast<std::size_t>(i) * dv;
-            for (std::uint32_t j = 0; j < dv; ++j) scratch[j] += row[j] * ki;
+            for (std::uint32_t j = 0; j < dv; ++j)
+                scratch[j] += row[j] * ki;
         }
 
         // 3. Correct toward v, scaled by beta, and write the outer product back.
-        for (std::uint32_t j = 0; j < dv; ++j) scratch[j] = (vh[j] - scratch[j]) * beta;
+        for (std::uint32_t j = 0; j < dv; ++j)
+            scratch[j] = (vh[j] - scratch[j]) * beta;
         for (std::uint32_t i = 0; i < dk; ++i) {
             const float ki = kh_ptr[i] * kinv;
             if (ki == 0.0f) continue;
             float* row = sh + static_cast<std::size_t>(i) * dv;
-            for (std::uint32_t j = 0; j < dv; ++j) row[j] += ki * scratch[j];
+            for (std::uint32_t j = 0; j < dv; ++j)
+                row[j] += ki * scratch[j];
         }
 
         // 4. Read out from the UPDATED state.
@@ -339,7 +352,8 @@ void step(const ArchIr& arch,
             const float qi = qh[i] * qinv * scale;
             if (qi == 0.0f) continue;
             const float* row = sh + static_cast<std::size_t>(i) * dv;
-            for (std::uint32_t j = 0; j < dv; ++j) oh[j] += row[j] * qi;
+            for (std::uint32_t j = 0; j < dv; ++j)
+                oh[j] += row[j] * qi;
         }
     }
 }
@@ -355,7 +369,8 @@ void gated_rmsnorm(const ArchIr& arch,
     for (std::uint32_t h = 0; h < g.n_v_heads; ++h) {
         const auto off = static_cast<std::size_t>(h) * dv;
         float sum = 0.0f;
-        for (std::uint32_t i = 0; i < dv; ++i) sum += x[off + i] * x[off + i];
+        for (std::uint32_t i = 0; i < dv; ++i)
+            sum += x[off + i] * x[off + i];
         const float inv = 1.0f / std::sqrt(sum / static_cast<float>(dv) + eps);
         for (std::uint32_t i = 0; i < dv; ++i) {
             // Norm, then WEIGHT, then the gate. `weight` is one [head_v_dim]

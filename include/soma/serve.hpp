@@ -74,7 +74,7 @@ struct ServeConfig {
     Determinism determinism = Determinism::Batched; // --determinism SOMA_DETERMINISM
 
     SpeculativeMode speculative = SpeculativeMode::Auto; // --speculative SOMA_SPECULATIVE
-    std::uint32_t speculative_tokens = 7; // --speculative-tokens SOMA_SPECULATIVE_TOKENS
+    std::uint32_t speculative_tokens = 7;          // --speculative-tokens SOMA_SPECULATIVE_TOKENS
     float speculative_confidence_threshold = 0.0f; // --dspark-confidence-threshold
 
     std::uint32_t telemetry_hz = kDefaultTelemetryHz; // --telemetry-hz

@@ -100,8 +100,7 @@ parse_kv_checkpoint_header(const std::byte* data, std::size_t size, KvCheckpoint
     // this header without a store and must not interpret a v1 layout — where the
     // payload starts immediately and the token array does not exist — as a v2
     // one. Every offset below would be wrong by 4 x length_tokens.
-    if (out.version != kKvCheckpointVersion &&
-        out.version != kKvCheckpointVersionSpeculative) {
+    if (out.version != kKvCheckpointVersion && out.version != kKvCheckpointVersionSpeculative) {
         return {StatusCode::VersionMismatch,
                 "unsupported checkpoint version " + std::to_string(out.version)};
     }

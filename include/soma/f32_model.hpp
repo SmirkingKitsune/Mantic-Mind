@@ -566,8 +566,7 @@ struct SpeculativeProposal {
 struct SpeculativeBackend {
     const char* name = nullptr;
 
-    StatusCode (*bind_model)(F32Model& model,
-                             const std::string& model_dir) noexcept = nullptr;
+    StatusCode (*bind_model)(F32Model& model, const std::string& model_dir) noexcept = nullptr;
     StatusCode (*start_runtime)(F32Model& model,
                                 const std::string& model_dir,
                                 std::uint64_t expert_cache_bytes) noexcept = nullptr;

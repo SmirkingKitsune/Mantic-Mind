@@ -195,8 +195,7 @@ Status Scheduler::open_f32(const F32Model& model,
     if (model.arch.schema_version >= kArchIrSchemaVersionV2 &&
         model.arch.topology.max_position_embeddings > 0 &&
         config.ctx_size > model.arch.topology.max_position_embeddings) {
-        return {StatusCode::InvalidArgument,
-                "ctx_size exceeds the model's maximum context"};
+        return {StatusCode::InvalidArgument, "ctx_size exceeds the model's maximum context"};
     }
     auto& im = *impl_;
     im.model = &model;
@@ -265,8 +264,8 @@ Status Scheduler::admit(SeqRequest request, SeqId& out_id, AdmitRejection& out_r
         if (speculative->open_sequence == nullptr) {
             return {StatusCode::Unsupported, "speculative backend cannot create sequence state"};
         }
-        if (const auto rc = speculative->open_sequence(
-                *im.model, im.cfg.ctx_size, s->speculative_state);
+        if (const auto rc =
+                speculative->open_sequence(*im.model, im.cfg.ctx_size, s->speculative_state);
             rc != StatusCode::Ok) {
             return {rc, "could not create speculative sequence state"};
         }
@@ -294,8 +293,9 @@ Status Scheduler::admit(SeqRequest request, SeqId& out_id, AdmitRejection& out_r
         if (base_prefix && im.cfg.enable_speculation && im.model->speculative_backend != nullptr) {
             speculative_ok = !cached.auxiliary.empty() &&
                              im.model->speculative_backend->restore_state != nullptr &&
-                             im.model->speculative_backend->restore_state(
-                                 *im.model, cached.auxiliary, s->speculative_state).ok();
+                             im.model->speculative_backend
+                                 ->restore_state(*im.model, cached.auxiliary, s->speculative_state)
+                                 .ok();
         }
         const bool is_prefix = base_prefix && speculative_ok;
         if (is_prefix && !cached.tokens.empty()) {
@@ -390,8 +390,7 @@ Status Scheduler::step() {
         return {};
     }
 
-    const auto* speculative =
-        (im.cfg.enable_speculation ? im.model->speculative_backend : nullptr);
+    const auto* speculative = (im.cfg.enable_speculation ? im.model->speculative_backend : nullptr);
 
     // Batch-1 speculative verification. Proposal construction is backend-owned;
     // sampling, stopping, streaming and target KV prefix commit remain ordinary
@@ -401,21 +400,19 @@ Status Scheduler::step() {
         Seq* s = batch[0];
         const auto remaining_ctx = s->kv.capacity() - s->kv.length();
         const auto remaining_out = s->max_tokens - s->generated;
-        const auto proposal_cap = remaining_ctx > 0
-                                      ? std::min({im.cfg.speculative_tokens,
-                                                  remaining_out,
-                                                  remaining_ctx - 1})
-                                      : 0u;
+        const auto proposal_cap =
+            remaining_ctx > 0
+                ? std::min({im.cfg.speculative_tokens, remaining_out, remaining_ctx - 1})
+                : 0u;
         SpeculativeProposal proposal;
         if (proposal_cap > 0) {
-            if (const auto rc = speculative->propose(
-                    *im.model,
-                    im.model->speculative_payload,
-                    s->speculative_state,
-                    s->next_token,
-                    proposal_cap,
-                    im.cfg.speculative_confidence_threshold,
-                    proposal);
+            if (const auto rc = speculative->propose(*im.model,
+                                                     im.model->speculative_payload,
+                                                     s->speculative_state,
+                                                     s->next_token,
+                                                     proposal_cap,
+                                                     im.cfg.speculative_confidence_threshold,
+                                                     proposal);
                 rc != StatusCode::Ok) {
                 if (im.on_error) im.on_error(s->id, rc, "speculative proposal failed");
                 s->finished = true;
@@ -454,8 +451,7 @@ Status Scheduler::step() {
                 r.transaction_row = j;
             }
             HiddenStateTaps taps{im.model->arch.speculative.target_layer_ids};
-            if (auto st = forward_step_f32(
-                    *im.model, verify, verify_rows, im.ws, im.logits, &taps);
+            if (auto st = forward_step_f32(*im.model, verify, verify_rows, im.ws, im.logits, &taps);
                 !st.ok()) {
                 s->kv.abort_tentative();
                 if (im.on_error) im.on_error(s->id, st.code(), st.message().c_str());
@@ -468,8 +464,7 @@ Status Scheduler::step() {
                 if (logits_are_finite(std::span<const float>(lg, vocab))) continue;
                 s->kv.abort_tentative();
                 s->finished = true;
-                const Status st{StatusCode::Internal,
-                                "model produced non-finite output logits"};
+                const Status st{StatusCode::Internal, "model produced non-finite output logits"};
                 if (im.on_error) im.on_error(s->id, st.code(), st.message().c_str());
                 return st;
             }
@@ -480,17 +475,14 @@ Status Scheduler::step() {
             TokenId last = s->next_token;
             const auto emit_sample = [&](std::uint32_t row) {
                 const float* lg = im.logits.data() + static_cast<std::size_t>(row) * vocab;
-                last = sample_token(std::span<const float>(lg, vocab),
-                                    s->sampler,
-                                    s->emitted,
-                                    s->scratch);
+                last = sample_token(
+                    std::span<const float>(lg, vocab), s->sampler, s->emitted, s->scratch);
                 s->emitted.push_back(last);
                 s->next_token = last;
                 ++s->generated;
                 ++im.stats.tokens_out;
-                hit_stop = std::find(s->stop_token_ids.begin(),
-                                     s->stop_token_ids.end(),
-                                     last) != s->stop_token_ids.end();
+                hit_stop = std::find(s->stop_token_ids.begin(), s->stop_token_ids.end(), last) !=
+                           s->stop_token_ids.end();
                 terminal = hit_stop || s->generated >= s->max_tokens;
             };
 
@@ -505,8 +497,7 @@ Status Scheduler::step() {
                 // transaction commits exactly `committed_rows`, so this is the
                 // earliest point at which the callback can truthfully mark the
                 // token that consumed the last cache position.
-                terminal = terminal ||
-                           s->kv.length() + committed_rows >= s->kv.capacity();
+                terminal = terminal || s->kv.length() + committed_rows >= s->kv.capacity();
                 if (!hit_stop && im.on_token) im.on_token(s->id, last, terminal);
                 if (!matched || terminal) break;
             }
@@ -518,14 +509,13 @@ Status Scheduler::step() {
             if (auto st = s->kv.commit_tentative_prefix(committed_rows); !st.ok()) return st;
             s->history.insert(s->history.end(), verify.begin(), verify.begin() + committed_rows);
             if (speculative->observe_target != nullptr) {
-                if (const auto rc = speculative->observe_target(
-                        *im.model,
-                        im.model->speculative_payload,
-                        s->speculative_state,
-                        taps,
-                        0,
-                        committed_rows,
-                        verify_rows.front().pos);
+                if (const auto rc = speculative->observe_target(*im.model,
+                                                                im.model->speculative_payload,
+                                                                s->speculative_state,
+                                                                taps,
+                                                                0,
+                                                                committed_rows,
+                                                                verify_rows.front().pos);
                     rc != StatusCode::Ok) {
                     s->finished = true;
                     return {rc, "updating speculative target context failed"};
@@ -667,8 +657,7 @@ Status Scheduler::step() {
     // sampled before committing any sequence state, so the caller receives an
     // explicit model-execution failure and can discard the launch.
     for (const auto [first, count] : span) {
-        const float* lg =
-            im.logits.data() + static_cast<std::size_t>(first + count - 1) * vocab;
+        const float* lg = im.logits.data() + static_cast<std::size_t>(first + count - 1) * vocab;
         if (logits_are_finite(std::span<const float>(lg, vocab))) continue;
 
         Status st{StatusCode::Internal, "model produced non-finite output logits"};
@@ -694,14 +683,13 @@ Status Scheduler::step() {
         // would then claim positions the cache does not hold.
         s->history.insert(s->history.end(), tokens.begin() + first, tokens.begin() + first + count);
         if (speculative != nullptr && speculative->observe_target != nullptr) {
-            if (const auto rc = speculative->observe_target(
-                    *im.model,
-                    im.model->speculative_payload,
-                    s->speculative_state,
-                    taps,
-                    first,
-                    count,
-                    rows[first].pos);
+            if (const auto rc = speculative->observe_target(*im.model,
+                                                            im.model->speculative_payload,
+                                                            s->speculative_state,
+                                                            taps,
+                                                            first,
+                                                            count,
+                                                            rows[first].pos);
                 rc != StatusCode::Ok) {
                 s->finished = true;
                 return {rc, "updating speculative target context failed"};
@@ -722,9 +710,9 @@ Status Scheduler::step() {
             s->emitted.push_back(s->next_token);
             ++s->generated;
             ++im.stats.tokens_out;
-            hit_stop = std::find(s->stop_token_ids.begin(),
-                                 s->stop_token_ids.end(),
-                                 s->next_token) != s->stop_token_ids.end();
+            hit_stop =
+                std::find(s->stop_token_ids.begin(), s->stop_token_ids.end(), s->next_token) !=
+                s->stop_token_ids.end();
         };
 
         bool produced = false;
@@ -745,8 +733,7 @@ Status Scheduler::step() {
         // cost warm reopen exists to remove. The slot is real memory, so the
         // caller is responsible for cancel()ing sessions it no longer wants —
         // admit() reports NoKvSlot rather than silently evicting someone.
-        const bool done = hit_stop ||
-                          (!s->prefilling() && s->generated >= s->max_tokens) ||
+        const bool done = hit_stop || (!s->prefilling() && s->generated >= s->max_tokens) ||
                           s->kv.length() >= s->kv.capacity();
 
         // `last` is computed BEFORE the token goes out, so a listener that keys
@@ -844,7 +831,8 @@ Status Scheduler::checkpoint(SeqId id, const std::string& key) {
     if (im.cfg.enable_speculation && im.model->speculative_backend != nullptr) {
         if (auto st = im.model->speculative_backend->serialize_state(
                 *im.model, s->speculative_state, persist.auxiliary);
-            !st.ok()) return st;
+            !st.ok())
+            return st;
     }
     return im.checkpoints->save(key, s->kv, persist);
 }
@@ -889,7 +877,8 @@ Status Scheduler::preempt(SeqId id) {
     if (im.cfg.enable_speculation && im.model->speculative_backend != nullptr) {
         if (auto st = im.model->speculative_backend->serialize_state(
                 *im.model, s->speculative_state, persist.auxiliary);
-            !st.ok()) return st;
+            !st.ok())
+            return st;
     }
     if (auto st = im.checkpoints->save(checkpoint_key(id), s->kv, persist); !st.ok()) return st;
 
@@ -933,14 +922,13 @@ Status Scheduler::resume(SeqId id) {
     // rather than being silently reverted to whatever was in flight.
     s->sampler.rng_state = restored.rng_state;
     if (im.cfg.enable_speculation && im.model->speculative_backend != nullptr) {
-        if (restored.auxiliary.empty() ||
-            im.model->speculative_backend->restore_state == nullptr) {
-            return {StatusCode::VersionMismatch,
-                    "checkpoint has no speculative sequence state"};
+        if (restored.auxiliary.empty() || im.model->speculative_backend->restore_state == nullptr) {
+            return {StatusCode::VersionMismatch, "checkpoint has no speculative sequence state"};
         }
         if (auto st = im.model->speculative_backend->restore_state(
                 *im.model, restored.auxiliary, s->speculative_state);
-            !st.ok()) return st;
+            !st.ok())
+            return st;
     }
 
     s->preempted = false;

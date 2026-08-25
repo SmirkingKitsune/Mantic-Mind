@@ -260,6 +260,7 @@ struct KdaSpec {
             if (k == AttnLayerKind::Linear) ++n;
         return n;
     }
+
     std::uint32_t n_full_layers() const noexcept {
         std::uint32_t n = 0;
         for (const auto k : layer_kinds)
@@ -303,6 +304,7 @@ struct GdnSpec {
     std::vector<AttnLayerKind> layer_kinds;
 
     std::uint32_t key_dim() const noexcept { return n_k_heads * head_k_dim; }
+
     std::uint32_t value_dim() const noexcept { return n_v_heads * head_v_dim; }
 
     /// Channels the depthwise convolution spans: q ++ k ++ v.
@@ -320,6 +322,7 @@ struct GdnSpec {
             if (k == AttnLayerKind::Linear) ++n;
         return n;
     }
+
     std::uint32_t n_full_layers() const noexcept {
         std::uint32_t n = 0;
         for (const auto k : layer_kinds)
@@ -552,11 +555,11 @@ struct AttentionSpec {
     std::uint32_t sliding_window = 0; ///< 0 = full attention
     bool bias = false;
     RopeConfig rope{};
-    MlaSpec mla{}; ///< meaningful only for Mla/MlaDsa
-    DsaSpec dsa{}; ///< meaningful only for MlaDsa
-    KdaSpec kda{}; ///< meaningful only for MlaKda
-    GdnSpec gdn{}; ///< meaningful only for GqaGdn
-    BsaSpec bsa{}; ///< meaningful only for GqaBsa
+    MlaSpec mla{};                        ///< meaningful only for Mla/MlaDsa
+    DsaSpec dsa{};                        ///< meaningful only for MlaDsa
+    KdaSpec kda{};                        ///< meaningful only for MlaKda
+    GdnSpec gdn{};                        ///< meaningful only for GqaGdn
+    BsaSpec bsa{};                        ///< meaningful only for GqaBsa
     CompressedAttentionSpec compressed{}; ///< CompressedSparse only
 
     /// Sigmoid output gate on the full-attention block, with the gate projection

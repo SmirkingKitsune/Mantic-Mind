@@ -77,6 +77,14 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $vs = & $vswhere -latest -products * `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath
+          if (-not $vs) { throw 'Visual Studio C++ tools were not found' }
+          Import-Module (Join-Path $vs 'Common7/Tools/Microsoft.VisualStudio.DevShell.dll')
+          Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation `
+              -DevCmdArguments '-arch=x64 -host_arch=x64'
           $fail = 0
           $hdrs = Get-ChildItem -Path include/soma -Filter *.hpp -Recurse | Sort-Object FullName
           $sep = [char]92

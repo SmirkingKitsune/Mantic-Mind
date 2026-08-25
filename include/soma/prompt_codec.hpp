@@ -6,10 +6,9 @@
 
 #include "soma/types.hpp"
 
-#include <nlohmann/json_fwd.hpp>
-
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace soma {
 
@@ -19,14 +18,26 @@ struct PromptCodecState {
     bool mode = false;
 };
 
+struct PromptToolCall {
+    std::string id;
+    std::string name;
+    std::string arguments;
+};
+
+struct PromptMessage {
+    std::string content;
+    std::string reasoning_content;
+    std::vector<PromptToolCall> tool_calls;
+};
+
 struct PromptCodec {
     const char* name = nullptr;
 
-    // ordered_json is intentional: DSML embeds tool schemas and response
-    // formats verbatim in the token stream. Losing the caller's object-key
-    // order while parsing HTTP JSON changes that stream and no longer matches
-    // the model's official encoder.
-    Status (*encode)(const nlohmann::ordered_json& request,
+    // The codec owns JSON parsing so this public descriptor remains a
+    // standard-library-only boundary. DSML parses the bytes as ordered JSON:
+    // tool schemas and response formats are embedded verbatim in the prompt,
+    // so losing the caller's object-key order would change the token stream.
+    Status (*encode)(std::string_view request_json,
                      std::string& prompt,
                      PromptCodecState& state) noexcept = nullptr;
 
@@ -37,7 +48,7 @@ struct PromptCodec {
                     const PromptCodecState& state,
                     bool final,
                     bool ended_by_stop,
-                    nlohmann::json& message) noexcept = nullptr;
+                    PromptMessage& message) noexcept = nullptr;
 };
 
 } // namespace soma

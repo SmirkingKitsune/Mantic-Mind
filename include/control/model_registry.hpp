@@ -169,9 +169,8 @@ std::string admission_source_name(const std::string& source, bool needs_fetch);
 ///
 /// Pure, so the identity rule ("these two refs are one model") can be asserted
 /// without converting anything.
-std::string admission_variant(const std::string& source,
-                              bool needs_fetch,
-                              const AdmissionTools& tools);
+std::string
+admission_variant(const std::string& source, bool needs_fetch, const AdmissionTools& tools);
 
 /// One row of api_token. The token itself is NEVER stored — only its SHA-256 —
 /// so a leaked database backup does not hand over working credentials.

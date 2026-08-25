@@ -248,8 +248,7 @@ StatusCode f32_bind_layer(const ArchIr& arch,
     // broken conversion, and silently running ungated is a different model that
     // produces perfectly reasonable text.
     if (m.output_gate &&
-        !soma::bind_layer_weight(
-             ctx, "self_attn.g_proj.weight", TensorRole::AttnProj, w->out_gate)
+        !soma::bind_layer_weight(ctx, "self_attn.g_proj.weight", TensorRole::AttnProj, w->out_gate)
              .ok()) {
         return StatusCode::NotFound;
     }

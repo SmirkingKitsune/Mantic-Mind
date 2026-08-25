@@ -83,8 +83,7 @@ struct EngineDescriptor {
         estimate_footprint;
 
     /// Whether two agents may share one live engine process.
-    std::function<bool(const EngineLoadRequest& a, const EngineLoadRequest& b)>
-        launch_compatible;
+    std::function<bool(const EngineLoadRequest& a, const EngineLoadRequest& b)> launch_compatible;
 
     /// Is this model reference loadable by THIS engine, on THIS node?
     ///

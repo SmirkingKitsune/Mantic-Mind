@@ -22,9 +22,7 @@ void KvTransaction::begin(std::uint32_t max_rows) {
     active_ = true;
 }
 
-void KvTransaction::capture(std::uint32_t row,
-                            std::byte* destination,
-                            std::size_t bytes) {
+void KvTransaction::capture(std::uint32_t row, std::byte* destination, std::size_t bytes) {
     if (!active_ || destination == nullptr || bytes == 0 || row >= max_rows_) return;
     const auto offset = saved_.size();
     saved_.insert(saved_.end(), destination, destination + bytes);
@@ -211,11 +209,10 @@ Status bind_fused_glu(F32Model& model,
     if (gu->dim(0) != 2 * static_cast<std::int64_t>(inter) || gu->dim(1) != d_model ||
         dn->dim(0) != d_model || dn->dim(1) != inter) {
         return {StatusCode::InvalidArgument,
-                where + "shapes [" + std::to_string(gu->dim(0)) + "," +
-                    std::to_string(gu->dim(1)) + "] / [" + std::to_string(dn->dim(0)) + "," +
-                    std::to_string(dn->dim(1)) + "] disagree with the IR's " +
-                    std::to_string(inter) + " intermediate x " + std::to_string(d_model) +
-                    " d_model"};
+                where + "shapes [" + std::to_string(gu->dim(0)) + "," + std::to_string(gu->dim(1)) +
+                    "] / [" + std::to_string(dn->dim(0)) + "," + std::to_string(dn->dim(1)) +
+                    "] disagree with the IR's " + std::to_string(inter) + " intermediate x " +
+                    std::to_string(d_model) + " d_model"};
     }
 
     const auto src = gu->f32();
@@ -329,8 +326,10 @@ Status bind_layer_weight(
     return bind_weight_view(*tv, n, ctx.quant->for_role(role), *ctx.owner, out);
 }
 
-Status bind_model_f32(
-    const ModelBindCtx& ctx, const char* name, std::span<const float>& out, bool optional) {
+Status bind_model_f32(const ModelBindCtx& ctx,
+                      const char* name,
+                      std::span<const float>& out,
+                      bool optional) {
     if (optional && ctx.weights->find(name) == nullptr) return {};
     return bind_tensor(*ctx.weights, name, out);
 }
@@ -340,8 +339,7 @@ Status bind_model_weight(
     const TensorView* tv = nullptr;
     if (optional && ctx.weights->find(name) == nullptr) return {};
     if (auto s = ctx.weights->require(name, tv); !s.ok()) return s;
-    return bind_weight_view(
-        *tv, std::string(name), ctx.quant->for_role(role), *ctx.owner, out);
+    return bind_weight_view(*tv, std::string(name), ctx.quant->for_role(role), *ctx.owner, out);
 }
 
 void F32Workspace::reserve(const ArchIr& arch, std::uint32_t max_tokens) {
@@ -502,7 +500,8 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
     out.quantized.reserve(static_cast<std::size_t>(arch.topology.n_layers) *
                               (3 * static_cast<std::size_t>(arch.router.n_experts) + 14) +
                           2);
-    if (auto s = bind_weight(out, "model.embed_tokens.weight", TensorRole::Embed, out.embed); !s.ok())
+    if (auto s = bind_weight(out, "model.embed_tokens.weight", TensorRole::Embed, out.embed);
+        !s.ok())
         return s;
     if (auto s = bind_tensor(out.weights, "model.norm.weight", out.out_norm); !s.ok()) return s;
 
@@ -670,9 +669,8 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
                                 "down_proj/up_proj"};
                 }
                 if (arch.ffn.routed_expert_norm) {
-                    if (auto s = bind_tensor(out.weights,
-                                             p + blk + ".routed_expert_norm.weight",
-                                             lw.latent_norm);
+                    if (auto s = bind_tensor(
+                            out.weights, p + blk + ".routed_expert_norm.weight", lw.latent_norm);
                         !s.ok())
                         return s;
                 }
@@ -683,15 +681,14 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
                 // by the same constructor. Tried FIRST so that a checkpoint
                 // carrying both layouts -- none does, but nothing prevents it --
                 // resolves the same way the routed experts above do.
-                const auto shared_fused =
-                    bind_fused_glu(out,
-                                   p + arch.naming.shared_block + '.',
-                                   arch.topology.d_model,
-                                   arch.ffn.shared_intermediate,
-                                   TensorRole::SharedExpert,
-                                   lw.shared_gate,
-                                   lw.shared_up,
-                                   lw.shared_down);
+                const auto shared_fused = bind_fused_glu(out,
+                                                         p + arch.naming.shared_block + '.',
+                                                         arch.topology.d_model,
+                                                         arch.ffn.shared_intermediate,
+                                                         TensorRole::SharedExpert,
+                                                         lw.shared_gate,
+                                                         lw.shared_up,
+                                                         lw.shared_down);
                 if (!shared_fused.ok() && shared_fused.code() != StatusCode::NotFound) {
                     return shared_fused;
                 }
@@ -703,10 +700,11 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
                                                  lw.shared_gate);
                         !s.ok())
                         return s;
-                    if (auto s = bind_weight_optional(out,
-                                                      p + arch.naming.shared_block + ".up_proj.weight",
-                                                      TensorRole::SharedExpert,
-                                                      lw.shared_up);
+                    if (auto s =
+                            bind_weight_optional(out,
+                                                 p + arch.naming.shared_block + ".up_proj.weight",
+                                                 TensorRole::SharedExpert,
+                                                 lw.shared_up);
                         !s.ok())
                         return s;
                     if (auto s =
@@ -962,8 +960,7 @@ void apply_glu_expert(const ArchIr& arch,
         f32::relu2_glu(s.gate, s.up, inter, s.act);
         break;
     case Activation::Situ:
-        f32::situ_glu(
-            s.gate, s.up, inter, arch.ffn.situ_beta, arch.ffn.situ_linear_beta, s.act);
+        f32::situ_glu(s.gate, s.up, inter, arch.ffn.situ_beta, arch.ffn.situ_linear_beta, s.act);
         break;
     case Activation::SwiGluOai:
         f32::swiglu_oai(s.gate, s.up, inter, arch.ffn.swiglu_alpha, s.act);
@@ -1242,9 +1239,8 @@ Status forward_impl(const F32Model& model,
         }
         const auto row = row_block(model.embed, id, 1);
         if (row.empty()) return {StatusCode::Internal, "embedding row view is empty"};
-        if (auto s = dequantize(row,
-                                std::span<float>(ws.hidden).subspan(
-                                    static_cast<std::size_t>(t) * d, d));
+        if (auto s = dequantize(
+                row, std::span<float>(ws.hidden).subspan(static_cast<std::size_t>(t) * d, d));
             !s.ok()) {
             return {s.code(), "embedding lookup: " + s.message()};
         }
@@ -1297,8 +1293,8 @@ Status forward_impl(const F32Model& model,
         ws.sink(l, "attn_out", ws.attn_out.data(), static_cast<std::size_t>(n) * d);
 
         if (backend->merge_attention != nullptr) {
-            if (const auto rc = backend->merge_attention(
-                    arch, lw, ws.attn_out.data(), n, ws, ws.hidden.data());
+            if (const auto rc =
+                    backend->merge_attention(arch, lw, ws.attn_out.data(), n, ws, ws.hidden.data());
                 rc != StatusCode::Ok)
                 return {rc, "attention merge hook failed at layer " + std::to_string(l)};
         } else {
@@ -1352,14 +1348,10 @@ Status forward_impl(const F32Model& model,
                 rc != StatusCode::Ok) {
                 return {rc, "routing failed at layer " + std::to_string(l)};
             }
-            ws.sink(l,
-                    "router_logits",
-                    ws.router_logits.data(),
-                    static_cast<std::size_t>(n) * n_exp);
-            ws.sink(l,
-                    "router_weights",
-                    ws.expert_weights.data(),
-                    static_cast<std::size_t>(n) * top_k);
+            ws.sink(
+                l, "router_logits", ws.router_logits.data(), static_cast<std::size_t>(n) * n_exp);
+            ws.sink(
+                l, "router_weights", ws.expert_weights.data(), static_cast<std::size_t>(n) * top_k);
             if (ws.sink) {
                 std::vector<float> route_ids(static_cast<std::size_t>(n) * top_k);
                 std::vector<float> route_dense(static_cast<std::size_t>(n) * n_exp, 0.0f);
@@ -1392,10 +1384,11 @@ Status forward_impl(const F32Model& model,
             float* expert_out = ws.attn_out.data();
             if (latent) {
                 ws.ensure_latent(n, ew);
-                soma::matmul(lw.latent_down, std::span<const float>(ws.normed).first(
-                                                 static_cast<std::size_t>(n) * d),
-                             n, std::span<float>(ws.latent_in).first(
-                                    static_cast<std::size_t>(n) * ew));
+                soma::matmul(
+                    lw.latent_down,
+                    std::span<const float>(ws.normed).first(static_cast<std::size_t>(n) * d),
+                    n,
+                    std::span<float>(ws.latent_in).first(static_cast<std::size_t>(n) * ew));
                 std::fill_n(ws.latent_out.begin(), static_cast<std::size_t>(n) * ew, 0.0f);
                 expert_x = ws.latent_in.data();
                 expert_out = ws.latent_out.data();
@@ -1534,11 +1527,11 @@ Status forward_impl(const F32Model& model,
                                      arch.rms_norm_eps);
                     }
                 }
-                soma::matmul(lw.latent_up,
-                             std::span<const float>(ws.latent_out)
-                                 .first(static_cast<std::size_t>(n) * ew),
-                             n,
-                             std::span<float>(ws.attn_out).first(static_cast<std::size_t>(n) * d));
+                soma::matmul(
+                    lw.latent_up,
+                    std::span<const float>(ws.latent_out).first(static_cast<std::size_t>(n) * ew),
+                    n,
+                    std::span<float>(ws.attn_out).first(static_cast<std::size_t>(n) * d));
             }
 
             if (!lw.shared_gate.empty()) {
@@ -1554,12 +1547,13 @@ Status forward_impl(const F32Model& model,
                 std::vector<float> scale;
                 if (!lw.shared_scale.empty()) {
                     scale.assign(n, 0.0f);
-                    soma::matmul(lw.shared_scale,
-                                 std::span<const float>(ws.normed.data(),
-                                                        static_cast<std::size_t>(n) * d),
-                                 n,
-                                 std::span<float>(scale));
-                    for (auto& s : scale) s = 1.0f / (1.0f + std::exp(-s));
+                    soma::matmul(
+                        lw.shared_scale,
+                        std::span<const float>(ws.normed.data(), static_cast<std::size_t>(n) * d),
+                        n,
+                        std::span<float>(scale));
+                    for (auto& s : scale)
+                        s = 1.0f / (1.0f + std::exp(-s));
                 }
                 for (std::uint32_t t = 0; t < n; ++t) {
                     const auto off = static_cast<std::size_t>(t) * d;
@@ -1578,8 +1572,8 @@ Status forward_impl(const F32Model& model,
         }
 
         if (backend->merge_ffn != nullptr) {
-            if (const auto rc = backend->merge_ffn(
-                    arch, lw, ws.attn_out.data(), n, ws, ws.hidden.data());
+            if (const auto rc =
+                    backend->merge_ffn(arch, lw, ws.attn_out.data(), n, ws, ws.hidden.data());
                 rc != StatusCode::Ok)
                 return {rc, "ffn merge hook failed at layer " + std::to_string(l)};
         } else {
@@ -1590,14 +1584,12 @@ Status forward_impl(const F32Model& model,
         if (taps != nullptr) {
             for (std::size_t ordinal = 0; ordinal < taps->layers.size(); ++ordinal) {
                 if (taps->layers[ordinal] != l) continue;
-                float* dst = taps->values.data() +
-                             ordinal * static_cast<std::size_t>(n) * d;
+                float* dst = taps->values.data() + ordinal * static_cast<std::size_t>(n) * d;
                 if (backend->export_layer_hidden != nullptr) {
-                    if (const auto rc = backend->export_layer_hidden(
-                            arch, l, n, ws, ws.hidden.data(), dst);
+                    if (const auto rc =
+                            backend->export_layer_hidden(arch, l, n, ws, ws.hidden.data(), dst);
                         rc != StatusCode::Ok) {
-                        return {rc, "layer hidden export failed at layer " +
-                                        std::to_string(l)};
+                        return {rc, "layer hidden export failed at layer " + std::to_string(l)};
                     }
                 } else {
                     std::copy_n(ws.hidden.data(), static_cast<std::size_t>(n) * d, dst);
@@ -1607,8 +1599,7 @@ Status forward_impl(const F32Model& model,
     }
 
     if (backend->end_forward != nullptr) {
-        if (const auto rc =
-                backend->end_forward(arch, model.arch_payload, n, ws, ws.hidden.data());
+        if (const auto rc = backend->end_forward(arch, model.arch_payload, n, ws, ws.hidden.data());
             rc != StatusCode::Ok)
             return {rc, "architecture end-forward hook failed"};
     }
