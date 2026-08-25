@@ -4,6 +4,7 @@
 #include "node/node_state.hpp"
 #include "node/engine_supervisor.hpp"
 #include "node/model_store.hpp"
+#include "node/ray_orchestration.hpp"
 #include "common/engine_client.hpp"
 #include "common/http_client.hpp"
 #include "common/http_server.hpp"
@@ -99,7 +100,7 @@ std::string engine_error_code_for(const std::string& detail) {
     };
     if (has("max slots reached") || has("max active slots reached") ||
         has("no available ports") || has("out of memory") || has("insufficient memory") ||
-        has("insufficient vram")) {
+        has("insufficient vram") || has("already reserved")) {
         return "capacity_pressure";
     }
     if (has("not found") || has("no such file") || has("does not exist")) {
@@ -198,6 +199,10 @@ void NodeApiServer::set_engine_manager(NodeEngineManager* manager) {
 
 void NodeApiServer::set_engine_config_callback(EngineConfigCallback callback) {
     engine_config_cb_ = std::move(callback);
+}
+
+void NodeApiServer::set_ray_controller(RayController* controller) {
+    ray_controller_ = controller;
 }
 
 // ── Auth check ────────────────────────────────────────────────────────────────
@@ -328,6 +333,9 @@ void NodeApiServer::register_routes() {
         }
         j["llama_runtime"] = state_.get_llama_runtime();
         j["action_progress"] = state_.get_action_progress();
+        j["ray"] = ray_controller_ != nullptr
+            ? nlohmann::json(ray_controller_->status())
+            : nlohmann::json(RayRuntimeStatus{});
 
         // Backwards compat: set single-model fields from first ready slot.
         std::string first_model;
@@ -631,6 +639,157 @@ void NodeApiServer::register_routes() {
                         "application/json");
     });
 
+    server_->Get("/api/node/ray/status", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401; return;
+        }
+        if (ray_controller_ == nullptr) {
+            res.status = 501;
+            res.set_content(R"({"error":"Ray orchestration is not configured"})",
+                            "application/json");
+            return;
+        }
+        res.set_content(nlohmann::json(ray_controller_->status()).dump(),
+                        "application/json");
+    });
+
+    server_->Post("/api/node/vllm/preflight", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401; return;
+        }
+        try {
+            const auto j = nlohmann::json::parse(req.body);
+            const std::string model = j.value("model_path", std::string{});
+            if (model.empty()) {
+                res.status = 400;
+                res.set_content(R"({"error":"model_path required"})", "application/json");
+                return;
+            }
+            if (!util::is_hf_repo_id(model)) {
+                const std::filesystem::path path(model);
+                std::error_code ec;
+                if (!path.is_absolute() || !std::filesystem::exists(path, ec)) {
+                    res.status = 409;
+                    res.set_content(
+                        nlohmann::json{{"error", "shared vLLM model path is not accessible"},
+                                       {"model_path", model}}
+                            .dump(),
+                        "application/json");
+                    return;
+                }
+            }
+            res.set_content(nlohmann::json{{"accessible", true},
+                                           {"model_path", model}}.dump(),
+                            "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(),
+                            "application/json");
+        }
+    });
+
+    server_->Post("/api/node/ray/start", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401; return;
+        }
+        if (ray_controller_ == nullptr) {
+            res.status = 501;
+            res.set_content(R"({"error":"Ray orchestration is not configured"})",
+                            "application/json");
+            return;
+        }
+        try {
+            const auto j = nlohmann::json::parse(req.body);
+            RayStartConfig cfg;
+            cfg.group_id = j.value("group_id", std::string{});
+            cfg.agent_id = j.value("agent_id", std::string{});
+            cfg.role = j.value("role", std::string{"head"});
+            cfg.head_address = j.value("head_address", std::string{});
+            cfg.node_ip = j.value("node_ip", std::string{});
+            cfg.transport = j.value("transport", std::string{"nccl"});
+            cfg.num_gpus = j.value("num_gpus", 0);
+            if (cfg.transport != "nccl" && cfg.transport != "gloo") {
+                res.status = 400;
+                res.set_content(R"({"error":"transport must be nccl or gloo"})",
+                                "application/json");
+                return;
+            }
+            const auto current = ray_controller_->status();
+            if (current.group_id.empty()) {
+                const auto slots = engines_.slots();
+                const bool occupied = std::any_of(
+                    slots.begin(), slots.end(), [](const SlotInfo& slot) {
+                        return slot.state != SlotState::Empty;
+                    });
+                if (occupied) {
+                    res.status = 409;
+                    res.set_content(
+                        R"({"error":"Ray requires an idle node with no engine slots","code":"capacity_pressure"})",
+                        "application/json");
+                    return;
+                }
+                const int available_gpus = state_.get_capabilities().gpu_count;
+                if (cfg.num_gpus < 1 || cfg.num_gpus > available_gpus) {
+                    res.status = 409;
+                    res.set_content(
+                        nlohmann::json{{"error", "invalid Ray GPU reservation"},
+                                       {"code", "capacity_pressure"},
+                                       {"requested_gpus", cfg.num_gpus},
+                                       {"available_gpus", available_gpus}}
+                            .dump(),
+                        "application/json");
+                    return;
+                }
+            }
+            std::string error;
+            if (!ray_controller_->start(cfg, error)) {
+                const bool conflict = error.find("reserved") != std::string::npos ||
+                    error.find("already bound") != std::string::npos ||
+                    error.find("already in progress") != std::string::npos;
+                res.status = conflict ? 409 : 500;
+                res.set_content(nlohmann::json{{"error", error},
+                                               {"ray", ray_controller_->status()}}.dump(),
+                                "application/json");
+                return;
+            }
+            res.set_content(nlohmann::json(ray_controller_->status()).dump(),
+                            "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(),
+                            "application/json");
+        }
+    });
+
+    server_->Post("/api/node/ray/stop", [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401; return;
+        }
+        if (ray_controller_ == nullptr) {
+            res.status = 501;
+            res.set_content(R"({"error":"Ray orchestration is not configured"})",
+                            "application/json");
+            return;
+        }
+        try {
+            const auto j = nlohmann::json::parse(req.body);
+            std::string error;
+            if (!ray_controller_->stop(j.value("group_id", std::string{}), error)) {
+                res.status = error.find("ownership") != std::string::npos ? 409 : 500;
+                res.set_content(nlohmann::json{{"error", error},
+                                               {"ray", ray_controller_->status()}}.dump(),
+                                "application/json");
+                return;
+            }
+            res.set_content(nlohmann::json(ray_controller_->status()).dump(),
+                            "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(),
+                            "application/json");
+        }
+    });
+
     server_->Post("/api/node/load-model", [this](const Request& req, Response& res) {
         if (!check_auth(req.get_header_value("Authorization"))) {
             res.status = 401; return;
@@ -652,8 +811,31 @@ void NodeApiServer::register_routes() {
             // field, so this default only decides hand-written requests.
             const std::string backend = mm::util::to_lower(mm::util::trim(
                 j.value("backend", std::string{"llama-cpp"})));
+
+            // Ray group ownership is a node-wide exclusive reservation. The
+            // only process admitted while it is active is the group's vLLM
+            // server on the head, for the same agent. Workers run Ray only.
+            if (ray_controller_ != nullptr) {
+                const auto ray = ray_controller_->status();
+                const bool owned_head_load = ray.active() && backend == "vllm" &&
+                    ray.role == "head" && !agent_id.empty() &&
+                    agent_id == ray.agent_id;
+                if (!ray.group_id.empty() && !owned_head_load) {
+                    res.status = 409;
+                    res.set_content(
+                        nlohmann::json{{"error", "node is reserved by Ray group '" +
+                                                       ray.group_id + "'"},
+                                       {"code", "capacity_pressure"},
+                                       {"ray", ray}}
+                            .dump(),
+                        "application/json");
+                    return;
+                }
+            }
             RuntimeSettings runtime_settings;
             if (j.contains("runtime_settings")) runtime_settings = j["runtime_settings"].get<RuntimeSettings>();
+            const std::string served_model_name =
+                j.value("served_model_name", std::string{});
 
             // A registry lookup, not a string literal. The `supported_backends`
             // list in the body is now the registry's ACTUAL contents, so it is
@@ -764,6 +946,79 @@ void NodeApiServer::register_routes() {
             load_req.model_path = model_path;
             load_req.mmproj_path = mmproj_path;
             load_req.settings = runtime_settings;
+            load_req.served_model_name = served_model_name.empty()
+                ? model_ref : served_model_name;
+            if (backend == "vllm") {
+                if (engine_manager_ == nullptr) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"engine manager unavailable"})",
+                                    "application/json");
+                    return;
+                }
+                const auto cluster = engine_manager_->current_config();
+                const EngineSpec* spec = cluster.find("vllm");
+                if (spec == nullptr) {
+                    res.status = 409;
+                    res.set_content(
+                        R"({"error":"vllm is not in the applied cluster engine configuration"})",
+                        "application/json");
+                    return;
+                }
+                load_req.vllm = effective_vllm_config(*spec);
+                load_req.ray_address = j.value("ray_address", std::string{});
+                load_req.host_ip = j.value("host_ip", std::string{});
+                if (j.contains("gpu_devices") && j.at("gpu_devices").is_array())
+                    load_req.gpu_devices = j.at("gpu_devices").get<std::vector<int>>();
+                const int wanted = load_req.vllm->tensor_parallel_size;
+                const int available = state_.get_capabilities().gpu_count;
+                std::set<int> reserved;
+                for (const auto& slot : engines_.slots()) {
+                    if (slot.backend != "vllm" || slot.state == SlotState::Empty ||
+                        slot.state == SlotState::Error) continue;
+                    reserved.insert(slot.gpu_devices.begin(), slot.gpu_devices.end());
+                }
+                if (load_req.gpu_devices.empty()) {
+                    for (int index = 0;
+                         index < available &&
+                         static_cast<int>(load_req.gpu_devices.size()) < wanted;
+                         ++index) {
+                        if (reserved.count(index) == 0)
+                            load_req.gpu_devices.push_back(index);
+                    }
+                    if (static_cast<int>(load_req.gpu_devices.size()) < wanted) {
+                        res.status = 503;
+                        res.set_content(
+                            nlohmann::json{{"error", "insufficient GPUs for vLLM"},
+                                           {"code", "capacity_pressure"},
+                                           {"required_gpus", wanted},
+                                           {"available_gpus", available}}
+                                .dump(),
+                            "application/json");
+                        return;
+                    }
+                } else {
+                    std::set<int> selected(load_req.gpu_devices.begin(),
+                                           load_req.gpu_devices.end());
+                    const bool valid = static_cast<int>(selected.size()) == wanted &&
+                        selected.size() == load_req.gpu_devices.size() &&
+                        std::all_of(selected.begin(), selected.end(), [&](const int index) {
+                            return index >= 0 && index < available &&
+                                   reserved.count(index) == 0;
+                        });
+                    if (!valid) {
+                        res.status = 409;
+                        res.set_content(
+                            nlohmann::json{{"error", "invalid or unavailable vLLM GPU reservation"},
+                                           {"code", "capacity_pressure"},
+                                           {"required_gpus", wanted},
+                                           {"available_gpus", available},
+                                           {"requested_devices", load_req.gpu_devices}}
+                                .dump(),
+                            "application/json");
+                        return;
+                    }
+                }
+            }
             auto slot_id = engines_.load(backend, load_req, agent_id);
             if (slot_id.empty()) {
                 nlohmann::json err = {{"error", "failed to load model"}};
@@ -1597,6 +1852,34 @@ void NodeApiServer::register_routes() {
             std::string agent_id   = j.value("agent_id", std::string{});
             const std::string backend = mm::util::to_lower(mm::util::trim(
                 j.value("backend", std::string{"llama-cpp"})));
+            if (ray_controller_ != nullptr) {
+                const auto ray = ray_controller_->status();
+                if (!ray.group_id.empty()) {
+                    const auto slots = engines_.slots();
+                    const bool sleeping_owned_vllm = std::any_of(
+                        slots.begin(), slots.end(), [&](const SlotInfo& slot) {
+                            const bool attached = slot.assigned_agent == agent_id ||
+                                std::find(slot.agent_ids.begin(), slot.agent_ids.end(),
+                                          agent_id) != slot.agent_ids.end();
+                            return slot.backend == "vllm" &&
+                                   slot.state == SlotState::Suspended && attached;
+                        });
+                    const bool owned_restore = ray.active() && ray.role == "head" &&
+                        backend == "vllm" && !agent_id.empty() &&
+                        agent_id == ray.agent_id && sleeping_owned_vllm;
+                    if (!owned_restore) {
+                        res.status = 409;
+                        res.set_content(
+                            nlohmann::json{{"error", "node is reserved by Ray group '" +
+                                                           ray.group_id + "'"},
+                                           {"code", "capacity_pressure"},
+                                           {"ray", ray}}
+                                .dump(),
+                            "application/json");
+                        return;
+                    }
+                }
+            }
             const std::string kv_cache_path = j.value("kv_cache_path", std::string{});
             const std::string model_id = j.value("model_id", std::string{});
             const std::string mmproj_model_id =
@@ -1688,6 +1971,25 @@ void NodeApiServer::register_routes() {
             restore_req.model_path = model_path;
             restore_req.mmproj_path = mmproj_path;
             restore_req.settings = runtime_settings;
+            restore_req.served_model_name = j.value("served_model_name", model_path);
+            if (backend == "vllm") {
+                if (engine_manager_ == nullptr) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"engine manager unavailable"})",
+                                    "application/json");
+                    return;
+                }
+                const auto cluster = engine_manager_->current_config();
+                const auto* spec = cluster.find("vllm");
+                if (spec == nullptr) {
+                    res.status = 409;
+                    res.set_content(
+                        R"({"error":"vllm is not in the applied cluster engine configuration"})",
+                        "application/json");
+                    return;
+                }
+                restore_req.vllm = effective_vllm_config(*spec);
+            }
             auto slot_id = engines_.restore(backend, restore_req, kv_cache_path, agent_id);
             state_.set_slots(engines_.slots());
 

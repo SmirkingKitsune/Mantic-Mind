@@ -62,6 +62,11 @@ NodeEngineManager::NodeEngineManager(EngineManagerPaths paths) : impl_(std::make
                                                  impl_->paths.llama_provision_dir));
     impl_->provisioners.emplace(
         "soma", std::make_unique<SomaEngineProvisioner>(impl_->paths.soma_executable));
+    impl_->provisioners.emplace(
+        "vllm", std::make_unique<VllmEngineProvisioner>(impl_->paths.vllm_executable,
+                                                        impl_->paths.vllm_provision_dir,
+                                                        impl_->paths.vllm_python,
+                                                        impl_->paths.vllm_variant));
 }
 
 NodeEngineManager::~NodeEngineManager() {

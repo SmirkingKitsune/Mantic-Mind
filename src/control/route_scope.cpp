@@ -189,6 +189,7 @@ std::vector<RouteScope> route_scope_table() {
         // stored state: it re-pushes to the whole cluster.
         {"GET", "/v1/cluster/engines/config", Scope::Read},
         {"GET", "/v1/cluster/engines/conformance", Scope::Read},
+        {"GET", "/v1/cluster/engines/ray", Scope::Read},
         {"PUT", "/v1/cluster/engines/config", Scope::Operator},
         {"POST", "/v1/cluster/engines/resync", Scope::Operator},
         {"POST", "/v1/cluster/engines/share", Scope::Operator},

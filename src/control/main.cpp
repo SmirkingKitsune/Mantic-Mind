@@ -24,6 +24,8 @@
 #include <iostream>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -359,7 +361,11 @@ static void print_control_usage() {
               << "  engines heat|slots <engine_id>\n"
               << "  engines conform\n"
               << "  engines setup\n"
-              << "  engines set primary <engine> [backup <engine>|backup none]\n"
+              << "  engines set primary <engine> [backup <engine>|backup none] [vllm-* <value>]\n"
+              << "    --vllm-install-method auto|wheel|source|path  --vllm-version <version>\n"
+              << "    --vllm-tp <gpus-per-node>  --vllm-pp <nodes>\n"
+              << "    --vllm-experimental-gloo true|false (unsupported upstream)\n"
+              << "  engines ray\n"
               << "  engines resync\n"
               << "  engines share <fingerprint> <target_node_id> [source_node_id]\n"
               << "  agents list|show|create|update|delete ...\n"
@@ -507,8 +513,7 @@ static void run_control_cli(uint16_t listen_port,
     auto known_engine_ids = [&]() -> std::vector<std::string> {
         std::vector<std::string> ids;
         const auto r = self.get("/v1/nodes");
-        if (!r.ok()) return ids;
-        try {
+        if (r.ok()) try {
             const auto j = nlohmann::json::parse(r.body);
             const auto& arr = j.contains("data") ? j.at("data") : j;
             for (const auto& n : arr) {
@@ -522,18 +527,49 @@ static void run_control_cli(uint16_t listen_port,
             }
         } catch (...) {
         }
+        for (const std::string builtin : {"soma", "llama-cpp", "vllm"}) {
+            if (std::find(ids.begin(), ids.end(), builtin) == ids.end())
+                ids.push_back(builtin);
+        }
         return ids;
     };
 
     auto put_engine_config = [&](const std::string& primary,
-                                 const std::string& backup) {
+                                 const std::string& backup,
+                                 const std::optional<mm::VllmEngineConfig>& vllm = std::nullopt,
+                                 const std::string& vllm_install_method = {},
+                                 const std::string& vllm_version = {}) {
+        std::optional<mm::ClusterEngineConfig> existing;
+        const auto current = self.get("/v1/cluster/engines/config");
+        if (current.ok()) try {
+            const auto root = nlohmann::json::parse(current.body);
+            if (root.value("configured", false))
+                existing = root.at("config").get<mm::ClusterEngineConfig>();
+        } catch (...) {
+        }
         nlohmann::json engines = nlohmann::json::array();
-        engines.push_back(nlohmann::json{{"engine_id", primary}});
-        if (!backup.empty()) engines.push_back(nlohmann::json{{"engine_id", backup}});
+        auto spec = [&](const std::string& id) {
+            nlohmann::json out{{"engine_id", id}};
+            if (existing) {
+                if (const auto* previous = existing->find(id)) out = *previous;
+            }
+            if (id == "vllm") {
+                if (!vllm_install_method.empty())
+                    out["install_method"] = vllm_install_method;
+                else if (!out.contains("install_method"))
+                    out["install_method"] = "auto";
+                if (!vllm_version.empty()) out["version"] = vllm_version;
+                out["vllm"] = vllm.value_or(mm::VllmEngineConfig{});
+            }
+            return out;
+        };
+        engines.push_back(spec(primary));
+        if (!backup.empty()) engines.push_back(spec(backup));
         const nlohmann::json body{{"primary_engine", primary},
                                   {"backup_engine", backup},
                                   {"engines", engines},
-                                  {"share_builds", true}};
+                                  {"share_builds", existing
+                                      ? existing->share_builds : true}};
         emit_http_result("engines set", self.put("/v1/cluster/engines/config", body));
     };
 
@@ -549,7 +585,7 @@ static void run_control_cli(uint16_t listen_port,
             // Not an error: on a fresh install no node has registered yet.
             // Offering the two engines this build ships is better than refusing
             // to proceed until a node appears.
-            ids = {"soma", "llama-cpp"};
+            ids = {"soma", "llama-cpp", "vllm"};
             printer.line("  (no node has reported its engines yet; offering the built-in set)");
         }
         printer.line("  Available engines: " + mm::util::join(ids, ", "));
@@ -591,10 +627,94 @@ static void run_control_cli(uint16_t listen_port,
             }
         }
 
+        std::optional<mm::VllmEngineConfig> vllm;
+        std::string vllm_install_method;
+        std::string vllm_version;
+        if (primary == "vllm" || backup == "vllm") {
+            mm::VllmEngineConfig profile;
+            auto prompt_int = [&](const std::string& label, int current) {
+                printer.line("  " + label + " [" + std::to_string(current) + "]");
+                printer.print_prompt();
+                std::string answer;
+                if (!std::getline(std::cin, answer)) return current;
+                answer = mm::util::trim(answer);
+                if (answer.empty()) return current;
+                try { return std::stoi(answer); } catch (...) { return current; }
+            };
+            auto prompt_string = [&](const std::string& label, std::string current) {
+                printer.line("  " + label + " [" +
+                             (current.empty() ? std::string{"none"} : current) + "]");
+                printer.print_prompt();
+                std::string answer;
+                if (!std::getline(std::cin, answer)) return current;
+                answer = mm::util::trim(answer);
+                return answer.empty() ? current : answer;
+            };
+            auto prompt_bool = [&](const std::string& label, bool current) {
+                printer.line("  " + label + (current ? " [yes]" : " [no]"));
+                printer.print_prompt();
+                std::string answer;
+                if (!std::getline(std::cin, answer)) return current;
+                answer = mm::util::to_lower(mm::util::trim(answer));
+                if (answer.empty()) return current;
+                return answer == "yes" || answer == "y" || answer == "true" ||
+                       answer == "1" || answer == "on";
+            };
+            vllm_install_method = prompt_string(
+                "vLLM install method (auto/wheel/source/path)", "auto");
+            vllm_version = prompt_string("vLLM version", "latest");
+            profile.max_model_len = prompt_int("vLLM max model length", profile.max_model_len);
+            profile.max_num_seqs = prompt_int("vLLM max sequences", profile.max_num_seqs);
+            profile.max_num_batched_tokens = prompt_int(
+                "vLLM max batched tokens (-1 = automatic)",
+                profile.max_num_batched_tokens);
+            profile.tensor_parallel_size = prompt_int(
+                "vLLM tensor parallel GPUs per node", profile.tensor_parallel_size);
+            profile.pipeline_parallel_size = prompt_int(
+                "vLLM pipeline parallel nodes", profile.pipeline_parallel_size);
+            printer.line("  vLLM GPU memory utilization [" +
+                         std::to_string(profile.gpu_memory_utilization) + "]");
+            printer.print_prompt();
+            std::string gpu_answer;
+            if (std::getline(std::cin, gpu_answer)) {
+                gpu_answer = mm::util::trim(gpu_answer);
+                if (!gpu_answer.empty()) {
+                    try { profile.gpu_memory_utilization = std::stod(gpu_answer); }
+                    catch (...) {}
+                }
+            }
+            profile.dtype = prompt_string("vLLM dtype", profile.dtype);
+            profile.quantization = prompt_string(
+                "vLLM quantization (blank keeps none)", profile.quantization);
+            profile.trust_remote_code = prompt_bool(
+                "Trust remote model code?", profile.trust_remote_code);
+            profile.enable_prefix_caching = prompt_bool(
+                "Enable prefix caching?", profile.enable_prefix_caching);
+            profile.enable_auto_tool_choice = prompt_bool(
+                "Enable automatic tool choice?", profile.enable_auto_tool_choice);
+            profile.enable_sleep_mode = prompt_bool(
+                "Enable sleep mode?", profile.enable_sleep_mode);
+            profile.tool_call_parser = prompt_string(
+                "Tool-call parser (blank keeps none)", profile.tool_call_parser);
+            const auto extras = prompt_string(
+                "Additional vLLM args, comma separated (blank keeps none)", {});
+            for (const auto& raw : mm::util::split(extras, ',')) {
+                const auto arg = mm::util::trim(raw);
+                if (!arg.empty()) profile.extra_args.push_back(arg);
+            }
+            if (profile.pipeline_parallel_size > 1) {
+                profile.allow_experimental_gloo = prompt_bool(
+                    "EXPERIMENTAL: allow Gloo when NCCL is unavailable?",
+                    profile.allow_experimental_gloo);
+            }
+            vllm = std::move(profile);
+        }
+
         printer.line("");
         printer.line("  primary: " + primary);
         printer.line("  backup:  " + (backup.empty() ? "(none)" : backup));
-        put_engine_config(primary, backup);
+        put_engine_config(primary, backup, vllm,
+                          vllm_install_method, vllm_version);
     };
 
     // Forced on entry, exactly as the TUI opens its Engines tab modally. The
@@ -627,7 +747,7 @@ static void run_control_cli(uint16_t listen_port,
 
         if (cmd0 == "engines") {
             if (tokens.size() < 2) {
-                printer.line("usage: engines show|conform|setup|set|resync|share|running|"
+                printer.line("usage: engines show|conform|ray|setup|set|resync|share|running|"
                              "heat|slots ...");
                 continue;
             }
@@ -639,6 +759,10 @@ static void run_control_cli(uint16_t listen_port,
             if (sub == "conform") {
                 emit_http_result("engines conform",
                                  self.get("/v1/cluster/engines/conformance"));
+                continue;
+            }
+            if (sub == "ray") {
+                emit_http_result("engines ray", self.get("/v1/cluster/engines/ray"));
                 continue;
             }
             if (sub == "setup") {
@@ -654,14 +778,87 @@ static void run_control_cli(uint16_t listen_port,
                 // engines set primary <id> [backup <id>|backup none]
                 std::string primary, backup;
                 bool have_backup = false;
+                mm::VllmEngineConfig profile;
+                std::optional<mm::ClusterEngineConfig> current_cluster;
+                const auto current_response =
+                    self.get("/v1/cluster/engines/config");
+                if (current_response.ok()) try {
+                    const auto root = nlohmann::json::parse(current_response.body);
+                    if (root.value("configured", false)) {
+                        current_cluster =
+                            root.at("config").get<mm::ClusterEngineConfig>();
+                        if (const auto* spec = current_cluster->find("vllm"))
+                            profile = mm::effective_vllm_config(*spec);
+                    }
+                } catch (...) {
+                }
+                bool vllm_option = false;
+                std::string vllm_install_method;
+                std::string vllm_version;
+                auto parse_bool = [](const std::string& raw) {
+                    const auto v = mm::util::to_lower(mm::util::trim(raw));
+                    if (v == "1" || v == "true" || v == "yes" || v == "on")
+                        return true;
+                    if (v == "0" || v == "false" || v == "no" || v == "off")
+                        return false;
+                    throw std::invalid_argument("expected true|false");
+                };
+                bool option_error = false;
+                std::string option_error_detail;
+                try {
                 for (std::size_t i = 2; i + 1 < tokens.size(); i += 2) {
-                    const std::string key = mm::util::to_lower(tokens[i]);
+                    std::string key = mm::util::to_lower(tokens[i]);
+                    if (key.rfind("--", 0) == 0) key.erase(0, 2);
                     if (key == "primary") primary = tokens[i + 1];
                     else if (key == "backup") {
                         have_backup = true;
                         backup = mm::util::to_lower(tokens[i + 1]) == "none" ? std::string{}
                                                                             : tokens[i + 1];
                     }
+                    else if (key == "vllm-install-method") {
+                        vllm_install_method = tokens[i + 1];
+                    } else if (key == "vllm-version") {
+                        vllm_version = tokens[i + 1];
+                    }
+                    else if (key == "vllm-max-model-len") {
+                        profile.max_model_len = std::stoi(tokens[i + 1]); vllm_option = true;
+                    } else if (key == "vllm-max-num-seqs") {
+                        profile.max_num_seqs = std::stoi(tokens[i + 1]); vllm_option = true;
+                    } else if (key == "vllm-max-num-batched-tokens") {
+                        profile.max_num_batched_tokens = std::stoi(tokens[i + 1]); vllm_option = true;
+                    } else if (key == "vllm-tp") {
+                        profile.tensor_parallel_size = std::stoi(tokens[i + 1]); vllm_option = true;
+                    } else if (key == "vllm-pp") {
+                        profile.pipeline_parallel_size = std::stoi(tokens[i + 1]); vllm_option = true;
+                    } else if (key == "vllm-gpu-memory-utilization") {
+                        profile.gpu_memory_utilization = std::stod(tokens[i + 1]); vllm_option = true;
+                    } else if (key == "vllm-dtype") {
+                        profile.dtype = tokens[i + 1]; vllm_option = true;
+                    } else if (key == "vllm-quantization") {
+                        profile.quantization = tokens[i + 1]; vllm_option = true;
+                    } else if (key == "vllm-trust-remote-code") {
+                        profile.trust_remote_code = parse_bool(tokens[i + 1]); vllm_option = true;
+                    } else if (key == "vllm-prefix-caching") {
+                        profile.enable_prefix_caching = parse_bool(tokens[i + 1]); vllm_option = true;
+                    } else if (key == "vllm-auto-tool-choice") {
+                        profile.enable_auto_tool_choice = parse_bool(tokens[i + 1]); vllm_option = true;
+                    } else if (key == "vllm-sleep-mode") {
+                        profile.enable_sleep_mode = parse_bool(tokens[i + 1]); vllm_option = true;
+                    } else if (key == "vllm-tool-call-parser") {
+                        profile.tool_call_parser = tokens[i + 1]; vllm_option = true;
+                    } else if (key == "vllm-extra-arg") {
+                        profile.extra_args.push_back(tokens[i + 1]); vllm_option = true;
+                    } else if (key == "vllm-experimental-gloo") {
+                        profile.allow_experimental_gloo = parse_bool(tokens[i + 1]); vllm_option = true;
+                    }
+                }
+                } catch (const std::exception& e) {
+                    option_error = true;
+                    option_error_detail = e.what();
+                }
+                if (option_error) {
+                    printer.line("invalid engines set option: " + option_error_detail);
+                    continue;
                 }
                 if (primary.empty()) {
                     printer.line("usage: engines set primary <engine> [backup <engine>|backup none]");
@@ -671,18 +868,19 @@ static void run_control_cli(uint16_t listen_port,
                 // it: `engines set primary soma` should not silently drop a
                 // configured fallback. Clearing takes the explicit word.
                 if (!have_backup) {
-                    const auto r = self.get("/v1/cluster/engines/config");
-                    if (r.ok()) {
-                        try {
-                            backup = nlohmann::json::parse(r.body)
-                                         .at("config")
-                                         .value("backup_engine", std::string{});
-                        } catch (...) {
-                        }
-                    }
+                    if (current_cluster) backup = current_cluster->backup_engine;
                 }
                 if (backup == primary) backup.clear();
-                put_engine_config(primary, backup);
+                if ((primary == "vllm" || backup == "vllm") && !vllm_option) {
+                    if (current_cluster)
+                        if (const auto* spec = current_cluster->find("vllm"))
+                            profile = mm::effective_vllm_config(*spec);
+                }
+                put_engine_config(primary, backup,
+                                  (primary == "vllm" || backup == "vllm")
+                                      ? std::optional<mm::VllmEngineConfig>(profile)
+                                      : std::nullopt,
+                                  vllm_install_method, vllm_version);
                 continue;
             }
             // Live engine PROCESSES, as opposed to `engines show`, which is the
@@ -1639,6 +1837,11 @@ int main(int argc, char** argv) {
     engine_config.set_change_callback(
         [&registry](const mm::ClusterEngineConfig& c) { registry.push_engine_config_to_all(c); });
     scheduler.set_engine_config_gate([&engine_config]() { return engine_config.configured(); });
+    scheduler.set_engine_config_provider(
+        [&engine_config]() -> std::optional<mm::ClusterEngineConfig> {
+            if (!engine_config.configured()) return std::nullopt;
+            return engine_config.get();
+        });
 
     mm::ControlApiServer  api_server(
         agents, queue, registry, scheduler,

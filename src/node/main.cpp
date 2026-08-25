@@ -15,6 +15,7 @@
 #include "node/engine_supervisor.hpp"
 #include "node/llama_cpp_provisioner.hpp"
 #include "node/llama_runtime.hpp"
+#include "node/ray_orchestration.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -86,6 +87,12 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
         cfg.control_api_key   = file.get("control_api_key",   "");
         cfg.llama_server_path = file.get("llama_server_path", "llama-server");
         cfg.soma_path         = file.get("soma_path",         "soma");
+        cfg.vllm_path         = file.get("vllm_path",         "vllm");
+        cfg.vllm_provision_dir = file.get("vllm_provision_dir", "");
+        cfg.vllm_python_path  = file.get("vllm_python_path",  "python");
+        cfg.ray_path          = file.get("ray_path",          "ray");
+        cfg.ray_port = static_cast<uint16_t>(file.get_int("ray_port", 6379));
+        cfg.hf_cache_dir      = file.get("hf_cache_dir", "");
         cfg.llama_auto_provision = file.get_bool("llama_auto_provision", true);
         cfg.llama_provision_dir = file.get("llama_provision_dir", "");
         cfg.llama_install_method = file.get("llama_install_method", "auto");
@@ -144,6 +151,11 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
     cfg.control_api_key   = env("MM_CONTROL_API_KEY", cfg.control_api_key);
     cfg.llama_server_path = env("MM_LLAMA_PATH", cfg.llama_server_path);
     cfg.soma_path         = env("MM_SOMA_PATH",  cfg.soma_path);
+    cfg.vllm_path         = env("MM_VLLM_PATH", cfg.vllm_path);
+    cfg.vllm_provision_dir = env("MM_VLLM_PROVISION_DIR", cfg.vllm_provision_dir);
+    cfg.vllm_python_path  = env("MM_VLLM_PYTHON", cfg.vllm_python_path);
+    cfg.ray_path          = env("MM_RAY_PATH", cfg.ray_path);
+    cfg.hf_cache_dir      = env("MM_HF_CACHE_DIR", cfg.hf_cache_dir);
     cfg.llama_auto_provision = env_bool("MM_LLAMA_AUTO_PROVISION", cfg.llama_auto_provision);
     cfg.llama_provision_dir = env("MM_LLAMA_PROVISION_DIR", cfg.llama_provision_dir);
     cfg.llama_install_method = env("MM_LLAMA_INSTALL_METHOD", cfg.llama_install_method);
@@ -157,6 +169,7 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
     cfg.pairing_key       = env("MM_PAIRING_KEY",     cfg.pairing_key);
     cfg.listen_port       = env_port("MM_LISTEN_PORT",    cfg.listen_port);
     cfg.discovery_port    = env_port("MM_DISCOVERY_PORT", cfg.discovery_port);
+    cfg.ray_port          = env_port("MM_RAY_PORT", cfg.ray_port);
 
     auto env_int = [](const char* name, int cur) -> int {
         const char* v = std::getenv(name);
@@ -196,6 +209,12 @@ static mm::NodeConfig load_config(std::string* loaded_cfg_path = nullptr,
     if (cfg.llama_install_method.empty()) cfg.llama_install_method = "auto";
     cfg.llama_install_method = mm::normalize_llama_install_method(cfg.llama_install_method);
     if (cfg.llama_version.empty()) cfg.llama_version = "latest";
+    if (cfg.vllm_path.empty()) cfg.vllm_path = "vllm";
+    if (cfg.vllm_python_path.empty()) cfg.vllm_python_path = "python";
+    if (cfg.ray_path.empty()) cfg.ray_path = "ray";
+    if (cfg.vllm_provision_dir.empty())
+        cfg.vllm_provision_dir =
+            (std::filesystem::path(cfg.data_dir) / "runtimes" / "vllm").string();
     if (cfg.llama_provision_dir.empty())
         cfg.llama_provision_dir =
             (std::filesystem::path(cfg.data_dir) / "runtimes" / "llama.cpp").string();
@@ -255,6 +274,10 @@ mm::NodeCapabilities detect_node_capabilities(const mm::NodeConfig& cfg,
     // llama.cpp build fingerprint (RPC groups need matching builds; advertised
     // for planning even while supports_llama_rpc stays a future capability).
     caps.llama_cpp_version = llama_version;
+
+    caps.supports_ray = mm::ray_supported() && caps.gpu_count > 0;
+    if (caps.gpu_count > 0) caps.comm_backends.push_back("nccl");
+    if (mm::ray_supported()) caps.comm_backends.push_back("gloo");
 
     return caps;
 }
@@ -826,6 +849,8 @@ int main(int argc, char** argv) {
     mm::EngineRegistry::instance().register_engine(
         mm::make_llama_descriptor(cfg.llama_server_path));
     mm::EngineRegistry::instance().register_engine(mm::make_soma_descriptor(cfg.soma_path));
+    mm::EngineRegistry::instance().register_engine(
+        mm::make_vllm_descriptor(cfg.vllm_path, cfg.hf_cache_dir));
     MM_INFO("Engines registered: {}", mm::util::join(mm::EngineRegistry::instance().ids(), ", "));
 
     // ── EngineSupervisor ──────────────────────────────────────────────────────
@@ -890,7 +915,27 @@ int main(int argc, char** argv) {
     engine_paths.llama_executable = cfg.llama_server_path;
     engine_paths.llama_provision_dir = cfg.llama_provision_dir;
     engine_paths.soma_executable = cfg.soma_path;
+    engine_paths.vllm_executable = cfg.vllm_path;
+    engine_paths.vllm_provision_dir = cfg.vllm_provision_dir;
+    engine_paths.vllm_python = cfg.vllm_python_path;
+    const auto vllm_caps = state.get_capabilities();
+#ifdef __APPLE__
+    engine_paths.vllm_variant = "metal";
+#else
+    engine_paths.vllm_variant = vllm_caps.gpu_count > 0 ? "cuda" : "cpu";
+#endif
     mm::NodeEngineManager engine_manager(engine_paths);
+    std::filesystem::path managed_ray = std::filesystem::path(cfg.vllm_provision_dir) /
+        "venv";
+#ifdef _WIN32
+    managed_ray /= "Scripts/ray.exe";
+#else
+    managed_ray /= "bin/ray";
+#endif
+    std::error_code managed_ray_ec;
+    const std::string initial_ray = std::filesystem::is_regular_file(
+        managed_ray, managed_ray_ec) ? managed_ray.string() : cfg.ray_path;
+    mm::RayController ray_controller(initial_ray, cfg.ray_port);
 
     std::atomic<bool> engine_provision_stop{false};
     std::mutex llama_operation_mutex;
@@ -946,6 +991,21 @@ int main(int argc, char** argv) {
                 cfg.soma_path = executable;
                 mm::EngineRegistry::instance().register_engine(
                     mm::make_soma_descriptor(executable));
+            } else if (engine_id == "vllm") {
+                cfg.vllm_path = executable;
+                mm::EngineRegistry::instance().register_engine(
+                    mm::make_vllm_descriptor(executable, cfg.hf_cache_dir));
+                auto managed_ray_executable = std::filesystem::path(executable).parent_path();
+#ifdef _WIN32
+                managed_ray_executable /= "ray.exe";
+#else
+                managed_ray_executable /= "ray";
+#endif
+                std::error_code ray_ec;
+                if (std::filesystem::is_regular_file(managed_ray_executable, ray_ec)) {
+                    ray_controller.set_executable_if_idle(
+                        managed_ray_executable.string());
+                }
             }
             MM_INFO("Engine '{}' resolved to {}", engine_id, executable);
         });
@@ -1144,6 +1204,7 @@ int main(int argc, char** argv) {
     api_server.set_model_store(&model_store);
     api_server.set_engine_manager(&engine_manager);
     api_server.set_engine_config_callback(apply_engine_config);
+    api_server.set_ray_controller(&ray_controller);
     api_server.set_llama_provision_callback([&]() {
         MM_INFO("llama.cpp provisioning requested by user");
         return ensure_llama_runtime();

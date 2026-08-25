@@ -424,7 +424,8 @@ new config is pushed to every connected node whose reported version differs.
 |---|---|
 | `primary_engine` | Required. Must have a matching entry in `engines`. |
 | `backup_engine` | `""` means **no backup**, which is a real configuration and not an unset one. Defaults to `llama-cpp` at setup. |
-| `engines[]` | `engine_id`, `version`, `install_method` (`auto\|release\|source\|path`), `update_policy` (`prompt\|auto\|manual`), `update_check`, `update_check_interval_hours`, `cmake_args`, `build_jobs`. |
+| `engines[]` | `engine_id`, `version`, `install_method`, `update_policy` (`prompt\|auto\|manual`), `update_check`, `update_check_interval_hours`, `cmake_args`, `build_jobs`. Soma/llama.cpp accept `auto\|release\|source\|path`; vLLM accepts `auto\|wheel\|source\|path`. |
+| `engines[].vllm` | Present only for vLLM: model/sequence/batch-token limits, TP/PP, GPU-memory utilization, dtype, quantization, trust/prefix/tool/sleep controls, tool parser, additional arguments, and automatic Ray policy. |
 | `share_builds` | Whether a node that built an engine may serve it to a node that needs the same one. |
 
 ### `GET /v1/cluster/engines/conformance` — `read`
@@ -434,6 +435,13 @@ provision, and whether placement may target it. `placement_eligible` is stated p
 
 States are `unconfigured`, `converging`, `conforming`, `drifted`, `failed`. Only `conforming`
 permits placement; `drifted` and `failed` carry a non-empty `detail`.
+
+### `GET /v1/cluster/engines/ray` — `read`
+
+Returns whether automatic Ray topology is required by the configured vLLM
+profile, the eligible-node count, active group summaries, TP/PP, transport,
+and diagnostics. The endpoint remains readable when vLLM is not selected and
+then reports `state: "hidden"`.
 
 ### `POST /v1/cluster/engines/resync` — `operator`
 Re-push the configuration to every node whose version differs, without waiting for the next

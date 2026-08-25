@@ -38,6 +38,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -51,6 +52,39 @@ namespace mm {
 /// never launch, and the node provisions nothing that the cluster config does
 /// not name.
 inline constexpr const char* kDefaultBackupEngine = "llama-cpp";
+
+/// Cluster-wide launch defaults for the vLLM OpenAI server.
+///
+/// Sampling remains per request in RuntimeSettings.  These values instead
+/// describe the process that must exist before a request can be served, which
+/// is why they belong beside the engine acquisition policy rather than on an
+/// agent.  `served_model_name` is intentionally absent: that is the existing
+/// AgentConfig alias and travels with the load request.
+struct VllmEngineConfig {
+    int max_model_len = 4096;
+    int max_num_seqs = 16;
+    int max_num_batched_tokens = -1; ///< -1 delegates to vLLM
+    int tensor_parallel_size = 1;    ///< GPUs per node
+    int pipeline_parallel_size = 1;  ///< nodes; >1 requires Ray
+    double gpu_memory_utilization = 0.90;
+    std::string dtype = "auto";
+    std::string quantization;
+    bool trust_remote_code = false;
+    bool enable_prefix_caching = true;
+    bool enable_auto_tool_choice = false;
+    bool enable_sleep_mode = true;
+    std::string tool_call_parser;
+    std::vector<std::string> extra_args;
+
+    /// Topology is always derived from TP/PP.  The string is kept on the wire
+    /// so a future mode cannot be mistaken for this build's automatic policy.
+    std::string ray_mode = "automatic";
+    bool allow_experimental_gloo = false;
+};
+
+/// Launch identity used by descriptor sharing and placement fingerprints.
+bool vllm_launch_compatible(const VllmEngineConfig& a,
+                            const VllmEngineConfig& b) noexcept;
 
 /// One engine's policy. Every field here is a property of the CLUSTER's intent.
 /// Anything that varies per machine is deliberately absent — see the header
@@ -72,7 +106,14 @@ struct EngineSpec {
     /// may state a number when its members are known to be alike; it is intent,
     /// not detection, which is why it is allowed to live here.
     int build_jobs = 0;
+
+    /// Present only for vllm.  Missing on an older config means the defaults
+    /// above, allowing a rolling upgrade without rewriting the stored policy.
+    std::optional<VllmEngineConfig> vllm;
 };
+
+/// Returns the stored profile or the backwards-compatible defaults.
+VllmEngineConfig effective_vllm_config(const EngineSpec& spec);
 
 /// The master's engine policy for the whole cluster.
 struct ClusterEngineConfig {
@@ -229,6 +270,8 @@ bool parse_conformance_state(const std::string& s, EngineConformanceState& out) 
 
 void to_json(nlohmann::json& j, const EngineSpec& s);
 void from_json(const nlohmann::json& j, EngineSpec& s);
+void to_json(nlohmann::json& j, const VllmEngineConfig& s);
+void from_json(const nlohmann::json& j, VllmEngineConfig& s);
 void to_json(nlohmann::json& j, const ClusterEngineConfig& c);
 /// Throws std::invalid_argument when a forbidden key is present, naming it.
 void from_json(const nlohmann::json& j, ClusterEngineConfig& c);

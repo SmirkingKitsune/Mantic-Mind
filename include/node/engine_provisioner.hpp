@@ -220,4 +220,39 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+/// vLLM — a Python runtime isolated in a node-local virtual environment.
+/// Cluster policy chooses version/method; executable, Python and install root
+/// remain local deployment facts.
+class VllmEngineProvisioner final : public EngineProvisioner {
+public:
+    VllmEngineProvisioner(std::string requested_executable,
+                          std::string provision_dir,
+                          std::string python_executable = "python",
+                          std::string hardware_variant = {});
+    ~VllmEngineProvisioner() override;
+
+    const std::string& engine_id() const override;
+    RuntimeStatus ensure(const EngineSpec& spec) override;
+    RuntimeStatus check_for_update(const EngineSpec& spec) override;
+    RuntimeStatus update(const EngineSpec& spec, const std::string& variant_override) override;
+    RuntimeStatus status() const override;
+    std::optional<EngineArtifact> installed_artifact() const override;
+    std::optional<EngineArtifact> desired_artifact(const EngineSpec& spec) const override;
+    bool shareable() const override;
+    bool package(const std::string& out_path, std::string& err) override;
+    bool install_package(const std::string& package_path,
+                         const EngineArtifact& artifact,
+                         std::string& err) override;
+    std::string executable_path() const override;
+
+private:
+    RuntimeStatus converge(const EngineSpec& spec, bool force_upgrade);
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+/// Pure acquisition selector used by the provisioner and unit tests. Empty for
+/// path-only policy, which must never invoke pip.
+std::string vllm_install_requirement(const EngineSpec& spec);
+
 } // namespace mm

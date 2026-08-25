@@ -5,6 +5,7 @@ add_executable(mm_reliability_tests
     ${CMAKE_SOURCE_DIR}/src/control/agent_config_validator.cpp
     ${CMAKE_SOURCE_DIR}/src/control/agent_scheduler.cpp
     ${CMAKE_SOURCE_DIR}/src/control/engine_config_store.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/engine_group_planner.cpp
     ${CMAKE_SOURCE_DIR}/src/control/model_registry.cpp
     ${CMAKE_SOURCE_DIR}/src/control/route_scope.cpp
     ${CMAKE_SOURCE_DIR}/src/control/control_api_server.cpp
@@ -17,11 +18,13 @@ add_executable(mm_reliability_tests
     ${CMAKE_SOURCE_DIR}/src/node/kv_checkpoint_backend.cpp
     ${CMAKE_SOURCE_DIR}/src/node/runtime_process.cpp
     ${CMAKE_SOURCE_DIR}/src/node/llama_runtime.cpp
+    ${CMAKE_SOURCE_DIR}/src/node/vllm_runtime.cpp
     ${CMAKE_SOURCE_DIR}/src/node/llama_cpp_provisioner.cpp
     ${CMAKE_SOURCE_DIR}/src/node/engine_provisioner.cpp
     ${CMAKE_SOURCE_DIR}/src/node/engine_manager.cpp
     ${CMAKE_SOURCE_DIR}/src/node/node_state.cpp
     ${CMAKE_SOURCE_DIR}/src/node/node_modal.cpp
+    ${CMAKE_SOURCE_DIR}/src/node/ray_orchestration.cpp
 )
 
 target_include_directories(mm_reliability_tests PRIVATE
@@ -179,9 +182,16 @@ if(Python3_Interpreter_FOUND)
                      "${CMAKE_SOURCE_DIR}"
                      "${CMAKE_CURRENT_BINARY_DIR}/minimax_dialect_tmp")
 
+    # Opt-in release smoke for a real Linux multi-node vLLM/Ray deployment.
+    # The script skips unless its control URL and agent ID are supplied.
+    add_test(NAME mm_vllm_ray_smoke
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_SOURCE_DIR}/tests/vllm_ray_smoke.py")
+
     # 77 is ctest's conventional "skipped". Without this a missing dependency
     # exits 0 and reads as Passed, which is how mm_fused_experts ran nothing for
     # its whole existence while showing green.
-    set_tests_properties(mm_fused_experts mm_verify_payload mm_minimax_dialect PROPERTIES
+    set_tests_properties(mm_fused_experts mm_verify_payload mm_minimax_dialect
+                         mm_vllm_ray_smoke PROPERTIES
                          SKIP_RETURN_CODE 77)
 endif()

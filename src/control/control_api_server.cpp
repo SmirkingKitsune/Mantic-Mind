@@ -8,6 +8,7 @@
 #include "common/pairing.hpp"
 #include "control/agent_config_validator.hpp"
 #include "control/engine_config_store.hpp"
+#include "control/engine_group_planner.hpp"
 #include "control/tts_service_client.hpp"
 #include "common/agent.hpp"
 #include "common/agent_db.hpp"
@@ -41,6 +42,7 @@
 #include <memory>
 #include <optional>
 #include <sstream>
+#include <set>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -2007,7 +2009,10 @@ void ControlApiServer::handle_chat(const AgentId& agent_id,
 
         // Build inference request
         InferenceRequest infer_req;
-        infer_req.model    = cfg.model_path;
+        const auto active_placement = scheduler_.get_placement(cfg.id);
+        infer_req.model = active_placement && active_placement->engine_id == "vllm" &&
+                                  !cfg.served_model_name.empty()
+            ? cfg.served_model_name : cfg.model_path;
         infer_req.messages = context_msgs;
         infer_req.settings = cfg.runtime_settings;
         infer_req.stream   = true;
@@ -2505,7 +2510,10 @@ void ControlApiServer::queue_global_recall(const AgentId& agent_id,
 
         for (int round = 0; round < kMaxRecallRounds; ++round) {
             InferenceRequest req;
-            req.model    = acfg.model_path;
+            const auto recall_placement = scheduler_.get_placement(acfg.id);
+            req.model = recall_placement && recall_placement->engine_id == "vllm" &&
+                                !acfg.served_model_name.empty()
+                ? acfg.served_model_name : acfg.model_path;
             req.messages = recall_ctx;
             req.settings = acfg.runtime_settings;
             req.tools    = tool_exec.get_all_tool_definitions();
@@ -3561,7 +3569,10 @@ void ControlApiServer::register_routes() {
             messages.push_back(user);
 
             InferenceRequest req;
-            req.model = acfg.model_path;
+            const auto voice_placement = scheduler_.get_placement(acfg.id);
+            req.model = voice_placement && voice_placement->engine_id == "vllm" &&
+                               !acfg.served_model_name.empty()
+                ? acfg.served_model_name : acfg.model_path;
             req.messages = std::move(messages);
             req.settings = acfg.runtime_settings;
             req.settings.max_tokens = std::min(std::max(req.settings.max_tokens, 256), 768);
@@ -4373,12 +4384,13 @@ void ControlApiServer::register_routes() {
             return;
         }
 
-        // Validated against the union of engine ids any node reports, so a
+        // Built-ins remain configurable before the first node registers. Node
+        // reports may add future engine ids to this set.
         // cluster of Soma-only nodes cannot be configured for an engine none of
         // them has. Empty means no node has reported yet, and validation then
         // skips the id check rather than refusing every write until a node
         // appears.
-        std::vector<std::string> known;
+        std::vector<std::string> known{"soma", "llama-cpp", "vllm"};
         for (const auto& n : registry_.list_nodes()) {
             for (const auto& e : n.engines) {
                 if (std::find(known.begin(), known.end(), e.engine_id) == known.end())
@@ -4396,6 +4408,107 @@ void ControlApiServer::register_routes() {
                                 std::to_string(engine_config_->version()));
         res.set_content(nlohmann::json{{"configured", true},
                                        {"config", engine_config_->get()}}
+                            .dump(),
+                        "application/json");
+    });
+
+    server_->Get("/v1/cluster/engines/ray", [this](const Request&, Response& res) {
+        if (engine_config_ == nullptr) {
+            res.status = 503;
+            res.set_content(R"({"error":"engine configuration is not available"})",
+                            "application/json");
+            return;
+        }
+        const auto cfg = engine_config_->get();
+        const bool configured = cfg.primary_engine == "vllm" ||
+                                cfg.backup_engine == "vllm";
+        VllmEngineConfig profile;
+        if (const auto* spec = cfg.find("vllm")) profile = effective_vllm_config(*spec);
+        int eligible = 0;
+        int active = 0;
+        nlohmann::json eligible_nodes = nlohmann::json::array();
+        nlohmann::json groups = nlohmann::json::array();
+        std::unordered_map<std::string, nlohmann::json> group_rows;
+        for (const auto& node : registry_.list_nodes()) {
+            const bool linux = util::to_lower(node.platform) == "linux";
+            const bool ready = std::any_of(
+                node.engines.begin(), node.engines.end(), [](const RuntimeStatus& runtime) {
+                    return runtime.engine_id == "vllm" && runtime.ready;
+                });
+            if (node.connected && linux && ready && node.capabilities.supports_ray &&
+                node.capabilities.gpu_count >= profile.tensor_parallel_size &&
+                node.engine_config_version == cfg.version && node.ray.group_id.empty())
+            {
+                ++eligible;
+                eligible_nodes.push_back(nlohmann::json{
+                    {"node_id", node.id},
+                    {"gpu_count", node.capabilities.gpu_count},
+                    {"architecture", node.capabilities.arch},
+                    {"transports", node.capabilities.comm_backends}});
+            }
+            if (!node.ray.group_id.empty()) {
+                auto [it, inserted] = group_rows.emplace(
+                    node.ray.group_id,
+                    nlohmann::json{{"group_id", node.ray.group_id},
+                                   {"agent_id", node.ray.agent_id},
+                                   {"state", node.ray.state},
+                                   {"transport", node.ray.transport},
+                                   {"members", nlohmann::json::array()}});
+                auto& group = it->second;
+                if (node.ray.active()) group["state"] = "active";
+                group["members"].push_back(nlohmann::json{
+                    {"node_id", node.id}, {"role", node.ray.role},
+                    {"state", node.ray.state},
+                    {"head_address", node.ray.head_address},
+                    {"reserved_gpus", node.ray.reserved_gpus}});
+            }
+        }
+        for (auto& [_, group] : group_rows) {
+            if (group.value("state", std::string{}) == "active") ++active;
+            groups.push_back(std::move(group));
+        }
+        const bool required = configured && profile.pipeline_parallel_size > 1;
+        std::vector<EngineGroupCandidate> eligible_groups;
+        if (required) {
+            EngineGroupRequest group_request;
+            group_request.model_ref = "status/probe"; // valid HF-shaped id; no I/O
+            group_request.tensor_parallel_size = profile.tensor_parallel_size;
+            group_request.pipeline_parallel_size = profile.pipeline_parallel_size;
+            group_request.config_version = cfg.version;
+            group_request.allow_experimental_gloo = profile.allow_experimental_gloo;
+            eligible_groups = plan_engine_groups(group_request, registry_.list_nodes());
+        }
+        std::string state = "hidden";
+        std::string detail = "vLLM is not selected as primary or backup";
+        if (configured && !required) {
+            state = "inactive";
+            detail = "pipeline parallelism is 1; Ray is not needed";
+        } else if (required && active > 0) {
+            state = "active";
+            detail = std::to_string(active) + " Ray group(s) active";
+        } else if (required && !eligible_groups.empty()) {
+            state = "ready";
+            detail = std::to_string(eligible_groups.size()) +
+                     " compatible Ray placement(s) available on demand";
+        } else if (required) {
+            state = "unavailable";
+            detail = "need " + std::to_string(profile.pipeline_parallel_size) +
+                     " idle compatible Linux nodes; " + std::to_string(eligible) +
+                     " currently eligible";
+        }
+        res.set_content(nlohmann::json{{"configured", configured},
+                                       {"required", required},
+                                       {"state", state},
+                                       {"detail", detail},
+                                       {"tensor_parallel_size", profile.tensor_parallel_size},
+                                       {"pipeline_parallel_size", profile.pipeline_parallel_size},
+                                       {"eligible_node_count", eligible},
+                                       {"eligible_nodes", eligible_nodes},
+                                       {"eligible_group_count", eligible_groups.size()},
+                                       {"active_groups", active},
+                                       {"groups", groups},
+                                       {"allow_experimental_gloo",
+                                        profile.allow_experimental_gloo}}
                             .dump(),
                         "application/json");
     });

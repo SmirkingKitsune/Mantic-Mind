@@ -166,7 +166,7 @@ std::optional<SlotId> EngineSupervisor::try_attach(const std::string& engine_id,
         // its predicate because its KV slot is per-sequence; llama.cpp cannot,
         // because ctx_size is carved per slot at launch.
         if (!e->descriptor->launch_compatible) continue;
-        if (!e->descriptor->launch_compatible(e->launch_settings, request.settings)) continue;
+        if (!e->descriptor->launch_compatible(e->launch_request, request)) continue;
 
         if (!agent_id.empty() &&
             std::find(e->agents.begin(), e->agents.end(), agent_id) == e->agents.end()) {
@@ -202,13 +202,37 @@ SlotId EngineSupervisor::load(const std::string& engine_id,
 
         const int live = static_cast<int>(
             std::count_if(engines_.begin(), engines_.end(), [](const std::unique_ptr<Engine>& e) {
-                // Suspended engines hold no process and no port, so they do not
-                // count against capacity. Preserved from SlotManager.
-                return e->state != SlotState::Suspended;
+                // Checkpoint-suspended engines hold no process and do not count
+                // against capacity. vLLM sleep is deliberately different: the
+                // process and its selected devices stay owned so wake is cheap,
+                // and that reservation must not turn into a free slot.
+                return e->state != SlotState::Suspended ||
+                       (e->descriptor != nullptr && e->descriptor->id == "vllm" &&
+                        e->process != nullptr);
             }));
         if (live + pending_loads_ >= max_slots_) {
             last_error_ = "max slots reached";
             return {};
+        }
+
+        if (engine_id == "vllm") {
+            for (const int device : request.gpu_devices) {
+                const bool live_conflict = std::any_of(
+                    engines_.begin(), engines_.end(), [&](const std::unique_ptr<Engine>& e) {
+                        if (e->descriptor == nullptr || e->descriptor->id != "vllm" ||
+                            e->state == SlotState::Empty || e->state == SlotState::Error) {
+                            return false;
+                        }
+                        return std::find(e->launch_request.gpu_devices.begin(),
+                                         e->launch_request.gpu_devices.end(), device) !=
+                               e->launch_request.gpu_devices.end();
+                    });
+                if (live_conflict || pending_gpu_devices_.count(device) != 0) {
+                    last_error_ = "vLLM GPU device " + std::to_string(device) +
+                                  " is already reserved";
+                    return {};
+                }
+            }
         }
 
         const auto allocated = allocate_port();
@@ -219,6 +243,9 @@ SlotId EngineSupervisor::load(const std::string& engine_id,
             return {};
         }
         port = *allocated;
+        if (engine_id == "vllm")
+            pending_gpu_devices_.insert(request.gpu_devices.begin(),
+                                        request.gpu_devices.end());
         ++pending_loads_;
         kv_dir = kv_checkpoint_dir_;
     }
@@ -230,6 +257,7 @@ SlotId EngineSupervisor::load(const std::string& engine_id,
     engine->model_path = request.model_path;
     engine->mmproj_path = request.mmproj_path;
     engine->launch_settings = request.settings;
+    engine->launch_request = request;
     engine->state = SlotState::Loading;
     engine->last_active_ms = util::now_ms();
     engine->effective_ctx_size = request.settings.ctx_size;
@@ -274,6 +302,8 @@ SlotId EngineSupervisor::load(const std::string& engine_id,
         const std::string why = engine->process->last_error();
         std::lock_guard<std::mutex> lk(mutex_);
         --pending_loads_;
+        for (const int device : request.gpu_devices)
+            pending_gpu_devices_.erase(device);
         release_port(port);
         last_error_ = "engine failed to start: " + why;
         MM_ERROR("EngineSupervisor: {}", last_error_);
@@ -286,6 +316,8 @@ SlotId EngineSupervisor::load(const std::string& engine_id,
             engine->process->stop();
             std::lock_guard<std::mutex> lk(mutex_);
             --pending_loads_;
+            for (const int device : request.gpu_devices)
+                pending_gpu_devices_.erase(device);
             release_port(port);
             last_error_ = "engine capability check failed: " + detail;
             MM_ERROR("EngineSupervisor: {}", last_error_);
@@ -299,6 +331,8 @@ SlotId EngineSupervisor::load(const std::string& engine_id,
     {
         std::lock_guard<std::mutex> lk(mutex_);
         --pending_loads_;
+        for (const int device : request.gpu_devices)
+            pending_gpu_devices_.erase(device);
         engines_.push_back(std::move(engine));
     }
     MM_INFO("EngineSupervisor: {} engine {} ready on port {}", engine_id, slot_id, port);
@@ -415,6 +449,47 @@ EngineOpResult EngineSupervisor::unload_all(bool force) {
 // ── suspend / restore ─────────────────────────────────────────────────────────
 
 EngineOpResult EngineSupervisor::suspend(const SlotId& slot_id) {
+    std::string vllm_url;
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        const auto it = std::find_if(
+            engines_.begin(), engines_.end(),
+            [&](const std::unique_ptr<Engine>& e) { return e->id == slot_id; });
+        if (it != engines_.end() && (*it)->descriptor != nullptr &&
+            (*it)->descriptor->id == "vllm") {
+            if ((*it)->state != SlotState::Ready)
+                return {EngineOpStatus::Failed, "engine is not ready", "", {}};
+            if ((*it)->active_requests > 0)
+                return {EngineOpStatus::Busy, "requests in flight",
+                        "capacity_pressure", {}};
+            const auto profile = (*it)->launch_request.vllm.value_or(VllmEngineConfig{});
+            if (!profile.enable_sleep_mode)
+                return {EngineOpStatus::Unsupported,
+                        "vLLM sleep mode is disabled by the cluster profile", "", {}};
+            vllm_url = (*it)->process ? (*it)->process->url() : std::string{};
+            if (vllm_url.empty())
+                return {EngineOpStatus::Failed,
+                        "vLLM process is unavailable", "internal", {}};
+            (*it)->state = SlotState::Suspending;
+        }
+    }
+    if (!vllm_url.empty()) {
+        VllmEngineClient client(vllm_url);
+        std::string error;
+        const bool slept = client.sleep(1, error);
+        std::lock_guard<std::mutex> lk(mutex_);
+        for (auto& engine : engines_) {
+            if (engine->id != slot_id) continue;
+            engine->state = slept ? SlotState::Suspended : SlotState::Ready;
+            if (!slept) last_error_ = "vLLM sleep failed: " + error;
+            break;
+        }
+        return slept
+            ? EngineOpResult{EngineOpStatus::Ok, "sleeping", "", {}}
+            : EngineOpResult{EngineOpStatus::Failed,
+                             "vLLM sleep failed: " + error, "internal", {}};
+    }
+
     KvCheckpointBackend* kv = nullptr;
     std::string checkpoint_path;
     std::string base_url;
@@ -520,6 +595,49 @@ SlotId EngineSupervisor::restore(const std::string& engine_id,
         last_error_ = "unknown engine '" + engine_id +
                       "'; registered engines: " + join_ids(EngineRegistry::instance().ids());
         return {};
+    }
+
+    SlotId sleeping_vllm;
+    std::string vllm_url;
+    if (engine_id == "vllm") {
+        std::lock_guard<std::mutex> lk(mutex_);
+        for (auto& engine : engines_) {
+            if (engine->state != SlotState::Suspended ||
+                engine->descriptor == nullptr || engine->descriptor->id != "vllm" ||
+                engine->model_path != request.model_path ||
+                engine->launch_request.served_model_name != request.served_model_name ||
+                !vllm_launch_compatible(
+                    engine->launch_request.vllm.value_or(VllmEngineConfig{}),
+                    request.vllm.value_or(VllmEngineConfig{}))) {
+                continue;
+            }
+            sleeping_vllm = engine->id;
+            vllm_url = engine->process ? engine->process->url() : std::string{};
+            if (vllm_url.empty()) {
+                sleeping_vllm.clear();
+                continue;
+            }
+            engine->state = SlotState::Suspending;
+            break;
+        }
+    }
+    if (!sleeping_vllm.empty() && !vllm_url.empty()) {
+        VllmEngineClient client(vllm_url);
+        std::string error;
+        const bool woke = client.wake(error);
+        std::lock_guard<std::mutex> lk(mutex_);
+        for (auto& engine : engines_) {
+            if (engine->id != sleeping_vllm) continue;
+            engine->state = woke ? SlotState::Ready : SlotState::Suspended;
+            if (woke && !agent_id.empty() &&
+                std::find(engine->agents.begin(), engine->agents.end(), agent_id) ==
+                    engine->agents.end()) {
+                engine->agents.push_back(agent_id);
+            }
+            if (!woke) last_error_ = "vLLM wake failed: " + error;
+            break;
+        }
+        return woke ? sleeping_vllm : SlotId{};
     }
 
     // Reject a cross-architecture resume BEFORE spawning anything. The header is
@@ -639,6 +757,7 @@ SlotInfo EngineSupervisor::make_slot_info(const Engine& engine) const {
     info.assigned_agent = engine.agents.empty() ? AgentId{} : engine.agents.front();
     info.agent_ids = engine.agents;
     info.state = engine.state;
+    info.gpu_devices = engine.launch_request.gpu_devices;
     // The single-scalar view, for the wire field that still expects one. Reported
     // as the dominant axis rather than as VRAM, because Soma's cost is RAM.
     info.vram_usage_mb =
@@ -728,7 +847,9 @@ int EngineSupervisor::available_slot_count() const {
     std::lock_guard<std::mutex> lk(mutex_);
     const int live = static_cast<int>(
         std::count_if(engines_.begin(), engines_.end(), [](const std::unique_ptr<Engine>& e) {
-            return e->state != SlotState::Suspended;
+            return e->state != SlotState::Suspended ||
+                   (e->descriptor != nullptr && e->descriptor->id == "vllm" &&
+                    e->process != nullptr);
         }));
     return std::max(0, max_slots_ - live - pending_loads_);
 }
@@ -741,7 +862,10 @@ ResourceFootprint EngineSupervisor::total_footprint() const {
     std::lock_guard<std::mutex> lk(mutex_);
     ResourceFootprint total;
     for (const auto& e : engines_) {
-        if (e->state == SlotState::Suspended) continue; // holds no process
+        const bool sleeping_vllm = e->state == SlotState::Suspended &&
+            e->descriptor != nullptr && e->descriptor->id == "vllm" &&
+            e->process != nullptr;
+        if (e->state == SlotState::Suspended && !sleeping_vllm) continue;
         total.vram_mb += e->footprint.vram_mb;
         total.ram_mb += e->footprint.ram_mb;
         total.disk_mb += e->footprint.disk_mb;
@@ -798,6 +922,9 @@ SlotId EngineSupervisor::add_ready_test_engine(const std::string& engine_id,
     engine->mmproj_path = std::move(mmproj_path);
     if (!agent_id.empty()) engine->agents.push_back(std::move(agent_id));
     engine->launch_settings = std::move(settings);
+    engine->launch_request.model_path = engine->model_path;
+    engine->launch_request.mmproj_path = engine->mmproj_path;
+    engine->launch_request.settings = engine->launch_settings;
     engine->client = std::make_unique<LlamaEngineClient>("http://127.0.0.1:0");
     engine->state = SlotState::Ready;
     engine->last_active_ms = util::now_ms();

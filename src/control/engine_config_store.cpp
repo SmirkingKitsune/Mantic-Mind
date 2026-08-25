@@ -187,11 +187,13 @@ ClusterEngineConfig EngineConfigStore::default_for(const std::string& primary_en
 
     EngineSpec primary;
     primary.engine_id = primary_engine;
+    if (primary_engine == "vllm") primary.vllm = VllmEngineConfig{};
     cfg.engines.push_back(primary);
 
     if (!cfg.backup_engine.empty()) {
         EngineSpec backup;
         backup.engine_id = cfg.backup_engine;
+        if (backup.engine_id == "vllm") backup.vllm = VllmEngineConfig{};
         cfg.engines.push_back(backup);
     }
     return cfg;

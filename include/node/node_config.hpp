@@ -34,6 +34,14 @@ struct NodeConfig {
     // verdict decides which one runs it.
     std::string soma_path = "soma";     // soma executable  MM_SOMA_PATH
 
+    // vLLM deployment locations. Version and install policy are cluster-owned.
+    std::string vllm_path = "vllm";
+    std::string vllm_provision_dir;
+    std::string vllm_python_path = "python";
+    std::string ray_path = "ray";
+    uint16_t ray_port = 6379;
+    std::string hf_cache_dir;
+
     // Hardware capability override; zero lets startup detect visible GPUs.
     int         node_gpu_count = 0;        // 0 = auto (nvidia-smi)
     uint16_t    runtime_port_range_start = 8080;

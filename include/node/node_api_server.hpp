@@ -15,6 +15,7 @@ class EngineSupervisor;
 class HttpServer;
 class ModelStore;
 class NodeEngineManager;
+class RayController;
 
 // Hosts the node REST API.
 // Most endpoints require "Authorization: Bearer <node-api-key>".
@@ -66,6 +67,7 @@ public:
     void set_engine_manager(NodeEngineManager* manager);
     using EngineConfigCallback = std::function<void(const ClusterEngineConfig&)>;
     void set_engine_config_callback(EngineConfigCallback callback);
+    void set_ray_controller(RayController* controller);
 
 private:
     NodeState&        state_;
@@ -73,6 +75,7 @@ private:
     ModelStore*    model_store_ = nullptr;
     NodeEngineManager* engine_manager_ = nullptr;
     EngineConfigCallback engine_config_cb_;
+    RayController* ray_controller_ = nullptr;
     std::string    control_url_;
     std::string    pairing_key_;
     std::unique_ptr<HttpServer> server_;

@@ -15,6 +15,7 @@
 #include "common/engine_client.hpp"
 #include "control/agent_scheduler.hpp"
 #include "control/engine_config_store.hpp"
+#include "control/engine_group_planner.hpp"
 #include "node/node_state.hpp"
 #include "node/engine_manager.hpp"
 #include "node/engine_provisioner.hpp"
@@ -39,6 +40,8 @@
 #include "node/engine_supervisor.hpp"
 #include "node/llama_runtime.hpp"
 #include "node/llama_cpp_provisioner.hpp"
+#include "node/ray_orchestration.hpp"
+#include "node/vllm_runtime.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -518,14 +521,18 @@ bool test_served_model_name_legacy_compatibility() {
         db.exec(R"sql(
             UPDATE agent_config
                SET served_model_name = '',
+                   inference_backend = 'vllm',
                    vllm_settings_json = '{"served_model_name":"legacy-db-alias"}'
              WHERE id = 'legacy-db-agent'
         )sql");
+        db.exec("DELETE FROM schema_migrations WHERE version = 12");
     }
     {
         mm::AgentDB db("legacy-db-agent", dir.string());
         const auto loaded = db.load_config();
         CHECK(loaded.served_model_name == "legacy-db-alias");
+        CHECK(loaded.inference_backend == "llama-cpp");
+        CHECK(loaded.backend_override == "auto");
     }
 
     CHECK(remove_tree(dir));
@@ -679,6 +686,221 @@ bool test_engine_config_validation_and_round_trip() {
     CHECK(parsed.backup_engine == "llama-cpp");
     CHECK(parsed.updated_by == "tui");
     CHECK(parsed.engines.size() == cfg.engines.size());
+
+    auto vllm = mm::EngineConfigStore::default_for("vllm");
+    CHECK(vllm.engines.front().vllm.has_value());
+    auto& profile = *vllm.engines.front().vllm;
+    profile.tensor_parallel_size = 4;
+    profile.pipeline_parallel_size = 2;
+    profile.max_num_batched_tokens = 8192;
+    profile.allow_experimental_gloo = true;
+    vllm.engines.front().install_method = "wheel";
+    CHECK(mm::validate_engine_config(vllm, {"vllm", "llama-cpp"}, err));
+    const auto vllm_parsed = nlohmann::json(vllm).get<mm::ClusterEngineConfig>();
+    const auto vllm_rt = mm::effective_vllm_config(*vllm_parsed.find("vllm"));
+    CHECK(vllm_rt.tensor_parallel_size == 4);
+    CHECK(vllm_rt.pipeline_parallel_size == 2);
+    CHECK(vllm_rt.max_num_batched_tokens == 8192);
+    CHECK(vllm_rt.allow_experimental_gloo);
+
+    auto legacy_vllm_json = nlohmann::json(vllm);
+    legacy_vllm_json["engines"][0].erase("vllm");
+    const auto legacy_vllm = legacy_vllm_json.get<mm::ClusterEngineConfig>();
+    CHECK(!legacy_vllm.engines.front().vllm.has_value());
+    CHECK(mm::effective_vllm_config(legacy_vllm.engines.front())
+              .pipeline_parallel_size == 1);
+    CHECK(!mm::effective_vllm_config(legacy_vllm.engines.front())
+               .allow_experimental_gloo);
+
+    auto invalid = vllm;
+    invalid.engines.front().vllm->gpu_memory_utilization = 1.1;
+    CHECK(!mm::validate_engine_config(invalid, {}, err));
+    CHECK(err.find("gpu_memory_utilization") != std::string::npos);
+
+    invalid = vllm;
+    invalid.engines.front().vllm->extra_args = {"--pipeline-parallel-size=8"};
+    CHECK(!mm::validate_engine_config(invalid, {}, err));
+    CHECK(err.find("managed flag") != std::string::npos);
+
+    invalid = vllm;
+    invalid.engines.front().install_method = "release";
+    CHECK(!mm::validate_engine_config(invalid, {}, err));
+    return true;
+}
+
+bool test_vllm_launch_profile_and_environment() {
+    mm::EngineSpec acquisition;
+    acquisition.engine_id = "vllm";
+    acquisition.install_method = "wheel";
+    acquisition.version = "0.10.2";
+    CHECK(mm::vllm_install_requirement(acquisition) == "vllm==0.10.2");
+    acquisition.install_method = "source";
+    CHECK(mm::vllm_install_requirement(acquisition).find("git+https://") == 0);
+    CHECK(mm::vllm_install_requirement(acquisition).find("@0.10.2") !=
+          std::string::npos);
+    acquisition.install_method = "path";
+    CHECK(mm::vllm_install_requirement(acquisition).empty());
+
+    const auto provision_dir = temp_test_dir("vllm-path-only");
+    mm::VllmEngineProvisioner path_only(
+        "definitely-not-a-real-vllm-executable", provision_dir.string(),
+        "python", "cuda");
+    const auto path_status = path_only.ensure(acquisition);
+    CHECK(!path_status.ready);
+    CHECK(path_status.status == "absent");
+    CHECK(path_status.variant == "cuda");
+    CHECK(remove_tree(provision_dir));
+
+    mm::VllmEngineConfig profile;
+    profile.max_model_len = 16384;
+    profile.max_num_seqs = 32;
+    profile.max_num_batched_tokens = 4096;
+    profile.tensor_parallel_size = 2;
+    profile.pipeline_parallel_size = 3;
+    profile.gpu_memory_utilization = 0.8;
+    profile.dtype = "bfloat16";
+    profile.quantization = "awq";
+    profile.trust_remote_code = true;
+    profile.enable_auto_tool_choice = true;
+    profile.enable_sleep_mode = true;
+    profile.tool_call_parser = "hermes";
+    profile.extra_args = {"--disable-log-requests"};
+
+    const auto args = mm::build_vllm_server_args(
+        "org/model", "public-alias", profile, 8123);
+    const auto has = [&](const std::string& value) {
+        return std::find(args.begin(), args.end(), value) != args.end();
+    };
+    CHECK(args.size() > 4);
+    CHECK(args[0] == "serve");
+    CHECK(args[1] == "org/model");
+    CHECK(has("--served-model-name"));
+    CHECK(has("public-alias"));
+    CHECK(has("--tensor-parallel-size"));
+    CHECK(has("--pipeline-parallel-size"));
+    CHECK(has("--distributed-executor-backend"));
+    CHECK(has("ray"));
+    CHECK(has("--enable-sleep-mode"));
+    CHECK(has("--disable-log-requests"));
+
+    mm::EngineLoadRequest request;
+    request.model_path = "org/model";
+    request.served_model_name = "public-alias";
+    request.vllm = profile;
+    request.ray_address = "10.0.0.1:6379";
+    request.host_ip = "10.0.0.1";
+    request.gpu_devices = {2, 3};
+    request.port = 8123;
+    const auto launch = mm::make_vllm_descriptor("vllm").build_launch(request);
+    const auto env_value = [&](const std::string& key) {
+        const auto it = std::find_if(
+            launch.env.begin(), launch.env.end(), [&](const auto& entry) {
+                return entry.first == key;
+            });
+        return it == launch.env.end() ? std::string{} : it->second;
+    };
+    CHECK(env_value("VLLM_SERVER_DEV_MODE") == "1");
+    CHECK(env_value("RAY_ADDRESS") == "10.0.0.1:6379");
+    CHECK(env_value("VLLM_HOST_IP") == "10.0.0.1");
+    CHECK(env_value("CUDA_VISIBLE_DEVICES") == "2,3");
+
+    mm::SlotInfo reservation;
+    reservation.id = "vllm-slot";
+    reservation.backend = "vllm";
+    reservation.state = mm::SlotState::Suspended;
+    reservation.gpu_devices = {2, 3};
+    const auto reservation_round_trip =
+        nlohmann::json(reservation).get<mm::SlotInfo>();
+    CHECK(reservation_round_trip.gpu_devices == reservation.gpu_devices);
+
+    const auto descriptor = mm::make_vllm_descriptor("vllm");
+    auto alternate_devices = request;
+    alternate_devices.gpu_devices = {0, 1};
+    // A new agent may attach to an already-compatible server; the device list
+    // is a reservation for process creation, not part of the serving API.
+    CHECK(descriptor.launch_compatible(request, alternate_devices));
+    auto changed = request;
+    changed.vllm->max_model_len++;
+    CHECK(!descriptor.launch_compatible(request, changed));
+    return true;
+}
+
+mm::NodeInfo ray_test_node(const std::string& id,
+                           const std::string& url,
+                           const std::vector<std::string>& transports,
+                           const std::string& version = "0.10.2") {
+    mm::NodeInfo node;
+    node.id = id;
+    node.url = url;
+    node.connected = true;
+    node.platform = "linux";
+    node.engine_config_version = 9;
+    node.capabilities.arch = "x86_64";
+    node.capabilities.gpu_count = 4;
+    node.capabilities.supports_ray = true;
+    node.capabilities.comm_backends = transports;
+    node.capabilities.interconnect_gbps = 100.0;
+    mm::RuntimeStatus runtime;
+    runtime.engine_id = "vllm";
+    runtime.ready = true;
+    runtime.status = "ready";
+    runtime.version = version;
+    runtime.variant = "cuda-13";
+    node.engines.push_back(runtime);
+    return node;
+}
+
+bool test_vllm_ray_group_planner_and_commands() {
+    mm::EngineGroupRequest request;
+    request.model_ref = "org/model";
+    request.tensor_parallel_size = 4;
+    request.pipeline_parallel_size = 2;
+    request.config_version = 9;
+
+    auto a = ray_test_node("a", "http://10.0.0.1:8080", {"nccl", "gloo"});
+    auto b = ray_test_node("b", "http://10.0.0.2:8080", {"nccl", "gloo"});
+    auto c = ray_test_node("c", "http://10.0.0.3:8080", {"gloo"});
+    auto mismatch = ray_test_node(
+        "mismatch", "http://10.0.0.4:8080", {"nccl", "gloo"}, "0.9.0");
+    const auto nccl = mm::best_engine_group(request, {c, mismatch, b, a});
+    CHECK(nccl.has_value());
+    CHECK(nccl->transport == "nccl");
+    CHECK(!nccl->experimental);
+    CHECK(nccl->nodes.size() == 2);
+    CHECK(std::find(nccl->nodes.begin(), nccl->nodes.end(), "mismatch") ==
+          nccl->nodes.end());
+
+    b.capabilities.comm_backends = {"gloo"};
+    CHECK(!mm::best_engine_group(request, {a, b}).has_value());
+    request.allow_experimental_gloo = true;
+    const auto gloo = mm::best_engine_group(request, {a, b});
+    CHECK(gloo.has_value());
+    CHECK(gloo->transport == "gloo");
+    CHECK(gloo->experimental);
+
+    std::string reason;
+    CHECK(mm::distributed_vllm_model_ref_supported("org/model", reason));
+    CHECK(mm::distributed_vllm_model_ref_supported("/models/shared", reason));
+    // Two segments are deliberately accepted as a Hugging Face repository id;
+    // a path-like relative reference needs an extra segment to be unambiguous.
+    CHECK(!mm::distributed_vllm_model_ref_supported("models/local/path", reason));
+    CHECK(!reason.empty());
+
+    mm::RayStartConfig head;
+    head.group_id = "group";
+    head.role = "head";
+    head.node_ip = "10.0.0.1";
+    head.num_gpus = 4;
+    const auto head_args = mm::build_ray_start_args(head, 6380);
+    CHECK(std::find(head_args.begin(), head_args.end(), "--head") != head_args.end());
+    CHECK(std::find(head_args.begin(), head_args.end(), "--port=6380") !=
+          head_args.end());
+    mm::RayStartConfig worker = head;
+    worker.role = "worker";
+    worker.head_address = "10.0.0.1:6380";
+    const auto worker_args = mm::build_ray_start_args(worker, 6380);
+    CHECK(std::find(worker_args.begin(), worker_args.end(),
+                    "--address=10.0.0.1:6380") != worker_args.end());
     return true;
 }
 
@@ -1626,6 +1848,162 @@ bool test_scheduler_skips_failed_node_current_attempt() {
     if (good_thread.joinable()) good_thread.join();
     RECORD(bad_listen_ok);
     RECORD(good_listen_ok);
+    RECORD(remove_tree(dir));
+
+#undef RECORD
+    return ok;
+}
+
+bool test_scheduler_exhausts_primary_before_cluster_backup() {
+    bool ok = true;
+#define RECORD(expr) do { if (!(expr)) { std::cerr << "CHECK failed at line " << __LINE__ << ": " << #expr << "\n"; ok = false; } } while (0)
+
+    const uint16_t port_a = find_free_test_port();
+    const uint16_t port_b = find_free_test_port();
+    RECORD(port_a != 0);
+    RECORD(port_b != 0);
+
+    httplib::Server server_a;
+    httplib::Server server_b;
+    std::mutex calls_mutex;
+    std::vector<std::string> calls;
+
+    auto install_routes = [&](httplib::Server& server, const std::string& node_name) {
+        server.Get("/api/node/health", [](const httplib::Request&,
+                                           httplib::Response& res) {
+            mm::NodeHealthMetrics health;
+            health.cpu_percent = 1.0f;
+            health.ram_percent = 5.0f;
+            health.gpu_vram_total_mb = 131072;
+            health.gpu_backend_available = true;
+            res.set_content(nlohmann::json(health).dump(), "application/json");
+        });
+        server.Get("/api/node/status", [](const httplib::Request&,
+                                           httplib::Response& res) {
+            mm::NodeCapabilities capabilities;
+            capabilities.arch = "x86_64";
+            capabilities.gpu_count = 4;
+            mm::RuntimeStatus vllm;
+            vllm.engine_id = "vllm";
+            vllm.status = "ready";
+            vllm.version = "0.10.2";
+            vllm.variant = "cuda-13";
+            vllm.ready = true;
+            mm::RuntimeStatus llama;
+            llama.engine_id = "llama-cpp";
+            llama.status = "ready";
+            llama.version = "b9999";
+            llama.variant = "cuda-13";
+            llama.ready = true;
+            res.set_content(nlohmann::json{
+                {"slots", nlohmann::json::array()},
+                {"max_slots", 2},
+                {"slot_available", 2},
+                {"disk_free_mb", 131072},
+                {"capabilities", capabilities},
+                {"engine_config_version", 11},
+                {"engine_runtimes", std::vector<mm::RuntimeStatus>{vllm, llama}}
+            }.dump(), "application/json");
+        });
+        server.Post("/api/node/load-model",
+                    [&, node_name](const httplib::Request& req,
+                                   httplib::Response& res) {
+            const auto body = nlohmann::json::parse(req.body);
+            const std::string backend = body.value("backend", std::string{});
+            {
+                std::lock_guard<std::mutex> lock(calls_mutex);
+                calls.push_back(node_name + ":" + backend);
+            }
+            if (backend == "vllm") {
+                res.status = 503;
+                res.set_content(nlohmann::json{
+                    {"error", "synthetic vLLM startup failure"},
+                    {"code", "engine_start_failed"}
+                }.dump(), "application/json");
+                return;
+            }
+            res.set_content(nlohmann::json{
+                {"status", "loaded"},
+                {"slot_id", "llama-backup-slot"},
+                {"effective_ctx_size", 4096}
+            }.dump(), "application/json");
+        });
+    };
+    install_routes(server_a, "a");
+    install_routes(server_b, "b");
+
+    std::atomic<bool> listen_a{false};
+    std::atomic<bool> listen_b{false};
+    std::thread thread_a([&] { listen_a = server_a.listen("127.0.0.1", port_a); });
+    std::thread thread_b([&] { listen_b = server_b.listen("127.0.0.1", port_b); });
+    const std::string url_a = "http://127.0.0.1:" + std::to_string(port_a);
+    const std::string url_b = "http://127.0.0.1:" + std::to_string(port_b);
+    auto wait_for_server = [](const std::string& url) {
+        mm::HttpClient client(url);
+        for (int attempt = 0; attempt < 50; ++attempt) {
+            if (client.get("/api/node/health").ok()) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return false;
+    };
+    RECORD(wait_for_server(url_a));
+    RECORD(wait_for_server(url_b));
+
+    const auto dir = temp_test_dir("scheduler-cluster-order");
+    std::filesystem::create_directories(dir / "models");
+    mm::NodeRegistry registry(dir.string());
+    registry.add_node(url_a, "secret-a", "linux", false, "node-a");
+    registry.add_node(url_b, "secret-b", "linux", false, "node-b");
+    registry.start_health_poll(1);
+    for (int attempt = 0; attempt < 50; ++attempt) {
+        const auto nodes = registry.list_nodes();
+        if (nodes.size() == 2 &&
+            std::all_of(nodes.begin(), nodes.end(), [](const mm::NodeInfo& node) {
+                return node.connected && node.engine_config_version == 11;
+            })) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    auto cluster = mm::EngineConfigStore::default_for("vllm");
+    cluster.version = 11;
+    mm::AgentScheduler scheduler(registry, (dir / "models").string());
+    scheduler.set_engine_config_provider(
+        [&cluster]() -> std::optional<mm::ClusterEngineConfig> { return cluster; });
+
+    mm::AgentConfig agent;
+    agent.id = "cluster-order-agent";
+    agent.name = "Cluster Order Agent";
+    agent.model_path = "org/model";
+    const auto scheduled = scheduler.ensure_agent_running(agent);
+    RECORD(scheduled.has_value());
+    const auto placement = scheduler.get_placement(agent.id);
+    RECORD(placement.has_value());
+    if (placement) RECORD(placement->engine_id == "llama-cpp");
+    {
+        std::lock_guard<std::mutex> lock(calls_mutex);
+        RECORD(calls.size() == 3);
+        if (calls.size() == 3) {
+            RECORD(calls[0].find(":vllm") != std::string::npos);
+            RECORD(calls[1].find(":vllm") != std::string::npos);
+            RECORD(calls[0].substr(0, 1) != calls[1].substr(0, 1));
+            RECORD(calls[2].find(":llama-cpp") != std::string::npos);
+        }
+    }
+
+    auto llama_pin = agent;
+    llama_pin.backend_override = "fallback";
+    RECORD(scheduler.resolve_backend_for(llama_pin).engine_id == "llama-cpp");
+    auto unavailable_pin = agent;
+    unavailable_pin.backend_override = "soma";
+    RECORD(scheduler.resolve_backend_for(unavailable_pin).engine_id.empty());
+
+    registry.stop_health_poll();
+    server_a.stop();
+    server_b.stop();
+    if (thread_a.joinable()) thread_a.join();
+    if (thread_b.joinable()) thread_b.join();
+    RECORD(listen_a);
+    RECORD(listen_b);
     RECORD(remove_tree(dir));
 
 #undef RECORD
@@ -7762,6 +8140,10 @@ int main(int argc, char** argv) {
          test_node_action_progress_json_round_trip},
         {"engine_config_validation_and_round_trip",
          test_engine_config_validation_and_round_trip},
+        {"vllm_launch_profile_and_environment",
+         test_vllm_launch_profile_and_environment},
+        {"vllm_ray_group_planner_and_commands",
+         test_vllm_ray_group_planner_and_commands},
         {"engine_config_rejects_per_machine_keys",
          test_engine_config_rejects_per_machine_keys},
         {"engine_artifact_fingerprint_is_exact",
@@ -7789,6 +8171,8 @@ int main(int argc, char** argv) {
          test_engine_digest_and_package_grants_are_one_shot},
         {"scheduler_skips_failed_node_current_attempt",
          test_scheduler_skips_failed_node_current_attempt},
+        {"scheduler_exhausts_primary_before_cluster_backup",
+         test_scheduler_exhausts_primary_before_cluster_backup},
         {"scheduler_transfers_existing_relative_models_with_unique_cache_ids",
          test_scheduler_transfers_existing_relative_models_with_unique_cache_ids},
         {"scheduler_eviction_skips_unsuspendable_shared_slot",

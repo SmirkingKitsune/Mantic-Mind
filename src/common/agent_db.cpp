@@ -656,6 +656,21 @@ void AgentDB::run_migrations() {
         db_->exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (11)");
         tx.commit();
     }
+
+    if (!has_version(12)) {
+        SQLite::Transaction tx(*db_);
+        // The divergent vLLM branch stored the engine name as an agent backend.
+        // Engine selection is cluster-owned now: preserve the public alias
+        // migrated above, and return those rows to local automatic routing.
+        db_->exec(R"(
+            UPDATE agent_config
+               SET inference_backend = 'llama-cpp',
+                   backend_override = 'auto'
+             WHERE lower(inference_backend) = 'vllm'
+        )");
+        db_->exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (12)");
+        tx.commit();
+    }
 }
 
 //

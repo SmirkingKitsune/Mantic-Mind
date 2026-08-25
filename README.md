@@ -421,6 +421,12 @@ After file loading, matching environment variables override config values.
 | `llama_update_policy` | `MM_LLAMA_UPDATE_POLICY` | `prompt` | llama.cpp update behavior: `prompt`, `auto`, or `manual` |
 | `llama_update_check` | `MM_LLAMA_UPDATE_CHECK` | `true` | Periodically inspect the latest llama.cpp tag and its release assets |
 | `llama_update_check_interval_hours` | `MM_LLAMA_UPDATE_CHECK_INTERVAL_HOURS` | `24` | llama.cpp update-check interval |
+| `vllm_path` | `MM_VLLM_PATH` | `vllm` | Explicit node-local vLLM executable used by `path`/`auto` resolution |
+| `vllm_provision_dir` | `MM_VLLM_PROVISION_DIR` | `data/runtimes/vllm` | Node-local managed vLLM virtual environment; never shared between nodes |
+| `vllm_python_path` | `MM_VLLM_PYTHON` | `python` | Python used to create the managed vLLM environment |
+| `ray_path` | `MM_RAY_PATH` | `ray` | Node-local Ray executable fallback; the managed vLLM environment is preferred |
+| `ray_port` | `MM_RAY_PORT` | `6379` | Ray head port for automatic multi-node vLLM groups |
+| `hf_cache_dir` | `MM_HF_CACHE_DIR` | *(provider default)* | Node-local Hugging Face cache exposed to vLLM as `HF_HOME` |
 | `max_slots` | `MM_MAX_SLOTS` | `4` | Maximum concurrent engine slots |
 | `runtime_port_range_start` | `MM_RUNTIME_PORT_RANGE_START` | `8080` | First port in the per-engine port range |
 | `runtime_port_range_end` | `MM_RUNTIME_PORT_RANGE_END` | `8090` | Last port in the per-engine port range |

@@ -177,6 +177,13 @@ public:
     using EngineConfigReadyFn = std::function<bool()>;
     void set_engine_config_gate(EngineConfigReadyFn ready);
 
+    /// Supplies the live cluster engine order and the launch profile applied to
+    /// each candidate.  Kept separate from the legacy boolean gate so tests and
+    /// embedders that do not own an EngineConfigStore retain their old routing.
+    using EngineConfigProvider =
+        std::function<std::optional<ClusterEngineConfig>()>;
+    void set_engine_config_provider(EngineConfigProvider provider);
+
     std::optional<ScheduleResult> ensure_agent_running(const AgentConfig& cfg);
     void release_agent(const AgentId& agent_id);
 
@@ -227,6 +234,7 @@ private:
     std::string models_dir_;
     bool engine_config_required_ = false;
     EngineConfigReadyFn engine_config_ready_;
+    EngineConfigProvider engine_config_provider_;
 
     // Scheduling can include node HTTP calls and large model transfers. Keep it
     // serialized without blocking read-only placement queries.
@@ -274,15 +282,26 @@ private:
     void detach_placement_best_effort(const AgentPlacement& placement,
                                       const AgentId& agent_id,
                                       const std::string& reason);
+    std::vector<BackendRouting> routing_candidates(const AgentConfig& cfg) const;
+    void stop_ray_group_best_effort(const AgentPlacement& placement,
+                                    const std::string& reason) const;
     std::vector<AgentId> lru_idle_agents(const NodeId& on_node = {}) const;
     std::optional<SlotId> restore_agent_on_node(const AgentPlacement& placement,
                                                 const AgentConfig& cfg,
-                                                const NodeId& node_id);
+                                                const NodeId& node_id,
+                                                const BackendRouting& routing,
+                                                const std::optional<VllmEngineConfig>& vllm);
     std::optional<SlotId> load_agent_on_node(const AgentConfig& cfg,
-                                             const NodeId& node_id);
+                                             const NodeId& node_id,
+                                             const BackendRouting& routing,
+                                             const std::optional<VllmEngineConfig>& vllm,
+                                             const std::string& ray_address = {},
+                                             const std::string& host_ip = {},
+                                             const std::vector<int>& gpu_devices = {});
     bool evict_slots_on_node(const NodeId& node_id,
                              const AgentId& preserve_agent,
                              int max_to_evict);
+    bool evict_agent_for_capacity(const AgentId& agent_id);
 };
 
 } // namespace mm

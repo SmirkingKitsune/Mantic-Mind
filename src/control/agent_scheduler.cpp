@@ -9,6 +9,7 @@
 #include "common/util.hpp"
 #include "control/model_registry.hpp"
 #include "control/node_registry.hpp"
+#include "control/engine_group_planner.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -203,9 +204,10 @@ std::string resolved_manifest_identity(const std::string& ref,
 
 std::string engine_fingerprint(const AgentConfig& cfg,
                                const std::string& models_dir,
-                               const std::string& engine_id) {
+                               const std::string& engine_id,
+                               const std::optional<VllmEngineConfig>& vllm = std::nullopt) {
     const auto& runtime = cfg.runtime_settings;
-    const nlohmann::json identity = {
+    nlohmann::json identity = {
         // The RESOLVED engine, passed IN. The fingerprint decides whether an
         // existing placement still describes this agent, so an agent whose
         // routing changed from fallback to Soma must not keep a slot running the
@@ -230,6 +232,7 @@ std::string engine_fingerprint(const AgentConfig& cfg,
             {"extra_args", runtime.extra_args},
         }},
     };
+    if (vllm) identity["vllm"] = *vllm;
     return pairing::hmac_sha256_hex(
         "mantic-engine-placement-v1", identity.dump());
 }
@@ -321,6 +324,36 @@ bool same_model_reference(const std::string& lhs, const std::string& rhs) {
         == util::to_lower(fs::path(rhs).filename().string());
 }
 
+std::string host_from_node_url(std::string url) {
+    const auto scheme = url.find("://");
+    if (scheme != std::string::npos) url.erase(0, scheme + 3);
+    const auto slash = url.find('/');
+    if (slash != std::string::npos) url.resize(slash);
+    if (!url.empty() && url.front() == '[') {
+        const auto close = url.find(']');
+        return close == std::string::npos ? std::string{} : url.substr(1, close - 1);
+    }
+    const auto colon = url.rfind(':');
+    return colon == std::string::npos ? url : url.substr(0, colon);
+}
+
+std::vector<int> select_vllm_gpu_devices(const NodeInfo& node, int wanted) {
+    std::unordered_set<int> reserved;
+    for (const auto& slot : node.slots) {
+        if (slot.backend != "vllm" || slot.state == SlotState::Empty ||
+            slot.state == SlotState::Error) continue;
+        reserved.insert(slot.gpu_devices.begin(), slot.gpu_devices.end());
+    }
+    std::vector<int> selected;
+    for (int device = 0;
+         device < node.capabilities.gpu_count &&
+         static_cast<int>(selected.size()) < wanted;
+         ++device) {
+        if (reserved.count(device) == 0) selected.push_back(device);
+    }
+    return selected;
+}
+
 } // namespace
 
 AgentScheduler::AgentScheduler(NodeRegistry& registry, std::string models_dir)
@@ -369,6 +402,71 @@ void AgentScheduler::set_model_registry(const ControlModelRegistry* registry) {
 void AgentScheduler::set_engine_config_gate(EngineConfigReadyFn ready) {
     engine_config_ready_ = std::move(ready);
     engine_config_required_ = static_cast<bool>(engine_config_ready_);
+}
+
+void AgentScheduler::set_engine_config_provider(EngineConfigProvider provider) {
+    engine_config_provider_ = std::move(provider);
+}
+
+std::vector<AgentScheduler::BackendRouting>
+AgentScheduler::routing_candidates(const AgentConfig& cfg) const {
+    if (!is_llama_backend(cfg.inference_backend)) {
+        return {{{}, "inference_backend '" + cfg.inference_backend +
+                         "' is not node-local"}};
+    }
+
+    const auto admission_routing = [&] {
+        soma::AdmissionRecord record;
+        if (models_ != nullptr) {
+            if (const auto admitted = models_->resolve(cfg.model_path)) {
+                record.present = true;
+                record.arch_hash = admitted->arch_hash;
+                switch (admitted->verdict) {
+                    case ModelVerdict::Stream:
+                        record.verdict = soma::Verdict::Stream; break;
+                    case ModelVerdict::Hybrid:
+                        record.verdict = soma::Verdict::Hybrid; break;
+                    case ModelVerdict::ResidentOnly:
+                        record.verdict = soma::Verdict::ResidentOnly; break;
+                    case ModelVerdict::Reject:
+                        record.verdict = soma::Verdict::Reject; break;
+                }
+            }
+        }
+        return resolve_backend(cfg, record);
+    };
+
+    const auto configured = engine_config_provider_
+        ? engine_config_provider_() : std::optional<ClusterEngineConfig>{};
+    if (!configured) return {admission_routing()};
+
+    const auto required = configured->required_engines();
+    const auto contains = [&](const std::string& engine_id) {
+        return std::find(required.begin(), required.end(), engine_id) !=
+               required.end();
+    };
+    if (cfg.backend_override == "soma") {
+        if (!contains("soma")) return {};
+        const auto admitted = admission_routing();
+        if (admitted.engine_id != "soma") return {};
+        return {{"soma", "explicit Soma engine pin; " + admitted.reason}};
+    }
+    if (cfg.backend_override == "fallback") {
+        if (!contains("llama-cpp")) return {};
+        return {{"llama-cpp", "explicit llama.cpp engine pin"}};
+    }
+
+    std::vector<BackendRouting> out;
+    for (const auto& engine_id : required) {
+        if (engine_id == "soma") {
+            const auto admitted = admission_routing();
+            if (admitted.engine_id != "soma") continue;
+            out.push_back({"soma", "cluster order; " + admitted.reason});
+        } else {
+            out.push_back({engine_id, "cluster engine order"});
+        }
+    }
+    return out;
 }
 
 std::string AgentScheduler::model_cache_id(const AgentConfig& cfg) const {
@@ -473,6 +571,11 @@ std::string AgentScheduler::model_location(const AgentConfig& cfg) const {
 
 AgentScheduler::BackendRouting
 AgentScheduler::resolve_backend_for(const AgentConfig& cfg) const {
+    if (engine_config_provider_) {
+        const auto candidates = routing_candidates(cfg);
+        if (!candidates.empty()) return candidates.front();
+        return {{}, "explicit engine pin is not configured"};
+    }
     soma::AdmissionRecord record;   // absent by default, which routes to fallback
     if (models_ != nullptr) {
         if (const auto admitted = models_->resolve(cfg.model_path)) {
@@ -512,17 +615,37 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         return std::nullopt;
     }
 
-    const auto routing = resolve_backend_for(cfg);
-    if (routing.engine_id.empty()) {
+    const auto routings = routing_candidates(cfg);
+    if (routings.size() == 1 && routings.front().engine_id.empty()) {
         // Release a prior local placement before reporting the routing result.
         release_agent(cfg.id);
         set_failure(PlacementFailure::NoLocalBackend,
-                    "agent has no node-local backend: " + routing.reason);
+                    "agent has no node-local backend: " + routings.front().reason);
+        return std::nullopt;
+    }
+    if (routings.empty()) {
+        release_agent(cfg.id);
+        set_failure(PlacementFailure::NoEligibleNode,
+                    "the agent's explicit engine pin is not configured as the "
+                    "cluster primary or backup, or Soma admission refused it");
         return std::nullopt;
     }
 
+    for (const auto& routing : routings) {
+    std::optional<VllmEngineConfig> vllm;
+    std::uint32_t engine_config_version = 0;
+    if (engine_config_provider_) {
+        if (const auto cluster = engine_config_provider_()) {
+            engine_config_version = cluster->version;
+            if (routing.engine_id == "vllm") {
+                if (const auto* spec = cluster->find("vllm"))
+                    vllm = effective_vllm_config(*spec);
+            }
+        }
+    }
+
     const std::string desired_fingerprint =
-        engine_fingerprint(cfg, models_dir_, routing.engine_id);
+        engine_fingerprint(cfg, models_dir_, routing.engine_id, vllm);
 
     // Audit events are QUEUED here and delivered by `audit_guard`'s destructor,
     // which runs after `schedule_lock` is released because destruction order is
@@ -665,6 +788,9 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
             placement.placed_at_ms = util::now_ms();
             placement.last_active_ms = placement.placed_at_ms;
             placement.engine_fingerprint = desired_fingerprint;
+            placement.engine_id = routing.engine_id;
+            placement.reservation_state = routing.engine_id == "vllm"
+                ? "exclusive" : std::string{};
             placement.kv_cache_node_path.clear();
             store_placement(placement);
             pending_audit.push_back(
@@ -672,25 +798,48 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
             return ScheduleResult{node_id, slot_id};
         };
 
-        auto slot_id = restore_agent_on_node(placement, cfg, placement.node_id);
+        auto slot_id = restore_agent_on_node(
+            placement, cfg, placement.node_id, routing, vllm);
         if (slot_id) {
             MM_INFO("AgentScheduler: restored agent {} on original node {}",
                     cfg.id, placement.node_id);
             return publish_restored(placement.node_id, *slot_id);
         }
 
-        for (const auto& candidate_id : lru_idle_agents(placement.node_id)) {
-            if (candidate_id == cfg.id || !suspend_agent(candidate_id)) continue;
-            slot_id = restore_agent_on_node(placement, cfg, placement.node_id);
-            if (slot_id) {
-                return publish_restored(placement.node_id, *slot_id);
+        const bool distributed_vllm = routing.engine_id == "vllm" && vllm &&
+            vllm->pipeline_parallel_size > 1;
+        if (distributed_vllm) {
+            // A distributed sleeping server belongs to its existing Ray group.
+            // If wake fails it cannot migrate like a checkpoint-backed local
+            // engine: tear down the whole transaction, then let the normal Ray
+            // planner form a fresh compatible group below.
+            erase_placement_entry(cfg.id);
+            pending_audit.push_back({false, cfg.id, {}, {}, {}, {}, {}});
+            detach_placement_best_effort(
+                placement, cfg.id, "distributed vLLM wake failed");
+            existing.reset();
+        } else {
+            for (const auto& candidate_id : lru_idle_agents(placement.node_id)) {
+                if (candidate_id == cfg.id ||
+                    !evict_agent_for_capacity(candidate_id)) continue;
+                slot_id = restore_agent_on_node(
+                    placement, cfg, placement.node_id, routing, vllm);
+                if (slot_id) {
+                    return publish_restored(placement.node_id, *slot_id);
+                }
             }
-        }
 
-        for (const auto& node : registry_.nodes_with_capacity(needed)) {
-            if (node.id == placement.node_id) continue;
-            slot_id = restore_agent_on_node(placement, cfg, node.id);
-            if (slot_id) return publish_restored(node.id, *slot_id);
+            const auto restore_candidates = engine_config_provider_
+                ? registry_.nodes_with_capacity_for_engine(
+                      [&](const NodeInfo&) { return needed; }, routing.engine_id,
+                      engine_config_version)
+                : registry_.nodes_with_capacity(needed);
+            for (const auto& node : restore_candidates) {
+                if (node.id == placement.node_id) continue;
+                slot_id = restore_agent_on_node(
+                    placement, cfg, node.id, routing, vllm);
+                if (slot_id) return publish_restored(node.id, *slot_id);
+            }
         }
     }
 
@@ -702,18 +851,206 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         placement.placed_at_ms = util::now_ms();
         placement.last_active_ms = placement.placed_at_ms;
         placement.engine_fingerprint = desired_fingerprint;
+        placement.engine_id = routing.engine_id;
+        placement.reservation_state = routing.engine_id == "vllm"
+            ? "exclusive" : std::string{};
         store_placement(placement);
         pending_audit.push_back(
             {true, cfg.id, node_id, slot_id, routing.engine_id, routing.reason, needed});
         return ScheduleResult{node_id, slot_id};
     };
 
+    if (routing.engine_id == "vllm" && vllm &&
+        vllm->pipeline_parallel_size > 1) {
+        EngineGroupRequest request;
+        request.model_ref = model_location(cfg);
+        request.tensor_parallel_size = vllm->tensor_parallel_size;
+        request.pipeline_parallel_size = vllm->pipeline_parallel_size;
+        request.config_version = engine_config_version;
+        request.allow_experimental_gloo = vllm->allow_experimental_gloo;
+        const auto group_candidates = plan_engine_groups(request, registry_.list_nodes());
+        if (group_candidates.empty()) {
+            std::string detail;
+            if (!distributed_vllm_model_ref_supported(request.model_ref, detail)) {
+                set_failure(PlacementFailure::NoEligibleNode, detail);
+            } else {
+                set_failure(PlacementFailure::NoEligibleNode,
+                            "no exclusive Ray group satisfies the configured vLLM "
+                            "TP/PP topology and runtime compatibility");
+            }
+            continue;
+        }
+
+        for (const auto& group_candidate : group_candidates) {
+        const auto* group = &group_candidate;
+
+        const std::string group_id = util::generate_uuid();
+        std::vector<NodeInfo> members;
+        members.reserve(group->nodes.size());
+        for (const auto& node_id : group->nodes)
+            members.push_back(registry_.get_node(node_id));
+
+        bool preflight_ok = true;
+        for (const auto& member : members) {
+            try {
+                HttpClient client(member.url);
+                client.set_bearer_token(member.api_key);
+                const auto response = client.post(
+                    "/api/node/vllm/preflight",
+                    nlohmann::json{{"model_path", request.model_ref}});
+                if (!response.ok()) {
+                    preflight_ok = false;
+                    set_failure(PlacementFailure::NodeRejected,
+                                "vLLM model preflight failed on Ray member " +
+                                    member.id + " (HTTP " +
+                                    std::to_string(response.status) + "): " +
+                                    response.body);
+                    break;
+                }
+            } catch (const std::exception& e) {
+                preflight_ok = false;
+                set_failure(PlacementFailure::NodeUnreachable,
+                            "vLLM model preflight could not reach Ray member " +
+                                member.id + ": " + e.what());
+                break;
+            }
+        }
+        if (!preflight_ok) continue;
+
+        std::vector<NodeInfo> started;
+        std::string head_address;
+        bool group_started = true;
+        for (std::size_t index = 0; index < members.size(); ++index) {
+            const auto& member = members[index];
+            const std::string role = index == 0 ? "head" : "worker";
+            const std::string node_ip = host_from_node_url(member.url);
+            try {
+                HttpClient client(member.url);
+                client.set_bearer_token(member.api_key);
+                const auto response = client.post(
+                    "/api/node/ray/start",
+                    nlohmann::json{{"group_id", group_id},
+                                   {"agent_id", cfg.id},
+                                   {"role", role},
+                                   {"head_address", head_address},
+                                   {"node_ip", node_ip},
+                                   {"transport", group->transport},
+                                   {"num_gpus", vllm->tensor_parallel_size}});
+                if (!response.ok()) {
+                    set_failure(PlacementFailure::NodeRejected,
+                                "Ray " + role + " start failed on node " + member.id +
+                                    " (HTTP " + std::to_string(response.status) +
+                                    "): " + response.body);
+                    group_started = false;
+                    break;
+                }
+                const auto status = nlohmann::json::parse(response.body)
+                                        .get<RayRuntimeStatus>();
+                if (!status.active() || status.group_id != group_id ||
+                    status.reserved_gpus != vllm->tensor_parallel_size) {
+                    set_failure(PlacementFailure::NodeProtocolError,
+                                "Ray member " + member.id +
+                                    " did not confirm the requested group/GPU reservation");
+                    group_started = false;
+                    break;
+                }
+                if (index == 0) head_address = status.head_address;
+                started.push_back(member);
+            } catch (const std::exception& e) {
+                set_failure(PlacementFailure::NodeUnreachable,
+                            "Ray " + role + " start failed on node " + member.id +
+                                ": " + e.what());
+                group_started = false;
+                break;
+            }
+        }
+
+        auto rollback = [&] {
+            for (auto it = started.rbegin(); it != started.rend(); ++it) {
+                try {
+                    HttpClient client(it->url);
+                    client.set_bearer_token(it->api_key);
+                    static_cast<void>(client.post(
+                        "/api/node/ray/stop", nlohmann::json{{"group_id", group_id}}));
+                } catch (...) {
+                }
+            }
+        };
+        if (!group_started) {
+            rollback();
+            continue;
+        }
+
+        std::vector<int> gpu_devices;
+        for (int index = 0; index < vllm->tensor_parallel_size; ++index)
+            gpu_devices.push_back(index);
+        const NodeInfo& head = members.front();
+        const auto slot_id = load_agent_on_node(
+            cfg, head.id, routing, vllm, head_address,
+            host_from_node_url(head.url), gpu_devices);
+        if (!slot_id) {
+            rollback();
+            continue;
+        }
+
+        AgentPlacement placement;
+        placement.agent_id = cfg.id;
+        placement.node_id = head.id;
+        placement.slot_id = *slot_id;
+        placement.engine_fingerprint = desired_fingerprint;
+        placement.engine_id = routing.engine_id;
+        placement.ray_group_id = group_id;
+        placement.member_node_ids = group->nodes;
+        placement.ray_role = "head";
+        placement.ray_transport = group->transport;
+        placement.reservation_state = "exclusive";
+        placement.placed_at_ms = util::now_ms();
+        placement.last_active_ms = placement.placed_at_ms;
+        store_placement(placement);
+        pending_audit.push_back(
+            {true, cfg.id, head.id, *slot_id, routing.engine_id,
+             routing.reason, needed});
+        return ScheduleResult{head.id, *slot_id};
+        }
+        continue;
+    }
+
     std::unordered_set<NodeId> attempted_nodes;
+    auto available_for_engine = engine_config_provider_
+        ? registry_.available_nodes_for_engine(routing.engine_id,
+                                               engine_config_version)
+        : registry_.available_nodes();
+    if (routing.engine_id == "vllm" && vllm) {
+        available_for_engine.erase(
+            std::remove_if(available_for_engine.begin(), available_for_engine.end(),
+                           [&](const NodeInfo& node) {
+                               return static_cast<int>(select_vllm_gpu_devices(
+                                          node, vllm->tensor_parallel_size).size()) <
+                                      vllm->tensor_parallel_size;
+                           }),
+            available_for_engine.end());
+    }
+    const auto is_available = [&](const NodeId& node_id) {
+        return std::any_of(
+            available_for_engine.begin(), available_for_engine.end(),
+            [&](const NodeInfo& node) { return node.id == node_id; });
+    };
     auto try_load = [&](const NodeId& node_id) -> std::optional<SlotId> {
-        if (node_id.empty() || !attempted_nodes.insert(node_id).second) {
+        if (node_id.empty() || !is_available(node_id) ||
+            !attempted_nodes.insert(node_id).second) {
             return std::nullopt;
         }
-        auto slot_id = load_agent_on_node(cfg, node_id);
+        std::vector<int> selected_gpu_devices;
+        if (routing.engine_id == "vllm" && vllm) {
+            const auto node = std::find_if(
+                available_for_engine.begin(), available_for_engine.end(),
+                [&](const NodeInfo& candidate) { return candidate.id == node_id; });
+            if (node == available_for_engine.end()) return std::nullopt;
+            selected_gpu_devices = select_vllm_gpu_devices(
+                *node, vllm->tensor_parallel_size);
+        }
+        auto slot_id = load_agent_on_node(
+            cfg, node_id, routing, vllm, {}, {}, selected_gpu_devices);
         if (!slot_id) {
             MM_WARN("AgentScheduler: node {} could not run agent {}; "
                     "trying another candidate", node_id, cfg.id);
@@ -733,7 +1070,7 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         int64_t last_active_ms = 0;
     };
     std::vector<SharedCandidate> shared_candidates;
-    for (const auto& node : registry_.available_nodes()) {
+    for (const auto& node : available_for_engine) {
         if (attempted_nodes.count(node.id)) continue;
         std::optional<SharedCandidate> best;
         for (const auto& slot : node.slots) {
@@ -779,7 +1116,11 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     // footprint_for_node() adds the container's disk only to nodes that would
     // have to fetch it.
     const auto demand = [&](const NodeInfo& node) { return footprint_for_node(cfg, needed, node); };
-    for (const auto& node : registry_.nodes_with_capacity_for(demand)) {
+    const auto capacity_candidates = engine_config_provider_
+        ? registry_.nodes_with_capacity_for_engine(
+              demand, routing.engine_id, engine_config_version)
+        : registry_.nodes_with_capacity_for(demand);
+    for (const auto& node : capacity_candidates) {
         if (const auto slot_id = try_load(node.id)) {
             return publish_new(node.id, *slot_id);
         }
@@ -788,11 +1129,26 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     for (const auto& candidate_id : lru_idle_agents()) {
         if (candidate_id == cfg.id) continue;
         const auto candidate = find_placement_copy(candidate_id);
-        if (!candidate || candidate->suspended || candidate->is_active
-            || !suspend_agent(candidate_id)) {
+        if (!candidate ||
+            (candidate->suspended && candidate->engine_id != "vllm") ||
+            candidate->is_active
+            || !evict_agent_for_capacity(candidate_id)) {
             continue;
         }
-        if (const auto slot_id = load_agent_on_node(cfg, candidate->node_id)) {
+        std::vector<int> selected_gpu_devices;
+        if (routing.engine_id == "vllm" && vllm) {
+            const auto node = std::find_if(
+                available_for_engine.begin(), available_for_engine.end(),
+                [&](const NodeInfo& available) {
+                    return available.id == candidate->node_id;
+                });
+            if (node != available_for_engine.end())
+                selected_gpu_devices = select_vllm_gpu_devices(
+                    *node, vllm->tensor_parallel_size);
+        }
+        if (const auto slot_id = load_agent_on_node(
+                cfg, candidate->node_id, routing, vllm, {}, {},
+                selected_gpu_devices)) {
             return publish_new(candidate->node_id, *slot_id);
         }
     }
@@ -812,7 +1168,7 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         // add hardware. `available_nodes()` applies the connected + conforming
         // filter, so an empty list means nothing was ELIGIBLE — every node is
         // offline, unconfigured, or not conforming to the engine policy.
-        if (registry_.available_nodes().empty()) {
+        if (available_for_engine.empty()) {
             set_failure(PlacementFailure::NoEligibleNode,
                         "no eligible node: none is connected and conforming to the "
                         "cluster engine configuration");
@@ -821,6 +1177,12 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
                         "no capacity: eligible nodes are connected, but none could "
                         "load this model");
         }
+    }
+    // A placement/startup failure is the only point at which routing moves to
+    // the next engine. Inference has not begun yet, so this can never replay a
+    // request on a different backend.
+    MM_WARN("AgentScheduler: exhausted engine {} for agent {}; trying backup",
+            routing.engine_id, cfg.id);
     }
     return std::nullopt;
 }
@@ -964,15 +1326,36 @@ void AgentScheduler::detach_placement_best_effort(
         MM_WARN("AgentScheduler: failed to detach slot for agent {} ({}): {}",
                 agent_id, reason, e.what());
     }
+    stop_ray_group_best_effort(placement, reason);
+}
+
+void AgentScheduler::stop_ray_group_best_effort(
+    const AgentPlacement& placement, const std::string& reason) const {
+    if (placement.ray_group_id.empty()) return;
+    for (auto it = placement.member_node_ids.rbegin();
+         it != placement.member_node_ids.rend(); ++it) {
+        try {
+            const auto node = registry_.get_node(*it);
+            HttpClient client(node.url);
+            client.set_bearer_token(node.api_key);
+            const auto response = client.post(
+                "/api/node/ray/stop",
+                nlohmann::json{{"group_id", placement.ray_group_id}});
+            if (!response.ok()) {
+                MM_WARN("AgentScheduler: Ray cleanup for group {} on node {} "
+                        "failed ({}; HTTP {})", placement.ray_group_id, *it,
+                        reason, response.status);
+            }
+        } catch (const std::exception& e) {
+            MM_WARN("AgentScheduler: Ray cleanup for group {} on node {} "
+                    "failed ({}): {}", placement.ray_group_id, *it, reason,
+                    e.what());
+        }
+    }
 }
 
 void AgentScheduler::housekeeping(const std::vector<AgentConfig>& active_agents) {
-    struct PendingDetach {
-        AgentId agent_id;
-        NodeId node_id;
-        SlotId slot_id;
-    };
-    std::vector<PendingDetach> detaches;
+    std::vector<AgentPlacement> detaches;
 
     {
         std::lock_guard schedule_lock(schedule_mutex_);
@@ -987,7 +1370,7 @@ void AgentScheduler::housekeeping(const std::vector<AgentConfig>& active_agents)
                 ++it;
                 continue;
             }
-            detaches.push_back({it->first, it->second.node_id, it->second.slot_id});
+            detaches.push_back(it->second);
             MM_INFO("AgentScheduler: housekeeping removed placement for deleted agent {}",
                     it->first);
             it = placements_.erase(it);
@@ -995,23 +1378,123 @@ void AgentScheduler::housekeeping(const std::vector<AgentConfig>& active_agents)
     }
 
     for (const auto& detach : detaches) {
-        try {
-            const auto node = registry_.get_node(detach.node_id);
-            HttpClient client(node.url);
-            client.set_bearer_token(node.api_key);
-            const auto response = client.post(
-                "/api/node/detach-agent",
-                nlohmann::json{{"slot_id", detach.slot_id},
-                               {"agent_id", detach.agent_id}});
-            if (!response.ok()) {
-                MM_WARN("AgentScheduler: housekeeping detach failed for agent {} "
-                        "on node {} (HTTP {})", detach.agent_id, detach.node_id,
-                        response.status);
+        detach_placement_best_effort(
+            detach, detach.agent_id, "agent deleted during housekeeping");
+    }
+
+    // Control placements are intentionally in-memory, while node-owned Ray
+    // daemons survive a control restart. Reconstruct only a complete group
+    // whose head still advertises the agent's ready vLLM slot; anything else is
+    // incomplete, conflicting, or orphaned and must release its reservations.
+    std::unordered_set<AgentId> active_ids;
+    for (const auto& agent : active_agents) active_ids.insert(agent.id);
+    std::unordered_map<std::string, std::vector<NodeInfo>> ray_groups;
+    for (const auto& node : registry_.list_nodes()) {
+        if (!node.ray.group_id.empty())
+            ray_groups[node.ray.group_id].push_back(node);
+    }
+    std::optional<VllmEngineConfig> expected_profile;
+    std::uint32_t expected_version = 0;
+    if (engine_config_provider_) {
+        if (const auto cluster = engine_config_provider_()) {
+            expected_version = cluster->version;
+            if ((cluster->primary_engine == "vllm" || cluster->backup_engine == "vllm")) {
+                if (const auto* spec = cluster->find("vllm"))
+                    expected_profile = effective_vllm_config(*spec);
             }
-        } catch (const std::exception& e) {
-            MM_WARN("AgentScheduler: housekeeping failed to detach deleted agent {}: {}",
-                    detach.agent_id, e.what());
         }
+    }
+    for (const auto& [group_id, members] : ray_groups) {
+        AgentPlacement recovered;
+        recovered.ray_group_id = group_id;
+        bool valid = expected_profile.has_value() &&
+                     static_cast<int>(members.size()) ==
+                         expected_profile->pipeline_parallel_size;
+        int heads = 0;
+        std::string runtime_fingerprint;
+        for (const auto& member : members) {
+            recovered.member_node_ids.push_back(member.id);
+            if (recovered.agent_id.empty()) recovered.agent_id = member.ray.agent_id;
+            if (recovered.ray_transport.empty())
+                recovered.ray_transport = member.ray.transport;
+            const auto runtime = std::find_if(
+                member.engines.begin(), member.engines.end(),
+                [](const RuntimeStatus& status) {
+                    return status.engine_id == "vllm" && status.ready;
+                });
+            const std::string member_fingerprint = runtime == member.engines.end()
+                ? std::string{}
+                : member.capabilities.arch + "|" + runtime->version + "|" +
+                      runtime->variant;
+            if (runtime_fingerprint.empty()) runtime_fingerprint = member_fingerprint;
+            const bool transport_available = member.ray.transport == "nccl"
+                ? std::find(member.capabilities.comm_backends.begin(),
+                            member.capabilities.comm_backends.end(), "nccl") !=
+                      member.capabilities.comm_backends.end()
+                : expected_profile->allow_experimental_gloo &&
+                      member.ray.transport == "gloo" &&
+                      std::find(member.capabilities.comm_backends.begin(),
+                                member.capabilities.comm_backends.end(), "gloo") !=
+                          member.capabilities.comm_backends.end();
+            valid = valid && member.connected &&
+                    util::to_lower(member.platform) == "linux" &&
+                    member.capabilities.supports_ray && runtime != member.engines.end() &&
+                    !member_fingerprint.empty() &&
+                    member_fingerprint == runtime_fingerprint && transport_available &&
+                    member.capabilities.gpu_count >=
+                        expected_profile->tensor_parallel_size && member.ray.active() &&
+                    member.ray.agent_id == recovered.agent_id &&
+                    member.ray.transport == recovered.ray_transport &&
+                    member.ray.reserved_gpus == expected_profile->tensor_parallel_size &&
+                    member.engine_config_version == expected_version;
+            if (member.ray.role == "head") {
+                ++heads;
+                recovered.node_id = member.id;
+                for (const auto& slot : member.slots) {
+                    const bool attached = slot.assigned_agent == recovered.agent_id ||
+                        std::find(slot.agent_ids.begin(), slot.agent_ids.end(),
+                                  recovered.agent_id) != slot.agent_ids.end();
+                    if (slot.backend == "vllm" &&
+                        (slot.state == SlotState::Ready ||
+                         slot.state == SlotState::Suspended) && attached) {
+                        recovered.slot_id = slot.id;
+                        recovered.suspended = slot.state == SlotState::Suspended;
+                    }
+                }
+            }
+        }
+        valid = valid && heads == 1 && !recovered.agent_id.empty() &&
+                active_ids.count(recovered.agent_id) > 0 && !recovered.slot_id.empty();
+        const auto recovered_cfg = std::find_if(
+            active_agents.begin(), active_agents.end(), [&](const AgentConfig& cfg) {
+                return cfg.id == recovered.agent_id;
+            });
+        valid = valid && recovered_cfg != active_agents.end();
+        const auto existing = recovered.agent_id.empty()
+            ? std::optional<AgentPlacement>{}
+            : find_placement_copy(recovered.agent_id);
+        if (existing && existing->ray_group_id != group_id) valid = false;
+        if (valid) {
+            if (!existing) {
+                recovered.engine_id = "vllm";
+                recovered.ray_role = "head";
+                recovered.reservation_state = recovered.suspended
+                    ? "sleeping" : "exclusive";
+                recovered.engine_fingerprint = engine_fingerprint(
+                    *recovered_cfg, models_dir_, "vllm", expected_profile);
+                recovered.placed_at_ms = util::now_ms();
+                recovered.last_active_ms = recovered.placed_at_ms;
+                store_placement(recovered);
+                MM_INFO("AgentScheduler: reconciled surviving Ray group {} for agent {}",
+                        group_id, recovered.agent_id);
+            }
+            continue;
+        }
+        // detach_placement_best_effort enforces the required ordering: the
+        // head server is stopped first, followed by owned Ray members.
+        detach_placement_best_effort(
+            recovered, recovered.agent_id,
+            "incomplete, conflicting, or orphaned Ray group during reconciliation");
     }
 }
 
@@ -1019,7 +1502,8 @@ std::vector<AgentId> AgentScheduler::lru_idle_agents(const NodeId& on_node) cons
     std::lock_guard state_lock(state_mutex_);
     std::vector<std::pair<AgentId, int64_t>> candidates;
     for (const auto& [id, placement] : placements_) {
-        if (placement.suspended || placement.is_active) continue;
+        if ((placement.suspended && placement.engine_id != "vllm") ||
+            placement.is_active) continue;
         if (!on_node.empty() && placement.node_id != on_node) continue;
         candidates.emplace_back(id, placement.last_active_ms);
     }
@@ -1084,6 +1568,8 @@ bool AgentScheduler::suspend_agent(const AgentId& agent_id) {
         const bool changed = mutate_placement(id, [&](AgentPlacement& candidate) {
             candidate.suspended = true;
             candidate.kv_cache_node_path = kv_cache_path;
+            if (candidate.engine_id == "vllm")
+                candidate.reservation_state = "sleeping";
         });
         if (id == agent_id) updated = changed;
     }
@@ -1097,7 +1583,9 @@ bool AgentScheduler::suspend_agent(const AgentId& agent_id) {
 std::optional<SlotId> AgentScheduler::restore_agent_on_node(
     const AgentPlacement& placement,
     const AgentConfig& cfg,
-    const NodeId& node_id) {
+    const NodeId& node_id,
+    const BackendRouting& routing,
+    const std::optional<VllmEngineConfig>& vllm) {
     try {
         const auto node = registry_.get_node(node_id);
         HttpClient client(node.url);
@@ -1124,9 +1612,12 @@ std::optional<SlotId> AgentScheduler::restore_agent_on_node(
                     ? placement.kv_cache_node_path : std::string{}},
                 // The RESOLVED engine id. Hardcoding "llama-cpp" here is what
                 // made a Soma agent unplaceable regardless of its verdict.
-                {"backend", resolve_backend_for(cfg).engine_id},
+                {"backend", routing.engine_id},
+                {"served_model_name", cfg.served_model_name.empty()
+                    ? cfg.model_path : cfg.served_model_name},
                 {"agent_id", cfg.id},
             };
+            if (vllm) body["vllm"] = *vllm;
             if (!prepared->model_id.empty()) {
                 body["model_id"] = prepared->model_id;
             }
@@ -1167,7 +1658,12 @@ std::optional<SlotId> AgentScheduler::restore_agent_on_node(
 
 std::optional<SlotId> AgentScheduler::load_agent_on_node(
     const AgentConfig& cfg,
-    const NodeId& node_id) {
+    const NodeId& node_id,
+    const BackendRouting& routing,
+    const std::optional<VllmEngineConfig>& vllm,
+    const std::string& ray_address,
+    const std::string& host_ip,
+    const std::vector<int>& gpu_devices) {
     try {
         const auto node = registry_.get_node(node_id);
         HttpClient client(node.url);
@@ -1176,8 +1672,19 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
             && cfg.preferred_node_id == node_id;
 
         std::string prepare_error;
-        auto prepared = prepare_model_for_node(
-            node, cfg, model_location(cfg), models_dir_, pin, false, &prepare_error);
+        std::optional<PreparedModel> prepared;
+        if (!ray_address.empty()) {
+            // Every member preflighted this exact shared reference. Copying it
+            // into the head's managed cache would destroy the identical-path
+            // invariant that distributed vLLM relies on.
+            PreparedModel shared;
+            shared.model_path = model_location(cfg);
+            shared.mmproj_path = cfg.vision_settings.mmproj_path;
+            prepared = std::move(shared);
+        } else {
+            prepared = prepare_model_for_node(
+                node, cfg, model_location(cfg), models_dir_, pin, false, &prepare_error);
+        }
         if (!prepared) {
             set_failure(PlacementFailure::ModelTransferFailed,
                         "failed to prepare model for node " + node_id + ": " + prepare_error);
@@ -1193,9 +1700,15 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
                 {"runtime_settings", cfg.runtime_settings},
                 // The RESOLVED engine id. Hardcoding "llama-cpp" here is what
                 // made a Soma agent unplaceable regardless of its verdict.
-                {"backend", resolve_backend_for(cfg).engine_id},
+                {"backend", routing.engine_id},
+                {"served_model_name", cfg.served_model_name.empty()
+                    ? cfg.model_path : cfg.served_model_name},
                 {"agent_id", cfg.id},
             };
+            if (vllm) body["vllm"] = *vllm;
+            if (!ray_address.empty()) body["ray_address"] = ray_address;
+            if (!host_ip.empty()) body["host_ip"] = host_ip;
+            if (!gpu_devices.empty()) body["gpu_devices"] = gpu_devices;
             if (!prepared->model_id.empty()) {
                 body["model_id"] = prepared->model_id;
             }
@@ -1317,7 +1830,7 @@ bool AgentScheduler::evict_slots_on_node(const NodeId& node_id,
         if (candidate_id == preserve_agent) continue;
         const auto placement = find_placement_copy(candidate_id);
         if (!placement || placement->suspended || placement->is_active) continue;
-        if (!suspend_agent(candidate_id)) continue;
+        if (!evict_agent_for_capacity(candidate_id)) continue;
         ++evicted;
     }
     if (!can_evict_more()) return evicted > 0;
@@ -1409,6 +1922,23 @@ bool AgentScheduler::evict_slots_on_node(const NodeId& node_id,
                 node_id, e.what());
         return evicted > 0;
     }
+}
+
+bool AgentScheduler::evict_agent_for_capacity(const AgentId& agent_id) {
+    const auto placement = find_placement_copy(agent_id);
+    if (!placement) return false;
+    if (placement->engine_id != "vllm") return suspend_agent(agent_id);
+
+    // vLLM sleep deliberately keeps its GPU/Ray reservation. Under capacity
+    // pressure that cannot help the pending load, so unload the placement and
+    // release the owned group instead of pretending its GPUs became reusable.
+    if (!erase_placement_entry(agent_id)) return false;
+    detach_placement_best_effort(
+        *placement, agent_id, "vLLM placement evicted under capacity pressure");
+    if (audit_.released) {
+        try { audit_.released(agent_id); } catch (...) {}
+    }
+    return true;
 }
 
 } // namespace mm

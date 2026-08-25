@@ -271,6 +271,64 @@ std::vector<NodeInfo> NodeRegistry::nodes_with_capacity_for(const FootprintForNo
     return out;
 }
 
+namespace {
+
+bool engine_ready_for_placement(const NodeInfo& node,
+                                const std::string& engine_id,
+                                std::uint32_t config_version) {
+    if (!node.connected || node.engine_config_version != config_version) return false;
+    const auto it = std::find_if(node.engines.begin(), node.engines.end(),
+                                 [&](const RuntimeStatus& runtime) {
+                                     return runtime.engine_id == engine_id;
+                                 });
+    return it != node.engines.end() && it->ready;
+}
+
+} // namespace
+
+std::vector<NodeInfo> NodeRegistry::available_nodes_for_engine(
+    const std::string& engine_id, std::uint32_t config_version) const {
+    std::lock_guard<std::mutex> g(mutex_);
+    std::vector<NodeInfo> out;
+    for (const auto& [_, node] : nodes_) {
+        if (engine_ready_for_placement(node, engine_id, config_version))
+            out.push_back(node);
+    }
+    std::sort(out.begin(), out.end(), [](const NodeInfo& lhs, const NodeInfo& rhs) {
+        return lhs.id < rhs.id;
+    });
+    return out;
+}
+
+std::vector<NodeInfo> NodeRegistry::nodes_with_capacity_for_engine(
+    const FootprintForNode& demand,
+    const std::string& engine_id,
+    std::uint32_t config_version,
+    const CapacityPolicy& policy) const {
+    struct Candidate {
+        NodeInfo info;
+        double score = 0.0;
+    };
+    std::lock_guard<std::mutex> g(mutex_);
+    std::vector<Candidate> candidates;
+    for (const auto& [_, node] : nodes_) {
+        if (!engine_ready_for_placement(node, engine_id, config_version)) continue;
+        const auto capacity = capacity_of(node);
+        const auto footprint = demand(node);
+        if (evaluate_fit(footprint, capacity, policy, nullptr) == FitQuality::None) continue;
+        candidates.push_back({node, capacity_score(footprint, capacity, policy)});
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& lhs,
+                                                        const Candidate& rhs) {
+        if (lhs.score != rhs.score) return lhs.score > rhs.score;
+        return lhs.info.id < rhs.info.id;
+    });
+    std::vector<NodeInfo> out;
+    out.reserve(candidates.size());
+    for (auto& candidate : candidates) out.push_back(std::move(candidate.info));
+    return out;
+}
+
 void NodeRegistry::set_update_callback(UpdateCallback cb) {
     std::lock_guard<std::mutex> g(mutex_); update_cb_ = std::move(cb);
 }
@@ -641,6 +699,8 @@ bool NodeRegistry::ping_node(NodeInfo& info) {
                 info.action_progress = sj["action_progress"].get<NodeActionProgress>();
             if (sj.contains("capabilities"))
                 info.capabilities = sj["capabilities"].get<NodeCapabilities>();
+            if (sj.contains("ray"))
+                info.ray = sj["ray"].get<RayRuntimeStatus>();
 
             // Engine conformance. A node that reports NOTHING here is left at
             // the default Unconfigured rather than assumed healthy: an old or

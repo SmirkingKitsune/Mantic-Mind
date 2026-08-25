@@ -38,6 +38,10 @@ struct EngineManagerPaths {
     std::string llama_executable = "llama-server";
     std::string llama_provision_dir;
     std::string soma_executable = "soma";
+    std::string vllm_executable = "vllm";
+    std::string vllm_provision_dir;
+    std::string vllm_python = "python";
+    std::string vllm_variant;
 };
 
 class NodeEngineManager {

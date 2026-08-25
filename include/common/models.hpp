@@ -351,6 +351,7 @@ struct SlotInfo {
     AgentId     assigned_agent;          // first attached agent (legacy display)
     std::vector<AgentId> agent_ids;      // all agents attached to this slot
     SlotState   state           = SlotState::Empty;
+    std::vector<int> gpu_devices;        // explicit vLLM device reservation
     int64_t     vram_usage_mb   = 0;
     int64_t     last_active_ms  = 0;
     std::string kv_cache_path;
@@ -366,6 +367,12 @@ struct AgentPlacement {
     bool        is_active       = false;  // true while inference/memory-extraction is in-flight
     std::string kv_cache_node_path;
     std::string engine_fingerprint;
+    std::string engine_id;
+    std::string ray_group_id;
+    std::vector<NodeId> member_node_ids;
+    std::string ray_role; ///< head for the placement owner; members report theirs in node health
+    std::string ray_transport;
+    std::string reservation_state; ///< exclusive|sleeping|empty for legacy engines
     int64_t     placed_at_ms    = 0;
     int64_t     last_active_ms  = 0;
 };
@@ -378,7 +385,25 @@ struct NodeCapabilities {
     // RPC members must share a compatible llama.cpp build fingerprint.
     std::string              llama_cpp_version; // llama.cpp build fingerprint, "" = unknown
     bool                     supports_llama_rpc = false; // can host/join a ggml RPC group
+    std::vector<std::string> comm_backends;
+    bool                     supports_ray = false;
+    double                   interconnect_gbps = 0.0;
+};
 
+/// Node-local ownership record for Ray. One active group per node is the
+/// exclusivity boundary; the group id makes start/stop idempotent and prevents
+/// one scheduler transaction from tearing down another's daemons.
+struct RayRuntimeStatus {
+    std::string state = "inactive"; ///< inactive|starting|active|error
+    std::string group_id;
+    std::string agent_id;
+    std::string role; ///< head|worker
+    std::string head_address;
+    std::string transport;
+    int reserved_gpus = 0;
+    std::string last_error;
+
+    bool active() const { return state == "active"; }
 };
 
 // ── NodeInfo ──────────────────────────────────────────────────────────────────
@@ -528,6 +553,7 @@ struct NodeInfo {
     std::string      platform;
     NodeCapabilities capabilities;
     NodeHealthMetrics metrics;
+    RayRuntimeStatus ray;
     int64_t          last_seen_ms = 0;
     int64_t          slot_snapshot_at_ms = 0; // last successfully parsed /api/node/status slots
     int64_t          unreachable_since_ms = 0;
@@ -1170,6 +1196,7 @@ inline void to_json(nlohmann::json& j, const SlotInfo& s) {
           {"assigned_agent",  s.assigned_agent},
           {"agent_ids",       s.agent_ids},
           {"state",           to_string(s.state)},
+          {"gpu_devices",     s.gpu_devices},
           {"vram_usage_mb",   s.vram_usage_mb},
           {"last_active_ms",  s.last_active_ms},
           {"kv_cache_path",   s.kv_cache_path},
@@ -1189,6 +1216,7 @@ inline void from_json(const nlohmann::json& j, SlotInfo& s) {
     if (s.agent_ids.empty() && !s.assigned_agent.empty())
         s.agent_ids.push_back(s.assigned_agent);
     if (j.contains("state"))          s.state = slot_state_from_string(j.at("state").get<std::string>());
+    if (j.contains("gpu_devices"))    j.at("gpu_devices").get_to(s.gpu_devices);
     if (j.contains("vram_usage_mb"))  j.at("vram_usage_mb").get_to(s.vram_usage_mb);
     if (j.contains("last_active_ms")) j.at("last_active_ms").get_to(s.last_active_ms);
     if (j.contains("kv_cache_path"))  j.at("kv_cache_path").get_to(s.kv_cache_path);
@@ -1204,6 +1232,12 @@ inline void to_json(nlohmann::json& j, const AgentPlacement& p) {
           {"is_active",          p.is_active},
           {"kv_cache_node_path", p.kv_cache_node_path},
           {"engine_fingerprint", p.engine_fingerprint},
+          {"engine_id",          p.engine_id},
+          {"ray_group_id",       p.ray_group_id},
+          {"member_node_ids",    p.member_node_ids},
+          {"ray_role",           p.ray_role},
+          {"ray_transport",      p.ray_transport},
+          {"reservation_state",  p.reservation_state},
           {"placed_at_ms",       p.placed_at_ms},
           {"last_active_ms",     p.last_active_ms} };
 }
@@ -1215,6 +1249,12 @@ inline void from_json(const nlohmann::json& j, AgentPlacement& p) {
     if (j.contains("is_active"))          j.at("is_active").get_to(p.is_active);
     if (j.contains("kv_cache_node_path")) j.at("kv_cache_node_path").get_to(p.kv_cache_node_path);
     if (j.contains("engine_fingerprint")) j.at("engine_fingerprint").get_to(p.engine_fingerprint);
+    if (j.contains("engine_id"))          j.at("engine_id").get_to(p.engine_id);
+    if (j.contains("ray_group_id"))       j.at("ray_group_id").get_to(p.ray_group_id);
+    if (j.contains("member_node_ids"))    j.at("member_node_ids").get_to(p.member_node_ids);
+    if (j.contains("ray_role"))           j.at("ray_role").get_to(p.ray_role);
+    if (j.contains("ray_transport"))      j.at("ray_transport").get_to(p.ray_transport);
+    if (j.contains("reservation_state"))  j.at("reservation_state").get_to(p.reservation_state);
     if (j.contains("placed_at_ms"))       j.at("placed_at_ms").get_to(p.placed_at_ms);
     if (j.contains("last_active_ms"))     j.at("last_active_ms").get_to(p.last_active_ms);
 }
@@ -1224,13 +1264,37 @@ inline void to_json(nlohmann::json& j, const NodeCapabilities& c) {
     j = { {"arch",          c.arch},
           {"gpu_count",     c.gpu_count},
           {"llama_cpp_version",  c.llama_cpp_version},
-          {"supports_llama_rpc", c.supports_llama_rpc} };
+          {"supports_llama_rpc", c.supports_llama_rpc},
+          {"comm_backends", c.comm_backends},
+          {"supports_ray", c.supports_ray},
+          {"interconnect_gbps", c.interconnect_gbps} };
 }
 inline void from_json(const nlohmann::json& j, NodeCapabilities& c) {
     if (j.contains("arch"))          j.at("arch").get_to(c.arch);
     if (j.contains("gpu_count"))     j.at("gpu_count").get_to(c.gpu_count);
     if (j.contains("llama_cpp_version"))  j.at("llama_cpp_version").get_to(c.llama_cpp_version);
     if (j.contains("supports_llama_rpc")) j.at("supports_llama_rpc").get_to(c.supports_llama_rpc);
+    if (j.contains("comm_backends")) j.at("comm_backends").get_to(c.comm_backends);
+    if (j.contains("supports_ray")) j.at("supports_ray").get_to(c.supports_ray);
+    if (j.contains("interconnect_gbps"))
+        j.at("interconnect_gbps").get_to(c.interconnect_gbps);
+}
+
+inline void to_json(nlohmann::json& j, const RayRuntimeStatus& r) {
+    j = {{"state", r.state}, {"group_id", r.group_id}, {"agent_id", r.agent_id},
+         {"role", r.role}, {"head_address", r.head_address},
+         {"transport", r.transport}, {"reserved_gpus", r.reserved_gpus},
+         {"last_error", r.last_error}};
+}
+inline void from_json(const nlohmann::json& j, RayRuntimeStatus& r) {
+    if (j.contains("state")) j.at("state").get_to(r.state);
+    if (j.contains("group_id")) j.at("group_id").get_to(r.group_id);
+    if (j.contains("agent_id")) j.at("agent_id").get_to(r.agent_id);
+    if (j.contains("role")) j.at("role").get_to(r.role);
+    if (j.contains("head_address")) j.at("head_address").get_to(r.head_address);
+    if (j.contains("transport")) j.at("transport").get_to(r.transport);
+    if (j.contains("reserved_gpus")) j.at("reserved_gpus").get_to(r.reserved_gpus);
+    if (j.contains("last_error")) j.at("last_error").get_to(r.last_error);
 }
 
 // ─── NodeInfo ─────────────────────────────────────────────────────────────────
@@ -1432,6 +1496,7 @@ inline void to_json(nlohmann::json& j, const NodeInfo& n) {
           {"platform",      n.platform},
           {"capabilities",  n.capabilities},
           {"metrics",       n.metrics},
+          {"ray",           n.ray},
           {"last_seen_ms",  n.last_seen_ms},
           {"slot_snapshot_at_ms", n.slot_snapshot_at_ms},
           {"unreachable_since_ms", n.unreachable_since_ms},
@@ -1470,6 +1535,7 @@ inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     if (j.contains("platform"))      j.at("platform").get_to(n.platform);
     if (j.contains("capabilities"))  j.at("capabilities").get_to(n.capabilities);
     if (j.contains("metrics"))       j.at("metrics").get_to(n.metrics);
+    if (j.contains("ray"))           j.at("ray").get_to(n.ray);
     if (j.contains("last_seen_ms"))  j.at("last_seen_ms").get_to(n.last_seen_ms);
     if (j.contains("slot_snapshot_at_ms"))
         j.at("slot_snapshot_at_ms").get_to(n.slot_snapshot_at_ms);

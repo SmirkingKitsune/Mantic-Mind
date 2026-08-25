@@ -107,6 +107,32 @@ def main() -> int:
             print("        be guarding a file that never compiles")
             failures += 1
 
+    # The engine form's conditional is part of the UI contract: a stale vLLM
+    # profile may remain in JSON, but it must not reveal vLLM/Ray controls until
+    # vLLM occupies either routing position. Keep this as a source gate because
+    # FormState is intentionally private to the FTXUI component.
+    engine_panel = (root / "src/control/engine_panels.cpp").read_text(encoding="utf-8")
+    ui_needles = [
+        'return primary == "vllm" || backup == "vllm";',
+        'Maybe(vllm_container, &form->show_vllm)',
+        'Ray: automatic when pipeline parallelism > 1',
+    ]
+    for needle in ui_needles:
+        if needle in engine_panel:
+            print(f"OK    engine form contract: {needle}")
+        else:
+            print(f"FAIL  engine form contract missing: {needle}")
+            failures += 1
+
+    cli = (root / "src/control/main.cpp").read_text(encoding="utf-8")
+    for flag in ("--vllm-install-method", "--vllm-version", "--vllm-tp",
+                 "--vllm-pp", "--vllm-experimental-gloo"):
+        if flag in cli:
+            print(f"OK    CLI exposes {flag}")
+        else:
+            print(f"FAIL  CLI does not expose {flag}")
+            failures += 1
+
     print(f"\n{checked} files checked, {failures} failures")
     return 1 if failures else 0
 

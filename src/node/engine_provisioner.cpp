@@ -617,4 +617,268 @@ bool SomaEngineProvisioner::install_package(const std::string& /*package_path*/,
     return false;
 }
 
+// ── vLLM ─────────────────────────────────────────────────────────────────────
+
+struct VllmEngineProvisioner::Impl {
+    const std::string id = "vllm";
+    std::string requested;
+    std::filesystem::path root;
+    std::string python;
+    std::string variant;
+    mutable std::mutex state_mutex;
+    std::mutex op_mutex;
+    RuntimeStatus status;
+};
+
+namespace {
+
+std::string vllm_platform_variant() {
+#ifdef _WIN32
+    return "windows";
+#elif defined(__APPLE__)
+    return "metal";
+#else
+    return "linux";
+#endif
+}
+
+std::filesystem::path managed_vllm_python(const std::filesystem::path& root) {
+#ifdef _WIN32
+    return root / "venv" / "Scripts" / "python.exe";
+#else
+    return root / "venv" / "bin" / "python";
+#endif
+}
+
+std::filesystem::path managed_vllm_binary(const std::filesystem::path& root) {
+#ifdef _WIN32
+    return root / "venv" / "Scripts" / "vllm.exe";
+#else
+    return root / "venv" / "bin" / "vllm";
+#endif
+}
+
+std::string capture_vllm_version(const std::string& executable) {
+    std::string first;
+    std::string error;
+    const int rc = run_streamed_command(
+        {executable, "--version"}, {},
+        [&](const std::string& line, bool) {
+            if (first.empty() && !util::trim(line).empty()) first = util::trim(line);
+        }, &error);
+    return rc == 0 ? first : std::string{};
+}
+
+std::string normalize_vllm_version(std::string version) {
+    version = util::to_lower(util::trim(version));
+    if (version.rfind("vllm", 0) == 0)
+        version = util::trim(version.substr(4));
+    if (!version.empty() && version.front() == 'v') version.erase(version.begin());
+    return version;
+}
+
+bool requested_vllm_version_matches(const std::string& installed,
+                                    const std::string& requested) {
+    if (requested.empty() || requested == "latest") return true;
+    return normalize_vllm_version(installed) == normalize_vllm_version(requested);
+}
+
+} // namespace
+
+std::string vllm_install_requirement(const EngineSpec& spec) {
+    if (spec.install_method == "path") return {};
+    std::string package;
+    if (spec.install_method == "source") {
+#ifdef _WIN32
+        package = "git+https://github.com/SystemPanic/vllm-windows.git";
+#else
+        package = "git+https://github.com/vllm-project/vllm.git";
+#endif
+        if (!spec.version.empty() && spec.version != "latest")
+            package += "@" + spec.version;
+    } else {
+        package = "vllm";
+        if (!spec.version.empty() && spec.version != "latest")
+            package += "==" + spec.version;
+    }
+    return package;
+}
+
+VllmEngineProvisioner::VllmEngineProvisioner(std::string requested_executable,
+                                             std::string provision_dir,
+                                             std::string python_executable,
+                                             std::string hardware_variant)
+    : impl_(std::make_unique<Impl>()) {
+    impl_->requested = requested_executable.empty() ? "vllm" : std::move(requested_executable);
+    impl_->root = provision_dir.empty()
+        ? std::filesystem::path("data") / "runtimes" / "vllm"
+        : std::filesystem::path(std::move(provision_dir));
+    impl_->python = python_executable.empty() ? "python" : std::move(python_executable);
+    impl_->variant = hardware_variant.empty()
+        ? vllm_platform_variant() : std::move(hardware_variant);
+    impl_->status.engine_id = impl_->id;
+    impl_->status.status = "absent";
+    impl_->status.variant = impl_->variant;
+}
+
+VllmEngineProvisioner::~VllmEngineProvisioner() = default;
+
+const std::string& VllmEngineProvisioner::engine_id() const { return impl_->id; }
+
+RuntimeStatus VllmEngineProvisioner::ensure(const EngineSpec& spec) {
+    return converge(spec, false);
+}
+
+RuntimeStatus VllmEngineProvisioner::converge(const EngineSpec& spec,
+                                              bool force_upgrade) {
+    std::lock_guard<std::mutex> op(impl_->op_mutex);
+    RuntimeStatus next;
+    next.engine_id = impl_->id;
+    next.variant = impl_->variant;
+
+    const auto managed = managed_vllm_binary(impl_->root);
+    const auto managed_python = managed_vllm_python(impl_->root);
+    std::error_code ec;
+    const std::string requested = resolve_llama_executable(impl_->requested);
+    const bool managed_exists = std::filesystem::is_regular_file(managed, ec);
+    std::string resolved;
+    std::string resolved_version;
+
+    // `path` means exactly the node-local executable. `wheel` and `source`
+    // always mean the isolated managed environment. `auto` may reuse a local
+    // executable when it satisfies the requested version, then falls back to
+    // that managed environment.
+    if (spec.install_method == "path") {
+        resolved = requested;
+    } else if (spec.install_method == "auto" && !requested.empty() &&
+               !force_upgrade) {
+        const auto version = capture_vllm_version(requested);
+        if (requested_vllm_version_matches(version, spec.version)) {
+            resolved = requested;
+            resolved_version = version;
+        }
+    }
+    if (resolved.empty() && managed_exists && !force_upgrade) {
+        const auto version = capture_vllm_version(managed.string());
+        if (requested_vllm_version_matches(version, spec.version)) {
+            resolved = managed.string();
+            resolved_version = version;
+        }
+    }
+
+    if (resolved.empty() && spec.install_method == "path") {
+        next.status = "absent";
+        next.last_error = "vLLM executable '" + impl_->requested +
+                          "' was not found; install_method=path disables managed provisioning";
+    } else if (resolved.empty()) {
+        if (progress_sink_) {
+            RuntimeInstallProgress p;
+            p.active = true;
+            p.stage = "Provisioning vLLM";
+            p.total_steps = 2;
+            p.step = 1;
+            progress_sink_(p);
+        }
+        std::filesystem::create_directories(impl_->root, ec);
+        std::string error;
+        int rc = 0;
+        if (!std::filesystem::is_regular_file(managed_python, ec)) {
+            rc = run_streamed_command(
+                {impl_->python, "-m", "venv", (impl_->root / "venv").string()}, {},
+                log_sink_, cancel_check_, &error);
+        }
+        if (rc == 0) {
+            const std::string package = vllm_install_requirement(spec);
+            if (progress_sink_) {
+                RuntimeInstallProgress p;
+                p.active = true;
+                p.stage = "Installing vLLM and Ray";
+                p.total_steps = 2;
+                p.step = 2;
+                progress_sink_(p);
+            }
+            std::vector<std::string> install{
+                managed_python.string(), "-m", "pip", "install"};
+            if (force_upgrade || managed_exists) install.emplace_back("--upgrade");
+            install.push_back(package);
+            install.emplace_back("ray[default]");
+            rc = run_streamed_command(install, {}, log_sink_, cancel_check_, &error);
+        }
+        if (progress_sink_) progress_sink_(RuntimeInstallProgress{});
+        if (rc == 0 && std::filesystem::is_regular_file(managed, ec))
+            resolved = managed.string();
+        else {
+            next.status = "error";
+            next.last_error = error.empty() ? "managed vLLM installation failed" : error;
+        }
+    }
+
+    if (!resolved.empty()) {
+        next.executable_path = resolved;
+        next.version = resolved_version.empty()
+            ? capture_vllm_version(resolved) : resolved_version;
+        if (next.version.empty()) next.version = spec.version;
+        if (!requested_vllm_version_matches(next.version, spec.version)) {
+            next.status = "error";
+            next.ready = false;
+            next.last_error = "vLLM version '" + next.version +
+                              "' does not satisfy requested version '" +
+                              spec.version + "'";
+        } else {
+            next.status = "ready";
+            next.ready = true;
+            next.last_error.clear();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> g(impl_->state_mutex);
+        impl_->status = next;
+    }
+    return next;
+}
+
+RuntimeStatus VllmEngineProvisioner::check_for_update(const EngineSpec&) {
+    return status();
+}
+
+RuntimeStatus VllmEngineProvisioner::update(const EngineSpec& spec,
+                                            const std::string&) {
+    // A PATH runtime is intentionally never mutated by this node. Managed
+    // wheel/source installs force pip to resolve the requested version again;
+    // this gives `latest` a real update operation instead of an idempotent no-op.
+    return spec.install_method == "path" ? ensure(spec) : converge(spec, true);
+}
+
+RuntimeStatus VllmEngineProvisioner::status() const {
+    std::lock_guard<std::mutex> g(impl_->state_mutex);
+    return impl_->status;
+}
+
+std::string VllmEngineProvisioner::executable_path() const {
+    return status().executable_path;
+}
+
+std::optional<EngineArtifact> VllmEngineProvisioner::installed_artifact() const {
+    return std::nullopt;
+}
+
+std::optional<EngineArtifact>
+VllmEngineProvisioner::desired_artifact(const EngineSpec&) const {
+    return std::nullopt;
+}
+
+bool VllmEngineProvisioner::shareable() const { return false; }
+
+bool VllmEngineProvisioner::package(const std::string&, std::string& err) {
+    err = "vLLM virtual environments are node-local and are not shared";
+    return false;
+}
+
+bool VllmEngineProvisioner::install_package(const std::string&,
+                                            const EngineArtifact&,
+                                            std::string& err) {
+    err = "vLLM virtual environments cannot be installed from a peer artifact";
+    return false;
+}
+
 } // namespace mm

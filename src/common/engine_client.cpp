@@ -177,6 +177,51 @@ bool LlamaEngineClient::query_capabilities(std::string& out_json) {
     return true;
 }
 
+// ── VllmEngineClient ─────────────────────────────────────────────────────────
+
+VllmEngineClient::VllmEngineClient(std::string base_url, std::string api_key)
+    : EngineClient(std::move(base_url), std::move(api_key)) {}
+
+Message VllmEngineClient::complete(const InferenceRequest& req) {
+    RuntimeClient rc(base_url_, api_key_);
+    return rc.complete(req);
+}
+
+void VllmEngineClient::stream_complete(const InferenceRequest& req,
+                                       ChunkCallback chunk_cb,
+                                       ErrorCallback error_cb) {
+    RuntimeClient rc(base_url_, api_key_);
+    rc.stream_complete(req, std::move(chunk_cb), [error_cb](const std::string& raw) {
+        if (error_cb) error_cb(parse_engine_error(raw));
+    });
+}
+
+bool VllmEngineClient::health_check() {
+    auto cli = make_client(base_url_, api_key_);
+    const auto res = cli.Get("/health");
+    return res && res->status == 200;
+}
+
+bool VllmEngineClient::sleep(int level, std::string& error) {
+    error.clear();
+    auto cli = make_client(base_url_, api_key_);
+    const auto res = cli.Post(("/sleep?level=" + std::to_string(level)).c_str());
+    if (res && res->status >= 200 && res->status < 300) return true;
+    error = res ? "HTTP " + std::to_string(res->status) + ": " + res->body
+                : "vLLM sleep endpoint is unreachable";
+    return false;
+}
+
+bool VllmEngineClient::wake(std::string& error) {
+    error.clear();
+    auto cli = make_client(base_url_, api_key_);
+    const auto res = cli.Post("/wake_up");
+    if (res && res->status >= 200 && res->status < 300) return true;
+    error = res ? "HTTP " + std::to_string(res->status) + ": " + res->body
+                : "vLLM wake endpoint is unreachable";
+    return false;
+}
+
 // ── SomaEngineClient ──────────────────────────────────────────────────────────
 
 SomaEngineClient::SomaEngineClient(std::string base_url, std::string api_key)

@@ -205,6 +205,7 @@ private:
         std::string mmproj_path;
         std::vector<AgentId> agents;
         RuntimeSettings launch_settings;
+        EngineLoadRequest launch_request;
         std::string kv_checkpoint_path;
 
         std::unique_ptr<EngineProcess> process;
@@ -233,6 +234,7 @@ private:
     mutable std::mutex mutex_;
     std::vector<std::unique_ptr<Engine>> engines_;
     std::set<std::uint16_t> used_ports_;
+    std::set<int> pending_gpu_devices_; ///< vLLM devices reserved during startup
     std::vector<RuntimeStatus> runtime_statuses_;
     std::string last_error_;
     int pending_loads_ = 0;

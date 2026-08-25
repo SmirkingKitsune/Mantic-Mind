@@ -98,6 +98,18 @@ public:
     bool query_capabilities(std::string& out_json) override;
 };
 
+/// vLLM's OpenAI-compatible surface.  It deliberately does not advertise
+/// llama.cpp-only /tokenize or /props support.
+class VllmEngineClient final : public EngineClient {
+public:
+    explicit VllmEngineClient(std::string base_url, std::string api_key = {});
+    Message complete(const InferenceRequest& req) override;
+    void stream_complete(const InferenceRequest&, ChunkCallback, ErrorCallback) override;
+    bool health_check() override;
+    bool sleep(int level, std::string& error);
+    bool wake(std::string& error);
+};
+
 /// Soma: the same OpenAI surface, plus /internal/telemetry and /internal/plan.
 ///
 /// Rejects image content parts with 422 rather than dropping them, and surfaces

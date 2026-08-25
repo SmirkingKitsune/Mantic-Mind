@@ -15,6 +15,7 @@ add_library(mm_node_engine STATIC
     # that function; it hand-rolled a thinner argv instead and dropped nine
     # settings on the floor (roadmap D14). Light TU — util + filesystem, no HTTP.
     llama_runtime.cpp
+    vllm_runtime.cpp
 )
 
 # mm_soma is here for ONE object: the KV checkpoint header codec. The node must
@@ -43,6 +44,7 @@ add_executable(mantic-mind
     node_api_server.cpp
     node_state.cpp
     node_modal.cpp
+    ray_orchestration.cpp
     node_ui.cpp
     singleton_lock.cpp
 )

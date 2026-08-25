@@ -37,6 +37,11 @@ struct EngineLoadRequest {
     std::string model_path; ///< file (fallback) or converted dir (Soma)
     std::string mmproj_path;
     RuntimeSettings settings{};
+    std::optional<VllmEngineConfig> vllm;
+    std::string served_model_name;
+    std::string ray_address; ///< non-empty for a control-owned Ray group
+    std::string host_ip;     ///< private address advertised to vLLM/Ray
+    std::vector<int> gpu_devices;
     std::string kv_checkpoint_dir;
     std::uint16_t port = 0;
 };
@@ -78,7 +83,8 @@ struct EngineDescriptor {
         estimate_footprint;
 
     /// Whether two agents may share one live engine process.
-    std::function<bool(const RuntimeSettings& a, const RuntimeSettings& b)> launch_compatible;
+    std::function<bool(const EngineLoadRequest& a, const EngineLoadRequest& b)>
+        launch_compatible;
 
     /// Is this model reference loadable by THIS engine, on THIS node?
     ///
@@ -130,6 +136,8 @@ struct EngineDescriptor {
 /// the environment behind the caller's back.
 EngineDescriptor make_soma_descriptor(const std::string& executable);
 EngineDescriptor make_llama_descriptor(const std::string& executable);
+EngineDescriptor make_vllm_descriptor(const std::string& executable,
+                                      const std::string& hf_cache_dir = {});
 
 class EngineRegistry {
 public:

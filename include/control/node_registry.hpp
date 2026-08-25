@@ -88,6 +88,17 @@ public:
     std::vector<NodeInfo> nodes_with_capacity_for(const FootprintForNode& demand,
                                                   const CapacityPolicy& policy = {}) const;
 
+    /// Placement eligibility for one engine.  This intentionally ignores an
+    /// unrelated required engine's conformance so a ready backup remains usable
+    /// while the primary is failed or still provisioning.
+    std::vector<NodeInfo> available_nodes_for_engine(
+        const std::string& engine_id, std::uint32_t config_version) const;
+    std::vector<NodeInfo> nodes_with_capacity_for_engine(
+        const FootprintForNode& demand,
+        const std::string& engine_id,
+        std::uint32_t config_version,
+        const CapacityPolicy& policy = {}) const;
+
     // Callback fired whenever node status changes (health poll results).
     using UpdateCallback = std::function<void(const NodeInfo&)>;
     void set_update_callback(UpdateCallback cb);

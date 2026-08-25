@@ -25,15 +25,23 @@
 #include <ftxui/component/component.hpp>
 #include <ftxui/dom/elements.hpp>
 
+#include "common/engine_config.hpp"
+
 #include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace mm {
+
+/// Shared visibility rules for the TUI and its tests. An unused/stale vLLM
+/// profile must not reveal controls, while either routing position must.
+bool vllm_controls_visible(const std::string& primary,
+                           const std::string& backup) noexcept;
 
 /// One engine on one node, as the conformance route reports it.
 struct EnginePanelRuntime {
@@ -75,6 +83,12 @@ struct EngineSnapshot {
     std::string primary_engine;
     std::string backup_engine; ///< empty means NO backup, which is a real choice
     bool share_builds = true;
+    std::optional<VllmEngineConfig> vllm;
+    std::string vllm_install_method = "auto";
+    std::string vllm_version = "latest";
+    std::string ray_state;
+    std::string ray_detail;
+    int ray_active_groups = 0;
 
     std::vector<EnginePanelNode> nodes;
     int conforming = 0;
@@ -111,6 +125,9 @@ public:
     bool save(const std::string& primary,
               const std::string& backup,
               bool share_builds,
+              const std::optional<VllmEngineConfig>& vllm,
+              const std::string& vllm_install_method,
+              const std::string& vllm_version,
               std::string& out_error);
 
     /// Re-push the current configuration to every node whose version differs.

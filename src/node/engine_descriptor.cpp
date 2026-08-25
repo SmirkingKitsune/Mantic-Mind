@@ -12,6 +12,7 @@
 
 #include "common/engine_capabilities.hpp"
 #include "node/llama_runtime.hpp"
+#include "node/vllm_runtime.hpp"
 #include "node/engine_descriptor.hpp"
 
 #include "common/engine_client.hpp"
@@ -237,7 +238,9 @@ EngineDescriptor make_soma_descriptor(const std::string& executable) {
     //
     // The model itself is not compared here: it is not in RuntimeSettings, and
     // the caller has already matched EngineLoadRequest::model_path before asking.
-    d.launch_compatible = [](const RuntimeSettings& a, const RuntimeSettings& b) {
+    d.launch_compatible = [](const EngineLoadRequest& lhs, const EngineLoadRequest& rhs) {
+        const auto& a = lhs.settings;
+        const auto& b = rhs.settings;
         return a.n_threads == b.n_threads // process-wide pool
                && a.n_threads_http == b.n_threads_http &&
                a.batch_size == b.batch_size // scheduler, not per-seq
@@ -333,8 +336,8 @@ EngineDescriptor make_llama_descriptor(const std::string& executable) {
     // The existing, unit-tested predicate from common/models.hpp — not `false`.
     // llama.cpp agents already share processes today, and answering "never" here
     // would silently spawn one llama-server per agent.
-    d.launch_compatible = [](const RuntimeSettings& a, const RuntimeSettings& b) {
-        return llama_launch_compatible(a, b);
+    d.launch_compatible = [](const EngineLoadRequest& a, const EngineLoadRequest& b) {
+        return llama_launch_compatible(a.settings, b.settings);
     };
 
     // A node-local GGUF FILE. This check used to run in the load-model handler
@@ -349,6 +352,67 @@ EngineDescriptor make_llama_descriptor(const std::string& executable) {
                      : "model file not found on this node: " + model_ref;
         return false;
     };
+    return d;
+}
+
+EngineDescriptor make_vllm_descriptor(const std::string& executable,
+                                      const std::string& hf_cache_dir) {
+    EngineDescriptor d;
+    d.id = "vllm";
+    d.display_name = "vLLM";
+    d.supports_vision = true;
+    d.supports_suspend = true;
+    d.supports_multi_seq = true;
+    d.readiness.kind = ReadinessProbe::Kind::HttpHealth;
+    d.readiness.http_path = "/health";
+
+    d.build_launch = [executable, hf_cache_dir](const EngineLoadRequest& req) {
+        EngineLaunchSpec spec;
+        spec.runtime_name = "vllm";
+        spec.executable = executable;
+        spec.port = req.port;
+        spec.readiness.kind = ReadinessProbe::Kind::HttpHealth;
+        spec.readiness.http_path = "/health";
+        const VllmEngineConfig profile = req.vllm.value_or(VllmEngineConfig{});
+        spec.args = build_vllm_server_args(
+            req.model_path, req.served_model_name, profile, req.port);
+        if (profile.enable_sleep_mode)
+            spec.env.emplace_back("VLLM_SERVER_DEV_MODE", "1");
+        if (!hf_cache_dir.empty()) spec.env.emplace_back("HF_HOME", hf_cache_dir);
+        if (!req.ray_address.empty())
+            spec.env.emplace_back("RAY_ADDRESS", req.ray_address);
+        if (!req.host_ip.empty())
+            spec.env.emplace_back("VLLM_HOST_IP", req.host_ip);
+        if (!req.gpu_devices.empty()) {
+            std::string visible;
+            for (const int index : req.gpu_devices) {
+                if (!visible.empty()) visible += ',';
+                visible += std::to_string(index);
+            }
+            spec.env.emplace_back("CUDA_VISIBLE_DEVICES", std::move(visible));
+        }
+        return spec;
+    };
+    d.make_client = [](const std::string& base_url) -> std::unique_ptr<EngineClient> {
+        return std::make_unique<VllmEngineClient>(base_url);
+    };
+    d.estimate_footprint = [](const EngineLoadRequest& req,
+                              ResourceFootprint& out,
+                              std::string&) {
+        // vLLM owns the definitive memory admission.  Keep disk accounting for
+        // local paths and avoid inventing a VRAM byte count from a percentage.
+        const auto bytes = path_size_bytes(req.model_path);
+        if (bytes > 0) out.disk_mb = static_cast<std::int64_t>(bytes / (1024 * 1024));
+        return true;
+    };
+    d.launch_compatible = [](const EngineLoadRequest& a, const EngineLoadRequest& b) {
+        return a.served_model_name == b.served_model_name &&
+               a.ray_address == b.ray_address &&
+               vllm_launch_compatible(a.vllm.value_or(VllmEngineConfig{}),
+                                      b.vllm.value_or(VllmEngineConfig{}));
+    };
+    // No validate_model_ref callback: unlike llama.cpp and Soma, vLLM resolves
+    // Hugging Face repository ids itself as well as accepting local paths.
     return d;
 }
 

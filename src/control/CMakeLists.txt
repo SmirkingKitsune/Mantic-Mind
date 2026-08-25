@@ -3,6 +3,7 @@ add_executable(mantic-mind-control
     node_registry.cpp
     agent_scheduler.cpp
     engine_config_store.cpp
+    engine_group_planner.cpp
     model_registry.cpp
     route_scope.cpp
     agent_queue.cpp
