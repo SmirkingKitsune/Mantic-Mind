@@ -125,8 +125,7 @@ parse_kv_checkpoint_header(const std::byte* data, std::size_t size, KvCheckpoint
     // this header without a store and must not interpret a v1 layout — where the
     // payload starts immediately and the token array does not exist — as a v2
     // one. Every offset below would be wrong by 4 x length_tokens.
-    if (out.version != kKvCheckpointVersion &&
-        out.version != kKvCheckpointVersionSpeculative &&
+    if (out.version != kKvCheckpointVersion && out.version != kKvCheckpointVersionSpeculative &&
         out.version != kKvCheckpointVersionSampler) {
         return {StatusCode::VersionMismatch,
                 "unsupported checkpoint version " + std::to_string(out.version)};
@@ -147,8 +146,7 @@ parse_kv_checkpoint_header(const std::byte* data, std::size_t size, KvCheckpoint
             // offset derived from it, so this is not a field to skip — it is the
             // whole rest of the file.
             return {StatusCode::VersionMismatch,
-                    "checkpoint carries unknown header flags " +
-                        hex32(out.flags & ~kKvFlagsKnown)};
+                    "checkpoint carries unknown header flags " + hex32(out.flags & ~kKvFlagsKnown)};
         }
         if ((out.flags & kKvFlagAuxiliary) != 0) out.auxiliary_bytes = c.u64();
         if ((out.flags & kKvFlagMedia) != 0) {

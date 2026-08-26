@@ -707,8 +707,7 @@ Status Scheduler::step() {
         taps.layers = im.model->arch.speculative.target_layer_ids;
         taps_ptr = &taps;
     }
-    if (auto st = forward_step_f32(
-            *im.model, tokens, rows, im.ws, im.logits, taps_ptr, overrides);
+    if (auto st = forward_step_f32(*im.model, tokens, rows, im.ws, im.logits, taps_ptr, overrides);
         !st.ok()) {
         if (im.on_error) {
             for (Seq* s : batch)
@@ -877,9 +876,8 @@ Status Scheduler::extend(SeqId id,
                 "the cached " + std::to_string(s->history.size()) +
                     " tokens are not a prefix of this prompt; cancel and admit fresh"};
     }
-    if (auto st = validate_prompt_embeddings(embeddings,
-                                             im.model->arch.topology.d_model,
-                                             static_cast<std::uint32_t>(prompt.size()));
+    if (auto st = validate_prompt_embeddings(
+            embeddings, im.model->arch.topology.d_model, static_cast<std::uint32_t>(prompt.size()));
         !st.ok()) {
         return st;
     }
@@ -891,11 +889,10 @@ Status Scheduler::extend(SeqId id,
     // A hard error rather than a cold start, matching the token check directly
     // above it: extend() is attaching to a LIVE session, and the caller's
     // remedy — cancel and admit fresh — is the same one either mismatch needs.
-    if (const auto offered =
-            media_digest_prefix(embeddings.positions,
-                                embeddings.values,
-                                im.model->arch.topology.d_model,
-                                static_cast<std::uint32_t>(s->history.size()));
+    if (const auto offered = media_digest_prefix(embeddings.positions,
+                                                 embeddings.values,
+                                                 im.model->arch.topology.d_model,
+                                                 static_cast<std::uint32_t>(s->history.size()));
         !(offered == s->media)) {
         return {StatusCode::ArchMismatch,
                 "the cached " + std::to_string(s->history.size()) +
@@ -1045,9 +1042,11 @@ Status Scheduler::resume(SeqId id) {
     // someone else's context is the failure this whole field exists to catch.
     if (!(restored.media == s->media)) {
         return {StatusCode::ArchMismatch,
-                "checkpoint " + checkpoint_key(id) + " was built from different supplied "
-                "embeddings (" + restored.media.hex().substr(0, 12) + " != " +
-                    s->media.hex().substr(0, 12) + ")"};
+                "checkpoint " + checkpoint_key(id) +
+                    " was built from different supplied "
+                    "embeddings (" +
+                    restored.media.hex().substr(0, 12) + " != " + s->media.hex().substr(0, 12) +
+                    ")"};
     }
     s->history = std::move(restored.tokens);
     s->emitted = std::move(restored.emitted);

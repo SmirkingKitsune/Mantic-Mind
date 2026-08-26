@@ -95,8 +95,7 @@ struct KvCheckpointStore::Impl {
     }
 
     Status gate(const KvCheckpointHeader& h) const {
-        if (h.version != kKvCheckpointVersion &&
-            h.version != kKvCheckpointVersionSpeculative &&
+        if (h.version != kKvCheckpointVersion && h.version != kKvCheckpointVersionSpeculative &&
             h.version != kKvCheckpointVersionSampler) {
             return {StatusCode::VersionMismatch,
                     "unsupported checkpoint version " + std::to_string(h.version)};
@@ -197,9 +196,8 @@ KvCheckpointStore::save(const std::string& key, const KvCache& kv, const SeqPers
     // One version, always the current one. What varies is the FLAGS word — see
     // kv_checkpoint.hpp for why the two optional fields stopped being two
     // version numbers.
-    const std::uint32_t flags =
-        (state.auxiliary.empty() ? 0u : kKvFlagAuxiliary) |
-        (state.media.empty() ? 0u : kKvFlagMedia);
+    const std::uint32_t flags = (state.auxiliary.empty() ? 0u : kKvFlagAuxiliary) |
+                                (state.media.empty() ? 0u : kKvFlagMedia);
     put_u32(buf, kKvCheckpointVersion);
     put_str(buf, im.arch.arch_hash);
     put_u32(buf, im.format_id);

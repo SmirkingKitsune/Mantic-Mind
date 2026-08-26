@@ -65,8 +65,8 @@ struct MediaDigest {
 /// different prompt position is a different context, and a digest that could not
 /// tell them apart would accept a cache whose image had moved.
 void media_digest_fold(MediaDigest& acc,
-                         std::uint32_t position,
-                         std::span<const float> row) noexcept;
+                       std::uint32_t position,
+                       std::span<const float> row) noexcept;
 
 /// The digest of every supplied row at a position BELOW `upto`.
 ///

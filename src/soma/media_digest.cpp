@@ -39,8 +39,8 @@ std::string MediaDigest::hex() const {
 }
 
 void media_digest_fold(MediaDigest& acc,
-                         std::uint32_t position,
-                         std::span<const float> row) noexcept {
+                       std::uint32_t position,
+                       std::span<const float> row) noexcept {
     // Two one-shot hashes rather than SHA256_Init/Update/Final, which OpenSSL 3
     // deprecates and this project builds with warnings as errors. The EVP
     // incremental API is the sanctioned replacement and allocates a context that
@@ -103,8 +103,8 @@ Status validate_prompt_embeddings(const PromptEmbeddings& e,
     const auto expected = e.positions.size() * static_cast<std::size_t>(d_model);
     if (e.values.size() != expected) {
         return {StatusCode::InvalidArgument,
-                "prompt embeddings hold " + std::to_string(e.values.size()) +
-                    " values; " + std::to_string(e.positions.size()) + " positions x d_model " +
+                "prompt embeddings hold " + std::to_string(e.values.size()) + " values; " +
+                    std::to_string(e.positions.size()) + " positions x d_model " +
                     std::to_string(d_model) + " needs " + std::to_string(expected)};
     }
     for (std::size_t i = 0; i < e.positions.size(); ++i) {
