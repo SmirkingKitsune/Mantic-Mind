@@ -1928,6 +1928,107 @@ A resume that handles only the second looks correct until someone checkpoints at
 is what cluster suspend/restore does every time. Removed alongside it: `Seq::have_next`, written in two
 places and read in none.
 
+#### Supplied embeddings, and checkpoint format v5
+
+Step one of vision, landed without a vision tower. The tower is a separate, larger piece of work; this
+is the plumbing underneath it, and it is worth having on its own terms because one half of it fixes a
+soundness hole that opens the moment the *first* supplied row exists.
+
+**A forward that accepts rows, not only ids.** `forward_impl` gathers an embedding row per token and
+runs. It now takes an optional `std::span<const EmbeddingOverride>` — `{row, const float*}` — written
+over the gathered rows before layer 0. Applied **after** the table gather rather than instead of it, so
+an overridden position's token id is still bounds-checked and still reaches `begin_forward` as an
+ordinary token. That ordering is the whole reason an image position carries a REAL placeholder id — the
+one the model's own template emits — rather than a sentinel every attention backend would have to learn
+about. The cost is one dequantize per overridden row that is immediately overwritten, which is a
+rounding error against a vision tower and buys a forward with **no second entry point**.
+
+One forward, not two, is the point. A separate `forward_embeddings_f32` would have doubled the surface
+every architecture backend hooks into, and the two would agree until the day they didn't.
+
+**The soundness hole.** v2 made a restore checkable by carrying the token ids the cached positions hold
+(above). That check rests on an assumption the engine could always make: **token ids determine the
+hidden state**. A supplied row breaks it. Two different images occupy the same placeholder positions and
+produce *byte-identical* token arrays, so v2's prefix check passes, the cache attaches, and the model
+answers fluently about a picture nobody sent — the exact failure the token array exists to prevent,
+reappearing one layer beneath it and invisible to it.
+
+So a checkpoint records a digest of the rows supplied for its cached positions, and every prefix check
+compares it. Text-only sequences supply none, both digests stay empty, and the comparison costs nothing
+on the path that has always existed.
+
+**Digested over the ROWS, not the source image.** Digesting the source bytes would be weaker in exactly
+the direction that matters: one JPEG through two preprocessing paths gives different rows and an
+identical source digest, so a cache built by one would validate against the other. The rows are what
+reached the forward.
+
+**A chain, not a stream** — `acc = H(acc || position || H(row))`, so the accumulator *is* the digest.
+A streaming hash would have to persist its internal state, and a cross-process resume has only what is
+on disk; the fold restores from 32 bytes and keeps going. Position is in the message because the same
+row at a different prompt position is a different context. Two one-shot `SHA256()` calls rather than
+`SHA256_Init/Update/Final`, which OpenSSL 3 deprecates under this repo's warnings-as-errors, and rather
+than the EVP incremental API, which allocates a context that can fail — leaving the fold either not
+`noexcept` or silently wrong under memory pressure. Hashing the row down to 32 bytes first keeps the
+chain message on the stack, so there is nothing to allocate and nothing to fail.
+
+Raw float bytes, so `-0.0` and `+0.0` digest differently. Stricter than numeric equality, and the
+strictness fails in the safe direction: a spurious cold start, never a cache attached to media that did
+not build it.
+
+**v5 retires the version-per-variant scheme.** v3 and v4 were the same checkpoint differing by one
+optional field, which made the version a variant tag rather than a history. A second optional field
+would have taken that to four numbers and a third to eight. v5 adds a **flags word** — `kKvFlagAuxiliary`,
+`kKvFlagMedia` — and the version is linear again. v3 and v4 are still *read*, parsed into the equivalent
+flags so nothing downstream branches on version a second time. Unknown flag bits are **refused**, not
+ignored: every field after that word sits at an offset derived from it, so a build that skipped a bit it
+did not recognise would not misread one field, it would misread the file.
+
+The version gate also moved **ahead** of the variable fields. It ran last, which meant a v4 file's
+auxiliary extent could be read as a v3 file's token array before anything checked. A related sharp edge
+found on the way: a file too short to hold the fixed fields has a version of 0 by truncation, and
+`unsupported checkpoint version 0` names the wrong fault — truncation is now checked first.
+
+**Three gates, one rule.** `Scheduler::admit` via `resume_key` degrades to a cold start (a stale image is
+"prefill from scratch", not an error). `Scheduler::extend` **refuses** — it is attaching to a live
+session, so there is no cold path to fall to, and the caller's remedy is the same one a token mismatch
+needs. `Scheduler::resume` verifies against the digest the live sequence still holds, which catches a
+checkpoint file that belongs to a different sequence. `extend()` takes the embeddings for the **whole**
+prompt, cached prefix included: the prefix is what gets checked, and a caller passing only the suffix
+would be asking to skip the check.
+
+Note the failure direction of a caller that simply forgets to resend the rows: the cached digest is
+non-empty, the computed one is empty, they differ, and the request cold starts. Forgetting is safe.
+
+**Graded on the plumbing, with no tower**, because every property here is a property of the plumbing and
+a tower would prove none of it. `soma_media_prefix_g3`, registered against GQA and MLA:
+
+| Claim | How |
+|---|---|
+| the fold and the one-shot prefix agree | incremental vs. `media_digest_prefix` at each length — if these ever drifted, warm reopen would silently stop attaching and nothing would report it |
+| one changed float is visible | 1e-3 on one element of one row |
+| the same rows at a moved position differ | position is in the message |
+| **the override REPLACES the lookup** | run token A while supplying token B's own embedding row; the logits must equal a plain run of B, bit for bit |
+| the gate | same prompt, same token ids, one float different in one supplied row → **cold start** |
+| v3 and v4 still parse | hand-written headers, not the encoder |
+| an unknown flag is refused | `0x80` → `VersionMismatch` |
+
+The forward-equality check is the strongest statement available without a tower. "The output changed"
+would also pass if the override were *added* to the gathered row, or scaled, or landed on the wrong
+position. It holds because nothing downstream of the embedding reads the token id on these families —
+which is not luck, it is the property that lets an overridden position keep a real id, and is worth
+failing loudly if it ever stops being true.
+
+**Verified by mutation**, both directions. Dropping the digest from `admit`'s prefix test fails exactly
+the two checks written for it; skipping the fold in the scatter fails four, including — correctly
+inverted — "omitting the rows cold starts too", which *passes* when nothing was ever recorded to differ
+from.
+
+**What this does not do.** There is no vision tower, no image decode, no preprocessing, and
+`flatten_messages` still answers 422 for an image content part. `engine_supports_vision("soma")` is
+still `false`. Nothing about the streaming-expert workflow changed: the dense half stays resident,
+routed experts stream per token, and a supplied row is a prefill-time substitution that the scheduler's
+existing chunking already bounds.
+
 #### Incremental detokenisation
 
 `CompiledTokenizer::Streamer` was declared in the header with no implementation. The server re-decoded
@@ -5026,5 +5127,5 @@ the next architecture through the seam will want to know which interface moved.
 | Paged KV with a block table | Post-G4. Extend the actual `F32Backend::attention_kv` / `KvRow` interface with block-table addressing. |
 | Speculation under batching | Post-G4 |
 | ~~**DSA + IndexShare attention**~~ (GLM-5.2) | **DONE** — implemented and token-exact against the oracle (`max=1.25e-06`, greedy exact). The concern recorded here, that `AttentionBackend` is per-layer function pointers with no channel for cross-layer state, turned out to be the wrong shape of problem: the index is per-(row, step) and never persists between steps, so it needed a per-FORWARD slot, not a per-sequence one. One `ArchLayerPayload` on `F32Workspace` — the same opaque idiom the per-layer weights already use — and the seam was untouched. See the DSA scoping section. |
-| Multimodal | **Still not planned; 422 is still the contract** — but it is no longer hypothetical. Kimi-K3 is the first checkpoint through the adapter that declares a vision tower, and `ModalitySpec` now RECORDS that declaration rather than dropping it. That is deliberately not a capability: it is what lets a plan say which of the two things is happening, because a vision checkpoint served text-only is fine and a vision checkpoint served text-only *silently* is a model answering about an image it never received. |
+| Multimodal | **422 is still the contract at the HTTP boundary, and there is still no vision tower** — but the engine underneath it is no longer text-shaped. `ModalitySpec` records the declaration (Kimi-K3 was the first checkpoint to carry one) and `soma plan` reports it, so a vision checkpoint served text-only says so rather than answering silently about an image it never received. The forward now accepts supplied embedding rows at chosen positions, and checkpoint v5 records a digest of them so a warm reopen cannot attach a cache built from a different picture — see [Supplied embeddings, and checkpoint format v5](#supplied-embeddings-and-checkpoint-format-v5). What remains is the tower itself, the converter’s dropped `vision_tower.` weights, image decode and preprocessing, a plan that charges the resident tower against the RAM budget, and a model-aware `engine_supports_vision`. Until those land, 422 is the honest answer. |
 | Distributed / multi-node single model | Not planned for v1 |

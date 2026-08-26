@@ -6,6 +6,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -1203,7 +1204,8 @@ Status forward_impl(const F32Model& model,
                     std::span<const KvRow> rows,
                     F32Workspace& ws,
                     std::vector<float>& out_logits,
-                    HiddenStateTaps* taps) {
+                    HiddenStateTaps* taps,
+                    std::span<const EmbeddingOverride> overrides) {
     const auto& arch = model.arch;
     const auto d = arch.topology.d_model;
     const auto vocab = arch.topology.vocab_size;
@@ -1244,6 +1246,26 @@ Status forward_impl(const F32Model& model,
             !s.ok()) {
             return {s.code(), "embedding lookup: " + s.message()};
         }
+    }
+
+    // Supplied rows, written OVER the gathered ones.
+    //
+    // After the gather rather than instead of it, so an image position's
+    // placeholder id is still bounds-checked and still reaches begin_forward
+    // below as an ordinary token. The cost is one dequantize per overridden row
+    // that is immediately overwritten, which is a rounding error against a
+    // vision tower and buys a forward with no second entry point.
+    for (const auto& ov : overrides) {
+        if (ov.row >= n) {
+            return {StatusCode::InvalidArgument,
+                    "embedding override row " + std::to_string(ov.row) + " >= batch rows " +
+                        std::to_string(n)};
+        }
+        if (ov.values == nullptr) {
+            return {StatusCode::InvalidArgument,
+                    "embedding override at row " + std::to_string(ov.row) + " has no values"};
+        }
+        std::copy_n(ov.values, d, ws.hidden.data() + static_cast<std::size_t>(ov.row) * d);
     }
 
     // A selection computed for a previous prompt has the wrong length and the
@@ -1623,8 +1645,9 @@ Status forward_impl(const F32Model& model,
 Status forward_f32(const F32Model& model,
                    std::span<const TokenId> tokens,
                    F32Workspace& ws,
-                   std::vector<float>& out_logits) {
-    return forward_impl(model, tokens, {}, ws, out_logits, nullptr);
+                   std::vector<float>& out_logits,
+                   std::span<const EmbeddingOverride> overrides) {
+    return forward_impl(model, tokens, {}, ws, out_logits, nullptr, overrides);
 }
 
 Status forward_step_f32(const F32Model& model,
@@ -1632,14 +1655,15 @@ Status forward_step_f32(const F32Model& model,
                         std::span<const KvRow> rows,
                         F32Workspace& ws,
                         std::vector<float>& out_logits,
-                        HiddenStateTaps* taps) {
+                        HiddenStateTaps* taps,
+                        std::span<const EmbeddingOverride> overrides) {
     if (rows.size() != tokens.size()) {
         return {StatusCode::InvalidArgument,
                 "forward_step_f32: " + std::to_string(tokens.size()) + " tokens against " +
                     std::to_string(rows.size()) + " KV rows"};
     }
     if (rows.empty()) return {StatusCode::InvalidArgument, "empty batch"};
-    return forward_impl(model, tokens, rows, ws, out_logits, taps);
+    return forward_impl(model, tokens, rows, ws, out_logits, taps, overrides);
 }
 
 Status generate_greedy_f32(const F32Model& model,

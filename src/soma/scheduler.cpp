@@ -67,6 +67,11 @@ struct Seq {
     std::uint32_t prompt_pos = 0; ///< next prompt token to feed
     TokenId next_token = 0;       ///< the row this sequence contributes when decoding
 
+    /// Rows supplied for prompt positions, replacing the embedding-table lookup.
+    /// Owned here because the batch builder hands the forward BORROWED pointers
+    /// into `values`, and they have to outlive the step.
+    PromptEmbeddings supplied;
+
     std::uint32_t generated = 0;
     std::uint32_t max_tokens = 0;
     std::vector<TokenId> stop_token_ids;
@@ -86,6 +91,14 @@ struct Seq {
     /// whose failure mode is fluent output about a context nobody supplied.
     std::vector<TokenId> history;
 
+    /// The digest of the supplied rows at the cached positions.
+    ///
+    /// Folded in alongside `history`, for the same reason and at the same place:
+    /// together they are what a restore is checked against. `history` alone stopped
+    /// being sufficient the moment a position could be built from something other
+    /// than its token id.
+    MediaDigest media{};
+
     /// Finished its turn. The sequence STAYS in the map: its KV, its emitted
     /// history and its sampler RNG are the session, and a session outlives the
     /// request that created it. cancel() is what actually retires one.
@@ -98,6 +111,19 @@ struct Seq {
     /// never branches on this — it only decides which token to contribute.
     bool prefilling() const noexcept { return prompt_pos < prompt.size(); }
 };
+
+/// The supplied row for one prompt position, or nullptr.
+///
+/// A binary search over the ascending position list rather than a hash map: an
+/// image contributes a long run of CONSECUTIVE positions, so the search stays in
+/// cache, and the whole set costs two allocations instead of thousands.
+const float*
+supplied_row(const PromptEmbeddings& e, std::uint32_t position, std::uint32_t d_model) {
+    const auto it = std::lower_bound(e.positions.begin(), e.positions.end(), position);
+    if (it == e.positions.end() || *it != position) return nullptr;
+    const auto k = static_cast<std::size_t>(it - e.positions.begin());
+    return e.values.data() + k * static_cast<std::size_t>(d_model);
+}
 
 /// Checkpoint key for a sequence.
 ///
@@ -248,6 +274,16 @@ Status Scheduler::admit(SeqRequest request, SeqId& out_id, AdmitRejection& out_r
                 "prompt + max_tokens (" + std::to_string(ctx_needed) + ") exceeds ctx_size " +
                     std::to_string(im.cfg.ctx_size)};
     }
+    // Validated before a KV slot is taken. The shape rules exist because the
+    // batch builder binary-searches these positions and the digest folds them in
+    // order: an unsorted list would override the wrong row AND digest to
+    // something the restoring side could not reproduce.
+    if (auto st = validate_prompt_embeddings(request.embeddings,
+                                             im.model->arch.topology.d_model,
+                                             static_cast<std::uint32_t>(request.prompt.size()));
+        !st.ok()) {
+        return st;
+    }
     if (im.seqs.size() >= im.cfg.kv_slots) {
         // Refused, not queued-without-limit: a KV slot is real memory, and the
         // remedy (preempt something) differs from the remedy for the gate
@@ -271,6 +307,7 @@ Status Scheduler::admit(SeqRequest request, SeqId& out_id, AdmitRejection& out_r
         }
     }
     s->prompt = std::move(request.prompt);
+    s->supplied = std::move(request.embeddings);
     s->sampler = request.sampler;
     s->determinism = request.determinism;
     s->max_tokens = request.max_tokens;
@@ -286,9 +323,24 @@ Status Scheduler::admit(SeqRequest request, SeqId& out_id, AdmitRejection& out_r
     if (!request.resume_key.empty() && im.checkpoints != nullptr) {
         SeqPersistState cached;
         const auto st = im.checkpoints->load(request.resume_key, s->kv, cached);
-        const bool base_prefix =
+        const bool tokens_prefix =
             st.ok() && cached.tokens.size() <= s->prompt.size() &&
             std::equal(cached.tokens.begin(), cached.tokens.end(), s->prompt.begin());
+
+        // The other half of the same proof. Token ids identify the context only
+        // while every position came from the embedding table; two different
+        // images occupy the same placeholder ids, pass the check above, and
+        // attach a cache built from a picture this request never sent.
+        //
+        // Both digests are empty for a text-only conversation, so this compares
+        // equal and costs nothing on the path that has always existed.
+        const bool media_prefix =
+            tokens_prefix &&
+            cached.media == media_digest_prefix(s->supplied.positions,
+                                                s->supplied.values,
+                                                im.model->arch.topology.d_model,
+                                                static_cast<std::uint32_t>(cached.tokens.size()));
+        const bool base_prefix = tokens_prefix && media_prefix;
         bool speculative_ok = true;
         if (base_prefix && im.cfg.enable_speculation && im.model->speculative_backend != nullptr) {
             speculative_ok = !cached.auxiliary.empty() &&
@@ -300,6 +352,10 @@ Status Scheduler::admit(SeqRequest request, SeqId& out_id, AdmitRejection& out_r
         const bool is_prefix = base_prefix && speculative_ok;
         if (is_prefix && !cached.tokens.empty()) {
             s->history = std::move(cached.tokens);
+            // Adopted, not recomputed. The chain has to CONTINUE from where the
+            // checkpoint left off, and a digest is exactly the state needed to do
+            // that — which is why it is a fold rather than a streaming hash.
+            s->media = cached.media;
             s->prompt_pos = static_cast<std::uint32_t>(s->history.size());
             // The conversation's own penalty history and draw stream come back
             // with its cache. A cross-process resume that kept only the KV would
@@ -373,6 +429,10 @@ Status Scheduler::step() {
     std::vector<Seq*> batch;
     std::vector<TokenId> tokens;
     std::vector<KvRow> rows;
+    // Borrowed pointers into each sequence's own `supplied.values`, which the
+    // Seq owns and nothing mutates during a step. Declared out here so they
+    // outlive the forward they are handed to.
+    std::vector<EmbeddingOverride> overrides;
 
     const auto want = std::min<std::size_t>(im.gate, im.ready.size());
     batch.reserve(want);
@@ -604,6 +664,17 @@ Status Scheduler::step() {
         for (std::uint32_t j = 0; j < count; ++j) {
             tokens.push_back(s->prefilling() ? s->prompt[s->prompt_pos + j] : s->next_token);
 
+            // Prefill rows only. A decode row's token was SAMPLED, so it comes
+            // from the table by definition; a supplied row there would be an
+            // image the model claimed to have generated.
+            if (s->prefilling() && !s->supplied.empty()) {
+                if (const float* row = supplied_row(
+                        s->supplied, s->prompt_pos + j, im.model->arch.topology.d_model)) {
+                    overrides.push_back(
+                        EmbeddingOverride{static_cast<std::uint32_t>(tokens.size() - 1), row});
+                }
+            }
+
             KvRow r{};
             if (s->kv.is_opaque()) {
                 r.opaque_base = s->kv.opaque_data();
@@ -636,7 +707,9 @@ Status Scheduler::step() {
         taps.layers = im.model->arch.speculative.target_layer_ids;
         taps_ptr = &taps;
     }
-    if (auto st = forward_step_f32(*im.model, tokens, rows, im.ws, im.logits, taps_ptr); !st.ok()) {
+    if (auto st = forward_step_f32(
+            *im.model, tokens, rows, im.ws, im.logits, taps_ptr, overrides);
+        !st.ok()) {
         if (im.on_error) {
             for (Seq* s : batch)
                 im.on_error(s->id, st.code(), st.message().c_str());
@@ -682,6 +755,18 @@ Status Scheduler::step() {
         // its rows without committing, and a history recorded at row-build time
         // would then claim positions the cache does not hold.
         s->history.insert(s->history.end(), tokens.begin() + first, tokens.begin() + first + count);
+        // Alongside `history` and under the same rule: after the commit, never
+        // before. `prompt_pos` still holds this step's starting position — it is
+        // advanced further down — so these are exactly the positions just cached.
+        if (s->prefilling() && !s->supplied.empty()) {
+            const auto d = im.model->arch.topology.d_model;
+            for (std::uint32_t j = 0; j < count; ++j) {
+                const auto pos = s->prompt_pos + j;
+                if (const float* row = supplied_row(s->supplied, pos, d)) {
+                    media_digest_fold(s->media, pos, std::span<const float>(row, d));
+                }
+            }
+        }
         if (speculative != nullptr && speculative->observe_target != nullptr) {
             if (const auto rc = speculative->observe_target(*im.model,
                                                             im.model->speculative_payload,
@@ -769,7 +854,10 @@ Status Scheduler::step() {
     return {};
 }
 
-Status Scheduler::extend(SeqId id, std::vector<TokenId> prompt, std::uint32_t max_tokens) {
+Status Scheduler::extend(SeqId id,
+                         std::vector<TokenId> prompt,
+                         std::uint32_t max_tokens,
+                         PromptEmbeddings embeddings) {
     auto& im = *impl_;
     std::lock_guard<std::mutex> lk(im.mu);
     if (!im.open) return {StatusCode::InvalidArgument, "scheduler is not open"};
@@ -789,6 +877,32 @@ Status Scheduler::extend(SeqId id, std::vector<TokenId> prompt, std::uint32_t ma
                 "the cached " + std::to_string(s->history.size()) +
                     " tokens are not a prefix of this prompt; cancel and admit fresh"};
     }
+    if (auto st = validate_prompt_embeddings(embeddings,
+                                             im.model->arch.topology.d_model,
+                                             static_cast<std::uint32_t>(prompt.size()));
+        !st.ok()) {
+        return st;
+    }
+    // The same check as the token prefix, over the half token ids cannot
+    // describe. A client that swapped the image in an earlier turn sends an
+    // identical token array, so without this the edit is invisible and the
+    // answer is about the picture it replaced.
+    //
+    // A hard error rather than a cold start, matching the token check directly
+    // above it: extend() is attaching to a LIVE session, and the caller's
+    // remedy — cancel and admit fresh — is the same one either mismatch needs.
+    if (const auto offered =
+            media_digest_prefix(embeddings.positions,
+                                embeddings.values,
+                                im.model->arch.topology.d_model,
+                                static_cast<std::uint32_t>(s->history.size()));
+        !(offered == s->media)) {
+        return {StatusCode::ArchMismatch,
+                "the cached " + std::to_string(s->history.size()) +
+                    " positions were built from different supplied embeddings (cached " +
+                    s->media.hex().substr(0, 12) + ", offered " + offered.hex().substr(0, 12) +
+                    "); cancel and admit fresh"};
+    }
     if (prompt.size() == s->history.size()) {
         // Nothing new to prefill. The last emitted token was sampled but never
         // fed back, so an empty extension has no row to contribute and would
@@ -803,6 +917,7 @@ Status Scheduler::extend(SeqId id, std::vector<TokenId> prompt, std::uint32_t ma
     }
 
     s->prompt = std::move(prompt);
+    s->supplied = std::move(embeddings);
     s->prompt_pos = static_cast<std::uint32_t>(s->history.size());
     s->max_tokens = max_tokens;
     s->generated = 0;
@@ -827,6 +942,7 @@ Status Scheduler::checkpoint(SeqId id, const std::string& key) {
     SeqPersistState persist;
     persist.tokens = s->history;
     persist.emitted = s->emitted;
+    persist.media = s->media;
     persist.rng_state = s->sampler.rng_state;
     if (im.cfg.enable_speculation && im.model->speculative_backend != nullptr) {
         if (auto st = im.model->speculative_backend->serialize_state(
@@ -873,6 +989,7 @@ Status Scheduler::preempt(SeqId id) {
     SeqPersistState persist;
     persist.tokens = s->history;
     persist.emitted = s->emitted;
+    persist.media = s->media;
     persist.rng_state = s->sampler.rng_state;
     if (im.cfg.enable_speculation && im.model->speculative_backend != nullptr) {
         if (auto st = im.model->speculative_backend->serialize_state(
@@ -884,6 +1001,13 @@ Status Scheduler::preempt(SeqId id) {
 
     // The KV buffer is released here — that is the entire point. Preemption that
     // keeps the memory it was called to reclaim is a no-op with extra steps.
+    //
+    // `supplied` is deliberately NOT released. Rows at positions past `prompt_pos`
+    // are still needed to prefill after a resume, and the already-cached ones
+    // could be compacted away but are not: they are a fraction of the KV this
+    // call just freed, and a compaction step whose invariant nothing exercises
+    // yet is the worse trade. Revisit when a tower makes them large in absolute
+    // terms.
     s->kv = KvCache{};
     s->speculative_state.reset();
     s->preempted = true;
@@ -915,6 +1039,16 @@ Status Scheduler::resume(SeqId id) {
     }
     SeqPersistState restored;
     if (auto st = im.checkpoints->load(checkpoint_key(id), s->kv, restored); !st.ok()) return st;
+    // The sequence never left memory, so this cannot disagree with what preempt()
+    // wrote unless the file under this key belongs to a different sequence.
+    // Checked rather than assumed: that is a store-level fault, and inheriting
+    // someone else's context is the failure this whole field exists to catch.
+    if (!(restored.media == s->media)) {
+        return {StatusCode::ArchMismatch,
+                "checkpoint " + checkpoint_key(id) + " was built from different supplied "
+                "embeddings (" + restored.media.hex().substr(0, 12) + " != " +
+                    s->media.hex().substr(0, 12) + ")"};
+    }
     s->history = std::move(restored.tokens);
     s->emitted = std::move(restored.emitted);
     // Only the stream position is restored — the sampling PARAMETERS stay as the

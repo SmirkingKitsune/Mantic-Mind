@@ -641,12 +641,30 @@ void build_expert_union(std::uint32_t n_rows,
                         const float* weights,
                         F32Workspace& ws);
 
+/// A pre-computed hidden-state row that REPLACES the embedding-table lookup at
+/// one row of this forward.
+///
+/// The row's token id is still gathered and bounds-checked first, and the
+/// override is written over the result. That ordering is not incidental: the
+/// architecture backends' begin-forward hook receives the token array, so an
+/// image position has to carry a REAL placeholder id rather than a sentinel the
+/// hook would have to learn about.
+///
+/// `values` is borrowed for the duration of the call — d_model floats owned by
+/// the caller. One forward's overrides are a contiguous batch-local view, which
+/// is why this is a pointer rather than a container.
+struct EmbeddingOverride {
+    std::uint32_t row = 0;         ///< index into this call's `tokens` span
+    const float* values = nullptr; ///< d_model floats
+};
+
 /// Teacher-forced forward over the whole sequence.
 /// out_logits is resized to [n_tokens * vocab_size].
 Status forward_f32(const F32Model& model,
                    std::span<const TokenId> tokens,
                    F32Workspace& ws,
-                   std::vector<float>& out_logits);
+                   std::vector<float>& out_logits,
+                   std::span<const EmbeddingOverride> overrides = {});
 
 /// One step of a RAGGED BATCH: `n_rows` rows, each from a possibly different
 /// sequence, each carrying its own KV cache and absolute position.
@@ -663,7 +681,8 @@ Status forward_step_f32(const F32Model& model,
                         std::span<const KvRow> rows,
                         F32Workspace& ws,
                         std::vector<float>& out_logits,
-                        HiddenStateTaps* taps = nullptr);
+                        HiddenStateTaps* taps = nullptr,
+                        std::span<const EmbeddingOverride> overrides = {});
 
 /// Greedy continuation from `prefix`, recomputing the full prefix each step.
 Status generate_greedy_f32(const F32Model& model,

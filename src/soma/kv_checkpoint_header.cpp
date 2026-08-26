@@ -69,7 +69,25 @@ struct Cursor {
         at += len;
         return s;
     }
+
+    void raw(std::uint8_t* out, std::size_t count) {
+        if (at + count > n) {
+            ok = false;
+            return;
+        }
+        for (std::size_t i = 0; i < count; ++i)
+            out[i] = static_cast<std::uint8_t>(p[at + i]);
+        at += count;
+    }
 };
+
+std::string hex32(std::uint32_t v) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string s = "0x";
+    for (int i = 7; i >= 0; --i)
+        s.push_back(kHex[(v >> (4 * i)) & 0xF]);
+    return s;
+}
 
 } // namespace
 
@@ -93,17 +111,51 @@ parse_kv_checkpoint_header(const std::byte* data, std::size_t size, KvCheckpoint
     out.written_at_ms = c.u64();
     out.rng_state = c.u64();
     out.n_emitted = c.u32();
-    if (out.version == kKvCheckpointVersionSpeculative) out.auxiliary_bytes = c.u64();
+    // Before the version gate: a file too short to hold the fixed fields has a
+    // version of 0 by truncation, and "unsupported checkpoint version 0" names
+    // the wrong fault.
     if (!c.ok) return {StatusCode::InvalidArgument, "truncated KV checkpoint header"};
 
-    // Checked HERE rather than only in the store's gate, because the node reads
+    // The version gate comes BEFORE the variable fields, not after. Reading a
+    // flags word out of a v4 file's auxiliary extent, or an extent out of a v3
+    // file's token array, is how a version check that ran last would let a
+    // rejected file still corrupt every offset it computed on the way there.
+    //
+    // Checked here rather than only in the store's gate, because the node reads
     // this header without a store and must not interpret a v1 layout — where the
     // payload starts immediately and the token array does not exist — as a v2
     // one. Every offset below would be wrong by 4 x length_tokens.
-    if (out.version != kKvCheckpointVersion && out.version != kKvCheckpointVersionSpeculative) {
+    if (out.version != kKvCheckpointVersion &&
+        out.version != kKvCheckpointVersionSpeculative &&
+        out.version != kKvCheckpointVersionSampler) {
         return {StatusCode::VersionMismatch,
                 "unsupported checkpoint version " + std::to_string(out.version)};
     }
+
+    // v3 and v4 predate the flags word. Synthesising theirs here is what lets
+    // every reader below — and every caller — branch on flags alone rather than
+    // re-deriving the layout from the version a second time.
+    if (out.version == kKvCheckpointVersionSampler) {
+        out.flags = 0;
+    } else if (out.version == kKvCheckpointVersionSpeculative) {
+        out.flags = kKvFlagAuxiliary;
+        out.auxiliary_bytes = c.u64();
+    } else {
+        out.flags = c.u32();
+        if ((out.flags & ~kKvFlagsKnown) != 0) {
+            // Written by a newer build. Every field after this word is at an
+            // offset derived from it, so this is not a field to skip — it is the
+            // whole rest of the file.
+            return {StatusCode::VersionMismatch,
+                    "checkpoint carries unknown header flags " +
+                        hex32(out.flags & ~kKvFlagsKnown)};
+        }
+        if ((out.flags & kKvFlagAuxiliary) != 0) out.auxiliary_bytes = c.u64();
+        if ((out.flags & kKvFlagMedia) != 0) {
+            c.raw(out.media_digest.bytes.data(), out.media_digest.bytes.size());
+        }
+    }
+    if (!c.ok) return {StatusCode::InvalidArgument, "truncated KV checkpoint header"};
 
     // Arithmetic, not consumed: stat() reads a bounded prefix and the token
     // arrays of a full context do not fit in it.

@@ -12,6 +12,7 @@
 // Decode rows and prefill rows are just rows.
 
 #include "soma/f32_model.hpp"
+#include "soma/media_digest.hpp"
 #include "soma/model.hpp"
 #include "soma/types.hpp"
 
@@ -59,6 +60,16 @@ enum class AdmitRejection : std::uint8_t {
 
 struct SeqRequest {
     std::vector<TokenId> prompt;
+
+    /// Optional: hidden-state rows supplied for specific prompt positions,
+    /// replacing the embedding-table lookup there.
+    ///
+    /// The positions still carry real token ids in `prompt` — a placeholder the
+    /// model's own template emits — so nothing downstream needs to learn about
+    /// this. What DOES change is that the token array alone no longer identifies
+    /// the context, which is why a checkpoint records a digest of these rows and
+    /// `resume_key` is checked against both. See media_digest.hpp.
+    PromptEmbeddings embeddings;
     SamplerState sampler{};
     Determinism determinism = Determinism::Batched;
     std::uint32_t max_tokens = 0;
@@ -72,6 +83,11 @@ struct SeqRequest {
     /// error — it is a cold start with a log line — because the alternative,
     /// attaching a cache that belongs to different tokens, produces fluent
     /// output about a context nobody supplied and nothing detects it.
+    ///
+    /// It carries a digest of any SUPPLIED EMBEDDINGS over those same positions
+    /// for the identical reason, one level down: two different images produce
+    /// the same token ids, so the ids alone would wave through a cache built
+    /// from a picture this request never sent.
     std::string resume_key;
 };
 
@@ -188,7 +204,14 @@ public:
     /// edits earlier turns gets a correct cold start rather than a warm cache
     /// describing a conversation that no longer exists. Returns ArchMismatch on
     /// that check, and the caller's remedy is to cancel() and admit() fresh.
-    Status extend(SeqId id, std::vector<TokenId> prompt, std::uint32_t max_tokens);
+    ///
+    /// `embeddings` describes the WHOLE new prompt, cached prefix included — not
+    /// just the extension. The cached prefix is what gets checked, and a caller
+    /// that passed only the suffix would be asking to skip the check.
+    Status extend(SeqId id,
+                  std::vector<TokenId> prompt,
+                  std::uint32_t max_tokens,
+                  PromptEmbeddings embeddings = {});
 
     /// Persist a sequence WITHOUT releasing it — the node's suspend path.
     ///

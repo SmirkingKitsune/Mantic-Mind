@@ -100,7 +100,8 @@ int main(int argc, char** argv) {
     }
 
     // A speculative backend owns additional per-sequence state.  Its presence
-    // selects v4 without changing the byte layout of ordinary v3 checkpoints.
+    // now sets a FLAG rather than selecting a version: v5 collapsed the
+    // version-per-variant scheme, so the assertion moved with it.
     {
         soma::KvCache written, restored;
         check(written.open(model.arch, 8).ok() && restored.open(model.arch, 8).ok(),
@@ -108,16 +109,22 @@ int main(int argc, char** argv) {
         soma::SeqPersistState state;
         state.auxiliary = {std::byte{0x11}, std::byte{0x00}, std::byte{0x7f}, std::byte{0xa5}};
         check(store.save("auxiliary-v4", written, state).ok(),
-              "backend state selects checkpoint v4");
+              "backend state sets the auxiliary flag");
         soma::KvCheckpointHeader header;
         check(store.stat("auxiliary-v4", header).ok() &&
-                  header.version == soma::kKvCheckpointVersionSpeculative &&
+                  header.version == soma::kKvCheckpointVersion &&
+                  (header.flags & soma::kKvFlagAuxiliary) != 0 &&
                   header.auxiliary_bytes == state.auxiliary.size(),
-              "v4 header records exact auxiliary extent");
+              "header records exact auxiliary extent");
+        // The other bit stays CLEAR. A flags word whose bits were not
+        // independent would make "no media" and "no backend state" the same
+        // condition, which is exactly what the version scheme did wrong.
+        check((header.flags & soma::kKvFlagMedia) == 0 && header.media_digest.empty(),
+              "a text-only checkpoint sets no media flag");
         soma::SeqPersistState loaded;
         check(store.load("auxiliary-v4", restored, loaded).ok() &&
                   loaded.auxiliary == state.auxiliary,
-              "v4 auxiliary state round-trips byte-exactly");
+              "auxiliary state round-trips byte-exactly");
         (void)store.remove("auxiliary-v4");
     }
 

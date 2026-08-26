@@ -45,6 +45,11 @@ void put_str(std::vector<std::byte>& b, const std::string& s) {
         b.push_back(static_cast<std::byte>(c));
 }
 
+void put_raw(std::vector<std::byte>& b, const std::uint8_t* p, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i)
+        b.push_back(static_cast<std::byte>(p[i]));
+}
+
 // The reading half of this codec lives in kv_checkpoint_header.cpp. Writing
 // stays here because only the store writes; the node only ever reads.
 
@@ -90,7 +95,9 @@ struct KvCheckpointStore::Impl {
     }
 
     Status gate(const KvCheckpointHeader& h) const {
-        if (h.version != kKvCheckpointVersion && h.version != kKvCheckpointVersionSpeculative) {
+        if (h.version != kKvCheckpointVersion &&
+            h.version != kKvCheckpointVersionSpeculative &&
+            h.version != kKvCheckpointVersionSampler) {
             return {StatusCode::VersionMismatch,
                     "unsupported checkpoint version " + std::to_string(h.version)};
         }
@@ -187,9 +194,13 @@ KvCheckpointStore::save(const std::string& key, const KvCache& kv, const SeqPers
     buf.reserve(static_cast<std::size_t>(cache_payload_bytes) + 256);
     for (const char c : kMagic)
         buf.push_back(static_cast<std::byte>(c));
-    const auto version =
-        state.auxiliary.empty() ? kKvCheckpointVersion : kKvCheckpointVersionSpeculative;
-    put_u32(buf, version);
+    // One version, always the current one. What varies is the FLAGS word — see
+    // kv_checkpoint.hpp for why the two optional fields stopped being two
+    // version numbers.
+    const std::uint32_t flags =
+        (state.auxiliary.empty() ? 0u : kKvFlagAuxiliary) |
+        (state.media.empty() ? 0u : kKvFlagMedia);
+    put_u32(buf, kKvCheckpointVersion);
     put_str(buf, im.arch.arch_hash);
     put_u32(buf, im.format_id);
     put_u32(buf, len);
@@ -200,8 +211,14 @@ KvCheckpointStore::save(const std::string& key, const KvCache& kv, const SeqPers
     // draw it was on rather than starting a fresh one.
     put_u64(buf, state.rng_state);
     put_u32(buf, static_cast<std::uint32_t>(state.emitted.size()));
-    if (version == kKvCheckpointVersionSpeculative)
+    put_u32(buf, flags);
+    if ((flags & kKvFlagAuxiliary) != 0)
         put_u64(buf, static_cast<std::uint64_t>(state.auxiliary.size()));
+    // v5: what the cached positions were built from beyond their token ids. A
+    // text-only sequence sets no bit and writes no bytes, so the ONLY cost of
+    // this field is borne by the checkpoints that need it.
+    if ((flags & kKvFlagMedia) != 0)
+        put_raw(buf, state.media.bytes.data(), state.media.bytes.size());
     // v2: the ids occupying the cached positions, so a restore can be CHECKED
     // against the prompt it is attached to rather than trusted.
     for (const auto t : state.tokens)
@@ -279,6 +296,10 @@ Status KvCheckpointStore::load(const std::string& key, KvCache& kv, SeqPersistSt
     out.tokens = read_ids(h.tokens_at, h.length_tokens);
     out.emitted = read_ids(h.emitted_at, h.n_emitted);
     out.rng_state = h.rng_state;
+    // Returned, never enforced here. The store cannot know what media the
+    // caller is about to attach this cache to — admit() and extend() can, and
+    // they are where the comparison belongs.
+    out.media = h.media_digest;
     if (h.auxiliary_bytes > 0) {
         if (h.auxiliary_at > raw.size() || h.auxiliary_bytes > raw.size() - h.auxiliary_at) {
             return {StatusCode::InvalidArgument, "checkpoint auxiliary state is truncated"};

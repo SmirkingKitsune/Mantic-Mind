@@ -24,6 +24,7 @@ set(SOMA_CORE_HEADERS
     soma/kernels.hpp
     soma/scheduler.hpp
     soma/kv_checkpoint.hpp
+    soma/media_digest.hpp
     soma/conformance.hpp
     soma/tokenizer.hpp
     soma/plan.hpp
@@ -78,6 +79,7 @@ set(MM_SOMA_SOURCES
     memory_hierarchy.cpp
     f32_model.cpp
     kv_checkpoint.cpp
+    media_digest.cpp
     telemetry.cpp
     kv_checkpoint_header.cpp   # standalone codec; the node links this object alone
     routing.cpp
@@ -521,6 +523,22 @@ if(BUILD_TESTING)
              COMMAND soma_checkpoint_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "GLM-5.2")
     add_test(NAME soma_checkpoint_v4_g3
              COMMAND soma_checkpoint_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "DeepSeek-V4-Pro-0813")
+
+    # ── G3 supplied embeddings, and the prefix check that survives them ───
+    # A cache must not attach to a prompt whose supplied rows differ from the ones
+    # that built it, even when every token id matches. Registered across families
+    # because the forward equality it asserts holds only where nothing downstream
+    # of the embedding reads the token id — which is the property that lets an
+    # image position keep a real placeholder id, and is worth failing loudly if it
+    # ever stops being true.
+    add_executable(soma_media_prefix_g3
+                   ${CMAKE_SOURCE_DIR}/tests/soma/media_prefix_g3.cpp)
+    target_link_libraries(soma_media_prefix_g3 PRIVATE mm_soma)
+
+    add_test(NAME soma_media_prefix_g3
+             COMMAND soma_media_prefix_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures")
+    add_test(NAME soma_media_prefix_mla_g3
+             COMMAND soma_media_prefix_g3 "${CMAKE_SOURCE_DIR}/tests/fixtures" "DeepSeek-V2-Lite")
 
     # ── G4 target-verified speculative decoding ──────────────────────────────
     # Every possible draft acceptance prefix must reproduce the exact ordinary
