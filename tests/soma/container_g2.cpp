@@ -23,6 +23,7 @@
 #include "soma/serve.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>

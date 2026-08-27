@@ -33,10 +33,6 @@ namespace {
 /// stops being used loses its pin rather than holding it forever.
 constexpr float kHeatDecay = 0.995f;
 
-std::uint64_t slot_key(LayerIndex layer, ExpertId expert) noexcept {
-    return (static_cast<std::uint64_t>(layer) << 32) | expert;
-}
-
 } // namespace
 
 struct MemoryHierarchy::Impl {

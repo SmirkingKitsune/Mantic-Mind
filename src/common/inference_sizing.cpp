@@ -19,7 +19,6 @@ namespace mm {
 namespace {
 
 constexpr int64_t kFallbackModelMb = 2048;
-constexpr int64_t kMiB = 1024 * 1024;
 
 bool arg_matches_flag(const std::string& raw, const std::string& flag) {
     const std::string arg = mm::util::trim(raw);

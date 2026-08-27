@@ -624,32 +624,10 @@ nlohmann::json openai_model_entry(const AgentConfig& cfg) {
     };
 }
 
-nlohmann::json mantic_model_entry(const AgentConfig& cfg) {
-    return nlohmann::json{
-        {"id", openai_agent_model_id(cfg)},
-        {"agent_id", cfg.id},
-        {"agent_name", cfg.name},
-        {"inference_backend", agent_backend(cfg)},
-        {"model_path", cfg.model_path},
-        {"vision_enabled", cfg.vision_settings.enabled},
-        {"served_model_name", cfg.served_model_name},
-        {"api_base_url", agent_uses_api_backend(cfg) ? cfg.api_settings.base_url : ""}
-    };
-}
-
 nlohmann::json openai_model_list(const std::vector<AgentConfig>& configs) {
     nlohmann::json data = nlohmann::json::array();
     for (const auto& cfg : configs) data.push_back(openai_model_entry(cfg));
     return nlohmann::json{{"object", "list"}, {"data", data}};
-}
-
-nlohmann::json mantic_model_list(const std::vector<AgentConfig>& configs) {
-    nlohmann::json data = nlohmann::json::array();
-    for (const auto& cfg : configs) data.push_back(mantic_model_entry(cfg));
-    return nlohmann::json{
-        {"models", data},
-        {"openai_compat_note", "Use agent:{agent_id} as the OpenAI model id."}
-    };
 }
 
 std::optional<AgentConfig> resolve_openai_agent_model(AgentManager& agents,

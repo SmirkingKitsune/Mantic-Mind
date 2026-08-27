@@ -36,6 +36,20 @@ namespace fs = std::filesystem;
 
 namespace {
 
+#if !defined(_WIN32)
+std::string posix_shell_quote(const std::string& value) {
+    std::string out = "'";
+    for (const char c : value) {
+        if (c == '\'')
+            out += "'\\''";
+        else
+            out += c;
+    }
+    out += '\'';
+    return out;
+}
+#endif
+
 std::uint64_t digest(const std::vector<float>& v) {
     std::uint64_t h = 1469598103934665603ull;
     const auto* p = reinterpret_cast<const unsigned char*>(v.data());
@@ -102,7 +116,12 @@ std::string run_child(const std::string& exe, const fs::path& root, const std::s
     setenv("SOMA_PREFETCH_DEPTH", prefetch, 1);
 #endif
     std::ostringstream cmd;
+#if defined(_WIN32)
     cmd << "\"\"" << exe << "\" \"" << root.string() << "\" " << name << " --emit\"";
+#else
+    cmd << posix_shell_quote(exe) << ' ' << posix_shell_quote(root.string()) << ' '
+        << posix_shell_quote(name) << " --emit";
+#endif
 
     std::string out;
 #if defined(_WIN32)

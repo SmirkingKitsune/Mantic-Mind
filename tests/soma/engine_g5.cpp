@@ -423,7 +423,8 @@ int main(int argc, char** argv) {
 #else
         const std::string cmd = "kill -9 " + std::to_string(victim) + " >/dev/null 2>&1";
 #endif
-        (void)std::system(cmd.c_str());
+        const int kill_rc = std::system(cmd.c_str());
+        check(kill_rc == 0, "child termination command succeeded", std::to_string(kill_rc));
 
         // Bounded wait: a watchdog that eventually notices is not a watchdog.
         bool noticed = false;
@@ -557,16 +558,20 @@ int main(int argc, char** argv) {
         // Kill it the way the OS would: find the child by the port the supervisor
         // assigned, since the supervisor owns the EngineProcess and the test does
         // not.
+        int kill_rc = 0;
 #if defined(_WIN32)
         const std::string cmd =
             "for /f \"tokens=5\" %a in ('netstat -ano ^| findstr :" + std::to_string(port) +
             " ^| findstr LISTENING') do @taskkill /F /PID %a >nul 2>&1";
-        (void)std::system(("cmd /c \"" + cmd + "\"").c_str());
+        kill_rc = std::system(("cmd /c \"" + cmd + "\"").c_str());
 #else
         const std::string cmd =
             "kill -9 $(lsof -ti tcp:" + std::to_string(port) + ") >/dev/null 2>&1";
-        (void)std::system(cmd.c_str());
+        kill_rc = std::system(cmd.c_str());
 #endif
+        check(kill_rc == 0,
+              "supervised child termination command succeeded",
+              std::to_string(kill_rc));
 
         bool noticed = false;
         for (int i = 0; i < 60 && !noticed; ++i) {

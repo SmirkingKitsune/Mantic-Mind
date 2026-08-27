@@ -21,3 +21,6 @@ CMakeLists.txt text eol=lf
 *.safetensors binary
 *.npz         binary
 *.gguf        binary
+
+# The DSML golden is compared byte-for-byte and upstream records LF bytes.
+tests/fixtures/dsml/encoding/tests/*.txt text eol=lf

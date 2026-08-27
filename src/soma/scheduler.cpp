@@ -28,6 +28,7 @@
 #include "soma/sampler.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <deque>
 #include <mutex>
 #include <unordered_map>
@@ -728,7 +729,7 @@ Status Scheduler::step() {
     // contract in the presence of NaNs. Validate the rows that can actually be
     // sampled before committing any sequence state, so the caller receives an
     // explicit model-execution failure and can discard the launch.
-    for (const auto [first, count] : span) {
+    for (const auto& [first, count] : span) {
         const float* lg = im.logits.data() + static_cast<std::size_t>(first + count - 1) * vocab;
         if (logits_are_finite(std::span<const float>(lg, vocab))) continue;
 

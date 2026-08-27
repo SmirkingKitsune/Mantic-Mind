@@ -67,17 +67,6 @@ Status bind_tensor(const SafeTensors& st, const std::string& name, std::span<con
     return {};
 }
 
-Status
-bind_tensor_optional(const SafeTensors& st, const std::string& name, std::span<const float>& out) {
-    if (const TensorView* tv = st.find(name); tv != nullptr) {
-        if (tv->dtype != DType::F32) {
-            return {StatusCode::Unsupported, name + " is not fp32"};
-        }
-        out = tv->f32();
-    }
-    return {};
-}
-
 Status bind_weight_view(const TensorView& tv,
                         const std::string& name,
                         const QuantSpec& spec,

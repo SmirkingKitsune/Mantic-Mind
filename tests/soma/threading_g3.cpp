@@ -34,6 +34,20 @@ namespace fs = std::filesystem;
 
 namespace {
 
+#if !defined(_WIN32)
+std::string posix_shell_quote(const std::string& value) {
+    std::string out = "'";
+    for (const char c : value) {
+        if (c == '\'')
+            out += "'\\''";
+        else
+            out += c;
+    }
+    out += '\'';
+    return out;
+}
+#endif
+
 /// FNV-1a over the raw logit bytes. A hash rather than a tolerance, because the
 /// claim is bit-identity: a comparison with any epsilon at all would pass on
 /// precisely the drift this exists to detect.
@@ -82,7 +96,12 @@ std::string run_child(const std::string& exe, const fs::path& root,
     setenv("SOMA_THREADS", threads.c_str(), 1);
 #endif
     std::ostringstream cmd;
+#if defined(_WIN32)
     cmd << "\"\"" << exe << "\" \"" << root.string() << "\" " << name << " --emit\"";
+#else
+    cmd << posix_shell_quote(exe) << ' ' << posix_shell_quote(root.string()) << ' '
+        << posix_shell_quote(name) << " --emit";
+#endif
 
     std::string out;
     FILE* p =

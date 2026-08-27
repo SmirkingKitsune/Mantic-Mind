@@ -32,7 +32,6 @@ namespace soma {
 namespace {
 
 constexpr char kMagic[8] = {'S', 'O', 'M', 'A', 'T', 'O', 'K', '\0'};
-constexpr std::uint32_t kFlagNfc = 1u << 0;
 constexpr std::uint32_t kFlagAddPrefixSpace = 1u << 2;
 constexpr std::uint32_t kInf = 0xFFFFFFFFu;
 
@@ -430,9 +429,10 @@ Status CompiledTokenizer::encode(std::string_view text, std::vector<TokenId>& ou
     if ((impl_->flags & kFlagAddPrefixSpace) != 0 && !work.empty() && work[0] != ' ') {
         work.insert(work.begin(), ' ');
     }
-    // NFC (kFlagNfc) is intentionally not applied — see the file header. The
-    // compiler guarantees the calibration corpus is NFC-stable and reports what
-    // it dropped, so this is a stated limitation rather than a silent one.
+    // NFC (the tokenizer format's bit-0 normalization flag) is intentionally not
+    // applied — see the file header. The compiler guarantees the calibration corpus
+    // is NFC-stable and reports what it dropped, so this is a stated limitation
+    // rather than a silent one.
 
     std::vector<std::string> chunks;
 

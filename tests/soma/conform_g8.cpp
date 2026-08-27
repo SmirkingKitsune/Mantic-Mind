@@ -36,6 +36,20 @@ namespace {
 
 int g_failures = 0;
 
+#if !defined(_WIN32)
+std::string posix_shell_quote(const std::string& value) {
+    std::string out = "'";
+    for (const char c : value) {
+        if (c == '\'')
+            out += "'\\''";
+        else
+            out += c;
+    }
+    out += '\'';
+    return out;
+}
+#endif
+
 void check(bool ok, const std::string& what, const std::string& detail = {}) {
     std::cout << "   " << std::left << std::setw(58) << what << (ok ? "OK" : "FAIL");
     if (!detail.empty()) std::cout << "   " << detail;
@@ -46,8 +60,14 @@ void check(bool ok, const std::string& what, const std::string& detail = {}) {
 /// Run `soma conform --json` and parse it. Returns a null json on failure.
 json conform(const std::string& exe, const std::string& dir, int& out_rc) {
     const auto tmp = fs::temp_directory_path() / "soma_conform_g8.json";
+#if defined(_WIN32)
     const std::string cmd =
         "\"\"" + exe + "\" conform --model-dir \"" + dir + "\" --json > \"" + tmp.string() + "\"\"";
+#else
+    const std::string cmd = posix_shell_quote(exe) + " conform --model-dir " +
+                            posix_shell_quote(dir) + " --json > " +
+                            posix_shell_quote(tmp.string());
+#endif
     out_rc = std::system(cmd.c_str());
     std::ifstream in(tmp, std::ios::binary);
     if (!in) return {};
