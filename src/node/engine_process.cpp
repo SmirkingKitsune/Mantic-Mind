@@ -99,6 +99,28 @@ struct EngineProcess::Impl {
 #endif
     }
 
+    /// During startup there is no watchdog waiting on the child yet, so POSIX
+    /// must reap a terminated child here. `kill(pid, 0)` alone reports a zombie
+    /// as alive and would make a startup error consume the entire readiness
+    /// budget (plus the shutdown grace period).
+    bool startup_child_alive() {
+#if defined(_WIN32)
+        return child_alive();
+#else
+        if (pid <= 0) return false;
+        int status = 0;
+        const pid_t result = ::waitpid(pid, &status, WNOHANG);
+        if (result == 0) return true;
+        if (result == pid) {
+            pid = 0;
+            return false;
+        }
+        // A transient interruption does not prove that the child exited. For
+        // any other error, retain the existing liveness probe as a fallback.
+        return ::kill(pid, 0) == 0;
+#endif
+    }
+
     void reap_and_notify() {
         int code = -1;
 #if defined(_WIN32)
@@ -265,7 +287,7 @@ bool EngineProcess::start(const EngineLaunchSpec& spec) {
     bool ready = false;
     if (spec.readiness.kind == ReadinessProbe::Kind::HttpHealth) {
         ready = poll_http_ready("127.0.0.1", spec.port, spec.readiness.http_path, budget, [&] {
-            return im.child_alive();
+            return im.startup_child_alive();
         });
     } else {
         // The stdout-sentinel path is declared in the header for engines that

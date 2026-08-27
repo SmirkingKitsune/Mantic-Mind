@@ -32,8 +32,12 @@ from pathlib import Path
 # add_test(NAME foo COMMAND ...) — the form every CMakeLists here uses.
 DECLARED = re.compile(r"add_test\s*\(\s*NAME\s+([A-Za-z0-9_.\-]+)")
 
-# add_test("foo" "exe" ...) — what CMake generates.
-REGISTERED = re.compile(r'^\s*add_test\s*\(\s*"([^"]+)"')
+# Depending on the generator, CMake writes either add_test("foo" ...) or its
+# bracket-quoted equivalent add_test([=[foo]=] ...). Ubuntu's single-config
+# generators use the latter while Visual Studio uses the former.
+REGISTERED = re.compile(
+    r'^\s*add_test\s*\(\s*(?:"([^"]+)"|\[(=*)\[([A-Za-z0-9_.\-]+)\]\2\])'
+)
 
 
 def declared_tests(source: Path) -> dict[str, Path]:
@@ -63,7 +67,7 @@ def registered_tests(build: Path) -> set[str]:
         for line in text.splitlines():
             m = REGISTERED.match(line)
             if m:
-                out.add(m.group(1))
+                out.add(m.group(1) or m.group(3))
     return out
 
 
