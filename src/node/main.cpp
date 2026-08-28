@@ -1013,8 +1013,14 @@ int main(int argc, char** argv) {
     // Applying a config is what moves conformance; this mirrors the state the
     // TUI and the status route read.
     auto apply_engine_config = [&](const mm::ClusterEngineConfig& cluster_cfg) {
+        // The manager owns the version gate, so NodeState follows its verdict
+        // rather than reaching its own. Setting NodeState first was a second
+        // copy of the ordering bug: a stale push the manager refused still
+        // landed in the TUI, which then displayed a config version the node was
+        // deliberately not running.
+        if (!engine_manager.apply_async(cluster_cfg)) return false;
         state.set_engine_config(cluster_cfg);
-        engine_manager.apply_async(cluster_cfg);
+        return true;
     };
 
     auto refresh_llama_state = [&]() -> mm::LlamaRuntimeStatus {
@@ -1409,8 +1415,26 @@ int main(int argc, char** argv) {
 
     broadcaster.stop();
 
+    // Cancel, join the listener, drain, THEN tear down. The order is the point,
+    // and cancellation has to come FIRST.
+    //
+    // cpp-httplib ends listen() by joining its handler pool, and the handler for
+    // /api/node/infer does not return until its SSE content provider does — which
+    // waits on the background generation. So api_thread.join() is already
+    // blocked on inference finishing. Cancelling AFTER it (as this did on the
+    // first pass) is code a stalled generation never lets you reach: the node
+    // hangs on shutdown forever, holding the very engines that would have
+    // unblocked it.
+    //
+    // Killing the engine children first fails whatever is in flight in about as
+    // long as a socket takes to close. The handler then completes, listen()
+    // returns, and drain_workers() joins the generation threads while NodeState
+    // and EngineSupervisor are still alive. unload_all() destroys the records
+    // last, further down.
     api_server.stop();
+    engines.stop_processes();
     if (api_thread.joinable()) api_thread.join();
+    api_server.drain_workers();
 
     stop_model_housekeeping = true;
     if (model_housekeeping_thread.joinable()) model_housekeeping_thread.join();
@@ -1433,20 +1457,8 @@ int main(int argc, char** argv) {
 
     state.stop_metrics_poll();
 
-    // Cancel, drain, THEN tear down — in that order, and the order is the point.
-    //
-    // /api/node/infer runs its generation on a thread that captures the api
-    // server, writes into NodeState and holds a lease into EngineSupervisor.
-    // Killing the engine children first fails whatever is in flight in about as
-    // long as a socket takes to close; draining then joins those threads while
-    // the objects they touch are still alive; only then is it safe to destroy
-    // the engine records and return from main.
-    //
-    // Reversing any two of these is the bug this replaces: shutdown used to stop
-    // the listener, unload every engine, and return, while a detached worker was
-    // still streaming through a freed EngineClient.
-    engines.stop_processes();
-    api_server.drain_workers();
+    // Safe now: every inference worker was joined above, so nothing is still
+    // calling through an EngineClient this destroys.
     engines.unload_all();
 
     // With all slots down nothing is in use; drop every unpinned model so the

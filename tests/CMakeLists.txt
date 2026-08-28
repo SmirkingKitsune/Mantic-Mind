@@ -31,6 +31,8 @@ add_executable(mm_reliability_tests
     ${CMAKE_SOURCE_DIR}/src/node/llama_cpp_provisioner.cpp
     ${CMAKE_SOURCE_DIR}/src/node/engine_provisioner.cpp
     ${CMAKE_SOURCE_DIR}/src/node/engine_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/node/node_api_server.cpp
+    ${CMAKE_SOURCE_DIR}/src/node/model_store.cpp
     ${CMAKE_SOURCE_DIR}/src/node/node_state.cpp
     ${CMAKE_SOURCE_DIR}/src/node/node_modal.cpp
     ${CMAKE_SOURCE_DIR}/src/node/ray_orchestration.cpp

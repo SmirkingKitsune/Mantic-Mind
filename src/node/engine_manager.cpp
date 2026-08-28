@@ -4,8 +4,10 @@
 #include "common/util.hpp"
 
 #include <atomic>
+#include <cstdint>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 namespace mm {
@@ -40,7 +42,22 @@ struct NodeEngineManager::Impl {
     EngineProvisioner::CancelCheck cancel_check;
     EngineResolvedCallback resolved_cb;
 
+    /// ONE worker, and at most one configuration waiting for it.
+    ///
+    /// A thread per push chained by joins was bounded only by how often control
+    /// pushed — every thirty seconds, for as long as a source build ran — and
+    /// each link replayed provisioning that the link before it had just done.
+    /// Coalescing makes the queue depth a property of the work rather than of
+    /// the poll interval: whatever is newest is what gets applied next.
     std::thread worker;
+    bool worker_active = false;
+    std::optional<ClusterEngineConfig> pending;
+
+    /// Highest version accepted OR queued. Configuration is monotonic and
+    /// master-assigned, so anything below this is a stale duplicate that must
+    /// not be allowed to overwrite what superseded it.
+    std::uint32_t highest_version = 0;
+
     std::atomic<bool> stopping{false};
 
     EngineProvisioner* find(const std::string& id) const {
@@ -78,6 +95,11 @@ void NodeEngineManager::shutdown() {
     std::thread worker;
     {
         std::lock_guard<std::mutex> g(impl_->mutex);
+        // Dropped, not drained. The worker checks `stopping` too, but clearing
+        // the queue here closes the window where it has already tested
+        // `pending` and is about to start one more provisioning pass that
+        // nobody will use.
+        impl_->pending.reset();
         worker = std::move(impl_->worker);
     }
     if (worker.joinable()) worker.join();
@@ -253,62 +275,96 @@ void NodeEngineManager::apply(const ClusterEngineConfig& cfg) {
     impl_->applying.store(false);
 }
 
-void NodeEngineManager::apply_async(const ClusterEngineConfig& cfg) {
-    // The whole handoff is one critical section. It used to be two — take the
-    // old worker under the lock, release, build the new one, retake the lock to
-    // store it — and two concurrent pushes could both find the slot already
-    // emptied by the other. The second store then move-assigned onto a JOINABLE
-    // thread, which is std::terminate: the node does not log, does not unload
-    // its engines, and simply vanishes while control reads the config as
-    // accepted. POST /api/node/engine-config is served from cpp-httplib's
-    // thread pool and control re-pushes on every stale health poll (plus
-    // /v1/cluster/engines/resync), so two in flight at once is a normal
-    // Tuesday, not a stress test.
+bool NodeEngineManager::apply_async(const ClusterEngineConfig& cfg) {
+    std::lock_guard<std::mutex> g(impl_->mutex);
+
+    // ── the version gate ─────────────────────────────────────────────────────
     //
-    // Constructing the thread under the lock is safe: construction does not
-    // wait for the thread body, and the body's own first lock simply blocks
-    // for the remainder of this function.
-    std::lock_guard<std::mutex> handoff(impl_->mutex);
+    // Versions are assigned by the master and only ever go up, so "newest wins"
+    // is a property of the CONFIG and not of the network. Ordering by arrival
+    // ordered by nothing: two pushes race, the thread pool hands them over in
+    // whichever order, and a delayed v3 landing after v5 used to overwrite it —
+    // leaving the node running an engine policy the cluster had already
+    // replaced, and reporting v3 as the version it was on.
+    //
+    // Strictly older is rejected; EQUAL is not. A resync re-pushing the same
+    // version to a node whose apply failed is the retry path, and refusing it
+    // would turn the recovery mechanism into a no-op.
+    if (cfg.version < impl_->highest_version) {
+        MM_WARN("Ignoring stale engine config v{}: v{} is already accepted or queued",
+                cfg.version, impl_->highest_version);
+        return false;
+    }
+    impl_->highest_version = cfg.version;
+
+    // ── the queue ────────────────────────────────────────────────────────────
+    //
+    // One slot, overwritten rather than appended. What is waiting is always the
+    // newest thing that arrived, because applying anything else would be
+    // applying a configuration already known to be superseded.
+    impl_->pending = cfg;
+
+    // A live worker will drain it on its next lap. This is what keeps the push
+    // rate off the thread count: control re-pushes on every stale health poll,
+    // once every thirty seconds, for as long as the build runs.
+    if (impl_->worker_active) return true;
+
+    impl_->worker_active = true;
+
+    // The previous worker has already returned — worker_active is false — but
+    // its std::thread has not been joined yet, and destroying a joinable thread
+    // is std::terminate. The new worker joins it first, so the chain is one
+    // deep by construction rather than as long as the operator was impatient.
+    //
+    // Constructing the thread under the lock is what makes the handoff atomic.
+    // Two concurrent pushes used to be able to both find the slot emptied by the
+    // other and both move-assign onto it; the second assignment landed on a
+    // JOINABLE thread and took the process down without a log line.
     std::thread previous = std::move(impl_->worker);
-    // The previous application is still joined before the next one starts — two
-    // concurrent applications would race on the same provisioner and could
-    // leave a half-installed runtime that neither call believes it owns — but
-    // the join happens INSIDE the new worker, not here.
-    //
-    // It used to happen here, on the caller's thread, which is the HTTP handler
-    // for POST /api/node/engine-config. That route's own comment says
-    // "provisioning runs in the background because a source build takes minutes
-    // and control's push must not block on it" — true for the first push and
-    // false for the second, which waited out the whole build while control's
-    // health poll timed out and marked the node unreachable. Latent until now
-    // only because the node died before it could ever build anything (D59).
-    //
-    // The backstop behind the per-engine catch in apply(). That one covers the
-    // provisioners, which is where the risk actually lives; this covers
-    // everything else on the thread — and, more importantly, guarantees the
-    // property rather than the coverage. A thread function that can throw at
-    // all is a process that can vanish, so the boundary belongs at the thread,
-    // not only at the call known to be dangerous today.
-    impl_->worker = std::thread([this, cfg, previous = std::move(previous)]() mutable {
+    impl_->worker = std::thread([this, previous = std::move(previous)]() mutable {
         if (previous.joinable()) previous.join();
-        try {
-            apply(cfg);
-        } catch (const std::exception& e) {
-            // `applying` is reset here too: apply() clears it on its own way
-            // out, and a throw that skipped that would leave conformance
-            // permanently Converging — a node stuck reporting "wait" forever,
-            // which reads healthier than Failed and is worse.
-            impl_->applying.store(false);
-            std::lock_guard<std::mutex> g(impl_->mutex);
-            impl_->apply_error = std::string("applying engine config threw: ") + e.what();
-            MM_ERROR("Applying engine config v{} threw: {}", cfg.version, e.what());
-        } catch (...) {
-            impl_->applying.store(false);
-            std::lock_guard<std::mutex> g(impl_->mutex);
-            impl_->apply_error = "applying engine config threw a non-standard exception";
-            MM_ERROR("Applying engine config v{} threw a non-standard exception", cfg.version);
+
+        for (;;) {
+            ClusterEngineConfig next;
+            {
+                std::lock_guard<std::mutex> lk(impl_->mutex);
+                // Queued work is DROPPED on shutdown rather than drained: the
+                // node is exiting, and provisioning an engine it is about to
+                // stop is time the operator is waiting through for nothing.
+                if (!impl_->pending || impl_->stopping.load()) {
+                    impl_->pending.reset();
+                    impl_->worker_active = false;
+                    return;
+                }
+                next = std::move(*impl_->pending);
+                impl_->pending.reset();
+            }
+
+            try {
+                apply(next);
+            } catch (const std::exception& e) {
+                // `applying` is reset here too: apply() clears it on its own way
+                // out, and a throw that skipped that would leave conformance
+                // permanently Converging — a node stuck reporting "wait"
+                // forever, which reads healthier than Failed and is worse.
+                impl_->applying.store(false);
+                std::lock_guard<std::mutex> lk(impl_->mutex);
+                impl_->apply_error = std::string("applying engine config threw: ") + e.what();
+                MM_ERROR("Applying engine config v{} threw: {}", next.version, e.what());
+            } catch (...) {
+                impl_->applying.store(false);
+                std::lock_guard<std::mutex> lk(impl_->mutex);
+                impl_->apply_error = "applying engine config threw a non-standard exception";
+                MM_ERROR("Applying engine config v{} threw a non-standard exception",
+                         next.version);
+            }
+            // The loop continues rather than returning: a config that threw must
+            // not strand a NEWER one that arrived while it was failing. It only
+            // goes round again if something is actually waiting, since `pending`
+            // was cleared before apply() ran.
         }
     });
+    return true;
 }
 
 std::vector<RuntimeStatus> NodeEngineManager::engine_statuses() const {
@@ -391,7 +447,12 @@ EngineConformance NodeEngineManager::conformance() const {
 
     // Mid-application is Converging, not Failed. The distinction is the whole
     // reason both states exist: one is "wait", the other is "act".
-    if (impl_->applying.load()) {
+    //
+    // A QUEUED config counts as mid-application. The worker clears `applying`
+    // between laps, and a conformance read landing in that gap would report
+    // Failed about a node whose next configuration is already in hand — telling
+    // control to act on a state it was about to leave.
+    if (impl_->applying.load() || impl_->pending.has_value()) {
         c.state = EngineConformanceState::Converging;
         c.detail = "applying config v" + std::to_string(c.config_version) +
                    "; pending: " + util::join(missing, ", ");

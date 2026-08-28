@@ -75,9 +75,24 @@ public:
     /// and returns.
     void apply(const ClusterEngineConfig& cfg);
 
-    /// apply() on a detached worker, replacing any in-flight application. Used
-    /// by the API route, which must answer before a build finishes.
-    void apply_async(const ClusterEngineConfig& cfg);
+    /// Queue cfg for application on the single background worker. Used by the
+    /// API route, which must answer before a build finishes.
+    ///
+    /// Returns false when cfg is STALE — older than the newest version already
+    /// accepted or queued — and nothing was queued. Configuration versions are
+    /// assigned by the master and are monotonic, so ordering by arrival was
+    /// ordering by nothing: two pushes race on the network, land in whatever
+    /// order the thread pool hands them over, and a delayed v3 could be applied
+    /// on top of a v5 that had already taken effect. The caller must not record
+    /// a rejected config as the node's intent.
+    ///
+    /// Never more than ONE worker, and never more than one config waiting for
+    /// it. A push arriving mid-application REPLACES the queued one instead of
+    /// chaining behind it: control re-pushes every stale health poll, so a
+    /// ten-minute source build used to accumulate a thread per poll, each
+    /// blocked joining the last and each destined to replay the identical
+    /// provisioning when its turn came.
+    bool apply_async(const ClusterEngineConfig& cfg);
 
     /// The last configuration applied or being applied. Version 0 = none yet.
     ClusterEngineConfig current_config() const;

@@ -16,6 +16,7 @@
 #include "control/agent_scheduler.hpp"
 #include "control/engine_config_store.hpp"
 #include "control/engine_group_planner.hpp"
+#include "node/node_api_server.hpp"
 #include "node/node_state.hpp"
 #include "node/engine_manager.hpp"
 #include "node/engine_provisioner.hpp"
@@ -579,6 +580,98 @@ bool test_slot_lease_blocks_unload_and_suspend_while_busy() {
     return true;
 }
 
+bool test_failed_inference_workers_are_harvested_and_drained() {
+    // A generation runs on its own thread while the SSE handler streams what it
+    // produces, so the node has to track those threads and eventually collect
+    // them. Two things could go wrong, and both did.
+    mm::NodeState state;
+    state.add_api_key("test-node-key");
+
+    mm::EngineSupervisor engines(46140, 46145, /*max_slots=*/2);
+    // Its client points at port 0, so complete() cannot connect and returns a
+    // default-constructed Message — role User, not Assistant. That is exactly
+    // the non-stream failure branch, which returned early out of the worker
+    // body and jumped over the bookkeeping that retires it.
+    const auto slot = engines.add_ready_test_engine("llama-cpp", "test-model.gguf", "agent-a");
+    CHECK(!slot.empty());
+
+    mm::NodeApiServer api(state, engines);
+    std::thread listener([&] { api.listen(46150); });
+
+    // Torn down on EVERY exit, including a failed CHECK. A bare early return
+    // would destroy a joinable listener thread, and that is std::terminate: the
+    // regression this test exists to catch would take the whole suite down
+    // instead of reporting itself. Ordered as main() orders it — stop, cancel,
+    // join, drain — because getting that order wrong is the other bug here.
+    struct Teardown {
+        mm::NodeApiServer* api;
+        mm::EngineSupervisor* engines;
+        std::thread* listener;
+        ~Teardown() {
+            api->stop();
+            engines->stop_processes();
+            if (listener->joinable()) listener->join();
+            api->drain_workers();
+            engines->unload_all();
+        }
+    } teardown{&api, &engines, &listener};
+    // Wait for the listener rather than sleeping a fixed amount: an unbound port
+    // fails every request below and reads as the bug under test.
+    bool up = false;
+    for (int i = 0; i < 200 && !up; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        mm::HttpClient probe("http://127.0.0.1:46150");
+        probe.set_bearer_token("test-node-key");
+        up = probe.get("/api/node/health").ok();
+    }
+    CHECK(up);
+
+    auto infer_once = [&] {
+        mm::HttpClient client("http://127.0.0.1:46150");
+        client.set_bearer_token("test-node-key");
+        nlohmann::json body{{"slot_id", slot},
+                            {"stream", false},
+                            {"messages", nlohmann::json::array({
+                                nlohmann::json{{"role", "user"}, {"content", "hello"}}})}};
+        return client.post("/api/node/infer", body).ok();
+    };
+
+    // ── 1. finished workers are HARVESTED ────────────────────────────────────
+    //
+    // Every one of these fails, and each used to leave a completed-but-joinable
+    // thread in the tracking list forever. Sixteen is not a threshold anyone
+    // tuned — it is "obviously more than the one or two a working harvest can
+    // have in flight at a moment", and the leaking version would sit at sixteen.
+    for (int i = 0; i < 16; ++i) CHECK(infer_once());
+
+    bool harvested = false;
+    for (int i = 0; i < 200 && !harvested; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        // The sweep runs when the NEXT request arrives, so one more request is
+        // what collects the previous one's corpse.
+        (void)infer_once();
+        harvested = api.tracked_worker_count() <= 2;
+    }
+    CHECK(harvested);
+
+    // ── 2. and the drain joins whatever is left ──────────────────────────────
+    //
+    // Cancellation first, exactly as main() orders it: kill the children, join
+    // the listener, then drain. Reversed, a stalled generation holds the handler
+    // thread inside its SSE provider, listen() never returns, and the
+    // cancellation that would have freed it is never reached.
+    api.stop();
+    engines.stop_processes();
+    if (listener.joinable()) listener.join();
+    api.drain_workers();
+    CHECK(api.tracked_worker_count() == 0);
+
+    // Refused once draining, so nothing new can appear behind the drain.
+    CHECK(!infer_once());
+
+    return true;   // the guard repeats the teardown; every step of it is idempotent
+}
+
 bool test_crashed_engine_releases_its_slot_and_port() {
     auto dir = temp_test_dir("crash-capacity");
     // One slot, which is the configuration where this mattered most: a single
@@ -621,6 +714,141 @@ bool test_crashed_engine_releases_its_slot_and_port() {
     const auto replacement = slots.add_ready_test_engine("llama-cpp", "test-model.gguf", "agent-c");
     CHECK(!replacement.empty());
     CHECK(slots.available_slot_count() == 0);
+
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+/// A provisioner that can be held inside ensure(), so a test can keep an
+/// application in flight while it pushes more configurations at the manager.
+class GatedProvisioner final : public mm::EngineProvisioner {
+public:
+    explicit GatedProvisioner(std::string id) : id_(std::move(id)) {}
+
+    const std::string& engine_id() const override { return id_; }
+
+    mm::RuntimeStatus ensure(const mm::EngineSpec&) override {
+        ++calls;
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [this] { return open_; });
+        return status();
+    }
+    void open() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            open_ = true;
+        }
+        cv_.notify_all();
+    }
+
+    mm::RuntimeStatus check_for_update(const mm::EngineSpec&) override { return status(); }
+    mm::RuntimeStatus update(const mm::EngineSpec&, const std::string&) override {
+        return status();
+    }
+    mm::RuntimeStatus status() const override {
+        mm::RuntimeStatus s;
+        s.engine_id = id_;
+        s.status = "ready";
+        s.ready = true;
+        s.executable_path = "gated";
+        return s;
+    }
+    std::optional<mm::EngineArtifact> installed_artifact() const override { return std::nullopt; }
+    std::optional<mm::EngineArtifact> desired_artifact(const mm::EngineSpec&) const override {
+        return std::nullopt;
+    }
+    bool shareable() const override { return false; }
+    bool package(const std::string&, std::string& err) override {
+        err = "not shareable";
+        return false;
+    }
+    bool install_package(const std::string&,
+                         const mm::EngineArtifact&,
+                         std::string& err) override {
+        err = "not installable";
+        return false;
+    }
+    std::string executable_path() const override { return "gated"; }
+
+    std::atomic<int> calls{0};
+
+private:
+    std::string id_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool open_ = false;
+};
+
+bool test_engine_config_pushes_coalesce_and_reject_stale() {
+    // Three properties of apply_async(), all of which were false when it spawned
+    // one joined-chain thread per push.
+    auto dir = temp_test_dir("engine-config-coalesce");
+    mm::EngineManagerPaths paths;
+    paths.llama_provision_dir = dir.string();
+    mm::NodeEngineManager manager(paths);
+
+    auto owned = std::make_unique<GatedProvisioner>("llama-cpp");
+    auto* gate = owned.get();
+    manager.set_provisioner("llama-cpp", std::move(owned));
+
+    // Opened on EVERY exit, including a failed CHECK. Without this a regression
+    // does not fail the suite, it HANGS it: the manager destructor joins the
+    // worker, the worker is parked inside ensure(), and nothing is left to let
+    // it out. A test whose failure mode is a hung CI job reports nothing.
+    struct GateOpener {
+        GatedProvisioner* gate;
+        ~GateOpener() { gate->open(); }
+    } gate_opener{gate};
+
+    auto config_at = [](std::uint32_t version) {
+        mm::ClusterEngineConfig cfg;
+        cfg.version = version;
+        cfg.primary_engine = "llama-cpp";
+        cfg.backup_engine.clear();
+        mm::EngineSpec spec;
+        spec.engine_id = "llama-cpp";
+        cfg.engines = {spec};
+        return cfg;
+    };
+
+    // ── 1. pushes arriving during an application COALESCE ────────────────────
+    //
+    // v1 parks inside ensure(). Control re-pushes on every stale health poll, so
+    // the eighteen that follow model half an hour of polling during a source
+    // build. Each used to be its own thread, blocked joining the one before it,
+    // and each would then replay the identical provisioning when its turn came.
+    CHECK(manager.apply_async(config_at(1)));
+    for (int i = 0; i < 200 && gate->calls.load() == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(gate->calls.load() == 1);   // v1 is inside ensure()
+
+    for (std::uint32_t v = 2; v <= 20; ++v) CHECK(manager.apply_async(config_at(v)));
+
+    // Still exactly one application in flight: nineteen pushes, no extra work.
+    CHECK(gate->calls.load() == 1);
+
+    // ── 2. a STALE push is refused, not queued ───────────────────────────────
+    //
+    // Versions are master-assigned and monotonic, so an older one arriving late
+    // is a duplicate that lost a race — never an instruction to roll back.
+    CHECK(!manager.apply_async(config_at(19)));
+    CHECK(!manager.apply_async(config_at(1)));
+    // Equal is NOT stale: a resync re-pushing the current version to a node
+    // whose apply failed is the retry path.
+    CHECK(manager.apply_async(config_at(20)));
+
+    // ── 3. exactly ONE more application runs, and it is the NEWEST ───────────
+    gate->open();   // idempotent; the guard above repeats it on the way out
+    for (int i = 0; i < 400 && manager.current_config().version != 20; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(manager.current_config().version == 20);
+    // Two: v1, then v20. Not twenty-one, and not v19 landing on top of v20.
+    CHECK(gate->calls.load() == 2);
+
+    manager.shutdown();
+    CHECK(manager.current_config().version == 20);
 
     CHECK(remove_tree(dir));
     return true;
@@ -677,12 +905,25 @@ bool test_concurrent_engine_config_pushes_do_not_terminate() {
         for (auto& t : pushers) t.join();
     }
 
-    // Joins whichever application is still in flight; reaching here at all is
-    // the assertion.
+    // Converge before shutting down. shutdown() DROPS queued work by design, so
+    // asserting the final version through it would be asserting a race.
+    for (int i = 0; i < 400 && manager.current_config().version != 80; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    // The version that ends up in force is the HIGHEST pushed, not the last to
+    // win a mutex. Eighty pushes arrived in eighty different orders across the
+    // rounds; ordering by arrival meant a delayed v77 could be applied on top of
+    // v80 and leave the node running a configuration the cluster had replaced.
+    // The old test logged the out-of-order application and asserted nothing
+    // about where it landed.
+    CHECK(manager.current_config().version == 80);
+
     manager.shutdown();
 
     const auto conf = manager.conformance();
     CHECK(conf.state != mm::EngineConformanceState::Converging);
+    CHECK(conf.config_version == 80);
 
     std::error_code ec;
     std::filesystem::remove(planted, ec);
@@ -8298,8 +8539,12 @@ int main(int argc, char** argv) {
          test_slot_lease_blocks_unload_and_suspend_while_busy},
         {"crashed_engine_releases_its_slot_and_port",
          test_crashed_engine_releases_its_slot_and_port},
+        {"failed_inference_workers_are_harvested_and_drained",
+         test_failed_inference_workers_are_harvested_and_drained},
         {"concurrent_engine_config_pushes_do_not_terminate",
          test_concurrent_engine_config_pushes_do_not_terminate},
+        {"engine_config_pushes_coalesce_and_reject_stale",
+         test_engine_config_pushes_coalesce_and_reject_stale},
         {"node_action_progress_json_round_trip",
          test_node_action_progress_json_round_trip},
         {"engine_config_validation_and_round_trip",

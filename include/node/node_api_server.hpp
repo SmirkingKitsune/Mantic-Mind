@@ -3,6 +3,7 @@
 #include "common/engine_config.hpp"
 #include "common/models.hpp"
 #include <atomic>
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -89,9 +90,24 @@ public:
     // half-working. A node that cannot apply a config should say so to the
     // master that pushed it, not accept it and quietly do nothing.
     void set_engine_manager(NodeEngineManager* manager);
-    using EngineConfigCallback = std::function<void(const ClusterEngineConfig&)>;
+    /// Returns false when the config was REFUSED as stale — older than one the
+    /// node has already accepted. Reported to the master rather than swallowed:
+    /// answering "accepted" to a configuration this node deliberately did not
+    /// take is the same lie as silently dropping a forbidden key.
+    using EngineConfigCallback = std::function<bool(const ClusterEngineConfig&)>;
     void set_engine_config_callback(EngineConfigCallback callback);
     void set_ray_controller(RayController* controller);
+
+#ifdef MM_TESTING
+    /// How many inference workers are still tracked.
+    ///
+    /// Test-only, because the number is meaningless to an operator and load
+    /// bearing to exactly one claim: that a worker which finished is EVENTUALLY
+    /// collected. Retention is invisible from outside otherwise — a leaked
+    /// worker serves requests correctly and only shows up as a process that
+    /// grows a thread handle per request forever.
+    std::size_t tracked_worker_count() const;
+#endif
 
 private:
     /// One in-flight /api/node/infer generation. Its `finished` flag lets a
@@ -99,7 +115,7 @@ private:
     /// be holding a million joinable threads.
     struct InferWorker;
 
-    std::mutex workers_mu_;
+    mutable std::mutex workers_mu_;
     std::vector<std::shared_ptr<InferWorker>> workers_;
     std::atomic<bool> draining_{false};
 

@@ -191,6 +191,13 @@ void NodeApiServer::drain_workers() {
         MM_INFO("NodeApiServer: drained {} inference worker(s)", pending.size());
 }
 
+#ifdef MM_TESTING
+std::size_t NodeApiServer::tracked_worker_count() const {
+    std::lock_guard<std::mutex> lk(workers_mu_);
+    return workers_.size();
+}
+#endif
+
 void NodeApiServer::set_runtime_logs_provider(RuntimeLogsProvider provider) {
     runtime_logs_provider_ = std::move(provider);
 }
@@ -506,13 +513,22 @@ void NodeApiServer::register_routes() {
         }
 
         MM_INFO("Applying cluster engine config v{} from control", cfg.version);
-        engine_config_cb_(cfg);
+        const bool accepted = engine_config_cb_(cfg);
 
         // Answers immediately with `converging`; provisioning runs in the
         // background because a source build takes minutes and control's push
         // must not block on it.
-        res.set_content(nlohmann::json{{"accepted", true},
-                                       {"engine_config_version", cfg.version},
+        //
+        // 200 even when refused, and deliberately. A refusal here means only
+        // that control raced itself — a delayed push landing behind a newer one
+        // — and NodeRegistry::push_engine_config treats any non-2xx as the node
+        // rejecting the configuration outright, which would turn control's own
+        // retry into an operator-visible fault. The version reported back is the
+        // one actually in force, which is what the convergence loop compares
+        // against; `accepted` says which of the two this push was.
+        res.set_content(nlohmann::json{{"accepted", accepted},
+                                       {"engine_config_version",
+                                        engine_manager_->current_config().version},
                                        {"conformance", engine_manager_->conformance()}}
                             .dump(),
                         "application/json");
@@ -2295,6 +2311,38 @@ void NodeApiServer::register_routes() {
                                           ctx,
                                           worker,
                                           slot_lease = std::move(slot_lease)]() mutable {
+                // Closing the stream and retiring the worker happen on EVERY exit
+                // path, which is why they are a guard rather than a tail.
+                //
+                // Written as a tail, the early return below — a non-stream
+                // completion that comes back with the wrong role — jumped over
+                // both. The stream still closed, because that branch passes
+                // done=true to emit_line, so the failure was invisible from
+                // outside; but `finished` stayed false, the harvest in the infer
+                // route never collected the worker, and every failed non-stream
+                // request left one more joinable thread in workers_ for the
+                // lifetime of the node.
+                //
+                // Declared FIRST so it destructs LAST, after emit_line and the
+                // lease.
+                struct Finalize {
+                    std::shared_ptr<SseInferCtx> ctx;
+                    std::shared_ptr<InferWorker> worker;
+                    ~Finalize() {
+                        {
+                            std::lock_guard<std::mutex> lk(ctx->mx);
+                            if (!ctx->done) {
+                                ctx->done = true;
+                                ctx->cv.notify_one();
+                            }
+                        }
+                        // Last, and after every use of `this`: the flag only says
+                        // the body is done. The join it invites is what actually
+                        // waits for the lease and the captures to be destroyed.
+                        worker->finished.store(true);
+                    }
+                } finalize{ctx, worker};
+
                 EngineClient* client = slot_lease.get();
                 auto emit_line = [ctx](const std::string& payload, bool done) {
                     std::lock_guard<std::mutex> lk(ctx->mx);
@@ -2427,18 +2475,6 @@ void NodeApiServer::register_routes() {
                     }) + "\n\n", true);
                 }
 
-                {
-                    std::lock_guard<std::mutex> lk(ctx->mx);
-                    if (!ctx->done) {
-                        ctx->done = true;
-                        ctx->cv.notify_one();
-                    }
-                }
-
-                // Last, and after every use of `this`: the flag only says the body
-                // is done, and the join that follows it is what actually waits for
-                // the lease and the captures to be destroyed.
-                worker->finished.store(true);
             });
             workers_.push_back(std::move(worker));
         }
