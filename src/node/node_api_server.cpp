@@ -24,6 +24,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <atomic>
+#include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -144,7 +147,19 @@ NodeApiServer::NodeApiServer(NodeState& state,
     , server_(std::make_unique<HttpServer>())
 {}
 
-NodeApiServer::~NodeApiServer() { stop(); }
+struct NodeApiServer::InferWorker {
+    std::thread thread;
+    std::atomic<bool> finished{false};
+};
+
+NodeApiServer::~NodeApiServer() {
+    stop();
+    // The backstop, not the intended path. main() kills the engine children
+    // between stop() and the drain so this returns promptly; reached from the
+    // destructor alone it waits out whatever the model is still generating,
+    // which is slow but never unsafe.
+    drain_workers();
+}
 
 bool NodeApiServer::listen(uint16_t port) {
     // Streamed model uploads far exceed cpp-httplib's 100 MB default body cap;
@@ -155,7 +170,26 @@ bool NodeApiServer::listen(uint16_t port) {
     return server_->listen("0.0.0.0", port);
 }
 
-void NodeApiServer::stop() { server_->stop(); }
+void NodeApiServer::stop() {
+    draining_.store(true);
+    server_->stop();
+}
+
+void NodeApiServer::drain_workers() {
+    std::vector<std::shared_ptr<InferWorker>> pending;
+    {
+        std::lock_guard<std::mutex> lk(workers_mu_);
+        pending = std::move(workers_);
+        workers_.clear();
+    }
+    // No new worker can appear behind this: the infer route refuses once
+    // draining_ is set, and it makes that decision under workers_mu_.
+    for (auto& w : pending) {
+        if (w && w->thread.joinable()) w->thread.join();
+    }
+    if (!pending.empty())
+        MM_INFO("NodeApiServer: drained {} inference worker(s)", pending.size());
+}
 
 void NodeApiServer::set_runtime_logs_provider(RuntimeLogsProvider provider) {
     runtime_logs_provider_ = std::move(provider);
@@ -2164,6 +2198,14 @@ void NodeApiServer::register_routes() {
         if (!check_auth(req.get_header_value("Authorization"))) {
             res.status = 401; return;
         }
+        // Cheap early out. The binding refusal is the one under workers_mu_
+        // below; this one just avoids acquiring a lease on a node that is on
+        // its way down.
+        if (draining_.load()) {
+            res.status = 503;
+            res.set_content(R"({"error":"node is shutting down"})", "application/json");
+            return;
+        }
 
         // Parse the InferenceRequest + slot_id
         InferenceRequest infer_req;
@@ -2221,149 +2263,185 @@ void NodeApiServer::register_routes() {
         state_.start_streaming_text(selected_slot_id, agent_for_slot);
         if (!agent_for_slot.empty()) state_.set_active_agent(agent_for_slot);
 
-        // Fire the LLM call on a background thread
-        std::thread([this,
-                     infer_req,
-                     ctx,
-                     slot_lease = std::move(slot_lease)]() mutable {
-            EngineClient* client = slot_lease.get();
-            auto emit_line = [ctx](const std::string& payload, bool done) {
-                std::lock_guard<std::mutex> lk(ctx->mx);
-                ctx->lines.push_back(payload);
-                if (done) ctx->done = true;
-                ctx->cv.notify_one();
-            };
+        // Fire the LLM call on a TRACKED background thread.
+        //
+        // It captures `this`, writes into state_, and holds a lease pointing
+        // into EngineSupervisor, so it must not outlive them. Detached, it did:
+        // stop() only stopped the listener, and shutdown went on to unload every
+        // engine and destroy both objects while this thread was still streaming
+        // through them. Quitting during inference was a use-after-free.
+        auto worker = std::make_shared<InferWorker>();
+        {
+            std::lock_guard<std::mutex> lk(workers_mu_);
+            // Re-checked under the lock that drain_workers() takes, so the
+            // registration and the decision to shut down cannot interleave.
+            if (draining_.load()) {
+                res.status = 503;
+                res.set_content(R"({"error":"node is shutting down"})", "application/json");
+                return;
+            }
+            // Harvest what has already finished. Without this the vector grows
+            // by one joinable thread per request the node ever served.
+            for (auto it = workers_.begin(); it != workers_.end();) {
+                if (*it && (*it)->finished.load()) {
+                    if ((*it)->thread.joinable()) (*it)->thread.join();
+                    it = workers_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            worker->thread = std::thread([this,
+                                          infer_req,
+                                          ctx,
+                                          worker,
+                                          slot_lease = std::move(slot_lease)]() mutable {
+                EngineClient* client = slot_lease.get();
+                auto emit_line = [ctx](const std::string& payload, bool done) {
+                    std::lock_guard<std::mutex> lk(ctx->mx);
+                    ctx->lines.push_back(payload);
+                    if (done) ctx->done = true;
+                    ctx->cv.notify_one();
+                };
 
-            try {
-                if (infer_req.stream) {
-                    client->stream_complete(infer_req,
-                        [this, emit_line](const InferenceChunk& c) {
-                            // EVERY field the chunk carries, not the first one
-                            // that matches.
-                            //
-                            // This was an if/else-if priority chain, so a chunk
-                            // carrying both thinking_delta and delta_content
-                            // silently dropped one, and tool_result_json was
-                            // never emitted at all — it had no branch. Both are
-                            // documented in mantic-mind-integration.md as faults
-                            // the rebuild must not inherit, and a dropped delta
-                            // presents as the model omitting a word rather than
-                            // as a transport bug.
-                            if (!c.thinking_delta.empty()) {
-                                state_.append_streaming_text("", c.thinking_delta);
+                try {
+                    if (infer_req.stream) {
+                        client->stream_complete(infer_req,
+                            [this, emit_line](const InferenceChunk& c) {
+                                // EVERY field the chunk carries, not the first one
+                                // that matches.
+                                //
+                                // This was an if/else-if priority chain, so a chunk
+                                // carrying both thinking_delta and delta_content
+                                // silently dropped one, and tool_result_json was
+                                // never emitted at all — it had no branch. Both are
+                                // documented in mantic-mind-integration.md as faults
+                                // the rebuild must not inherit, and a dropped delta
+                                // presents as the model omitting a word rather than
+                                // as a transport bug.
+                                if (!c.thinking_delta.empty()) {
+                                    state_.append_streaming_text("", c.thinking_delta);
+                                    emit_line("data: " + safe_json_dump(nlohmann::json{
+                                        {"type","thinking"},{"content", c.thinking_delta}
+                                    }) + "\n\n", false);
+                                }
+                                if (!c.delta_content.empty()) {
+                                    state_.append_streaming_text(c.delta_content, "");
+                                    emit_line("data: " + safe_json_dump(nlohmann::json{
+                                        {"type","delta"},{"content", c.delta_content}
+                                    }) + "\n\n", false);
+                                }
+                                if (c.tool_call_delta) {
+                                    const auto& tc = *c.tool_call_delta;
+                                    emit_line("data: " + safe_json_dump(nlohmann::json{
+                                        {"type","tool_call"},{"id", tc.id},
+                                        {"name", tc.function_name},
+                                        {"arguments", tc.arguments_json}
+                                    }) + "\n\n", false);
+                                }
+                                if (!c.tool_result_json.empty()) {
+                                    emit_line("data: " + safe_json_dump(nlohmann::json{
+                                        {"type","tool_result"},{"result", c.tool_result_json}
+                                    }) + "\n\n", false);
+                                }
+                                // Always last, and always sent: `done` is what closes
+                                // the stream, so it cannot be conditional on any of
+                                // the above having matched.
+                                if (c.is_done) {
+                                    state_.finish_streaming_text(c.finish_reason, c.tokens_used);
+                                    emit_line("data: " + safe_json_dump(nlohmann::json{
+                                        {"type", "done"},
+                                        {"tokens_used", c.tokens_used},
+                                        {"finish_reason", c.finish_reason}
+                                    }) + "\n\n", true);
+                                }
+                            },
+                            [this, emit_line](const EngineError& err) {
+                                state_.finish_streaming_text("error", 0);
+                                // The structured code rides through to control, which
+                                // no longer has to read the message to decide whether
+                                // this was capacity.
                                 emit_line("data: " + safe_json_dump(nlohmann::json{
-                                    {"type","thinking"},{"content", c.thinking_delta}
-                                }) + "\n\n", false);
-                            }
-                            if (!c.delta_content.empty()) {
-                                state_.append_streaming_text(c.delta_content, "");
-                                emit_line("data: " + safe_json_dump(nlohmann::json{
-                                    {"type","delta"},{"content", c.delta_content}
-                                }) + "\n\n", false);
-                            }
-                            if (c.tool_call_delta) {
-                                const auto& tc = *c.tool_call_delta;
-                                emit_line("data: " + safe_json_dump(nlohmann::json{
-                                    {"type","tool_call"},{"id", tc.id},
-                                    {"name", tc.function_name},
-                                    {"arguments", tc.arguments_json}
-                                }) + "\n\n", false);
-                            }
-                            if (!c.tool_result_json.empty()) {
-                                emit_line("data: " + safe_json_dump(nlohmann::json{
-                                    {"type","tool_result"},{"result", c.tool_result_json}
-                                }) + "\n\n", false);
-                            }
-                            // Always last, and always sent: `done` is what closes
-                            // the stream, so it cannot be conditional on any of
-                            // the above having matched.
-                            if (c.is_done) {
-                                state_.finish_streaming_text(c.finish_reason, c.tokens_used);
-                                emit_line("data: " + safe_json_dump(nlohmann::json{
-                                    {"type", "done"},
-                                    {"tokens_used", c.tokens_used},
-                                    {"finish_reason", c.finish_reason}
+                                    {"type","error"},
+                                    {"code", err.code},
+                                    {"message", err.message}
                                 }) + "\n\n", true);
                             }
-                        },
-                        [this, emit_line](const EngineError& err) {
+                        );
+                    } else {
+                        Message full = client->complete(infer_req);
+                        if (full.role != MessageRole::Assistant) {
                             state_.finish_streaming_text("error", 0);
-                            // The structured code rides through to control, which
-                            // no longer has to read the message to decide whether
-                            // this was capacity.
                             emit_line("data: " + safe_json_dump(nlohmann::json{
-                                {"type","error"},
-                                {"code", err.code},
-                                {"message", err.message}
+                                {"type", "error"},
+                                {"message", "non-stream inference failed"}
                             }) + "\n\n", true);
+                            return;
                         }
-                    );
-                } else {
-                    Message full = client->complete(infer_req);
-                    if (full.role != MessageRole::Assistant) {
-                        state_.finish_streaming_text("error", 0);
+                        if (!full.thinking_text.empty()) {
+                            state_.append_streaming_text("", full.thinking_text);
+                            emit_line("data: " + safe_json_dump(nlohmann::json{
+                                {"type", "thinking"},
+                                {"content", full.thinking_text}
+                            }) + "\n\n", false);
+                        }
+                        if (!full.content.empty()) {
+                            state_.append_streaming_text(full.content, "");
+                            emit_line("data: " + safe_json_dump(nlohmann::json{
+                                {"type", "delta"},
+                                {"content", full.content}
+                            }) + "\n\n", false);
+                        }
+                        for (const auto& tc : full.tool_calls) {
+                            emit_line("data: " + safe_json_dump(nlohmann::json{
+                                {"type", "tool_call"},
+                                {"id", tc.id},
+                                {"name", tc.function_name},
+                                {"arguments", tc.arguments_json}
+                            }) + "\n\n", false);
+                        }
+                        const std::string finish_reason = full.content.empty() && full.tool_calls.empty()
+                            ? "empty"
+                            : "stop";
+                        state_.finish_streaming_text(finish_reason, full.token_count);
                         emit_line("data: " + safe_json_dump(nlohmann::json{
-                            {"type", "error"},
-                            {"message", "non-stream inference failed"}
+                            {"type", "done"},
+                            {"tokens_used", full.token_count},
+                            {"finish_reason", finish_reason}
                         }) + "\n\n", true);
-                        return;
                     }
-                    if (!full.thinking_text.empty()) {
-                        state_.append_streaming_text("", full.thinking_text);
-                        emit_line("data: " + safe_json_dump(nlohmann::json{
-                            {"type", "thinking"},
-                            {"content", full.thinking_text}
-                        }) + "\n\n", false);
-                    }
-                    if (!full.content.empty()) {
-                        state_.append_streaming_text(full.content, "");
-                        emit_line("data: " + safe_json_dump(nlohmann::json{
-                            {"type", "delta"},
-                            {"content", full.content}
-                        }) + "\n\n", false);
-                    }
-                    for (const auto& tc : full.tool_calls) {
-                        emit_line("data: " + safe_json_dump(nlohmann::json{
-                            {"type", "tool_call"},
-                            {"id", tc.id},
-                            {"name", tc.function_name},
-                            {"arguments", tc.arguments_json}
-                        }) + "\n\n", false);
-                    }
-                    const std::string finish_reason = full.content.empty() && full.tool_calls.empty()
-                        ? "empty"
-                        : "stop";
-                    state_.finish_streaming_text(finish_reason, full.token_count);
+                } catch (const std::exception& e) {
+                    MM_ERROR("NodeApiServer infer worker exception: {}", e.what());
+                    state_.set_last_error(std::string("infer worker exception: ") + e.what());
+                    state_.finish_streaming_text("error", 0);
                     emit_line("data: " + safe_json_dump(nlohmann::json{
-                        {"type", "done"},
-                        {"tokens_used", full.token_count},
-                        {"finish_reason", finish_reason}
+                        {"type","error"},
+                        {"message", std::string("infer worker exception: ") + e.what()}
+                    }) + "\n\n", true);
+                } catch (...) {
+                    MM_ERROR("NodeApiServer infer worker exception: unknown");
+                    state_.set_last_error("infer worker exception: unknown");
+                    state_.finish_streaming_text("error", 0);
+                    emit_line("data: " + safe_json_dump(nlohmann::json{
+                        {"type","error"},
+                        {"message", "infer worker exception: unknown"}
                     }) + "\n\n", true);
                 }
-            } catch (const std::exception& e) {
-                MM_ERROR("NodeApiServer infer worker exception: {}", e.what());
-                state_.set_last_error(std::string("infer worker exception: ") + e.what());
-                state_.finish_streaming_text("error", 0);
-                emit_line("data: " + safe_json_dump(nlohmann::json{
-                    {"type","error"},
-                    {"message", std::string("infer worker exception: ") + e.what()}
-                }) + "\n\n", true);
-            } catch (...) {
-                MM_ERROR("NodeApiServer infer worker exception: unknown");
-                state_.set_last_error("infer worker exception: unknown");
-                state_.finish_streaming_text("error", 0);
-                emit_line("data: " + safe_json_dump(nlohmann::json{
-                    {"type","error"},
-                    {"message", "infer worker exception: unknown"}
-                }) + "\n\n", true);
-            }
 
-            std::lock_guard<std::mutex> lk(ctx->mx);
-            if (!ctx->done) {
-                ctx->done = true;
-                ctx->cv.notify_one();
-            }
-        }).detach();
+                {
+                    std::lock_guard<std::mutex> lk(ctx->mx);
+                    if (!ctx->done) {
+                        ctx->done = true;
+                        ctx->cv.notify_one();
+                    }
+                }
+
+                // Last, and after every use of `this`: the flag only says the body
+                // is done, and the join that follows it is what actually waits for
+                // the lease and the captures to be destroyed.
+                worker->finished.store(true);
+            });
+            workers_.push_back(std::move(worker));
+        }
 
         // Stream SSE to client via chunked content provider
         res.set_chunked_content_provider("text/event-stream",

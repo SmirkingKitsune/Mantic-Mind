@@ -254,11 +254,22 @@ void NodeEngineManager::apply(const ClusterEngineConfig& cfg) {
 }
 
 void NodeEngineManager::apply_async(const ClusterEngineConfig& cfg) {
-    std::thread previous;
-    {
-        std::lock_guard<std::mutex> g(impl_->mutex);
-        previous = std::move(impl_->worker);
-    }
+    // The whole handoff is one critical section. It used to be two — take the
+    // old worker under the lock, release, build the new one, retake the lock to
+    // store it — and two concurrent pushes could both find the slot already
+    // emptied by the other. The second store then move-assigned onto a JOINABLE
+    // thread, which is std::terminate: the node does not log, does not unload
+    // its engines, and simply vanishes while control reads the config as
+    // accepted. POST /api/node/engine-config is served from cpp-httplib's
+    // thread pool and control re-pushes on every stale health poll (plus
+    // /v1/cluster/engines/resync), so two in flight at once is a normal
+    // Tuesday, not a stress test.
+    //
+    // Constructing the thread under the lock is safe: construction does not
+    // wait for the thread body, and the body's own first lock simply blocks
+    // for the remainder of this function.
+    std::lock_guard<std::mutex> handoff(impl_->mutex);
+    std::thread previous = std::move(impl_->worker);
     // The previous application is still joined before the next one starts — two
     // concurrent applications would race on the same provisioner and could
     // leave a half-installed runtime that neither call believes it owns — but
@@ -278,7 +289,7 @@ void NodeEngineManager::apply_async(const ClusterEngineConfig& cfg) {
     // property rather than the coverage. A thread function that can throw at
     // all is a process that can vanish, so the boundary belongs at the thread,
     // not only at the call known to be dangerous today.
-    std::thread next([this, cfg, previous = std::move(previous)]() mutable {
+    impl_->worker = std::thread([this, cfg, previous = std::move(previous)]() mutable {
         if (previous.joinable()) previous.join();
         try {
             apply(cfg);
@@ -298,10 +309,6 @@ void NodeEngineManager::apply_async(const ClusterEngineConfig& cfg) {
             MM_ERROR("Applying engine config v{} threw a non-standard exception", cfg.version);
         }
     });
-    {
-        std::lock_guard<std::mutex> g(impl_->mutex);
-        impl_->worker = std::move(next);
-    }
 }
 
 std::vector<RuntimeStatus> NodeEngineManager::engine_statuses() const {

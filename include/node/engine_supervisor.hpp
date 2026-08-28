@@ -123,6 +123,20 @@ public:
     DetachResult detach_agent(const SlotId& slot_id, const AgentId& agent_id);
     EngineOpResult unload_all(bool force = true);
 
+    /// Stop every child process, keeping the records and their clients.
+    ///
+    /// The CANCELLATION half of shutdown. EngineClient has no cancel — an
+    /// in-flight stream ends when its socket does — so a node quitting mid
+    /// generation has only two options: wait out whatever the model was in the
+    /// middle of saying, or take the socket away. This takes the socket away.
+    ///
+    /// Deliberately not unload_all(): that destroys the Engine records, and with
+    /// them the EngineClient objects that in-flight requests are still calling
+    /// into. Killing the child while the client object survives is what makes
+    /// those calls FAIL rather than crash, which is what lets the node join its
+    /// inference workers before tearing anything down.
+    void stop_processes();
+
     /// Persist KV and stop the process.
     ///
     /// Refuses (Unsupported) when the engine has live sequences beyond index 0
@@ -187,6 +201,13 @@ public:
                                      std::string model_path = "model.gguf",
                                      AgentId agent_id = {},
                                      RuntimeSettings settings = {});
+
+    /// Drive a record through the real crash path.
+    ///
+    /// The watchdog callback, reached directly. Constructing an Error record by
+    /// hand would test the predicate and not the transition, and the transition
+    /// is where the slot and the port are supposed to come back.
+    void crash_test_engine(const SlotId& slot_id, int exit_code, const std::string& detail);
 #endif
 
     /// Per-engine provisioning/health, keyed by engine id. Generalizes the
@@ -238,6 +259,25 @@ private:
     std::vector<RuntimeStatus> runtime_statuses_;
     std::string last_error_;
     int pending_loads_ = 0;
+
+    /// Does this record consume one of `max_slots_`?
+    ///
+    /// One predicate, three call sites — load(), available_slot_count() and
+    /// total_footprint() each carried their own copy, and the copies drifted
+    /// into agreeing on the wrong answer. A slot is consumed by a record that
+    /// still owns a running process; a record kept only so an operator can SEE
+    /// what happened does not.
+    ///
+    /// Error and Empty are terminal and processless. Retaining them is
+    /// deliberate (on_engine_crash() says why), but retaining them as capacity
+    /// was not: with max_slots=1 a single crash bricked the node until someone
+    /// unloaded the corpse by hand, and the node went on reporting zero free
+    /// slots as if that were a resource fact rather than a bookkeeping one.
+    ///
+    /// Suspended is the pre-existing exception, and vLLM is the exception to
+    /// the exception: its sleep keeps the process and its selected devices
+    /// owned so that waking is cheap, and that reservation is real.
+    static bool occupies_slot(const Engine& engine);
 
     void release_request(const SlotId& slot_id);
     void on_engine_crash(const SlotId& slot_id, int exit_code, const std::string& detail);

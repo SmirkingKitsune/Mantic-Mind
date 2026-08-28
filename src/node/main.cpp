@@ -1432,6 +1432,21 @@ int main(int argc, char** argv) {
     }
 
     state.stop_metrics_poll();
+
+    // Cancel, drain, THEN tear down — in that order, and the order is the point.
+    //
+    // /api/node/infer runs its generation on a thread that captures the api
+    // server, writes into NodeState and holds a lease into EngineSupervisor.
+    // Killing the engine children first fails whatever is in flight in about as
+    // long as a socket takes to close; draining then joins those threads while
+    // the objects they touch are still alive; only then is it safe to destroy
+    // the engine records and return from main.
+    //
+    // Reversing any two of these is the bug this replaces: shutdown used to stop
+    // the listener, unload every engine, and return, while a detached worker was
+    // still streaming through a freed EngineClient.
+    engines.stop_processes();
+    api_server.drain_workers();
     engines.unload_all();
 
     // With all slots down nothing is in use; drop every unpinned model so the

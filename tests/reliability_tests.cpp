@@ -579,6 +579,117 @@ bool test_slot_lease_blocks_unload_and_suspend_while_busy() {
     return true;
 }
 
+bool test_crashed_engine_releases_its_slot_and_port() {
+    auto dir = temp_test_dir("crash-capacity");
+    // One slot, which is the configuration where this mattered most: a single
+    // crash used to brick the node until an operator unloaded the corpse by
+    // hand, because the Error record went on counting as a live engine.
+    mm::EngineSupervisor slots(46130, 46131, 1);
+    const auto slot_id = slots.add_ready_test_engine("llama-cpp", "test-model.gguf", "agent-a");
+    CHECK(slots.available_slot_count() == 0);
+
+    slots.crash_test_engine(slot_id, 139, "segmentation fault");
+
+    // The record SURVIVES. Deleting it would present a crash as an engine that
+    // was never there, which is the whole reason on_engine_crash() keeps it.
+    const auto info = slots.find(slot_id);
+    CHECK(info.has_value());
+    CHECK(info->state == mm::SlotState::Error);
+    CHECK(slots.last_error().find("139") != std::string::npos);
+
+    // ...and its agents are detached, so nothing believes it is still placed.
+    CHECK(info->assigned_agent.empty());
+
+    // But it no longer holds the node's only slot: a dead process consumes no
+    // capacity, and available_slot_count() is what control reads to decide
+    // whether this node can take work.
+    CHECK(slots.available_slot_count() == 1);
+
+    // Nor does it hold VRAM. Freeing the slot while still charging for the
+    // footprint would just move the stall from the slot check to the memory
+    // check.
+    const auto footprint = slots.total_footprint();
+    CHECK(footprint.vram_mb == 0);
+    CHECK(footprint.ram_mb == 0);
+
+    // A checkpoint-suspended engine still frees its slot, and a Ready one still
+    // holds it — the pre-existing contract the shared predicate had to preserve.
+    const auto suspended = slots.add_suspended_test_engine("llama-cpp", "other.gguf", "agent-b");
+    CHECK(!suspended.empty());
+    CHECK(slots.available_slot_count() == 1);
+
+    const auto replacement = slots.add_ready_test_engine("llama-cpp", "test-model.gguf", "agent-c");
+    CHECK(!replacement.empty());
+    CHECK(slots.available_slot_count() == 0);
+
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_concurrent_engine_config_pushes_do_not_terminate() {
+    // Two pushes at once used to be std::terminate. apply_async() took the old
+    // worker under the lock, released it, built the replacement, and retook the
+    // lock to store it; two callers could both find the slot already emptied by
+    // the other, and the second store move-assigned onto a JOINABLE thread.
+    //
+    // Reachable in production, not just in a stress test: the route is served
+    // from cpp-httplib's thread pool, and control re-pushes on every stale
+    // health poll as well as from /v1/cluster/engines/resync.
+    const std::string soma_name = "mm-soma-race-" + mm::util::generate_uuid();
+#ifdef _WIN32
+    const std::filesystem::path planted =
+        std::filesystem::path(mm::util::executable_dir()) / (soma_name + ".exe");
+#else
+    const std::filesystem::path planted =
+        std::filesystem::path(mm::util::executable_dir()) / soma_name;
+#endif
+    {
+        std::ofstream out(planted, std::ios::binary | std::ios::trunc);
+        out << "not a real engine";
+    }
+
+    auto dir = temp_test_dir("engine-config-race");
+    mm::EngineManagerPaths paths;
+    paths.llama_provision_dir = dir.string();
+    paths.soma_executable = soma_name;
+    mm::NodeEngineManager manager(paths);
+
+    // Soma only, and no backup. Its provisioner RESOLVES rather than builds, so
+    // this exercises the handoff without a source build or a network fetch.
+    mm::ClusterEngineConfig cfg;
+    cfg.primary_engine = "soma";
+    cfg.backup_engine.clear();
+    mm::EngineSpec soma_spec;
+    soma_spec.engine_id = "soma";
+    cfg.engines = {soma_spec};
+
+    // Several rounds, because the old failure needed a specific interleaving:
+    // one round passing proves nothing, and the crash is a process-level abort
+    // rather than a failed CHECK, so a regression takes the whole suite down.
+    for (int round = 0; round < 20; ++round) {
+        std::vector<std::thread> pushers;
+        for (int i = 0; i < 4; ++i) {
+            pushers.emplace_back([&manager, cfg, round, i]() mutable {
+                cfg.version = round * 4 + i + 1;
+                manager.apply_async(cfg);
+            });
+        }
+        for (auto& t : pushers) t.join();
+    }
+
+    // Joins whichever application is still in flight; reaching here at all is
+    // the assertion.
+    manager.shutdown();
+
+    const auto conf = manager.conformance();
+    CHECK(conf.state != mm::EngineConformanceState::Converging);
+
+    std::error_code ec;
+    std::filesystem::remove(planted, ec);
+    CHECK(remove_tree(dir));
+    return true;
+}
+
 bool test_node_action_progress_json_round_trip() {
     mm::NodeActionProgress p;
     p.active = true;
@@ -8185,6 +8296,10 @@ int main(int argc, char** argv) {
         {"engine_supervisor_not_found_statuses", test_engine_supervisor_not_found_statuses},
         {"slot_lease_blocks_unload_and_suspend_while_busy",
          test_slot_lease_blocks_unload_and_suspend_while_busy},
+        {"crashed_engine_releases_its_slot_and_port",
+         test_crashed_engine_releases_its_slot_and_port},
+        {"concurrent_engine_config_pushes_do_not_terminate",
+         test_concurrent_engine_config_pushes_do_not_terminate},
         {"node_action_progress_json_round_trip",
          test_node_action_progress_json_round_trip},
         {"engine_config_validation_and_round_trip",

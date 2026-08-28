@@ -151,6 +151,22 @@ void EngineSupervisor::set_models_dir(const std::string& dir) {
     models_dir_ = dir;
 }
 
+// ── capacity ──────────────────────────────────────────────────────────────────
+
+bool EngineSupervisor::occupies_slot(const Engine& engine) {
+    // Terminal and processless. The record survives so control can see that the
+    // placement died; the SLOT does not, because nothing is running in it.
+    if (engine.state == SlotState::Error || engine.state == SlotState::Empty) return false;
+
+    // vLLM sleep keeps the process and its devices; a checkpointed suspend does
+    // not, and its slot is genuinely free.
+    if (engine.state == SlotState::Suspended) {
+        return engine.descriptor != nullptr && engine.descriptor->id == "vllm" &&
+               engine.process != nullptr;
+    }
+    return true;
+}
+
 // ── load ──────────────────────────────────────────────────────────────────────
 
 std::optional<SlotId> EngineSupervisor::try_attach(const std::string& engine_id,
@@ -202,13 +218,7 @@ SlotId EngineSupervisor::load(const std::string& engine_id,
 
         const int live = static_cast<int>(
             std::count_if(engines_.begin(), engines_.end(), [](const std::unique_ptr<Engine>& e) {
-                // Checkpoint-suspended engines hold no process and do not count
-                // against capacity. vLLM sleep is deliberately different: the
-                // process and its selected devices stay owned so wake is cheap,
-                // and that reservation must not turn into a free slot.
-                return e->state != SlotState::Suspended ||
-                       (e->descriptor != nullptr && e->descriptor->id == "vllm" &&
-                        e->process != nullptr);
+                return occupies_slot(*e);
             }));
         if (live + pending_loads_ >= max_slots_) {
             last_error_ = "max slots reached";
@@ -356,6 +366,14 @@ void EngineSupervisor::on_engine_crash(const SlotId& slot_id,
             orphaned = e->agents;
             e->agents.clear();
             e->client.reset();
+            // The dead child is not listening any more, so the reservation is
+            // fiction. Freeing the slot without freeing the port would move the
+            // stall from max_slots to the port range — eleven ports by default,
+            // which is eleven crashes instead of one. suspend() already does
+            // exactly this: the record keeps `port` for observability while
+            // used_ports_ stops claiming it, and allocate_port() bind-probes
+            // before handing anything out.
+            release_port(e->port);
             last_error_ =
                 "engine " + slot_id + " exited (code " + std::to_string(exit_code) + "): " + detail;
             break;
@@ -444,6 +462,25 @@ EngineOpResult EngineSupervisor::unload_all(bool force) {
     }
     return {
         EngineOpStatus::Ok, "unloaded " + std::to_string(victims.size()) + " engine(s)", "", {}};
+}
+
+void EngineSupervisor::stop_processes() {
+    std::vector<std::unique_ptr<EngineProcess>> children;
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        for (auto& e : engines_) {
+            if (!e->process) continue;
+            children.push_back(std::move(e->process));
+            // The record survives, and so does its client, so a request already
+            // inside stream_complete() gets a failed read rather than a freed
+            // object. Ready becomes Error because that is now true.
+            if (e->state == SlotState::Ready) e->state = SlotState::Error;
+        }
+    }
+    // Outside the lock. EngineProcess::stop() joins the watchdog, and that
+    // thread calls back into on_engine_crash(), which takes mutex_.
+    for (auto& child : children) child->stop();
+    MM_INFO("EngineSupervisor: stopped {} engine process(es)", children.size());
 }
 
 // ── suspend / restore ─────────────────────────────────────────────────────────
@@ -847,9 +884,7 @@ int EngineSupervisor::available_slot_count() const {
     std::lock_guard<std::mutex> lk(mutex_);
     const int live = static_cast<int>(
         std::count_if(engines_.begin(), engines_.end(), [](const std::unique_ptr<Engine>& e) {
-            return e->state != SlotState::Suspended ||
-                   (e->descriptor != nullptr && e->descriptor->id == "vllm" &&
-                    e->process != nullptr);
+            return occupies_slot(*e);
         }));
     return std::max(0, max_slots_ - live - pending_loads_);
 }
@@ -862,10 +897,11 @@ ResourceFootprint EngineSupervisor::total_footprint() const {
     std::lock_guard<std::mutex> lk(mutex_);
     ResourceFootprint total;
     for (const auto& e : engines_) {
-        const bool sleeping_vllm = e->state == SlotState::Suspended &&
-            e->descriptor != nullptr && e->descriptor->id == "vllm" &&
-            e->process != nullptr;
-        if (e->state == SlotState::Suspended && !sleeping_vllm) continue;
+        // Same predicate as the slot count, for the same reason: a crashed
+        // engine holds no VRAM. Freeing its slot while still charging the node
+        // for its footprint would move the stuck placement from the slot check
+        // to the memory check rather than fixing it.
+        if (!occupies_slot(*e)) continue;
         total.vram_mb += e->footprint.vram_mb;
         total.ram_mb += e->footprint.ram_mb;
         total.disk_mb += e->footprint.disk_mb;
@@ -905,6 +941,12 @@ bool EngineSupervisor::runtime_ready(const std::string& engine_id) const {
 }
 
 #ifdef MM_TESTING
+void EngineSupervisor::crash_test_engine(const SlotId& slot_id,
+                                         int exit_code,
+                                         const std::string& detail) {
+    on_engine_crash(slot_id, exit_code, detail);
+}
+
 SlotId EngineSupervisor::add_ready_test_engine(const std::string& engine_id,
                                                std::string model_path,
                                                AgentId agent_id,

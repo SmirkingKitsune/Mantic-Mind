@@ -2,8 +2,10 @@
 
 #include "common/engine_config.hpp"
 #include "common/models.hpp"
+#include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <cstdint>
 #include <vector>
@@ -30,7 +32,29 @@ public:
 
     // Registers all routes and starts listening.  Blocks until stop() called.
     bool listen(uint16_t port);
+
+    /// Stop accepting work: the listener comes down and /api/node/infer starts
+    /// refusing. Does NOT wait for work already running — see drain_workers().
     void stop();
+
+    /// Join the inference workers.
+    ///
+    /// Split from stop() because the two have to happen on either side of the
+    /// engines being killed. /api/node/infer answers on a chunked SSE provider
+    /// while the actual generation runs on its own thread, and that thread holds
+    /// a lease into EngineSupervisor and captures this server. Detached, as it
+    /// used to be, nothing waited for it: shutdown stopped the listener, unloaded
+    /// every engine, and returned from main while the worker was still writing
+    /// through a freed EngineClient into a destroyed NodeState.
+    ///
+    /// Joining alone is not enough either — an untouched stream ends when the
+    /// model stops generating, which can be minutes. The caller therefore kills
+    /// the engine children first (EngineSupervisor::stop_processes()), which
+    /// fails every outstanding request in about as long as a socket takes to
+    /// close, and only then drains.
+    ///
+    /// Safe to call more than once; safe to call with nothing in flight.
+    void drain_workers();
 
     using RuntimeLogsProvider = std::function<std::vector<std::string>(int tail)>;
     using RememberApiKeyCallback = std::function<void(const std::string& key)>;
@@ -70,6 +94,15 @@ public:
     void set_ray_controller(RayController* controller);
 
 private:
+    /// One in-flight /api/node/infer generation. Its `finished` flag lets a
+    /// later request harvest it: a node that served a million requests must not
+    /// be holding a million joinable threads.
+    struct InferWorker;
+
+    std::mutex workers_mu_;
+    std::vector<std::shared_ptr<InferWorker>> workers_;
+    std::atomic<bool> draining_{false};
+
     NodeState&        state_;
     EngineSupervisor& engines_;
     ModelStore*    model_store_ = nullptr;
