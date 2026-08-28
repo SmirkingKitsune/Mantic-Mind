@@ -1,0 +1,173 @@
+name: Soma
+
+# Structural gates for the Soma engine. These run on every commit and are cheap
+# (no vcpkg, no model weights, seconds not minutes) — deliberately, because a
+# check that is expensive gets made optional and a check that is optional gets
+# skipped.
+#
+# The heavyweight build/test matrix stays in cmake-multi-platform.yml.
+
+on:
+  push:
+    branches: [ "main", "a/**", "EXPERIMENTAL/**" ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  seam-check:
+    name: seam-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # R1: no core file includes soma/arch/.
+      # R2: no architecture identifier in core code (arch_ir.hpp allow-listed —
+      #     the IR is a description, not logic).
+      #
+      # This caught two real leaks during the design pass: KvFormatId enumerating
+      # per-family values in a core header (which would have meant adding a third
+      # architecture required editing core), and two core structs defaulting to
+      # AttentionFamily::Gqa.
+      - name: Seam falsification
+        run: python tools/ci/check_seam.py .
+
+  header-selftest:
+    name: header-selftest (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-gcc,   os: ubuntu-latest,  cxx: g++ }
+          - { name: linux-clang, os: ubuntu-latest,  cxx: clang++ }
+          - { name: windows-msvc, os: windows-latest, cxx: '' }
+    steps:
+      - uses: actions/checkout@v4
+
+      # Every public Soma header compiles standalone and twice-included, with
+      # the project's real warning settings. No vcpkg: these headers depend on
+      # nothing but the standard library, which is itself worth enforcing.
+      - name: Compile each header standalone (POSIX)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          fail=0
+          for hdr in $(find include/soma -name '*.hpp' | sort); do
+            rel="${hdr#include/}"
+            printf '  %-40s' "$rel"
+            printf '#include "%s"\n#include "%s"\nint probe() { return 0; }\n' "$rel" "$rel" > /tmp/st.cpp
+            if ${{ matrix.cxx }} -std=c++20 -Wall -Wextra -Wpedantic -Werror \
+                 -Wno-unknown-pragmas -Wno-missing-field-initializers \
+                 -Iinclude -fsyntax-only /tmp/st.cpp; then
+              echo "ok"
+            else
+              echo "FAIL"; fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Compile each header standalone (MSVC)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $vs = & $vswhere -latest -products * `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath
+          if (-not $vs) { throw 'Visual Studio C++ tools were not found' }
+          Import-Module (Join-Path $vs 'Common7/Tools/Microsoft.VisualStudio.DevShell.dll')
+          Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation `
+              -DevCmdArguments '-arch=x64 -host_arch=x64'
+          $fail = 0
+          $hdrs = Get-ChildItem -Path include/soma -Filter *.hpp -Recurse | Sort-Object FullName
+          $sep = [char]92
+          New-Item -ItemType Directory -Force -Path selftest | Out-Null
+          foreach ($h in $hdrs) {
+            $rel  = $h.FullName.Substring((Resolve-Path include).Path.Length + 1).Replace($sep, '/')
+            $safe = ($rel -replace '[^A-Za-z0-9]','_')
+            $body = "#include `"$rel`"" + "`n" + "#include `"$rel`"" + "`n" + "int probe_$safe() { return 0; }"
+            Set-Content -Path "selftest/st_$safe.cpp" -Value $body -Encoding ascii
+          }
+          & cl /nologo /c /EHsc /std:c++20 /W4 /WX /utf-8 /permissive- `
+               /DNOMINMAX /DWIN32_LEAN_AND_MEAN /D_CRT_SECURE_NO_WARNINGS `
+               /Iinclude /Foselftest/ selftest/st_*.cpp
+          if ($LASTEXITCODE -ne 0) { $fail = 1 }
+          exit $fail
+
+  format-check:
+    name: format-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format-17
+
+      # Scoped to the new tree only. Reformatting the ~40 pre-existing
+      # translation units would bury the actual change in whitespace and send
+      # every future `git blame` here. Scope widens as files are rewritten.
+      - name: Check formatting
+        run: |
+          files=$(find include/soma src/soma \
+                       include/node/engine_*.hpp \
+                       include/node/kv_checkpoint_backend.hpp \
+                       include/common/engine_client.hpp \
+                       include/common/footprint.hpp \
+                       include/control/model_registry.hpp \
+                       include/control/route_scope.hpp \
+                       -name '*.hpp' -o -name '*.cpp' 2>/dev/null | sort)
+          [ -z "$files" ] && { echo "nothing to check"; exit 0; }
+          clang-format-17 --dry-run --Werror $files
+
+  schema-check:
+    name: schema-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Applies the registry migrations to a scratch database. Catches DDL typos
+      # before the first SQLiteCpp call, and verifies the migration bookkeeping
+      # matches AgentDB::run_migrations()'s established pattern.
+      - name: Apply registry migrations
+        run: |
+          python - <<'PY'
+          import sqlite3, pathlib, sys, tempfile, os
+          d = tempfile.mkdtemp()
+          con = sqlite3.connect(os.path.join(d, "control.db"))
+          applied = []
+          for sql in sorted(pathlib.Path("schemas/registry").glob("*.sql")):
+              con.executescript(sql.read_text(encoding="utf-8"))
+              applied.append(sql.name)
+          con.commit()
+          vers = [r[0] for r in con.execute("SELECT version FROM schema_migrations ORDER BY version")]
+          tabs = [r[0] for r in con.execute(
+              "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+          print("applied :", ", ".join(applied))
+          print("versions:", vers)
+          print("tables  :", ", ".join(tabs))
+          if len(vers) != len(applied):
+              sys.exit(f"migration count mismatch: {len(applied)} files, {len(vers)} versions")
+          if vers != list(range(1, len(vers) + 1)):
+              sys.exit(f"migration versions are not contiguous from 1: {vers}")
+          PY
+
+# ── Landing later, at the gate that makes them meaningful ────────────────────
+#
+#   soma-conformance  (G0)  the full ladder on committed tiny-random fixtures,
+#                           per family, every commit. Fixtures and golden oracle
+#                           logits are COMMITTED, not generated here — that keeps
+#                           torch/transformers out of the CI image and makes the
+#                           oracle reproducible.
+#
+#   aarch64-cross     (G5)  the vcpkg-aarch64-linux-release preset exists and CI
+#                           has never used it. Cross-compilation is a stated
+#                           requirement, so it needs a gate rather than a hope.

@@ -1,0 +1,316 @@
+{
+  "format": 1,
+  "metadata": {
+    "total_size": 352640
+  },
+  "weight_map": {
+    "model.dspark.confidence_proj.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00002.bin",
+      "group": 96,
+      "length": 384,
+      "offset": 188416,
+      "shape": [
+        1,
+        96
+      ]
+    },
+    "model.dspark.layers.0.ffn.shared_experts.down_proj.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00000.bin",
+      "group": 32,
+      "length": 8192,
+      "offset": 49152,
+      "shape": [
+        64,
+        32
+      ]
+    },
+    "model.dspark.layers.0.ffn.shared_experts.gate_proj.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00000.bin",
+      "group": 64,
+      "length": 8192,
+      "offset": 32768,
+      "shape": [
+        32,
+        64
+      ]
+    },
+    "model.dspark.layers.0.ffn.shared_experts.up_proj.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00000.bin",
+      "group": 64,
+      "length": 8192,
+      "offset": 40960,
+      "shape": [
+        32,
+        64
+      ]
+    },
+    "model.dspark.layers.0.self_attn.wkv.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00000.bin",
+      "group": 64,
+      "length": 4096,
+      "offset": 16384,
+      "shape": [
+        16,
+        64
+      ]
+    },
+    "model.dspark.layers.0.self_attn.wo_a.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00000.bin",
+      "group": 32,
+      "length": 4096,
+      "offset": 20480,
+      "shape": [
+        32,
+        32
+      ]
+    },
+    "model.dspark.layers.0.self_attn.wo_b.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00000.bin",
+      "group": 32,
+      "length": 8192,
+      "offset": 24576,
+      "shape": [
+        64,
+        32
+      ]
+    },
+    "model.dspark.layers.0.self_attn.wq_a.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00000.bin",
+      "group": 64,
+      "length": 8192,
+      "offset": 0,
+      "shape": [
+        32,
+        64
+      ]
+    },
+    "model.dspark.layers.0.self_attn.wq_b.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00000.bin",
+      "group": 32,
+      "length": 8192,
+      "offset": 8192,
+      "shape": [
+        64,
+        32
+      ]
+    },
+    "model.dspark.layers.1.ffn.shared_experts.down_proj.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00001.bin",
+      "group": 32,
+      "length": 8192,
+      "offset": 49152,
+      "shape": [
+        64,
+        32
+      ]
+    },
+    "model.dspark.layers.1.ffn.shared_experts.gate_proj.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00001.bin",
+      "group": 64,
+      "length": 8192,
+      "offset": 32768,
+      "shape": [
+        32,
+        64
+      ]
+    },
+    "model.dspark.layers.1.ffn.shared_experts.up_proj.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00001.bin",
+      "group": 64,
+      "length": 8192,
+      "offset": 40960,
+      "shape": [
+        32,
+        64
+      ]
+    },
+    "model.dspark.layers.1.self_attn.wkv.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00001.bin",
+      "group": 64,
+      "length": 4096,
+      "offset": 16384,
+      "shape": [
+        16,
+        64
+      ]
+    },
+    "model.dspark.layers.1.self_attn.wo_a.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00001.bin",
+      "group": 32,
+      "length": 4096,
+      "offset": 20480,
+      "shape": [
+        32,
+        32
+      ]
+    },
+    "model.dspark.layers.1.self_attn.wo_b.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00001.bin",
+      "group": 32,
+      "length": 8192,
+      "offset": 24576,
+      "shape": [
+        64,
+        32
+      ]
+    },
+    "model.dspark.layers.1.self_attn.wq_a.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00001.bin",
+      "group": 64,
+      "length": 8192,
+      "offset": 0,
+      "shape": [
+        32,
+        64
+      ]
+    },
+    "model.dspark.layers.1.self_attn.wq_b.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00001.bin",
+      "group": 32,
+      "length": 8192,
+      "offset": 8192,
+      "shape": [
+        64,
+        32
+      ]
+    },
+    "model.dspark.layers.2.ffn.shared_experts.down_proj.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00002.bin",
+      "group": 32,
+      "length": 8192,
+      "offset": 49152,
+      "shape": [
+        64,
+        32
+      ]
+    },
+    "model.dspark.layers.2.ffn.shared_experts.gate_proj.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00002.bin",
+      "group": 64,
+      "length": 8192,
+      "offset": 32768,
+      "shape": [
+        32,
+        64
+      ]
+    },
+    "model.dspark.layers.2.ffn.shared_experts.up_proj.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00002.bin",
+      "group": 64,
+      "length": 8192,
+      "offset": 40960,
+      "shape": [
+        32,
+        64
+      ]
+    },
+    "model.dspark.layers.2.self_attn.wkv.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00002.bin",
+      "group": 64,
+      "length": 4096,
+      "offset": 16384,
+      "shape": [
+        16,
+        64
+      ]
+    },
+    "model.dspark.layers.2.self_attn.wo_a.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00002.bin",
+      "group": 32,
+      "length": 4096,
+      "offset": 20480,
+      "shape": [
+        32,
+        32
+      ]
+    },
+    "model.dspark.layers.2.self_attn.wo_b.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00002.bin",
+      "group": 32,
+      "length": 8192,
+      "offset": 24576,
+      "shape": [
+        64,
+        32
+      ]
+    },
+    "model.dspark.layers.2.self_attn.wq_a.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00002.bin",
+      "group": 64,
+      "length": 8192,
+      "offset": 0,
+      "shape": [
+        32,
+        64
+      ]
+    },
+    "model.dspark.layers.2.self_attn.wq_b.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00002.bin",
+      "group": 32,
+      "length": 8192,
+      "offset": 8192,
+      "shape": [
+        64,
+        32
+      ]
+    },
+    "model.dspark.main_proj.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00000.bin",
+      "group": 96,
+      "length": 49152,
+      "offset": 57344,
+      "shape": [
+        64,
+        192
+      ]
+    },
+    "model.dspark.markov_w1.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00002.bin",
+      "group": 32,
+      "length": 65536,
+      "offset": 57344,
+      "shape": [
+        512,
+        32
+      ]
+    },
+    "model.dspark.markov_w2.weight": {
+      "dtype": "f32",
+      "file": "dspark-dense-q-00002.bin",
+      "group": 32,
+      "length": 65536,
+      "offset": 122880,
+      "shape": [
+        512,
+        32
+      ]
+    }
+  }
+}

@@ -18,6 +18,27 @@ struct ControlConfig {
     // Model distribution
     std::string models_dir  = "models";
 
+    // ── admission ─────────────────────────────────────────────────────────────
+    // Converting a model runs the Python tools in tools/admission/ as
+    // subprocesses. They are a dependency of ADMITTING, which happens once per
+    // model — never of serving.
+    std::string admission_python     = "python";           // MM_ADMISSION_PYTHON
+    std::string admission_tools_dir  = "tools/admission";  // MM_ADMISSION_TOOLS
+    std::string admission_soma_path  = "soma";             // MM_SOMA_PATH
+    std::string containers_dir       = "data/containers";  // MM_CONTAINERS_DIR
+    std::string sources_dir          = "data/sources";     // MM_SOURCES_DIR
+    std::string admission_quant      = "q4_g";             // MM_ADMISSION_QUANT
+    std::string admission_expert_down = "q6_g";
+
+    // Allow admitting a repo that publishes only pickled .bin weights, which
+    // conversion has to unpickle — i.e. execute. Opt-in per deployment.
+    bool admission_allow_pickle      = false;              // MM_ADMISSION_ALLOW_PICKLE
+
+    // How many admissions may run at once; the rest queue. 1 by default —
+    // a conversion moves tens to hundreds of GB, so two on one box contend
+    // for the same disk rather than going twice as fast.
+    int  admission_max_concurrent    = 1;                  // MM_ADMISSION_MAX_CONCURRENT
+
     // Optional bearer token required by external /v1/* client routes.
     std::string external_api_token;
 

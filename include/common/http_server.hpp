@@ -5,6 +5,7 @@
 #include <memory>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 // Thin wrapper around cpp-httplib Server.
 namespace httplib { class Server; struct Request; struct Response; }
@@ -38,6 +39,13 @@ public:
     void Put(const std::string& pattern, Handler h);
     void Delete(const std::string& pattern, Handler h);
     void PostUpload(const std::string& pattern, UploadHandler h);
+
+    /// Every route registered on this server, as "METHOD /pattern".
+    ///
+    /// Exists so authorization coverage can be CHECKED rather than maintained by
+    /// hand: a route with no scope entry is a startup failure, and that check
+    /// needs the actual registrations, not a second list someone updates.
+    std::vector<std::string> registered_routes() const;
 
     // Raise the maximum accepted request-body size (cpp-httplib defaults to
     // 100 MB, which would reject streamed model uploads). Applies to all routes.

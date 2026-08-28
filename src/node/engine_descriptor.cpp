@@ -1,0 +1,419 @@
+// Mantic-Mind — the engine registry: llama.cpp and Soma as two DESCRIPTORS.
+//
+// The point of this file is what is NOT in it. Today the node has
+// `backend != "llama-cpp" -> 400` duplicated at node_api_server.cpp:449 and
+// :911, `SlotManager::Slot` hardcodes `unique_ptr<RuntimeProcess>` plus llama
+// paths, and adding an engine means touching all of them. Here an engine is a
+// row of callbacks, and the node's only question is "is this id registered?".
+//
+// A consequence worth stating: an unknown backend now returns a message listing
+// the registry's ACTUAL contents. The old 400 named "llama-cpp" from a string
+// literal, so it stayed accurate only as long as nothing else was ever added.
+
+#include "common/engine_capabilities.hpp"
+#include "node/llama_runtime.hpp"
+#include "node/vllm_runtime.hpp"
+#include "node/engine_descriptor.hpp"
+
+#include "common/engine_client.hpp"
+#include "common/util.hpp"
+#include "node/engine_process.hpp"
+#include "node/kv_checkpoint_backend.hpp"
+
+#include <httplib.h>
+
+#include <algorithm>
+#include <filesystem>
+#include <memory>
+#include <mutex>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+namespace mm {
+
+namespace {
+
+/// Recursive directory sizing.
+///
+/// `estimate_inference_vram_mb()` calls fs::file_size() on the path, which sets
+/// an error_code on a directory and falls through to a flat 2048 MB. Every
+/// multi-shard HF checkpoint and every Soma container therefore sizes
+/// identically today, and it is the single scalar the scheduler feeds to
+/// nodes_with_available_vram(). This is a live bug on the FALLBACK path too, not
+/// only for Soma.
+std::uint64_t path_size_bytes(const std::string& path) {
+    std::error_code ec;
+    if (!fs::exists(path, ec)) return 0;
+    if (!fs::is_directory(path, ec)) {
+        const auto sz = fs::file_size(path, ec);
+        return ec ? 0 : sz;
+    }
+    std::uint64_t total = 0;
+    for (const auto& e : fs::recursive_directory_iterator(path, ec)) {
+        if (ec) break;
+        std::error_code fe;
+        if (e.is_regular_file(fe)) {
+            const auto sz = e.file_size(fe);
+            if (!fe) total += sz;
+        }
+    }
+    return total;
+}
+
+/// One instance each, owned here. EngineDescriptor holds a raw pointer because a
+/// descriptor is copied into the registry and the backend is stateless — every
+/// call carries its own base_url and path.
+LlamaKvBackend& llama_kv() {
+    static LlamaKvBackend backend;
+    return backend;
+}
+
+SomaKvBackend& soma_kv() {
+    static SomaKvBackend backend;
+    return backend;
+}
+
+} // namespace
+
+/// Descriptors are held indirectly so that a pointer returned by find() stays
+/// valid across later registrations. With a vector of values, registering a
+/// second engine reallocates and dangles every pointer already handed out — and
+/// the node caches those pointers in its slot records.
+struct EngineRegistry::Impl {
+    mutable std::mutex mu;
+    std::vector<std::unique_ptr<EngineDescriptor>> engines;
+};
+
+EngineRegistry& EngineRegistry::instance() {
+    static EngineRegistry reg;
+    return reg;
+}
+
+EngineRegistry::EngineRegistry() : impl_(std::make_unique<Impl>()) {}
+
+EngineRegistry::~EngineRegistry() = default;
+
+void EngineRegistry::register_engine(EngineDescriptor descriptor) {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    for (auto& e : impl_->engines) {
+        if (e->id == descriptor.id) {
+            // Update in place. The provisioner re-registers once it resolves a
+            // real executable path, and appending instead would leave the
+            // placeholder ahead of it in the search order.
+            *e = std::move(descriptor);
+            return;
+        }
+    }
+    impl_->engines.push_back(std::make_unique<EngineDescriptor>(std::move(descriptor)));
+}
+
+const EngineDescriptor* EngineRegistry::find(const std::string& id) const {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    for (const auto& e : impl_->engines) {
+        if (e->id == id) return e.get();
+    }
+    return nullptr;
+}
+
+std::vector<std::string> EngineRegistry::ids() const {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    std::vector<std::string> out;
+    out.reserve(impl_->engines.size());
+    for (const auto& e : impl_->engines)
+        out.push_back(e->id);
+    return out;
+}
+
+std::vector<const EngineDescriptor*> EngineRegistry::all() const {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    std::vector<const EngineDescriptor*> out;
+    out.reserve(impl_->engines.size());
+    for (const auto& e : impl_->engines)
+        out.push_back(e.get());
+    return out;
+}
+
+// ── descriptors ──────────────────────────────────────────────────────────────
+
+EngineDescriptor make_soma_descriptor(const std::string& executable) {
+    EngineDescriptor d;
+    d.id = "soma";
+    d.display_name = "Soma (MoE streaming)";
+    // From the shared table, not a literal — control has to answer the same
+    // question at the request boundary and cannot reach this file. See
+    // common/engine_capabilities.hpp.
+    d.supports_vision = engine_supports_vision(d.id);
+    d.supports_suspend = true;
+    // The one capability that distinguishes it from the fallback at this layer:
+    // real per-sequence state, so several agents share one engine rather than
+    // one process each.
+    d.supports_multi_seq = true;
+
+    d.readiness.kind = ReadinessProbe::Kind::HttpHealth;
+    d.readiness.http_path = "/health";
+
+    d.build_launch = [executable](const EngineLoadRequest& req) {
+        EngineLaunchSpec spec;
+        spec.runtime_name = "soma";
+        spec.executable = executable;
+        spec.port = req.port;
+        spec.readiness.kind = ReadinessProbe::Kind::HttpHealth;
+        spec.readiness.http_path = "/health";
+
+        spec.args = {"serve",
+                     "--model-dir",
+                     req.model_path,
+                     "--port",
+                     std::to_string(req.port),
+                     "--host",
+                     "127.0.0.1"};
+        if (req.settings.ctx_size > 0) {
+            spec.args.push_back("--ctx-size");
+            spec.args.push_back(std::to_string(req.settings.ctx_size));
+        }
+        // RuntimeSettings::parallel predates Soma and defaults to llama.cpp's
+        // one slot. Treat that legacy default as "unstated" so Soma retains its
+        // established four-sequence capacity; explicit wider selections still
+        // flow through. Direct Soma launches can select one with --kv-slots 1.
+        if (req.settings.parallel > 1) {
+            spec.args.push_back("--kv-slots");
+            spec.args.push_back(std::to_string(req.settings.parallel));
+        }
+        if (!req.kv_checkpoint_dir.empty()) {
+            spec.args.push_back("--kv-dir");
+            spec.args.push_back(req.kv_checkpoint_dir);
+        }
+        spec.args.insert(
+            spec.args.end(), req.settings.extra_args.begin(), req.settings.extra_args.end());
+        return spec;
+    };
+
+    d.make_client = [](const std::string& base_url) -> std::unique_ptr<EngineClient> {
+        return std::make_unique<SomaEngineClient>(base_url);
+    };
+
+    d.kv = &soma_kv();
+
+    d.telemetry_path = "/internal/telemetry";
+    d.heat_path = "/internal/heat";
+
+    d.fetch_sequences = [](const std::string& base_url, std::string& out_json) {
+        httplib::Client cli(base_url);
+        cli.set_connection_timeout(2);
+        cli.set_read_timeout(5);
+        auto res = cli.Get("/internal/sessions");
+        if (!res || res->status != 200) return false;
+        out_json = res->body;
+        return true;
+    };
+
+    d.estimate_footprint =
+        [](const EngineLoadRequest& req, ResourceFootprint& out, std::string& error) {
+            // The honest version reads `soma plan --json`, which is headers-only and
+            // safe on a node that could not host the model. Until that call is wired
+            // in, size the directory rather than return a constant — a wrong number
+            // that varies with the model beats a constant that does not.
+            const auto bytes = path_size_bytes(req.model_path);
+            if (bytes == 0) {
+                error = "cannot size " + req.model_path;
+                return false;
+            }
+            out.disk_mb = static_cast<std::int64_t>(bytes / (1024 * 1024));
+            out.ram_mb = out.disk_mb; // resident upper bound; the plan refines it
+            out.vram_mb = 0;          // CPU-only in v1
+            return true;
+        };
+
+    // Two agents may share one Soma process: per-sequence KV is the entire point
+    // of the scheduler. The fallback cannot, which is why this is a descriptor
+    // field rather than a global policy.
+    //
+    // Note what is ABSENT versus llama_launch_compatible(): ctx_size. In
+    // llama-server ctx_size is carved per slot at launch, so two agents wanting
+    // different context lengths need different processes. In Soma the KV slot is
+    // per-sequence and sized on admission, so ctx_size rides the request. That
+    // single omission is what lets agents co-locate — and it is also why this is
+    // a per-descriptor predicate rather than one shared function.
+    //
+    // The model itself is not compared here: it is not in RuntimeSettings, and
+    // the caller has already matched EngineLoadRequest::model_path before asking.
+    d.launch_compatible = [](const EngineLoadRequest& lhs, const EngineLoadRequest& rhs) {
+        const auto& a = lhs.settings;
+        const auto& b = rhs.settings;
+        return a.n_threads == b.n_threads // process-wide pool
+               && a.n_threads_http == b.n_threads_http &&
+               a.batch_size == b.batch_size // scheduler, not per-seq
+               && a.ubatch_size == b.ubatch_size &&
+               a.extra_args == b.extra_args; // arbitrary launch flags
+    };
+
+    // A CONTAINER, which is a directory. Checking for `container_meta.json`
+    // rather than merely that the directory exists: `soma serve` refuses an
+    // unconverted checkpoint, and refusing it here costs a stat instead of a
+    // process spawn and a startup timeout.
+    d.validate_model_ref = [](const std::string& model_ref, std::string& detail) {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        if (!fs::is_directory(model_ref, ec)) {
+            detail = fs::is_regular_file(model_ref, ec)
+                         ? "soma loads a converted container DIRECTORY, not a file: " + model_ref
+                         : "no such directory on this node: " + model_ref;
+            return false;
+        }
+        if (!fs::is_regular_file(fs::path(model_ref) / "container_meta.json", ec)) {
+            detail = "not a converted container (no container_meta.json): " + model_ref +
+                     "; admit it through POST /v1/models/admit first";
+            return false;
+        }
+        return true;
+    };
+
+    return d;
+}
+
+EngineDescriptor make_llama_descriptor(const std::string& executable) {
+    EngineDescriptor d;
+    d.id = "llama-cpp";
+    d.display_name = "llama.cpp";
+    d.supports_vision = engine_supports_vision(d.id);
+    d.supports_suspend = true;
+    // llama-server's slot state is per-process in practice; the existing
+    // checkpoint path hardcodes sequence 0, so a --parallel > 1 slot only ever
+    // saves its first sequence. Reporting false here is what stops the scheduler
+    // from co-locating agents on that assumption.
+    d.supports_multi_seq = false;
+
+    d.readiness.kind = ReadinessProbe::Kind::HttpHealth;
+    d.readiness.http_path = "/health";
+
+    d.build_launch = [executable](const EngineLoadRequest& req) {
+        EngineLaunchSpec spec;
+        spec.runtime_name = "llama-cpp";
+        spec.executable = executable;
+        spec.port = req.port;
+        spec.readiness.kind = ReadinessProbe::Kind::HttpHealth;
+        spec.readiness.http_path = "/health";
+        // THE existing builder, which is what this callback's documentation has
+        // always claimed it called. It hand-rolled its own argv instead — model,
+        // port, host, mmproj, slot-save-path — and silently dropped everything
+        // else in RuntimeSettings: ctx_size, n_gpu_layers, threads, threads_http,
+        // parallel, batch_size, ubatch_size, flash_attn and extra_args
+        // (roadmap D14). An engine started through EngineSupervisor therefore ran
+        // on llama.cpp's defaults no matter what the operator configured, and
+        // n_gpu_layers defaulting to -1 means ALL layers on GPU — so the drop
+        // over-committed VRAM rather than under-committing it.
+        //
+        // It also carries the rule that user-supplied extra_args win over
+        // computed defaults, which a second argv builder had no way to honour.
+        spec.args = build_llama_server_args(req.model_path,
+                                            req.mmproj_path,
+                                            req.settings,
+                                            req.port,
+                                            req.kv_checkpoint_dir);
+        return spec;
+    };
+
+    d.make_client = [](const std::string& base_url) -> std::unique_ptr<EngineClient> {
+        return std::make_unique<LlamaEngineClient>(base_url);
+    };
+
+    d.kv = &llama_kv();
+
+    d.estimate_footprint =
+        [](const EngineLoadRequest& req, ResourceFootprint& out, std::string& error) {
+            const auto bytes = path_size_bytes(req.model_path);
+            if (bytes == 0) {
+                error = "cannot size " + req.model_path;
+                return false;
+            }
+            out.disk_mb = static_cast<std::int64_t>(bytes / (1024 * 1024));
+            out.vram_mb = out.disk_mb;
+            out.ram_mb = 0;
+            return true;
+        };
+
+    // The existing, unit-tested predicate from common/models.hpp — not `false`.
+    // llama.cpp agents already share processes today, and answering "never" here
+    // would silently spawn one llama-server per agent.
+    d.launch_compatible = [](const EngineLoadRequest& a, const EngineLoadRequest& b) {
+        return llama_launch_compatible(a.settings, b.settings);
+    };
+
+    // A node-local GGUF FILE. This check used to run in the load-model handler
+    // for every backend, which is why a Soma container could never load.
+    d.validate_model_ref = [](const std::string& model_ref, std::string& detail) {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        if (fs::is_regular_file(model_ref, ec)) return true;
+        detail = mm::util::is_hf_repo_id(model_ref)
+                     ? "llama.cpp requires a node-local GGUF file; Hugging Face repository IDs are "
+                       "not loadable"
+                     : "model file not found on this node: " + model_ref;
+        return false;
+    };
+    return d;
+}
+
+EngineDescriptor make_vllm_descriptor(const std::string& executable,
+                                      const std::string& hf_cache_dir) {
+    EngineDescriptor d;
+    d.id = "vllm";
+    d.display_name = "vLLM";
+    d.supports_vision = true;
+    d.supports_suspend = true;
+    d.supports_multi_seq = true;
+    d.readiness.kind = ReadinessProbe::Kind::HttpHealth;
+    d.readiness.http_path = "/health";
+
+    d.build_launch = [executable, hf_cache_dir](const EngineLoadRequest& req) {
+        EngineLaunchSpec spec;
+        spec.runtime_name = "vllm";
+        spec.executable = executable;
+        spec.port = req.port;
+        spec.readiness.kind = ReadinessProbe::Kind::HttpHealth;
+        spec.readiness.http_path = "/health";
+        const VllmEngineConfig profile = req.vllm.value_or(VllmEngineConfig{});
+        spec.args = build_vllm_server_args(
+            req.model_path, req.served_model_name, profile, req.port);
+        if (profile.enable_sleep_mode)
+            spec.env.emplace_back("VLLM_SERVER_DEV_MODE", "1");
+        if (!hf_cache_dir.empty()) spec.env.emplace_back("HF_HOME", hf_cache_dir);
+        if (!req.ray_address.empty())
+            spec.env.emplace_back("RAY_ADDRESS", req.ray_address);
+        if (!req.host_ip.empty())
+            spec.env.emplace_back("VLLM_HOST_IP", req.host_ip);
+        if (!req.gpu_devices.empty()) {
+            std::string visible;
+            for (const int index : req.gpu_devices) {
+                if (!visible.empty()) visible += ',';
+                visible += std::to_string(index);
+            }
+            spec.env.emplace_back("CUDA_VISIBLE_DEVICES", std::move(visible));
+        }
+        return spec;
+    };
+    d.make_client = [](const std::string& base_url) -> std::unique_ptr<EngineClient> {
+        return std::make_unique<VllmEngineClient>(base_url);
+    };
+    d.estimate_footprint = [](const EngineLoadRequest& req,
+                              ResourceFootprint& out,
+                              std::string&) {
+        // vLLM owns the definitive memory admission.  Keep disk accounting for
+        // local paths and avoid inventing a VRAM byte count from a percentage.
+        const auto bytes = path_size_bytes(req.model_path);
+        if (bytes > 0) out.disk_mb = static_cast<std::int64_t>(bytes / (1024 * 1024));
+        return true;
+    };
+    d.launch_compatible = [](const EngineLoadRequest& a, const EngineLoadRequest& b) {
+        return a.served_model_name == b.served_model_name &&
+               a.ray_address == b.ray_address &&
+               vllm_launch_compatible(a.vllm.value_or(VllmEngineConfig{}),
+                                      b.vllm.value_or(VllmEngineConfig{}));
+    };
+    // No validate_model_ref callback: unlike llama.cpp and Soma, vLLM resolves
+    // Hugging Face repository ids itself as well as accepting local paths.
+    return d;
+}
+
+} // namespace mm

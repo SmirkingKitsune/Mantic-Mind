@@ -139,11 +139,39 @@ std::vector<NodeInfo> NodeRegistry::nodes_with_model(const std::string& model) c
     return out;
 }
 
+bool NodeRegistry::placement_allowed_locked(const NodeInfo& n) const {
+    // The gate applies only when something is MANAGING engine conformance.
+    //
+    // Without an engine-config provider nothing ever pushes a configuration, so
+    // no node can ever report `conforming` — gating anyway would mean a registry
+    // used without a config store silently places nowhere, and the symptom
+    // ("no available nodes") would point at healthy nodes. Control always sets
+    // the provider, so production always gates; an embedding that does not
+    // manage engines is not silently broken by a policy it never opted into.
+    if (!engine_config_provider_) return true;
+    return conformance_permits_placement(n.conformance);
+}
+
 std::vector<NodeInfo> NodeRegistry::available_nodes() const {
     std::lock_guard<std::mutex> g(mutex_);
     std::vector<NodeInfo> out;
+    // Conformance is part of "available", not a separate check at the call
+    // site. This and nodes_with_capacity() are the two doors placement uses,
+    // and a predicate written at each caller instead is how the third caller
+    // gets missed.
     for (auto& [_, n] : nodes_)
-        if (n.connected) out.push_back(n);
+        if (n.connected && placement_allowed_locked(n)) out.push_back(n);
+    return out;
+}
+
+std::vector<NodeInfo> NodeRegistry::conforming_nodes() const {
+    std::lock_guard<std::mutex> g(mutex_);
+    std::vector<NodeInfo> out;
+    // Literal, unlike the placement filters above: a caller asking which nodes
+    // CONFORM wants the conformance answer, not the placement decision that
+    // happens to coincide with it when nothing is managing engines.
+    for (auto& [_, n] : nodes_)
+        if (conformance_permits_placement(n.conformance)) out.push_back(n);
     return out;
 }
 
@@ -195,48 +223,45 @@ std::vector<NodeInfo> NodeRegistry::nodes_with_model_loaded(
     return out;
 }
 
-std::vector<NodeInfo> NodeRegistry::nodes_with_available_vram(
-    int64_t min_vram_mb) const
-{
+std::vector<NodeInfo> NodeRegistry::nodes_with_capacity(const ResourceFootprint& footprint,
+                                                        const CapacityPolicy& policy) const {
+    // The uniform-demand case, expressed in terms of the per-node one so there
+    // is a single ranking implementation rather than two that must agree.
+    return nodes_with_capacity_for([&footprint](const NodeInfo&) { return footprint; }, policy);
+}
+
+std::vector<NodeInfo> NodeRegistry::nodes_with_capacity_for(const FootprintForNode& demand,
+                                                            const CapacityPolicy& policy) const {
     std::lock_guard<std::mutex> g(mutex_);
     struct Candidate {
         NodeInfo info;
-        bool     native_vram_fit = false;
-        int64_t  score_mb = 0;
+        double   score = 0.0;
     };
     std::vector<Candidate> cands;
 
-    constexpr int64_t kVramHeadroomMb = 1024;       // keep 1 GiB VRAM safety margin
-    constexpr int64_t kRamHeadroomMb  = 2048;       // keep 2 GiB system RAM safety margin
-    constexpr double  kRamOffloadWeight = 0.60;     // CPU-offloaded weights are slower/less reliable
-    constexpr int64_t kMinGpuForOffloadMb = 8192;   // require at least 8 GiB GPU for hybrid loads
-
+    // The policy constants that used to live here as four `constexpr`s are now
+    // CapacityPolicy's defaults, unchanged in value. Moving them means the node
+    // and control cannot disagree about what fits — and that the caller can pass
+    // a different policy without editing this function.
     for (auto& [_, n] : nodes_) {
         if (!n.connected) continue;
-
-        int64_t vram_free_raw = n.metrics.gpu_vram_total_mb - n.metrics.gpu_vram_used_mb;
-        int64_t ram_free_raw  = n.metrics.ram_total_mb - n.metrics.ram_used_mb;
-        int64_t vram_free = std::max<int64_t>(0, vram_free_raw - kVramHeadroomMb);
-        int64_t ram_free  = std::max<int64_t>(0, ram_free_raw  - kRamHeadroomMb);
-
-        bool native_fit = vram_free >= min_vram_mb;
-        bool allow_offload = (n.metrics.gpu_vram_total_mb >= kMinGpuForOffloadMb) ||
-                             (n.metrics.gpu_vram_total_mb <= 0);
-        int64_t effective_mb = vram_free + static_cast<int64_t>(ram_free * kRamOffloadWeight);
-        bool offload_fit = allow_offload && effective_mb >= min_vram_mb;
-
-        if (!native_fit && !offload_fit) continue;
-
-        Candidate c;
-        c.info = n;
-        c.native_vram_fit = native_fit;
-        c.score_mb = native_fit ? vram_free : effective_mb;
-        cands.push_back(std::move(c));
+        // A node with room to spare and the wrong engines has no capacity for
+        // the purpose this function serves. Placement asks "where can this
+        // run", and it cannot run on an engine set the cluster did not
+        // configure.
+        if (!placement_allowed_locked(n)) continue;
+        const auto capacity = capacity_of(n);
+        // Asked per node, because the answer differs per node.
+        const ResourceFootprint footprint = demand(n);
+        if (evaluate_fit(footprint, capacity, policy, nullptr) == FitQuality::None) continue;
+        cands.push_back({n, capacity_score(footprint, capacity, policy)});
     }
 
+    // capacity_score() already ranks a native fit above every offloaded one, so
+    // the two-key sort this replaces collapses into one. Ties still break on id
+    // so the order is stable across polls rather than hash-order.
     std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b) {
-        if (a.native_vram_fit != b.native_vram_fit) return a.native_vram_fit > b.native_vram_fit;
-        if (a.score_mb != b.score_mb) return a.score_mb > b.score_mb;
+        if (a.score != b.score) return a.score > b.score;
         return a.info.id < b.info.id;
     });
 
@@ -246,8 +271,134 @@ std::vector<NodeInfo> NodeRegistry::nodes_with_available_vram(
     return out;
 }
 
+namespace {
+
+bool engine_ready_for_placement(const NodeInfo& node,
+                                const std::string& engine_id,
+                                std::uint32_t config_version) {
+    if (!node.connected || node.engine_config_version != config_version) return false;
+    const auto it = std::find_if(node.engines.begin(), node.engines.end(),
+                                 [&](const RuntimeStatus& runtime) {
+                                     return runtime.engine_id == engine_id;
+                                 });
+    return it != node.engines.end() && it->ready;
+}
+
+} // namespace
+
+std::vector<NodeInfo> NodeRegistry::available_nodes_for_engine(
+    const std::string& engine_id, std::uint32_t config_version) const {
+    std::lock_guard<std::mutex> g(mutex_);
+    std::vector<NodeInfo> out;
+    for (const auto& [_, node] : nodes_) {
+        if (engine_ready_for_placement(node, engine_id, config_version))
+            out.push_back(node);
+    }
+    std::sort(out.begin(), out.end(), [](const NodeInfo& lhs, const NodeInfo& rhs) {
+        return lhs.id < rhs.id;
+    });
+    return out;
+}
+
+std::vector<NodeInfo> NodeRegistry::nodes_with_capacity_for_engine(
+    const FootprintForNode& demand,
+    const std::string& engine_id,
+    std::uint32_t config_version,
+    const CapacityPolicy& policy) const {
+    struct Candidate {
+        NodeInfo info;
+        double score = 0.0;
+    };
+    std::lock_guard<std::mutex> g(mutex_);
+    std::vector<Candidate> candidates;
+    for (const auto& [_, node] : nodes_) {
+        if (!engine_ready_for_placement(node, engine_id, config_version)) continue;
+        const auto capacity = capacity_of(node);
+        const auto footprint = demand(node);
+        if (evaluate_fit(footprint, capacity, policy, nullptr) == FitQuality::None) continue;
+        candidates.push_back({node, capacity_score(footprint, capacity, policy)});
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& lhs,
+                                                        const Candidate& rhs) {
+        if (lhs.score != rhs.score) return lhs.score > rhs.score;
+        return lhs.info.id < rhs.info.id;
+    });
+    std::vector<NodeInfo> out;
+    out.reserve(candidates.size());
+    for (auto& candidate : candidates) out.push_back(std::move(candidate.info));
+    return out;
+}
+
 void NodeRegistry::set_update_callback(UpdateCallback cb) {
     std::lock_guard<std::mutex> g(mutex_); update_cb_ = std::move(cb);
+}
+
+// ── Cluster engine configuration ─────────────────────────────────────────────
+void NodeRegistry::set_engine_config_provider(EngineConfigProvider provider) {
+    std::lock_guard<std::mutex> g(mutex_);
+    engine_config_provider_ = std::move(provider);
+}
+
+bool NodeRegistry::push_engine_config(const NodeId& id,
+                                      const ClusterEngineConfig& cfg,
+                                      std::string& out_error) {
+    out_error.clear();
+
+    std::string url;
+    std::string key;
+    {
+        std::lock_guard<std::mutex> g(mutex_);
+        auto it = nodes_.find(id);
+        if (it == nodes_.end()) {
+            out_error = "unknown node " + id;
+            return false;
+        }
+        url = it->second.url;
+        key = it->second.api_key;
+    }
+
+    // Outside the lock: this is an HTTP call, and holding the registry mutex
+    // across it would stall every read for the duration of a push fan-out.
+    HttpClient client(url);
+    if (!key.empty()) client.set_bearer_token(key);
+    const nlohmann::json body = cfg;
+    const auto res = client.post("/api/node/engine-config", body);
+    if (!res.ok()) {
+        out_error = "node " + id + " refused engine config v" +
+                    std::to_string(cfg.version) + ": HTTP " + std::to_string(res.status);
+        // The node's refusal reason matters more than the status code: it is
+        // the one place that knows WHY it will not run this configuration.
+        try {
+            const auto j = nlohmann::json::parse(res.body);
+            if (j.contains("error")) out_error += " — " + j["error"].get<std::string>();
+        } catch (...) {
+        }
+        MM_WARN("NodeRegistry: {}", out_error);
+        return false;
+    }
+
+    MM_INFO("NodeRegistry: pushed engine config v{} to node {}", cfg.version, id);
+    return true;
+}
+
+void NodeRegistry::push_engine_config_to_all(const ClusterEngineConfig& cfg) {
+    std::vector<NodeId> targets;
+    {
+        std::lock_guard<std::mutex> g(mutex_);
+        for (const auto& [id, n] : nodes_) {
+            // Unreachable nodes are skipped rather than retried here: the
+            // health poll pushes on version mismatch, so a node that was down
+            // during a change converges when it comes back instead of needing
+            // an operator to notice.
+            if (!n.connected) continue;
+            if (n.engine_config_version == cfg.version) continue;
+            targets.push_back(id);
+        }
+    }
+    for (const auto& id : targets) {
+        std::string err;
+        push_engine_config(id, cfg, err);
+    }
 }
 
 // ── Discovery ──────────────────────────────────────────────────────────────────
@@ -513,6 +664,17 @@ bool NodeRegistry::ping_node(NodeInfo& info) {
                 info.hostname = sj["hostname"].get<std::string>();
             if (sj.contains("disk_free_mb"))
                 info.disk_free_mb = sj["disk_free_mb"].get<int64_t>();
+            // Which models the node already holds. A node too old to report the
+            // field keeps `local_model_cache = true` with an empty list, so it
+            // is charged for every transfer — the conservative direction, and
+            // the same answer placement gave before the field existed.
+            if (sj.contains("local_model_ids") && sj["local_model_ids"].is_array()) {
+                info.local_model_ids.clear();
+                for (const auto& id : sj["local_model_ids"]) {
+                    if (id.is_string()) info.local_model_ids.push_back(id.get<std::string>());
+                }
+            }
+            info.local_model_cache = sj.value("local_model_cache", true);
             if (sj.contains("max_slots"))
                 info.max_slots = sj["max_slots"].get<int>();
             if (sj.contains("slot_in_use"))
@@ -537,6 +699,20 @@ bool NodeRegistry::ping_node(NodeInfo& info) {
                 info.action_progress = sj["action_progress"].get<NodeActionProgress>();
             if (sj.contains("capabilities"))
                 info.capabilities = sj["capabilities"].get<NodeCapabilities>();
+            if (sj.contains("ray"))
+                info.ray = sj["ray"].get<RayRuntimeStatus>();
+
+            // Engine conformance. A node that reports NOTHING here is left at
+            // the default Unconfigured rather than assumed healthy: an old or
+            // partial node that cannot describe its engines is exactly the node
+            // not to schedule onto, and defaulting the other way would open the
+            // gate to every node whose reply this build cannot read.
+            if (sj.contains("engine_runtimes"))
+                info.engines = sj["engine_runtimes"].get<std::vector<RuntimeStatus>>();
+            if (sj.contains("engine_conformance"))
+                info.conformance = sj["engine_conformance"].get<EngineConformance>();
+            if (sj.contains("engine_config_version"))
+                info.engine_config_version = sj["engine_config_version"].get<std::uint32_t>();
 
             // Backfill occupancy counts when a node returns only raw slots.
             if (!sj.contains("slot_in_use")) {
@@ -591,8 +767,9 @@ void NodeRegistry::poll_all_nodes() {
         const auto previous_connection = info.connection_status;
         ping_node(info); // modifies info in place
 
-        // Write updated info back; grab callback outside the lock
+        // Write updated info back; grab callbacks outside the lock
         UpdateCallback cb;
+        EngineConfigProvider provider;
         {
             std::lock_guard<std::mutex> g(mutex_);
             auto it = nodes_.find(id);
@@ -603,6 +780,8 @@ void NodeRegistry::poll_all_nodes() {
                 it->second.loaded_model  = info.loaded_model;
                 it->second.slots         = info.slots;
                 it->second.disk_free_mb  = info.disk_free_mb;
+                it->second.local_model_ids = info.local_model_ids;
+                it->second.local_model_cache = info.local_model_cache;
                 it->second.max_slots     = info.max_slots;
                 it->second.slot_in_use   = info.slot_in_use;
                 it->second.connection_status = info.connection_status;
@@ -622,12 +801,31 @@ void NodeRegistry::poll_all_nodes() {
                 it->second.llama_runtime = info.llama_runtime;
                 it->second.action_progress = info.action_progress;
                 it->second.capabilities = info.capabilities;
+                it->second.engines = info.engines;
+                it->second.conformance = info.conformance;
+                it->second.engine_config_version = info.engine_config_version;
             }
             cb = update_cb_;
+            provider = engine_config_provider_;
         }
 
         if (info.connection_status != previous_connection) {
             MM_INFO("Node {} is now {}", id, to_string(info.connection_status));
+        }
+
+        // ── Convergence ───────────────────────────────────────────────────────
+        // The health poll IS the convergence loop. Control already contacts
+        // every node on this interval, so a version comparison here costs
+        // nothing and needs no second thread — and a node that was offline
+        // during a config change converges on its next successful poll rather
+        // than staying stale until someone notices.
+        if (info.connected && provider) {
+            if (const auto cfg = provider()) {
+                if (cfg->version != 0 && info.engine_config_version != cfg->version) {
+                    std::string err;
+                    push_engine_config(id, *cfg, err);
+                }
+            }
         }
 
         if (cb) cb(info);

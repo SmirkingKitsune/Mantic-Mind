@@ -212,19 +212,6 @@ std::string clock_hms() {
     return buf;
 }
 
-std::string bytes_label(int64_t bytes) {
-    const double value = static_cast<double>(std::max<int64_t>(0, bytes));
-    char buf[48];
-    if (value >= 1024.0 * 1024.0 * 1024.0)
-        std::snprintf(buf, sizeof(buf), "%.2f GB", value / (1024.0 * 1024.0 * 1024.0));
-    else if (value >= 1024.0 * 1024.0)
-        std::snprintf(buf, sizeof(buf), "%.1f MB", value / (1024.0 * 1024.0));
-    else if (value >= 1024.0)
-        std::snprintf(buf, sizeof(buf), "%.1f KB", value / 1024.0);
-    else
-        std::snprintf(buf, sizeof(buf), "%.0f B", value);
-    return buf;
-}
 
 // Let focused controls handle input before global shortcuts. FTXUI's standard
 // CatchEvent does the reverse, which lets shortcuts steal navigation keys.
@@ -256,13 +243,15 @@ NodeUI::NodeUI(NodeState& state, uint16_t listen_port,
                ForgetPairingCallback forget_pairing_cb,
                RequestLlamaUpdateCallback request_llama_update_cb,
                RequestLlamaSwitchCallback request_llama_switch_cb,
-               RequestLlamaRecoveryCallback request_llama_recovery_cb)
+               RequestLlamaRecoveryCallback request_llama_recovery_cb,
+               EngineViewProvider engine_view_provider)
     : state_(state)
     , listen_port_(listen_port)
     , forget_pairing_cb_(std::move(forget_pairing_cb))
     , request_llama_update_cb_(std::move(request_llama_update_cb))
     , request_llama_switch_cb_(std::move(request_llama_switch_cb))
-    , request_llama_recovery_cb_(std::move(request_llama_recovery_cb)) {
+    , request_llama_recovery_cb_(std::move(request_llama_recovery_cb))
+    , engine_view_provider_(std::move(engine_view_provider)) {
     started_ms_ = mm::util::now_ms();
     log_file_path_ = make_temp_runtime_log_path();
     if (!log_file_path_.empty()) {
@@ -348,27 +337,79 @@ void NodeUI::run() {
     auto btn_forget_pairing = Button("[F] Forget Pairing", [&] { forget_pairing(); },
                                      ButtonOption::Simple());
 
-    // ── llama.cpp runtime prompt state ─────────────────────────────────────────
-    // These are recomputed each frame by the renderer; the buttons and modal read
-    // them by reference.
-    bool        show_llama_update_modal  = false;
-    bool        show_llama_update_button = false;
-    bool        show_llama_engine_modal = false;
-    bool        show_llama_engine_button = false;
-    bool        show_llama_target_modal = false;
-    bool        show_llama_target_button = false;
-    bool        show_llama_troubleshoot_button = false;
-    bool        show_llama_troubleshoot_modal = false;
-    bool        show_llama_release_choice = false;
-    bool        show_llama_compile_anyway = false;
-    bool        show_llama_current_action = false;
-    bool        show_llama_alt_cuda = false;
-    bool        show_llama_alt_rocm = false;
-    bool        show_llama_alt_vulkan = false;
-    bool        show_llama_alt_openvino = false;
-    bool        show_llama_alt_metal = false;
-    bool        show_llama_alt_cpu = false;
-    bool        show_action_modal  = false;
+    // ── Engine panel state ─────────────────────────────────────────────────────
+    //
+    // This was seventeen `show_llama_*` booleans, and they were three different
+    // KINDS of thing wearing one name: which modal owns the screen, which
+    // actions are offered, and what is visible inside a modal. Only the first is
+    // state — the other two are derived facts about the runtime.
+    //
+    // Conflating them cost something concrete. The precedence between modals was
+    // written as five scattered "if X then Y = false" statements in the
+    // recompute, and AGAIN as a differently-ordered if-ladder in the event
+    // handler. The two agreed only because the recompute happened to leave at
+    // most one boolean true; nothing made them agree, and nothing would have
+    // caught it if they stopped.
+
+    /// Which modal owns the screen. At most one — that is the type's job.
+    ///
+    /// The ladder lives in `resolve_node_modal` (node_ui.hpp), pure and tested,
+    /// and every other reader asks this value. FTXUI's Modal()/Maybe() take a
+    /// `bool*`, so the booleans below still exist — but they are WRITTEN ONLY by
+    /// `apply_modal`, from this value. They are render plumbing, not state.
+    NodeModal active_modal = NodeModal::None;
+
+    /// Which engine's detail the Runtime tab is showing. The llama.cpp wizard
+    /// hangs off its row rather than being the tab, which is what makes a second
+    /// engine visible at all.
+    int selected_engine = 0;
+    std::vector<std::string> engine_ids_in_view;
+
+    /// Whether an action is OFFERED. Independent of each other and of the modal
+    /// — grouped so that is legible, since as loose booleans they read like more
+    /// modal flags.
+    struct LlamaActions {
+        bool update = false;
+        bool switch_engine = false;
+        bool target = false;
+        bool troubleshoot = false;
+    } llama_actions;
+
+    // Modal-visibility adapters for FTXUI. Written only by apply_modal().
+    bool show_action_modal = false;
+    bool show_llama_update_modal = false;
+    bool show_llama_engine_modal = false;
+    bool show_llama_target_modal = false;
+    bool show_llama_troubleshoot_modal = false;
+
+    // Content visibility INSIDE the update / troubleshoot modals. Genuinely
+    // independent of the modal ladder: they describe what the runtime offers,
+    // not what is on screen.
+    bool show_llama_release_choice = false;
+    bool show_llama_compile_anyway = false;
+    bool show_llama_current_action = false;
+
+    /// The alternative-release buttons, as DATA.
+    ///
+    /// This was six booleans and six components for cuda/rocm/vulkan/openvino/
+    /// metal/cpu, each with its own `has_llama_alternative("literal")` call and
+    /// its own Maybe. Six hardcoded slots for what the runtime reports as a
+    /// list: a seventh accelerator upstream would have been invisible until
+    /// someone added a seventh boolean.
+    struct LlamaAlternative {
+        std::string accelerator;
+        std::string label;
+        bool available = false;
+    };
+    std::vector<LlamaAlternative> llama_alternatives = {
+        {"cuda", " Use CUDA release ", false},
+        {"rocm", " Use ROCm release ", false},
+        {"vulkan", " Use Vulkan release ", false},
+        {"openvino", " Use OpenVINO release ", false},
+        {"metal", " Use Metal release ", false},
+        {"cpu", " Use CPU release ", false},
+    };
+
     std::string llama_cur_latest;
     std::string llama_modal_ack_version;
     std::string llama_target_ack_key;
@@ -384,6 +425,17 @@ void NodeUI::run() {
     std::vector<std::string> llama_engine_ids;
     std::vector<std::string> llama_engine_details;
     int llama_engine_selection = 0;
+
+    /// Project `active_modal` onto the booleans FTXUI needs. The ONLY writer of
+    /// those five, so "at most one modal" is true by construction rather than by
+    /// five statements that each clear someone else.
+    auto apply_modal = [&]() {
+        show_action_modal = active_modal == NodeModal::Progress;
+        show_llama_engine_modal = active_modal == NodeModal::EngineSwitch;
+        show_llama_troubleshoot_modal = active_modal == NodeModal::Troubleshoot;
+        show_llama_target_modal = active_modal == NodeModal::Target;
+        show_llama_update_modal = active_modal == NodeModal::Update;
+    };
 
     auto high_contrast_button_option = [] {
         ButtonOption option = ButtonOption::Simple();
@@ -409,57 +461,53 @@ void NodeUI::run() {
         // Always reopen the decision prompt: a click must not silently start a
         // potentially long local compilation.
         llama_modal_ack_version.clear();
-        show_llama_update_modal = true;
+        active_modal = NodeModal::Update;
+        apply_modal();
     }, ButtonOption::Simple());
-    auto btn_llama_update_maybe = Maybe(btn_llama_update, &show_llama_update_button);
+    auto btn_llama_update_maybe = Maybe(btn_llama_update, &llama_actions.update);
 
+    auto dismiss_update = [&]() {
+        llama_modal_ack_version = llama_cur_latest;
+        active_modal = NodeModal::None;
+        apply_modal();
+    };
     auto modal_llama_current = Button(" Proceed with current target ", [&] {
         request_llama_update({});
-        llama_modal_ack_version = llama_cur_latest;
-        show_llama_update_modal = false;
+        dismiss_update();
     }, ButtonOption::Simple());
     auto modal_llama_current_maybe = Maybe(modal_llama_current, &show_llama_current_action);
-    auto llama_alternative_button = [&](const std::string& label,
-                                        const std::string& accelerator) {
-        return Button(label, [&, accelerator] {
-            request_llama_update(accelerator);
-            llama_modal_ack_version = llama_cur_latest;
-            show_llama_update_modal = false;
-        }, ButtonOption::Simple());
-    };
-    auto modal_llama_cuda = llama_alternative_button(" Use CUDA release ", "cuda");
-    auto modal_llama_rocm = llama_alternative_button(" Use ROCm release ", "rocm");
-    auto modal_llama_vulkan = llama_alternative_button(" Use Vulkan release ", "vulkan");
-    auto modal_llama_openvino =
-        llama_alternative_button(" Use OpenVINO release ", "openvino");
-    auto modal_llama_metal = llama_alternative_button(" Use Metal release ", "metal");
-    auto modal_llama_cpu = llama_alternative_button(" Use CPU release ", "cpu");
-    auto modal_llama_cuda_maybe = Maybe(modal_llama_cuda, &show_llama_alt_cuda);
-    auto modal_llama_rocm_maybe = Maybe(modal_llama_rocm, &show_llama_alt_rocm);
-    auto modal_llama_vulkan_maybe = Maybe(modal_llama_vulkan, &show_llama_alt_vulkan);
-    auto modal_llama_openvino_maybe =
-        Maybe(modal_llama_openvino, &show_llama_alt_openvino);
-    auto modal_llama_metal_maybe = Maybe(modal_llama_metal, &show_llama_alt_metal);
-    auto modal_llama_cpu_maybe = Maybe(modal_llama_cpu, &show_llama_alt_cpu);
-    auto modal_llama_later = Button(" Later ", [&] {
-        llama_modal_ack_version = llama_cur_latest;
-        show_llama_update_modal = false;
-    }, ButtonOption::Simple());
-    auto modal_llama_btns = Container::Vertical({
-        modal_llama_current_maybe,
-        modal_llama_cuda_maybe,
-        modal_llama_rocm_maybe,
-        modal_llama_vulkan_maybe,
-        modal_llama_openvino_maybe,
-        modal_llama_metal_maybe,
-        modal_llama_cpu_maybe,
-        modal_llama_later,
-    });
+
+    // One button per reported alternative, built from the table rather than
+    // from six named variables. Bound by INDEX so each Maybe reads its own
+    // entry's `available` flag, which the recompute fills from what the runtime
+    // actually offers.
+    Components llama_alternative_components;
+    for (std::size_t i = 0; i < llama_alternatives.size(); ++i) {
+        auto button = Button(
+            llama_alternatives[i].label,
+            [&, i] {
+                request_llama_update(llama_alternatives[i].accelerator);
+                dismiss_update();
+            },
+            ButtonOption::Simple());
+        llama_alternative_components.push_back(
+            Maybe(button, &llama_alternatives[i].available));
+    }
+
+    auto modal_llama_later = Button(" Later ", [&] { dismiss_update(); },
+                                    ButtonOption::Simple());
+    Components modal_llama_children{modal_llama_current_maybe};
+    modal_llama_children.insert(modal_llama_children.end(),
+                                llama_alternative_components.begin(),
+                                llama_alternative_components.end());
+    modal_llama_children.push_back(modal_llama_later);
+    auto modal_llama_btns = Container::Vertical(modal_llama_children);
 
     auto btn_llama_engine = Button("[ Change llama.cpp engine ]", [&] {
-        show_llama_engine_modal = true;
+        active_modal = NodeModal::EngineSwitch;
+        apply_modal();
     }, high_contrast_button_option());
-    auto btn_llama_engine_maybe = Maybe(btn_llama_engine, &show_llama_engine_button);
+    auto btn_llama_engine_maybe = Maybe(btn_llama_engine, &llama_actions.switch_engine);
     MenuOption llama_engine_menu_option = MenuOption::Vertical();
     llama_engine_menu_option.entries_option.transform =
         [](const EntryState& state) -> Element {
@@ -476,10 +524,12 @@ void NodeUI::run() {
             request_llama_switch_cb_(
                 llama_engine_ids[static_cast<size_t>(llama_engine_selection)]);
         }
-        show_llama_engine_modal = false;
+        active_modal = NodeModal::None;
+        apply_modal();
     }, high_contrast_button_option());
     auto modal_llama_engine_cancel = Button("[ Cancel ]", [&] {
-        show_llama_engine_modal = false;
+        active_modal = NodeModal::None;
+        apply_modal();
     }, high_contrast_button_option());
     auto llama_engine_actions = Container::Horizontal({
         modal_llama_engine_apply, modal_llama_engine_cancel,
@@ -493,22 +543,26 @@ void NodeUI::run() {
         if (request_llama_recovery_cb_) request_llama_recovery_cb_(action, variant);
         const auto rt = state_.get_llama_runtime();
         llama_troubleshoot_ack_fingerprint = rt.troubleshooting.fingerprint;
-        show_llama_troubleshoot_modal = false;
+        active_modal = NodeModal::None;
+        apply_modal();
     };
     auto btn_llama_target = Button("[ Review target build ]", [&] {
-        show_llama_target_modal = true;
+        active_modal = NodeModal::Target;
+        apply_modal();
     }, high_contrast_button_option());
-    auto btn_llama_target_maybe = Maybe(btn_llama_target, &show_llama_target_button);
+    auto btn_llama_target_maybe = Maybe(btn_llama_target, &llama_actions.target);
     auto modal_llama_target_install = Button("[ Install target build ]", [&] {
         const auto rt = state_.get_llama_runtime();
         llama_target_ack_key = llama_target_key(rt);
         if (request_llama_recovery_cb_)
             request_llama_recovery_cb_("target", {});
-        show_llama_target_modal = false;
+        active_modal = NodeModal::None;
+        apply_modal();
     }, high_contrast_button_option());
     auto modal_llama_target_later = Button("[ Keep current for now ]", [&] {
         llama_target_ack_key = llama_target_key(state_.get_llama_runtime());
-        show_llama_target_modal = false;
+        active_modal = NodeModal::None;
+        apply_modal();
     }, high_contrast_button_option());
     auto llama_target_actions = Container::Horizontal({
         modal_llama_target_install, modal_llama_target_later,
@@ -519,7 +573,7 @@ void NodeUI::run() {
             request_llama_recovery_cb_("diagnose", {});
     }, high_contrast_button_option());
     auto btn_llama_troubleshoot_maybe =
-        Maybe(btn_llama_troubleshoot, &show_llama_troubleshoot_button);
+        Maybe(btn_llama_troubleshoot, &llama_actions.troubleshoot);
     auto modal_llama_diagnose = Button("[ Re-run diagnostics ]", [&] {
         request_llama_recovery("diagnose");
     }, high_contrast_button_option());
@@ -566,7 +620,8 @@ void NodeUI::run() {
     auto modal_llama_troubleshoot_dismiss = Button("[ Dismiss ]", [&] {
         const auto rt = state_.get_llama_runtime();
         llama_troubleshoot_ack_fingerprint = rt.troubleshooting.fingerprint;
-        show_llama_troubleshoot_modal = false;
+        active_modal = NodeModal::None;
+        apply_modal();
     }, high_contrast_button_option());
 
     auto action_cancel = Button("  Cancel  ", [&] {
@@ -671,8 +726,6 @@ void NodeUI::run() {
         auto api_keys     = state_.get_api_keys();
         auto streaming    = state_.get_streaming_text();
 
-        show_action_modal = action_prog.active;
-
         // Drive the llama.cpp update and recovery controls from current runtime state.
         llama_cur_latest = llama_rt.latest_version;
         const bool llama_busy = action_prog.active &&
@@ -680,32 +733,31 @@ void NodeUI::run() {
         const bool llama_ready =
             (llama_rt.status == "ready" || llama_rt.status == "resolved") &&
             !llama_rt.executable_path.empty();
-        show_llama_engine_button = static_cast<bool>(request_llama_switch_cb_) &&
-                                   llama_ready && !llama_busy;
-        show_llama_target_button = llama_rt.target_mismatch && llama_ready &&
-                                   static_cast<bool>(request_llama_recovery_cb_) &&
-                                   !llama_busy;
-        show_llama_troubleshoot_button =
+
+        // Which actions are OFFERED. Independent of each other and of whatever
+        // modal is up.
+        llama_actions.switch_engine = static_cast<bool>(request_llama_switch_cb_) &&
+                                      llama_ready && !llama_busy;
+        llama_actions.target = llama_rt.target_mismatch && llama_ready &&
+                               static_cast<bool>(request_llama_recovery_cb_) &&
+                               !llama_busy;
+        llama_actions.troubleshoot =
             static_cast<bool>(request_llama_recovery_cb_) && !llama_busy;
         const bool can_update_llama = llama_rt.update_available && llama_rt.managed &&
                                       static_cast<bool>(request_llama_update_cb_) &&
                                       !llama_busy;
-        show_llama_update_button = can_update_llama;
+        llama_actions.update = can_update_llama;
         show_llama_current_action = llama_rt.update_action != "unavailable";
-        auto has_llama_alternative = [&](const std::string& accelerator) {
-            return std::find(llama_rt.update_release_alternatives.begin(),
-                             llama_rt.update_release_alternatives.end(), accelerator)
-                != llama_rt.update_release_alternatives.end();
-        };
-        show_llama_alt_cuda = has_llama_alternative("cuda");
-        show_llama_alt_rocm = has_llama_alternative("rocm");
-        show_llama_alt_vulkan = has_llama_alternative("vulkan");
-        show_llama_alt_openvino = has_llama_alternative("openvino");
-        show_llama_alt_metal = has_llama_alternative("metal");
-        show_llama_alt_cpu = has_llama_alternative("cpu");
-        show_llama_update_modal = !show_action_modal && can_update_llama &&
-            (show_llama_update_modal ||
-             llama_modal_ack_version != llama_rt.latest_version);
+
+        // One pass over the reported list instead of six literal lookups. An
+        // accelerator upstream adds one table row here rather than a boolean, a
+        // component, a Maybe, and a container slot.
+        for (auto& alt : llama_alternatives) {
+            alt.available =
+                std::find(llama_rt.update_release_alternatives.begin(),
+                          llama_rt.update_release_alternatives.end(),
+                          alt.accelerator) != llama_rt.update_release_alternatives.end();
+        }
 
         llama_release_entries.clear();
         llama_release_ids.clear();
@@ -726,11 +778,6 @@ void NodeUI::run() {
             llama_rt.troubleshooting.can_override_checks;
         const bool can_troubleshoot = llama_rt.troubleshooting.required &&
             static_cast<bool>(request_llama_recovery_cb_);
-        show_llama_troubleshoot_modal = !show_action_modal && can_troubleshoot &&
-            (show_llama_troubleshoot_modal ||
-             llama_troubleshoot_ack_fingerprint !=
-                 llama_rt.troubleshooting.fingerprint);
-        if (show_llama_troubleshoot_modal) show_llama_update_modal = false;
 
         llama_engine_entries.clear();
         llama_engine_ids.clear();
@@ -756,21 +803,28 @@ void NodeUI::run() {
         if (llama_engine_selection >= static_cast<int>(llama_engine_entries.size()))
             llama_engine_selection = std::max(
                 0, static_cast<int>(llama_engine_entries.size()) - 1);
-        show_llama_engine_modal = !show_action_modal && show_llama_engine_button &&
-                                  show_llama_engine_modal &&
-                                  !llama_engine_entries.empty();
-        if (show_llama_engine_modal) {
-            show_llama_update_modal = false;
-            show_llama_troubleshoot_modal = false;
-        }
         const bool can_install_target = llama_rt.target_mismatch && llama_ready &&
             static_cast<bool>(request_llama_recovery_cb_) && !llama_busy;
-        show_llama_target_modal = !show_action_modal &&
-            !show_llama_troubleshoot_modal && !show_llama_engine_modal &&
-            can_install_target &&
-            (show_llama_target_modal ||
-             llama_target_ack_key != llama_target_key(llama_rt));
-        if (show_llama_target_modal) show_llama_update_modal = false;
+
+        // The modal ladder. Gathered here, DECIDED in resolve_node_modal —
+        // which is pure, lives in the header, and is asserted directly by
+        // `node_modal_ladder` in the reliability suite. Precedence used to be
+        // five scattered "if X then Y = false" statements plus a second,
+        // differently-ordered if-ladder in the event handler.
+        NodeModalInputs modal_in;
+        modal_in.progress_active = action_prog.active;
+        modal_in.engine_switch_available = llama_actions.switch_engine;
+        modal_in.engine_variants_listed = !llama_engine_entries.empty();
+        modal_in.can_troubleshoot = can_troubleshoot;
+        modal_in.troubleshoot_unacknowledged =
+            llama_troubleshoot_ack_fingerprint != llama_rt.troubleshooting.fingerprint;
+        modal_in.can_install_target = can_install_target;
+        modal_in.target_unacknowledged = llama_target_ack_key != llama_target_key(llama_rt);
+        modal_in.can_update = can_update_llama;
+        modal_in.update_unacknowledged = llama_modal_ack_version != llama_rt.latest_version;
+
+        active_modal = resolve_node_modal(modal_in, active_modal);
+        apply_modal();
 
         int log_scroll_from_bottom = 0;
         std::string log_file_path;
@@ -935,7 +989,7 @@ void NodeUI::run() {
             Element line = text("llama.cpp " +
                 (llama_rt.version.empty() ? std::string{"?"} : llama_rt.version) +
                 " → " + llama_rt.latest_version) | color(Color::Cyan) | bold;
-            if (show_llama_update_button)
+            if (llama_actions.update)
                 status_rows.push_back(field("update", vbox({ line, btn_llama_update->Render() })));
             else
                 status_rows.push_back(field("update",
@@ -1126,17 +1180,158 @@ void NodeUI::run() {
                 paragraph(llama_rt.target_mismatch_reason) | color(Color::Yellow),
             }));
         }
-        Element runtimes_page = vbox({
-            panel("llama.cpp", runtime_status("llama.cpp", llama_rt,
-                                               llama_rt.variant)),
-            std::move(llama_target_notice),
-            vbox({
+        // ── What the cluster told this node to run ────────────────────────────
+        //
+        // This panel comes FIRST, and that ordering is the visible half of
+        // "nodes conform to the master". Engine configuration is no longer a
+        // node-local decision: this tab reports what was dictated and whether
+        // this machine is meeting it. The llama.cpp controls below remain, but
+        // they are recovery actions on one engine rather than the page's
+        // subject.
+        NodeUI::EngineView ev;
+        if (engine_view_provider_) ev = engine_view_provider_();
+
+        const auto conformance_color = [](EngineConformanceState st) {
+            switch (st) {
+            case EngineConformanceState::Conforming: return Color::Green;
+            case EngineConformanceState::Converging: return Color::Cyan;
+            case EngineConformanceState::Drifted:    return Color::Yellow;
+            case EngineConformanceState::Failed:     return Color::Red;
+            case EngineConformanceState::Unconfigured:
+            default:                                 return Color::GrayDark;
+            }
+        };
+
+        Elements cluster_rows;
+        if (!engine_view_provider_) {
+            cluster_rows.push_back(text("engine management is not wired on this node") | dim);
+        } else if (ev.config.version == 0) {
+            // Not an error. A node that has not been told yet is the normal
+            // state between startup and the master's first push, and saying so
+            // is more useful than an empty panel that reads like a fault.
+            cluster_rows.push_back(
+                text("waiting for the master's engine configuration") | color(Color::Yellow));
+            cluster_rows.push_back(
+                text("Nothing is provisioned until control says what to run.") | dim);
+        } else {
+            cluster_rows.push_back(hbox({text("primary       ") | dim,
+                                         text(ev.config.primary_engine) | bold}));
+            cluster_rows.push_back(
+                hbox({text("backup        ") | dim,
+                      ev.config.backup_engine.empty()
+                          ? text("(none)") | dim
+                          : text(ev.config.backup_engine)}));
+            cluster_rows.push_back(hbox({text("config        ") | dim,
+                                         text("v" + std::to_string(ev.config.version))}));
+        }
+        cluster_rows.push_back(
+            hbox({text("conformance   ") | dim,
+                  text(to_string(ev.conformance.state)) | bold |
+                      color(conformance_color(ev.conformance.state))}));
+        if (!ev.conformance.detail.empty())
+            cluster_rows.push_back(paragraph(ev.conformance.detail) | dim);
+        if (!ev.conformance.needs_artifact.empty())
+            cluster_rows.push_back(paragraph("waiting on a peer's build: " +
+                                             ev.conformance.needs_artifact) |
+                                   color(Color::Yellow));
+        if (!conformance_permits_placement(ev.conformance))
+            cluster_rows.push_back(
+                text("Control will not place agents here until this node conforms.") |
+                color(Color::Yellow));
+
+        // Every engine this node can provision, including ones the cluster did
+        // not ask for — "we could run this but were not asked to" is worth
+        // seeing, and it was invisible when llama.cpp was the only row.
+        //
+        // SELECTABLE, because the detail pane and the action row below follow
+        // the selection. That is the other half of {selected_engine,
+        // active_modal}: the wizard hangs off the llama.cpp row instead of
+        // being the tab, so a second engine is not competing with it for the
+        // same screen.
+        engine_ids_in_view.clear();
+        for (const auto& r : ev.runtimes) engine_ids_in_view.push_back(r.engine_id);
+        if (selected_engine >= static_cast<int>(engine_ids_in_view.size()))
+            selected_engine = std::max(0, static_cast<int>(engine_ids_in_view.size()) - 1);
+        const std::string selected_engine_id =
+            (selected_engine >= 0 &&
+             selected_engine < static_cast<int>(engine_ids_in_view.size()))
+                ? engine_ids_in_view[static_cast<size_t>(selected_engine)]
+                : std::string{};
+
+        Elements engine_rows;
+        for (std::size_t i = 0; i < ev.runtimes.size(); ++i) {
+            const auto& r = ev.runtimes[i];
+            const Color c = r.ready              ? Color::Green
+                          : r.status == "building" ? Color::Cyan
+                          : r.status == "error"    ? Color::Red
+                                                   : Color::GrayDark;
+            std::string detail = r.status;
+            if (!r.variant.empty()) detail += " · " + r.variant;
+            if (!r.version.empty()) detail += " · " + r.version;
+            Element row = hbox({
+                text(r.ready ? "  ● " : "  ○ ") | color(c),
+                text(r.engine_id + std::string(
+                        r.engine_id.size() < 12 ? 12 - r.engine_id.size() : 1, ' ')) | bold,
+                text(detail) | color(c),
+            });
+            if (static_cast<int>(i) == selected_engine) row = std::move(row) | inverted;
+            engine_rows.push_back(std::move(row));
+            if (!r.last_error.empty())
+                engine_rows.push_back(paragraph("      " + r.last_error) | color(Color::Red));
+            if (!r.executable_path.empty())
+                engine_rows.push_back(paragraph("      " + r.executable_path) | dim);
+        }
+        if (engine_rows.empty())
+            engine_rows.push_back(text("  no engines resolved yet") | dim);
+        else
+            engine_rows.push_back(text("  ←/→ select engine") | dim);
+
+        // The detail pane and actions belong to the SELECTED engine. llama.cpp
+        // has a release matrix, a target build, and a troubleshooting wizard;
+        // Soma has none of those and says so rather than showing four buttons
+        // that would each refuse.
+        Elements detail;
+        if (selected_engine_id == "llama-cpp") {
+            detail.push_back(panel("llama.cpp",
+                                   runtime_status("llama.cpp", llama_rt, llama_rt.variant)));
+            detail.push_back(std::move(llama_target_notice));
+            detail.push_back(vbox({
                 hbox({btn_llama_engine_maybe->Render(), text(" "),
                       btn_llama_target_maybe->Render()}),
                 hbox({btn_llama_troubleshoot_maybe->Render(), text(" "),
                       btn_llama_update_maybe->Render()}),
-            }),
-        });
+            }));
+        } else if (!selected_engine_id.empty()) {
+            Elements rows;
+            for (const auto& r : ev.runtimes) {
+                if (r.engine_id != selected_engine_id) continue;
+                rows.push_back(hbox({text("engine        ") | dim,
+                                     text(r.engine_id) | bold}));
+                rows.push_back(hbox({text("status        ") | dim, text(r.status) | bold}));
+                rows.push_back(hbox({text("version       ") | dim,
+                                     text(r.version.empty() ? "not reported" : r.version)}));
+                rows.push_back(paragraph(
+                    "path          " +
+                    (r.executable_path.empty() ? std::string{"not resolved"}
+                                               : r.executable_path)) | dim);
+                if (!r.last_error.empty())
+                    rows.push_back(paragraph(r.last_error) | color(Color::Red));
+            }
+            rows.push_back(text("") );
+            rows.push_back(
+                text("This engine has no build variants or recovery wizard.") | dim);
+            rows.push_back(
+                text("What it runs is set by the master; there is nothing to change here.") |
+                dim);
+            detail.push_back(panel(selected_engine_id, vbox(std::move(rows))));
+        }
+
+        Elements runtime_children{
+            panel("CLUSTER ENGINE POLICY", vbox(std::move(cluster_rows))),
+            panel("ENGINES ON THIS NODE", vbox(std::move(engine_rows))),
+        };
+        runtime_children.insert(runtime_children.end(), detail.begin(), detail.end());
+        Element runtimes_page = vbox(std::move(runtime_children));
 
         std::vector<std::string> local_models;
         for (const auto& slot : slots) {
@@ -1443,8 +1638,8 @@ void NodeUI::run() {
         }
         if (p.bytes_total > 0) {
             rows.push_back(hbox({text(" data   : ") | dim,
-                                 text(bytes_label(p.bytes_done) + " / " +
-                                      bytes_label(p.bytes_total))}));
+                                 text(mm::util::bytes_label(p.bytes_done) + " / " +
+                                      mm::util::bytes_label(p.bytes_total))}));
         }
         if (!p.detail.empty())
             rows.push_back(paragraph(" " + shorten_middle(p.detail, 80)) | dim);
@@ -1474,51 +1669,63 @@ void NodeUI::run() {
         Modal(with_llama_troubleshooting, action_modal_renderer, &show_action_modal);
 
     auto component = make_catch_event_after(with_modal, [&](Event ev) {
-        if (show_action_modal) {
-            if (ev == Event::Escape) {
+        // ONE switch, because there is one modal. This was a five-branch
+        // if-ladder testing the booleans in a different order from the one the
+        // recompute imposed — harmless only for as long as the recompute kept
+        // them mutually exclusive.
+        //
+        // While a modal owns the screen it also swallows every other key, which
+        // is unchanged: tab switching and log scrolling below must not fire
+        // behind a prompt.
+        if (active_modal != NodeModal::None) {
+            if (ev != Event::Escape) return false;
+            switch (active_modal) {
+            case NodeModal::Progress:
+                // Escape CANCELS rather than dismisses: the modal is reporting
+                // work in flight, and hiding it would leave that work running
+                // with nothing showing it.
                 state_.request_action_cancel();
                 return true;
-            }
-            return false;
-        }
-        if (show_llama_troubleshoot_modal) {
-            if (ev == Event::Escape) {
-                const auto rt = state_.get_llama_runtime();
+            case NodeModal::Troubleshoot:
                 llama_troubleshoot_ack_fingerprint =
-                    rt.troubleshooting.fingerprint;
-                show_llama_troubleshoot_modal = false;
-                return true;
-            }
-            return false;
-        }
-        if (show_llama_target_modal) {
-            if (ev == Event::Escape) {
-                llama_target_ack_key =
-                    llama_target_key(state_.get_llama_runtime());
-                show_llama_target_modal = false;
-                return true;
-            }
-            return false;
-        }
-        if (show_llama_engine_modal) {
-            if (ev == Event::Escape) {
-                show_llama_engine_modal = false;
-                return true;
-            }
-            return false;
-        }
-        if (show_llama_update_modal) {
-            if (ev == Event::Escape) {
+                    state_.get_llama_runtime().troubleshooting.fingerprint;
+                break;
+            case NodeModal::Target:
+                llama_target_ack_key = llama_target_key(state_.get_llama_runtime());
+                break;
+            case NodeModal::Update:
                 llama_modal_ack_version = llama_cur_latest;
-                show_llama_update_modal = false;
-                return true;
+                break;
+            case NodeModal::EngineSwitch:
+                // Nothing to acknowledge: it never auto-opens, so there is no
+                // "do not show me this again" to record.
+                break;
+            case NodeModal::None:
+                break;
             }
-            return false;
+            active_modal = NodeModal::None;
+            apply_modal();
+            return true;
         }
         if (ev == Event::Character('1')) { node_tab = 0; return true; }
         if (ev == Event::Character('2')) { node_tab = 1; return true; }
         if (ev == Event::Character('3')) { node_tab = 2; return true; }
         if (ev == Event::Character('4')) { node_tab = 3; return true; }
+
+        // Engine selection, Runtime tab only. Left/right rather than up/down
+        // because the Runtime tab's arrow keys already belong to whichever
+        // button has focus, and stealing them would break the action row.
+        if (node_tab == 1 && !engine_ids_in_view.empty()) {
+            const int last = static_cast<int>(engine_ids_in_view.size()) - 1;
+            if (ev == Event::ArrowLeft) {
+                selected_engine = std::max(0, selected_engine - 1);
+                return true;
+            }
+            if (ev == Event::ArrowRight) {
+                selected_engine = std::min(last, selected_engine + 1);
+                return true;
+            }
+        }
 
         const int viewport = log_viewport;
         auto scroll_logs = [&](int delta) {

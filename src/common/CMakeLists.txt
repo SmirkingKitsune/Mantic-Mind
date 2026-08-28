@@ -4,6 +4,9 @@ set(MM_COMMON_SOURCES
     agent.cpp
     agent_db.cpp
     runtime_client.cpp
+    engine_capabilities.cpp
+    engine_client.cpp
+    engine_config.cpp
     conversation_manager.cpp
     memory_manager.cpp
     tool_executor.cpp
@@ -18,6 +21,8 @@ set(MM_COMMON_SOURCES
     inference_response_parser.cpp
     gguf_metadata.cpp
     inference_sizing.cpp
+    footprint.cpp
+    process_exec.cpp
 )
 
 add_library(mm_common STATIC ${MM_COMMON_SOURCES})

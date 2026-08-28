@@ -1,0 +1,138 @@
+#pragma once
+
+// Soma — the compiled tokenizer.
+//
+// Deliberately NOT part of the seam. Admission compiles tokenizer.json into this
+// normalized form and the runtime loads it as DATA. Two architectures sharing a
+// tokenizer therefore share zero code in arch/, which is correct.
+//
+// The pretokenizer is a compiled byte-class NFA, not a live regex engine —
+// pulling a regex library into the hot path to re-derive a fixed partition every
+// prompt is cost for nothing, and it is a runtime dependency the engine
+// otherwise does not need.
+
+#include "soma/arch_ir.hpp"
+#include "soma/types.hpp"
+
+#include <cstdint>
+#include <memory>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace soma {
+
+inline constexpr std::uint32_t kTokenizerFormatVersion = 1;
+
+enum class MessageRole : std::uint8_t { System = 0, User, Assistant, Tool };
+
+struct ChatMessage {
+    MessageRole role = MessageRole::User;
+    std::string_view content;
+    std::string_view tool_call_id;
+};
+
+/// The chat template, resolved to TOKEN IDS at admission rather than rendered to
+/// a string and re-tokenized at runtime. Round-tripping through text is where
+/// off-by-one-special-token bugs come from.
+struct ChatTemplate {
+    std::vector<TokenId> bos;
+    std::vector<TokenId> eos;
+    std::vector<TokenId> role_prefix[4];
+    std::vector<TokenId> role_suffix[4];
+    std::vector<TokenId> generation_prompt;
+    std::vector<TokenId> thinking_open;
+    std::vector<TokenId> thinking_close;
+    bool supports_thinking = false;
+};
+
+class CompiledTokenizer {
+public:
+    CompiledTokenizer();
+    CompiledTokenizer(const CompiledTokenizer&) = delete;
+    CompiledTokenizer& operator=(const CompiledTokenizer&) = delete;
+    ~CompiledTokenizer();
+
+    /// Refuses to load across a format-version mismatch.
+    Status open(const std::string& compiled_path);
+    void close();
+
+    TokenizerKind kind() const noexcept;
+    std::uint32_t vocab_size() const noexcept;
+    bool byte_fallback() const noexcept;
+
+    Status encode(std::string_view text, std::vector<TokenId>& out) const;
+    Status decode(std::span<const TokenId> tokens, std::string& out) const;
+
+    /// Incremental decode for streaming, holding partial UTF-8 across calls so a
+    /// multi-byte codepoint split across two tokens never emits a replacement
+    /// character mid-stream.
+    class Streamer {
+    public:
+        explicit Streamer(const CompiledTokenizer& tokenizer);
+        ~Streamer();
+        Status push(TokenId token, std::string& out_delta);
+        Status flush(std::string& out_delta);
+
+    private:
+        struct Impl;
+        std::unique_ptr<Impl> impl_;
+    };
+
+    const ChatTemplate& chat_template() const noexcept;
+    Status apply_chat_template(std::span<const ChatMessage> messages,
+                               bool add_generation_prompt,
+                               bool enable_thinking,
+                               std::vector<TokenId>& out) const;
+
+    bool is_special(TokenId token) const noexcept;
+    bool is_eog(TokenId token) const noexcept; ///< end-of-generation
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+/// One calibration string and the ids HF's `tokenizers` produced for it.
+struct TokenizerOracleCase {
+    std::string text;
+    std::vector<TokenId> ids;
+};
+
+/// Read a `SOMATORC` oracle, as written by tools/admission/compile_tokenizer.py.
+///
+/// In the library rather than in the test that first needed it, for the same
+/// reason the KV checkpoint header is: it is a FORMAT with more than one reader,
+/// and two parsers that must agree is how they stop agreeing. The comparison
+/// stays with each caller — one parser, independent verdicts.
+Status read_tokenizer_oracle(const std::string& path, std::vector<TokenizerOracleCase>& out);
+
+struct RoundTripResult {
+    std::uint32_t cases = 0;
+    std::uint32_t encode_ok = 0; ///< ids identical to HF's
+    std::uint32_t decode_ok = 0; ///< decode(HF's ids) reproduces the source text
+
+    /// The first case that failed, rendered for a human. Empty when clean —
+    /// "which one and where" is the whole difference between a usable tokenizer
+    /// bug report and "conformance failed".
+    std::string first_failure;
+
+    bool clean() const noexcept { return cases > 0 && encode_ok == cases && decode_ok == cases; }
+};
+
+/// Round-trip the oracle's corpus and compare against HF's own answer.
+///
+/// ADMISSION IS GATED ON THIS. A tokenizer that does not reproduce HF
+/// `tokenizers` byte-for-byte is the cheapest possible bug to catch here and one
+/// of the most expensive to catch at G2, where it presents as "the model is
+/// subtly stupid" rather than as a tokenizer fault.
+///
+/// Takes the oracle's IDS rather than a digest of them. A hash can only say
+/// "different"; the ids say which case, which position, and what was expected —
+/// and the digest bought nothing, since both sides are on the same host.
+Status verify_roundtrip(const CompiledTokenizer& tokenizer,
+                        std::span<const TokenizerOracleCase> oracle,
+                        RoundTripResult& out);
+
+} // namespace soma

@@ -1,0 +1,914 @@
+{
+  "completed_dense_shards": {
+    "0": {
+      "file_bytes": 4684,
+      "names": [
+        "model.norm.weight",
+        "model.hc_head_fn",
+        "model.hc_head_base",
+        "model.hc_head_scale"
+      ]
+    },
+    "1": {
+      "file_bytes": 72064,
+      "names": [
+        "model.layers.0.input_layernorm.weight",
+        "model.layers.0.post_attention_layernorm.weight",
+        "model.layers.0.hc_attn_fn",
+        "model.layers.0.hc_attn_base",
+        "model.layers.0.hc_attn_scale",
+        "model.layers.0.hc_ffn_fn",
+        "model.layers.0.hc_ffn_base",
+        "model.layers.0.hc_ffn_scale",
+        "model.layers.0.self_attn.attn_sink",
+        "model.layers.0.self_attn.q_norm.weight",
+        "model.layers.0.self_attn.kv_norm.weight",
+        "model.layers.0.self_attn.compressor.ape",
+        "model.layers.0.self_attn.compressor.norm.weight",
+        "model.layers.0.ffn.gate.weight",
+        "model.layers.0.ffn.gate.tid2eid"
+      ]
+    },
+    "2": {
+      "file_bytes": 72064,
+      "names": [
+        "model.layers.1.input_layernorm.weight",
+        "model.layers.1.post_attention_layernorm.weight",
+        "model.layers.1.hc_attn_fn",
+        "model.layers.1.hc_attn_base",
+        "model.layers.1.hc_attn_scale",
+        "model.layers.1.hc_ffn_fn",
+        "model.layers.1.hc_ffn_base",
+        "model.layers.1.hc_ffn_scale",
+        "model.layers.1.self_attn.attn_sink",
+        "model.layers.1.self_attn.q_norm.weight",
+        "model.layers.1.self_attn.kv_norm.weight",
+        "model.layers.1.self_attn.compressor.ape",
+        "model.layers.1.self_attn.compressor.norm.weight",
+        "model.layers.1.ffn.gate.weight",
+        "model.layers.1.ffn.gate.tid2eid"
+      ]
+    },
+    "3": {
+      "file_bytes": 65184,
+      "names": [
+        "model.layers.2.input_layernorm.weight",
+        "model.layers.2.post_attention_layernorm.weight",
+        "model.layers.2.hc_attn_fn",
+        "model.layers.2.hc_attn_base",
+        "model.layers.2.hc_attn_scale",
+        "model.layers.2.hc_ffn_fn",
+        "model.layers.2.hc_ffn_base",
+        "model.layers.2.hc_ffn_scale",
+        "model.layers.2.self_attn.attn_sink",
+        "model.layers.2.self_attn.q_norm.weight",
+        "model.layers.2.self_attn.kv_norm.weight",
+        "model.layers.2.self_attn.compressor.ape",
+        "model.layers.2.self_attn.compressor.norm.weight",
+        "model.layers.2.ffn.gate.weight",
+        "model.layers.2.ffn.gate.tid2eid",
+        "model.layers.2.self_attn.indexer.compressor.ape",
+        "model.layers.2.self_attn.indexer.compressor.norm.weight"
+      ]
+    },
+    "4": {
+      "file_bytes": 63928,
+      "names": [
+        "model.layers.3.input_layernorm.weight",
+        "model.layers.3.post_attention_layernorm.weight",
+        "model.layers.3.hc_attn_fn",
+        "model.layers.3.hc_attn_base",
+        "model.layers.3.hc_attn_scale",
+        "model.layers.3.hc_ffn_fn",
+        "model.layers.3.hc_ffn_base",
+        "model.layers.3.hc_ffn_scale",
+        "model.layers.3.self_attn.attn_sink",
+        "model.layers.3.self_attn.q_norm.weight",
+        "model.layers.3.self_attn.kv_norm.weight",
+        "model.layers.3.self_attn.compressor.ape",
+        "model.layers.3.self_attn.compressor.norm.weight",
+        "model.layers.3.ffn.gate.weight",
+        "model.layers.3.ffn.gate.bias"
+      ]
+    }
+  },
+  "completed_expert_layers": {
+    "0": {
+      "entries": [
+        [
+          0,
+          4352
+        ],
+        [
+          8192,
+          4352
+        ],
+        [
+          16384,
+          4352
+        ],
+        [
+          24576,
+          4352
+        ],
+        [
+          32768,
+          4352
+        ],
+        [
+          40960,
+          4352
+        ],
+        [
+          49152,
+          4352
+        ],
+        [
+          57344,
+          4352
+        ],
+        [
+          65536,
+          4352
+        ],
+        [
+          73728,
+          4352
+        ],
+        [
+          81920,
+          4352
+        ],
+        [
+          90112,
+          4352
+        ],
+        [
+          98304,
+          4352
+        ],
+        [
+          106496,
+          4352
+        ],
+        [
+          114688,
+          4352
+        ],
+        [
+          122880,
+          4352
+        ]
+      ],
+      "file_bytes": 131072
+    },
+    "1": {
+      "entries": [
+        [
+          0,
+          4352
+        ],
+        [
+          8192,
+          4352
+        ],
+        [
+          16384,
+          4352
+        ],
+        [
+          24576,
+          4352
+        ],
+        [
+          32768,
+          4352
+        ],
+        [
+          40960,
+          4352
+        ],
+        [
+          49152,
+          4352
+        ],
+        [
+          57344,
+          4352
+        ],
+        [
+          65536,
+          4352
+        ],
+        [
+          73728,
+          4352
+        ],
+        [
+          81920,
+          4352
+        ],
+        [
+          90112,
+          4352
+        ],
+        [
+          98304,
+          4352
+        ],
+        [
+          106496,
+          4352
+        ],
+        [
+          114688,
+          4352
+        ],
+        [
+          122880,
+          4352
+        ]
+      ],
+      "file_bytes": 131072
+    },
+    "2": {
+      "entries": [
+        [
+          0,
+          4352
+        ],
+        [
+          8192,
+          4352
+        ],
+        [
+          16384,
+          4352
+        ],
+        [
+          24576,
+          4352
+        ],
+        [
+          32768,
+          4352
+        ],
+        [
+          40960,
+          4352
+        ],
+        [
+          49152,
+          4352
+        ],
+        [
+          57344,
+          4352
+        ],
+        [
+          65536,
+          4352
+        ],
+        [
+          73728,
+          4352
+        ],
+        [
+          81920,
+          4352
+        ],
+        [
+          90112,
+          4352
+        ],
+        [
+          98304,
+          4352
+        ],
+        [
+          106496,
+          4352
+        ],
+        [
+          114688,
+          4352
+        ],
+        [
+          122880,
+          4352
+        ]
+      ],
+      "file_bytes": 131072
+    },
+    "3": {
+      "entries": [
+        [
+          0,
+          4352
+        ],
+        [
+          8192,
+          4352
+        ],
+        [
+          16384,
+          4352
+        ],
+        [
+          24576,
+          4352
+        ],
+        [
+          32768,
+          4352
+        ],
+        [
+          40960,
+          4352
+        ],
+        [
+          49152,
+          4352
+        ],
+        [
+          57344,
+          4352
+        ],
+        [
+          65536,
+          4352
+        ],
+        [
+          73728,
+          4352
+        ],
+        [
+          81920,
+          4352
+        ],
+        [
+          90112,
+          4352
+        ],
+        [
+          98304,
+          4352
+        ],
+        [
+          106496,
+          4352
+        ],
+        [
+          114688,
+          4352
+        ],
+        [
+          122880,
+          4352
+        ]
+      ],
+      "file_bytes": 131072
+    }
+  },
+  "completed_qweight_shards": {
+    "0": {
+      "entries": {
+        "lm_head.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00000.bin",
+          "group": 64,
+          "length": 20480,
+          "offset": 20480,
+          "shape": [
+            512,
+            64
+          ]
+        },
+        "model.embed_tokens.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00000.bin",
+          "group": 64,
+          "length": 20480,
+          "offset": 0,
+          "shape": [
+            512,
+            64
+          ]
+        }
+      },
+      "file_bytes": 40960
+    },
+    "1": {
+      "entries": {
+        "model.layers.0.ffn.shared_experts.down_proj.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00001.bin",
+          "group": 32,
+          "length": 1536,
+          "offset": 36864,
+          "shape": [
+            64,
+            32
+          ]
+        },
+        "model.layers.0.ffn.shared_experts.gate_proj.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00001.bin",
+          "group": 64,
+          "length": 1280,
+          "offset": 28672,
+          "shape": [
+            32,
+            64
+          ]
+        },
+        "model.layers.0.ffn.shared_experts.up_proj.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00001.bin",
+          "group": 64,
+          "length": 1280,
+          "offset": 32768,
+          "shape": [
+            32,
+            64
+          ]
+        },
+        "model.layers.0.self_attn.compressor.wgate.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00001.bin",
+          "group": 64,
+          "length": 640,
+          "offset": 24576,
+          "shape": [
+            16,
+            64
+          ]
+        },
+        "model.layers.0.self_attn.compressor.wkv.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00001.bin",
+          "group": 64,
+          "length": 640,
+          "offset": 20480,
+          "shape": [
+            16,
+            64
+          ]
+        },
+        "model.layers.0.self_attn.wkv.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00001.bin",
+          "group": 64,
+          "length": 640,
+          "offset": 8192,
+          "shape": [
+            16,
+            64
+          ]
+        },
+        "model.layers.0.self_attn.wo_a.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00001.bin",
+          "group": 32,
+          "length": 768,
+          "offset": 12288,
+          "shape": [
+            32,
+            32
+          ]
+        },
+        "model.layers.0.self_attn.wo_b.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00001.bin",
+          "group": 32,
+          "length": 1536,
+          "offset": 16384,
+          "shape": [
+            64,
+            32
+          ]
+        },
+        "model.layers.0.self_attn.wq_a.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00001.bin",
+          "group": 64,
+          "length": 1280,
+          "offset": 0,
+          "shape": [
+            32,
+            64
+          ]
+        },
+        "model.layers.0.self_attn.wq_b.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00001.bin",
+          "group": 32,
+          "length": 1536,
+          "offset": 4096,
+          "shape": [
+            64,
+            32
+          ]
+        }
+      },
+      "file_bytes": 40960
+    },
+    "2": {
+      "entries": {
+        "model.layers.1.ffn.shared_experts.down_proj.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00002.bin",
+          "group": 32,
+          "length": 1536,
+          "offset": 36864,
+          "shape": [
+            64,
+            32
+          ]
+        },
+        "model.layers.1.ffn.shared_experts.gate_proj.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00002.bin",
+          "group": 64,
+          "length": 1280,
+          "offset": 28672,
+          "shape": [
+            32,
+            64
+          ]
+        },
+        "model.layers.1.ffn.shared_experts.up_proj.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00002.bin",
+          "group": 64,
+          "length": 1280,
+          "offset": 32768,
+          "shape": [
+            32,
+            64
+          ]
+        },
+        "model.layers.1.self_attn.compressor.wgate.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00002.bin",
+          "group": 64,
+          "length": 640,
+          "offset": 24576,
+          "shape": [
+            16,
+            64
+          ]
+        },
+        "model.layers.1.self_attn.compressor.wkv.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00002.bin",
+          "group": 64,
+          "length": 640,
+          "offset": 20480,
+          "shape": [
+            16,
+            64
+          ]
+        },
+        "model.layers.1.self_attn.wkv.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00002.bin",
+          "group": 64,
+          "length": 640,
+          "offset": 8192,
+          "shape": [
+            16,
+            64
+          ]
+        },
+        "model.layers.1.self_attn.wo_a.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00002.bin",
+          "group": 32,
+          "length": 768,
+          "offset": 12288,
+          "shape": [
+            32,
+            32
+          ]
+        },
+        "model.layers.1.self_attn.wo_b.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00002.bin",
+          "group": 32,
+          "length": 1536,
+          "offset": 16384,
+          "shape": [
+            64,
+            32
+          ]
+        },
+        "model.layers.1.self_attn.wq_a.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00002.bin",
+          "group": 64,
+          "length": 1280,
+          "offset": 0,
+          "shape": [
+            32,
+            64
+          ]
+        },
+        "model.layers.1.self_attn.wq_b.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00002.bin",
+          "group": 32,
+          "length": 1536,
+          "offset": 4096,
+          "shape": [
+            64,
+            32
+          ]
+        }
+      },
+      "file_bytes": 40960
+    },
+    "3": {
+      "entries": {
+        "model.layers.2.ffn.shared_experts.down_proj.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00003.bin",
+          "group": 32,
+          "length": 1536,
+          "offset": 36864,
+          "shape": [
+            64,
+            32
+          ]
+        },
+        "model.layers.2.ffn.shared_experts.gate_proj.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00003.bin",
+          "group": 64,
+          "length": 1280,
+          "offset": 28672,
+          "shape": [
+            32,
+            64
+          ]
+        },
+        "model.layers.2.ffn.shared_experts.up_proj.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00003.bin",
+          "group": 64,
+          "length": 1280,
+          "offset": 32768,
+          "shape": [
+            32,
+            64
+          ]
+        },
+        "model.layers.2.self_attn.compressor.wgate.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00003.bin",
+          "group": 64,
+          "length": 1280,
+          "offset": 24576,
+          "shape": [
+            32,
+            64
+          ]
+        },
+        "model.layers.2.self_attn.compressor.wkv.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00003.bin",
+          "group": 64,
+          "length": 1280,
+          "offset": 20480,
+          "shape": [
+            32,
+            64
+          ]
+        },
+        "model.layers.2.self_attn.indexer.compressor.wgate.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00003.bin",
+          "group": 64,
+          "length": 1280,
+          "offset": 57344,
+          "shape": [
+            32,
+            64
+          ]
+        },
+        "model.layers.2.self_attn.indexer.compressor.wkv.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00003.bin",
+          "group": 64,
+          "length": 1280,
+          "offset": 53248,
+          "shape": [
+            32,
+            64
+          ]
+        },
+        "model.layers.2.self_attn.indexer.weights_proj.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00003.bin",
+          "group": 64,
+          "length": 640,
+          "offset": 49152,
+          "shape": [
+            16,
+            64
+          ]
+        },
+        "model.layers.2.self_attn.indexer.wq_b.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00003.bin",
+          "group": 32,
+          "length": 6144,
+          "offset": 40960,
+          "shape": [
+            256,
+            32
+          ]
+        },
+        "model.layers.2.self_attn.wkv.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00003.bin",
+          "group": 64,
+          "length": 640,
+          "offset": 8192,
+          "shape": [
+            16,
+            64
+          ]
+        },
+        "model.layers.2.self_attn.wo_a.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00003.bin",
+          "group": 32,
+          "length": 768,
+          "offset": 12288,
+          "shape": [
+            32,
+            32
+          ]
+        },
+        "model.layers.2.self_attn.wo_b.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00003.bin",
+          "group": 32,
+          "length": 1536,
+          "offset": 16384,
+          "shape": [
+            64,
+            32
+          ]
+        },
+        "model.layers.2.self_attn.wq_a.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00003.bin",
+          "group": 64,
+          "length": 1280,
+          "offset": 0,
+          "shape": [
+            32,
+            64
+          ]
+        },
+        "model.layers.2.self_attn.wq_b.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00003.bin",
+          "group": 32,
+          "length": 1536,
+          "offset": 4096,
+          "shape": [
+            64,
+            32
+          ]
+        }
+      },
+      "file_bytes": 61440
+    },
+    "4": {
+      "entries": {
+        "model.layers.3.ffn.shared_experts.down_proj.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00004.bin",
+          "group": 32,
+          "length": 1536,
+          "offset": 36864,
+          "shape": [
+            64,
+            32
+          ]
+        },
+        "model.layers.3.ffn.shared_experts.gate_proj.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00004.bin",
+          "group": 64,
+          "length": 1280,
+          "offset": 28672,
+          "shape": [
+            32,
+            64
+          ]
+        },
+        "model.layers.3.ffn.shared_experts.up_proj.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00004.bin",
+          "group": 64,
+          "length": 1280,
+          "offset": 32768,
+          "shape": [
+            32,
+            64
+          ]
+        },
+        "model.layers.3.self_attn.compressor.wgate.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00004.bin",
+          "group": 64,
+          "length": 640,
+          "offset": 24576,
+          "shape": [
+            16,
+            64
+          ]
+        },
+        "model.layers.3.self_attn.compressor.wkv.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00004.bin",
+          "group": 64,
+          "length": 640,
+          "offset": 20480,
+          "shape": [
+            16,
+            64
+          ]
+        },
+        "model.layers.3.self_attn.wkv.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00004.bin",
+          "group": 64,
+          "length": 640,
+          "offset": 8192,
+          "shape": [
+            16,
+            64
+          ]
+        },
+        "model.layers.3.self_attn.wo_a.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00004.bin",
+          "group": 32,
+          "length": 768,
+          "offset": 12288,
+          "shape": [
+            32,
+            32
+          ]
+        },
+        "model.layers.3.self_attn.wo_b.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00004.bin",
+          "group": 32,
+          "length": 1536,
+          "offset": 16384,
+          "shape": [
+            64,
+            32
+          ]
+        },
+        "model.layers.3.self_attn.wq_a.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00004.bin",
+          "group": 64,
+          "length": 1280,
+          "offset": 0,
+          "shape": [
+            32,
+            64
+          ]
+        },
+        "model.layers.3.self_attn.wq_b.weight": {
+          "dtype": "q4_g",
+          "file": "dense-q-00004.bin",
+          "group": 32,
+          "length": 1536,
+          "offset": 4096,
+          "shape": [
+            64,
+            32
+          ]
+        }
+      },
+      "file_bytes": 40960
+    }
+  },
+  "config_sha256": "6feff8bd2e7409edc671c595588b38c1a9c35c4cb810a3338585966cd28bf94a",
+  "format": 1,
+  "group": 128,
+  "index_sha256": "7352971c674c2a67011b534dbfd18687e69226bb7100027ba126feaf5e4c7960",
+  "omitted_namespaces": [],
+  "quant_down": "q6_g",
+  "quant_gate_up": "q4_g",
+  "source_revision": "tiny-fixture"
+}

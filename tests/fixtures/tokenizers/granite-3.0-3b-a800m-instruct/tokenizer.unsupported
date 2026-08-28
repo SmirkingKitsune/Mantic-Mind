@@ -1,0 +1,1 @@
+legacy vocab.json + merges.txt with no tokenizer.json; the slow-tokenizer path is not compiled

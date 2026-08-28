@@ -1,0 +1,43 @@
+{
+  "fixture_version": 1,
+  "generate": 256,
+  "greedy_first_16": [
+    214,
+    214,
+    214,
+    214,
+    214,
+    214,
+    214,
+    214,
+    214,
+    214,
+    214,
+    214,
+    214,
+    272,
+    272,
+    214
+  ],
+  "implementation": "native",
+  "layer_kinds": [
+    "moe",
+    "moe",
+    "moe",
+    "moe"
+  ],
+  "n_params": 693376,
+  "numpy_version": "2.4.6",
+  "positions": 512,
+  "seed": 20260727,
+  "slug": "Mixtral-8x7B-v0.1",
+  "source": "Z:/AI/Ubiquitious-Memories/Mantic-Mind/models/mistralai/Mixtral-8x7B-v0.1",
+  "source_architectures": [
+    "MixtralForCausalLM"
+  ],
+  "source_model_type": "mixtral",
+  "tf_logits_sha256": "2ccf41dbf0d9ca636e2a9f11809ca8c796e16d50598f1af5cfaf203e5f15e183",
+  "torch_version": "2.13.0+cpu",
+  "transformers_version": "4.57.6",
+  "weights_sha256": "b3aacd13f5d2e798777ad28da435a1fbae9d80334a5a382366ec7d510693b2c2"
+}

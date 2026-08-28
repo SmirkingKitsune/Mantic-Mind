@@ -1,5 +1,7 @@
 #pragma once
 
+#include "common/engine_config.hpp"
+
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -160,6 +162,17 @@ struct AgentConfig {
     std::string   model_path;
     std::string   system_prompt;
     std::string   inference_backend = "llama-cpp"; // llama-cpp (default) | api
+
+    // Which local engine serves this agent: auto | soma | fallback.
+    //
+    // PERSISTENT and on the agent, not per placement. Placement is recomputed on
+    // every ensure_agent_running(), so a per-placement override would evaporate
+    // on the next eviction cycle and read as a flapping bug rather than as a
+    // setting that stopped applying.
+    //
+    // `auto` defers to the admission verdict. Absence of a verdict routes to the
+    // fallback — absence of a record is not evidence of admissibility.
+    std::string   backend_override = "auto";
     // Public alias advertised by the control server's OpenAI-compatible model
     // catalog. Older profiles stored this inside their backend-specific block.
     std::string   served_model_name;
@@ -338,6 +351,7 @@ struct SlotInfo {
     AgentId     assigned_agent;          // first attached agent (legacy display)
     std::vector<AgentId> agent_ids;      // all agents attached to this slot
     SlotState   state           = SlotState::Empty;
+    std::vector<int> gpu_devices;        // explicit vLLM device reservation
     int64_t     vram_usage_mb   = 0;
     int64_t     last_active_ms  = 0;
     std::string kv_cache_path;
@@ -353,6 +367,12 @@ struct AgentPlacement {
     bool        is_active       = false;  // true while inference/memory-extraction is in-flight
     std::string kv_cache_node_path;
     std::string engine_fingerprint;
+    std::string engine_id;
+    std::string ray_group_id;
+    std::vector<NodeId> member_node_ids;
+    std::string ray_role; ///< head for the placement owner; members report theirs in node health
+    std::string ray_transport;
+    std::string reservation_state; ///< exclusive|sleeping|empty for legacy engines
     int64_t     placed_at_ms    = 0;
     int64_t     last_active_ms  = 0;
 };
@@ -365,7 +385,25 @@ struct NodeCapabilities {
     // RPC members must share a compatible llama.cpp build fingerprint.
     std::string              llama_cpp_version; // llama.cpp build fingerprint, "" = unknown
     bool                     supports_llama_rpc = false; // can host/join a ggml RPC group
+    std::vector<std::string> comm_backends;
+    bool                     supports_ray = false;
+    double                   interconnect_gbps = 0.0;
+};
 
+/// Node-local ownership record for Ray. One active group per node is the
+/// exclusivity boundary; the group id makes start/stop idempotent and prevents
+/// one scheduler transaction from tearing down another's daemons.
+struct RayRuntimeStatus {
+    std::string state = "inactive"; ///< inactive|starting|active|error
+    std::string group_id;
+    std::string agent_id;
+    std::string role; ///< head|worker
+    std::string head_address;
+    std::string transport;
+    int reserved_gpus = 0;
+    std::string last_error;
+
+    bool active() const { return state == "active"; }
 };
 
 // ── NodeInfo ──────────────────────────────────────────────────────────────────
@@ -515,6 +553,7 @@ struct NodeInfo {
     std::string      platform;
     NodeCapabilities capabilities;
     NodeHealthMetrics metrics;
+    RayRuntimeStatus ray;
     int64_t          last_seen_ms = 0;
     int64_t          slot_snapshot_at_ms = 0; // last successfully parsed /api/node/status slots
     int64_t          unreachable_since_ms = 0;
@@ -532,9 +571,43 @@ struct NodeInfo {
     int                      slot_suspending = 0;
     int                      slot_suspended = 0;
     int                      slot_error = 0;
+
+    /// Cache ids of the models this node already holds, from its last status
+    /// poll. Empty means "holds none" OR "has no managed cache" — the two are
+    /// distinguished by `local_model_cache`.
+    ///
+    /// Placement charges a candidate for a model's disk footprint only when the
+    /// id is absent here. Before this the health poll collected `disk_free_mb`
+    /// and placement had no way to know whether a transfer was even needed, so
+    /// it charged nothing and the disk axis could only ever reject on headroom
+    /// (roadmap D65).
+    std::vector<std::string> local_model_ids;
+
+    /// False when the node reports no managed model cache at all. Distinct from
+    /// an empty list: "I hold nothing" and "I cannot tell you" lead to different
+    /// decisions, and conflating them would make a node with no cache look like
+    /// one that is empty and therefore cheap to place on.
+    bool local_model_cache = true;
+
     std::string              llama_server_path;
+    // The llama-specific DETAIL view. Kept beside `engines` rather than folded
+    // into it: release-asset variants, CUDA architecture, and the
+    // troubleshooting report are things llama.cpp has and Soma does not, and a
+    // generic per-engine status that carried them would be mostly empty fields
+    // describing a matrix most engines have no concept of.
     LlamaRuntimeStatus       llama_runtime;
     NodeActionProgress       action_progress;
+
+    // ── Cluster engine conformance ────────────────────────────────────────────
+    // Every engine this node can provision, and whether it runs what the master
+    // configured. Before this, `llama_runtime` above was the ONLY engine health
+    // control could see, so a Soma-only node reported a disabled llama runtime
+    // and nothing about the engine it was actually serving with.
+    std::vector<RuntimeStatus> engines;
+    EngineConformance          conformance;
+    // Last config version this node applied. Compared against the store's on
+    // every health poll; a mismatch is what triggers a push.
+    std::uint32_t              engine_config_version = 0;
 };
 
 // ── ToolDefinition ────────────────────────────────────────────────────────────
@@ -805,6 +878,7 @@ inline void to_json(nlohmann::json& j, const AgentConfig& a) {
           {"model_path",        a.model_path},
           {"system_prompt",     a.system_prompt},
           {"inference_backend", a.inference_backend},
+          {"backend_override",  a.backend_override},
           {"served_model_name", a.served_model_name},
           {"runtime_settings",  a.runtime_settings},
           {"api_settings",      a.api_settings},
@@ -820,6 +894,7 @@ inline void from_json(const nlohmann::json& j, AgentConfig& a) {
     if (j.contains("model_path"))        j.at("model_path").get_to(a.model_path);
     if (j.contains("system_prompt"))     j.at("system_prompt").get_to(a.system_prompt);
     if (j.contains("inference_backend")) j.at("inference_backend").get_to(a.inference_backend);
+    if (j.contains("backend_override"))  j.at("backend_override").get_to(a.backend_override);
     if (j.contains("served_model_name")) j.at("served_model_name").get_to(a.served_model_name);
     if (j.contains("runtime_settings"))  j.at("runtime_settings").get_to(a.runtime_settings);
     // Compatibility reader for agents serialized before the runtime split.
@@ -1121,6 +1196,7 @@ inline void to_json(nlohmann::json& j, const SlotInfo& s) {
           {"assigned_agent",  s.assigned_agent},
           {"agent_ids",       s.agent_ids},
           {"state",           to_string(s.state)},
+          {"gpu_devices",     s.gpu_devices},
           {"vram_usage_mb",   s.vram_usage_mb},
           {"last_active_ms",  s.last_active_ms},
           {"kv_cache_path",   s.kv_cache_path},
@@ -1140,6 +1216,7 @@ inline void from_json(const nlohmann::json& j, SlotInfo& s) {
     if (s.agent_ids.empty() && !s.assigned_agent.empty())
         s.agent_ids.push_back(s.assigned_agent);
     if (j.contains("state"))          s.state = slot_state_from_string(j.at("state").get<std::string>());
+    if (j.contains("gpu_devices"))    j.at("gpu_devices").get_to(s.gpu_devices);
     if (j.contains("vram_usage_mb"))  j.at("vram_usage_mb").get_to(s.vram_usage_mb);
     if (j.contains("last_active_ms")) j.at("last_active_ms").get_to(s.last_active_ms);
     if (j.contains("kv_cache_path"))  j.at("kv_cache_path").get_to(s.kv_cache_path);
@@ -1155,6 +1232,12 @@ inline void to_json(nlohmann::json& j, const AgentPlacement& p) {
           {"is_active",          p.is_active},
           {"kv_cache_node_path", p.kv_cache_node_path},
           {"engine_fingerprint", p.engine_fingerprint},
+          {"engine_id",          p.engine_id},
+          {"ray_group_id",       p.ray_group_id},
+          {"member_node_ids",    p.member_node_ids},
+          {"ray_role",           p.ray_role},
+          {"ray_transport",      p.ray_transport},
+          {"reservation_state",  p.reservation_state},
           {"placed_at_ms",       p.placed_at_ms},
           {"last_active_ms",     p.last_active_ms} };
 }
@@ -1166,6 +1249,12 @@ inline void from_json(const nlohmann::json& j, AgentPlacement& p) {
     if (j.contains("is_active"))          j.at("is_active").get_to(p.is_active);
     if (j.contains("kv_cache_node_path")) j.at("kv_cache_node_path").get_to(p.kv_cache_node_path);
     if (j.contains("engine_fingerprint")) j.at("engine_fingerprint").get_to(p.engine_fingerprint);
+    if (j.contains("engine_id"))          j.at("engine_id").get_to(p.engine_id);
+    if (j.contains("ray_group_id"))       j.at("ray_group_id").get_to(p.ray_group_id);
+    if (j.contains("member_node_ids"))    j.at("member_node_ids").get_to(p.member_node_ids);
+    if (j.contains("ray_role"))           j.at("ray_role").get_to(p.ray_role);
+    if (j.contains("ray_transport"))      j.at("ray_transport").get_to(p.ray_transport);
+    if (j.contains("reservation_state"))  j.at("reservation_state").get_to(p.reservation_state);
     if (j.contains("placed_at_ms"))       j.at("placed_at_ms").get_to(p.placed_at_ms);
     if (j.contains("last_active_ms"))     j.at("last_active_ms").get_to(p.last_active_ms);
 }
@@ -1175,13 +1264,37 @@ inline void to_json(nlohmann::json& j, const NodeCapabilities& c) {
     j = { {"arch",          c.arch},
           {"gpu_count",     c.gpu_count},
           {"llama_cpp_version",  c.llama_cpp_version},
-          {"supports_llama_rpc", c.supports_llama_rpc} };
+          {"supports_llama_rpc", c.supports_llama_rpc},
+          {"comm_backends", c.comm_backends},
+          {"supports_ray", c.supports_ray},
+          {"interconnect_gbps", c.interconnect_gbps} };
 }
 inline void from_json(const nlohmann::json& j, NodeCapabilities& c) {
     if (j.contains("arch"))          j.at("arch").get_to(c.arch);
     if (j.contains("gpu_count"))     j.at("gpu_count").get_to(c.gpu_count);
     if (j.contains("llama_cpp_version"))  j.at("llama_cpp_version").get_to(c.llama_cpp_version);
     if (j.contains("supports_llama_rpc")) j.at("supports_llama_rpc").get_to(c.supports_llama_rpc);
+    if (j.contains("comm_backends")) j.at("comm_backends").get_to(c.comm_backends);
+    if (j.contains("supports_ray")) j.at("supports_ray").get_to(c.supports_ray);
+    if (j.contains("interconnect_gbps"))
+        j.at("interconnect_gbps").get_to(c.interconnect_gbps);
+}
+
+inline void to_json(nlohmann::json& j, const RayRuntimeStatus& r) {
+    j = {{"state", r.state}, {"group_id", r.group_id}, {"agent_id", r.agent_id},
+         {"role", r.role}, {"head_address", r.head_address},
+         {"transport", r.transport}, {"reserved_gpus", r.reserved_gpus},
+         {"last_error", r.last_error}};
+}
+inline void from_json(const nlohmann::json& j, RayRuntimeStatus& r) {
+    if (j.contains("state")) j.at("state").get_to(r.state);
+    if (j.contains("group_id")) j.at("group_id").get_to(r.group_id);
+    if (j.contains("agent_id")) j.at("agent_id").get_to(r.agent_id);
+    if (j.contains("role")) j.at("role").get_to(r.role);
+    if (j.contains("head_address")) j.at("head_address").get_to(r.head_address);
+    if (j.contains("transport")) j.at("transport").get_to(r.transport);
+    if (j.contains("reserved_gpus")) j.at("reserved_gpus").get_to(r.reserved_gpus);
+    if (j.contains("last_error")) j.at("last_error").get_to(r.last_error);
 }
 
 // ─── NodeInfo ─────────────────────────────────────────────────────────────────
@@ -1383,6 +1496,7 @@ inline void to_json(nlohmann::json& j, const NodeInfo& n) {
           {"platform",      n.platform},
           {"capabilities",  n.capabilities},
           {"metrics",       n.metrics},
+          {"ray",           n.ray},
           {"last_seen_ms",  n.last_seen_ms},
           {"slot_snapshot_at_ms", n.slot_snapshot_at_ms},
           {"unreachable_since_ms", n.unreachable_since_ms},
@@ -1400,7 +1514,10 @@ inline void to_json(nlohmann::json& j, const NodeInfo& n) {
           {"slot_error",    n.slot_error},
           {"llama_server_path",        n.llama_server_path},
           {"llama_runtime",            n.llama_runtime},
-          {"action_progress",          n.action_progress} };
+          {"action_progress",          n.action_progress},
+          {"engines",                  n.engines},
+          {"conformance",              n.conformance},
+          {"engine_config_version",    n.engine_config_version} };
 }
 inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     j.at("id").get_to(n.id);
@@ -1418,6 +1535,7 @@ inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     if (j.contains("platform"))      j.at("platform").get_to(n.platform);
     if (j.contains("capabilities"))  j.at("capabilities").get_to(n.capabilities);
     if (j.contains("metrics"))       j.at("metrics").get_to(n.metrics);
+    if (j.contains("ray"))           j.at("ray").get_to(n.ray);
     if (j.contains("last_seen_ms"))  j.at("last_seen_ms").get_to(n.last_seen_ms);
     if (j.contains("slot_snapshot_at_ms"))
         j.at("slot_snapshot_at_ms").get_to(n.slot_snapshot_at_ms);
@@ -1437,6 +1555,10 @@ inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     if (j.contains("llama_server_path")) j.at("llama_server_path").get_to(n.llama_server_path);
     if (j.contains("llama_runtime")) j.at("llama_runtime").get_to(n.llama_runtime);
     if (j.contains("action_progress")) j.at("action_progress").get_to(n.action_progress);
+    if (j.contains("engines")) j.at("engines").get_to(n.engines);
+    if (j.contains("conformance")) j.at("conformance").get_to(n.conformance);
+    if (j.contains("engine_config_version"))
+        j.at("engine_config_version").get_to(n.engine_config_version);
 }
 
 // ─── ToolDefinition ───────────────────────────────────────────────────────────

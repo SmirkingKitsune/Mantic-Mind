@@ -1,0 +1,14 @@
+{
+  "add_prefix_space": false,
+  "corpus_size": 36,
+  "n_added": 28,
+  "n_classes": 7,
+  "n_merges": 50009,
+  "n_vocab": 50280,
+  "nfc_implemented_in_engine": false,
+  "nfc_unstable_dropped": 1,
+  "normalizer": "NFC",
+  "program": "gpt2",
+  "source": "Z:\\AI\\Ubiquitious-Memories\\Mantic-Mind\\models\\allenai\\OLMoE-1B-7B-0924",
+  "total_oracle_tokens": 353
+}

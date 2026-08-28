@@ -1,0 +1,17 @@
+{
+  "fixture_version": 1,
+  "implementation": "pinned DeepSeek inference/model.py with CPU kernel replacements",
+  "kernel_py_sha256": "59b325083d7103975cba025bd0d60ea343bb82d8fff53088afb7c04bd380c0c2",
+  "model_py_sha256": "c0c19e6c9fa439bac7fbb1c5bc1868232dfd5aa2f439a548d0e33dcc2a9edd3f",
+  "oracle_sha256": "964c3155be52fc4b54e5c740bf22fba4caeac718be009e2b26c837713d4cabae",
+  "proposal_tokens": [
+    101,
+    202,
+    303,
+    404,
+    505
+  ],
+  "seed": 20260820,
+  "source_revision": "72e1d3230f6c080a530b0a1d46f8eb4602340597",
+  "weights_sha256": "388593bfc70182a09e55817c6d4f4fedb37ccb20fa35571626f70f2d59f49509"
+}

@@ -1,0 +1,46 @@
+# Admission tooling — OFFLINE ONLY.
+#
+# Never installed on a serving host. The engine does not spawn Python, link it,
+# or require it at runtime; these exist to build oracles and profile models.
+#
+# This is the first requirements.txt in the repo. Every other Python file here
+# (tools/qwen_tts_service.py and the two test scripts) is stdlib-only, and that
+# stays true — admission is the exception because the conformance oracle is
+# defined as "what transformers does".
+#
+# Install:
+#   python -m venv tools/admission/.venv
+#   tools/admission/.venv/Scripts/python -m pip install -r tools/admission/requirements.txt \
+#       --extra-index-url https://download.pytorch.org/whl/cu128
+#
+# torch is pinned to a CUDA 12.8 build: the dev box is an RTX 5090 (Blackwell,
+# sm_120), which older CUDA builds do not target. CPU-only wheels are sufficient
+# for G0/G1 (tiny-random models) but not for G2's fp16 reference pass over real
+# checkpoints, so the CUDA build is installed once rather than swapped later.
+
+torch>=2.7.0
+
+# Upper-bounded at 5.0 deliberately, and this is not conservatism.
+#
+# DeepSeek-V2-Lite and Moonlight-16B-A3B are `custom_code` repos: their
+# modeling_deepseek.py ships in the checkpoint and imports
+# `transformers.utils.import_utils.is_torch_fx_available`, which was removed in
+# transformers 5.x. Those two ARE the MLA seam fixtures for G4, so the oracle has
+# to be able to build them.
+#
+# Lower bound is 4.51: Qwen3-MoE support landed there.
+transformers>=4.51.0,<5.0.0
+
+# fetch.py only. Everything else here works on a local directory, which is the
+# point of fetch being its own stage — a host that converts models someone else
+# downloaded does not need this, and `fetch.py` says so rather than crashing.
+huggingface-hub>=0.26.0
+
+safetensors>=0.4.5
+numpy>=1.26.0,<3.0.0
+accelerate>=1.0.0
+
+# Pinned separately from transformers: the tokenizer round-trip gate compares
+# our compiled tokenizer against THIS library's output byte-for-byte, so its
+# version is part of the fixture's identity.
+tokenizers>=0.21.0

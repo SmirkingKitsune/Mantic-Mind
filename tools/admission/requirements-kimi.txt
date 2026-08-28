@@ -1,0 +1,33 @@
+# The KIMI oracle interpreter — a THIRD venv, and the reason is Triton.
+#
+#   python -m venv tools/admission/.venv-kimi
+#   .venv-kimi/Scripts/python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
+#   .venv-kimi/Scripts/python -m pip install -r tools/admission/requirements-kimi.txt
+#
+# WHY NOT THE ADMISSION VENV. `moonshotai/Kimi-K3`'s modeling code does not
+# degrade without `fla`: `modeling_kimi_linear.py` raises ImportError at import
+# time if it is absent. And `fla`'s kernels are Triton, which on Windows means
+# `triton-windows` — a community build, not the upstream package, which ships no
+# Windows wheels at all. Putting a GPU-and-Windows-specific compiler stack into
+# the venv that runs `convert.py` for every admission would make the whole
+# pipeline depend on it. The same argument that split `.venv-oracle` off for a
+# transformers major bump applies here with more force.
+#
+# WHY NOT `.venv-oracle`. That one is pinned to transformers 5.12.1 for GLM-5.2.
+# Kimi-K3's config declares `transformers_version: 4.56.2`, and its modeling code
+# imports `ALL_LAYERNORM_LAYERS` from `transformers.pytorch_utils`, which 5.x
+# removed. An oracle should be the reference the checkpoint names.
+#
+# TORCH MUST BE THE CUDA BUILD. Triton compiles for a GPU; there is no CPU
+# backend to fall back to. Note the `--index-url` above rather than
+# `--extra-index-url`: with the extra form pip sees PyPI's default wheel at an
+# equal-or-higher version and installs the CPU build, which is what happened to
+# `.venv` and is why its own comment about needing CUDA is not what its command
+# produces.
+
+transformers>=4.56,<5.0
+fla-core>=0.5.2
+triton-windows>=3.7 ; sys_platform == "win32"
+numpy
+safetensors
+einops

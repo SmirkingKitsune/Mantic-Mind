@@ -4,6 +4,13 @@
 #include "control/agent_manager.hpp"
 #include "control/agent_scheduler.hpp"
 #include "control/agent_config_validator.hpp"
+// The Soma tab, built entirely from /v1/*. Its panels live in their own
+// translation unit precisely so they CANNOT reach the three registries this
+// file holds by reference; tools/ci/check_ui_api.py enforces that.
+#include "control/soma_dashboard.hpp"
+#include "control/admission_panels.hpp"
+#include "control/engine_panels.hpp"
+#include "control/soma_panels.hpp"
 #include "common/agent.hpp"
 #include "common/agent_db.hpp"
 #include "common/http_client.hpp"
@@ -194,6 +201,12 @@ void ControlUI::run() {
     //
 
     int tab_index = 0;
+    int soma_selected = 0;
+    int engine_selected = 0;
+    int admission_selected = 0;
+    // Owned here rather than inside the tab: the same fact drives the
+    // banner on every other tab, and two owners is how those disagree.
+    bool force_engine_setup = false;
     mm::tui::LayoutStore layout("data/control-tui-layout.json");
     int node_detail_height = layout.get("nodes.detail_height", 20, 12, 40);
     int node_name_width = layout.get("nodes.name_width", 18, 12, 36);
@@ -240,7 +253,13 @@ void ControlUI::run() {
     std::string ed_max_s{"1024"};
     // Local llama.cpp and remote API runtime settings.
     int ed_backend = 0;
-    std::vector<std::string> ed_backend_labels = {"llama.cpp", "Remote API"};
+    // Which ENGINE serves this agent, as distinct from whether it is served
+    // node-locally at all. backend_override has been in AgentConfig and on the
+    // API from the start and reachable from no TUI control, so 'soma' was a
+    // decision an operator could read back and never make.
+    int ed_override = 0;
+    std::vector<std::string> ed_override_labels = {"auto", "soma", "fallback"};
+    std::vector<std::string> ed_backend_labels = {"Cluster engine", "Remote API"};
     std::string ed_unsupported_backend;
     std::string ed_ctx_s{"4096"}, ed_gpu_layers_s{"-1"}, ed_threads_s{"-1"};
     std::string ed_threads_http_s{"-1"}, ed_parallel_s{"1"};
@@ -314,6 +333,19 @@ void ControlUI::run() {
     std::vector<std::string> cur_agent_entries;
     std::vector<std::string> cur_conv_entries;
     std::vector<std::string> cur_mem_entries;
+    // Ids of the CONVERSATION-LOCAL memories last listed, and its own vector on
+    // purpose: `cur_mem_entries` holds the agent-WIDE memories, and indexing
+    // one list to edit the other would silently address the wrong row. The two
+    // are different scopes that happen to render the same way.
+    std::vector<std::string> cur_local_mem_ids;
+    std::vector<std::string> cur_local_mem_entries;
+    int cur_local_mem_sel = 0;
+    std::string cur_local_mem_conversation_id;
+    // The exact proposal documents returned by the API. Apply validates their
+    // before/after snapshots, so sending an empty body (or reconstructing a
+    // proposal from the visible label) can never work correctly.
+    nlohmann::json cur_proposals = nlohmann::json::array();
+    std::string cur_proposals_agent_id;
     std::string cur_new_title;
     std::string cur_start_s{"0"};
     std::string cur_end_s{"0"};
@@ -507,6 +539,9 @@ void ControlUI::run() {
             : (ed_backend >= 2 && !ed_unsupported_backend.empty()
                 ? ed_unsupported_backend
                 : "llama-cpp");
+        cfg.backend_override = ed_override == 1 ? "soma"
+                             : ed_override == 2 ? "fallback"
+                                                : "auto";
         // Generation (shared request contract → RuntimeSettings)
         try { cfg.runtime_settings.temperature = std::stof(ed_temp_s); } catch (...) {}
         try { cfg.runtime_settings.top_p = std::stof(ed_topp_s); } catch (...) {}
@@ -878,7 +913,8 @@ void ControlUI::run() {
         ed_minp_s = "-1.00"; ed_presence_s = "0.00"; ed_repeat_s = "-1.00";
         ed_max_s = "1024";
         ed_backend = 0;
-        ed_backend_labels = {"llama.cpp", "Remote API"};
+        ed_backend_labels = {"Cluster engine", "Remote API"};
+        ed_override = 0;
         ed_unsupported_backend.clear();
         ed_ctx_s = "4096"; ed_gpu_layers_s = "-1"; ed_threads_s = "-1";
         ed_threads_http_s = "-1"; ed_parallel_s = "1"; ed_batch_s = "-1"; ed_ubatch_s = "-1";
@@ -913,7 +949,7 @@ void ControlUI::run() {
             ed_repeat_s = tmp;
             ed_max_s = std::to_string(c.runtime_settings.max_tokens);
             const std::string backend = util::to_lower(c.inference_backend);
-            ed_backend_labels = {"llama.cpp", "Remote API"};
+            ed_backend_labels = {"Cluster engine", "Remote API"};
             ed_unsupported_backend.clear();
             if (backend.empty() || backend == "llama-cpp" || backend == "llama.cpp" ||
                 backend == "llama") {
@@ -925,6 +961,9 @@ void ControlUI::run() {
                 ed_backend_labels.push_back("Unsupported: " + backend);
                 ed_backend = 2;
             }
+            ed_override = c.backend_override == "soma"     ? 1
+                        : c.backend_override == "fallback" ? 2
+                                                           : 0;
             ed_ctx_s = std::to_string(c.runtime_settings.ctx_size);
             ed_gpu_layers_s = std::to_string(c.runtime_settings.n_gpu_layers);
             ed_threads_s = std::to_string(c.runtime_settings.n_threads);
@@ -960,7 +999,45 @@ void ControlUI::run() {
                 agent_sel = std::max(0, static_cast<int>(cs.size()) - 2);
         }
     }, ButtonOption::Simple());
-    auto agent_list_btns = Container::Horizontal({btn_new_a, btn_edit_a, btn_del_a});
+    // ── placement lifecycle, on the tab that is about placements ─────────────
+    //
+    // These reached the API in D51 and the CLI with it, and had no control on
+    // the one screen showing which agents are running. An operator freeing a
+    // node had to drop to a shell — for an action the scheduler performs on its
+    // own under capacity pressure.
+    auto btn_suspend_a = Button(
+        "[⏸] Suspend",
+        [&] {
+            auto cs = agents_.list_agents();
+            if (agent_sel < 0 || agent_sel >= static_cast<int>(cs.size())) return;
+            // Reported either way: "nothing to suspend" and "suspended" are
+            // different outcomes and the row looks identical after both.
+            if (scheduler_.suspend_agent(cs[agent_sel].id))
+                log(LogLevel::Info, "Suspended agent " + cs[agent_sel].id);
+            else
+                log(LogLevel::Warn,
+                    "Agent " + cs[agent_sel].id + " holds no live placement to suspend");
+        },
+        ButtonOption::Simple());
+
+    auto btn_restore_a = Button(
+        "[▶] Restore",
+        [&] {
+            auto cs = agents_.list_agents();
+            if (agent_sel < 0 || agent_sel >= static_cast<int>(cs.size())) return;
+            // Restore IS ensure_agent_running — its first step is
+            // existing/suspended placement, so this resumes from the checkpoint
+            // rather than reloading. Same call the API route makes.
+            if (auto placed = scheduler_.ensure_agent_running(cs[agent_sel]))
+                log(LogLevel::Info,
+                    "Restored agent " + cs[agent_sel].id + " on node " + placed->node_id);
+            else
+                log(LogLevel::Error, "Restore failed: " + scheduler_.last_error());
+        },
+        ButtonOption::Simple());
+
+    auto agent_list_btns =
+        Container::Horizontal({btn_new_a, btn_edit_a, btn_suspend_a, btn_restore_a, btn_del_a});
     // Maybe wrapper: keep agent_menu out of the component tree when empty, matching
     // every other list menu, so FTXUI never indexes/focuses an empty entries vector.
     auto agent_menu_m = Maybe(agent_menu, [&]() { return !agent_entries.empty(); });
@@ -991,6 +1068,7 @@ void ControlUI::run() {
     auto ed_inp_repeat = Input(&ed_repeat_s, sl);
     auto ed_inp_max   = Input(&ed_max_s,     sl);
     auto ed_backend_toggle = Toggle(&ed_backend_labels, &ed_backend);
+    auto ed_override_toggle = Toggle(&ed_override_labels, &ed_override);
     auto ed_inp_ctx = Input(&ed_ctx_s, sl);
     auto ed_inp_gpu_layers = Input(&ed_gpu_layers_s, sl);
     auto ed_inp_threads = Input(&ed_threads_s, sl);
@@ -1159,6 +1237,7 @@ void ControlUI::run() {
     auto sampling_m = Maybe(sampling_fields, [&] { return ed_open_sampling; });
     auto engine_fields = Container::Vertical({
         ed_backend_toggle,
+        ed_override_toggle,
         ed_inp_ctx, ed_inp_gpu_layers, ed_inp_threads, ed_inp_threads_http,
         ed_inp_parallel, ed_inp_batch, ed_inp_ubatch, ed_cb_flash, ed_inp_llama_extra,
         ed_cb_vision, mmproj_row,
@@ -1816,9 +1895,12 @@ void ControlUI::run() {
         return row;
     };
     auto cur_mem_menu   = Menu(&cur_mem_entries, &cur_mem_sel, cur_mem_opt);
+    auto cur_local_mem_menu = Menu(&cur_local_mem_entries, &cur_local_mem_sel);
     auto cur_agent_menu_m = Maybe(cur_agent_menu, [&]() { return !cur_agent_entries.empty(); });
     auto cur_conv_menu_m  = Maybe(cur_conv_menu,  [&]() { return !cur_conv_entries.empty(); });
     auto cur_mem_menu_m   = Maybe(cur_mem_menu,   [&]() { return !cur_mem_entries.empty(); });
+    auto cur_local_mem_menu_m =
+        Maybe(cur_local_mem_menu, [&]() { return !cur_local_mem_entries.empty(); });
 
     InputOption cur_iopt;
     cur_iopt.multiline = false;
@@ -1832,6 +1914,258 @@ void ControlUI::run() {
     auto cur_ctx_input     = Input(&cur_context_before_s, cur_num_opt);
     auto cur_new_active_cb = Checkbox("Set active", &cur_new_set_active);
     auto cur_new_parent_cb = Checkbox("Use selected as parent", &cur_new_use_parent);
+
+    // ── curation proposals and conversation-local memories ───────────────────
+    //
+    // These go over HTTP rather than through `a->db()` like the rest of this
+    // tab, deliberately. The db() path bypasses ConversationManager and
+    // MemoryManager as well as the API handler — two layers, not one (roadmap
+    // D54) — and the propose/apply loop in particular has real logic in the
+    // handler that a direct table write would skip entirely.
+    //
+    // It also moves the TUI a step toward being what P1 says it is: one client
+    // of the API, rather than a privileged process that happens to share an
+    // address space.
+    auto curation_http = [this]() {
+        HttpClient cli(control_base_url_);
+        if (!control_api_token_.empty()) cli.set_bearer_token(control_api_token_);
+        return cli;
+    };
+    auto selected_agent_id = [&]() -> std::string {
+        auto agents = agents_.list_agents();
+        if (cur_agent_sel < 0 || cur_agent_sel >= static_cast<int>(agents.size())) return {};
+        return agents[cur_agent_sel].id;
+    };
+
+    auto btn_cur_propose = Button(
+        " Propose ",
+        [&] {
+            const auto id = selected_agent_id();
+            if (id.empty()) return;
+            auto cli = curation_http();
+            const auto r =
+                cli.post("/v1/agents/" + id + "/curation/proposals", nlohmann::json::object());
+            if (!r.ok()) {
+                set_curation_status("failed", "propose failed: HTTP " + std::to_string(r.status));
+            } else {
+                try {
+                    const auto body = nlohmann::json::parse(r.body);
+                    const auto proposals = body.at("proposals");
+                    if (!proposals.is_array())
+                        throw std::runtime_error("proposals is not an array");
+                    cur_proposals = proposals;
+                    cur_proposals_agent_id = id;
+                    set_curation_status("ok",
+                                        std::to_string(cur_proposals.size()) +
+                                            (cur_proposals.empty() ? " proposals; nothing to apply"
+                                                                   : " proposals ready to apply"));
+                } catch (const std::exception& e) {
+                    cur_proposals = nlohmann::json::array();
+                    cur_proposals_agent_id.clear();
+                    set_curation_status("failed",
+                                        std::string("invalid proposal response: ") + e.what());
+                }
+            }
+            refresh();
+        },
+        ButtonOption::Simple());
+
+    auto apply_cur_proposals = [&](const std::string& id,
+                                   const std::string& path,
+                                   const std::string& success) {
+        if (cur_proposals_agent_id != id || !cur_proposals.is_array() || cur_proposals.empty()) {
+            set_curation_status("failed", "generate proposals for this agent first");
+            refresh();
+            return;
+        }
+        auto cli = curation_http();
+        const auto r = cli.post(path, nlohmann::json{{"proposals", cur_proposals}});
+        if (r.ok()) {
+            cur_proposals = nlohmann::json::array();
+            cur_proposals_agent_id.clear();
+            cur_cache_dirty = true;
+        }
+        set_curation_status(r.ok() ? "ok" : "failed",
+                            r.ok() ? success : "apply failed: HTTP " + std::to_string(r.status));
+        refresh();
+    };
+
+    auto btn_cur_apply = Button(
+        " Apply proposals ",
+        [&] {
+            const auto id = selected_agent_id();
+            if (id.empty()) return;
+            // Two routes exist for this; `/curation/proposals/apply` is the one the
+            // API document names as the alias, and both reach one handler.
+            apply_cur_proposals(
+                id, "/v1/agents/" + id + "/curation/proposals/apply", "curation proposals applied");
+        },
+        ButtonOption::Simple());
+
+    auto btn_cur_apply_direct = Button(
+        " Apply edits ",
+        [&] {
+            const auto id = selected_agent_id();
+            if (id.empty()) return;
+            apply_cur_proposals(
+                id, "/v1/agents/" + id + "/curation/apply", "curation edits applied");
+        },
+        ButtonOption::Simple());
+
+    // Conversation-LOCAL memories: scoped to one conversation, distinct from the
+    // agent-wide memories the list above shows. All four verbs were unreachable
+    // from any screen.
+    auto local_mem_base = [&]() -> std::string {
+        const auto id = selected_agent_id();
+        if (id.empty()) return {};
+        auto a = agents_.get_agent(id);
+        if (!a) return {};
+        const auto convs = a->db().list_conversations();
+        if (cur_conv_sel < 0 || cur_conv_sel >= static_cast<int>(convs.size())) return {};
+        return "/v1/agents/" + id + "/conversations/" + convs[cur_conv_sel].id + "/local-memories";
+    };
+
+    auto btn_cur_local_list = Button(
+        " Local memories ",
+        [&] {
+            const auto base = local_mem_base();
+            if (base.empty()) {
+                set_curation_status("failed", "select an agent and a conversation first");
+                return;
+            }
+            auto cli = curation_http();
+            const auto r = cli.get(base);
+            if (!r.ok()) {
+                set_curation_status("failed", "local memories: HTTP " + std::to_string(r.status));
+            } else {
+                std::size_t n = 0;
+                cur_local_mem_ids.clear();
+                cur_local_mem_entries.clear();
+                try {
+                    const auto j = nlohmann::json::parse(r.body);
+                    const auto& arr = j.contains("data") ? j.at("data") : j;
+                    if (!arr.is_array()) throw std::runtime_error("response is not an array");
+                    n = arr.size();
+                    for (const auto& m : arr) {
+                        const auto id = m.value("id", std::string{});
+                        const auto content = m.value("content", std::string{});
+                        if (!id.empty()) {
+                            cur_local_mem_ids.push_back(m.value("id", std::string{}));
+                            cur_local_mem_entries.push_back(
+                                content.size() > 72 ? content.substr(0, 69) + "..." : content);
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    set_curation_status("failed",
+                                        std::string("invalid local-memory response: ") + e.what());
+                    refresh();
+                    return;
+                }
+                if (cur_local_mem_sel >= static_cast<int>(cur_local_mem_ids.size()))
+                    cur_local_mem_sel = 0;
+                cur_local_mem_conversation_id =
+                    cur_local_mem_ids.empty() ? std::string{} : cur_detail_loaded_id;
+                set_curation_status("ok",
+                                    std::to_string(n) + " memory/ies local to this conversation");
+            }
+            refresh();
+        },
+        ButtonOption::Simple());
+
+    auto btn_cur_local_add = Button(
+        " + Local ",
+        [&] {
+            const auto base = local_mem_base();
+            if (base.empty()) {
+                set_curation_status("failed", "select an agent and a conversation first");
+                return;
+            }
+            if (cur_new_title.empty()) {
+                // Reuses the title field rather than adding another input: the
+                // capability is what was missing, and a second text box on this tab
+                // buys nothing an operator asked for.
+                set_curation_status("failed", "type the memory text in the title field first");
+                return;
+            }
+            auto cli = curation_http();
+            const auto r = cli.post(base, nlohmann::json{{"content", cur_new_title}});
+            if (r.ok()) {
+                try {
+                    const auto saved = nlohmann::json::parse(r.body);
+                    const auto saved_id = saved.value("id", std::string{});
+                    if (!saved_id.empty()) {
+                        cur_local_mem_ids.push_back(saved_id);
+                        cur_local_mem_entries.push_back(cur_new_title.size() > 72
+                                                            ? cur_new_title.substr(0, 69) + "..."
+                                                            : cur_new_title);
+                        cur_local_mem_sel = static_cast<int>(cur_local_mem_ids.size()) - 1;
+                        cur_local_mem_conversation_id = cur_detail_loaded_id;
+                    }
+                } catch (const std::exception&) {
+                    // The mutation succeeded. A list refresh can recover the view;
+                    // do not report a successful create as failed because its
+                    // representation could not be refreshed optimistically.
+                }
+            }
+            set_curation_status(r.ok() ? "ok" : "failed",
+                                r.ok() ? "local memory added"
+                                       : "add failed: HTTP " + std::to_string(r.status));
+            refresh();
+        },
+        ButtonOption::Simple());
+
+    auto btn_cur_local_edit = Button(
+        " Edit Local ",
+        [&] {
+            const auto base = local_mem_base();
+            if (base.empty() || cur_local_mem_sel < 0 ||
+                cur_local_mem_sel >= static_cast<int>(cur_local_mem_ids.size())) {
+                set_curation_status("failed", "press Local memories to list them first");
+                return;
+            }
+            if (cur_new_title.empty()) {
+                set_curation_status("failed", "type the replacement text in the title field first");
+                return;
+            }
+            auto cli = curation_http();
+            const auto r =
+                cli.put(base + "/" + cur_local_mem_ids[static_cast<size_t>(cur_local_mem_sel)],
+                        nlohmann::json{{"content", cur_new_title}});
+            if (r.ok())
+                cur_local_mem_entries[static_cast<size_t>(cur_local_mem_sel)] =
+                    cur_new_title.size() > 72 ? cur_new_title.substr(0, 69) + "..." : cur_new_title;
+            set_curation_status(r.ok() ? "ok" : "failed",
+                                r.ok() ? "local memory updated"
+                                       : "update failed: HTTP " + std::to_string(r.status));
+            refresh();
+        },
+        ButtonOption::Simple());
+
+    auto btn_cur_local_del = Button(
+        " - Local ",
+        [&] {
+            const auto base = local_mem_base();
+            if (base.empty() || cur_local_mem_sel < 0 ||
+                cur_local_mem_sel >= static_cast<int>(cur_local_mem_ids.size())) {
+                set_curation_status("failed", "press Local memories to list them first");
+                return;
+            }
+            auto cli = curation_http();
+            const auto r =
+                cli.del(base + "/" + cur_local_mem_ids[static_cast<size_t>(cur_local_mem_sel)]);
+            if (r.ok()) {
+                cur_local_mem_ids.erase(cur_local_mem_ids.begin() + cur_local_mem_sel);
+                cur_local_mem_entries.erase(cur_local_mem_entries.begin() + cur_local_mem_sel);
+                if (cur_local_mem_sel >= static_cast<int>(cur_local_mem_ids.size()))
+                    cur_local_mem_sel = std::max(0, static_cast<int>(cur_local_mem_ids.size()) - 1);
+                if (cur_local_mem_ids.empty()) cur_local_mem_conversation_id.clear();
+            }
+            set_curation_status(r.ok() ? "ok" : "failed",
+                                r.ok() ? "local memory deleted"
+                                       : "delete failed: HTTP " + std::to_string(r.status));
+            refresh();
+        },
+        ButtonOption::Simple());
 
     auto btn_cur_new_conv = Button(" New Conversation ", [&] {
         auto agents = agents_.list_agents();
@@ -2010,6 +2344,7 @@ void ControlUI::run() {
         cur_agent_menu_m,
         cur_conv_menu_m,
         cur_mem_menu_m,
+        cur_local_mem_menu_m,
         cur_new_title_input,
         cur_start_input,
         cur_end_input,
@@ -2021,7 +2356,17 @@ void ControlUI::run() {
         btn_cur_compact,
         btn_cur_delete_conv,
         btn_cur_extract,
-        btn_cur_delete_mem
+        btn_cur_delete_mem,
+        // The propose/apply loop and conversation-local memories. Both reach
+        // the API over HTTP rather than a->db(), so neither adds to the
+        // in-process mutation surface the parity check has to carry.
+        btn_cur_propose,
+        btn_cur_apply,
+        btn_cur_apply_direct,
+        btn_cur_local_list,
+        btn_cur_local_add,
+        btn_cur_local_edit,
+        btn_cur_local_del
     });
 
     auto btn_cur_confirm_delete = Button(" Confirm Delete ", [&] {
@@ -2371,6 +2716,7 @@ void ControlUI::run() {
             }
             Element engine_body = vbox({
                 field(" backend", ed_backend_toggle->Render() | flex),
+                field(" engine", ed_override_toggle->Render() | flex),
                 separator(),
                 std::move(engine_specific),
             });
@@ -2726,8 +3072,15 @@ void ControlUI::run() {
         // which would spin a redraw loop while the DB stays locked.
         const auto cur_now = std::chrono::steady_clock::now();
         const bool cur_force = cur_cache_dirty.exchange(false);
-        if (cur_force || cur_agent_id != cur_cache_agent_id ||
+        const bool cur_agent_changed = cur_agent_id != cur_cache_agent_id;
+        if (cur_force || cur_agent_changed ||
             cur_now - cur_cache_at > std::chrono::milliseconds(1000)) {
+            if (cur_agent_changed) {
+                cur_local_mem_ids.clear();
+                cur_local_mem_entries.clear();
+                cur_local_mem_conversation_id.clear();
+                cur_local_mem_sel = 0;
+            }
             cur_cache_agent_id = cur_agent_id;
             cur_cache_at = cur_now;
             cur_convs_cache.clear();
@@ -2770,6 +3123,12 @@ void ControlUI::run() {
         if (!convs.empty() && cur_conv_sel >= 0 && cur_conv_sel < static_cast<int>(convs.size())) {
             const std::string want_id = convs[cur_conv_sel].id;
             if (want_id != cur_detail_loaded_id) {
+                if (want_id != cur_local_mem_conversation_id) {
+                    cur_local_mem_ids.clear();
+                    cur_local_mem_entries.clear();
+                    cur_local_mem_conversation_id.clear();
+                    cur_local_mem_sel = 0;
+                }
                 cur_conv_detail_cache.reset();
                 if (auto a = curation_agent()) {
                     try {
@@ -2783,6 +3142,10 @@ void ControlUI::run() {
                 }
             }
         } else {
+            cur_local_mem_ids.clear();
+            cur_local_mem_entries.clear();
+            cur_local_mem_conversation_id.clear();
+            cur_local_mem_sel = 0;
             cur_conv_detail_cache.reset();
             cur_detail_loaded_id.clear();
         }
@@ -2878,6 +3241,27 @@ void ControlUI::run() {
             text(" "), btn_cur_new_conv->Render(),
             filler(),
         }));
+        dl.push_back(hbox({
+            text("curate ") | dim,
+            btn_cur_propose->Render(),
+            text(" "),
+            btn_cur_apply->Render(),
+            text(" "),
+            btn_cur_apply_direct->Render(),
+            filler(),
+        }));
+        dl.push_back(hbox({
+            text("local  ") | dim,
+            btn_cur_local_list->Render(), text(" "),
+            btn_cur_local_add->Render(), text(" "),
+            btn_cur_local_edit->Render(), text(" "),
+            btn_cur_local_del->Render(),
+            filler(),
+        }));
+        if (!cur_local_mem_entries.empty()) {
+            dl.push_back(hbox({text("       ") | dim,
+                               cur_local_mem_menu_m->Render() | size(HEIGHT, LESS_THAN, 3) | flex}));
+        }
         if (!error_snapshot.empty())
             dl.push_back(text("error: " + error_snapshot) | color(Color::Red));
         if (!cur_db_error.empty())
@@ -3062,13 +3446,36 @@ void ControlUI::run() {
         return vbox(std::move(page));
     });
 
+    // Polls on its own thread at the tab's cadence rather than inside a
+    // renderer: an HTTP round trip on the render path stalls every other panel,
+    // and the existing performance tab already shows what that feels like.
+    SomaDashboard soma_dashboard(control_base_url_, control_api_token_);
+    soma_dashboard.start(500);
+    auto soma_renderer = soma_tab(soma_dashboard, soma_selected);
+
+    // Same discipline as the Soma tab: its own translation unit, fed entirely
+    // by /v1/*, unable to reach the three references this class holds.
+    EngineDashboard engine_dashboard(control_base_url_, control_api_token_);
+    engine_dashboard.start(1000);
+    auto engines_renderer = engine_tab(engine_dashboard, engine_selected, force_engine_setup);
+
+    // Admission is the longest operation in the system — hours, hundreds of GB —
+    // and until now it had a full progress/cancel/rejoin protocol and no surface
+    // that could show it (roadmap D47). Polled, not streamed, so reopening the
+    // TUI mid-conversion rejoins with no protocol on this side.
+    AdmissionDashboard admission_dashboard(control_base_url_, control_api_token_);
+    admission_dashboard.start(1000);
+    auto admissions_renderer = admission_tab(admission_dashboard, admission_selected);
+
     auto main_tabs = Container::Tab({nodes_renderer, agents_renderer, activity_renderer,
-        chat_renderer, curation_renderer, performance_renderer, voice_renderer}, &tab_index);
+        chat_renderer, curation_renderer, performance_renderer, voice_renderer,
+        soma_renderer, engines_renderer, admissions_renderer}, &tab_index);
 
     // Mockup-style header: the tab strip is real Button components (clickable +
     // focusable) rendered as `n Label` chips, the active one inverted.
-    static const std::array<const char*, 7> kTabLabels = {
-        "1 Nodes", "2 Agents", "3 Activity", "4 Chat", "5 Curation", "6 Performance", "7 Voice"};
+    static const std::array<const char*, 10> kTabLabels = {
+        "1 Nodes", "2 Agents", "3 Activity", "4 Chat", "5 Curation", "6 Performance", "7 Voice",
+        "8 Soma", "9 Engines", "0 Admissions"};
     Components tab_buttons;
     for (int i = 0; i < static_cast<int>(kTabLabels.size()); ++i) {
         ButtonOption opt = ButtonOption::Simple();
@@ -3108,18 +3515,26 @@ void ControlUI::run() {
             text(" "),
         });
         auto footer = hbox({
-            text(" 1-7 tabs · ↑/↓ select · click rows · q quit") | dim,
+            text(" 1-9,0 tabs · ↑/↓ select · click rows · q quit") | dim,
             filler(),
             text("mantic-mind · control ") | dim,
         });
 
-        return vbox({
-            header,
-            separator(),
-            main_tabs->Render() | flex,
-            separator(),
-            footer,
-        }) | border;
+        // An unconfigured cluster cannot place anything, and the operator needs
+        // to know that from wherever they are rather than only from the tab
+        // they have not opened. The banner drives them to the one place that
+        // fixes it, and disappears the moment it is fixed.
+        const auto engine_snap = engine_dashboard.snapshot();
+        force_engine_setup = engine_snap.reachable && !engine_snap.configured;
+        Elements shell{header, separator()};
+        if (force_engine_setup && tab_index != 8) {
+            shell.push_back(render_unconfigured_banner(engine_snap));
+            shell.push_back(separator());
+        }
+        shell.push_back(main_tabs->Render() | flex);
+        shell.push_back(separator());
+        shell.push_back(footer);
+        return vbox(shell) | border;
     });
 
     //
@@ -3134,6 +3549,9 @@ void ControlUI::run() {
             if (ev == Event::Character('4')) { tab_index = 3; return true; }
             if (ev == Event::Character('6')) { tab_index = 5; return true; }
             if (ev == Event::Character('7')) { tab_index = 6; return true; }
+            if (ev == Event::Character('8')) { tab_index = 7; return true; }
+            if (ev == Event::Character('9')) { tab_index = 8; return true; }
+            if (ev == Event::Character('0')) { tab_index = 9; return true; }
             if (ev == Event::Character('5')) { tab_index = 4; return true; }
             if (ev == Event::Character('f') && tab_index == 0) {
                 forget_selected_node();

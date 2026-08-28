@@ -76,6 +76,17 @@ std::string normalize_inference_backend(std::string backend) {
     return backend;
 }
 
+std::string normalize_backend_override(std::string value) {
+    value = util::to_lower(util::trim(value));
+    // Anything unrecognised becomes "auto" rather than being stored verbatim.
+    // The override decides which ENGINE serves an agent, so a typo that survived
+    // to the routing call would either be treated as a refusal or fall through
+    // to a default — silently, and differently depending on which. Defaulting
+    // here means the stored value is always one the router understands.
+    if (value == "soma" || value == "fallback") return value;
+    return "auto";
+}
+
 bool is_transient_sqlite_lock(const SQLite::Exception& e) {
     const std::string msg = util::to_lower(e.what());
     return msg.find("locked") != std::string::npos ||
@@ -631,6 +642,35 @@ void AgentDB::run_migrations() {
         db_->exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (10)");
         tx.commit();
     }
+
+    if (!has_version(11)) {
+        SQLite::Transaction tx(*db_);
+        // Which local engine serves this agent. 'auto' defers to the admission
+        // verdict, and every existing row gets it: an agent created before Soma
+        // existed has expressed no preference, and inventing one for it would be
+        // a routing decision made by a migration.
+        if (!has_column("agent_config", "backend_override")) {
+            db_->exec("ALTER TABLE agent_config "
+                      "ADD COLUMN backend_override TEXT NOT NULL DEFAULT 'auto'");
+        }
+        db_->exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (11)");
+        tx.commit();
+    }
+
+    if (!has_version(12)) {
+        SQLite::Transaction tx(*db_);
+        // The divergent vLLM branch stored the engine name as an agent backend.
+        // Engine selection is cluster-owned now: preserve the public alias
+        // migrated above, and return those rows to local automatic routing.
+        db_->exec(R"(
+            UPDATE agent_config
+               SET inference_backend = 'llama-cpp',
+                   backend_override = 'auto'
+             WHERE lower(inference_backend) = 'vllm'
+        )");
+        db_->exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (12)");
+        tx.commit();
+    }
 }
 
 //
@@ -641,12 +681,13 @@ void AgentDB::save_config(const AgentConfig& cfg) {
     const auto api_settings_json = serialize(cfg.api_settings);
     const auto vision_settings_json = serialize(cfg.vision_settings);
     const auto inference_backend = normalize_inference_backend(cfg.inference_backend);
+    const auto backend_override = normalize_backend_override(cfg.backend_override);
 
     run_with_sqlite_retry("save_config", [&] {
         SQLite::Statement q(*db_, R"(
             INSERT INTO agent_config
                 (id, name, model_path, system_prompt,
-                 inference_backend, served_model_name,
+                 inference_backend, backend_override, served_model_name,
                  ctx_size, n_gpu_layers, n_threads, n_threads_http,
                  parallel, batch_size, ubatch_size, temperature, top_p,
                  top_k, min_p, presence_penalty, repeat_penalty,
@@ -656,7 +697,7 @@ void AgentDB::save_config(const AgentConfig& cfg) {
                  preferred_node_id, updated_at_ms)
             VALUES
                 (:id,:name,:model_path,:system_prompt,
-                 :inference_backend,:served_model_name,
+                 :inference_backend,:backend_override,:served_model_name,
                  :ctx_size,:n_gpu_layers,:n_threads,:n_threads_http,
                  :parallel,:batch_size,:ubatch_size,:temperature,:top_p,
                  :top_k,:min_p,:presence_penalty,:repeat_penalty,
@@ -669,6 +710,7 @@ void AgentDB::save_config(const AgentConfig& cfg) {
                 model_path        = excluded.model_path,
                 system_prompt     = excluded.system_prompt,
                 inference_backend = excluded.inference_backend,
+                backend_override  = excluded.backend_override,
                 served_model_name = excluded.served_model_name,
                 ctx_size          = excluded.ctx_size,
                 n_gpu_layers      = excluded.n_gpu_layers,
@@ -701,6 +743,7 @@ void AgentDB::save_config(const AgentConfig& cfg) {
         q.bind(":model_path",        cfg.model_path);
         q.bind(":system_prompt",     cfg.system_prompt);
         q.bind(":inference_backend", inference_backend);
+        q.bind(":backend_override",  backend_override);
         q.bind(":served_model_name", cfg.served_model_name);
         q.bind(":ctx_size",          s.ctx_size);
         q.bind(":n_gpu_layers",      s.n_gpu_layers);
@@ -743,6 +786,8 @@ AgentConfig AgentDB::load_config() const {
     cfg.system_prompt= q.getColumn("system_prompt").getText();
     cfg.inference_backend = normalize_inference_backend(
         q.getColumn("inference_backend").getText());
+    cfg.backend_override = normalize_backend_override(
+        q.getColumn("backend_override").getText());
     cfg.served_model_name = q.getColumn("served_model_name").getText();
 
     auto& s = cfg.runtime_settings;

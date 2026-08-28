@@ -60,13 +60,17 @@ inline const char* spinner_frame(int64_t period_ms = 100) {
 }
 
 // ── Byte formatting ───────────────────────────────────────────────────────────
+/// Megabytes as a narrow column. Binary, and the suffixes say so — `Gi`/`Mi`
+/// rather than `G`/`M`, matching util::bytes_label. See defect D5: three
+/// formatters divided by 1024 and labelled the result as if they had divided by
+/// 1000, which is how one transfer reported two different sizes.
 inline std::string mb_str(int64_t mb) {
     if (mb >= 1024) {
         char b[32];
-        std::snprintf(b, sizeof(b), "%.1fG", static_cast<double>(mb) / 1024.0);
+        std::snprintf(b, sizeof(b), "%.1fGi", static_cast<double>(mb) / 1024.0);
         return b;
     }
-    return std::to_string(mb) + "M";
+    return std::to_string(mb) + "Mi";
 }
 
 // ── Fixed-width column helpers ────────────────────────────────────────────────

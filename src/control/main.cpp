@@ -5,11 +5,13 @@
 #include "common/util.hpp"
 #include "control/control_config.hpp"
 #include "control/agent_manager.hpp"
+#include "control/model_registry.hpp"
 #include "control/node_registry.hpp"
 #include "control/agent_scheduler.hpp"
 #include "control/agent_queue.hpp"
 #include "control/control_api_server.hpp"
 #include "control/control_ui.hpp"
+#include "control/engine_config_store.hpp"
 
 #include <atomic>
 #include <algorithm>
@@ -22,6 +24,8 @@
 #include <iostream>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -90,6 +94,17 @@ static mm::ControlConfig load_config(
         cfg.openai_compat_port = static_cast<uint16_t>(
             file.get_int("openai_compat_port", static_cast<int>(cfg.openai_compat_port)));
         cfg.data_dir    = file.get("data_dir",  cfg.data_dir);
+        cfg.admission_python      = file.get("admission_python",      cfg.admission_python);
+        cfg.admission_tools_dir   = file.get("admission_tools_dir",   cfg.admission_tools_dir);
+        cfg.admission_soma_path   = file.get("soma_path",             cfg.admission_soma_path);
+        cfg.containers_dir        = file.get("containers_dir",        cfg.containers_dir);
+        cfg.sources_dir           = file.get("sources_dir",           cfg.sources_dir);
+        cfg.admission_allow_pickle =
+            file.get_bool("admission_allow_pickle", cfg.admission_allow_pickle);
+        cfg.admission_max_concurrent =
+            file.get_int("admission_max_concurrent", cfg.admission_max_concurrent);
+        cfg.admission_quant       = file.get("admission_quant",       cfg.admission_quant);
+        cfg.admission_expert_down = file.get("admission_expert_down", cfg.admission_expert_down);
         cfg.log_file    = file.get("log_file",   cfg.log_file);
         cfg.node_health_poll_interval_s = static_cast<uint32_t>(
             file.get_int("node_health_poll_interval_s",
@@ -143,6 +158,18 @@ static mm::ControlConfig load_config(
     cfg.openai_compat_port = static_cast<uint16_t>(
         env_int("MM_OPENAI_COMPAT_PORT", static_cast<int>(cfg.openai_compat_port)));
     cfg.data_dir    = env("MM_DATA_DIR",    cfg.data_dir);
+    cfg.admission_python      = env("MM_ADMISSION_PYTHON", cfg.admission_python);
+    cfg.admission_tools_dir   = env("MM_ADMISSION_TOOLS",  cfg.admission_tools_dir);
+    cfg.admission_soma_path   = env("MM_SOMA_PATH",        cfg.admission_soma_path);
+    cfg.containers_dir        = env("MM_CONTAINERS_DIR",   cfg.containers_dir);
+    cfg.sources_dir           = env("MM_SOURCES_DIR",      cfg.sources_dir);
+    cfg.admission_allow_pickle =
+        env_bool("MM_ADMISSION_ALLOW_PICKLE", cfg.admission_allow_pickle);
+    // env_int already keeps the current value on an unparseable string, so a
+    // garbage knob does not stop a cluster head from booting.
+    cfg.admission_max_concurrent =
+        env_int("MM_ADMISSION_MAX_CONCURRENT", cfg.admission_max_concurrent);
+    cfg.admission_quant       = env("MM_ADMISSION_QUANT",  cfg.admission_quant);
     cfg.log_file    = env("MM_LOG_FILE",    cfg.log_file);
     cfg.models_dir  = env("MM_MODELS_DIR",  cfg.models_dir);
     cfg.external_api_token =
@@ -302,31 +329,59 @@ static ControlMainArgs parse_control_main_args(int argc, char** argv) {
 }
 
 static void print_control_usage() {
-    std::cout
-        << "Usage: mantic-mind-control [--mode tui|cli] [--output text|json] [--help]\n\n"
-        << "Modes:\n"
-        << "  tui  Default FTXUI terminal interface.\n"
-        << "  cli  Interactive REPL suitable for terminal assistants.\n\n"
-        << "Output:\n"
-        << "  text Default human-readable CLI output.\n"
-        << "  json Structured CLI output for automation.\n\n"
-        << "CLI commands:\n"
-        << "  nodes list\n"
-        << "  nodes discovered\n"
-        << "  nodes add <url> <api_key> [platform] [remember]\n"
-        << "  nodes remove <node_id>\n"
-        << "  nodes forget <node_id>\n"
-        << "  nodes pair start <url>\n"
-        << "  nodes pair complete <url> <nonce> <pin_or_psk> [remember]\n"
-        << "  nodes pair psk <url> [psk] [remember]\n"
-        << "  models list\n"
-        << "  agents list|show|create|update|delete ...\n"
-        << "  chat send <agent_id> <message> [conversation_id]\n"
-        << "  curation conv ...\n"
-        << "  curation mem ...\n"
-        << "  activity tail [n]\n"
-        << "  help\n"
-        << "  quit\n";
+    std::cout << "Usage: mantic-mind-control [--mode tui|cli] [--output text|json] [--help]\n\n"
+              << "Modes:\n"
+              << "  tui  Default FTXUI terminal interface.\n"
+              << "  cli  Interactive REPL suitable for terminal assistants.\n\n"
+              << "Output:\n"
+              << "  text Default human-readable CLI output.\n"
+              << "  json Structured CLI output for automation.\n\n"
+              << "CLI commands:\n"
+              << "  nodes list\n"
+              << "  nodes discovered\n"
+              << "  nodes add <url> <api_key> [platform] [remember]\n"
+              << "  nodes remove <node_id>\n"
+              << "  nodes forget <node_id>\n"
+              << "  nodes pair start <url>\n"
+              << "  nodes pair complete <url> <nonce> <pin_or_psk> [remember]\n"
+              << "  nodes pair psk <url> [psk] [remember]\n"
+              << "  models list\n"
+              << "  models show|plan|conformance|heat <model_id>\n"
+              << "  models admit <source> [expert_gate] [expert_down] [group]\n"
+              << "  models admissions\n"
+              << "  models cancel <operation_id>\n"
+              << "  models register <json>\n"
+              << "  models reprofile <model_id>\n"
+              << "  models verdict <model_id> <stream|hybrid|resident_only|reject> [reason]\n"
+              << "  models delete <model_id>\n"
+              << "  tokens list|create|delete ...\n"
+              << "  performance [reset]\n"
+              << "  engines show\n"
+              << "  engines running\n"
+              << "  engines heat|slots <engine_id>\n"
+              << "  engines conform\n"
+              << "  engines setup\n"
+              << "  engines set primary <engine> [backup <engine>|backup none] [vllm-* <value>]\n"
+              << "    --vllm-install-method auto|wheel|source|path  --vllm-version <version>\n"
+              << "    --vllm-tp <gpus-per-node>  --vllm-pp <nodes>\n"
+              << "    --vllm-experimental-gloo true|false (unsupported upstream)\n"
+              << "  engines ray\n"
+              << "  engines resync\n"
+              << "  engines share <fingerprint> <target_node_id> [source_node_id]\n"
+              << "  agents list|show|create|update|delete ...\n"
+              << "  agents suspend|restore|release <agent_id>\n"
+              << "  placements\n"
+              << "  chat send <agent_id> <message> [conversation_id]\n"
+              << "  curation conv ...\n"
+              << "  curation mem ...\n"
+              << "  curation local list|create|update|delete <agent_id> <conv_id> ...\n"
+              << "  curation propose <agent_id>\n"
+              << "  curation apply <agent_id> <json>\n"
+              << "  voice show|proposals|propose <agent_id>\n"
+              << "  voice approve|reject|sample <agent_id> <proposal_id>\n"
+              << "  activity tail [n]\n"
+              << "  help\n"
+              << "  quit\n";
 }
 
 class CliPrinter {
@@ -433,6 +488,240 @@ static void run_control_cli(uint16_t listen_port,
         else emit_result(false, command, nlohmann::json::object(), summarize_http_error(r));
     };
 
+    // ── engine configuration ──────────────────────────────────────────────────
+    //
+    // Everything below drives the same /v1/cluster/engines/* routes the TUI
+    // uses, so the rules have one implementation rather than a CLI copy that
+    // drifts. `engines setup` is the CLI half of forced first-run
+    // configuration: a headless deployment must be able to reach the same
+    // decision the TUI's modal asks for, or `--mode cli` would be a way to run
+    // a cluster that can never place anything.
+
+    auto engine_config_missing = [&]() -> bool {
+        const auto r = self.get("/v1/cluster/engines/config");
+        if (!r.ok()) return false; // unreachable/unsupported: not our call to make
+        try {
+            return !nlohmann::json::parse(r.body).value("configured", false);
+        } catch (...) {
+            return false;
+        }
+    };
+
+    // Engine ids any connected node reports it can run. The setup prompt offers
+    // these rather than a hardcoded pair, so a node that grows a third engine
+    // shows up here without an edit.
+    auto known_engine_ids = [&]() -> std::vector<std::string> {
+        std::vector<std::string> ids;
+        const auto r = self.get("/v1/nodes");
+        if (r.ok()) try {
+            const auto j = nlohmann::json::parse(r.body);
+            const auto& arr = j.contains("data") ? j.at("data") : j;
+            for (const auto& n : arr) {
+                if (!n.contains("engines")) continue;
+                for (const auto& e : n.at("engines")) {
+                    const auto id = e.value("engine_id", std::string{});
+                    if (!id.empty() &&
+                        std::find(ids.begin(), ids.end(), id) == ids.end())
+                        ids.push_back(id);
+                }
+            }
+        } catch (...) {
+        }
+        for (const std::string builtin : {"soma", "llama-cpp", "vllm"}) {
+            if (std::find(ids.begin(), ids.end(), builtin) == ids.end())
+                ids.push_back(builtin);
+        }
+        return ids;
+    };
+
+    auto put_engine_config = [&](const std::string& primary,
+                                 const std::string& backup,
+                                 const std::optional<mm::VllmEngineConfig>& vllm = std::nullopt,
+                                 const std::string& vllm_install_method = {},
+                                 const std::string& vllm_version = {}) {
+        std::optional<mm::ClusterEngineConfig> existing;
+        const auto current = self.get("/v1/cluster/engines/config");
+        if (current.ok()) try {
+            const auto root = nlohmann::json::parse(current.body);
+            if (root.value("configured", false))
+                existing = root.at("config").get<mm::ClusterEngineConfig>();
+        } catch (...) {
+        }
+        nlohmann::json engines = nlohmann::json::array();
+        auto spec = [&](const std::string& id) {
+            nlohmann::json out{{"engine_id", id}};
+            if (existing) {
+                if (const auto* previous = existing->find(id)) out = *previous;
+            }
+            if (id == "vllm") {
+                if (!vllm_install_method.empty())
+                    out["install_method"] = vllm_install_method;
+                else if (!out.contains("install_method"))
+                    out["install_method"] = "auto";
+                if (!vllm_version.empty()) out["version"] = vllm_version;
+                out["vllm"] = vllm.value_or(mm::VllmEngineConfig{});
+            }
+            return out;
+        };
+        engines.push_back(spec(primary));
+        if (!backup.empty()) engines.push_back(spec(backup));
+        const nlohmann::json body{{"primary_engine", primary},
+                                  {"backup_engine", backup},
+                                  {"engines", engines},
+                                  {"share_builds", existing
+                                      ? existing->share_builds : true}};
+        emit_http_result("engines set", self.put("/v1/cluster/engines/config", body));
+    };
+
+    auto run_engine_setup = [&]() {
+        printer.line("");
+        printer.line("  No cluster engine configuration exists.");
+        printer.line("  Nothing can be placed until one is set — every node is waiting to be");
+        printer.line("  told what to run.");
+        printer.line("");
+
+        auto ids = known_engine_ids();
+        if (ids.empty()) {
+            // Not an error: on a fresh install no node has registered yet.
+            // Offering the two engines this build ships is better than refusing
+            // to proceed until a node appears.
+            ids = {"soma", "llama-cpp", "vllm"};
+            printer.line("  (no node has reported its engines yet; offering the built-in set)");
+        }
+        printer.line("  Available engines: " + mm::util::join(ids, ", "));
+        printer.line("");
+
+        std::string primary;
+        while (primary.empty()) {
+            printer.line("  Primary engine? (" + mm::util::join(ids, "/") + ")");
+            printer.print_prompt();
+            std::string answer;
+            if (!std::getline(std::cin, answer)) return;
+            answer = mm::util::trim(answer);
+            if (answer.empty()) continue;
+            if (std::find(ids.begin(), ids.end(), answer) == ids.end()) {
+                printer.line("  '" + answer + "' is not one of: " + mm::util::join(ids, ", "));
+                continue;
+            }
+            primary = answer;
+        }
+
+        // llama.cpp is the DEFAULT backup, not a requirement. Offering "none"
+        // explicitly is the point: a Soma-only cluster should not compile a
+        // llama-server it will never launch, and that has to be a choice the
+        // operator can actually make here.
+        std::string backup = (primary == mm::kDefaultBackupEngine)
+                                 ? std::string{}
+                                 : std::string(mm::kDefaultBackupEngine);
+        printer.line("");
+        printer.line(backup.empty()
+                         ? "  Backup engine? (none available — primary is the default backup)"
+                         : "  Backup engine? [" + backup + "] — enter an engine, or 'none'");
+        if (!backup.empty()) {
+            printer.print_prompt();
+            std::string answer;
+            if (std::getline(std::cin, answer)) {
+                answer = mm::util::trim(answer);
+                if (mm::util::to_lower(answer) == "none") backup.clear();
+                else if (!answer.empty()) backup = answer;
+            }
+        }
+
+        std::optional<mm::VllmEngineConfig> vllm;
+        std::string vllm_install_method;
+        std::string vllm_version;
+        if (primary == "vllm" || backup == "vllm") {
+            mm::VllmEngineConfig profile;
+            auto prompt_int = [&](const std::string& label, int current) {
+                printer.line("  " + label + " [" + std::to_string(current) + "]");
+                printer.print_prompt();
+                std::string answer;
+                if (!std::getline(std::cin, answer)) return current;
+                answer = mm::util::trim(answer);
+                if (answer.empty()) return current;
+                try { return std::stoi(answer); } catch (...) { return current; }
+            };
+            auto prompt_string = [&](const std::string& label, std::string current) {
+                printer.line("  " + label + " [" +
+                             (current.empty() ? std::string{"none"} : current) + "]");
+                printer.print_prompt();
+                std::string answer;
+                if (!std::getline(std::cin, answer)) return current;
+                answer = mm::util::trim(answer);
+                return answer.empty() ? current : answer;
+            };
+            auto prompt_bool = [&](const std::string& label, bool current) {
+                printer.line("  " + label + (current ? " [yes]" : " [no]"));
+                printer.print_prompt();
+                std::string answer;
+                if (!std::getline(std::cin, answer)) return current;
+                answer = mm::util::to_lower(mm::util::trim(answer));
+                if (answer.empty()) return current;
+                return answer == "yes" || answer == "y" || answer == "true" ||
+                       answer == "1" || answer == "on";
+            };
+            vllm_install_method = prompt_string(
+                "vLLM install method (auto/wheel/source/path)", "auto");
+            vllm_version = prompt_string("vLLM version", "latest");
+            profile.max_model_len = prompt_int("vLLM max model length", profile.max_model_len);
+            profile.max_num_seqs = prompt_int("vLLM max sequences", profile.max_num_seqs);
+            profile.max_num_batched_tokens = prompt_int(
+                "vLLM max batched tokens (-1 = automatic)",
+                profile.max_num_batched_tokens);
+            profile.tensor_parallel_size = prompt_int(
+                "vLLM tensor parallel GPUs per node", profile.tensor_parallel_size);
+            profile.pipeline_parallel_size = prompt_int(
+                "vLLM pipeline parallel nodes", profile.pipeline_parallel_size);
+            printer.line("  vLLM GPU memory utilization [" +
+                         std::to_string(profile.gpu_memory_utilization) + "]");
+            printer.print_prompt();
+            std::string gpu_answer;
+            if (std::getline(std::cin, gpu_answer)) {
+                gpu_answer = mm::util::trim(gpu_answer);
+                if (!gpu_answer.empty()) {
+                    try { profile.gpu_memory_utilization = std::stod(gpu_answer); }
+                    catch (...) {}
+                }
+            }
+            profile.dtype = prompt_string("vLLM dtype", profile.dtype);
+            profile.quantization = prompt_string(
+                "vLLM quantization (blank keeps none)", profile.quantization);
+            profile.trust_remote_code = prompt_bool(
+                "Trust remote model code?", profile.trust_remote_code);
+            profile.enable_prefix_caching = prompt_bool(
+                "Enable prefix caching?", profile.enable_prefix_caching);
+            profile.enable_auto_tool_choice = prompt_bool(
+                "Enable automatic tool choice?", profile.enable_auto_tool_choice);
+            profile.enable_sleep_mode = prompt_bool(
+                "Enable sleep mode?", profile.enable_sleep_mode);
+            profile.tool_call_parser = prompt_string(
+                "Tool-call parser (blank keeps none)", profile.tool_call_parser);
+            const auto extras = prompt_string(
+                "Additional vLLM args, comma separated (blank keeps none)", {});
+            for (const auto& raw : mm::util::split(extras, ',')) {
+                const auto arg = mm::util::trim(raw);
+                if (!arg.empty()) profile.extra_args.push_back(arg);
+            }
+            if (profile.pipeline_parallel_size > 1) {
+                profile.allow_experimental_gloo = prompt_bool(
+                    "EXPERIMENTAL: allow Gloo when NCCL is unavailable?",
+                    profile.allow_experimental_gloo);
+            }
+            vllm = std::move(profile);
+        }
+
+        printer.line("");
+        printer.line("  primary: " + primary);
+        printer.line("  backup:  " + (backup.empty() ? "(none)" : backup));
+        put_engine_config(primary, backup, vllm,
+                          vllm_install_method, vllm_version);
+    };
+
+    // Forced on entry, exactly as the TUI opens its Engines tab modally. The
+    // API stays up either way — this blocks the operator, not the process, so
+    // an automated deployment can still PUT the configuration from outside.
+    if (engine_config_missing()) run_engine_setup();
+
     while (!stop_flag.load()) {
         printer.print_prompt();
         std::string line;
@@ -453,6 +742,177 @@ static void run_control_cli(uint16_t listen_port,
         if (cmd0 == "quit" || cmd0 == "exit") break;
         if (cmd0 == "help") {
             print_help();
+            continue;
+        }
+
+        if (cmd0 == "engines") {
+            if (tokens.size() < 2) {
+                printer.line("usage: engines show|conform|ray|setup|set|resync|share|running|"
+                             "heat|slots ...");
+                continue;
+            }
+            const std::string sub = mm::util::to_lower(tokens[1]);
+            if (sub == "show") {
+                emit_http_result("engines show", self.get("/v1/cluster/engines/config"));
+                continue;
+            }
+            if (sub == "conform") {
+                emit_http_result("engines conform",
+                                 self.get("/v1/cluster/engines/conformance"));
+                continue;
+            }
+            if (sub == "ray") {
+                emit_http_result("engines ray", self.get("/v1/cluster/engines/ray"));
+                continue;
+            }
+            if (sub == "setup") {
+                run_engine_setup();
+                continue;
+            }
+            if (sub == "resync") {
+                emit_http_result("engines resync",
+                                 self.post("/v1/cluster/engines/resync", nlohmann::json::object()));
+                continue;
+            }
+            if (sub == "set") {
+                // engines set primary <id> [backup <id>|backup none]
+                std::string primary, backup;
+                bool have_backup = false;
+                mm::VllmEngineConfig profile;
+                std::optional<mm::ClusterEngineConfig> current_cluster;
+                const auto current_response =
+                    self.get("/v1/cluster/engines/config");
+                if (current_response.ok()) try {
+                    const auto root = nlohmann::json::parse(current_response.body);
+                    if (root.value("configured", false)) {
+                        current_cluster =
+                            root.at("config").get<mm::ClusterEngineConfig>();
+                        if (const auto* spec = current_cluster->find("vllm"))
+                            profile = mm::effective_vllm_config(*spec);
+                    }
+                } catch (...) {
+                }
+                bool vllm_option = false;
+                std::string vllm_install_method;
+                std::string vllm_version;
+                auto parse_bool = [](const std::string& raw) {
+                    const auto v = mm::util::to_lower(mm::util::trim(raw));
+                    if (v == "1" || v == "true" || v == "yes" || v == "on")
+                        return true;
+                    if (v == "0" || v == "false" || v == "no" || v == "off")
+                        return false;
+                    throw std::invalid_argument("expected true|false");
+                };
+                bool option_error = false;
+                std::string option_error_detail;
+                try {
+                for (std::size_t i = 2; i + 1 < tokens.size(); i += 2) {
+                    std::string key = mm::util::to_lower(tokens[i]);
+                    if (key.rfind("--", 0) == 0) key.erase(0, 2);
+                    if (key == "primary") primary = tokens[i + 1];
+                    else if (key == "backup") {
+                        have_backup = true;
+                        backup = mm::util::to_lower(tokens[i + 1]) == "none" ? std::string{}
+                                                                            : tokens[i + 1];
+                    }
+                    else if (key == "vllm-install-method") {
+                        vllm_install_method = tokens[i + 1];
+                    } else if (key == "vllm-version") {
+                        vllm_version = tokens[i + 1];
+                    }
+                    else if (key == "vllm-max-model-len") {
+                        profile.max_model_len = std::stoi(tokens[i + 1]); vllm_option = true;
+                    } else if (key == "vllm-max-num-seqs") {
+                        profile.max_num_seqs = std::stoi(tokens[i + 1]); vllm_option = true;
+                    } else if (key == "vllm-max-num-batched-tokens") {
+                        profile.max_num_batched_tokens = std::stoi(tokens[i + 1]); vllm_option = true;
+                    } else if (key == "vllm-tp") {
+                        profile.tensor_parallel_size = std::stoi(tokens[i + 1]); vllm_option = true;
+                    } else if (key == "vllm-pp") {
+                        profile.pipeline_parallel_size = std::stoi(tokens[i + 1]); vllm_option = true;
+                    } else if (key == "vllm-gpu-memory-utilization") {
+                        profile.gpu_memory_utilization = std::stod(tokens[i + 1]); vllm_option = true;
+                    } else if (key == "vllm-dtype") {
+                        profile.dtype = tokens[i + 1]; vllm_option = true;
+                    } else if (key == "vllm-quantization") {
+                        profile.quantization = tokens[i + 1]; vllm_option = true;
+                    } else if (key == "vllm-trust-remote-code") {
+                        profile.trust_remote_code = parse_bool(tokens[i + 1]); vllm_option = true;
+                    } else if (key == "vllm-prefix-caching") {
+                        profile.enable_prefix_caching = parse_bool(tokens[i + 1]); vllm_option = true;
+                    } else if (key == "vllm-auto-tool-choice") {
+                        profile.enable_auto_tool_choice = parse_bool(tokens[i + 1]); vllm_option = true;
+                    } else if (key == "vllm-sleep-mode") {
+                        profile.enable_sleep_mode = parse_bool(tokens[i + 1]); vllm_option = true;
+                    } else if (key == "vllm-tool-call-parser") {
+                        profile.tool_call_parser = tokens[i + 1]; vllm_option = true;
+                    } else if (key == "vllm-extra-arg") {
+                        profile.extra_args.push_back(tokens[i + 1]); vllm_option = true;
+                    } else if (key == "vllm-experimental-gloo") {
+                        profile.allow_experimental_gloo = parse_bool(tokens[i + 1]); vllm_option = true;
+                    }
+                }
+                } catch (const std::exception& e) {
+                    option_error = true;
+                    option_error_detail = e.what();
+                }
+                if (option_error) {
+                    printer.line("invalid engines set option: " + option_error_detail);
+                    continue;
+                }
+                if (primary.empty()) {
+                    printer.line("usage: engines set primary <engine> [backup <engine>|backup none]");
+                    continue;
+                }
+                // Unstated backup keeps the current one rather than clearing
+                // it: `engines set primary soma` should not silently drop a
+                // configured fallback. Clearing takes the explicit word.
+                if (!have_backup) {
+                    if (current_cluster) backup = current_cluster->backup_engine;
+                }
+                if (backup == primary) backup.clear();
+                if ((primary == "vllm" || backup == "vllm") && !vllm_option) {
+                    if (current_cluster)
+                        if (const auto* spec = current_cluster->find("vllm"))
+                            profile = mm::effective_vllm_config(*spec);
+                }
+                put_engine_config(primary, backup,
+                                  (primary == "vllm" || backup == "vllm")
+                                      ? std::optional<mm::VllmEngineConfig>(profile)
+                                      : std::nullopt,
+                                  vllm_install_method, vllm_version);
+                continue;
+            }
+            // Live engine PROCESSES, as opposed to `engines show`, which is the
+            // cluster's engine POLICY. Two different resources one word apart —
+            // see the /v1/engines vs /v1/cluster/engines split.
+            if (sub == "running") {
+                emit_http_result("engines running", self.get("/v1/engines"));
+                continue;
+            }
+            if (sub == "heat" || sub == "slots") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: engines " + sub + " <engine_id>");
+                    continue;
+                }
+                emit_http_result("engines " + sub,
+                                 self.get("/v1/engines/" + tokens[2] + "/" + sub));
+                continue;
+            }
+            if (sub == "share") {
+                if (tokens.size() < 4) {
+                    printer.line("usage: engines share <fingerprint> <target_node_id> [source_node_id]");
+                    continue;
+                }
+                nlohmann::json body{{"fingerprint", tokens[2]},
+                                    {"target_node_id", tokens[3]}};
+                if (tokens.size() > 4) body["source_node_id"] = tokens[4];
+                emit_http_result("engines share",
+                                 self.post("/v1/cluster/engines/share", body));
+                continue;
+            }
+            printer.line("usage: engines show|conform|setup|set|resync|share|running|"
+                         "heat|slots ...");
             continue;
         }
 
@@ -557,17 +1017,197 @@ static void run_control_cli(uint16_t listen_port,
         }
 
         if (cmd0 == "models") {
-            if (tokens.size() >= 2 && mm::util::to_lower(tokens[1]) != "list") {
-                printer.line("usage: models [list]");
+            const std::string sub =
+                tokens.size() < 2 ? std::string{"list"} : mm::util::to_lower(tokens[1]);
+            if (sub == "list") {
+                emit_http_result("models list", self.get("/v1/models"));
                 continue;
             }
-            emit_http_result("models list", self.get("/v1/models"));
+            if (sub == "admissions") {
+                emit_http_result("models admissions", self.get("/v1/models/admissions"));
+                continue;
+            }
+            // The registry's administrative half. All four are `operator` on the
+            // API and had no CLI form, so a headless deployment could admit a
+            // model and then neither correct its verdict nor remove it.
+            if (sub == "show") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: models show <model_id>");
+                    continue;
+                }
+                emit_http_result("models show", self.get("/v1/models/" + tokens[2]));
+                continue;
+            }
+            if (sub == "plan" || sub == "conformance" || sub == "heat") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: models " + sub + " <model_id>");
+                    continue;
+                }
+                emit_http_result("models " + sub, self.get("/v1/models/" + tokens[2] + "/" + sub));
+                continue;
+            }
+            if (sub == "delete") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: models delete <model_id>");
+                    continue;
+                }
+                emit_http_result("models delete", self.del("/v1/models/" + tokens[2]));
+                continue;
+            }
+            if (sub == "reprofile") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: models reprofile <model_id>");
+                    continue;
+                }
+                // SSE like admit, and handled the same way: read the operation
+                // id off the first frame and let `models admissions` watch it.
+                // Re-profiling re-derives a verdict from the SAME bytes — it
+                // never requantizes, so arch_hash and every KV checkpoint
+                // written against it survive.
+                std::string op_id;
+                int status = 0;
+                std::string error_body;
+                self.stream_post(
+                    "/v1/models/" + tokens[2] + "/reprofile",
+                    nlohmann::json::object(),
+                    [&op_id](const std::string& line) {
+                        const auto pos = line.find("data:");
+                        if (pos == std::string::npos) return true;
+                        try {
+                            const auto j =
+                                nlohmann::json::parse(mm::util::trim(line.substr(pos + 5)));
+                            const auto id = j.value("operation_id", std::string{});
+                            if (!id.empty()) {
+                                op_id = id;
+                                return false;
+                            }
+                        } catch (...) {
+                        }
+                        return true;
+                    },
+                    &status,
+                    &error_body);
+                if (!op_id.empty())
+                    emit_result(
+                        true,
+                        "models reprofile",
+                        nlohmann::json{{"operation_id", op_id}, {"watch", "models admissions"}},
+                        "");
+                else
+                    emit_result(false,
+                                "models reprofile",
+                                nlohmann::json::object(),
+                                error_body.empty() ? "reprofile reported no operation id"
+                                                   : error_body);
+                continue;
+            }
+            if (sub == "verdict") {
+                if (tokens.size() < 4) {
+                    printer.line("usage: models verdict <model_id> "
+                                 "<stream|hybrid|resident_only|reject> [reason]");
+                    continue;
+                }
+                nlohmann::json body{{"verdict", tokens[3]}};
+                if (tokens.size() > 4) body["reason"] = mm::cli::join_tokens(tokens, 4);
+                emit_http_result("models verdict",
+                                 self.put("/v1/models/" + tokens[2] + "/verdict", body));
+                continue;
+            }
+            if (sub == "register") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: models register <json>");
+                    continue;
+                }
+                try {
+                    emit_http_result(
+                        "models register",
+                        self.post("/v1/models",
+                                  nlohmann::json::parse(mm::cli::join_tokens(tokens, 2))));
+                } catch (const std::exception& e) {
+                    printer.line(std::string("error: invalid JSON: ") + e.what());
+                }
+                continue;
+            }
+            if (sub == "cancel") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: models cancel <operation_id>");
+                    continue;
+                }
+                emit_http_result("models cancel",
+                                 self.post("/v1/models/admissions/" + tokens[2] + "/cancel",
+                                           nlohmann::json::object()));
+                continue;
+            }
+            if (sub == "admit") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: models admit <source> [expert_gate] [expert_down] [group]");
+                    continue;
+                }
+                nlohmann::json body{{"source", tokens[2]}};
+                nlohmann::json quant = nlohmann::json::object();
+                if (tokens.size() > 3 && !tokens[3].empty()) quant["expert_gate"] = tokens[3];
+                if (tokens.size() > 4 && !tokens[4].empty()) quant["expert_down"] = tokens[4];
+                if (tokens.size() > 5) {
+                    try { quant["group"] = std::stoi(tokens[5]); } catch (...) {}
+                }
+                if (!quant.empty()) body["quantization"] = quant;
+
+                // The route answers ONLY as a stream, and this admission runs
+                // for hours. So the id is read off the first frame and the
+                // stream dropped — control logs "client disconnected;
+                // conversion continues" and the worker is detached precisely so
+                // it outlives the request. `models admissions` is how you watch
+                // it afterwards, which is also what makes this survive closing
+                // the REPL.
+                std::string op_id;
+                int status = 0;
+                std::string error_body;
+                const bool connected = self.stream_post(
+                    "/v1/models/admit", body,
+                    [&op_id](const std::string& line) {
+                        const auto pos = line.find("data:");
+                        if (pos == std::string::npos) return true;
+                        try {
+                            const auto j =
+                                nlohmann::json::parse(mm::util::trim(line.substr(pos + 5)));
+                            const auto id = j.value("operation_id", std::string{});
+                            if (!id.empty()) { op_id = id; return false; }
+                        } catch (...) {
+                        }
+                        return true;
+                    },
+                    &status, &error_body);
+
+                if (!op_id.empty()) {
+                    emit_result(true, "models admit",
+                                nlohmann::json{{"operation_id", op_id},
+                                               {"source", tokens[2]},
+                                               {"watch", "models admissions"}},
+                                "");
+                } else {
+                    std::string why = error_body;
+                    try {
+                        const auto j = nlohmann::json::parse(error_body);
+                        if (j.contains("error")) why = j["error"].get<std::string>();
+                    } catch (...) {
+                    }
+                    if (why.empty())
+                        why = connected ? "admission started but reported no operation id"
+                                        : "cannot reach control (HTTP " +
+                                              std::to_string(status) + ")";
+                    emit_result(false, "models admit", nlohmann::json::object(), why);
+                }
+                continue;
+            }
+            printer.line("usage: models list|show|plan|conformance|heat|admit|admissions|"
+                         "cancel|register|reprofile|verdict|delete ...");
             continue;
         }
 
         if (cmd0 == "agents") {
             if (tokens.size() < 2) {
-                printer.line("usage: agents list|show|create|update|delete ...");
+                printer.line("usage: agents list|show|create|update|delete|backend|"
+                             "suspend|restore|release ...");
                 continue;
             }
             const std::string sub = mm::util::to_lower(tokens[1]);
@@ -612,6 +1252,32 @@ static void run_control_cli(uint16_t listen_port,
                 } catch (const std::exception& e) {
                     printer.line(std::string("error: invalid JSON: ") + e.what());
                 }
+                continue;
+            }
+            // Which ENGINE serves this agent — the one place an operator can
+            // overrule a verdict. `operator` on the API, and it had no CLI form,
+            // so overruling a verdict was a TUI-only act.
+            if (sub == "backend") {
+                if (tokens.size() < 4) {
+                    printer.line("usage: agents backend <agent_id> <auto|soma|fallback>");
+                    continue;
+                }
+                emit_http_result("agents backend",
+                                 self.put("/v1/agents/" + tokens[2] + "/backend",
+                                          nlohmann::json{{"backend_override", tokens[3]}}));
+                continue;
+            }
+            // Placement lifecycle. These three had no /v1 route at all until the
+            // parity audit: the scheduler could do them and the node API exposed
+            // them, and no client could ask for them.
+            if (sub == "suspend" || sub == "restore" || sub == "release") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: agents " + sub + " <agent_id>");
+                    continue;
+                }
+                emit_http_result("agents " + sub,
+                                 self.post("/v1/agents/" + tokens[2] + "/" + sub,
+                                           nlohmann::json::object()));
                 continue;
             }
             if (sub == "delete") {
@@ -702,11 +1368,97 @@ static void run_control_cli(uint16_t listen_port,
 
         if (cmd0 == "curation") {
             if (tokens.size() < 3) {
-                printer.line("usage: curation conv|mem ...");
+                printer.line("usage: curation conv|mem|local|propose|apply ...");
                 continue;
             }
             const std::string group = mm::util::to_lower(tokens[1]);
             const std::string sub = mm::util::to_lower(tokens[2]);
+
+            // ── proposals ─────────────────────────────────────────────────────
+            // The review half of curation: the model proposes edits, an operator
+            // applies them. Both routes existed with no CLI form, so the
+            // propose/review loop was TUI-only in practice.
+            if (group == "propose") {
+                emit_http_result("curation propose",
+                                 self.post("/v1/agents/" + tokens[2] + "/curation/proposals",
+                                           nlohmann::json::object()));
+                continue;
+            }
+            if (group == "apply") {
+                if (tokens.size() < 4) {
+                    printer.line("usage: curation apply <agent_id> <json>");
+                    continue;
+                }
+                try {
+                    emit_http_result(
+                        "curation apply",
+                        self.post("/v1/agents/" + tokens[2] + "/curation/apply",
+                                  nlohmann::json::parse(mm::cli::join_tokens(tokens, 3))));
+                } catch (const std::exception& e) {
+                    printer.line(std::string("error: invalid JSON: ") + e.what());
+                }
+                continue;
+            }
+
+            // ── conversation-local memories ───────────────────────────────────
+            // Distinct from the agent-wide memories `curation mem` reaches:
+            // these are scoped to one conversation, and all four verbs were
+            // unreachable outside the TUI.
+            if (group == "local") {
+                if (tokens.size() < 5) {
+                    printer.line("usage: curation local list|create|update|delete "
+                                 "<agent_id> <conv_id> [memory_id] [json]");
+                    continue;
+                }
+                const std::string base =
+                    "/v1/agents/" + tokens[3] + "/conversations/" + tokens[4] + "/local-memories";
+                if (sub == "list") {
+                    emit_http_result("curation local list", self.get(base));
+                    continue;
+                }
+                if (sub == "create") {
+                    if (tokens.size() < 6) {
+                        printer.line("usage: curation local create <agent_id> <conv_id> <json>");
+                        continue;
+                    }
+                    try {
+                        emit_http_result(
+                            "curation local create",
+                            self.post(base,
+                                      nlohmann::json::parse(mm::cli::join_tokens(tokens, 5))));
+                    } catch (const std::exception& e) {
+                        printer.line(std::string("error: invalid JSON: ") + e.what());
+                    }
+                    continue;
+                }
+                if (sub == "update") {
+                    if (tokens.size() < 7) {
+                        printer.line("usage: curation local update <agent_id> <conv_id> "
+                                     "<memory_id> <json>");
+                        continue;
+                    }
+                    try {
+                        emit_http_result(
+                            "curation local update",
+                            self.put(base + "/" + tokens[5],
+                                     nlohmann::json::parse(mm::cli::join_tokens(tokens, 6))));
+                    } catch (const std::exception& e) {
+                        printer.line(std::string("error: invalid JSON: ") + e.what());
+                    }
+                    continue;
+                }
+                if (sub == "delete") {
+                    if (tokens.size() < 6) {
+                        printer.line("usage: curation local delete <agent_id> <conv_id> "
+                                     "<memory_id>");
+                        continue;
+                    }
+                    emit_http_result("curation local delete", self.del(base + "/" + tokens[5]));
+                    continue;
+                }
+                printer.line("usage: curation local list|create|update|delete ...");
+                continue;
+            }
 
             if (group == "conv") {
                 if (sub == "list") {
@@ -783,6 +1535,108 @@ static void run_control_cli(uint16_t listen_port,
             }
 
             printer.line("error: unknown curation command");
+            continue;
+        }
+
+        // GET /v1/placements had no CLI reader at all — the one route that says
+        // where every agent actually is.
+        if (cmd0 == "placements") {
+            emit_http_result("placements", self.get("/v1/placements"));
+            continue;
+        }
+
+        // ── voice ─────────────────────────────────────────────────────────────
+        //
+        // Voice-design proposals: the model drafts a voice, an operator listens
+        // and approves or rejects. Approve/reject are `operator` on the API and
+        // had no CLI form, so a headless deployment could create proposals it
+        // could never act on.
+        //
+        // `sample` renders audio to the server's cache and returns its id; the
+        // audio itself is fetched by a route this REPL exempts, because a WAV is
+        // not something a terminal can usefully render.
+        if (cmd0 == "voice") {
+            const std::string sub =
+                tokens.size() < 2 ? std::string{} : mm::util::to_lower(tokens[1]);
+            if (sub == "show" && tokens.size() > 2) {
+                emit_http_result("voice show", self.get("/v1/agents/" + tokens[2] + "/voice"));
+                continue;
+            }
+            if (sub == "proposals" && tokens.size() > 2) {
+                emit_http_result("voice proposals",
+                                 self.get("/v1/agents/" + tokens[2] + "/voice/proposals"));
+                continue;
+            }
+            if (sub == "propose" && tokens.size() > 2) {
+                emit_http_result("voice propose",
+                                 self.post("/v1/agents/" + tokens[2] + "/voice/proposals",
+                                           nlohmann::json::object()));
+                continue;
+            }
+            if ((sub == "approve" || sub == "reject" || sub == "sample") && tokens.size() > 3) {
+                emit_http_result("voice " + sub,
+                                 self.post("/v1/agents/" + tokens[2] + "/voice/proposals/" +
+                                               tokens[3] + "/" + sub,
+                                           nlohmann::json::object()));
+                continue;
+            }
+            printer.line("usage: voice show|proposals|propose <agent_id>  |  "
+                         "voice approve|reject|sample <agent_id> <proposal_id>");
+            continue;
+        }
+
+        // ── tokens ────────────────────────────────────────────────────────────
+        //
+        // The scoped-credential surface, and the sharpest of the coverage gaps:
+        // with no CLI form, a headless deployment could not mint its FIRST
+        // token. Bootstrapping required either the legacy flat
+        // `external_api_token` from config or hand-rolled HTTP — so the scoped
+        // auth system was, in practice, unreachable on exactly the deployments
+        // it was designed for.
+        //
+        // The plaintext is returned ONCE at creation and never persisted (only
+        // sha256 is stored), so `tokens create` prints the only copy that will
+        // ever exist. Said in the output rather than assumed.
+        if (cmd0 == "tokens") {
+            const std::string sub =
+                tokens.size() < 2 ? std::string{"list"} : mm::util::to_lower(tokens[1]);
+            if (sub == "list") {
+                emit_http_result("tokens list", self.get("/v1/tokens"));
+                continue;
+            }
+            if (sub == "create") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: tokens create <label> [read|chat|operator,...]");
+                    continue;
+                }
+                nlohmann::json body{{"label", tokens[2]}};
+                // Defaults to `read` rather than to everything: a credential
+                // whose scope nobody chose should be the harmless one.
+                body["scopes"] = tokens.size() > 3 ? tokens[3] : std::string{"read"};
+                const auto r = self.post("/v1/tokens", body);
+                if (r.ok()) printer.line("  the plaintext token is shown ONCE — store it now");
+                emit_http_result("tokens create", r);
+                continue;
+            }
+            if (sub == "delete") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: tokens delete <token_id>");
+                    continue;
+                }
+                emit_http_result("tokens delete", self.del("/v1/tokens/" + tokens[2]));
+                continue;
+            }
+            printer.line("usage: tokens list|create|delete ...");
+            continue;
+        }
+
+        // ── performance ───────────────────────────────────────────────────────
+        if (cmd0 == "performance") {
+            if (tokens.size() > 1 && mm::util::to_lower(tokens[1]) == "reset") {
+                emit_http_result("performance reset", self.del("/v1/performance"));
+                continue;
+            }
+            emit_http_result("performance", self.get("/v1/performance"));
             continue;
         }
 
@@ -888,6 +1742,39 @@ int main(int argc, char** argv) {
 
     // ── Core services ─────────────────────────────────────────────────────────
 
+    // ── control.db ────────────────────────────────────────────────────────────
+    //
+    // The first control-wide database in this system. Without an admission
+    // record, select_backend() routes every agent to the fallback — absence of a
+    // record is not evidence of admissibility — so this is what makes Soma
+    // reachable at all.
+    mm::ControlModelRegistry model_registry;
+    {
+        std::string registry_error;
+        if (!model_registry.open(cfg.data_dir, registry_error)) {
+            // Non-fatal. A control that cannot open its registry still serves
+            // llama.cpp agents correctly; refusing to start would turn a routing
+            // limitation into an outage.
+            MM_WARN("Model registry unavailable ({}); every agent will route to the "
+                    "fallback engine", registry_error);
+        } else {
+            mm::AdmissionTools tools;
+            tools.python = cfg.admission_python;
+            tools.tools_dir = cfg.admission_tools_dir;
+            tools.soma_path = cfg.admission_soma_path;
+            tools.containers_dir = cfg.containers_dir;
+            tools.sources_dir = cfg.sources_dir;
+            tools.allow_pickle = cfg.admission_allow_pickle;
+            tools.quant = cfg.admission_quant;
+            tools.expert_down = cfg.admission_expert_down;
+            model_registry.set_tools(tools);
+            model_registry.set_max_concurrent_admissions(
+                static_cast<std::size_t>(std::max(1, cfg.admission_max_concurrent)));
+            MM_INFO("Model registry: {} models, schema v{}",
+                    model_registry.list().size(), model_registry.schema_version());
+        }
+    }
+
     mm::AgentManager agents(cfg.data_dir);
     agents.load_all();
 
@@ -895,9 +1782,72 @@ int main(int argc, char** argv) {
     mm::AgentScheduler    scheduler(registry, cfg.models_dir);
     registry.set_offline_after_seconds(static_cast<int>(cfg.node_offline_after_s));
     mm::AgentQueue        queue;
+    // Both sides of the routing decision see the same registry: the scheduler
+    // reads it to choose an engine, the API serves and edits it. Two lookups
+    // against one table rather than a cached copy that can disagree with itself.
+    scheduler.set_model_registry(&model_registry);
+
+    // The audit trail. `placement_history` and its writer shipped with no caller
+    // and no reader — a table created on every start for a history nothing
+    // recorded (roadmap D60). Wired here rather than inside the scheduler
+    // because the scheduler holds the registry as const on purpose: it reads
+    // verdicts and must not be able to write model rows.
+    scheduler.set_placement_audit({
+        [&model_registry](const mm::AgentId& agent_id,
+                          const mm::NodeId& node_id,
+                          const mm::SlotId& slot_id,
+                          const std::string& backend,
+                          const std::string& backend_reason,
+                          const mm::ResourceFootprint& footprint) {
+            model_registry.record_placement(
+                agent_id, node_id, slot_id, backend, backend_reason, footprint);
+        },
+        [&model_registry](const mm::AgentId& agent_id) {
+            model_registry.mark_placement_released(agent_id);
+        },
+    });
+
+    // ── the master's engine policy ────────────────────────────────────────────
+    //
+    // What the cluster runs, owned here and pushed to nodes. Until it exists,
+    // placement refuses and first-run setup is forced — see the gate below.
+    mm::EngineConfigStore engine_config(cfg.data_dir);
+    {
+        std::string load_error;
+        if (!engine_config.load(load_error)) {
+            // A present-but-unreadable configuration is fatal to CONFIGURATION,
+            // not to the process: control still serves reads and the setup
+            // surface. Starting with a silently empty policy would be worse —
+            // it would re-run setup on a cluster that already had one and then
+            // push a config the operator did not write.
+            MM_ERROR("Engine configuration unusable: {}", load_error);
+            std::fprintf(stderr, "\n  Engine configuration at %s is unusable:\n    %s\n"
+                                 "  Fix or remove it, then restart.\n\n",
+                         engine_config.path().c_str(), load_error.c_str());
+            return 1;
+        }
+    }
+    // The health poll converges nodes on this; the callback makes a change
+    // propagate immediately instead of waiting up to one poll interval.
+    registry.set_engine_config_provider(
+        [&engine_config]() -> std::optional<mm::ClusterEngineConfig> {
+            if (!engine_config.configured()) return std::nullopt;
+            return engine_config.get();
+        });
+    engine_config.set_change_callback(
+        [&registry](const mm::ClusterEngineConfig& c) { registry.push_engine_config_to_all(c); });
+    scheduler.set_engine_config_gate([&engine_config]() { return engine_config.configured(); });
+    scheduler.set_engine_config_provider(
+        [&engine_config]() -> std::optional<mm::ClusterEngineConfig> {
+            if (!engine_config.configured()) return std::nullopt;
+            return engine_config.get();
+        });
+
     mm::ControlApiServer  api_server(
         agents, queue, registry, scheduler,
         cfg.data_dir, cfg.models_dir, cfg.external_api_token, cfg.tts);
+    api_server.set_model_registry(&model_registry);
+    api_server.set_engine_config_store(&engine_config);
     api_server.cleanup_expired_tts_cache();
     mm::ControlUI         ui(
         registry,

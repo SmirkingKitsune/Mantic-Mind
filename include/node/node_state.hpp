@@ -1,9 +1,11 @@
 #pragma once
 
+#include "common/engine_config.hpp"
 #include "common/models.hpp"
 #include <optional>
 #include <string>
 #include <vector>
+#include <unordered_map>
 #include <unordered_set>
 #include <condition_variable>
 #include <mutex>
@@ -68,6 +70,35 @@ public:
     LlamaRuntimeStatus get_llama_runtime() const;
     void               set_llama_runtime(const LlamaRuntimeStatus& runtime);
 
+    // ── Cluster engine configuration (pushed by the master) ───────────────────
+    // The last configuration this node was told to run. Version 0 means it has
+    // not been told yet, which is what control's status poll compares against
+    // to decide whether to push — so this must be set the moment a config
+    // arrives, before provisioning begins, or every poll re-pushes a config the
+    // node is already applying.
+    ClusterEngineConfig get_engine_config() const;
+    void                set_engine_config(const ClusterEngineConfig& cfg);
+
+    // ── Brokered engine transfers ─────────────────────────────────────────────
+    // Control announces an inbound artifact and the digest to expect BEFORE
+    // telling the source node to push. The receiver then verifies against this
+    // rather than against a digest the sender supplied — otherwise a
+    // compromised source defines its own checksum and the check proves nothing.
+    void expect_engine_digest(const std::string& fingerprint, const std::string& sha256);
+    /// The expected digest for `fingerprint`, CONSUMING it, or "" when none was
+    /// announced. One-shot by construction: an authorization that survived its
+    /// transfer would let a later unbrokered push reuse it.
+    std::string take_expected_engine_digest(const std::string& fingerprint);
+
+    /// A package this node has built and hashed, awaiting the push instruction.
+    /// Keyed by an opaque token so the bytes SENT are provably the bytes
+    /// HASHED — re-packaging at send time would let the artifact change between
+    /// the digest control relayed and what arrives.
+    void set_prepared_engine_package(const std::string& token, const std::string& path);
+    /// The package path for `token`, CONSUMING it, or "" when unknown. One-shot
+    /// so a repeated share cannot re-push bytes whose authorization was spent.
+    std::string take_prepared_engine_package(const std::string& token);
+
     // Live install/upgrade progress for the node TUI loading bar.
     NodeActionProgress  get_action_progress() const;
     void                set_action_progress(const NodeActionProgress& p);
@@ -118,6 +149,11 @@ private:
     NodeHealthMetrics            metrics_;
     NodeCapabilities             capabilities_;
     LlamaRuntimeStatus           llama_runtime_;
+    ClusterEngineConfig          engine_config_;
+    // fingerprint -> expected sha256 for a brokered inbound artifact.
+    std::unordered_map<std::string, std::string> expected_engine_digests_;
+    // package token -> path of a packaged artifact awaiting its push.
+    std::unordered_map<std::string, std::string> prepared_engine_packages_;
     NodeActionProgress           action_progress_;
     std::string                  last_error_;
     std::unordered_set<std::string> api_keys_;

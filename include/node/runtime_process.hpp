@@ -1,6 +1,16 @@
 #pragma once
 
 #include "common/models.hpp"
+// ProcessState now comes from engine_process.hpp, which owns it.
+//
+// Both headers declared `enum class ProcessState` in namespace mm — the old
+// four-state one here and the five-state one there (it adds Crashed, which is
+// the whole point of the watchdog). Including both was an ODR violation waiting
+// for the first translation unit that needed the engine registry and a slot
+// manager at once. EngineProcess REPLACES this class, so the definition follows
+// the replacement rather than being duplicated during the transition.
+#include "node/engine_process.hpp"
+
 #include <string>
 #include <functional>
 #include <thread>
@@ -9,8 +19,6 @@
 #include <vector>
 
 namespace mm {
-
-enum class ProcessState { Stopped, Starting, Ready, Error };
 
 // Manages a llama-server inference child process.
 // Platform specifics are hidden behind a PIMPL.

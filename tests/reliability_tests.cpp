@@ -11,18 +11,37 @@
 #include "common/util.hpp"
 #include "control/agent_manager.hpp"
 #include "control/agent_queue.hpp"
+#include "common/engine_capabilities.hpp"
+#include "common/engine_client.hpp"
 #include "control/agent_scheduler.hpp"
+#include "control/engine_config_store.hpp"
+#include "control/engine_group_planner.hpp"
+#include "node/node_state.hpp"
+#include "node/engine_manager.hpp"
+#include "node/engine_provisioner.hpp"
+#include "node/node_ui.hpp"
+#include "node/engine_descriptor.hpp"
 #include "control/control_api_server.hpp"
+#include "common/pairing.hpp"
+#include "control/model_registry.hpp"
+#include "control/route_scope.hpp"
 #include "control/node_registry.hpp"
 #include "control/performance_tracker.hpp"
 #include "control/tts_service_client.hpp"
 #include "common/gguf_metadata.hpp"
 #include "common/inference_sizing.hpp"
 #include "control/agent_config_validator.hpp"
+// The requantization gate reaches into the ENGINE's types: arch_hash is
+// computed there, and the KV store is what enforces the invalidation.
+#include "soma/arch_ir.hpp"
+#include "soma/kv_cache.hpp"
+#include "soma/kv_checkpoint.hpp"
 #include "node/runtime_process.hpp"
-#include "node/slot_manager.hpp"
+#include "node/engine_supervisor.hpp"
 #include "node/llama_runtime.hpp"
 #include "node/llama_cpp_provisioner.hpp"
+#include "node/ray_orchestration.hpp"
+#include "node/vllm_runtime.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -77,6 +96,31 @@ bool check(bool condition, const char* expression, int line) {
     return false;
 }
 
+/// The Windows-loopback transport flake, and the ONE budget for it.
+///
+/// mm::HttpClient opens a fresh connection per request, and rapid sequential
+/// connect/close cycles on Windows loopback occasionally fail before the server
+/// is reached at all: `status` stays 0 and no response is parsed. It is a real
+/// property of the environment, not of the code under test, so every request in
+/// this file retries it.
+///
+/// Stated once because it used to be stated twice, with different numbers:
+/// `with_retry` allowed 8 flat 50 ms attempts (400 ms) and the SSE helper allowed
+/// 3 (150 ms). The SSE path is the one that carries the auth negatives, so the
+/// thinner budget sat under the assertions where a transport failure is hardest
+/// to tell from a wrong verdict — `status == 403` fails identically whether
+/// authorization returned 200 or the request never arrived. That is exactly how
+/// it presented: one intermittent failure, at the auth assertion, in the suite's
+/// most alarming test.
+///
+/// Backoff rather than a flat interval: the failure is a socket in TIME_WAIT or a
+/// listener mid-accept, and both clear on a timescale that a fixed short retry
+/// re-hits every time.
+constexpr int kTransportRetries = 6;
+inline void transport_backoff(int attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50 * (attempt + 1)));
+}
+
 #define CHECK(expr) do { if (!check((expr), #expr, __LINE__)) return false; } while (0)
 
 std::filesystem::path temp_test_dir(const std::string& name) {
@@ -89,32 +133,82 @@ std::filesystem::path temp_test_dir(const std::string& name) {
 // can land inside one after a reboot and the server under test silently fails
 // to bind. Probe for a port we can actually bind. Socket headers/WSA init come
 // with <httplib.h>.
+/// A port no OTHER TEST PROCESS will also pick.
+///
+/// The probe below binds, closes, and returns the number, so the caller binds it
+/// a moment later — a window in which anything may take it. Within one process
+/// the monotonic counter makes that harmless. ACROSS processes it was not: every
+/// process started at 42800 and marched upward in lockstep, so two of them
+/// racing picked the same ports in the same order.
+///
+/// The failure that produces is worse than a refused connection. The loser's
+/// `listen()` fails, the winner's server answers the readiness poll, and the test
+/// proceeds to assert against A DIFFERENT PROCESS'S SERVER — which replies with
+/// plausible, wrong statuses. That is what D1 had been reporting as an
+/// intermittent transport flake: measured here at roughly 80% failure with eight
+/// concurrent copies, and the failing checks were content assertions, not
+/// connection errors.
+///
+/// An atomic directory per port is the cross-process lease. The process keeps
+/// every lease until exit, so another copy of this test cannot select the same
+/// port during the probe-to-listen gap. A hard-killed process can leave stale
+/// leases, but the 22k-port range makes those skips harmless and normal teardown
+/// removes them. Unrelated processes do not honor the lease, so callers still
+/// assert that THEIR listen succeeded; see RECORD(listen_ok) in each test.
+struct TestPortLeases {
+    std::filesystem::path root =
+        std::filesystem::temp_directory_path() / "mantic-mind-test-port-leases";
+    std::vector<std::filesystem::path> held;
+
+    TestPortLeases() {
+        std::error_code ec;
+        std::filesystem::create_directories(root, ec);
+    }
+
+    ~TestPortLeases() {
+        std::error_code ec;
+        for (const auto& lease : held) {
+            std::filesystem::remove(lease, ec);
+            ec.clear();
+        }
+        std::filesystem::remove(root, ec); // succeeds only for the last process
+    }
+};
+
 uint16_t find_free_test_port() {
     static uint16_t next_candidate = 42800;
+    static TestPortLeases leases;
     for (int p = next_candidate; p < 65000; ++p) {
+        std::error_code lease_ec;
+        const auto lease = leases.root / ("port-" + std::to_string(p));
+        if (!std::filesystem::create_directory(lease, lease_ec)) continue;
+
         sockaddr_in addr{};
         addr.sin_family      = AF_INET;
         addr.sin_port        = htons(static_cast<uint16_t>(p));
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        bool ok = false;
 #ifdef _WIN32
         SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (s == INVALID_SOCKET) continue;
-        const bool ok =
-            bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
-        closesocket(s);
+        if (s != INVALID_SOCKET) {
+            ok = bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
+            closesocket(s);
+        }
 #else
         int s = socket(AF_INET, SOCK_STREAM, 0);
-        if (s < 0) continue;
-        int opt = 1;
-        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-        const bool ok =
-            ::bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
-        ::close(s);
+        if (s >= 0) {
+            int opt = 1;
+            setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+            ok = ::bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
+            ::close(s);
+        }
 #endif
         if (ok) {
+            leases.held.push_back(lease);
             next_candidate = static_cast<uint16_t>(p + 1);
             return static_cast<uint16_t>(p);
         }
+        std::filesystem::remove(lease, lease_ec);
     }
     return 0;
 }
@@ -427,32 +521,36 @@ bool test_served_model_name_legacy_compatibility() {
         db.exec(R"sql(
             UPDATE agent_config
                SET served_model_name = '',
+                   inference_backend = 'vllm',
                    vllm_settings_json = '{"served_model_name":"legacy-db-alias"}'
              WHERE id = 'legacy-db-agent'
         )sql");
+        db.exec("DELETE FROM schema_migrations WHERE version = 12");
     }
     {
         mm::AgentDB db("legacy-db-agent", dir.string());
         const auto loaded = db.load_config();
         CHECK(loaded.served_model_name == "legacy-db-alias");
+        CHECK(loaded.inference_backend == "llama-cpp");
+        CHECK(loaded.backend_override == "auto");
     }
 
     CHECK(remove_tree(dir));
     return true;
 }
 
-bool test_slot_manager_not_found_statuses() {
+bool test_engine_supervisor_not_found_statuses() {
     auto dir = temp_test_dir("slots");
-    mm::SlotManager slots(46100, 46101, 1);
+    mm::EngineSupervisor slots(46100, 46101, 1);
 
-    auto unload = slots.unload_slot("missing-slot");
-    CHECK(unload.status == mm::SlotOperationStatus::NotFound);
+    auto unload = slots.unload("missing-slot");
+    CHECK(unload.status == mm::EngineOpStatus::NotFound);
 
-    auto suspend = slots.suspend_slot("missing-slot");
-    CHECK(suspend.status == mm::SlotOperationStatus::NotFound);
+    auto suspend = slots.suspend("missing-slot");
+    CHECK(suspend.status == mm::EngineOpStatus::NotFound);
 
     auto unload_all = slots.unload_all(false);
-    CHECK(unload_all.status == mm::SlotOperationStatus::Ok);
+    CHECK(unload_all.status == mm::EngineOpStatus::Ok);
 
     CHECK(remove_tree(dir));
     return true;
@@ -460,22 +558,22 @@ bool test_slot_manager_not_found_statuses() {
 
 bool test_slot_lease_blocks_unload_and_suspend_while_busy() {
     auto dir = temp_test_dir("lease-busy");
-    mm::SlotManager slots(46110, 46111, 1);
-    const auto slot_id = slots.add_ready_test_slot("test-model.gguf", "agent-a");
+    mm::EngineSupervisor slots(46110, 46111, 1);
+    const auto slot_id = slots.add_ready_test_engine("llama-cpp", "test-model.gguf", "agent-a");
 
     {
-        auto inference_lease = slots.acquire_slot(slot_id);
+        auto inference_lease = slots.acquire(slot_id);
         CHECK(static_cast<bool>(inference_lease));
 
-        auto unload = slots.unload_slot(slot_id);
-        CHECK(unload.status == mm::SlotOperationStatus::Busy);
+        auto unload = slots.unload(slot_id);
+        CHECK(unload.status == mm::EngineOpStatus::Busy);
 
-        auto suspend = slots.suspend_slot(slot_id);
-        CHECK(suspend.status == mm::SlotOperationStatus::Busy);
+        auto suspend = slots.suspend(slot_id);
+        CHECK(suspend.status == mm::EngineOpStatus::Busy);
     }
 
-    auto unload_after_release = slots.unload_slot(slot_id);
-    CHECK(unload_after_release.status == mm::SlotOperationStatus::Ok);
+    auto unload_after_release = slots.unload(slot_id);
+    CHECK(unload_after_release.status == mm::EngineOpStatus::Ok);
 
     CHECK(remove_tree(dir));
     return true;
@@ -524,6 +622,1124 @@ bool test_node_action_progress_json_round_trip() {
     auto node = nlohmann::json(n).get<mm::NodeInfo>();
     CHECK(node.action_progress.operation_id == "op-1");
     CHECK(node.action_progress.cancel_requested);
+    return true;
+}
+
+// ── Cluster engine configuration ─────────────────────────────────────────────
+
+bool test_engine_config_validation_and_round_trip() {
+    // A config is only meaningful with a primary.
+    mm::ClusterEngineConfig empty;
+    std::string err;
+    CHECK(!mm::validate_engine_config(empty, {}, err));
+    CHECK(err.find("primary_engine") != std::string::npos);
+
+    // Named but unspecified: the failure that would otherwise surface as a node
+    // provisioning defaults nobody chose.
+    mm::ClusterEngineConfig no_spec;
+    no_spec.primary_engine = "soma";
+    CHECK(!mm::validate_engine_config(no_spec, {}, err));
+    CHECK(err.find("no spec") != std::string::npos);
+
+    auto cfg = mm::EngineConfigStore::default_for("soma");
+    CHECK(cfg.primary_engine == "soma");
+    CHECK(cfg.backup_engine == "llama-cpp");
+    CHECK(mm::validate_engine_config(cfg, {}, err));
+
+    // Backup == primary is a configuration mistake with a silent failure mode
+    // (one engine, reported as two), so it is refused rather than deduplicated.
+    auto same = cfg;
+    same.backup_engine = "soma";
+    CHECK(!mm::validate_engine_config(same, {}, err));
+    CHECK(err.find("differ") != std::string::npos);
+
+    // An engine no node can run is refused at the write, not discovered per node.
+    CHECK(!mm::validate_engine_config(cfg, {"soma"}, err));
+    CHECK(err.find("unknown engine") != std::string::npos);
+    CHECK(mm::validate_engine_config(cfg, {"soma", "llama-cpp"}, err));
+
+    // THE claim this whole feature rests on: an empty backup is a real
+    // configuration, and required_engines() is what makes it mean "never
+    // provision llama.cpp" rather than "provision it and don't use it".
+    auto solo = mm::EngineConfigStore::default_for("soma");
+    solo.backup_engine.clear();
+    solo.engines.erase(std::remove_if(solo.engines.begin(), solo.engines.end(),
+                                      [](const mm::EngineSpec& s) {
+                                          return s.engine_id == "llama-cpp";
+                                      }),
+                       solo.engines.end());
+    CHECK(mm::validate_engine_config(solo, {}, err));
+    CHECK(solo.required_engines().size() == 1);
+    CHECK(solo.required_engines()[0] == "soma");
+
+    // llama.cpp as primary gets no backup, rather than itself as one.
+    auto llama_primary = mm::EngineConfigStore::default_for("llama-cpp");
+    CHECK(llama_primary.backup_engine.empty());
+    CHECK(mm::validate_engine_config(llama_primary, {}, err));
+
+    cfg.version = 7;
+    cfg.updated_by = "tui";
+    const nlohmann::json j = cfg;
+    const auto parsed = j.get<mm::ClusterEngineConfig>();
+    CHECK(parsed.version == 7);
+    CHECK(parsed.primary_engine == "soma");
+    CHECK(parsed.backup_engine == "llama-cpp");
+    CHECK(parsed.updated_by == "tui");
+    CHECK(parsed.engines.size() == cfg.engines.size());
+
+    auto vllm = mm::EngineConfigStore::default_for("vllm");
+    CHECK(vllm.engines.front().vllm.has_value());
+    auto& profile = *vllm.engines.front().vllm;
+    profile.tensor_parallel_size = 4;
+    profile.pipeline_parallel_size = 2;
+    profile.max_num_batched_tokens = 8192;
+    profile.allow_experimental_gloo = true;
+    vllm.engines.front().install_method = "wheel";
+    CHECK(mm::validate_engine_config(vllm, {"vllm", "llama-cpp"}, err));
+    const auto vllm_parsed = nlohmann::json(vllm).get<mm::ClusterEngineConfig>();
+    const auto vllm_rt = mm::effective_vllm_config(*vllm_parsed.find("vllm"));
+    CHECK(vllm_rt.tensor_parallel_size == 4);
+    CHECK(vllm_rt.pipeline_parallel_size == 2);
+    CHECK(vllm_rt.max_num_batched_tokens == 8192);
+    CHECK(vllm_rt.allow_experimental_gloo);
+
+    auto legacy_vllm_json = nlohmann::json(vllm);
+    legacy_vllm_json["engines"][0].erase("vllm");
+    const auto legacy_vllm = legacy_vllm_json.get<mm::ClusterEngineConfig>();
+    CHECK(!legacy_vllm.engines.front().vllm.has_value());
+    CHECK(mm::effective_vllm_config(legacy_vllm.engines.front())
+              .pipeline_parallel_size == 1);
+    CHECK(!mm::effective_vllm_config(legacy_vllm.engines.front())
+               .allow_experimental_gloo);
+
+    auto invalid = vllm;
+    invalid.engines.front().vllm->gpu_memory_utilization = 1.1;
+    CHECK(!mm::validate_engine_config(invalid, {}, err));
+    CHECK(err.find("gpu_memory_utilization") != std::string::npos);
+
+    invalid = vllm;
+    invalid.engines.front().vllm->extra_args = {"--pipeline-parallel-size=8"};
+    CHECK(!mm::validate_engine_config(invalid, {}, err));
+    CHECK(err.find("managed flag") != std::string::npos);
+
+    invalid = vllm;
+    invalid.engines.front().install_method = "release";
+    CHECK(!mm::validate_engine_config(invalid, {}, err));
+    return true;
+}
+
+bool test_vllm_launch_profile_and_environment() {
+    mm::EngineSpec acquisition;
+    acquisition.engine_id = "vllm";
+    acquisition.install_method = "wheel";
+    acquisition.version = "0.10.2";
+    CHECK(mm::vllm_install_requirement(acquisition) == "vllm==0.10.2");
+    acquisition.install_method = "source";
+    CHECK(mm::vllm_install_requirement(acquisition).find("git+https://") == 0);
+    CHECK(mm::vllm_install_requirement(acquisition).find("@0.10.2") !=
+          std::string::npos);
+    acquisition.install_method = "path";
+    CHECK(mm::vllm_install_requirement(acquisition).empty());
+
+    const auto provision_dir = temp_test_dir("vllm-path-only");
+    mm::VllmEngineProvisioner path_only(
+        "definitely-not-a-real-vllm-executable", provision_dir.string(),
+        "python", "cuda");
+    const auto path_status = path_only.ensure(acquisition);
+    CHECK(!path_status.ready);
+    CHECK(path_status.status == "absent");
+    CHECK(path_status.variant == "cuda");
+    CHECK(remove_tree(provision_dir));
+
+    mm::VllmEngineConfig profile;
+    profile.max_model_len = 16384;
+    profile.max_num_seqs = 32;
+    profile.max_num_batched_tokens = 4096;
+    profile.tensor_parallel_size = 2;
+    profile.pipeline_parallel_size = 3;
+    profile.gpu_memory_utilization = 0.8;
+    profile.dtype = "bfloat16";
+    profile.quantization = "awq";
+    profile.trust_remote_code = true;
+    profile.enable_auto_tool_choice = true;
+    profile.enable_sleep_mode = true;
+    profile.tool_call_parser = "hermes";
+    profile.extra_args = {"--disable-log-requests"};
+
+    const auto args = mm::build_vllm_server_args(
+        "org/model", "public-alias", profile, 8123);
+    const auto has = [&](const std::string& value) {
+        return std::find(args.begin(), args.end(), value) != args.end();
+    };
+    CHECK(args.size() > 4);
+    CHECK(args[0] == "serve");
+    CHECK(args[1] == "org/model");
+    CHECK(has("--served-model-name"));
+    CHECK(has("public-alias"));
+    CHECK(has("--tensor-parallel-size"));
+    CHECK(has("--pipeline-parallel-size"));
+    CHECK(has("--distributed-executor-backend"));
+    CHECK(has("ray"));
+    CHECK(has("--enable-sleep-mode"));
+    CHECK(has("--disable-log-requests"));
+
+    mm::EngineLoadRequest request;
+    request.model_path = "org/model";
+    request.served_model_name = "public-alias";
+    request.vllm = profile;
+    request.ray_address = "10.0.0.1:6379";
+    request.host_ip = "10.0.0.1";
+    request.gpu_devices = {2, 3};
+    request.port = 8123;
+    const auto launch = mm::make_vllm_descriptor("vllm").build_launch(request);
+    const auto env_value = [&](const std::string& key) {
+        const auto it = std::find_if(
+            launch.env.begin(), launch.env.end(), [&](const auto& entry) {
+                return entry.first == key;
+            });
+        return it == launch.env.end() ? std::string{} : it->second;
+    };
+    CHECK(env_value("VLLM_SERVER_DEV_MODE") == "1");
+    CHECK(env_value("RAY_ADDRESS") == "10.0.0.1:6379");
+    CHECK(env_value("VLLM_HOST_IP") == "10.0.0.1");
+    CHECK(env_value("CUDA_VISIBLE_DEVICES") == "2,3");
+
+    mm::SlotInfo reservation;
+    reservation.id = "vllm-slot";
+    reservation.backend = "vllm";
+    reservation.state = mm::SlotState::Suspended;
+    reservation.gpu_devices = {2, 3};
+    const auto reservation_round_trip =
+        nlohmann::json(reservation).get<mm::SlotInfo>();
+    CHECK(reservation_round_trip.gpu_devices == reservation.gpu_devices);
+
+    const auto descriptor = mm::make_vllm_descriptor("vllm");
+    auto alternate_devices = request;
+    alternate_devices.gpu_devices = {0, 1};
+    // A new agent may attach to an already-compatible server; the device list
+    // is a reservation for process creation, not part of the serving API.
+    CHECK(descriptor.launch_compatible(request, alternate_devices));
+    auto changed = request;
+    changed.vllm->max_model_len++;
+    CHECK(!descriptor.launch_compatible(request, changed));
+    return true;
+}
+
+mm::NodeInfo ray_test_node(const std::string& id,
+                           const std::string& url,
+                           const std::vector<std::string>& transports,
+                           const std::string& version = "0.10.2") {
+    mm::NodeInfo node;
+    node.id = id;
+    node.url = url;
+    node.connected = true;
+    node.platform = "linux";
+    node.engine_config_version = 9;
+    node.capabilities.arch = "x86_64";
+    node.capabilities.gpu_count = 4;
+    node.capabilities.supports_ray = true;
+    node.capabilities.comm_backends = transports;
+    node.capabilities.interconnect_gbps = 100.0;
+    mm::RuntimeStatus runtime;
+    runtime.engine_id = "vllm";
+    runtime.ready = true;
+    runtime.status = "ready";
+    runtime.version = version;
+    runtime.variant = "cuda-13";
+    node.engines.push_back(runtime);
+    return node;
+}
+
+bool test_vllm_ray_group_planner_and_commands() {
+    mm::EngineGroupRequest request;
+    request.model_ref = "org/model";
+    request.tensor_parallel_size = 4;
+    request.pipeline_parallel_size = 2;
+    request.config_version = 9;
+
+    auto a = ray_test_node("a", "http://10.0.0.1:8080", {"nccl", "gloo"});
+    auto b = ray_test_node("b", "http://10.0.0.2:8080", {"nccl", "gloo"});
+    auto c = ray_test_node("c", "http://10.0.0.3:8080", {"gloo"});
+    auto mismatch = ray_test_node(
+        "mismatch", "http://10.0.0.4:8080", {"nccl", "gloo"}, "0.9.0");
+    const auto nccl = mm::best_engine_group(request, {c, mismatch, b, a});
+    CHECK(nccl.has_value());
+    CHECK(nccl->transport == "nccl");
+    CHECK(!nccl->experimental);
+    CHECK(nccl->nodes.size() == 2);
+    CHECK(std::find(nccl->nodes.begin(), nccl->nodes.end(), "mismatch") ==
+          nccl->nodes.end());
+
+    b.capabilities.comm_backends = {"gloo"};
+    CHECK(!mm::best_engine_group(request, {a, b}).has_value());
+    request.allow_experimental_gloo = true;
+    const auto gloo = mm::best_engine_group(request, {a, b});
+    CHECK(gloo.has_value());
+    CHECK(gloo->transport == "gloo");
+    CHECK(gloo->experimental);
+
+    std::string reason;
+    CHECK(mm::distributed_vllm_model_ref_supported("org/model", reason));
+    CHECK(mm::distributed_vllm_model_ref_supported("/models/shared", reason));
+    // Two segments are deliberately accepted as a Hugging Face repository id;
+    // a path-like relative reference needs an extra segment to be unambiguous.
+    CHECK(!mm::distributed_vllm_model_ref_supported("models/local/path", reason));
+    CHECK(!reason.empty());
+
+    mm::RayStartConfig head;
+    head.group_id = "group";
+    head.role = "head";
+    head.node_ip = "10.0.0.1";
+    head.num_gpus = 4;
+    const auto head_args = mm::build_ray_start_args(head, 6380);
+    CHECK(std::find(head_args.begin(), head_args.end(), "--head") != head_args.end());
+    CHECK(std::find(head_args.begin(), head_args.end(), "--port=6380") !=
+          head_args.end());
+    mm::RayStartConfig worker = head;
+    worker.role = "worker";
+    worker.head_address = "10.0.0.1:6380";
+    const auto worker_args = mm::build_ray_start_args(worker, 6380);
+    CHECK(std::find(worker_args.begin(), worker_args.end(),
+                    "--address=10.0.0.1:6380") != worker_args.end());
+    return true;
+}
+
+bool test_engine_config_rejects_per_machine_keys() {
+    // The invariant, asserted rather than only documented. A cluster config that
+    // carried an accelerator would make every heterogeneous cluster permanently
+    // non-conforming, and SILENTLY ignoring the key is the worse failure: the
+    // write is accepted and the operator believes the cluster was told.
+    for (const auto& key : mm::forbidden_config_keys()) {
+        nlohmann::json top{{"primary_engine", "soma"}};
+        top[key] = "cuda";
+        bool threw = false;
+        try {
+            (void)top.get<mm::ClusterEngineConfig>();
+        } catch (const std::exception& e) {
+            threw = true;
+            // The message must name the field; "invalid config" would send the
+            // operator looking in the wrong place.
+            CHECK(std::string(e.what()).find(key) != std::string::npos);
+        }
+        CHECK(threw);
+
+        // And nested inside a spec, which is where an operator would most
+        // naturally try to put it.
+        nlohmann::json spec{{"engine_id", "llama-cpp"}};
+        spec[key] = "cuda";
+        nlohmann::json nested{{"primary_engine", "llama-cpp"},
+                              {"engines", nlohmann::json::array({spec})}};
+        bool nested_threw = false;
+        try {
+            (void)nested.get<mm::ClusterEngineConfig>();
+        } catch (const std::exception&) {
+            nested_threw = true;
+        }
+        CHECK(nested_threw);
+    }
+
+    // A well-formed config still parses — the guard must not be a blanket
+    // refusal of anything it does not recognise.
+    const nlohmann::json ok{{"primary_engine", "soma"},
+                            {"engines", nlohmann::json::array(
+                                            {nlohmann::json{{"engine_id", "soma"}}})}};
+    const auto parsed = ok.get<mm::ClusterEngineConfig>();
+    CHECK(parsed.primary_engine == "soma");
+    return true;
+}
+
+bool test_engine_artifact_fingerprint_is_exact() {
+    mm::EngineArtifact base;
+    base.engine_id = "llama-cpp";
+    base.version = "b4321";
+    base.platform = "linux";
+    base.arch = "x86_64";
+    base.variant = "cuda-12";
+    CHECK(base.valid());
+
+    const std::string fp = base.fingerprint();
+
+    // Every identity field must move the fingerprint. A field that did not
+    // would let a share match on a binary that cannot run: an x86_64 build on
+    // aarch64, or cuda-12 on a cuda-13 host.
+    const std::vector<std::function<void(mm::EngineArtifact&)>> mutations = {
+        [](mm::EngineArtifact& a) { a.engine_id = "soma"; },
+        [](mm::EngineArtifact& a) { a.version = "b4322"; },
+        [](mm::EngineArtifact& a) { a.platform = "windows"; },
+        [](mm::EngineArtifact& a) { a.arch = "aarch64"; },
+        [](mm::EngineArtifact& a) { a.variant = "cuda-13"; },
+    };
+    for (const auto& mutate : mutations) {
+        auto other = base;
+        mutate(other);
+        CHECK(other.fingerprint() != fp);
+    }
+
+    // sha256 is deliberately NOT part of it: two independent builds of the same
+    // source at the same version are the same NEED even when their bytes differ.
+    auto rehashed = base;
+    rehashed.sha256 = "deadbeef";
+    CHECK(rehashed.fingerprint() == fp);
+
+    mm::EngineArtifact parsed;
+    CHECK(mm::parse_engine_fingerprint(fp, parsed));
+    CHECK(parsed.engine_id == base.engine_id);
+    CHECK(parsed.version == base.version);
+    CHECK(parsed.platform == base.platform);
+    CHECK(parsed.arch == base.arch);
+    CHECK(parsed.variant == base.variant);
+
+    // An engine with no build variants keeps its empty slot, so the round trip
+    // survives and "soma|1|linux|x86_64|" cannot be confused with a 4-field form.
+    mm::EngineArtifact no_variant;
+    no_variant.engine_id = "soma";
+    no_variant.version = "1";
+    no_variant.platform = "linux";
+    no_variant.arch = "x86_64";
+    mm::EngineArtifact rt;
+    CHECK(mm::parse_engine_fingerprint(no_variant.fingerprint(), rt));
+    CHECK(rt.variant.empty());
+    CHECK(rt.engine_id == "soma");
+
+    mm::EngineArtifact junk;
+    CHECK(!mm::parse_engine_fingerprint("llama-cpp|b1|linux", junk));
+    CHECK(!mm::parse_engine_fingerprint("|||| ", junk));
+    return true;
+}
+
+bool test_engine_config_store_persists_and_bumps_version() {
+    auto dir = temp_test_dir("engine-config-store");
+    std::filesystem::create_directories(dir);
+
+    mm::EngineConfigStore store(dir.string());
+    std::string err;
+    CHECK(store.load(err));
+    // Absence of the file IS the unconfigured signal — the load succeeds and
+    // reports nothing configured, because that is what forces first-run setup.
+    CHECK(err.empty());
+    CHECK(!store.configured());
+    CHECK(store.version() == 0);
+
+    // A rejected write must leave nothing behind: nodes that started chasing a
+    // config the store refused would be converging on something that does not
+    // exist.
+    mm::ClusterEngineConfig bad;
+    CHECK(!store.save(bad, {}, "test", err));
+    CHECK(!store.configured());
+    CHECK(!std::filesystem::exists(dir / "engine_config.json"));
+
+    int callbacks = 0;
+    std::uint32_t seen_version = 0;
+    store.set_change_callback([&](const mm::ClusterEngineConfig& c) {
+        ++callbacks;
+        seen_version = c.version;
+    });
+
+    auto cfg = mm::EngineConfigStore::default_for("soma");
+    // The caller's version is IGNORED — a client echoing a stale one back could
+    // otherwise walk the cluster backwards, and every node compares on it.
+    cfg.version = 999;
+    CHECK(store.save(cfg, {}, "test", err));
+    CHECK(store.configured());
+    CHECK(store.version() == 1);
+    CHECK(callbacks == 1);
+    CHECK(seen_version == 1);
+    CHECK(store.get().updated_by == "test");
+    CHECK(store.get().updated_at_ms > 0);
+
+    cfg.share_builds = false;
+    CHECK(store.save(cfg, {}, "test2", err));
+    CHECK(store.version() == 2);
+    CHECK(callbacks == 2);
+
+    // Reopened from disk: the version survives, so a restart does not re-push
+    // v1 to a cluster already at v2.
+    mm::EngineConfigStore reopened(dir.string());
+    CHECK(reopened.load(err));
+    CHECK(reopened.configured());
+    CHECK(reopened.version() == 2);
+    CHECK(reopened.get().primary_engine == "soma");
+    CHECK(!reopened.get().share_builds);
+
+    // A corrupt file is reported, not silently replaced with a default the
+    // operator never chose — that would re-run setup on a configured cluster.
+    {
+        std::ofstream out(dir / "engine_config.json", std::ios::trunc);
+        out << "{ not json";
+    }
+    mm::EngineConfigStore broken(dir.string());
+    std::string load_err;
+    CHECK(!broken.load(load_err));
+    CHECK(!load_err.empty());
+    CHECK(!broken.configured());
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    return true;
+}
+
+bool test_placement_refused_until_engine_config_exists() {
+    auto dir = temp_test_dir("engine-gate");
+    std::filesystem::create_directories(dir / "models");
+
+    mm::NodeRegistry registry(dir.string());
+    mm::AgentScheduler scheduler(registry, (dir / "models").string());
+    mm::EngineConfigStore store(dir.string());
+    std::string err;
+    CHECK(store.load(err));
+    scheduler.set_engine_config_gate([&store]() { return store.configured(); });
+
+    mm::AgentConfig cfg;
+    cfg.id = "agent-gate";
+    cfg.name = "Gate";
+    cfg.model_path = "Qwen/Qwen3-8B";
+
+    // No configuration: refused, and the message names the fix. "No available
+    // nodes" would send an operator to inspect nodes that are all healthy.
+    CHECK(!scheduler.ensure_agent_running(cfg).has_value());
+    const std::string refusal = scheduler.last_error();
+    CHECK(refusal.find("engine configuration") != std::string::npos);
+    CHECK(refusal.find("/v1/cluster/engines/config") != std::string::npos);
+    // Structurally, not by prose. This assertion used to exist only as the
+    // string match above, which is the defect D64 names: reword the message and
+    // the test still passes while every client breaks.
+    CHECK(scheduler.last_failure() == mm::PlacementFailure::EngineConfigMissing);
+    // An operator must act. Retrying this forever is the wrong behaviour and a
+    // client can now know that without reading English.
+    CHECK(!mm::placement_failure_retryable(scheduler.last_failure()));
+
+    // Configured: the gate opens. It still finds no node — there are none
+    // registered — but the refusal is no longer the configuration one, which is
+    // the distinction being asserted.
+    CHECK(store.save(mm::EngineConfigStore::default_for("llama-cpp"), {}, "test", err));
+    CHECK(!scheduler.ensure_agent_running(cfg).has_value());
+    CHECK(scheduler.last_error().find("engine configuration required") == std::string::npos);
+    // The SAME failure the old code called "no capacity: no connected node
+    // could load this model" — which conflated an unconfigured cluster with a
+    // full one. Nothing is eligible here; nothing is full.
+    CHECK(scheduler.last_failure() == mm::PlacementFailure::NoEligibleNode);
+    CHECK(mm::placement_failure_retryable(scheduler.last_failure()));
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    return true;
+}
+
+bool test_conformance_gates_placement_candidates() {
+    auto dir = temp_test_dir("engine-conformance");
+    std::filesystem::create_directories(dir);
+    mm::NodeRegistry registry(dir.string());
+
+    const auto id = registry.add_node("http://127.0.0.1:1", "secret", "linux", false, "n1");
+
+    // With no engine-config provider nothing is MANAGING conformance, so the
+    // gate stays open. Closing it here would mean a registry used without a
+    // config store silently places nowhere, and the symptom would point at
+    // healthy nodes.
+    CHECK(registry.available_nodes().empty()); // not connected yet
+    CHECK(registry.conforming_nodes().empty());
+
+    mm::ClusterEngineConfig cfg = mm::EngineConfigStore::default_for("soma");
+    cfg.version = 3;
+    registry.set_engine_config_provider(
+        [&cfg]() -> std::optional<mm::ClusterEngineConfig> { return cfg; });
+
+    // conformance_permits_placement is the single predicate both filters use,
+    // so assert its contract directly across every state.
+    mm::EngineConformance c;
+    for (const auto st : {mm::EngineConformanceState::Unconfigured,
+                          mm::EngineConformanceState::Converging,
+                          mm::EngineConformanceState::Drifted,
+                          mm::EngineConformanceState::Failed}) {
+        c.state = st;
+        CHECK(!mm::conformance_permits_placement(c));
+    }
+    c.state = mm::EngineConformanceState::Conforming;
+    CHECK(mm::conformance_permits_placement(c));
+
+    // Round-trip through the wire form the node actually sends.
+    c.config_version = 3;
+    c.detail = "running 2 configured engine(s)";
+    const auto parsed = nlohmann::json(c).get<mm::EngineConformance>();
+    CHECK(parsed.state == mm::EngineConformanceState::Conforming);
+    CHECK(parsed.config_version == 3);
+    CHECK(parsed.detail == c.detail);
+
+    // An unrecognised state leaves the default, which STOPS placement. A node
+    // speaking a vocabulary this build does not know is the node not to
+    // schedule onto.
+    const auto unknown =
+        nlohmann::json{{"state", "quantum"}}.get<mm::EngineConformance>();
+    CHECK(unknown.state == mm::EngineConformanceState::Unconfigured);
+    CHECK(!mm::conformance_permits_placement(unknown));
+
+    (void)id;
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    return true;
+}
+
+bool test_engine_digest_and_package_grants_are_one_shot() {
+    mm::NodeState state;
+
+    // Unbrokered transfers are refused: an empty expected digest is what the
+    // receive route turns into a 409.
+    CHECK(state.take_expected_engine_digest("llama-cpp|b1|linux|x86_64|cpu").empty());
+
+    state.expect_engine_digest("llama-cpp|b1|linux|x86_64|cpu", "abc123");
+    CHECK(state.take_expected_engine_digest("llama-cpp|b1|linux|x86_64|cpu") == "abc123");
+    // Consumed. A grant that outlived its transfer would authorize a later
+    // unbrokered push of the same fingerprint — exactly what it exists to
+    // refuse.
+    CHECK(state.take_expected_engine_digest("llama-cpp|b1|linux|x86_64|cpu").empty());
+
+    state.set_prepared_engine_package("tok-1", "/tmp/pkg.tar.gz");
+    CHECK(state.take_prepared_engine_package("tok-1") == "/tmp/pkg.tar.gz");
+    CHECK(state.take_prepared_engine_package("tok-1").empty());
+    CHECK(state.take_prepared_engine_package("never-issued").empty());
+    return true;
+}
+
+bool test_admission_variant_is_the_collision_key() {
+    // The identity rule, asserted without converting anything. Two refs that
+    // denote one model must produce ONE container directory — that is what makes
+    // the variant usable as an in-flight collision key, and it is why the key is
+    // derived by the same function that picks the write path rather than by a
+    // second copy of the rule.
+    mm::AdmissionTools tools;
+    tools.quant = "q4_g";
+    tools.expert_down = "q6_g";
+    tools.group = 128;
+
+    const auto from_repo = mm::admission_variant("Qwen/Qwen3-30B-A3B", true, tools);
+    const auto from_dir =
+        mm::admission_variant("/models/Qwen3-30B-A3B", false, tools);
+    CHECK(from_repo == from_dir);
+    CHECK(from_repo == "Qwen3-30B-A3B-q4_g-q6_g-g128");
+
+    // A revision suffix names the same model directory. (Whether it SHOULD is a
+    // separate question — see the note in the roadmap — but the two halves of
+    // the system must at least agree, which is what this pins.)
+    CHECK(mm::admission_variant("Qwen/Qwen3-30B-A3B@main", true, tools) == from_repo);
+
+    // Quantization is part of the identity: the same weights at two quants are
+    // two containers, and must NOT collide.
+    auto other = tools;
+    other.expert_down = "q4_g";
+    CHECK(mm::admission_variant("Qwen/Qwen3-30B-A3B", true, other) != from_repo);
+    auto grouped = tools;
+    grouped.group = 64;
+    CHECK(mm::admission_variant("Qwen/Qwen3-30B-A3B", true, grouped) != from_repo);
+
+    // The fetch destination shares the name half, so sources/<name> and
+    // containers/<name>-... cannot disagree about which model a ref denotes.
+    CHECK(mm::admission_source_name("Qwen/Qwen3-30B-A3B", true) == "Qwen3-30B-A3B");
+    CHECK(mm::admission_source_name("/models/Qwen3-30B-A3B", false) == "Qwen3-30B-A3B");
+    CHECK(mm::admission_source_name("/models/Qwen3-30B-A3B/", false) ==
+          "Qwen3-30B-A3B");
+    CHECK(mm::admission_variant("/models/Qwen3-30B-A3B/", false, tools) == from_repo);
+    CHECK(mm::admission_source_name("Qwen/Qwen3-30B-A3B@main", true) == "Qwen3-30B-A3B");
+    return true;
+}
+
+bool test_concurrent_admission_of_one_model_joins_not_duplicates() {
+    // The case nothing had ever run. Both existing admission tests drive exactly
+    // one operation, so two in flight — the shape that corrupts a container —
+    // had never happened in the suite.
+    const char* soma_path = std::getenv("MM_TEST_SOMA_PATH");
+    const char* container_dir = std::getenv("MM_TEST_CONTAINER_DIR");
+    if (soma_path == nullptr || container_dir == nullptr) {
+        std::cout << "  (skipped: MM_TEST_SOMA_PATH / MM_TEST_CONTAINER_DIR unset)\n";
+        return true;
+    }
+
+    auto dir = temp_test_dir("admission-concurrency");
+    mm::ControlModelRegistry reg;
+    std::string err;
+    CHECK(reg.open(dir.string(), err));
+
+    mm::AdmissionTools tools;
+    tools.soma_path = soma_path;
+    tools.containers_dir = (dir / "containers").string();
+    tools.sources_dir = (dir / "sources").string();
+    reg.set_tools(tools);
+
+    // Default is 1, and 0 must not be honoured — a cap of zero parks every
+    // admission on a gate nothing can open, which reads as "pause" and behaves
+    // as "hang forever".
+    CHECK(reg.max_concurrent_admissions() == 1);
+    reg.set_max_concurrent_admissions(0);
+    CHECK(reg.max_concurrent_admissions() == 1);
+    reg.set_max_concurrent_admissions(2);
+    CHECK(reg.max_concurrent_admissions() == 2);
+    reg.set_max_concurrent_admissions(1);
+
+    // Two admissions of ONE source. The second must JOIN the first rather than
+    // start a second convert.py writing the same directory.
+    std::atomic<int> frames_a{0};
+    std::atomic<int> frames_b{0};
+    const std::string source = container_dir;
+
+    const auto id_a = reg.admit(source, [&frames_a](const mm::AdmissionProgress&) {
+        ++frames_a;
+    }, err);
+    CHECK(!id_a.empty());
+    const auto id_b = reg.admit(source, [&frames_b](const mm::AdmissionProgress&) {
+        ++frames_b;
+    }, err);
+    CHECK(!id_b.empty());
+
+    // THE assertion: one operation, not two. Before the fix these were distinct
+    // ids and both threads ran.
+    CHECK(id_a == id_b);
+
+    // The joiner gets a replayed frame immediately rather than waiting for the
+    // next stage boundary, which mid-convert can be twenty minutes away.
+    CHECK(frames_b.load() >= 1);
+
+    // And the registry lists ONE operation for the pair.
+    int matching = 0;
+    for (const auto& op : reg.operations())
+        if (op.source_ref == source) ++matching;
+    CHECK(matching == 1);
+
+    reg.cancel(id_a);
+    for (int i = 0; i < 100; ++i) {
+        const auto op = reg.operation(id_a);
+        if (op && op->done) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    const auto finished = reg.operation(id_a);
+    CHECK(finished.has_value());
+    // Exactly one terminal frame on every path — including cancelled-while-
+    // queued, which used to publish nothing at all and left a watcher waiting
+    // forever for an operation that had already stopped.
+    CHECK(finished->done);
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    return true;
+}
+
+bool test_registry_destruction_cancels_and_joins_admissions() {
+    const char* helper = std::getenv("MM_TEST_PROCESS_HELPER_PATH");
+    if (helper == nullptr) {
+        std::cout << "  (skipped: MM_TEST_PROCESS_HELPER_PATH unset)\n";
+        return true;
+    }
+
+    auto dir = temp_test_dir("admission-shutdown");
+    const auto source = dir / "source-model";
+    std::error_code ec;
+    std::filesystem::create_directories(source, ec);
+    CHECK(!ec);
+
+    auto destroy_started = std::chrono::steady_clock::time_point{};
+    {
+        mm::ControlModelRegistry reg;
+        std::string err;
+        CHECK(reg.open(dir.string(), err));
+
+        mm::AdmissionTools tools;
+        tools.soma_path = helper;
+        tools.containers_dir = (dir / "containers").string();
+        tools.sources_dir = (dir / "sources").string();
+        reg.set_tools(tools);
+
+        const auto id = reg.admit(source.string(), {}, err);
+        CHECK(!id.empty());
+
+        // The helper's direct process has spawned a descendant that holds the
+        // inherited stdout/stderr pipes. Destruction must cancel that whole tree
+        // and join the admission worker before `impl_` or its database vanish.
+        const auto marker = source / "process-helper-ready";
+        for (int i = 0; i < 100 && !std::filesystem::exists(marker); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        CHECK(std::filesystem::exists(marker));
+        destroy_started = std::chrono::steady_clock::now();
+    }
+    const double destroy_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - destroy_started).count();
+    CHECK(destroy_seconds < 5.0);
+
+    std::filesystem::remove_all(dir, ec);
+    return true;
+}
+
+bool test_desired_artifact_names_what_a_node_lacks() {
+    // The distinction this exists to hold: what a node HAS versus what it
+    // WANTS. `needs_artifact` was filled from installed_artifact(), which
+    // requires a working runtime — and is consulted only when provisioning
+    // FAILED. So a node that could not build asked for help by naming the build
+    // it did not have, and named nothing: the share path had no reachable
+    // trigger at all.
+    mm::SomaEngineProvisioner soma("soma");
+    mm::EngineSpec soma_spec;
+    soma_spec.engine_id = "soma";
+
+    // Soma ships with the node, so there is no peer that could supply one.
+    // Naming an artifact would send control hunting a source that cannot exist.
+    CHECK(!soma.desired_artifact(soma_spec).has_value());
+    CHECK(!soma.installed_artifact().has_value());
+    CHECK(!soma.shareable());
+
+    mm::LlamaEngineProvisioner llama("llama-server", {});
+    mm::EngineSpec llama_spec;
+    llama_spec.engine_id = "llama-cpp";
+
+    // Nothing resolved yet: no version and no variant, so the node cannot name
+    // what it needs and says so rather than emitting a fingerprint with blank
+    // fields that would match no source ever.
+    llama_spec.version = "latest";
+    CHECK(!llama.desired_artifact(llama_spec).has_value());
+
+    // A pinned version is knowable immediately — but a variant still is not,
+    // and every real llama install advertises an accelerator. A fingerprint
+    // with a blank variant 404s every time, which is worse than admitting
+    // ignorance.
+    llama_spec.version = "b4321";
+    CHECK(!llama.desired_artifact(llama_spec).has_value());
+
+    // Nothing is installed, so it is not a source for anyone.
+    CHECK(!llama.installed_artifact().has_value());
+    CHECK(!llama.shareable());
+    return true;
+}
+
+namespace {
+
+/// A provisioner that fails the only way the two real ones can't be made to on
+/// demand. Every other method is inert; `ensure` is the one the manager calls.
+class ThrowingProvisioner final : public mm::EngineProvisioner {
+public:
+    explicit ThrowingProvisioner(std::string id) : id_(std::move(id)) {}
+
+    const std::string& engine_id() const override { return id_; }
+    mm::RuntimeStatus ensure(const mm::EngineSpec&) override {
+        ++calls;
+        throw std::runtime_error("provisioner exploded");
+    }
+    mm::RuntimeStatus check_for_update(const mm::EngineSpec&) override { return status(); }
+    mm::RuntimeStatus update(const mm::EngineSpec&, const std::string&) override {
+        return status();
+    }
+    mm::RuntimeStatus status() const override {
+        mm::RuntimeStatus s;
+        s.engine_id = id_;
+        s.status = "absent";
+        return s;
+    }
+    std::optional<mm::EngineArtifact> installed_artifact() const override { return std::nullopt; }
+    std::optional<mm::EngineArtifact> desired_artifact(const mm::EngineSpec&) const override {
+        return std::nullopt;
+    }
+    bool shareable() const override { return false; }
+    bool package(const std::string&, std::string& err) override {
+        err = "not shareable";
+        return false;
+    }
+    bool install_package(const std::string&,
+                         const mm::EngineArtifact&,
+                         std::string& err) override {
+        err = "not installable";
+        return false;
+    }
+    std::string executable_path() const override { return {}; }
+
+    int calls = 0;
+
+private:
+    std::string id_;
+};
+
+} // namespace
+
+bool test_provisioner_exception_fails_the_engine_not_the_node() {
+    // The guarantee behind D56: whatever a provisioner does, the node survives
+    // it and says what happened. The reentrant lock was one way to throw; the
+    // point of the boundary is that it does not have to be the last one.
+    // Soma stays REAL and stays primary, and is planted where it will actually
+    // resolve, because the second half of the claim is that a backup blowing up
+    // does not stop the primary from coming up. With one catch around the whole
+    // loop it would have — and a primary that failed for its own reasons would
+    // have hidden the difference.
+    const std::string soma_name = "mm-soma-fixture-" + mm::util::generate_uuid();
+#ifdef _WIN32
+    const std::filesystem::path planted =
+        std::filesystem::path(mm::util::executable_dir()) / (soma_name + ".exe");
+#else
+    const std::filesystem::path planted =
+        std::filesystem::path(mm::util::executable_dir()) / soma_name;
+#endif
+    {
+        std::ofstream out(planted, std::ios::binary | std::ios::trunc);
+        out << "not a real engine";
+    }
+
+    mm::EngineManagerPaths paths;
+    paths.llama_provision_dir = temp_test_dir("engine-manager-throw").string();
+    paths.soma_executable = soma_name;
+    mm::NodeEngineManager manager(paths);
+
+    auto owned = std::make_unique<ThrowingProvisioner>("llama-cpp");
+    auto* thrower = owned.get();
+    manager.set_provisioner("llama-cpp", std::move(owned));
+
+    mm::ClusterEngineConfig cfg;
+    cfg.version = 1;
+    cfg.primary_engine = "soma";
+    cfg.backup_engine = "llama-cpp";
+    mm::EngineSpec soma_spec;
+    soma_spec.engine_id = "soma";
+    mm::EngineSpec llama_spec;
+    llama_spec.engine_id = "llama-cpp";
+    cfg.engines = {soma_spec, llama_spec};
+
+    manager.apply(cfg); // must return, not terminate
+    CHECK(thrower->calls == 1);
+
+    const auto conf = manager.conformance();
+    // Failed, not Converging: the application finished, and a node stuck
+    // reporting "wait" forever reads healthier than one reporting a fault.
+    CHECK(conf.state == mm::EngineConformanceState::Failed);
+    CHECK(conf.detail.find("provisioner exploded") != std::string::npos);
+
+    // And the per-engine row says error, not absent. Absent means nothing
+    // tried; something tried and blew up, and an operator reading "absent"
+    // would go looking for a missing install rather than a crash.
+    bool saw_llama = false, soma_ready = false;
+    for (const auto& s : manager.engine_statuses()) {
+        if (s.engine_id == "soma") soma_ready = s.ready;
+        if (s.engine_id != "llama-cpp") continue;
+        saw_llama = true;
+        CHECK(s.status == "error");
+        CHECK(!s.ready);
+        CHECK(s.last_error.find("provisioner exploded") != std::string::npos);
+    }
+    CHECK(saw_llama);
+    CHECK(soma_ready);
+
+    std::error_code ec;
+    std::filesystem::remove(planted, ec);
+    return true;
+}
+
+bool test_soma_resolves_beside_the_node_binary() {
+    // D58: the node looked for `soma` on PATH alone, while the documented rule —
+    // and the deployment layout — is that soma ships BESIDE the node binary. In
+    // any build tree those are different directories, so the engine built with
+    // the node was invisible to it and every Soma-primary config reported the
+    // engine absent.
+    const std::string dir = mm::util::executable_dir();
+    CHECK(!dir.empty());
+
+    // Written beside the RUNNING test binary, because that is the only way to
+    // assert "beside the executable" without hardcoding a build layout — which
+    // is the very thing this fix exists to avoid.
+    const std::string name = "mm-soma-fixture-" + mm::util::generate_uuid();
+#ifdef _WIN32
+    const std::filesystem::path planted = std::filesystem::path(dir) / (name + ".exe");
+#else
+    const std::filesystem::path planted = std::filesystem::path(dir) / name;
+#endif
+    {
+        std::ofstream out(planted, std::ios::binary | std::ios::trunc);
+        out << "not a real engine";
+    }
+
+    mm::EngineSpec spec;
+    spec.engine_id = "soma";
+
+    // The bare name resolves to the sibling, and to its full path — a status
+    // that echoed the request back would pass a weaker test while telling the
+    // supervisor nothing it did not already have.
+    mm::SomaEngineProvisioner found(name);
+    const auto ok = found.ensure(spec);
+    CHECK(ok.ready);
+    CHECK(ok.status == "ready");
+    CHECK(ok.executable_path == planted.string());
+
+    std::error_code ec;
+    std::filesystem::remove(planted, ec);
+
+    // Gone from both places now, and the failure has to NAME where it looked.
+    // "not found, check the install" is a dead end when the operator's next
+    // question is which of the two directories was empty.
+    mm::SomaEngineProvisioner missing(name);
+    const auto absent = missing.ensure(spec);
+    CHECK(!absent.ready);
+    CHECK(absent.status == "absent");
+    CHECK(absent.last_error.find(dir) != std::string::npos);
+    return true;
+}
+
+bool test_provisioning_progress_sink_may_read_status() {
+    // The node crash: a cluster config naming llama-cpp killed the node inside
+    // one health poll, with nothing in the log, on every fresh install (D56).
+    //
+    // The shape is a lock held across a callback. LlamaEngineProvisioner held
+    // one mutex for the whole of ensure(); ensure() reports progress by calling
+    // the progress sink; the node's sink asks the engine manager for llama
+    // status, which comes straight back into the same object and takes the same
+    // mutex on the same thread. MSVC does not hang on that — it THROWS
+    // `resource deadlock would occur` — out of a worker thread with no handler,
+    // into std::terminate, which is abort().
+    //
+    // So the assertion is not "no deadlock", which a passing test cannot
+    // distinguish from a test that never reached the callback. It is: the sink
+    // FIRED, it read status from inside the callback, and ensure() returned.
+    // The middle one is what makes the other two mean anything.
+    auto dir = temp_test_dir("provisioner-reentrancy");
+    std::filesystem::create_directories(dir);
+
+    // Injected wholesale: reaching the progress callback at all requires
+    // getting into a managed install, and a test that downloaded llama.cpp to
+    // get there would be a network test that fails for its own reasons.
+    mm::LlamaCommandRunner runner;
+    runner.resolve_executable = [](const std::string&) { return std::string{}; };
+    runner.capture_output = [](const std::vector<std::string>&,
+                               const std::filesystem::path&) { return std::string{}; };
+    runner.capture_first_line = [](const std::vector<std::string>&,
+                                   const std::filesystem::path&) { return std::string{}; };
+    runner.fetch_latest = [](const mm::LlamaProvisionConfig&) { return std::string{"b4321"}; };
+    runner.fetch_release_assets = [](const mm::LlamaProvisionConfig&, const std::string&) {
+        return std::vector<std::string>{};
+    };
+    runner.run = [](const std::vector<std::string>&,
+                    const std::filesystem::path&,
+                    const mm::StreamLineCallback&,
+                    const mm::CancelCheckCallback&,
+                    std::string*) { return 0; };
+
+    mm::LlamaEngineProvisioner llama("llama-server", dir.string(), runner);
+
+    int progress_frames = 0;
+    int reads_from_inside_the_callback = 0;
+    llama.set_progress_sink([&](const mm::RuntimeInstallProgress& p) {
+        if (!p.active) return;
+        ++progress_frames;
+        // Exactly what src/node/main.cpp's progress sink does — it reads the
+        // accelerator to label the operation. Reading it here is the whole
+        // test; before the fix this threw.
+        const auto s = llama.llama_status();
+        (void)s.accelerator;
+        // …and the generic accessors, which the API thread and the TUI reach
+        // through on the same object while a build runs.
+        (void)llama.status();
+        (void)llama.executable_path();
+        ++reads_from_inside_the_callback;
+    });
+
+    mm::EngineSpec spec;
+    spec.engine_id = "llama-cpp";
+    spec.version = "latest";
+    spec.install_method = "auto";
+
+    bool threw = false;
+    try {
+        llama.ensure(spec);
+    } catch (...) {
+        threw = true;
+    }
+
+    CHECK(!threw);
+    // The install cannot SUCCEED here — no bytes were ever downloaded — and
+    // that is fine. It has to reach the progress callback, which is a
+    // different claim, and the one this test is about.
+    CHECK(progress_frames > 0);
+    CHECK(reads_from_inside_the_callback == progress_frames);
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    return true;
+}
+
+bool test_node_modal_ladder() {
+    using mm::NodeModal;
+    using mm::NodeModalInputs;
+
+    // Everything available at once. The precedence has to be asserted from the
+    // TOP down, because that is the property the old code could not state: it
+    // was five scattered "if X then Y = false" statements plus a second,
+    // differently-ordered ladder in the event handler, agreeing only by luck.
+    NodeModalInputs all;
+    all.progress_active = true;
+    all.engine_switch_available = true;
+    all.engine_variants_listed = true;
+    all.can_troubleshoot = true;
+    all.troubleshoot_unacknowledged = true;
+    all.can_install_target = true;
+    all.target_unacknowledged = true;
+    all.can_update = true;
+    all.update_unacknowledged = true;
+
+    // Progress outranks everything, from any current modal.
+    for (const auto cur : {NodeModal::None, NodeModal::EngineSwitch, NodeModal::Troubleshoot,
+                           NodeModal::Target, NodeModal::Update})
+        CHECK(mm::resolve_node_modal(all, cur) == NodeModal::Progress);
+
+    auto no_progress = all;
+    no_progress.progress_active = false;
+
+    // EngineSwitch next — but ONLY when it is already open. It has no
+    // auto-open, so from None the ladder falls through to Troubleshoot even
+    // with everything else available.
+    CHECK(mm::resolve_node_modal(no_progress, NodeModal::EngineSwitch) ==
+          NodeModal::EngineSwitch);
+    CHECK(mm::resolve_node_modal(no_progress, NodeModal::None) == NodeModal::Troubleshoot);
+
+    // Then Troubleshoot > Target > Update, each asserted by removing the one
+    // above it rather than by trusting the order of the branches.
+    auto below_troubleshoot = no_progress;
+    below_troubleshoot.can_troubleshoot = false;
+    CHECK(mm::resolve_node_modal(below_troubleshoot, NodeModal::None) == NodeModal::Target);
+
+    auto below_target = below_troubleshoot;
+    below_target.can_install_target = false;
+    CHECK(mm::resolve_node_modal(below_target, NodeModal::None) == NodeModal::Update);
+
+    auto below_update = below_target;
+    below_update.can_update = false;
+    CHECK(mm::resolve_node_modal(below_update, NodeModal::None) == NodeModal::None);
+
+    // Acknowledgement closes an auto-opening prompt — and NOT while it is the
+    // current modal, or acknowledging from inside would close it mid-read.
+    NodeModalInputs update_only;
+    update_only.can_update = true;
+    update_only.update_unacknowledged = false;
+    CHECK(mm::resolve_node_modal(update_only, NodeModal::None) == NodeModal::None);
+    CHECK(mm::resolve_node_modal(update_only, NodeModal::Update) == NodeModal::Update);
+    update_only.update_unacknowledged = true;
+    CHECK(mm::resolve_node_modal(update_only, NodeModal::None) == NodeModal::Update);
+
+    // "Can" gates the prompt regardless of stickiness: a runtime that stops
+    // offering an update must close the prompt, not keep it pinned open.
+    update_only.can_update = false;
+    CHECK(mm::resolve_node_modal(update_only, NodeModal::Update) == NodeModal::None);
+
+    // EngineSwitch closes when its variant list empties — the modal is a menu,
+    // and a menu with nothing in it is not a thing to show.
+    NodeModalInputs engine_only;
+    engine_only.engine_switch_available = true;
+    engine_only.engine_variants_listed = true;
+    CHECK(mm::resolve_node_modal(engine_only, NodeModal::EngineSwitch) ==
+          NodeModal::EngineSwitch);
+    engine_only.engine_variants_listed = false;
+    CHECK(mm::resolve_node_modal(engine_only, NodeModal::EngineSwitch) == NodeModal::None);
+    engine_only.engine_variants_listed = true;
+    engine_only.engine_switch_available = false;
+    CHECK(mm::resolve_node_modal(engine_only, NodeModal::EngineSwitch) == NodeModal::None);
+
+    // Nothing available is None from every starting point — no modal can pin
+    // itself open against its own preconditions.
+    NodeModalInputs none;
+    for (const auto cur : {NodeModal::None, NodeModal::Progress, NodeModal::EngineSwitch,
+                           NodeModal::Troubleshoot, NodeModal::Target, NodeModal::Update})
+        CHECK(mm::resolve_node_modal(none, cur) == NodeModal::None);
+
+    CHECK(std::string(mm::to_string(NodeModal::EngineSwitch)) == "engine-switch");
+    CHECK(std::string(mm::to_string(NodeModal::None)) == "none");
     return true;
 }
 
@@ -637,10 +1853,33 @@ bool test_scheduler_skips_failed_node_current_attempt() {
     retired.id = "retired-agent";
     retired.inference_backend = "vllm";
     RECORD(!scheduler.ensure_agent_running(retired).has_value());
-    RECORD(scheduler.last_error().find("supports llama-cpp only") !=
-           std::string::npos);
+    // Asserted STRUCTURALLY: an agent with no node-local backend resolves to an
+    // empty engine id. The previous version matched the phrase "supports
+    // llama-cpp only", which made the test a hostage of the error prose — the
+    // same mistake the capacity-pressure substring matcher made.
+    RECORD(mm::AgentScheduler::resolve_backend(retired).engine_id.empty());
     RECORD(bad_loads.load() == 0);
     RECORD(good_loads.load() == 0);
+
+    // And the agent that DOES own a slot routes to a real engine. `auto` with no
+    // admission record is the fallback, which is policy rather than a placeholder:
+    // absence of a record is not evidence of admissibility.
+    RECORD(mm::AgentScheduler::resolve_backend(cfg).engine_id == "llama-cpp");
+
+    // An operator override to Soma is REFUSED while no record admits these
+    // weights — forcing the streaming engine onto a model nothing has passed
+    // through conformance is the same bet as overriding a `reject`, with less
+    // evidence behind it. Once the model registry lands, an admitted model with
+    // a stream verdict is what makes this resolve to "soma".
+    auto forced = cfg;
+    forced.backend_override = "soma";
+    RECORD(mm::AgentScheduler::resolve_backend(forced).engine_id == "llama-cpp");
+    RECORD(mm::AgentScheduler::resolve_backend(forced).reason.find("override_refused") !=
+           std::string::npos);
+
+    auto forced_fallback = cfg;
+    forced_fallback.backend_override = "fallback";
+    RECORD(mm::AgentScheduler::resolve_backend(forced_fallback).engine_id == "llama-cpp");
 
     auto scheduled = scheduler.ensure_agent_running(cfg);
     RECORD(scheduled.has_value());
@@ -658,6 +1897,162 @@ bool test_scheduler_skips_failed_node_current_attempt() {
     if (good_thread.joinable()) good_thread.join();
     RECORD(bad_listen_ok);
     RECORD(good_listen_ok);
+    RECORD(remove_tree(dir));
+
+#undef RECORD
+    return ok;
+}
+
+bool test_scheduler_exhausts_primary_before_cluster_backup() {
+    bool ok = true;
+#define RECORD(expr) do { if (!(expr)) { std::cerr << "CHECK failed at line " << __LINE__ << ": " << #expr << "\n"; ok = false; } } while (0)
+
+    const uint16_t port_a = find_free_test_port();
+    const uint16_t port_b = find_free_test_port();
+    RECORD(port_a != 0);
+    RECORD(port_b != 0);
+
+    httplib::Server server_a;
+    httplib::Server server_b;
+    std::mutex calls_mutex;
+    std::vector<std::string> calls;
+
+    auto install_routes = [&](httplib::Server& server, const std::string& node_name) {
+        server.Get("/api/node/health", [](const httplib::Request&,
+                                           httplib::Response& res) {
+            mm::NodeHealthMetrics health;
+            health.cpu_percent = 1.0f;
+            health.ram_percent = 5.0f;
+            health.gpu_vram_total_mb = 131072;
+            health.gpu_backend_available = true;
+            res.set_content(nlohmann::json(health).dump(), "application/json");
+        });
+        server.Get("/api/node/status", [](const httplib::Request&,
+                                           httplib::Response& res) {
+            mm::NodeCapabilities capabilities;
+            capabilities.arch = "x86_64";
+            capabilities.gpu_count = 4;
+            mm::RuntimeStatus vllm;
+            vllm.engine_id = "vllm";
+            vllm.status = "ready";
+            vllm.version = "0.10.2";
+            vllm.variant = "cuda-13";
+            vllm.ready = true;
+            mm::RuntimeStatus llama;
+            llama.engine_id = "llama-cpp";
+            llama.status = "ready";
+            llama.version = "b9999";
+            llama.variant = "cuda-13";
+            llama.ready = true;
+            res.set_content(nlohmann::json{
+                {"slots", nlohmann::json::array()},
+                {"max_slots", 2},
+                {"slot_available", 2},
+                {"disk_free_mb", 131072},
+                {"capabilities", capabilities},
+                {"engine_config_version", 11},
+                {"engine_runtimes", std::vector<mm::RuntimeStatus>{vllm, llama}}
+            }.dump(), "application/json");
+        });
+        server.Post("/api/node/load-model",
+                    [&, node_name](const httplib::Request& req,
+                                   httplib::Response& res) {
+            const auto body = nlohmann::json::parse(req.body);
+            const std::string backend = body.value("backend", std::string{});
+            {
+                std::lock_guard<std::mutex> lock(calls_mutex);
+                calls.push_back(node_name + ":" + backend);
+            }
+            if (backend == "vllm") {
+                res.status = 503;
+                res.set_content(nlohmann::json{
+                    {"error", "synthetic vLLM startup failure"},
+                    {"code", "engine_start_failed"}
+                }.dump(), "application/json");
+                return;
+            }
+            res.set_content(nlohmann::json{
+                {"status", "loaded"},
+                {"slot_id", "llama-backup-slot"},
+                {"effective_ctx_size", 4096}
+            }.dump(), "application/json");
+        });
+    };
+    install_routes(server_a, "a");
+    install_routes(server_b, "b");
+
+    std::atomic<bool> listen_a{false};
+    std::atomic<bool> listen_b{false};
+    std::thread thread_a([&] { listen_a = server_a.listen("127.0.0.1", port_a); });
+    std::thread thread_b([&] { listen_b = server_b.listen("127.0.0.1", port_b); });
+    const std::string url_a = "http://127.0.0.1:" + std::to_string(port_a);
+    const std::string url_b = "http://127.0.0.1:" + std::to_string(port_b);
+    auto wait_for_server = [](const std::string& url) {
+        mm::HttpClient client(url);
+        for (int attempt = 0; attempt < 50; ++attempt) {
+            if (client.get("/api/node/health").ok()) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return false;
+    };
+    RECORD(wait_for_server(url_a));
+    RECORD(wait_for_server(url_b));
+
+    const auto dir = temp_test_dir("scheduler-cluster-order");
+    std::filesystem::create_directories(dir / "models");
+    mm::NodeRegistry registry(dir.string());
+    registry.add_node(url_a, "secret-a", "linux", false, "node-a");
+    registry.add_node(url_b, "secret-b", "linux", false, "node-b");
+    registry.start_health_poll(1);
+    for (int attempt = 0; attempt < 50; ++attempt) {
+        const auto nodes = registry.list_nodes();
+        if (nodes.size() == 2 &&
+            std::all_of(nodes.begin(), nodes.end(), [](const mm::NodeInfo& node) {
+                return node.connected && node.engine_config_version == 11;
+            })) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    auto cluster = mm::EngineConfigStore::default_for("vllm");
+    cluster.version = 11;
+    mm::AgentScheduler scheduler(registry, (dir / "models").string());
+    scheduler.set_engine_config_provider(
+        [&cluster]() -> std::optional<mm::ClusterEngineConfig> { return cluster; });
+
+    mm::AgentConfig agent;
+    agent.id = "cluster-order-agent";
+    agent.name = "Cluster Order Agent";
+    agent.model_path = "org/model";
+    const auto scheduled = scheduler.ensure_agent_running(agent);
+    RECORD(scheduled.has_value());
+    const auto placement = scheduler.get_placement(agent.id);
+    RECORD(placement.has_value());
+    if (placement) RECORD(placement->engine_id == "llama-cpp");
+    {
+        std::lock_guard<std::mutex> lock(calls_mutex);
+        RECORD(calls.size() == 3);
+        if (calls.size() == 3) {
+            RECORD(calls[0].find(":vllm") != std::string::npos);
+            RECORD(calls[1].find(":vllm") != std::string::npos);
+            RECORD(calls[0].substr(0, 1) != calls[1].substr(0, 1));
+            RECORD(calls[2].find(":llama-cpp") != std::string::npos);
+        }
+    }
+
+    auto llama_pin = agent;
+    llama_pin.backend_override = "fallback";
+    RECORD(scheduler.resolve_backend_for(llama_pin).engine_id == "llama-cpp");
+    auto unavailable_pin = agent;
+    unavailable_pin.backend_override = "soma";
+    RECORD(scheduler.resolve_backend_for(unavailable_pin).engine_id.empty());
+
+    registry.stop_health_poll();
+    server_a.stop();
+    server_b.stop();
+    if (thread_a.joinable()) thread_a.join();
+    if (thread_b.joinable()) thread_b.join();
+    RECORD(listen_a);
+    RECORD(listen_b);
     RECORD(remove_tree(dir));
 
 #undef RECORD
@@ -963,6 +2358,568 @@ bool test_scheduler_eviction_skips_unsuspendable_shared_slot() {
     return ok;
 }
 
+bool test_container_directory_transfers_to_a_node() {
+    // D66: transfer_model_to_node() has always walked a directory and streamed
+    // every file, and both of its callers resolved through a FILE-ONLY helper —
+    // so the directory branch was unreachable from placement and an admitted
+    // Soma container was never sent to a node. Soma's models are always
+    // container directories, so this was the normal case for the engine the
+    // branch exists to serve.
+    //
+    // Asserted by counting what the node RECEIVES. A test that only checked the
+    // resolver would pass with the transfer still unreachable — the resolver was
+    // never the point, reaching the streaming branch was.
+    const auto dir = temp_test_dir("container-transfer");
+    const auto models = dir / "models";
+    std::filesystem::create_directories(models);
+
+    const auto container = models / "Qwen3-30B-A3B-q4_g-q6_g-g128";
+    std::filesystem::create_directories(container / "experts");
+    for (const auto& rel : {std::string("container_meta.json"),
+                            std::string("dense.bin"),
+                            std::string("experts/layer0.bin")}) {
+        std::ofstream out(container / rel, std::ios::binary | std::ios::trunc);
+        out << "payload-" << rel;
+    }
+
+    const uint16_t port = find_free_test_port();
+    CHECK(port != 0);
+    const std::string url = "http://127.0.0.1:" + std::to_string(port);
+
+    httplib::Server server;
+    std::mutex received_mutex;
+    std::vector<std::string> received_paths;
+    std::string received_model_id;
+
+    server.Get("/api/node/health", [](const httplib::Request&, httplib::Response& res) {
+        mm::NodeHealthMetrics health;
+        health.gpu_vram_total_mb = 131072;
+        health.gpu_backend_available = true;
+        health.disk_free_mb = 1000000;
+        health.ram_total_mb = 65536;
+        res.set_content(nlohmann::json(health).dump(), "application/json");
+    });
+    server.Get("/api/node/status", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(nlohmann::json{{"slots", nlohmann::json::array()},
+                                       {"max_slots", 2},
+                                       {"slot_available", 2}}
+                            .dump(),
+                        "application/json");
+    });
+    server.Post("/api/node/load-model", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(nlohmann::json{{"status", "loaded"}, {"slot_id", "slot-container"}}.dump(),
+                        "application/json");
+    });
+    server.Get("/api/node/models/local", [](const httplib::Request&, httplib::Response& res) {
+        // Not present, so the transfer is not skipped by the dedup check.
+        res.set_content(nlohmann::json{{"available", true}, {"present", false}}.dump(),
+                        "application/json");
+    });
+    server.Post("/api/node/models/receive",
+                [&](const httplib::Request& req, httplib::Response& res) {
+                    {
+                        std::lock_guard<std::mutex> lk(received_mutex);
+                        received_paths.push_back(req.get_header_value("X-MM-Rel-Path"));
+                        received_model_id = req.get_header_value("X-MM-Model-Id");
+                    }
+                    res.set_content(nlohmann::json{{"status", "stored"},
+                                                   {"load_path", "/node/models/container"}}
+                                        .dump(),
+                                    "application/json");
+                });
+
+    std::atomic<bool> listen_ok{false};
+    std::thread server_thread([&] { listen_ok = server.listen("127.0.0.1", port); });
+
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    RECORD(wait_for_test_server(url));
+
+    // The resolver half: a directory now resolves as a model reference, while
+    // the file-only form still refuses it — the split is the fix, not a widening.
+    RECORD(mm::util::resolve_existing_local_model_ref(container.string(), models.string())
+               .has_value());
+    RECORD(!mm::util::resolve_existing_local_model_path(container.string(), models.string())
+                .has_value());
+
+    mm::NodeRegistry registry((dir / "registry").string());
+    const auto node_id = registry.add_node(url, "container-secret", "test");
+    registry.start_health_poll(1);
+    RECORD(wait_for_registered_node(registry, node_id));
+    mm::AgentScheduler scheduler(registry, models.string());
+
+    mm::AgentConfig cfg;
+    cfg.id = "container-agent";
+    cfg.model_path = container.string();
+
+    // The cache id is derivable for a directory, which is what lets residency
+    // and disk accounting work for containers at all (D65 leaned on this).
+    RECORD(!scheduler.model_cache_id(cfg).empty());
+
+    // And the bytes actually move — driven through REAL placement rather than the
+    // transfer helper, because "the directory reaches the streaming branch when
+    // an agent is placed" is the claim, and calling the helper directly would
+    // assert it about a path placement might not take.
+    cfg.preferred_node_id = node_id;
+    RECORD(scheduler.ensure_agent_running(cfg).has_value());
+    {
+        std::lock_guard<std::mutex> lk(received_mutex);
+        RECORD(received_paths.size() == 3);
+        RECORD(!received_model_id.empty());
+        RECORD(std::find(received_paths.begin(), received_paths.end(), "container_meta.json") !=
+               received_paths.end());
+        // Nested files keep their RELATIVE path — a flattened transfer would
+        // land every shard in the container root and fail at load.
+        RECORD(std::find(received_paths.begin(), received_paths.end(), "experts/layer0.bin") !=
+               received_paths.end());
+    }
+
+    registry.stop_health_poll();
+    server.stop();
+    if (server_thread.joinable()) server_thread.join();
+    RECORD(listen_ok);
+    RECORD(remove_tree(dir));
+
+#undef RECORD
+    return ok;
+}
+
+bool test_disk_is_charged_only_to_nodes_lacking_the_model() {
+    // D65: `disk_mb` was 0 for every placement, so the disk axis could only ever
+    // reject on the 8 GiB headroom and never on a model's actual demand. The
+    // reason it stayed 0 was sound — a container the target already holds is not
+    // an additional cost, and NodeInfo could not say whether it holds it — so
+    // the fix is the missing INPUT, and this is the property it buys.
+    const auto dir = temp_test_dir("disk-residency");
+    const auto models = dir / "models";
+    std::filesystem::create_directories(models);
+
+    // A real model FILE, because the size charged is measured rather than
+    // stated — and because a file is what control can actually transfer.
+    // `prepare_model_for_node()` resolves through
+    // `resolve_existing_local_model_path()`, which matches `is_regular_file`
+    // only, so a container DIRECTORY never reaches the transfer path at all
+    // (logged as D66). Charging disk for bytes that will never be sent would be
+    // a worse error than charging none.
+    const auto model_file = models / "tiny-model.gguf";
+    {
+        std::ofstream out(model_file, std::ios::binary | std::ios::trunc);
+        const std::vector<char> block(1024 * 1024, 'w'); // 1 MiB, enough to be measurable
+        for (int i = 0; i < 3; ++i)
+            out.write(block.data(), static_cast<std::streamsize>(block.size()));
+    }
+
+    mm::NodeRegistry registry((dir / "registry").string());
+    mm::AgentScheduler scheduler(registry, models.string());
+
+    mm::AgentConfig cfg;
+    cfg.id = "disk-agent";
+    cfg.model_path = model_file.string();
+
+    const std::string cache_id = scheduler.model_cache_id(cfg);
+    CHECK(!cache_id.empty());
+
+    mm::ResourceFootprint base; // no disk of its own
+
+    // A node that does NOT hold it pays for the transfer.
+    mm::NodeInfo without;
+    without.id = "node-without";
+    const auto charged = scheduler.footprint_for_node(cfg, base, without);
+    CHECK(charged.disk_mb >= 3);
+
+    // The same node, once it holds it, pays nothing — which is the entire point.
+    // Charging it anyway would reject exactly the nodes that are cheapest to
+    // place on, and that risk is why this stayed unfixed rather than guessed at.
+    mm::NodeInfo with;
+    with.id = "node-with";
+    with.local_model_ids.push_back(cache_id);
+    const auto free_for_holder = scheduler.footprint_for_node(cfg, base, with);
+    CHECK(free_for_holder.disk_mb == 0);
+
+    // A DIFFERENT model's id must not count as this one. The ids come from
+    // manifest_cache_id() on both sides; a mismatch here would silently make
+    // every node look empty, and every placement would be over-charged forever.
+    mm::NodeInfo other;
+    other.id = "node-other";
+    other.local_model_ids.push_back("some-other-model-id");
+    CHECK(scheduler.footprint_for_node(cfg, base, other).disk_mb >= 3);
+
+    // A ref control cannot resolve locally is one no node will be sent, so it
+    // costs no disk anywhere — the same rule prepare_model_for_node() follows.
+    mm::AgentConfig remote = cfg;
+    remote.model_path = "org/never-fetched";
+    CHECK(scheduler.model_cache_id(remote).empty());
+    CHECK(scheduler.footprint_for_node(remote, base, without).disk_mb == 0);
+
+    // The base footprint is carried through untouched — this adds disk, it does
+    // not replace the engine-shaped demand computed for the model.
+    mm::ResourceFootprint ram_base;
+    ram_base.ram_mb = 4096;
+    const auto combined = scheduler.footprint_for_node(cfg, ram_base, without);
+    CHECK(combined.ram_mb == 4096);
+    CHECK(combined.disk_mb >= 3);
+
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_soma_footprint_is_ram_shaped_not_vram_shaped() {
+    // D62: every demand figure was VRAM, produced by llama.cpp's estimator, for
+    // BOTH engines. Soma v1 is CPU-only, and evaluate_fit() refuses to offload
+    // against a host with less than min_gpu_for_offload_mb (8 GiB) of GPU — so a
+    // Soma agent could not be placed on a GPU-less node at all, for VRAM it
+    // would never have touched. That is a rejection, not merely a bad estimate.
+    mm::ResourceFootprint soma;
+    soma.ram_mb = 8192; // a resident half, no VRAM — the shape soma_footprint returns
+
+    mm::HostCapacity cpu_only;
+    cpu_only.vram_total_mb = 0; // no GPU whatsoever
+    cpu_only.vram_free_mb = 0;
+    cpu_only.ram_total_mb = 65536;
+    cpu_only.ram_free_mb = 64000;
+    cpu_only.disk_free_mb = 500000;
+
+    const mm::CapacityPolicy policy;
+    std::string reason;
+    // A zero-VRAM ask short-circuits to Native: RAM and disk are still checked,
+    // the GPU question simply never arises.
+    CHECK(mm::evaluate_fit(soma, cpu_only, policy, &reason) == mm::FitQuality::Native);
+
+    // The same host, asked the OLD way — a llama-shaped VRAM figure for a model
+    // whose real cost is RAM. This is what placement used to compute for Soma,
+    // and it is refused outright: not "ranked lower", refused.
+    mm::ResourceFootprint vram_shaped;
+    vram_shaped.vram_mb = 8192;
+    CHECK(mm::evaluate_fit(vram_shaped, cpu_only, policy, &reason) == mm::FitQuality::None);
+    CHECK(reason.find("no GPU large enough") != std::string::npos);
+
+    // RAM is still a real constraint in the new shape — this is not "Soma fits
+    // everywhere". A resident half larger than the host's free RAM is refused,
+    // which is the whole point of moving the demand onto the right axis.
+    mm::ResourceFootprint too_big;
+    too_big.ram_mb = 63000; // leaves under the 2 GiB RAM headroom
+    CHECK(mm::evaluate_fit(too_big, cpu_only, policy, &reason) == mm::FitQuality::None);
+    CHECK(reason.find("MB RAM") != std::string::npos);
+
+    // And the producer, not just the rule it feeds. Whatever the registry knows
+    // or does not know about a model, the Soma footprint never asks for VRAM —
+    // that is the invariant, and the one the old code broke for every agent.
+    const auto dir = temp_test_dir("soma-footprint");
+    std::filesystem::create_directories(dir / "models");
+    {
+        mm::NodeRegistry registry((dir / "registry").string());
+        mm::AgentScheduler scheduler(registry, (dir / "models").string());
+        mm::AgentConfig cfg;
+        cfg.id = "soma-agent";
+        cfg.model_path = "org/model";
+        const auto fp = scheduler.soma_footprint(cfg);
+        CHECK(fp.vram_mb == 0);
+        // No registry and no local bytes, so the resident half is unknown and
+        // reported as nothing rather than guessed — under-charging is the safe
+        // direction, since the node re-derives the real plan before loading.
+        CHECK(fp.ram_mb == 0);
+        CHECK(fp.disk_mb == 0);
+    }
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_placement_failure_codes_separate_eligibility_from_capacity() {
+    // The pair D64 exists for. "No node is conforming" and "every node is full"
+    // called for opposite operator actions and produced the SAME sentence, so
+    // the only way to tell them apart was to match prose.
+    //
+    // The eligibility half is covered by the engine-config gate test with no
+    // nodes registered. This is the other half, which needs a node that is
+    // connected and conforming and simply has no room — otherwise the two codes
+    // could be swapped and nothing would notice.
+    const auto dir = temp_test_dir("placement-failure-codes");
+    std::filesystem::create_directories(dir / "models");
+    const uint16_t port = find_free_test_port();
+    CHECK(port != 0);
+    const std::string url = "http://127.0.0.1:" + std::to_string(port);
+
+    httplib::Server server;
+    server.Get("/api/node/health", [](const httplib::Request&, httplib::Response& res) {
+        mm::NodeHealthMetrics health;
+        // Connected and healthy, with nowhere near enough room for any model.
+        // This is what separates "not eligible" from "no capacity": the node
+        // passes every filter except the one about space.
+        health.gpu_vram_total_mb = 1;
+        health.gpu_vram_used_mb = 1;
+        health.gpu_backend_available = true;
+        health.disk_free_mb = 1;
+        res.set_content(nlohmann::json(health).dump(), "application/json");
+    });
+    server.Get("/api/node/status", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(nlohmann::json{{"slots", nlohmann::json::array()},
+                                       {"max_slots", 1},
+                                       {"slot_available", 1}}
+                            .dump(),
+                        "application/json");
+    });
+
+    std::atomic<bool> listen_ok{false};
+    std::thread server_thread([&] { listen_ok = server.listen("127.0.0.1", port); });
+
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    RECORD(wait_for_test_server(url));
+    mm::NodeRegistry registry((dir / "registry").string());
+    const auto node_id = registry.add_node(url, "codes-secret", "test");
+    registry.start_health_poll(1);
+    RECORD(wait_for_registered_node(registry, node_id));
+    mm::AgentScheduler scheduler(registry, (dir / "models").string());
+
+    mm::AgentConfig cfg;
+    cfg.id = "no-room-agent";
+    cfg.name = "No Room";
+    cfg.model_path = "org/model";
+
+    RECORD(!scheduler.ensure_agent_running(cfg).has_value());
+    // A node IS eligible — it is connected and no engine-config gate is set —
+    // so this must not report NoEligibleNode.
+    RECORD(!registry.available_nodes().empty());
+    RECORD(scheduler.last_failure() == mm::PlacementFailure::NoCapacity);
+    RECORD(mm::placement_failure_retryable(scheduler.last_failure()));
+    // The prose is still there and still useful; it is simply no longer the
+    // only thing carrying the answer.
+    RECORD(scheduler.last_error().find("no capacity") != std::string::npos);
+
+    // The wire spellings are part of the contract: clients branch on these, so
+    // renaming one is an API change and should break a test.
+    RECORD(std::string(mm::to_string(mm::PlacementFailure::None)) == "none");
+    RECORD(std::string(mm::to_string(mm::PlacementFailure::NoEligibleNode)) == "no_eligible_node");
+    RECORD(std::string(mm::to_string(mm::PlacementFailure::NoCapacity)) == "no_capacity");
+    RECORD(std::string(mm::to_string(mm::PlacementFailure::EngineConfigMissing)) ==
+           "engine_config_missing");
+    // Only the two that genuinely need a human are non-retryable.
+    RECORD(!mm::placement_failure_retryable(mm::PlacementFailure::EngineConfigMissing));
+    RECORD(!mm::placement_failure_retryable(mm::PlacementFailure::NoLocalBackend));
+    RECORD(mm::placement_failure_retryable(mm::PlacementFailure::NodeUnreachable));
+    RECORD(mm::placement_failure_retryable(mm::PlacementFailure::ModelTransferFailed));
+
+    registry.stop_health_poll();
+    server.stop();
+    if (server_thread.joinable()) server_thread.join();
+    RECORD(listen_ok);
+    RECORD(remove_tree(dir));
+
+#undef RECORD
+    return ok;
+}
+
+bool test_scheduler_audits_placement_and_release() {
+    // The wiring D60 was missing: nothing ever CALLED record_placement. A
+    // registry round-trip proves the table works and says nothing about whether
+    // a placement reaches it, which is the half that was actually broken.
+    const auto dir = temp_test_dir("scheduler-audit");
+    std::filesystem::create_directories(dir / "models");
+    const uint16_t port = find_free_test_port();
+    CHECK(port != 0);
+    const std::string url = "http://127.0.0.1:" + std::to_string(port);
+
+    httplib::Server server;
+    server.Get("/api/node/health", [](const httplib::Request&, httplib::Response& res) {
+        mm::NodeHealthMetrics health;
+        health.gpu_vram_total_mb = 131072;
+        health.gpu_backend_available = true;
+        res.set_content(nlohmann::json(health).dump(), "application/json");
+    });
+    server.Get("/api/node/status", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(nlohmann::json{{"slots", nlohmann::json::array()},
+                                       {"max_slots", 2},
+                                       {"slot_available", 2}}
+                            .dump(),
+                        "application/json");
+    });
+    server.Post("/api/node/load-model", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(nlohmann::json{{"status", "loaded"}, {"slot_id", "slot-audit"}}.dump(),
+                        "application/json");
+    });
+    server.Post("/api/node/detach-agent", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(nlohmann::json{{"status", "detached"}}.dump(), "application/json");
+    });
+
+    std::atomic<bool> listen_ok{false};
+    std::thread server_thread([&] { listen_ok = server.listen("127.0.0.1", port); });
+
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    RECORD(wait_for_test_server(url));
+    mm::NodeRegistry registry((dir / "registry").string());
+    const auto node_id = registry.add_node(url, "audit-secret", "test");
+    registry.start_health_poll(1);
+    RECORD(wait_for_registered_node(registry, node_id));
+    mm::AgentScheduler scheduler(registry, (dir / "models").string());
+
+    struct Placed {
+        mm::AgentId agent_id;
+        mm::NodeId node_id;
+        mm::SlotId slot_id;
+        std::string backend;
+        std::string reason;
+    };
+
+    std::mutex audit_mutex;
+    std::vector<Placed> placed;
+    std::vector<mm::AgentId> released;
+    scheduler.set_placement_audit({[&](const mm::AgentId& a,
+                                       const mm::NodeId& n,
+                                       const mm::SlotId& sl,
+                                       const std::string& backend,
+                                       const std::string& reason,
+                                       const mm::ResourceFootprint&) {
+                                       std::lock_guard<std::mutex> lk(audit_mutex);
+                                       placed.push_back({a, n, sl, backend, reason});
+                                   },
+                                   [&](const mm::AgentId& a) {
+                                       std::lock_guard<std::mutex> lk(audit_mutex);
+                                       released.push_back(a);
+                                   }});
+
+    mm::AgentConfig cfg;
+    cfg.id = "audited-agent";
+    cfg.name = "Audited";
+    cfg.model_path = "org/model";
+    cfg.preferred_node_id = node_id;
+
+    RECORD(scheduler.ensure_agent_running(cfg).has_value());
+    {
+        std::lock_guard<std::mutex> lk(audit_mutex);
+        RECORD(placed.size() == 1);
+        if (placed.size() == 1) {
+            RECORD(placed[0].agent_id == cfg.id);
+            RECORD(placed[0].node_id == node_id);
+            RECORD(placed[0].slot_id == "slot-audit");
+            // The engine the scheduler ACTED on, and its reason string — not a
+            // reconstruction. Nothing is admitted here, so it routes to the
+            // fallback and says so.
+            RECORD(placed[0].backend == "llama-cpp");
+            RECORD(placed[0].reason.find("no_admission_record") != std::string::npos);
+        }
+        RECORD(released.empty());
+    }
+
+    // A second ensure on an UNCHANGED placement is a refresh, not a placement.
+    // store_placement() is called on that path too, which is exactly why the
+    // audit hangs off the two publish sites rather than off the store.
+    RECORD(scheduler.ensure_agent_running(cfg).has_value());
+    {
+        std::lock_guard<std::mutex> lk(audit_mutex);
+        RECORD(placed.size() == 1);
+    }
+
+    scheduler.release_agent(cfg.id);
+    {
+        std::lock_guard<std::mutex> lk(audit_mutex);
+        RECORD(released.size() == 1);
+        if (released.size() == 1) RECORD(released[0] == cfg.id);
+    }
+
+    registry.stop_health_poll();
+    server.stop();
+    if (server_thread.joinable()) server_thread.join();
+    RECORD(listen_ok);
+    RECORD(remove_tree(dir));
+
+#undef RECORD
+    return ok;
+}
+
+bool test_placement_history_records_and_closes_rows() {
+    // D60: the table, its index and record_placement() all shipped with no
+    // caller and no query. The subtle half is the CLOSE rule — an agent that was
+    // placed, released, and placed again has two rows, and stamping "the row for
+    // this agent" would close the older one a second time and lose the first
+    // placement's duration entirely.
+    auto dir = temp_test_dir("placement-history");
+    // Scoped so the SQLite handle is closed before the directory is removed —
+    // on Windows an open file cannot be deleted, and the failure surfaces as a
+    // cleanup error that says nothing about the behaviour under test.
+    {
+        mm::ControlModelRegistry reg;
+        std::string err;
+        CHECK(reg.open(dir.string(), err));
+
+        CHECK(reg.placement_history("agent-1").empty());
+
+        mm::ResourceFootprint first;
+        first.vram_mb = 4096;
+        reg.record_placement(
+            "agent-1", "node-a", "slot-1", "llama-cpp", "llama-cpp (no_admission_record)", first);
+
+        auto rows = reg.placement_history("agent-1");
+        CHECK(rows.size() == 1);
+        CHECK(rows[0].node_id == "node-a");
+        CHECK(rows[0].backend == "llama-cpp");
+        CHECK(rows[0].backend_reason == "llama-cpp (no_admission_record)");
+        CHECK(rows[0].vram_mb == 4096);
+        // Open until something closes it — and 0 rather than a null, so a renderer
+        // does not need a separate presence check to ask the same question.
+        CHECK(rows[0].open());
+        CHECK(rows[0].released_at_ms == 0);
+
+        reg.mark_placement_released("agent-1");
+        rows = reg.placement_history("agent-1");
+        CHECK(rows.size() == 1);
+        CHECK(!rows[0].open());
+        const std::int64_t first_released = rows[0].released_at_ms;
+        CHECK(first_released > 0);
+
+        // Placed again, on a different engine. Two rows now, newest first.
+        mm::ResourceFootprint second;
+        second.ram_mb = 19840;
+        second.disk_mb = 14848;
+        reg.record_placement(
+            "agent-1", "node-b", "slot-7", "soma", "soma (verdict=stream)", second);
+        rows = reg.placement_history("agent-1");
+        CHECK(rows.size() == 2);
+        CHECK(rows[0].backend == "soma"); // newest first
+        CHECK(rows[0].ram_mb == 19840);
+        CHECK(rows[0].disk_mb == 14848);
+        CHECK(rows[0].open());
+        CHECK(rows[1].backend == "llama-cpp");
+        CHECK(!rows[1].open());
+
+        // THE RULE: closing again must close the NEW row and leave the old one's
+        // timestamp untouched.
+        reg.mark_placement_released("agent-1");
+        rows = reg.placement_history("agent-1");
+        CHECK(rows.size() == 2);
+        CHECK(!rows[0].open());
+        CHECK(rows[1].released_at_ms == first_released);
+
+        // Idempotent: a release for an agent with no open row is a no-op, because a
+        // release can legitimately arrive for a placement this process never saw.
+        reg.mark_placement_released("agent-1");
+        reg.mark_placement_released("agent-never-placed");
+        rows = reg.placement_history("agent-1");
+        CHECK(rows.size() == 2);
+        CHECK(rows[1].released_at_ms == first_released);
+
+        // Other agents are not touched, and the limit is honoured.
+        CHECK(reg.placement_history("agent-2").empty());
+        CHECK(reg.placement_history("agent-1", 1).size() == 1);
+        CHECK(reg.placement_history("agent-1", 0).empty());
+    }
+
+    CHECK(remove_tree(dir));
+    return true;
+}
+
 bool test_scheduler_backend_change_releases_local_placement() {
     const auto dir = temp_test_dir("scheduler-backend-change");
     std::filesystem::create_directories(dir / "models");
@@ -1042,8 +2999,11 @@ bool test_scheduler_backend_change_releases_local_placement() {
         RECORD(detach_body.value("slot_id", std::string{}) == "slot-local");
         RECORD(detach_body.value("agent_id", std::string{}) == cfg.id);
     }
-    RECORD(scheduler.last_error().find("supports llama-cpp only") !=
-           std::string::npos);
+    // Structural again: an "api" agent owns no node-local slot, so it resolves
+    // to no engine at all — which is a different statement from "this branch
+    // only supports llama-cpp", and the one that stays true now that it does not.
+    RECORD(mm::AgentScheduler::resolve_backend(api_cfg).engine_id.empty());
+    RECORD(scheduler.last_error().find("no node-local backend") != std::string::npos);
 
     registry.stop_health_poll();
     server.stop();
@@ -1321,15 +3281,30 @@ bool test_control_api_external_token_gate() {
         }
         RECORD(server_ready);
 
-        // mm::HttpClient opens a fresh connection per request; rapid
-        // sequential connect/close cycles on Windows loopback occasionally
-        // fail at the transport level (status == 0). Retry those.
+        // Is the server that answered OURS?
+        //
+        // `listen()` blocks while serving, so `listen_ok` cannot be read until
+        // teardown — which is where it IS asserted, ~350 lines below. That is too
+        // late to be useful: if another process holds this port, our bind fails,
+        // the readiness poll above is satisfied by THEIR server, and every
+        // assertion in between fails against a stranger returning plausible wrong
+        // statuses. The teardown check then reports the cause after twenty
+        // confusing symptoms.
+        //
+        // `listen_returned` is readable now and says the same thing early: our
+        // listen() has only returned if it FAILED, because a serving one does not
+        // return. A ready server plus a returned listen means the responder is
+        // not ours.
+        RECORD(!listen_returned);
+
+        // Transport retries: see kTransportRetries. One budget for the whole
+        // file — this test is where two of them diverging did damage.
         auto with_retry = [](auto&& request) {
             mm::HttpResponse resp;
-            for (int attempt = 0; attempt < 8; ++attempt) {
+            for (int attempt = 0; attempt < kTransportRetries; ++attempt) {
                 resp = request();
                 if (resp.status != 0) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                transport_backoff(attempt);
             }
             return resp;
         };
@@ -1338,6 +3313,19 @@ bool test_control_api_external_token_gate() {
                                 int expected_status,
                                 const std::string& expected_text,
                                 int call_line) {
+            // Same ambiguity `reached_server` exists to remove, on the non-SSE
+            // path: status stays 0 when the request never arrived, and `0 !=
+            // 401` fails exactly the way a broken auth gate does. This half of
+            // the file was left without the guard when D1 was fixed, so the
+            // recurrence reported a bare status mismatch and said nothing about
+            // which of the two findings it was. Checked first, and loudly.
+            if (resp.status == 0) {
+                std::cerr << "  TRANSPORT FAILURE at line " << call_line << " after "
+                          << kTransportRetries << " attempts: status=0\n"
+                          << "  (the assertion below is about to fail for a reason that\n"
+                          << "   has nothing to do with authorization)\n";
+            }
+            RECORD(resp.status != 0);
             if (resp.status != expected_status ||
                 resp.body.find(expected_text) == std::string::npos) {
                 std::cerr << "expect_error (call at line " << call_line
@@ -1367,9 +3355,16 @@ bool test_control_api_external_token_gate() {
         client.set_bearer_token("control-secret");
         auto valid = with_retry([&] { return client.get("/v1/nodes"); });
         RECORD(valid.status == 200);
+        // /v1/models is the ADMISSION REGISTRY now, not agents wearing model
+        // costumes — the agents catalog lives on the :9091 OpenAI-compat
+        // listener where it belongs. This server has no registry attached, so
+        // the route answers 503; that still proves the token gate let it
+        // through, which is what this test is about. The old assertion (that the
+        // body contained "agent:agent-a") is the behaviour being retired.
         auto valid_models = with_retry([&] { return client.get("/v1/models"); });
-        RECORD(valid_models.status == 200);
-        RECORD(valid_models.body.find("agent:agent-a") != std::string::npos);
+        RECORD(valid_models.status == 503);
+        RECORD(valid_models.body.find("registry") != std::string::npos);
+        RECORD(valid_models.body.find("agent:agent-a") == std::string::npos);
         auto valid_voice = with_retry([&] { return client.get("/v1/agents/agent-a/voice"); });
         RECORD(valid_voice.status == 200);
 
@@ -1424,14 +3419,16 @@ bool test_control_api_external_token_gate() {
             int status = 0;
             std::string body;
             std::vector<std::string> events;
+            int retries = 0;
         };
         auto stream_chat = [&](const std::string& token,
                                const nlohmann::json& body) {
             mm::HttpClient stream_client(base_url);
             if (!token.empty()) stream_client.set_bearer_token(token);
             StreamAttempt attempt;
-            for (int retry = 0; retry < 3; ++retry) {
+            for (int retry = 0; retry < kTransportRetries; ++retry) {
                 attempt = StreamAttempt{};
+                attempt.retries = retry;
                 attempt.ok = stream_client.stream_post(
                     "/v1/agents/agent-a/chat",
                     body,
@@ -1443,24 +3440,46 @@ bool test_control_api_external_token_gate() {
                     &attempt.body);
                 // status stays 0 only on transport failure; retry those.
                 if (attempt.ok || attempt.status != 0) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                transport_backoff(retry);
             }
             return attempt;
         };
 
+        // A transport failure and a wrong status code are DIFFERENT findings,
+        // and the assertions below cannot tell them apart: status stays 0 when
+        // the request never reached the server, and `0 == 403` fails exactly the
+        // way a broken auth gate does. That ambiguity cost a diagnosis once —
+        // one intermittent failure at `status == 403` that said nothing about
+        // whether authorization had been consulted at all.
+        //
+        // Checked first, separately, and loudly.
+        const auto reached_server = [&](const StreamAttempt& a, const char* what) {
+            if (a.status != 0) return;
+            std::cerr << "  TRANSPORT FAILURE on " << what << " after " << (a.retries + 1)
+                      << " attempts: status=0, body=\"" << a.body.substr(0, 120) << "\"\n"
+                      << "  (the auth assertions below are about to fail for a reason that\n"
+                      << "   has nothing to do with auth)\n";
+        };
+
         auto missing_chat = stream_chat("", nlohmann::json{{"message", "hello"}});
+        reached_server(missing_chat, "missing_chat");
+        RECORD(missing_chat.status != 0);
         RECORD(!missing_chat.ok);
         RECORD(missing_chat.status == 401);
         RECORD(missing_chat.body.find("missing bearer token") != std::string::npos);
         RECORD(missing_chat.events.empty());
 
         auto invalid_chat = stream_chat("wrong-secret", nlohmann::json{{"message", "hello"}});
+        reached_server(invalid_chat, "invalid_chat");
+        RECORD(invalid_chat.status != 0);
         RECORD(!invalid_chat.ok);
         RECORD(invalid_chat.status == 403);
         RECORD(invalid_chat.body.find("invalid bearer token") != std::string::npos);
         RECORD(invalid_chat.events.empty());
 
         auto node_chat = stream_chat("node-secret", nlohmann::json{{"message", "hello"}});
+        reached_server(node_chat, "node_chat");
+        RECORD(node_chat.status != 0);
         RECORD(!node_chat.ok);
         RECORD(node_chat.status == 403);
         RECORD(node_chat.body.find("invalid bearer token") != std::string::npos);
@@ -1653,10 +3672,10 @@ bool test_openai_compat_api_listener_and_model_catalog() {
         mm::HttpClient client(base_url);
         auto with_retry = [](auto&& request) {
             mm::HttpResponse resp;
-            for (int attempt = 0; attempt < 3; ++attempt) {
+            for (int attempt = 0; attempt < kTransportRetries; ++attempt) {
                 resp = request();
                 if (resp.status != 0) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                transport_backoff(attempt);
             }
             return resp;
         };
@@ -1874,10 +3893,10 @@ bool test_control_api_agent_api_mode_chat() {
 
         auto with_retry = [](auto&& request) {
             mm::HttpResponse resp;
-            for (int attempt = 0; attempt < 8; ++attempt) {
+            for (int attempt = 0; attempt < kTransportRetries; ++attempt) {
                 resp = request();
                 if (resp.status != 0) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                transport_backoff(attempt);
             }
             return resp;
         };
@@ -1936,7 +3955,9 @@ bool test_control_api_agent_api_mode_chat() {
         };
         auto stream_chat = [&](const nlohmann::json& request_body) {
             StreamAttempt attempt;
-            for (int retry = 0; retry < 3; ++retry) {
+            // Same budget as everywhere else; see kTransportRetries. This loop
+            // was the third copy of the policy and the second one with 3.
+            for (int retry = 0; retry < kTransportRetries; ++retry) {
                 attempt = StreamAttempt{};
                 attempt.ok = client.stream_post(
                     "/v1/agents/api-agent/chat",
@@ -1948,7 +3969,7 @@ bool test_control_api_agent_api_mode_chat() {
                     &attempt.status,
                     &attempt.body);
                 if (attempt.ok || attempt.status != 0) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                transport_backoff(retry);
             }
             return attempt;
         };
@@ -3245,21 +5266,31 @@ bool test_vision_profile_validation_and_suggestions() {
 }
 
 bool test_vision_slot_projector_isolation_and_json() {
-    mm::SlotManager slots(46250, 46253, 4);
-    slots.set_llama_server_path("missing-llama-server");
+    // Sharing is decided by the DESCRIPTOR's launch_compatible predicate now, so
+    // the registry has to hold one. The executable is deliberately bogus: a load
+    // that cannot attach must try to spawn and fail, which is the case under test.
+    mm::EngineRegistry::instance().register_engine(
+        mm::make_llama_descriptor("missing-llama-server"));
+
+    mm::EngineSupervisor slots(46250, 46253, 4);
+    slots.set_models_dir("missing-llama-server");
     mm::RuntimeSettings settings;
-    const auto first = slots.add_ready_test_slot(
+    const auto first = slots.add_ready_test_engine("llama-cpp",
         "model.gguf", "agent-a", settings, "mmproj-a.gguf");
     CHECK(!first.empty());
 
-    const auto shared = slots.load_model(
-        "model.gguf", "mmproj-a.gguf", settings, "agent-b");
+    mm::EngineLoadRequest same_req;
+    same_req.model_path = "model.gguf";
+    same_req.mmproj_path = "mmproj-a.gguf";
+    same_req.settings = settings;
+    const auto shared = slots.load("llama-cpp", same_req, "agent-b");
     CHECK(shared == first);
 
-    const auto different = slots.load_model(
-        "model.gguf", "mmproj-b.gguf", settings, "agent-c");
+    mm::EngineLoadRequest other_req = same_req;
+    other_req.mmproj_path = "mmproj-b.gguf";
+    const auto different = slots.load("llama-cpp", other_req, "agent-c");
     CHECK(different.empty());
-    const auto info = slots.find_slot(first);
+    const auto info = slots.find(first);
     CHECK(info.has_value());
     CHECK(info->backend == "llama-cpp");
     CHECK(info->vision_enabled);
@@ -4168,30 +6199,32 @@ bool test_llama_nvcc_architecture_preflight_and_diagnostics() {
 
 bool test_llama_slot_info_backend_and_suspend() {
     auto dir = temp_test_dir("llama-slot");
-    mm::SlotManager slots(46170, 46173, 2);
-    slots.set_llama_server_path("missing-llama");
-    slots.set_kv_cache_dir((dir / "kv").string());
+    mm::EngineSupervisor slots(46170, 46173, 2);
+    slots.set_models_dir("missing-llama");
+    slots.set_kv_checkpoint_dir((dir / "kv").string());
 
     mm::RuntimeSettings s;
     s.ctx_size = 2048;
     s.parallel = 1;
-    const auto id = slots.add_ready_test_slot("m.gguf", "agent-l", s);
+    const auto id = slots.add_ready_test_engine("llama-cpp", "m.gguf", "agent-l", s);
 
-    auto info = slots.find_slot(id);
+    auto info = slots.find(id);
     CHECK(info.has_value());
     CHECK(info->backend == "llama-cpp");
     // Backend survives the SlotInfo JSON round-trip.
     nlohmann::json j = *info;
     CHECK(j.get<mm::SlotInfo>().backend == "llama-cpp");
 
-    // A test slot has no live engine (port 0), so suspend skips the KV save and
-    // still transitions to Suspended with an empty cache path.
-    auto susp = slots.suspend_slot(id);
-    CHECK(susp.status == mm::SlotOperationStatus::Ok);
-    CHECK(susp.kv_cache_path.empty());
-    auto after = slots.find_slot(id);
+    // A test engine has no live process, so the KV save cannot succeed — and a
+    // suspend whose checkpoint was not written now FAILS rather than reporting
+    // success with an empty path. SlotManager reported Ok here and dropped the
+    // context silently; that is the behaviour the rebuild does not carry forward.
+    // The engine is left Ready, not killed.
+    auto susp = slots.suspend(id);
+    CHECK(susp.status == mm::EngineOpStatus::Failed);
+    auto after = slots.find(id);
     CHECK(after.has_value());
-    CHECK(after->state == mm::SlotState::Suspended);
+    CHECK(after->state == mm::SlotState::Ready);
 
     CHECK(remove_tree(dir));
     return true;
@@ -4222,6 +6255,10 @@ bool test_runtime_client_health_empty_body_ok() {
     }
     srv.stop();
     th.join();
+    // Every other server in this file asserts its own listen; this one did not,
+    // so a stolen port would have been probed, answered by a stranger, and
+    // reported as a health-check result.
+    CHECK(listen_ok);
     CHECK(reachable);
     CHECK(healthy);
     return true;
@@ -4252,13 +6289,18 @@ bool test_llama_default_backend_and_slot_sharing() {
     // Compatible agents share one ready process. A launch-setting mismatch
     // cannot attach; the attempted new process then fails on the fake path.
     auto dir = temp_test_dir("llama-sharing");
-    mm::SlotManager slots(46180, 46183, 4);
-    slots.set_llama_server_path("missing-llama");
+    mm::EngineSupervisor slots(46180, 46183, 4);
+    slots.set_models_dir("missing-llama");
     mm::RuntimeSettings settings;
     settings.ctx_size = 4096;
-    const auto llama_id = slots.add_ready_test_slot("m.gguf", "agent-a", settings);
-    CHECK(slots.load_model("m.gguf", settings, "agent-b") == llama_id);
-    auto llama_info = slots.find_slot(llama_id);
+    mm::EngineRegistry::instance().register_engine(
+        mm::make_llama_descriptor("missing-llama"));
+    const auto llama_id = slots.add_ready_test_engine("llama-cpp", "m.gguf", "agent-a", settings);
+    mm::EngineLoadRequest compat_req;
+    compat_req.model_path = "m.gguf";
+    compat_req.settings = settings;
+    CHECK(slots.load("llama-cpp", compat_req, "agent-b") == llama_id);
+    auto llama_info = slots.find(llama_id);
     CHECK(llama_info.has_value());
     CHECK(llama_info->backend == "llama-cpp");
     CHECK(llama_info->assigned_agent == "agent-a");
@@ -4268,8 +6310,11 @@ bool test_llama_default_backend_and_slot_sharing() {
 
     auto incompatible = settings;
     incompatible.ctx_size = 8192;
-    CHECK(slots.load_model("m.gguf", incompatible, "agent-c").empty());
-    llama_info = slots.find_slot(llama_id);
+    mm::EngineLoadRequest incompat_req;
+    incompat_req.model_path = "m.gguf";
+    incompat_req.settings = incompatible;
+    CHECK(slots.load("llama-cpp", incompat_req, "agent-c").empty());
+    llama_info = slots.find(llama_id);
     CHECK(llama_info.has_value());
     CHECK(std::find(llama_info->agent_ids.begin(), llama_info->agent_ids.end(),
                     "agent-c") == llama_info->agent_ids.end());
@@ -4281,7 +6326,7 @@ bool test_llama_default_backend_and_slot_sharing() {
     const auto last_detach = slots.detach_agent(llama_id, "agent-a");
     CHECK(last_detach.ok());
     CHECK(last_detach.unloaded);
-    CHECK(!slots.find_slot(llama_id).has_value());
+    CHECK(!slots.find(llama_id).has_value());
 
     CHECK(remove_tree(dir));
     return true;
@@ -4289,22 +6334,27 @@ bool test_llama_default_backend_and_slot_sharing() {
 
 bool test_llama_restore_attaches_and_cleans_suspended_record() {
     auto dir = temp_test_dir("llama-restore-attach");
-    mm::SlotManager slots(46190, 46193, 4);
+    mm::EngineSupervisor slots(46190, 46193, 4);
     mm::RuntimeSettings settings;
     settings.ctx_size = 4096;
 
+    // Constructed directly rather than via suspend(): a test engine has no live
+    // process, so its KV save fails and the suspend is correctly refused. What
+    // this test is about is what RESTORE does with a suspended record.
     const auto suspended_id =
-        slots.add_ready_test_slot("m.gguf", "agent-b", settings);
-    CHECK(slots.suspend_slot(suspended_id).ok());
-    CHECK(slots.find_slot(suspended_id)->state == mm::SlotState::Suspended);
+        slots.add_suspended_test_engine("llama-cpp", "m.gguf", "agent-b", settings);
+    CHECK(slots.find(suspended_id)->state == mm::SlotState::Suspended);
 
-    const auto ready_id = slots.add_ready_test_slot("m.gguf", "agent-a", settings);
-    const auto restored = slots.restore_slot("m.gguf", settings, "", "agent-b");
+    const auto ready_id = slots.add_ready_test_engine("llama-cpp", "m.gguf", "agent-a", settings);
+    mm::EngineLoadRequest restore_req;
+    restore_req.model_path = "m.gguf";
+    restore_req.settings = settings;
+    const auto restored = slots.restore("llama-cpp", restore_req, "", "agent-b");
     CHECK(restored == ready_id);
-    CHECK(!slots.find_slot(suspended_id).has_value());
-    CHECK(slots.find_slot_by_agent("agent-b") == ready_id);
+    CHECK(!slots.find(suspended_id).has_value());
+    CHECK(slots.find_by_agent("agent-b") == ready_id);
 
-    const auto ready = slots.find_slot(ready_id);
+    const auto ready = slots.find(ready_id);
     CHECK(ready.has_value());
     CHECK(ready->agent_ids.size() == 2);
     CHECK(ready->backend == "llama-cpp");
@@ -4422,6 +6472,1699 @@ bool test_inference_sizing_estimate() {
     return true;
 }
 
+bool test_multi_shard_directory_sizes_correctly() {
+    // The bug: fs::file_size() sets an error_code on a DIRECTORY, and the caller
+    // fell through to a flat 2048 MB. Every multi-shard HF checkpoint and every
+    // converted Soma container therefore reported the same size — and that single
+    // number is what placement consumed.
+    auto dir = temp_test_dir("multi-shard");
+    const auto model = dir / "model";
+    std::filesystem::create_directories(model / "nested");
+
+    const auto write_blob = [](const std::filesystem::path& p, std::size_t bytes) {
+        std::ofstream f(p, std::ios::binary);
+        const std::vector<char> chunk(bytes, '\0');
+        f.write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+    };
+    write_blob(model / "shard-00001.safetensors", 3 * 1024 * 1024);
+    write_blob(model / "shard-00002.safetensors", 5 * 1024 * 1024);
+    write_blob(model / "nested" / "extra.bin", 1024 * 1024);
+
+    // Recursive, and it finds the nested file too.
+    const auto bytes = mm::measure_model_bytes(model.string(), "", nullptr);
+    CHECK(bytes == 9 * 1024 * 1024);
+
+    // A single file still works, and a missing path reports nothing rather than
+    // a plausible-looking constant.
+    write_blob(dir / "single.gguf", 2 * 1024 * 1024);
+    CHECK(mm::measure_model_bytes((dir / "single.gguf").string(), "", nullptr) ==
+          2 * 1024 * 1024);
+    CHECK(mm::measure_model_bytes((dir / "absent.gguf").string(), "", nullptr) == 0);
+
+    // Two DIFFERENT directories must not size identically, which is the whole
+    // point — the old path returned 2048 MB for both.
+    const auto other = dir / "other";
+    std::filesystem::create_directories(other);
+    write_blob(other / "shard-00001.safetensors", 7 * 1024 * 1024);
+    CHECK(mm::measure_model_bytes(model.string(), "", nullptr) !=
+          mm::measure_model_bytes(other.string(), "", nullptr));
+
+    CHECK(mm::bytes_to_mb(0) == 0);
+    CHECK(mm::bytes_to_mb(1) == 1);            // rounds UP, never to zero
+    CHECK(mm::bytes_to_mb(9 * 1024 * 1024) == 9);
+
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_model_registry_makes_soma_routable() {
+    auto dir = temp_test_dir("control-db");
+    mm::ControlModelRegistry reg;
+    std::string err;
+    CHECK(reg.open(dir.string(), err));
+    // v2 added the conformance table's third state. Asserted rather than
+    // ranged: a migration that did not run is the failure this catches.
+    CHECK(reg.schema_version() == 2);
+    CHECK(reg.list().empty());
+    CHECK(std::filesystem::exists(dir / "control.db"));
+
+    mm::NodeRegistry nodes((dir / "nodes").string());
+    mm::AgentScheduler scheduler(nodes, (dir / "models").string());
+
+    mm::AgentConfig cfg;
+    cfg.id = "agent-soma";
+    cfg.name = "Soma Agent";
+    cfg.model_path = "Qwen/Qwen3-30B-A3B";
+
+    // ── before: nothing admitted it, so nothing routes to Soma ───────────────
+    scheduler.set_model_registry(&reg);
+    CHECK(scheduler.resolve_backend_for(cfg).engine_id == "llama-cpp");
+    // And with no record, the agent's own path IS the location — this is the
+    // fallback's GGUF, and it must keep passing through untouched.
+    CHECK(scheduler.model_location(cfg) == cfg.model_path);
+    auto forced = cfg;
+    forced.backend_override = "soma";
+    CHECK(scheduler.resolve_backend_for(forced).engine_id == "llama-cpp");
+
+    // ── admit it with a stream verdict ───────────────────────────────────────
+    mm::AdmittedModel m;
+    m.arch_hash = std::string(64, 'a');
+    m.name = "Qwen3-30B-A3B";
+    // The quantization suffix is the POINT, not decoration. With
+    // `model_dir == "/containers/" + name` the record's location and the agent's
+    // model_path are the same string, and every assertion below passes whichever
+    // one the scheduler happens to use — which is exactly how defect D7 hid.
+    m.model_dir = "/containers/Qwen3-30B-A3B-q4_g-q6_g-g128";
+    m.attention_family = "gqa";
+    m.n_layers = 48; m.n_moe_layers = 48; m.n_experts = 128; m.top_k = 8;
+    m.bytes_per_token = 1098ll * 1024 * 1024;
+    m.total_routed_bytes = 17ll * 1024 * 1024 * 1024;
+    m.active_fraction = 0.0625;
+    m.verdict = mm::ModelVerdict::Stream;
+    CHECK(reg.upsert(m, err));
+    CHECK(m.id > 0);
+
+    // The agent's model_path is "Qwen/Qwen3-30B-A3B" and the record's name is
+    // "Qwen3-30B-A3B": resolution compares the trailing component, so an agent
+    // configured with an HF-style ref matches a record admitted from a directory.
+    CHECK(reg.resolve("Qwen/Qwen3-30B-A3B").has_value());
+    CHECK(reg.resolve("/some/where/qwen3-30b-a3b/").has_value());   // case + trailing slash
+    CHECK(!reg.resolve("Mistral-7B").has_value());
+    CHECK(!reg.resolve("").has_value());
+
+    // ── the model's LOCATION comes from the record, not the agent ────────────
+    //
+    // Defect D7: placement resolved the record for `arch_hash` and `verdict` and
+    // threw `model_dir` away, then handed the node the agent's model_path. The
+    // node resolves what it is handed against its own models_dir and found no
+    // such directory — `model file not found on this node: OLMoE-1B-7B-0924`
+    // while `OLMoE-1B-7B-0924-q4_g-q6_g-g128` sat right there.
+    CHECK(scheduler.model_location(cfg) == "/containers/Qwen3-30B-A3B-q4_g-q6_g-g128");
+    CHECK(scheduler.model_location(cfg) != cfg.model_path);
+
+    // A model nobody admitted still passes its own path through.
+    auto unknown = cfg;
+    unknown.model_path = "/models/mixtral-8x7b-q4.gguf";
+    CHECK(scheduler.model_location(unknown) == "/models/mixtral-8x7b-q4.gguf");
+
+    // ── after: the SAME agent config now routes to Soma, unprompted ──────────
+    CHECK(scheduler.resolve_backend_for(cfg).engine_id == "soma");
+    CHECK(scheduler.resolve_backend_for(cfg).reason.find("verdict") != std::string::npos);
+
+    // An explicit fallback override still wins: it can only be more conservative.
+    auto pinned = cfg;
+    pinned.backend_override = "fallback";
+    CHECK(scheduler.resolve_backend_for(pinned).engine_id == "llama-cpp");
+
+    // resident-only means it fits and streaming buys nothing → fallback.
+    CHECK(reg.set_verdict(m.id, mm::ModelVerdict::ResidentOnly, "fits in RAM", err));
+    CHECK(scheduler.resolve_backend_for(cfg).engine_id == "llama-cpp");
+    // ...but an operator may override THAT, because it is an economics call.
+    CHECK(scheduler.resolve_backend_for(forced).engine_id == "soma");
+
+    // reject means it FAILED CONFORMANCE, and the override is refused. This is
+    // the one asymmetry in the policy: no config flag turns "produces wrong
+    // tokens" into "serve it anyway".
+    CHECK(reg.set_verdict(m.id, mm::ModelVerdict::Reject, "stage 2 divergence", err));
+    CHECK(scheduler.resolve_backend_for(cfg).engine_id == "llama-cpp");
+    CHECK(scheduler.resolve_backend_for(forced).engine_id == "llama-cpp");
+    CHECK(scheduler.resolve_backend_for(forced).reason.find("refused") != std::string::npos);
+
+    // An unparseable verdict must not become a licence to stream.
+    CHECK(mm::parse_verdict("nonsense") == mm::ModelVerdict::Reject);
+    CHECK(mm::parse_verdict("STREAM") == mm::ModelVerdict::Stream);
+    CHECK(mm::verdict_selects_soma(mm::ModelVerdict::Hybrid));
+    CHECK(!mm::verdict_selects_soma(mm::ModelVerdict::ResidentOnly));
+
+    // ── persistence, and re-admission updating rather than duplicating ───────
+    CHECK(reg.set_verdict(m.id, mm::ModelVerdict::Stream, "re-profiled", err));
+    mm::AdmittedModel again = m;
+    again.name = "Qwen3-30B-A3B (requantized labels)";
+    again.verdict = mm::ModelVerdict::Hybrid;
+    CHECK(reg.upsert(again, err));
+    CHECK(again.id == m.id);          // same arch_hash is the same model
+    CHECK(reg.list().size() == 1);
+
+    reg.close();
+    mm::ControlModelRegistry reopened;
+    CHECK(reopened.open(dir.string(), err));
+    const auto rows = reopened.list();
+    CHECK(rows.size() == 1);
+    CHECK(rows[0].verdict == mm::ModelVerdict::Hybrid);
+    CHECK(rows[0].arch_hash == m.arch_hash);
+    CHECK(rows[0].top_k == 8);
+
+    // Removal, and a scheduler with no registry at all.
+    CHECK(reopened.remove(rows[0].id, err));
+    CHECK(reopened.list().empty());
+    CHECK(!reopened.remove(rows[0].id, err));   // gone stays gone, and says so
+
+    mm::AgentScheduler bare(nodes, (dir / "models").string());
+    CHECK(bare.resolve_backend_for(cfg).engine_id == "llama-cpp");
+
+    reopened.close();
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_admission_pipeline_runs_and_reports() {
+    // Drives the REAL pipeline against the real `soma` binary — no mock. What is
+    // under test is orchestration: staged progress, a terminal frame, cancel, and
+    // the registry row at the end. Conversion is skipped by pointing at a
+    // container that already exists, which is exactly what reprofile() does.
+    const char* soma_path = std::getenv("MM_TEST_SOMA_PATH");
+    const char* model_dir = std::getenv("MM_TEST_MODEL_DIR");
+    if (soma_path == nullptr || model_dir == nullptr) {
+        // Skipped rather than silently passing: CTest passes both, and a
+        // developer running the binary by hand should be told why this is quiet.
+        std::cout << "  (skipped: MM_TEST_SOMA_PATH / MM_TEST_MODEL_DIR unset)\n";
+        return true;
+    }
+
+    auto dir = temp_test_dir("admission");
+    mm::ControlModelRegistry reg;
+    std::string err;
+    CHECK(reg.open(dir.string(), err));
+
+    mm::AdmissionTools tools;
+    tools.soma_path = soma_path;
+    tools.containers_dir = (dir / "containers").string();
+    reg.set_tools(tools);
+
+    // ── a source that does not exist fails BEFORE an operation exists ────────
+    CHECK(reg.admit((dir / "nope").string(), nullptr, err).empty());
+    CHECK(!err.empty());
+    CHECK(reg.operations().empty());   // nothing was started, so nothing is listed
+
+    // ── the real thing ───────────────────────────────────────────────────────
+    std::mutex m;
+    std::condition_variable cv;
+    std::vector<mm::AdmissionProgress> frames;
+    bool finished = false;
+
+    const auto op = reg.admit_container(model_dir, [&](const mm::AdmissionProgress& p) {
+        std::lock_guard<std::mutex> lk(m);
+        frames.push_back(p);
+        if (p.done) { finished = true; cv.notify_all(); }
+    }, err);
+    CHECK(!op.empty());
+
+    {
+        std::unique_lock<std::mutex> lk(m);
+        CHECK(cv.wait_for(lk, std::chrono::seconds(120), [&] { return finished; }));
+    }
+
+    CHECK(!frames.empty());
+    const auto& last = frames.back();
+    CHECK(last.done);
+    CHECK(last.operation_id == op);
+    // A terminal frame ALWAYS arrives. A stream that just goes quiet is
+    // indistinguishable from a network fault, which is why `done` is a field and
+    // not the absence of further frames.
+    CHECK(last.finished_at_ms >= last.started_at_ms);
+
+    // The tiny fixture is a raw HF checkpoint, not a converted container, so it
+    // carries no arch_hash — and without an identity there is nothing to key a
+    // row on. Refused with that reason rather than recorded under an empty hash,
+    // which would collide with every other unconverted model.
+    if (!last.last_error.empty()) {
+        CHECK(last.last_error.find("arch_hash") != std::string::npos);
+        CHECK(reg.list().empty());
+    } else {
+        CHECK(last.model_id > 0);
+        const auto admitted = reg.find_by_id(last.model_id);
+        CHECK(admitted.has_value());
+        // Straight from `soma plan --json`, which is why those fields were added
+        // to the plan document: control has no other view of the model.
+        CHECK(admitted->n_experts > 0);
+        CHECK(admitted->top_k > 0);
+        CHECK(admitted->active_fraction > 0.0);
+        CHECK(!admitted->attention_family.empty());
+    }
+
+    // Progress is STAGED, and the operation is retrievable after it ends — an
+    // SSE connection will not survive a real conversion, so a client that
+    // reconnects has to be able to find out how it went.
+    bool saw_profile = false, saw_finalize = false;
+    for (const auto& f : frames) {
+        if (f.stage == "profile") saw_profile = true;
+        if (f.stage == "finalize") saw_finalize = true;
+    }
+    CHECK(saw_profile);
+    CHECK(saw_finalize);
+    CHECK(reg.operation(op).has_value());
+    CHECK(reg.operation(op)->done);
+    CHECK(reg.operations().size() == 1);
+    CHECK(!reg.operation("no-such-operation").has_value());
+
+    // Cancelling a finished operation is refused rather than silently accepted:
+    // "too late" and "never existed" are both false, but only one is confusing.
+    CHECK(!reg.cancel(op));
+    CHECK(!reg.cancel("no-such-operation"));
+
+    // A late watcher still gets the outcome, immediately, and is not registered
+    // as a sink for a stream that is over.
+    mm::AdmissionProgress snapshot;
+    CHECK(reg.attach_sink(op, [](const mm::AdmissionProgress&) {}, snapshot));
+    CHECK(snapshot.done);
+    CHECK(snapshot.operation_id == op);
+
+    reg.close();
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_admission_fetch_stage() {
+    // The fetch stage is the only one that touches the network, so it is the
+    // only one that cannot be driven against the real thing here. What IS under
+    // test is everything on this side of the subprocess: the repo-id rule, the
+    // progress parsing, the resolved path, and the two ways a fetch can exit 0
+    // while having produced nothing.
+    //
+    // A stub tools/ directory does that. convert.py is stubbed too, so the run
+    // reaches the REAL `soma plan --json` on a real container and the whole
+    // six-stage path is exercised end to end.
+
+    // ── the repo-id rule, on its own ─────────────────────────────────────────
+    //
+    // Checked directly rather than only through a failed download: this is what
+    // stands between an operator-scoped `source` field and a write outside
+    // sources_dir, and "the download failed" is not evidence that it held.
+    std::string why;
+    CHECK(mm::valid_repo_id("gpt2", why));
+    CHECK(mm::valid_repo_id("Qwen/Qwen3-30B-A3B", why));
+    CHECK(mm::valid_repo_id("org/model@refs/pr/1", why));
+    CHECK(mm::valid_repo_id("a.b/c-d_e", why));
+    CHECK(!mm::valid_repo_id("", why));
+    CHECK(!mm::valid_repo_id("../../etc/passwd", why));
+    CHECK(!mm::valid_repo_id("org/../../x", why));
+    CHECK(!mm::valid_repo_id("a/b/c", why));       // more than one component
+    CHECK(!mm::valid_repo_id("C:\\weights", why)); // a Windows path is not a repo id
+    CHECK(!mm::valid_repo_id("org/model@../evil", why));
+    CHECK(!mm::valid_repo_id("-leading-dash/x", why));
+
+    const char* python = std::getenv("MM_TEST_PYTHON");
+    const char* soma_path = std::getenv("MM_TEST_SOMA_PATH");
+    // The CONTAINER, not the raw checkpoint: the stubbed convert stands in for
+    // the real one, so what it produces has to be what the real one produces.
+    // Otherwise the conformance stage downstream has no container to read, and
+    // skips for a reason the test invented rather than the pipeline.
+    const char* model_dir = std::getenv("MM_TEST_CONTAINER_DIR");
+    if (python == nullptr || soma_path == nullptr || model_dir == nullptr) {
+        std::cout << "  (stage skipped: MM_TEST_PYTHON / SOMA_PATH / CONTAINER_DIR unset)\n";
+        return true;
+    }
+
+    auto dir = temp_test_dir("admission-fetch");
+    const auto tools_dir = dir / "tools";
+    std::filesystem::create_directories(tools_dir);
+
+    // The stub. Emits exactly the line protocol fetch.py promises, writes a
+    // directory, and can be told to fail in each of the interesting ways.
+    {
+        std::ofstream f(tools_dir / "fetch.py", std::ios::binary);
+        f << "import os, sys\n"
+             "repo = sys.argv[1]\n"
+             "out = sys.argv[sys.argv.index('--out') + 1]\n"
+             "mode = os.environ.get('MM_STUB_FETCH', 'ok')\n"
+             "if mode == 'fail':\n"
+             "    print('cannot read %s: 401 Unauthorized' % repo, flush=True)\n"
+             "    sys.exit(3)\n"
+             "print('manifest 3 4096', flush=True)\n"
+             "print('progress 1024 4096', flush=True)\n"
+             "print('progress 4096 4096', flush=True)\n"
+             // Exits 0 having produced no directory.
+             "if mode == 'silent':\n"
+             "    sys.exit(0)\n"
+             "os.makedirs(out, exist_ok=True)\n"
+             // A real config, copied from the fixture: what a fetch produces has
+             // to be plannable, because the architecture check runs on it before
+             // conversion is allowed to start.
+             "import shutil\n"
+             "shutil.copy(os.path.join(os.environ['MM_STUB_CONTAINER'], 'config.json'), out)\n"
+             "print('resolved ' + os.path.abspath(out), flush=True)\n";
+    }
+    // Conversion, stubbed: copy the real fixture so `soma plan` has something
+    // true to read. Stubbing the planner too would leave nothing under test.
+    {
+        std::ofstream f(tools_dir / "convert.py", std::ios::binary);
+        f << "import shutil, sys, os\n"
+             "src = os.environ['MM_STUB_CONTAINER']\n"
+             "out = sys.argv[sys.argv.index('--out') + 1]\n"
+             "shutil.rmtree(out, ignore_errors=True)\n"
+             "shutil.copytree(src, out)\n"
+             "print('    layer 1/1  0.00 GB', flush=True)\n";
+        std::ofstream t(tools_dir / "compile_tokenizer.py", std::ios::binary);
+        t << "print('stub tokenizer', flush=True)\n";
+        // Stands in for the real oracle builder, which needs torch and must not
+        // become a dependency of this suite. It writes the directory SHAPE
+        // make_oracle.py produces — <out>/<model-name>/ — so the pipeline's
+        // lift-into-place step is exercised rather than silently skipped by a
+        // missing script.
+        std::ofstream o(tools_dir / "make_oracle.py", std::ios::binary);
+        o << "import os, sys\n"
+             "out = sys.argv[sys.argv.index('--out') + 1]\n"
+             "d = os.path.join(out, 'stub-fixture')\n"
+             "os.makedirs(d, exist_ok=True)\n"
+             "open(os.path.join(d, 'oracle.bin'), 'wb').write(b'SOMAORCL')\n"
+             "print('stub oracle', flush=True)\n";
+        // Same reasoning for the bf16 reference, which needs torch AND enough
+        // RAM to hold a real checkpoint. It writes <out>/oracle.bin flat, which
+        // is the shape make_reference.py produces, so the pipeline's
+        // rename-to-reference.bin step is exercised rather than skipped by a
+        // missing script.
+        std::ofstream mr(tools_dir / "make_reference.py", std::ios::binary);
+        mr << "import os, sys\n"
+              "out = sys.argv[sys.argv.index('--out') + 1]\n"
+              "os.makedirs(out, exist_ok=True)\n"
+              "open(os.path.join(out, 'oracle.bin'), 'wb').write(b'SOMAORCL')\n"
+              "print('stub reference', flush=True)\n";
+    }
+
+    mm::ControlModelRegistry reg;
+    std::string err;
+    CHECK(reg.open(dir.string(), err));
+
+    mm::AdmissionTools tools;
+    tools.python = python;
+    tools.soma_path = soma_path;
+    tools.tools_dir = tools_dir.string();
+    tools.containers_dir = (dir / "containers").string();
+    tools.sources_dir = (dir / "sources").string();
+    reg.set_tools(tools);
+
+#ifdef _WIN32
+    _putenv_s("MM_STUB_CONTAINER", model_dir);
+#else
+    setenv("MM_STUB_CONTAINER", model_dir, 1);
+#endif
+
+    // ── a source that is neither a directory nor a repo id ───────────────────
+    //
+    // Refused before an operation exists, so a typo is a 400 rather than an
+    // operation that appears to start and dies a second later.
+    CHECK(reg.admit("org/../../escape", nullptr, err).empty());
+    CHECK(!err.empty());
+    CHECK(reg.operations().empty());
+
+    struct Run {
+        std::vector<mm::AdmissionProgress> frames;
+        std::mutex m;
+        std::condition_variable cv;
+        bool finished = false;
+    };
+    const auto drive = [&](const char* mode, const std::string& source) {
+#ifdef _WIN32
+        _putenv_s("MM_STUB_FETCH", mode);
+#else
+        setenv("MM_STUB_FETCH", mode, 1);
+#endif
+        auto run = std::make_shared<Run>();
+        std::string e;
+        const auto id = reg.admit(source, [run](const mm::AdmissionProgress& p) {
+            std::lock_guard<std::mutex> lk(run->m);
+            run->frames.push_back(p);
+            if (p.done) {
+                run->finished = true;
+                run->cv.notify_all();
+            }
+        }, e);
+        if (!id.empty()) {
+            std::unique_lock<std::mutex> lk(run->m);
+            (void)run->cv.wait_for(lk, std::chrono::seconds(120), [&] { return run->finished; });
+        }
+        return run;
+    };
+
+    // ── the happy path ───────────────────────────────────────────────────────
+    const auto good = drive("ok", "fake-org/Qwen3-30B-A3B");
+    CHECK(!good->frames.empty());
+    CHECK(good->finished);
+
+    // Every stage, in order, and `step` consistent with `total_steps`. Those two
+    // used to be written independently: a container admission advertised 2 total
+    // steps and then emitted step 5, which renders as 250%.
+    //  builds the tiny-random conformance fixture that turns ladder
+    // stage 1 from "skipped" into an answer.
+    // "reference" is the bf16 pass over the REAL checkpoint — the counterpart to
+    // "oracle", and the stage that turns ladder stage 2 from "skipped" into an
+    // answer. Both are here because a pipeline that silently stopped running
+    // either would leave the ladder reporting fewer stages while still saying
+    // "no failures", which reads as a pass.
+    const std::vector<std::string> want{"fetch",     "convert",     "tokenize",
+                                        "oracle",    "reference",   "profile",
+                                        "conformance", "finalize"};
+    std::size_t at = 0;
+    std::int64_t peak_bytes = 0, peak_total = 0;
+    for (const auto& f : good->frames) {
+        CHECK(f.step >= 1 && f.step <= f.total_steps);
+        CHECK(f.total_steps == static_cast<int>(want.size()));
+        if (at < want.size() && f.stage == want[at]) ++at;
+        peak_bytes = std::max(peak_bytes, f.bytes_done);
+        peak_total = std::max(peak_total, f.bytes_total);
+    }
+    CHECK(at == want.size()); // all six seen, in order
+
+    // The byte counters are the reason fetch is worth a stage of its own: it is
+    // the only one whose remaining time a client can estimate.
+    CHECK(peak_bytes == 4096);
+    CHECK(peak_total == 4096);
+
+    const auto& done = good->frames.back();
+    CHECK(done.done);
+    CHECK(done.last_error.empty());
+    CHECK(done.model_id > 0);
+
+    const auto admitted = reg.find_by_id(done.model_id);
+    CHECK(admitted.has_value());
+    // The trailing component, so `fake-org/Qwen3-30B-A3B` and a local directory
+    // of the same name are ONE model rather than two rows for one set of weights.
+    CHECK(admitted->name.find("Qwen3-30B-A3B") != std::string::npos);
+    CHECK(!admitted->arch_hash.empty());
+    // The fetched directory is where it was told to put it, not somewhere the
+    // repo id chose.
+    CHECK(std::filesystem::exists(dir / "sources" / "Qwen3-30B-A3B" / "config.json"));
+
+    // ── a fetch that fails ───────────────────────────────────────────────────
+    const auto failed = drive("fail", "fake-org/unauthorized-model");
+    CHECK(!failed->frames.empty());
+    CHECK(failed->frames.back().done);
+    CHECK(!failed->frames.back().last_error.empty());
+    CHECK(failed->frames.back().last_error.find("fetch.py") != std::string::npos);
+    CHECK(failed->frames.back().model_id == 0);
+
+    // ── a fetch that exits 0 having produced nothing ─────────────────────────
+    //
+    // The failure this guards is a confusing one: conversion would be handed a
+    // path that is not there and the error would name convert.py.
+    const auto silent = drive("silent", "fake-org/silent-model");
+    CHECK(!silent->frames.empty());
+    CHECK(silent->frames.back().done);
+    CHECK(silent->frames.back().last_error.find("no directory") != std::string::npos);
+
+    // One record from three admissions: two of them never got far enough to
+    // write one, and neither left a half-row behind.
+    CHECK(reg.list().size() == 1);
+
+    // ── the ladder ran, and said what it did not do ──────────────────────────
+    //
+    // `soma conform` is invoked for real here — the stubs cover fetch and
+    // convert, not this. What matters is that the SKIPPED stages are recorded as
+    // skipped: a pipeline that wrote `passed` rows for stages needing a
+    // transformers oracle would hand every model a verdict that looks validated.
+    {
+        const auto stages = reg.conformance(done.model_id);
+        CHECK(!stages.empty());
+        std::size_t skipped = 0, passed = 0;
+        bool saw_reason = false;
+        for (const auto& s : stages) {
+            CHECK(s.status == "passed" || s.status == "failed" || s.status == "skipped");
+            CHECK(s.passed == (s.status == "passed"));
+            if (s.status == "skipped") {
+                ++skipped;
+                // A skip without a reason is indistinguishable from a stage
+                // nobody wrote.
+                if (s.detail.find("reason") != std::string::npos) saw_reason = true;
+            }
+            if (s.status == "passed") ++passed;
+        }
+        CHECK(skipped >= 3); // fp32_tiny_tf, real_logit_kl, accuracy_floor
+        CHECK(passed >= 1);  // quant_codec, against the real container
+        CHECK(saw_reason);
+    }
+
+    // ── an unsupported architecture fails BEFORE conversion ─────────────────
+    //
+    // The G8 gate line, and the difference between failing in 200 ms and failing
+    // after six hours. `adapt_hf_config`'s table IS the registry of architectures
+    // this engine understands; an unknown `model_type` stops there, and a
+    // container built from a config Soma cannot parse is gigabytes nothing can
+    // read.
+    //
+    // Proven by the stub convert never running: it writes a container, so if the
+    // check happened afterwards the directory would exist.
+    {
+        const auto weird = dir / "weird-arch";
+        std::filesystem::create_directories(weird);
+        {
+            std::ofstream f(weird / "config.json", std::ios::binary);
+            f << R"({"model_type":"nonexistent_moe","num_hidden_layers":4,"hidden_size":64})";
+        }
+        auto run = std::make_shared<Run>();
+        std::string e;
+        const auto id = reg.admit(weird.string(), [run](const mm::AdmissionProgress& p) {
+            std::lock_guard<std::mutex> lk(run->m);
+            run->frames.push_back(p);
+            if (p.done) {
+                run->finished = true;
+                run->cv.notify_all();
+            }
+        }, e);
+        CHECK(!id.empty()); // it is a real directory, so the operation starts
+        {
+            std::unique_lock<std::mutex> lk(run->m);
+            (void)run->cv.wait_for(lk, std::chrono::seconds(60), [&] { return run->finished; });
+        }
+        CHECK(run->finished);
+        const auto& fin = run->frames.back();
+        CHECK(!fin.last_error.empty());
+        CHECK(fin.last_error.find("not supported") != std::string::npos);
+        CHECK(fin.model_id == 0);
+
+        // Conversion never started. The stub convert copies a whole container, so
+        // its absence is what proves the check ran first rather than after.
+        CHECK(!std::filesystem::exists(dir / "containers" / "weird-arch"));
+        bool converted = false;
+        for (const auto& f : run->frames) {
+            if (f.stage == "tokenize") converted = true;
+        }
+        CHECK(!converted);
+    }
+
+    // ── a failed stage rejects the model rather than the request ─────────────
+    //
+    // The operator asked whether Soma can run this; "no, and here is the stage
+    // that says so" is an answer. A rejected model is a successfully admitted
+    // RECORD meaning "route this to the fallback", so the admission must SUCCEED
+    // and the verdict must be reject — not the other way around.
+    {
+        const auto broken = dir / "broken-container";
+        std::filesystem::copy(model_dir, broken,
+                              std::filesystem::copy_options::recursive |
+                                  std::filesystem::copy_options::overwrite_existing);
+        // A tokenizer paired with ANOTHER model's oracle. Realistic — it is what
+        // a mismatched compile step produces — and it fails one conformance stage
+        // while leaving the container plannable, which is the combination this
+        // case needs.
+        //
+        // Corrupting container_meta.json would not do: the planner reads it now,
+        // because the quantization is part of arch_hash, so an unreadable one
+        // fails the admission outright rather than one stage of the ladder.
+        const auto tok_dir = std::filesystem::path(model_dir).parent_path().parent_path() /
+                             "tokenizers";
+        if (!std::filesystem::exists(tok_dir / "Qwen3-30B-A3B" / "tokenizer.soma") ||
+            !std::filesystem::exists(tok_dir / "OLMoE-1B-7B-0924" / "tokenizer_oracle.bin")) {
+            std::cout << "  (verdict-downgrade case skipped: tokenizer fixtures not found)\n";
+            reg.close();
+            CHECK(remove_tree(dir));
+            return true;
+        }
+        std::filesystem::copy_file(tok_dir / "Qwen3-30B-A3B" / "tokenizer.soma",
+                                   broken / "tokenizer.soma");
+        std::filesystem::copy_file(tok_dir / "OLMoE-1B-7B-0924" / "tokenizer_oracle.bin",
+                                   broken / "tokenizer_oracle.bin");
+
+        auto run = std::make_shared<Run>();
+        std::string e;
+        const auto id = reg.admit_container(broken.string(), [run](const mm::AdmissionProgress& p) {
+            std::lock_guard<std::mutex> lk(run->m);
+            run->frames.push_back(p);
+            if (p.done) {
+                run->finished = true;
+                run->cv.notify_all();
+            }
+        }, e);
+        CHECK(!id.empty());
+        {
+            std::unique_lock<std::mutex> lk(run->m);
+            (void)run->cv.wait_for(lk, std::chrono::seconds(120), [&] { return run->finished; });
+        }
+        CHECK(run->finished);
+        const auto& fin = run->frames.back();
+        CHECK(fin.last_error.empty());  // the REQUEST succeeded
+        CHECK(fin.model_id > 0);
+
+        const auto rec = reg.find_by_id(fin.model_id);
+        CHECK(rec.has_value());
+        CHECK(rec->verdict == mm::ModelVerdict::Reject);
+        CHECK(rec->verdict_reason.find("conformance") != std::string::npos);
+        CHECK(!mm::verdict_selects_soma(rec->verdict)); // so it routes to the fallback
+
+        bool saw_failed = false;
+        for (const auto& s : reg.conformance(fin.model_id)) {
+            if (s.stage == "tokenizer_roundtrip" && s.status == "failed") saw_failed = true;
+        }
+        CHECK(saw_failed);
+    }
+
+    reg.close();
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_requantization_is_a_new_admission() {
+    // The G8 gate line, and it has two halves that pull opposite ways:
+    //
+    //   re-admitting at a different quantization MUST produce a new arch_hash
+    //   and invalidate KV checkpoints;
+    //   re-PROFILING must NOT.
+    //
+    // Getting either one alone is easy. A hash over the whole container makes
+    // the first true and the second false — every reprofile would orphan every
+    // checkpoint. A hash over the architecture only makes the second true and
+    // the first false — two quantizations share one identity and a checkpoint
+    // written under one replays under the other, fluently and wrongly.
+
+    // ── the hash covers the quantization, all of it ──────────────────────────
+    //
+    // Checked on the IR directly rather than only through the pipeline: this is
+    // the property everything else here depends on, and a pipeline test that
+    // happened to pass would not say which field made it pass.
+    soma::ArchIr ir;
+    ir.schema_version = soma::kArchIrSchemaVersion;
+    ir.attention.family = soma::AttentionFamily::Gqa;
+    ir.topology.n_layers = 4;
+    ir.topology.d_model = 64;
+    ir.topology.vocab_size = 512;
+    ir.topology.layer_kinds.assign(4, soma::LayerKind::Moe);
+    ir.attention.n_heads = 4;
+    ir.attention.n_kv_heads = 2;
+    ir.attention.head_dim = 16;
+    ir.router.n_experts = 16;
+    ir.router.top_k = 2;
+    ir.quantization.expert_gate = {soma::DType::Q4_G, 128};
+    ir.quantization.expert_up = {soma::DType::Q4_G, 128};
+    ir.quantization.expert_down = {soma::DType::Q6_G, 128};
+
+    std::string base;
+    CHECK(soma::compute_arch_hash(ir, base).ok());
+    CHECK(base.size() == 64);
+
+    {
+        // Same dtypes, different GROUP. These dequantize to different weights,
+        // and before this they hashed identically — so a KV checkpoint written
+        // at group 128 would replay under group 64 with nothing detecting it.
+        auto other = ir;
+        other.quantization.expert_gate.group = 64;
+        std::string h;
+        CHECK(soma::compute_arch_hash(other, h).ok());
+        CHECK(h != base);
+    }
+    {
+        auto other = ir;
+        other.quantization.expert_down.dtype = soma::DType::Q8_0;
+        std::string h;
+        CHECK(soma::compute_arch_hash(other, h).ok());
+        CHECK(h != base);
+    }
+    {
+        // A role the original hash did not cover at all.
+        auto other = ir;
+        other.quantization.shared_expert = {soma::DType::Q8_0, 32};
+        std::string h;
+        CHECK(soma::compute_arch_hash(other, h).ok());
+        CHECK(h != base);
+    }
+    {
+        // And the other half: a MEASUREMENT changing must not move the hash.
+        // Economics is deliberately outside it — re-profiling on a faster disk
+        // would otherwise orphan every checkpoint written before the upgrade.
+        auto other = ir;
+        other.economics.measured_disk_bw = 4ull * 1000 * 1000 * 1000;
+        other.economics.expert_bytes = 999999;
+        other.economics.measured_at_host = "some-other-box";
+        std::string h;
+        CHECK(soma::compute_arch_hash(other, h).ok());
+        CHECK(h == base);
+    }
+
+    // ── and the pipeline honours it ──────────────────────────────────────────
+    const char* python = std::getenv("MM_TEST_PYTHON");
+    const char* soma_path = std::getenv("MM_TEST_SOMA_PATH");
+    const char* container_dir = std::getenv("MM_TEST_CONTAINER_DIR");
+    if (python == nullptr || soma_path == nullptr || container_dir == nullptr) {
+        std::cout << "  (pipeline half skipped: MM_TEST_PYTHON / SOMA_PATH / CONTAINER_DIR unset)\n";
+        return true;
+    }
+
+    auto dir = temp_test_dir("requant");
+    const auto tools_dir = dir / "tools";
+    std::filesystem::create_directories(tools_dir);
+
+    // A stub convert that RESPECTS --quant, so the two admissions differ in the
+    // way a real conversion would. It copies the fixture and rewrites the
+    // container's declared quantization; that is exactly the field `soma plan`
+    // reads to build the IR the hash is taken over.
+    {
+        std::ofstream f(tools_dir / "convert.py", std::ios::binary);
+        f << "import json, os, shutil, sys\n"
+             "src = os.environ['MM_STUB_CONTAINER']\n"
+             "out = sys.argv[sys.argv.index('--out') + 1]\n"
+             "quant = sys.argv[sys.argv.index('--quant') + 1]\n"
+             "down = sys.argv[sys.argv.index('--expert-down') + 1]\n"
+             "group = int(sys.argv[sys.argv.index('--group') + 1])\n"
+             "shutil.rmtree(out, ignore_errors=True)\n"
+             "shutil.copytree(src, out)\n"
+             "p = os.path.join(out, 'container_meta.json')\n"
+             "m = json.load(open(p))\n"
+             "m['dtype_gate_up'] = quant\n"
+             "m['dtype_down'] = down\n"
+             "m['group'] = group\n"
+             "json.dump(m, open(p, 'w'))\n"
+             "print('    layer 1/1  0.00 GB', flush=True)\n";
+        std::ofstream t(tools_dir / "compile_tokenizer.py", std::ios::binary);
+        t << "print('stub tokenizer', flush=True)\n";
+        // Stands in for the real oracle builder, which needs torch and must not
+        // become a dependency of this suite. It writes the directory SHAPE
+        // make_oracle.py produces — <out>/<model-name>/ — so the pipeline's
+        // lift-into-place step is exercised rather than silently skipped by a
+        // missing script.
+        std::ofstream o(tools_dir / "make_oracle.py", std::ios::binary);
+        o << "import os, sys\n"
+             "out = sys.argv[sys.argv.index('--out') + 1]\n"
+             "d = os.path.join(out, 'stub-fixture')\n"
+             "os.makedirs(d, exist_ok=True)\n"
+             "open(os.path.join(d, 'oracle.bin'), 'wb').write(b'SOMAORCL')\n"
+             "print('stub oracle', flush=True)\n";
+        // Same reasoning for the bf16 reference, which needs torch AND enough
+        // RAM to hold a real checkpoint. It writes <out>/oracle.bin flat, which
+        // is the shape make_reference.py produces, so the pipeline's
+        // rename-to-reference.bin step is exercised rather than skipped by a
+        // missing script.
+        std::ofstream mr(tools_dir / "make_reference.py", std::ios::binary);
+        mr << "import os, sys\n"
+              "out = sys.argv[sys.argv.index('--out') + 1]\n"
+              "os.makedirs(out, exist_ok=True)\n"
+              "open(os.path.join(out, 'oracle.bin'), 'wb').write(b'SOMAORCL')\n"
+              "print('stub reference', flush=True)\n";
+    }
+
+    mm::ControlModelRegistry reg;
+    std::string err;
+    CHECK(reg.open(dir.string(), err));
+
+    mm::AdmissionTools tools;
+    tools.python = python;
+    tools.soma_path = soma_path;
+    tools.tools_dir = tools_dir.string();
+    tools.containers_dir = (dir / "containers").string();
+    tools.sources_dir = (dir / "sources").string();
+    reg.set_tools(tools);
+
+#ifdef _WIN32
+    _putenv_s("MM_STUB_CONTAINER", container_dir);
+#else
+    setenv("MM_STUB_CONTAINER", container_dir, 1);
+#endif
+
+    // The source is a raw config the architecture check can read.
+    const auto source = dir / "weights";
+    std::filesystem::create_directories(source);
+    std::filesystem::copy_file(std::filesystem::path(container_dir) / "config.json",
+                               source / "config.json");
+
+    struct Run {
+        std::vector<mm::AdmissionProgress> frames;
+        std::mutex m;
+        std::condition_variable cv;
+        bool finished = false;
+    };
+    const auto admit_at = [&](const mm::ControlModelRegistry::QuantOverride& q) {
+        auto run = std::make_shared<Run>();
+        std::string e;
+        const auto id = reg.admit(source.string(), q, [run](const mm::AdmissionProgress& p) {
+            std::lock_guard<std::mutex> lk(run->m);
+            run->frames.push_back(p);
+            if (p.done) {
+                run->finished = true;
+                run->cv.notify_all();
+            }
+        }, e);
+        if (!id.empty()) {
+            std::unique_lock<std::mutex> lk(run->m);
+            (void)run->cv.wait_for(lk, std::chrono::seconds(120), [&] { return run->finished; });
+        }
+        return run;
+    };
+
+    const auto first = admit_at({"q4_g", "q6_g", 128});
+    CHECK(first->finished);
+    CHECK(first->frames.back().last_error.empty());
+    const auto id_a = first->frames.back().model_id;
+    CHECK(id_a > 0);
+
+    const auto second = admit_at({"q8_0", "q8_0", 32});
+    CHECK(second->finished);
+    CHECK(second->frames.back().last_error.empty());
+    const auto id_b = second->frames.back().model_id;
+    CHECK(id_b > 0);
+
+    // TWO rows, not one updated in place. The registry keys on arch_hash, so
+    // this is the observable form of "a different quantization is a different
+    // model".
+    CHECK(id_a != id_b);
+    CHECK(reg.list().size() == 2);
+
+    const auto a = reg.find_by_id(id_a);
+    const auto b = reg.find_by_id(id_b);
+    CHECK(a.has_value() && b.has_value());
+    CHECK(!a->arch_hash.empty());
+    CHECK(a->arch_hash != b->arch_hash);
+
+    // Separate containers. Sharing one directory meant the second conversion
+    // overwrote the first, leaving row A describing bytes that were no longer
+    // its quantization — with nothing to detect it.
+    CHECK(a->model_dir != b->model_dir);
+    CHECK(std::filesystem::exists(a->model_dir));
+    CHECK(std::filesystem::exists(b->model_dir));
+
+    // ── the checkpoint half ──────────────────────────────────────────────────
+    //
+    // "Invalidates KV checkpoints" is the consequence that matters, and it is
+    // checked against the real store rather than inferred from the hashes being
+    // different. A resume gated on a hash nobody compares is not a gate.
+    {
+        auto ckpt_dir = dir / "kv";
+        // The same shape both sides, differing ONLY in arch_hash. That is the
+        // point: the cache geometry is identical, so nothing about the bytes
+        // would stop the load — the hash is the only thing standing between a
+        // q4_g checkpoint and a q8_0 engine.
+        auto arch_a = ir;
+        arch_a.arch_hash = a->arch_hash;
+        auto arch_b = ir;
+        arch_b.arch_hash = b->arch_hash;
+
+        soma::KvCheckpointStore store_a;
+        CHECK(store_a.open(ckpt_dir.string(), arch_a).ok());
+        soma::KvCache kv;
+        CHECK(kv.open(arch_a, 64).ok());
+        CHECK(kv.set_length(4).ok());
+        soma::SeqPersistState st;
+        st.tokens = {1, 2, 3, 4};
+        CHECK(store_a.save("conv-1", kv, st).ok());
+        store_a.close();
+
+        soma::KvCheckpointStore store_b;
+        CHECK(store_b.open(ckpt_dir.string(), arch_b).ok());
+        soma::KvCache kv2;
+        CHECK(kv2.open(arch_b, 64).ok());
+        soma::SeqPersistState out;
+        const auto load = store_b.load("conv-1", kv2, out);
+        CHECK(!load.ok());
+        CHECK(load.code() == soma::StatusCode::ArchMismatch);
+    }
+
+    // ── and re-profiling does NOT ────────────────────────────────────────────
+    //
+    // The other half of the gate. A reprofile re-derives a verdict from the same
+    // bytes; if it moved the hash it would orphan every checkpoint written
+    // against the model, for a request that asked only for a fresh number.
+    {
+        auto run = std::make_shared<Run>();
+        std::string e;
+        const auto id = reg.reprofile(id_a, [run](const mm::AdmissionProgress& p) {
+            std::lock_guard<std::mutex> lk(run->m);
+            run->frames.push_back(p);
+            if (p.done) {
+                run->finished = true;
+                run->cv.notify_all();
+            }
+        }, e);
+        CHECK(!id.empty());
+        {
+            std::unique_lock<std::mutex> lk(run->m);
+            (void)run->cv.wait_for(lk, std::chrono::seconds(120), [&] { return run->finished; });
+        }
+        CHECK(run->finished);
+        CHECK(run->frames.back().last_error.empty());
+
+        const auto again = reg.find_by_id(id_a);
+        CHECK(again.has_value());
+        CHECK(again->arch_hash == a->arch_hash);
+        CHECK(again->model_dir == a->model_dir);
+        // Still two rows: the reprofile updated one, it did not add a third.
+        CHECK(reg.list().size() == 2);
+    }
+
+    // ── which one an agent gets ──────────────────────────────────────────────
+    //
+    // Two rows now match the same name, so "the first row the scan reaches" is
+    // not an answer — it is whichever the b-tree yielded, and it would change
+    // under an unrelated insert. An exact arch_hash is unambiguous and stays so.
+    {
+        const auto by_hash = reg.resolve(a->arch_hash);
+        CHECK(by_hash.has_value());
+        CHECK(by_hash->id == id_a);
+        const auto by_hash_b = reg.resolve(b->arch_hash);
+        CHECK(by_hash_b.has_value());
+        CHECK(by_hash_b->id == id_b);
+
+        // By name it is deterministic rather than arbitrary: repeated calls
+        // agree, which is the property that was missing.
+        const auto once = reg.resolve("weights");
+        const auto twice = reg.resolve("weights");
+        CHECK(once.has_value() && twice.has_value());
+        CHECK(once->id == twice->id);
+    }
+
+    reg.close();
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_scope_negatives_over_http() {
+    // The predicate is asserted elsewhere; this asserts the WIRE. A scope table
+    // that is right in a unit test and unreached by the middleware protects
+    // nothing, and the failure mode is silent — every request succeeds.
+    auto dir = temp_test_dir("scope-http");
+    std::filesystem::create_directories(dir / "models");
+
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    {
+        mm::AgentManager agents(dir.string());
+        mm::AgentConfig cfg;
+        cfg.id = "agent-a";
+        cfg.name = "Agent A";
+        cfg.model_path = "model.gguf";
+        agents.create_agent(cfg);
+
+        mm::AgentQueue queue;
+        mm::NodeRegistry registry(dir.string());
+        mm::AgentScheduler scheduler(registry, (dir / "models").string());
+
+        // The registry has to be attached: without one, has_api_tokens() is
+        // false and — with no legacy token either — auth is off entirely, so
+        // the scoped path is never reached. That is the exact shape of the bug
+        // this test would otherwise miss.
+        mm::ControlModelRegistry models;
+        std::string err;
+        RECORD(models.open(dir.string(), err));
+
+        const auto read_token = models.create_api_token(
+            "dashboard", static_cast<mm::ScopeSet>(mm::Scope::Read), err);
+        const auto chat_token = models.create_api_token(
+            "assistant", static_cast<mm::ScopeSet>(mm::Scope::Chat), err);
+        const auto op_token = models.create_api_token(
+            "ops", static_cast<mm::ScopeSet>(mm::Scope::Operator), err);
+        RECORD(!read_token.empty() && !chat_token.empty() && !op_token.empty());
+
+        // No legacy token: auth is on purely because api_token has rows.
+        mm::ControlApiServer api(agents, queue, registry, scheduler, dir.string(),
+                                 (dir / "models").string(), /*external_api_token=*/"");
+        api.set_model_registry(&models);
+
+        const uint16_t port = find_free_test_port();
+        CHECK(port != 0);
+        const std::string base_url = "http://127.0.0.1:" + std::to_string(port);
+        std::atomic<bool> listen_ok{false};
+        std::thread server_thread([&] { listen_ok = api.listen(port); });
+
+        mm::HttpClient probe(base_url);
+        bool ready = false;
+        for (int i = 0; i < 50 && !ready; ++i) {
+            if (probe.get("/v1/nodes").status != 0) ready = true;
+            else std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        RECORD(ready);
+
+        auto with_retry = [](auto&& request) {
+            mm::HttpResponse resp;
+            for (int attempt = 0; attempt < kTransportRetries; ++attempt) {
+                resp = request();
+                if (resp.status != 0) break;
+                transport_backoff(attempt);
+            }
+            return resp;
+        };
+        auto as = [&](const std::string& token) {
+            auto c = std::make_shared<mm::HttpClient>(base_url);
+            c->set_bearer_token(token);
+            return c;
+        };
+
+        // ── read: GETs yes, everything else no ───────────────────────────────
+        auto reader = as(read_token);
+        RECORD(with_retry([&] { return reader->get("/v1/nodes"); }).status == 200);
+        RECORD(with_retry([&] { return reader->get("/v1/agents"); }).status == 200);
+        RECORD(with_retry([&] { return reader->get("/v1/models"); }).status == 200);
+
+        auto reader_admits = with_retry([&] {
+            return reader->post("/v1/models/admit", nlohmann::json{{"source", "/nope"}});
+        });
+        RECORD(reader_admits.status == 403);
+        // The body names WHICH scope was needed and which were held. "403
+        // forbidden" with no detail sends an operator to read source to find out
+        // what to grant.
+        RECORD(reader_admits.body.find("insufficient scope") != std::string::npos);
+        RECORD(reader_admits.body.find("operator") != std::string::npos);
+        RECORD(reader_admits.body.find("read") != std::string::npos);
+
+        RECORD(with_retry([&] { return reader->del("/v1/agents/agent-a"); }).status == 403);
+        RECORD(with_retry([&] {
+                   return reader->post("/v1/agents/agent-a/conversations",
+                                       nlohmann::json{{"title", "nope"}});
+               }).status == 403);
+        // Still there: the refusal was a refusal, not a 403 after the fact.
+        RECORD(agents.get_agent("agent-a") != nullptr);
+
+        // ── chat: conversations yes, admission and deletes no ────────────────
+        auto chatter = as(chat_token);
+        // chat implies read.
+        RECORD(with_retry([&] { return chatter->get("/v1/agents"); }).status == 200);
+        auto chat_creates = with_retry([&] {
+            return chatter->post("/v1/agents/agent-a/conversations",
+                                 nlohmann::json{{"title", "Allowed"}, {"set_active", true}});
+        });
+        RECORD(chat_creates.status == 200 || chat_creates.status == 201);
+
+        auto chat_admits = with_retry([&] {
+            return chatter->post("/v1/models/admit", nlohmann::json{{"source", "/nope"}});
+        });
+        RECORD(chat_admits.status == 403);
+        RECORD(chat_admits.body.find("insufficient scope") != std::string::npos);
+        RECORD(with_retry([&] { return chatter->del("/v1/agents/agent-a"); }).status == 403);
+        RECORD(with_retry([&] { return chatter->get("/v1/tokens"); }).status == 403);
+
+        // ── operator: everything, including the things that refused above ────
+        auto op = as(op_token);
+        RECORD(with_retry([&] { return op->get("/v1/agents"); }).status == 200);
+        RECORD(with_retry([&] { return op->get("/v1/tokens"); }).status == 200);
+        auto op_admits = with_retry([&] {
+            return op->post("/v1/models/admit", nlohmann::json{{"source", "/nope"}});
+        });
+        // 400, not 403: authorization PASSED and the request was then rejected on
+        // its merits. That distinction is the whole point — a 403 here would mean
+        // the operator scope was not being honoured.
+        RECORD(op_admits.status == 400);
+        RECORD(op_admits.body.find("not found") != std::string::npos);
+
+        // ── a revoked token stops working immediately ────────────────────────
+        const auto rows = models.list_api_tokens();
+        std::int64_t chat_id = 0;
+        for (const auto& t : rows) {
+            if (t.label == "assistant") chat_id = t.id;
+        }
+        RECORD(chat_id != 0);
+        RECORD(models.revoke_api_token(chat_id, err));
+        auto revoked = with_retry([&] { return chatter->get("/v1/agents"); });
+        RECORD(revoked.status == 403);
+        RECORD(revoked.body.find("invalid bearer token") != std::string::npos);
+
+        // ── an unknown token is 403, a missing one is 401 ────────────────────
+        RECORD(with_retry([&] { return as("never-minted")->get("/v1/agents"); }).status == 403);
+        RECORD(with_retry([&] { return probe.get("/v1/agents"); }).status == 401);
+
+        // Deleting the agent as operator — the mutation the reader and chatter
+        // were both refused — proves the route works and the refusals were about
+        // the credential rather than the request.
+        RECORD(with_retry([&] { return op->del("/v1/agents/agent-a"); }).status == 200);
+
+        api.stop();
+        if (server_thread.joinable()) server_thread.join();
+        RECORD(listen_ok.load());
+        models.close();
+    }
+
+    RECORD(remove_tree(dir));
+#undef RECORD
+    return ok;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// capacity_pressure: the signal that earns a failed placement a second chance.
+//
+// This is a G8 criterion that had NO coverage at all — the code was implemented
+// across both engines, the node proxy and the scheduler, and nothing asserted
+// any of it. What makes that worth fixing is not the happy path, which is one
+// string compare, but the PRECEDENCE rule underneath it: a structured code is
+// authoritative, so an engine that says `model_not_found` in prose containing
+// "out of memory" must NOT be retried. Swap the two blocks in the definition
+// and every obvious test still passes.
+//
+// Also pinned here: the wire shape the node actually emits, which is neither of
+// the shapes you would guess. See below.
+// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Images are refused by the ENGINE's capability, not only the agent's profile.
+//
+// The G8 criterion is "image content parts return 422, not a dropped part", and
+// it was half-implemented in a way that read as done: all four gates tested
+// `vision_settings.enabled` — the operator's INTENT — and none tested whether
+// the engine on the far end could accept an image at all. So an agent with
+// vision switched on, serving a model that earned a streamable verdict, sent
+// image parts to Soma, which is text-only by construction (roadmap D12).
+//
+// That failure is the bad kind: not a crash, a silently text-only answer to a
+// question about a picture.
+// ─────────────────────────────────────────────────────────────────────────────
+bool test_images_refused_by_engine_capability() {
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    // ── the capability table ─────────────────────────────────────────────────
+    RECORD(mm::engine_supports_vision("llama-cpp"));
+    RECORD(!mm::engine_supports_vision("soma"));
+    // Unknown engines refuse. A new engine that has said nothing about vision
+    // gets a clear refusal the operator can act on; the other default silently
+    // drops the image and answers as though it had been read.
+    RECORD(!mm::engine_supports_vision("vllm"));
+    RECORD(!mm::engine_supports_vision(""));
+
+    // ── the rule ─────────────────────────────────────────────────────────────
+    const auto refusal = [](bool enabled, const char* engine, const char* why = "") {
+        return mm::image_refusal_for(enabled, engine, why);
+    };
+
+    // Profile off is the whole answer, whatever the engine. Naming an engine
+    // here would misdirect: the operator's own setting is what to change.
+    RECORD(refusal(false, "llama-cpp") == "this agent profile does not accept images");
+    RECORD(refusal(false, "soma") == "this agent profile does not accept images");
+
+    // Profile on + an engine that can: allowed. This is the case that must keep
+    // working — a capability check that refuses everything would also "fix" D12.
+    RECORD(refusal(true, "llama-cpp").empty());
+
+    // THE DEFECT. Profile on, engine cannot, and this used to be allowed.
+    const auto blocked = refusal(true, "soma", "soma (verdict=hybrid)");
+    RECORD(!blocked.empty());
+    RECORD(blocked.find("soma") != std::string::npos);
+    RECORD(blocked.find("does not accept images") != std::string::npos);
+    // The reason already names the engine, so the message must not ALSO quote
+    // the id — that produced "the 'soma' engine ... (soma (verdict=hybrid))",
+    // saying it twice inside nested parens (D15's residue).
+    RECORD(blocked.find("'soma'") == std::string::npos);
+    RECORD(blocked.find("((") == std::string::npos);
+    // With no reason to carry the name, the id is quoted — otherwise the message
+    // would not say WHICH engine at all.
+    RECORD(refusal(true, "soma").find("'soma'") != std::string::npos);
+    // The routing reason rides along, so the message says why THAT engine is
+    // serving. Without it the text reads as a profile problem and the operator
+    // goes to switch on a setting that is already on.
+    RECORD(blocked.find("verdict=hybrid") != std::string::npos);
+    // An unknown engine is refused on the same rule, not a separate branch.
+    RECORD(!refusal(true, "vllm").empty());
+
+    // API-backed agents own no node-local engine; the remote provider's own
+    // capabilities govern and control has no business refusing on its behalf.
+    RECORD(refusal(true, "").empty());
+
+    // ── the descriptors read the SAME table ──────────────────────────────────
+    // This is what keeps the two sides from drifting. Before, `supports_vision`
+    // was a literal in each descriptor and control could not see it at all;
+    // asserting the node's view against the shared function is what makes the
+    // single-source claim true rather than merely intended.
+    RECORD(mm::make_soma_descriptor("soma").supports_vision ==
+           mm::engine_supports_vision("soma"));
+    RECORD(mm::make_llama_descriptor("llama-server").supports_vision ==
+           mm::engine_supports_vision("llama-cpp"));
+
+#undef RECORD
+    return ok;
+}
+
+bool test_capacity_pressure_is_structured() {
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    const auto pressure = &mm::AgentScheduler::response_indicates_capacity_pressure;
+
+    // ── 1. the two structured shapes, because there are two producers ────────
+    // `soma serve` and the node's inference proxy nest it under `error`.
+    RECORD(pressure(R"({"error":{"code":"capacity_pressure","message":"no free sequence"}})"));
+    // The node's LOAD handlers keep `error` as a human string and carry the code
+    // beside it, so existing clients are not broken by the addition. `error` is
+    // therefore a STRING here, not an object — a parser that only checks the
+    // nested shape misses this entirely.
+    RECORD(pressure(
+        R"({"error":"failed to load model","code":"capacity_pressure","engine":"soma"})"));
+
+    // ── 2. a structured code is AUTHORITATIVE ────────────────────────────────
+    // The whole point of the rewrite. The engine has decided this is not
+    // capacity; reading its prose for a contradicting hint would undo that, and
+    // an evict-and-retry here would destroy a healthy resident agent to make
+    // room for a model that is never going to be found.
+    RECORD(!pressure(
+        R"({"error":{"code":"model_not_found","message":"ran out of memory looking"}})"));
+    RECORD(!pressure(
+        R"({"error":"out of memory","code":"model_not_found","engine":"llama-cpp"})"));
+    // Same rule, stated for a code nobody has defined yet: unrecognised is not
+    // capacity. A future engine inventing `quota_exceeded` gets a hard failure
+    // rather than an eviction storm, until someone decides otherwise.
+    RECORD(!pressure(R"({"error":{"code":"quota_exceeded","message":"insufficient vram"}})"));
+
+    // ── 3. the legacy substring fallback ─────────────────────────────────────
+    // Retained deliberately for a node that predates the code. It is reachable
+    // ONLY when no structured code was found — never as a tiebreak.
+    RECORD(pressure("max slots reached"));
+    RECORD(pressure("llama-server: out of memory"));
+    RECORD(pressure("INSUFFICIENT VRAM"));           // matched case-insensitively
+    RECORD(pressure(R"({"error":"no available ports"})")); // JSON, but no code
+    RECORD(!pressure("model architecture is not supported"));
+    RECORD(!pressure(""));
+
+    // ── 4. an unparseable body is not a guess ────────────────────────────────
+    // Truncated JSON falls through to the substring match rather than throwing,
+    // and answers on the prose alone.
+    RECORD(pressure(R"({"error":"out of memory while loa)"));
+    // A truncated body whose only capacity evidence is the CODE stays false —
+    // the six legacy phrases are llama.cpp's prose, and "capacity_pressure" is
+    // deliberately not among them. So a half-written structured body is not
+    // silently rescued by the matcher underneath it, which is the right answer:
+    // a response that arrived incomplete has not told us what went wrong.
+    RECORD(!pressure(R"({"error":{"code":"capacity_pre)"));
+    RECORD(!pressure("<html><body>502 Bad Gateway</body></html>"));
+
+    // ── 5. the same refusal, through EngineClient's parser ───────────────────
+    // Two parsers exist for one code and they cover different shapes: this one
+    // reads only the NESTED form, so the node's load-handler shape above leaves
+    // its code empty — and is rescued by the status-derived fallback, since the
+    // node answers 503 for capacity. That recovery is load-bearing and entirely
+    // implicit, so it is pinned here: if either the node's status or this
+    // fallback changes, this is the assertion that objects.
+    //
+    // Stated plainly, because the section reads like it guards something live:
+    // `EngineError::is_capacity_pressure()` has NO production consumer today.
+    // The scheduler uses its own matcher; these assertions describe the path
+    // EngineClient is being built toward. They are worth having early — the
+    // shape divergence above is exactly the kind that is free to fix now and
+    // expensive to discover the first time something depends on it — but they
+    // are not evidence that this parser is in the eviction path. It is not.
+    const auto through_client = [](int status, const std::string& body) {
+        return mm::EngineError::parse("HTTP " + std::to_string(status) + ": " + body);
+    };
+    RECORD(through_client(503, R"({"error":"failed to load model","code":"capacity_pressure"})")
+               .is_capacity_pressure());
+    RECORD(through_client(503, "").is_capacity_pressure());
+    RECORD(through_client(500, R"({"error":{"code":"capacity_pressure"}})")
+               .is_capacity_pressure());
+    // 500 with no code is internal, not capacity: retrying it evicts a live
+    // agent to re-run a request that will fail again the same way.
+    RECORD(!through_client(500, R"({"error":"segfault in expert routing"})")
+                .is_capacity_pressure());
+    RECORD(!through_client(404, R"({"error":"no such model"})").is_capacity_pressure());
+
+#undef RECORD
+    return ok;
+}
+
+bool test_engine_telemetry_republication() {
+    // Control's half of the chain, against a node that answers. What is under
+    // test is the ROUTING: finding which node holds an engine, passing the
+    // upstream status through rather than flattening it, and distinguishing
+    // "no such engine" from "the node is unreachable".
+    auto dir = temp_test_dir("engine-telemetry");
+    std::filesystem::create_directories(dir / "models");
+
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    {
+        // A stand-in node exposing the two proxied GETs.
+        httplib::Server node;
+        std::atomic<int> heat_calls{0};
+        std::string last_heat_query;
+        std::mutex query_mutex;
+
+        node.Get("/api/node/engines/:slot/heat",
+                 [&](const httplib::Request& req, httplib::Response& res) {
+                     const auto slot = req.path_params.at("slot");
+                     // The 501 lives INSIDE the parameterised handler, exactly as
+                     // it does on the real node: the descriptor is consulted per
+                     // slot, not routed around. A second, more specific httplib
+                     // route would never be reached — `:slot` is registered first
+                     // and matches everything.
+                     if (slot == "no-telemetry") {
+                         res.status = 501;
+                         res.set_content(
+                             nlohmann::json{{"error", "this engine publishes no heat map"}}
+                                 .dump(),
+                             "application/json");
+                         return;
+                     }
+                     ++heat_calls;
+                     {
+                         std::lock_guard<std::mutex> lk(query_mutex);
+                         last_heat_query = req.get_param_value("resolution");
+                     }
+                     res.set_content(nlohmann::json{{"slot", slot},
+                                                    {"resolution", "bucketed"},
+                                                    {"n_layers", 4},
+                                                    {"n_experts", 16}}
+                                         .dump(),
+                                     "application/json");
+                 });
+        node.Get("/api/node/engines/:slot/sequences",
+                 [&](const httplib::Request&, httplib::Response& res) {
+                     res.set_content(
+                         nlohmann::json{{"sequences", nlohmann::json::array()}}.dump(),
+                         "application/json");
+                 });
+
+        // Health and status too: `connected` and the slot list come from the
+        // POLL, not from a setter. Faking them would test a registry state the
+        // real system never reaches this way.
+        node.Get("/api/node/health", [&](const httplib::Request&, httplib::Response& res) {
+            res.set_content(nlohmann::json{{"cpu_percent", 10.0},
+                                           {"ram_percent", 20.0},
+                                           {"ram_total_mb", 65536},
+                                           {"ram_used_mb", 8192},
+                                           {"gpu_vram_total_mb", 24576},
+                                           {"gpu_vram_used_mb", 1024}}
+                                .dump(),
+                            "application/json");
+        });
+        node.Get("/api/node/status", [&](const httplib::Request&, httplib::Response& res) {
+            nlohmann::json soma_slot = {{"id", "slot-soma"},
+                                        {"backend", "soma"},
+                                        {"state", "ready"},
+                                        {"model_path", "container/Qwen3-30B-A3B"},
+                                        {"vram_usage_mb", 512},
+                                        {"agent_ids", nlohmann::json::array()}};
+            nlohmann::json llama_slot = {{"id", "no-telemetry"},
+                                         {"backend", "llama-cpp"},
+                                         {"state", "ready"},
+                                         {"model_path", "m.gguf"},
+                                         {"agent_ids", nlohmann::json::array()}};
+            res.set_content(nlohmann::json{{"slots", {soma_slot, llama_slot}},
+                                           {"max_slots", 4},
+                                           {"slot_available", 2},
+                                           {"disk_free_mb", 100000}}
+                                .dump(),
+                            "application/json");
+        });
+
+        const uint16_t node_port = find_free_test_port();
+        RECORD(node_port != 0);
+        std::thread node_thread([&] { node.listen("127.0.0.1", node_port); });
+        for (int i = 0; i < 50 && !node.is_running(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+
+        mm::AgentManager agents(dir.string());
+        mm::AgentQueue queue;
+        mm::NodeRegistry registry(dir.string());
+        mm::AgentScheduler scheduler(registry, (dir / "models").string());
+        mm::ControlApiServer api(agents, queue, registry, scheduler, dir.string(),
+                                 (dir / "models").string(), "");
+
+        const auto node_url = "http://127.0.0.1:" + std::to_string(node_port);
+        RECORD(wait_for_test_server(node_url));
+        const auto node_id = registry.add_node(node_url, "", "engine-host", false);
+        RECORD(!node_id.empty());
+        // The slot list is what makes an engine FINDABLE: control discovers which
+        // node holds it rather than making the caller supply one, because the
+        // answer changes on every eviction. It arrives through the health poll,
+        // which is the path the real system uses.
+        registry.start_health_poll(1);
+        RECORD(wait_for_registered_node(registry, node_id));
+        RECORD(wait_for_node_snapshot(registry, node_id, 0, [](const mm::NodeInfo& n) {
+            return n.slots.size() == 2;
+        }));
+
+        const uint16_t port = find_free_test_port();
+        RECORD(port != 0);
+        const std::string base = "http://127.0.0.1:" + std::to_string(port);
+        std::thread api_thread([&] { api.listen(port); });
+        mm::HttpClient client(base);
+        for (int i = 0; i < 50; ++i) {
+            if (client.get("/v1/engines").status != 0) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+
+        auto with_retry = [](auto&& request) {
+            mm::HttpResponse resp;
+            for (int attempt = 0; attempt < kTransportRetries; ++attempt) {
+                resp = request();
+                if (resp.status != 0) break;
+                transport_backoff(attempt);
+            }
+            return resp;
+        };
+
+        // ── the cluster view ─────────────────────────────────────────────────
+        auto engines = with_retry([&] { return client.get("/v1/engines"); });
+        RECORD(engines.status == 200);
+        {
+            const auto j = nlohmann::json::parse(engines.body, nullptr, false);
+            RECORD(!j.is_discarded());
+            RECORD(j.value("data", nlohmann::json::array()).size() == 2);
+            // The node is reported WITH the engine, so a client never has to
+            // resolve it separately.
+            RECORD(engines.body.find("\"node_id\"") != std::string::npos);
+            RECORD(engines.body.find("\"backend\":\"soma\"") != std::string::npos);
+            RECORD(j["tier_summary"].value("vram_mb", 0) == 512);
+        }
+
+        // ── the proxied GETs ─────────────────────────────────────────────────
+        auto heat = with_retry([&] { return client.get("/v1/engines/slot-soma/heat"); });
+        RECORD(heat.status == 200);
+        RECORD(heat.body.find("\"n_experts\":16") != std::string::npos);
+        RECORD(heat_calls.load() >= 1);
+        {
+            std::lock_guard<std::mutex> lk(query_mutex);
+            // Bucketed by default all the way down: the opt-in is explicit at
+            // every hop rather than defaulted back to full by a middle layer.
+            RECORD(last_heat_query.empty());
+        }
+
+        auto full = with_retry([&] {
+            return client.get("/v1/engines/slot-soma/heat?resolution=full");
+        });
+        RECORD(full.status == 200);
+        {
+            std::lock_guard<std::mutex> lk(query_mutex);
+            RECORD(last_heat_query == "full");
+        }
+
+        auto slots = with_retry([&] { return client.get("/v1/engines/slot-soma/slots"); });
+        RECORD(slots.status == 200);
+        RECORD(slots.body.find("sequences") != std::string::npos);
+
+        // ── the refusals ─────────────────────────────────────────────────────
+        auto unknown = with_retry([&] { return client.get("/v1/engines/nope/heat"); });
+        RECORD(unknown.status == 404);
+        RECORD(unknown.body.find("no such engine") != std::string::npos);
+
+        // 501 survives the hop rather than becoming a generic control error.
+        auto unsupported = with_retry([&] {
+            return client.get("/v1/engines/no-telemetry/heat");
+        });
+        RECORD(unsupported.status == 501);
+        RECORD(unsupported.body.find("publishes no heat map") != std::string::npos);
+
+        // A node that has gone away is 502, not 500 — an operator chasing this
+        // should be pointed at the node rather than at control.
+        node.stop();
+        if (node_thread.joinable()) node_thread.join();
+        auto gone = with_retry([&] { return client.get("/v1/engines/slot-soma/heat"); });
+        RECORD(gone.status == 502);
+        RECORD(gone.body.find("node unreachable") != std::string::npos);
+        RECORD(gone.body.find(node_id) != std::string::npos);
+
+        registry.stop_health_poll();
+        api.stop();
+        if (api_thread.joinable()) api_thread.join();
+    }
+
+    RECORD(remove_tree(dir));
+#undef RECORD
+    return ok;
+}
+
+bool test_route_scopes_and_token_store() {
+    // ── the table is exhaustive, and the check that says so actually works ───
+    //
+    // A coverage check that cannot fail is decoration. This asserts BOTH
+    // directions: the real table covers a realistic route set, and a route
+    // absent from it is reported rather than defaulted.
+    std::vector<std::string> missing;
+    CHECK(mm::require_complete_coverage(
+        {"GET /v1/agents", "POST /v1/agents/:id/chat", "POST /v1/models/admit",
+         "PUT /v1/agents/:id/backend", "DELETE /v1/models/:id", "GET /v1/tokens"},
+        missing));
+    CHECK(missing.empty());
+
+    CHECK(!mm::require_complete_coverage({"GET /v1/agents", "POST /v1/not/in/the/table"},
+                                         missing));
+    CHECK(missing.size() == 1);
+    CHECK(missing[0] == "POST /v1/not/in/the/table");
+
+    // Every entry has a method and a pattern — an empty one would match nothing
+    // and silently fall through to the restrictive default.
+    for (const auto& rs : mm::route_scope_table()) {
+        CHECK(rs.method != nullptr && *rs.method != '\0');
+        CHECK(rs.pattern != nullptr && *rs.pattern != '\0');
+    }
+
+    // ── the implication order ────────────────────────────────────────────────
+    const auto read = static_cast<mm::ScopeSet>(mm::Scope::Read);
+    const auto chat = static_cast<mm::ScopeSet>(mm::Scope::Chat);
+    const auto oper = static_cast<mm::ScopeSet>(mm::Scope::Operator);
+
+    CHECK(mm::scope_permits(read, mm::Scope::Read));
+    CHECK(!mm::scope_permits(read, mm::Scope::Chat));
+    CHECK(!mm::scope_permits(read, mm::Scope::Operator));
+    // chat implies read: sending a message you cannot then fetch is not a
+    // coherent permission.
+    CHECK(mm::scope_permits(chat, mm::Scope::Read));
+    CHECK(mm::scope_permits(chat, mm::Scope::Chat));
+    CHECK(!mm::scope_permits(chat, mm::Scope::Operator));
+    // operator implies everything.
+    CHECK(mm::scope_permits(oper, mm::Scope::Read));
+    CHECK(mm::scope_permits(oper, mm::Scope::Chat));
+    CHECK(mm::scope_permits(oper, mm::Scope::Operator));
+    CHECK(!mm::scope_permits(mm::kScopeNone, mm::Scope::Read));
+
+    // ── parsing rejects rather than drops ────────────────────────────────────
+    mm::ScopeSet parsed = mm::kScopeNone;
+    CHECK(mm::parse_scopes("read,operator", parsed));
+    CHECK(parsed == (read | oper));
+    CHECK(mm::parse_scopes(" READ , chat ", parsed));   // case and space tolerant
+    CHECK(parsed == (read | chat));
+    // "opereator" must be REPORTED. Silently ignoring it would mint a token that
+    // looks right in the request and cannot do what it was minted for.
+    CHECK(!mm::parse_scopes("read,opereator", parsed));
+    CHECK(parsed == read);
+    CHECK(mm::format_scopes(read | oper) == "read,operator");
+
+    // ── the token store ──────────────────────────────────────────────────────
+    auto dir = temp_test_dir("scopes");
+    mm::ControlModelRegistry reg;
+    std::string err;
+    CHECK(reg.open(dir.string(), err));
+    CHECK(!reg.has_api_tokens());
+
+    // A token with no scopes can do nothing; minting one is refused rather than
+    // producing a credential that fails every request mysteriously.
+    CHECK(reg.create_api_token("empty", mm::kScopeNone, err).empty());
+
+    const auto reader = reg.create_api_token("dashboard", read, err);
+    CHECK(!reader.empty());
+    CHECK(reg.has_api_tokens());
+    const auto admin = reg.create_api_token("ops", oper, err);
+    CHECK(!admin.empty());
+    CHECK(reader != admin);
+    CHECK(reader.size() >= 32);   // CSPRNG material, not a counter
+
+    // The token is stored HASHED. A leaked backup must not hand over working
+    // credentials, so the secret appears in no row.
+    mm::ApiToken row;
+    CHECK(reg.find_api_token(mm::pairing::sha256_hex(reader), row));
+    CHECK(row.label == "dashboard");
+    CHECK(row.scopes == read);
+    CHECK(row.token_sha256 != reader);
+    CHECK(!reg.find_api_token(reader, row));            // the raw token is not a key
+    CHECK(!reg.find_api_token(mm::pairing::sha256_hex("guessed"), row));
+
+    CHECK(reg.list_api_tokens().size() == 2);
+    for (const auto& t : reg.list_api_tokens()) CHECK(t.token_sha256.size() == 64);
+
+    // Revoked, not deleted: the row is the audit trail, and a deleted token
+    // cannot answer "what was this credential allowed to do".
+    const auto reader_id = reg.list_api_tokens().front().id;
+    CHECK(reg.revoke_api_token(reader_id, err));
+    CHECK(!reg.find_api_token(mm::pairing::sha256_hex(reader), row));
+    CHECK(reg.list_api_tokens().size() == 2);
+    CHECK(!reg.revoke_api_token(reader_id, err));       // already revoked
+    CHECK(reg.has_api_tokens());                        // the operator token remains
+
+    reg.close();
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_capacity_fit_across_three_axes() {
+    mm::CapacityPolicy policy;   // defaults are the constants this replaced
+
+    mm::ResourceFootprint model;
+    model.vram_mb = 8000;
+
+    // A node with plenty of everything: native fit.
+    mm::HostCapacity roomy;
+    roomy.vram_total_mb = 24576; roomy.vram_free_mb = 20000;
+    roomy.ram_total_mb = 65536;  roomy.ram_free_mb = 40000;
+    roomy.disk_free_mb = 500000;
+    CHECK(mm::evaluate_fit(model, roomy, policy) == mm::FitQuality::Native);
+
+    // Not enough VRAM but a big GPU and spare RAM: offload, and it must rank
+    // BELOW a native fit however much headroom it has left.
+    mm::HostCapacity offloadable = roomy;
+    offloadable.vram_free_mb = 4000;
+    CHECK(mm::evaluate_fit(model, offloadable, policy) == mm::FitQuality::Offload);
+    CHECK(mm::capacity_score(model, roomy, policy) >
+          mm::capacity_score(model, offloadable, policy));
+
+    // A small GPU cannot offload against: hybrid loads need a real one.
+    mm::HostCapacity tiny_gpu = roomy;
+    tiny_gpu.vram_total_mb = 4096; tiny_gpu.vram_free_mb = 4000;
+    CHECK(mm::evaluate_fit(model, tiny_gpu, policy) == mm::FitQuality::None);
+
+    // DISK. Collected by the health poll since it was written and consulted by
+    // nothing until now: a node with no room cannot write a KV checkpoint or
+    // spill, so it cannot host anything however much VRAM it has.
+    mm::HostCapacity no_disk = roomy;
+    no_disk.disk_free_mb = 512;
+    std::string why;
+    CHECK(mm::evaluate_fit(model, no_disk, policy, &why) == mm::FitQuality::None);
+    CHECK(why.find("disk") != std::string::npos);
+
+    // Zero means NOT REPORTED, not full — the field defaults to zero and an
+    // older node never sends it. Enforcing against that would exclude every node
+    // predating the field.
+    mm::HostCapacity silent = roomy;
+    silent.disk_free_mb = 0;
+    CHECK(mm::evaluate_fit(model, silent, policy) == mm::FitQuality::Native);
+
+    // A streaming footprint — RAM + disk, no VRAM — fits when the disk is there.
+    mm::ResourceFootprint streamed;
+    streamed.ram_mb = 4000;
+    streamed.disk_mb = 400000;
+    CHECK(mm::evaluate_fit(streamed, roomy, policy) == mm::FitQuality::Native);
+
+    // And is refused when it is not, with no offload path: there is nothing to
+    // trade disk against, which is exactly why one scalar could not carry it.
+    // 495000 leaves 5000 MB, under the 8192 MB headroom.
+    streamed.disk_mb = 495000;
+    std::string disk_why;
+    CHECK(mm::evaluate_fit(streamed, roomy, policy, &disk_why) == mm::FitQuality::None);
+    CHECK(disk_why.find("disk") != std::string::npos);
+    // The same node still takes the VRAM-shaped model, so the refusal is about
+    // the axis that ran out rather than about the node.
+    CHECK(mm::evaluate_fit(model, roomy, policy) == mm::FitQuality::Native);
+
+    // A no-VRAM footprint fits natively; the old scalar had no way to say this.
+    mm::ResourceFootprint cpu_only;
+    cpu_only.ram_mb = 8000;
+    CHECK(mm::evaluate_fit(cpu_only, roomy, policy) == mm::FitQuality::Native);
+    CHECK(!cpu_only.empty());
+    CHECK(cpu_only.dominant_mb() == 8000);
+    return true;
+}
+
 int main(int argc, char** argv) {
     struct TestCase {
         const char* name;
@@ -4439,17 +8182,64 @@ int main(int argc, char** argv) {
          test_agent_api_settings_round_trip_without_key_persistence},
         {"served_model_name_legacy_compatibility",
          test_served_model_name_legacy_compatibility},
-        {"slot_manager_not_found_statuses", test_slot_manager_not_found_statuses},
+        {"engine_supervisor_not_found_statuses", test_engine_supervisor_not_found_statuses},
         {"slot_lease_blocks_unload_and_suspend_while_busy",
          test_slot_lease_blocks_unload_and_suspend_while_busy},
         {"node_action_progress_json_round_trip",
          test_node_action_progress_json_round_trip},
+        {"engine_config_validation_and_round_trip",
+         test_engine_config_validation_and_round_trip},
+        {"vllm_launch_profile_and_environment",
+         test_vllm_launch_profile_and_environment},
+        {"vllm_ray_group_planner_and_commands",
+         test_vllm_ray_group_planner_and_commands},
+        {"engine_config_rejects_per_machine_keys",
+         test_engine_config_rejects_per_machine_keys},
+        {"engine_artifact_fingerprint_is_exact",
+         test_engine_artifact_fingerprint_is_exact},
+        {"engine_config_store_persists_and_bumps_version",
+         test_engine_config_store_persists_and_bumps_version},
+        {"placement_refused_until_engine_config_exists",
+         test_placement_refused_until_engine_config_exists},
+        {"conformance_gates_placement_candidates",
+         test_conformance_gates_placement_candidates},
+        {"admission_variant_is_the_collision_key",
+         test_admission_variant_is_the_collision_key},
+        {"concurrent_admission_of_one_model_joins_not_duplicates",
+         test_concurrent_admission_of_one_model_joins_not_duplicates},
+        {"registry_destruction_cancels_and_joins_admissions",
+         test_registry_destruction_cancels_and_joins_admissions},
+        {"desired_artifact_names_what_a_node_lacks",
+         test_desired_artifact_names_what_a_node_lacks},
+        {"provisioning_progress_sink_may_read_status",
+         test_provisioning_progress_sink_may_read_status},
+        {"provisioner_exception_fails_the_engine_not_the_node",
+         test_provisioner_exception_fails_the_engine_not_the_node},
+        {"soma_resolves_beside_the_node_binary",
+         test_soma_resolves_beside_the_node_binary},
+        {"node_modal_ladder", test_node_modal_ladder},
+        {"engine_digest_and_package_grants_are_one_shot",
+         test_engine_digest_and_package_grants_are_one_shot},
         {"scheduler_skips_failed_node_current_attempt",
          test_scheduler_skips_failed_node_current_attempt},
+        {"scheduler_exhausts_primary_before_cluster_backup",
+         test_scheduler_exhausts_primary_before_cluster_backup},
         {"scheduler_transfers_existing_relative_models_with_unique_cache_ids",
          test_scheduler_transfers_existing_relative_models_with_unique_cache_ids},
         {"scheduler_eviction_skips_unsuspendable_shared_slot",
          test_scheduler_eviction_skips_unsuspendable_shared_slot},
+        {"container_directory_transfers_to_a_node",
+         test_container_directory_transfers_to_a_node},
+        {"disk_is_charged_only_to_nodes_lacking_the_model",
+         test_disk_is_charged_only_to_nodes_lacking_the_model},
+        {"soma_footprint_is_ram_shaped_not_vram_shaped",
+         test_soma_footprint_is_ram_shaped_not_vram_shaped},
+        {"placement_failure_codes_separate_eligibility_from_capacity",
+         test_placement_failure_codes_separate_eligibility_from_capacity},
+        {"scheduler_audits_placement_and_release",
+         test_scheduler_audits_placement_and_release},
+        {"placement_history_records_and_closes_rows",
+         test_placement_history_records_and_closes_rows},
         {"scheduler_backend_change_releases_local_placement",
          test_scheduler_backend_change_releases_local_placement},
         {"scheduler_reconciles_ready_absent_and_suspended_snapshots",
@@ -4511,6 +8301,17 @@ int main(int argc, char** argv) {
         {"performance_tracker_capacity_aggregation_and_clear",
          test_performance_tracker_capacity_aggregation_and_clear},
         {"inference_sizing_estimate", test_inference_sizing_estimate},
+        {"multi_shard_directory_sizes_correctly", test_multi_shard_directory_sizes_correctly},
+        {"capacity_fit_across_three_axes", test_capacity_fit_across_three_axes},
+        {"model_registry_makes_soma_routable", test_model_registry_makes_soma_routable},
+        {"admission_pipeline_runs_and_reports", test_admission_pipeline_runs_and_reports},
+        {"admission_fetch_stage", test_admission_fetch_stage},
+        {"requantization_is_a_new_admission", test_requantization_is_a_new_admission},
+        {"route_scopes_and_token_store", test_route_scopes_and_token_store},
+        {"scope_negatives_over_http", test_scope_negatives_over_http},
+        {"images_refused_by_engine_capability", test_images_refused_by_engine_capability},
+        {"capacity_pressure_is_structured", test_capacity_pressure_is_structured},
+        {"engine_telemetry_republication", test_engine_telemetry_republication},
     };
 
     const std::string filter = argc > 1 ? argv[1] : std::string{};

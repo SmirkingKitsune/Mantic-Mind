@@ -1,0 +1,31 @@
+{
+  "align": 4096,
+  "container_version": 1,
+  "dense_tensors": 129,
+  "dtype_down": "q6_g",
+  "dtype_gate_up": "q4_g",
+  "effective_groups": {
+    "q4_g": 64,
+    "q6_g": 32
+  },
+  "expert_bytes": 4352,
+  "group": 128,
+  "layer_kinds": [
+    "dense",
+    "dense",
+    "dense",
+    "moe",
+    "moe",
+    "moe",
+    "moe",
+    "moe"
+  ],
+  "model_type": "glm_moe_dsa",
+  "n_experts": 16,
+  "n_layers": 8,
+  "n_moe_layers": 5,
+  "n_shards": 1,
+  "source": "tests\\fixtures\\tiny\\GLM-5.2",
+  "tokenizer": "unsupported",
+  "total_expert_bytes": 348160
+}

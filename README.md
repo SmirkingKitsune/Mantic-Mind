@@ -8,6 +8,31 @@ Distributed LLM inference cluster — two executables that turn any collection o
 > **Branch note:** `main` is the llama.cpp runtime line. The alternative runtime
 > implementation is maintained separately on the `vLLM-runtime` branch.
 
+> **This branch — Soma.** An experimental line adding **Soma**, a concurrency-first MoE
+> streaming inference engine, as a peer of llama.cpp. Soma runs oversized Mixture-of-Experts models on
+> modest hardware by treating VRAM/RAM/disk as one managed hierarchy and streaming routed experts from
+> NVMe; llama.cpp becomes the **fallback** for models Soma can't or shouldn't run, chosen by an offline
+> **verdict** rather than by configuration.
+>
+> The Soma engine core currently implements and tests the G0–G4 roadmap gates: fp32 and quantized
+> inference, compiled tokenizers, containers and verdicts, expert streaming, deterministic scheduling,
+> checkpointing, sampling, SIMD kernels, and the MLA positional path. The external API, admission/control
+> plane integration, and the G5 serving executable remain planned. The sections further down describe the
+> shipping llama.cpp system and remain accurate for it.
+>
+> | Document | |
+> |---|---|
+> | [docs/architecture.md](docs/architecture.md) | The seam, the three state-ownership tiers, the step-major scheduler, and the before/after of every subsystem being rebuilt |
+> | [docs/external-api.md](docs/external-api.md) | The full new `/v1/*` surface, three-scope auth, SSE throttling |
+> | [docs/mantic-mind-integration.md](docs/mantic-mind-integration.md) | Engine↔node boundary, verdict routing, FTXUI panels |
+> | [docs/roadmap.md](docs/roadmap.md) | G0–G8 validation gates |
+> | [docs/repo-layout.md](docs/repo-layout.md) | Tree, seam boundary, where new code goes |
+> | [schemas/arch-ir.md](schemas/arch-ir.md) | `arch.json` and the verdict function |
+>
+> Note that the API section below documents the **current** routes. The design reclaims
+> `GET /v1/models` for the admission registry and moves the agents-as-models catalog to the
+> OpenAI-compat listener on `:9091`; that has not happened yet.
+
 ## Prerequisites
 
 | Tool | Minimum version |
@@ -396,6 +421,12 @@ After file loading, matching environment variables override config values.
 | `llama_update_policy` | `MM_LLAMA_UPDATE_POLICY` | `prompt` | llama.cpp update behavior: `prompt`, `auto`, or `manual` |
 | `llama_update_check` | `MM_LLAMA_UPDATE_CHECK` | `true` | Periodically inspect the latest llama.cpp tag and its release assets |
 | `llama_update_check_interval_hours` | `MM_LLAMA_UPDATE_CHECK_INTERVAL_HOURS` | `24` | llama.cpp update-check interval |
+| `vllm_path` | `MM_VLLM_PATH` | `vllm` | Explicit node-local vLLM executable used by `path`/`auto` resolution |
+| `vllm_provision_dir` | `MM_VLLM_PROVISION_DIR` | `data/runtimes/vllm` | Node-local managed vLLM virtual environment; never shared between nodes |
+| `vllm_python_path` | `MM_VLLM_PYTHON` | `python` | Python used to create the managed vLLM environment |
+| `ray_path` | `MM_RAY_PATH` | `ray` | Node-local Ray executable fallback; the managed vLLM environment is preferred |
+| `ray_port` | `MM_RAY_PORT` | `6379` | Ray head port for automatic multi-node vLLM groups |
+| `hf_cache_dir` | `MM_HF_CACHE_DIR` | *(provider default)* | Node-local Hugging Face cache exposed to vLLM as `HF_HOME` |
 | `max_slots` | `MM_MAX_SLOTS` | `4` | Maximum concurrent engine slots |
 | `runtime_port_range_start` | `MM_RUNTIME_PORT_RANGE_START` | `8080` | First port in the per-engine port range |
 | `runtime_port_range_end` | `MM_RUNTIME_PORT_RANGE_END` | `8090` | Last port in the per-engine port range |

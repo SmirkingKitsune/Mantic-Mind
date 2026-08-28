@@ -1,0 +1,58 @@
+# Mantic-Mind / Soma static analysis.
+#
+# Deliberately narrow. A maximal check list on a codebase that has never run
+# clang-tidy produces thousands of diagnostics, which get suppressed wholesale
+# and then the tool is worthless. These are the checks that catch bugs this
+# engine is actually prone to.
+#
+# WarningsAsErrors is intentionally EMPTY at first: the job reports, it does not
+# block. It flips to the full list once the backlog on new code is zero, which
+# is tracked as part of G6.
+
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  cert-dcl21-cpp,
+  cert-dcl58-cpp,
+  cert-err34-c,
+  cppcoreguidelines-pro-type-member-init,
+  cppcoreguidelines-slicing,
+  cppcoreguidelines-virtual-class-destructor,
+  misc-misplaced-const,
+  misc-unused-parameters,
+  misc-unused-using-decls,
+  modernize-use-nullptr,
+  modernize-use-override,
+  modernize-use-using,
+  performance-*,
+  -performance-avoid-endl,
+  readability-const-return-type,
+  readability-misleading-indentation,
+  readability-redundant-smartptr-get,
+  readability-simplify-boolean-expr,
+  readability-static-definition-in-anonymous-namespace
+
+WarningsAsErrors: ''
+HeaderFilterRegex: '(include|src)/(soma|common|node|control)/.*\.(hpp|h)$'
+FormatStyle: file
+
+CheckOptions:
+  # bugprone-easily-swappable-parameters is disabled above, but the engine has
+  # real instances of the underlying hazard — (layer, expert) and (m, n, k) are
+  # same-typed adjacent parameters throughout. The mitigation is strong typedefs
+  # in soma/types.hpp (LayerIndex, ExpertId) rather than a check that would fire
+  # on every kernel signature.
+  - key: readability-identifier-naming.NamespaceCase
+    value: lower_case
+  - key: readability-identifier-naming.ClassCase
+    value: CamelCase
+  - key: readability-identifier-naming.StructCase
+    value: CamelCase
+  - key: readability-identifier-naming.FunctionCase
+    value: lower_case
+  - key: readability-identifier-naming.PrivateMemberSuffix
+    value: '_'
+  - key: performance-unnecessary-value-param.AllowedTypes
+    value: 'std::span;soma::ByteSpan;soma::CByteSpan'

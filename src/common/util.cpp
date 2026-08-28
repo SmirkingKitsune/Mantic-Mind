@@ -1,5 +1,7 @@
 #include "common/util.hpp"
 
+#include <cstdio>
+
 #include <openssl/rand.h>
 
 #include <random>
@@ -29,6 +31,33 @@ std::string hostname() {
     if (::gethostname(name, sizeof(name) - 1) == 0 && name[0] != '\0') return name;
 #endif
     return "unknown-host";
+}
+
+
+std::string executable_dir() {
+#ifdef _WIN32
+    // 32 KiB rather than MAX_PATH: long paths are legal and a truncated one
+    // resolves to a real directory that is the WRONG directory, which is worse
+    // than returning nothing.
+    std::vector<char> buf(32768);
+    const DWORD n = GetModuleFileNameA(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
+    if (n == 0 || n >= buf.size()) return {};
+    std::error_code ec;
+    const std::filesystem::path p(std::string(buf.data(), n));
+    const auto parent = p.parent_path();
+    return std::filesystem::exists(parent, ec) ? parent.string() : std::string{};
+#else
+    std::error_code ec;
+    const auto p = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (ec) {
+        // macOS and the BSDs have no /proc. _NSGetExecutablePath would be the
+        // portable answer there; until this build targets them, saying "I do
+        // not know" is honest and the PATH lookup still runs.
+        return {};
+    }
+    const auto parent = p.parent_path();
+    return std::filesystem::exists(parent, ec) ? parent.string() : std::string{};
+#endif
 }
 
 
@@ -169,9 +198,14 @@ bool model_ref_is_local_path(const std::string& ref) {
     return false;
 }
 
-std::optional<std::string> resolve_existing_local_model_path(
-    const std::string& ref,
-    const std::string& models_dir) {
+namespace {
+
+/// Shared body of the two resolvers. `allow_directory` is the only difference:
+/// what counts as "a model" depends on the engine, and a single predicate could
+/// not serve both without one caller silently accepting the wrong thing.
+std::optional<std::string> resolve_local_model_ref(const std::string& ref,
+                                                   const std::string& models_dir,
+                                                   bool allow_directory) {
     namespace fs = std::filesystem;
 
     std::string cleaned = trim(ref);
@@ -213,7 +247,12 @@ std::optional<std::string> resolve_existing_local_model_path(
 
     for (const auto& candidate : candidates) {
         std::error_code ec;
-        if (!fs::is_regular_file(candidate, ec)) continue;
+        bool acceptable = fs::is_regular_file(candidate, ec);
+        if (!acceptable && allow_directory) {
+            ec.clear();
+            acceptable = fs::is_directory(candidate, ec);
+        }
+        if (!acceptable) continue;
 
         ec.clear();
         fs::path resolved = fs::weakly_canonical(candidate, ec);
@@ -225,6 +264,38 @@ std::optional<std::string> resolve_existing_local_model_path(
         return resolved.lexically_normal().string();
     }
     return std::nullopt;
+}
+
+} // namespace
+
+std::optional<std::string> resolve_existing_local_model_path(const std::string& ref,
+                                                             const std::string& models_dir) {
+    return resolve_local_model_ref(ref, models_dir, /*allow_directory=*/false);
+}
+
+std::optional<std::string> resolve_existing_local_model_ref(const std::string& ref,
+                                                            const std::string& models_dir) {
+    return resolve_local_model_ref(ref, models_dir, /*allow_directory=*/true);
+}
+
+std::string bytes_label(std::int64_t bytes) {
+    const double v = static_cast<double>(bytes > 0 ? bytes : 0);
+    struct Unit { double scale; const char* name; int decimals; };
+    static constexpr Unit kUnits[] = {
+        {1024.0 * 1024.0 * 1024.0 * 1024.0, "TiB", 2},
+        {1024.0 * 1024.0 * 1024.0, "GiB", 2},
+        {1024.0 * 1024.0, "MiB", 1},
+        {1024.0, "KiB", 1},
+    };
+    char buf[48];
+    for (const auto& u : kUnits) {
+        if (v >= u.scale) {
+            std::snprintf(buf, sizeof(buf), "%.*f %s", u.decimals, v / u.scale, u.name);
+            return buf;
+        }
+    }
+    std::snprintf(buf, sizeof(buf), "%.0f B", v);
+    return buf;
 }
 
 std::string model_id_from_ref(const std::string& ref) {

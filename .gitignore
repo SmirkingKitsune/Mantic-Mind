@@ -19,6 +19,11 @@
 /logs/
 /models/
 *.gguf
+# ...except the test fixture. It is 244 KiB of random weights with a real llama
+# architecture, built by tools/testing/make_tiny_gguf.py, and engine_g5 §12 needs
+# it to start a real llama-server. Excluding it would leave the G8 coexistence
+# criterion covered on exactly one machine.
+!/tests/fixtures/gguf/*.gguf
 
 # Local third-party checkouts
 /external/llama.cpp/
@@ -56,6 +61,18 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# Admission tooling virtualenv. Offline-only and never a runtime dependency;
+# reproducible from tools/admission/requirements.txt.
+/tools/admission/.venv/
+# The Kimi oracle venv: a THIRD interpreter, because modeling_kimi_linear.py
+# raises at import without `fla`, whose kernels are Triton — on Windows the
+# community `triton-windows` build. See tools/admission/requirements-kimi.txt.
+/tools/admission/.venv-kimi/
+# The oracle venv: a SECOND interpreter on transformers 5.x, because the pinned
+# 4.57 cannot load glm_moe_dsa and upgrading in place would put the working
+# admission pipeline behind a major version bump.
+/tools/admission/.venv-oracle/
 
 # OS
 .DS_Store

@@ -1,0 +1,26 @@
+{
+  "align": 4096,
+  "container_version": 1,
+  "dense_tensors": 49,
+  "dtype_down": "q6_g",
+  "dtype_gate_up": "q4_g",
+  "effective_groups": {
+    "q4_g": 64,
+    "q6_g": 32
+  },
+  "expert_bytes": 4352,
+  "group": 128,
+  "layer_kinds": [
+    "dense",
+    "moe",
+    "moe",
+    "moe"
+  ],
+  "model_type": "deepseek_v3",
+  "n_experts": 16,
+  "n_layers": 4,
+  "n_moe_layers": 3,
+  "n_shards": 1,
+  "source": "tests\\fixtures\\tiny\\Moonlight-16B-A3B",
+  "total_expert_bytes": 208896
+}

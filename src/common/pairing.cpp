@@ -5,6 +5,7 @@
 #include <openssl/rand.h>
 
 #include <cstdint>
+#include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -53,6 +54,79 @@ std::string hmac_sha256_hex(const std::string& key, const std::string& data) {
          reinterpret_cast<const unsigned char*>(data.data()),
          data.size(),
          out, &len);
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (unsigned int i = 0; i < len; ++i)
+        oss << std::setw(2) << static_cast<unsigned int>(out[i]);
+    return oss.str();
+}
+
+std::string sha256_hex(const std::string& data) {
+    unsigned char out[EVP_MAX_MD_SIZE];
+    unsigned int len = 0;
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (ctx == nullptr) throw std::runtime_error("sha256_hex: EVP_MD_CTX_new failed");
+    const bool ok = EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) == 1 &&
+                    EVP_DigestUpdate(ctx, data.data(), data.size()) == 1 &&
+                    EVP_DigestFinal_ex(ctx, out, &len) == 1;
+    EVP_MD_CTX_free(ctx);
+    if (!ok) throw std::runtime_error("sha256_hex: digest failed");
+
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (unsigned int i = 0; i < len; ++i)
+        oss << std::setw(2) << static_cast<unsigned int>(out[i]);
+    return oss.str();
+}
+
+std::string sha256_file_hex(const std::string& path, std::string* error) {
+    if (error) error->clear();
+
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) {
+        if (error) *error = "cannot open " + path;
+        return {};
+    }
+
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (ctx == nullptr) {
+        if (error) *error = "EVP_MD_CTX_new failed";
+        return {};
+    }
+    if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1) {
+        EVP_MD_CTX_free(ctx);
+        if (error) *error = "digest init failed";
+        return {};
+    }
+
+    std::vector<char> buf(64 * 1024);
+    while (in.good()) {
+        in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+        const auto got = in.gcount();
+        if (got <= 0) break;
+        if (EVP_DigestUpdate(ctx, buf.data(), static_cast<size_t>(got)) != 1) {
+            EVP_MD_CTX_free(ctx);
+            if (error) *error = "digest update failed";
+            return {};
+        }
+    }
+    // Distinguish a read fault from a clean EOF: a truncated read that hashed
+    // the prefix would produce a confident digest of the wrong bytes.
+    if (in.bad()) {
+        EVP_MD_CTX_free(ctx);
+        if (error) *error = "read error on " + path;
+        return {};
+    }
+
+    unsigned char out[EVP_MAX_MD_SIZE];
+    unsigned int len = 0;
+    const bool ok = EVP_DigestFinal_ex(ctx, out, &len) == 1;
+    EVP_MD_CTX_free(ctx);
+    if (!ok) {
+        if (error) *error = "digest final failed";
+        return {};
+    }
+
     std::ostringstream oss;
     oss << std::hex << std::setfill('0');
     for (unsigned int i = 0; i < len; ++i)

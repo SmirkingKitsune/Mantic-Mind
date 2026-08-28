@@ -1,0 +1,46 @@
+{
+  "attn_implementation": null,
+  "device": "cpu",
+  "fixture_version": 1,
+  "generate": 256,
+  "greedy_first_16": [
+    501,
+    7,
+    310,
+    243,
+    166,
+    248,
+    107,
+    8,
+    174,
+    478,
+    351,
+    272,
+    483,
+    368,
+    451,
+    27
+  ],
+  "implementation": "native",
+  "kda_mode": null,
+  "layer_kinds": [
+    "moe",
+    "moe",
+    "moe",
+    "moe"
+  ],
+  "n_params": 785136,
+  "numpy_version": "2.5.2",
+  "positions": 512,
+  "seed": 20260727,
+  "slug": "Qwen3.5-MoE-Tiny",
+  "source": "models/Qwen/Qwen3.8-2.4T-A95B",
+  "source_architectures": [
+    "Qwen3_5MoeForCausalLM"
+  ],
+  "source_model_type": "qwen3_5_moe_text",
+  "tf_logits_sha256": "b67ba33b0a1ec7f86a70f4bf460059c32904f60624074f513415bf51d55dada4",
+  "torch_version": "2.11.0+cpu",
+  "transformers_version": "5.15.1",
+  "weights_sha256": "653d665d5ec4016db387b95bb72300a5da8863ca73e7a35732a52cddd7a84f60"
+}

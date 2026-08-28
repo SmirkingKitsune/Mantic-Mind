@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/footprint.hpp"
 #include "common/models.hpp"
 #include "common/node_discovery.hpp"
 #include <unordered_map>
@@ -58,14 +59,77 @@ public:
 
     /// Nodes that have a model loaded in a ready slot.
     std::vector<NodeInfo> nodes_with_model_loaded(const std::string& model_path) const;
-    /// Nodes that can likely host a model requiring `min_vram_mb`:
-    /// - preferred: enough free VRAM
-    /// - fallback: VRAM + weighted RAM budget (CPU offload)
-    std::vector<NodeInfo> nodes_with_available_vram(int64_t min_vram_mb) const;
+    /// Nodes that can host `footprint`, best fit first.
+    ///
+    /// REPLACES nodes_with_available_vram(int64_t). The policy is unchanged —
+    /// same headroom, same 0.60 offload weight, same 8 GiB minimum GPU, and a
+    /// native fit still outranks an offloaded one — but it is expressed over
+    /// three axes instead of one, and it lives in common/footprint.cpp so the
+    /// node and control agree on what "fits" means.
+    ///
+    /// Soma's cost is RAM + disk + optional VRAM, and no amount of tuning a VRAM
+    /// scalar expresses that. `NodeInfo::disk_free_mb` has been collected by the
+    /// health poll since it was written and consulted by nothing.
+    std::vector<NodeInfo> nodes_with_capacity(const ResourceFootprint& footprint,
+                                              const CapacityPolicy& policy = {}) const;
+
+    /// The same ranking, with the demand computed PER NODE.
+    ///
+    /// A footprint is not a property of the model alone — the same shape of
+    /// claim the verdict makes about `(model, quantization, host budget)`. The
+    /// concrete case is disk: a node that already holds the container needs no
+    /// room for it, and one that does not needs all of it, so a single
+    /// `ResourceFootprint` cannot express the demand this function is filtering
+    /// on (roadmap D65).
+    ///
+    /// `demand` is called once per connected, placement-eligible node and must
+    /// be pure — it runs under the registry's lock.
+    using FootprintForNode = std::function<ResourceFootprint(const NodeInfo&)>;
+    std::vector<NodeInfo> nodes_with_capacity_for(const FootprintForNode& demand,
+                                                  const CapacityPolicy& policy = {}) const;
+
+    /// Placement eligibility for one engine.  This intentionally ignores an
+    /// unrelated required engine's conformance so a ready backup remains usable
+    /// while the primary is failed or still provisioning.
+    std::vector<NodeInfo> available_nodes_for_engine(
+        const std::string& engine_id, std::uint32_t config_version) const;
+    std::vector<NodeInfo> nodes_with_capacity_for_engine(
+        const FootprintForNode& demand,
+        const std::string& engine_id,
+        std::uint32_t config_version,
+        const CapacityPolicy& policy = {}) const;
 
     // Callback fired whenever node status changes (health poll results).
     using UpdateCallback = std::function<void(const NodeInfo&)>;
     void set_update_callback(UpdateCallback cb);
+
+    // ── Cluster engine configuration ──────────────────────────────────────────
+    /// Supplies the current cluster engine config. Set by control's startup;
+    /// unset means engine conformance is not managed and no node is ever
+    /// pushed to.
+    ///
+    /// A provider rather than a stored copy: the config changes underneath the
+    /// registry, and a copy taken at construction would push a stale version
+    /// forever.
+    using EngineConfigProvider = std::function<std::optional<ClusterEngineConfig>()>;
+    void set_engine_config_provider(EngineConfigProvider provider);
+
+    /// Push the configuration to one node now. Used at registration, on an
+    /// operator-forced resync, and by the health poll on a version mismatch.
+    /// Returns false with `out_error` on a transport failure or a node refusal.
+    bool push_engine_config(const NodeId& id,
+                            const ClusterEngineConfig& cfg,
+                            std::string& out_error);
+
+    /// Push to every connected node whose reported version differs. Called
+    /// after a config save so a change propagates immediately rather than
+    /// waiting up to one poll interval.
+    void push_engine_config_to_all(const ClusterEngineConfig& cfg);
+
+    /// Nodes reporting a conformance state that permits placement. Distinct
+    /// from `connected`: a reachable node running the wrong engines is exactly
+    /// the node this exists to exclude.
+    std::vector<NodeInfo> conforming_nodes() const;
 
     // Start/stop background health polling (every interval_s seconds).
     void start_health_poll(int interval_s = 30);
@@ -100,6 +164,7 @@ private:
     std::unordered_set<NodeId>            remembered_nodes_;
     std::string                           remembered_nodes_path_;
     UpdateCallback                        update_cb_;
+    EngineConfigProvider                  engine_config_provider_;
     std::atomic<int64_t> offline_after_ms_{90000};
 
     std::atomic<bool>       polling_{false};
@@ -110,6 +175,12 @@ private:
     NodeDiscoveryListener discovery_listener_;
 
     void poll_all_nodes();
+    /// May placement target this node? Call with mutex_ held.
+    ///
+    /// Answers true unconditionally when no engine-config provider is set —
+    /// see the definition for why gating an unmanaged registry would break it
+    /// silently.
+    bool placement_allowed_locked(const NodeInfo& n) const;
     bool ping_node(NodeInfo& info);
     void load_remembered_nodes();
     void save_remembered_nodes_unlocked() const;

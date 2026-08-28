@@ -1,0 +1,43 @@
+{
+  "fixture_version": 1,
+  "generate": 256,
+  "greedy_first_16": [
+    93,
+    93,
+    93,
+    93,
+    93,
+    93,
+    93,
+    93,
+    93,
+    93,
+    93,
+    93,
+    93,
+    93,
+    93,
+    93
+  ],
+  "implementation": "native",
+  "layer_kinds": [
+    "moe",
+    "moe",
+    "moe",
+    "moe"
+  ],
+  "n_params": 744288,
+  "numpy_version": "2.4.6",
+  "positions": 512,
+  "seed": 20260727,
+  "slug": "granite-3.0-3b-a800m-instruct",
+  "source": "Z:/AI/Ubiquitious-Memories/Mantic-Mind/models/ibm-granite/granite-3.0-3b-a800m-instruct",
+  "source_architectures": [
+    "GraniteMoeForCausalLM"
+  ],
+  "source_model_type": "granitemoe",
+  "tf_logits_sha256": "1f6749867aee4828af858d8a460f71891fc512cebda93a97e1e1ec0157ff5c02",
+  "torch_version": "2.13.0+cpu",
+  "transformers_version": "4.57.6",
+  "weights_sha256": "6d34ebdd40c55f5ac909e13b59baa73872e417ef2f53d9da0f76e8ab24cdc537"
+}

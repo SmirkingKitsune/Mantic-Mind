@@ -18,6 +18,19 @@ std::string hostname();
 //   - First character must be alphanumeric
 bool is_valid_agent_id(const std::string& id);
 
+// Directory holding the RUNNING executable, or "" if it cannot be determined.
+//
+// Not `current_path()` and not argv[0]: a node started as a service, or from a
+// shortcut, has a working directory unrelated to where its binary lives, and
+// argv[0] is whatever the launcher felt like passing. This asks the OS.
+//
+// It exists because "ships beside the node" is a claim the node has to be able
+// to CHECK. Soma is built from this repository and deployed next to
+// mantic-mind, but the node looked for it on PATH alone — so in any build tree,
+// where soma lands in src/soma/ and the node in src/node/, the engine that
+// ships with the node could not be found by the node (D58).
+std::string executable_dir();
+
 // ── Time ─────────────────────────────────────────────────────────────────────
 int64_t now_ms();   // milliseconds since Unix epoch
 int64_t now_s();    // seconds since Unix epoch
@@ -53,12 +66,47 @@ std::optional<std::string> resolve_existing_local_model_path(
     const std::string& ref,
     const std::string& models_dir = {});
 
+// The same resolution, accepting a DIRECTORY as well as a file.
+//
+// A model is not always one file. llama.cpp loads a single GGUF, and for that
+// caller "is this a regular file" is the right question; Soma loads a converted
+// container DIRECTORY, and for that caller it is the wrong one.
+//
+// Split rather than widened, because three of the existing callers genuinely
+// mean "file": the projector is always one, and the llama.cpp config validator
+// is explicitly scoped to a runtime that loads a GGUF. Widening the shared
+// predicate would have made those quietly accept a directory they cannot load.
+//
+// What it fixes: `transfer_model_to_node()` walks directories and streams every
+// file, and both of its callers resolved through the file-only form — so the
+// directory branch was unreachable from placement and an admitted Soma
+// container was never transferred to a node at all. On one machine that is
+// invisible, because control's absolute path also resolves on the node; on a
+// real cluster the node is handed a path that does not exist there and fails at
+// load time (roadmap D66).
+std::optional<std::string> resolve_existing_local_model_ref(const std::string& ref,
+                                                            const std::string& models_dir = {});
+
 // A stable, filesystem-safe identity for a model reference: the final path
 // component (a file name like "Qwen3-8B.gguf" or a directory name), with any
 // character outside [A-Za-z0-9._-] replaced by '_'. Both control and node
 // compute the same id from the same ref so they agree on the node-local
 // destination folder and the cache dedup key. Handles '/' and '\\'.
 std::string model_id_from_ref(const std::string& ref);
+
+/// Bytes for a human, in BINARY units with binary LABELS.
+///
+/// One implementation because there were three, and they disagreed with a fourth
+/// in Python. `fetch.py` divided by 1e9 and wrote "GB"; two separate C++
+/// `bytes_label` copies divided by 1024^3 and also wrote "GB". The same OLMoE
+/// transfer therefore announced `13.84 GB` in its manifest line and `12.89 GB`
+/// on every progress line — the same number, and an operator watching a 14 GB
+/// download see a gigabyte go missing.
+///
+/// Binary was chosen because every C++ site was already binary and Windows
+/// reports file sizes the same way; the fix is the LABEL, which now says what
+/// the arithmetic does. Defect D5.
+std::string bytes_label(std::int64_t bytes);
 
 // ── URL / SSE helpers ───────────────────────────────────────────────────────
 // Parse "http://host:port/path" → {host, port}.  Defaults to port 80.
