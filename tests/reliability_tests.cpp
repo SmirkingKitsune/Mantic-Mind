@@ -1235,6 +1235,9 @@ bool test_admission_variant_is_the_collision_key() {
     // containers/<name>-... cannot disagree about which model a ref denotes.
     CHECK(mm::admission_source_name("Qwen/Qwen3-30B-A3B", true) == "Qwen3-30B-A3B");
     CHECK(mm::admission_source_name("/models/Qwen3-30B-A3B", false) == "Qwen3-30B-A3B");
+    CHECK(mm::admission_source_name("/models/Qwen3-30B-A3B/", false) ==
+          "Qwen3-30B-A3B");
+    CHECK(mm::admission_variant("/models/Qwen3-30B-A3B/", false, tools) == from_repo);
     CHECK(mm::admission_source_name("Qwen/Qwen3-30B-A3B@main", true) == "Qwen3-30B-A3B");
     return true;
 }
@@ -1314,6 +1317,52 @@ bool test_concurrent_admission_of_one_model_joins_not_duplicates() {
     CHECK(finished->done);
 
     std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    return true;
+}
+
+bool test_registry_destruction_cancels_and_joins_admissions() {
+    const char* helper = std::getenv("MM_TEST_PROCESS_HELPER_PATH");
+    if (helper == nullptr) {
+        std::cout << "  (skipped: MM_TEST_PROCESS_HELPER_PATH unset)\n";
+        return true;
+    }
+
+    auto dir = temp_test_dir("admission-shutdown");
+    const auto source = dir / "source-model";
+    std::error_code ec;
+    std::filesystem::create_directories(source, ec);
+    CHECK(!ec);
+
+    auto destroy_started = std::chrono::steady_clock::time_point{};
+    {
+        mm::ControlModelRegistry reg;
+        std::string err;
+        CHECK(reg.open(dir.string(), err));
+
+        mm::AdmissionTools tools;
+        tools.soma_path = helper;
+        tools.containers_dir = (dir / "containers").string();
+        tools.sources_dir = (dir / "sources").string();
+        reg.set_tools(tools);
+
+        const auto id = reg.admit(source.string(), {}, err);
+        CHECK(!id.empty());
+
+        // The helper's direct process has spawned a descendant that holds the
+        // inherited stdout/stderr pipes. Destruction must cancel that whole tree
+        // and join the admission worker before `impl_` or its database vanish.
+        const auto marker = source / "process-helper-ready";
+        for (int i = 0; i < 100 && !std::filesystem::exists(marker); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        CHECK(std::filesystem::exists(marker));
+        destroy_started = std::chrono::steady_clock::now();
+    }
+    const double destroy_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - destroy_started).count();
+    CHECK(destroy_seconds < 5.0);
+
     std::filesystem::remove_all(dir, ec);
     return true;
 }
@@ -8158,6 +8207,8 @@ int main(int argc, char** argv) {
          test_admission_variant_is_the_collision_key},
         {"concurrent_admission_of_one_model_joins_not_duplicates",
          test_concurrent_admission_of_one_model_joins_not_duplicates},
+        {"registry_destruction_cancels_and_joins_admissions",
+         test_registry_destruction_cancels_and_joins_admissions},
         {"desired_artifact_names_what_a_node_lacks",
          test_desired_artifact_names_what_a_node_lacks},
         {"provisioning_progress_sink_may_read_status",

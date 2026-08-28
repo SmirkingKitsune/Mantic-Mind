@@ -1,3 +1,12 @@
+add_executable(mm_process_exec_tests
+    process_exec_tests.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/process_exec.cpp
+)
+target_include_directories(mm_process_exec_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+add_test(NAME mm_process_exec_tests COMMAND mm_process_exec_tests)
+
 add_executable(mm_reliability_tests
     reliability_tests.cpp
     ${CMAKE_SOURCE_DIR}/src/control/agent_queue.cpp
@@ -32,6 +41,7 @@ target_include_directories(mm_reliability_tests PRIVATE
 )
 
 target_compile_definitions(mm_reliability_tests PRIVATE MM_TESTING)
+add_dependencies(mm_reliability_tests mm_process_exec_tests)
 
 target_link_libraries(mm_reliability_tests PRIVATE
     mm_common
@@ -97,7 +107,7 @@ message(STATUS "admission tests will run under: ${MM_ADMISSION_PY}")
 # progress parsing, the resolved path, and the two ways a fetch can lie about
 # succeeding.
 set_tests_properties(mm_reliability_tests PROPERTIES
-    ENVIRONMENT "MM_TEST_SOMA_PATH=$<TARGET_FILE:soma>;MM_TEST_MODEL_DIR=${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/Qwen3-30B-A3B;MM_TEST_PYTHON=${Python3_EXECUTABLE};MM_TEST_CONTAINER_DIR=${CMAKE_SOURCE_DIR}/tests/fixtures/containers/Qwen3-30B-A3B")
+    ENVIRONMENT "MM_TEST_SOMA_PATH=$<TARGET_FILE:soma>;MM_TEST_MODEL_DIR=${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/Qwen3-30B-A3B;MM_TEST_PYTHON=${Python3_EXECUTABLE};MM_TEST_CONTAINER_DIR=${CMAKE_SOURCE_DIR}/tests/fixtures/containers/Qwen3-30B-A3B;MM_TEST_PROCESS_HELPER_PATH=$<TARGET_FILE:mm_process_exec_tests>")
 
 if(Python3_Interpreter_FOUND)
     # The direction require_complete_coverage() cannot walk. It asserts every

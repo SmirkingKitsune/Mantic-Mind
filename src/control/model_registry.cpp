@@ -88,7 +88,13 @@ std::string admission_source_name(const std::string& source, bool needs_fetch) {
     // The trailing component either way — a repo id `Qwen/Qwen3-30B-A3B` and a
     // directory `.../Qwen3-30B-A3B` are the same model and must produce the same
     // container, or admitting one after the other silently makes two.
-    if (!needs_fetch) return fs::path(source).filename().string();
+    if (!needs_fetch) {
+        auto trimmed = util::trim(source);
+        while (trimmed.size() > 1 && (trimmed.back() == '/' || trimmed.back() == '\\')) {
+            trimmed.pop_back();
+        }
+        return fs::path(trimmed).filename().string();
+    }
     auto id = source;
     if (const auto at = id.rfind('@'); at != std::string::npos) id = id.substr(0, at);
     const auto slash = id.find_last_of('/');
@@ -492,7 +498,31 @@ void ControlModelRegistry::Impl::publish(const std::shared_ptr<AdmissionOperatio
 
 ControlModelRegistry::ControlModelRegistry() : impl_(std::make_unique<Impl>()) {}
 
-ControlModelRegistry::~ControlModelRegistry() = default;
+ControlModelRegistry::~ControlModelRegistry() {
+    // Admission operations outlive the HTTP request that started them, but they
+    // must not outlive their registry. Every worker captures `this` and may use
+    // the gate, progress map, or database until its final instruction.
+    std::vector<std::shared_ptr<AdmissionOperation>> operations;
+    {
+        std::lock_guard<std::mutex> lk(impl_->ops_mu);
+        operations.reserve(impl_->ops.size());
+        for (const auto& [id, op] : impl_->ops) {
+            if (!op) continue;
+            op->cancel.store(true);
+            operations.push_back(op);
+        }
+    }
+
+    // Release workers that have not claimed an admission slot yet. Running
+    // workers observe the same cancel flag in run_streamed_command().
+    impl_->admission_gate.notify_all();
+
+    // Join outside ops_mu: each worker takes that mutex while publishing its
+    // terminal state and releasing its slot.
+    for (const auto& op : operations) {
+        if (op->worker.joinable()) op->worker.join();
+    }
+}
 
 bool ControlModelRegistry::open(const std::string& data_dir, std::string& out_error) {
     std::lock_guard<std::mutex> lk(impl_->mu);
@@ -1378,10 +1408,9 @@ std::string ControlModelRegistry::start_operation(const std::string& source,
         }
         impl_->admission_gate.notify_all();
     });
-    // Detached because the operation outlives its request by design: a client
-    // that disconnects mid-conversion must not cancel it, and joining here would
-    // block the HTTP thread for hours.
-    op->worker.detach();
+    // Kept joinable by the registry. The operation still outlives the request —
+    // nothing joins here — but registry destruction can now cancel and join it
+    // before releasing the state captured by the worker.
     return id;
 }
 
