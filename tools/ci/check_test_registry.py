@@ -43,10 +43,13 @@ REGISTERED = re.compile(
 def declared_tests(source: Path) -> dict[str, Path]:
     out: dict[str, Path] = {}
     for f in source.rglob("CMakeLists.txt"):
-        # Skip anything vendored: vcpkg trees and build outputs carry their own
-        # tests that this project neither declares nor runs.
+        # Skip anything vendored: vcpkg trees, build outputs and the admission
+        # venvs carry their own tests that this project neither declares nor
+        # runs. Match venvs by prefix so a new one is covered on arrival.
         parts = {p.lower() for p in f.parts}
-        if parts & {"build", "cmbuild", "vcpkg_installed", ".venv", ".venv-oracle"}:
+        if parts & {"build", "cmbuild", "vcpkg_installed"} or any(
+            p.startswith(".venv") for p in parts
+        ):
             continue
         try:
             text = f.read_text(encoding="utf-8", errors="replace")

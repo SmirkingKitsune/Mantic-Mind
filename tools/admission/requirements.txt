@@ -8,16 +8,32 @@
 # stays true — admission is the exception because the conformance oracle is
 # defined as "what transformers does".
 #
-# Install:
+# Install - TWO steps, torch first and from the CUDA index:
 #   python -m venv tools/admission/.venv
-#   tools/admission/.venv/Scripts/python -m pip install -r tools/admission/requirements.txt \
-#       --extra-index-url https://download.pytorch.org/whl/cu128
+#   tools/admission/.venv/Scripts/python -m pip install torch \
+#       --index-url https://download.pytorch.org/whl/cu130
+#   tools/admission/.venv/Scripts/python -m pip install -r tools/admission/requirements.txt
 #
-# torch is pinned to a CUDA 12.8 build: the dev box is an RTX 5090 (Blackwell,
-# sm_120), which older CUDA builds do not target. CPU-only wheels are sufficient
-# for G0/G1 (tiny-random models) but not for G2's fp16 reference pass over real
+# torch must be a CUDA build: the dev box is an RTX 5090 (Blackwell, sm_120),
+# which older CUDA builds do not target. CPU-only wheels are sufficient for
+# G0/G1 (tiny-random models) but not for G2's fp16 reference pass over real
 # checkpoints, so the CUDA build is installed once rather than swapped later.
+#
+# WHY torch IS ON ITS OWN LINE, AND WHY `--index-url`. This used to read
+# `pip install -r requirements.txt --extra-index-url .../cu128` as ONE command.
+# With the `--extra-` form pip sees PyPI's default wheel at an equal-or-higher
+# version and takes the CPU build - which is precisely what this venv held
+# (2.13.0+cpu) until 2026-08-28, silently disabling the G2 pass this comment
+# says it needs. But `--index-url` cannot be used on the combined command
+# either: the PyTorch index carries no transformers and no huggingface-hub, so
+# the rest of this file must come from PyPI. Hence two steps.
+#
+# cu130 rather than cu128: the cu128 index stops at torch 2.11.0 while cu130
+# carries 2.13.0, and both target sm_120. `.venv-kimi` stays on cu128 because
+# its triton-windows build is matched to that line.
 
+# Installed separately from the CUDA index above; listed here so the
+# constraint is recorded, not so pip resolves it from PyPI.
 torch>=2.7.0
 
 # Upper-bounded at 5.0 deliberately, and this is not conservatism.
