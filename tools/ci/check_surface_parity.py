@@ -11,6 +11,14 @@ Two checks already guard neighbouring properties and neither guards this one:
   check_ui_api.py      soma/engine/admission panels include nothing in-process
   THIS                 CLI -> scope table    (a CLI verb hits a real route)
                        TUI mutations -> scope table (nothing mutates only in-process)
+                       node TUI -> node API  (same rule, one tier down)
+
+The node half was added after the control half missed it for a release: the
+llama.cpp provisioning wizard existed only on the node's screen, its five API
+routes had no caller anywhere, and control's Engines tab could configure a
+cluster it could not repair. Watching control alone and calling that "every
+in-process mutation" is the same shape of mistake as watching three references
+and calling that every channel.
 
 The gap it closes, concretely: `AgentScheduler::suspend_agent` was PRIVATE, the
 node API had `/api/node/suspend-slot`, and no `/v1/*` route could reach either.
@@ -187,6 +195,51 @@ TUI_COVERAGE_EXEMPT = {
     ("POST", "/v1/agents/:id/attachments"): "multipart upload; the Chat tab covers text",
     ("GET", "/v1/agents/:id/speech/cache/:cache_id"): "binary audio, fetched by the player",
     ("POST", "/v1/audio/speech"): "OpenAI-compat spelling of the Voice tab's synthesis",
+    ("POST", "/v1/cluster/engines/nodes/:node_id/switch"):
+        "picking a build variant needs that node's troubleshooting report — release "
+        "assets, CUDA architectures, a compile assessment — and none of it crosses "
+        "the conformance route control polls. A variant menu control cannot populate "
+        "is a list whose every entry might fail; the Engines tab offers Retry instead "
+        "and the choice stays on the node's own screen until a route carries the report",
+}
+
+# ── The node's TUI is a second control plane, and nothing watched it ──────────
+#
+# Everything above measures control. The node has its own FTXUI screen, its own
+# API, and — until this list existed — its own private capabilities: the
+# llama.cpp troubleshooting wizard was wired to in-process callbacks and reached
+# five node routes that NO client ever called. control could not provision, could
+# not diagnose, could not retry a failed build. An operator holding the entire
+# cluster API had to open a session on the machine.
+#
+# That is the same defect the control half of this file was written for, one tier
+# down, and it passed CI for the same reason: nothing looked. The rule is the
+# rule P1 states for control, applied to the node — if the node's screen can do
+# it, an API client can do it through the same route.
+#
+# Mapped to /api/node/* rather than /v1/*: the node's own API is its control
+# plane. Control reaching those routes is a separate property, and the /v1
+# coverage checks above already carry it.
+NODE_TUI = "src/node/node_ui.cpp"
+NODE_API = "src/node/node_api_server.cpp"
+
+# `server_->Post("/api/node/engines/:id/provision", ...)`
+NODE_ROUTE_RE = re.compile(r'server_->(Get|Post|Put|Delete|PostUpload)\(\s*"(/api/node/[^"]+)"')
+
+# The node TUI mutates by calling these callbacks. Each names the /api/node
+# route that performs the same action, so a button with no route fails here
+# rather than becoming a node-only capability nobody can automate.
+NODE_TUI_MUTATION_ROUTES = {
+    # One callback, five wizard actions, all of them recovery verbs on one
+    # engine — so they share a route that takes the verb in its body. The
+    # exception is "target", which the node maps onto the same recover call.
+    'request_llama_recovery_cb_': ("POST", "/api/node/engines/:id/recover"),
+    'request_llama_update_cb_':   ("POST", "/api/node/engines/:id/provision"),
+    'request_llama_switch_cb_':   ("POST", "/api/node/engines/:id/switch"),
+    # Clearing remembered pairings is local credential hygiene on that machine.
+    # Deliberately NOT an API route: a route that lets a caller drop the keys it
+    # authenticated with is a way to lock an operator out remotely.
+    'forget_pairing_cb_': None,
 }
 
 
@@ -371,6 +424,39 @@ def main() -> int:
                 f"{TUI} mutates via {mutator}() whose /v1 equivalent "
                 f"{want[0]} {want[1]} is NOT in the scope table — that is a TUI-only "
                 f"capability, which P1 forbids")
+
+    # ── 2b. every node-TUI mutation has an /api/node route ────────────────────
+    node_tui_path = root / NODE_TUI
+    node_api_path = root / NODE_API
+    if node_tui_path.exists() and node_api_path.exists():
+        node_tui_src = node_tui_path.read_text(encoding="utf-8", errors="replace")
+        # Upper-cased on the way in: httplib spells the verb `Post`, every
+        # table in this file spells it `POST`, and comparing the two silently
+        # reported every route missing.
+        node_routes = {(v.upper().replace("UPLOAD", ""), path)
+                       for v, path in NODE_ROUTE_RE.findall(
+                           node_api_path.read_text(encoding="utf-8", errors="replace"))}
+        if not node_routes:
+            failures.append(f"no /api/node routes parsed from {NODE_API}")
+        for cb, want in NODE_TUI_MUTATION_ROUTES.items():
+            if cb + "(" not in node_tui_src:
+                continue
+            if want is None:
+                continue
+            if want not in node_routes:
+                failures.append(
+                    f"{NODE_TUI} mutates via {cb}() whose node-API equivalent "
+                    f"{want[0]} {want[1]} is NOT registered — that is a node-TUI-only "
+                    f"capability, which is how provisioning became unreachable from control")
+        # The other direction: a callback the node TUI grew that this list has
+        # never heard of. Caught here rather than at the next audit, which is the
+        # whole difference between a check and a comment.
+        for m in sorted(set(re.findall(
+                r'\b(request_[a-z_]+_cb_|forget_[a-z_]+_cb_)\(', node_tui_src))):
+            if m not in NODE_TUI_MUTATION_ROUTES:
+                failures.append(
+                    f"{NODE_TUI} calls {m}() and this check has no node-API route mapped "
+                    f"for it — either add the route or record why it needs none")
 
     # ── 3. the mapping table cannot rot ───────────────────────────────────────
     # A mapped mutator that no longer appears in the TUI means the entry is

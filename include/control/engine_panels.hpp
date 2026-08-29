@@ -27,6 +27,8 @@
 
 #include "common/engine_config.hpp"
 
+#include <nlohmann/json_fwd.hpp>
+
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -138,6 +140,28 @@ public:
                const std::string& target_node_id,
                const std::string& source_node_id,
                std::string& out_error);
+
+    /// Run one engine action on one node: provision | check-update | switch |
+    /// diagnose | recover.
+    ///
+    /// The lever this tab did not have. Resync only reaches nodes whose config
+    /// VERSION differs, and a node bumps its version on accepting a config
+    /// rather than on conforming to one — so the node an operator is staring at
+    /// because it says `failed` is exactly the node resync silently skips.
+    ///
+    /// `extra` carries the per-action fields the node expects: `variant` for
+    /// switch, `action`/`variant` for recover, `update`/`accelerator` for
+    /// provision. Passed through rather than modelled here, because the node is
+    /// where those are validated and a second copy of the rules is a second
+    /// place for them to drift.
+    ///
+    /// Returns on the node's 202, NOT on the work finishing. Progress arrives
+    /// through the same conformance poll that fills `progress_*`, which is what
+    /// `render_engine_activity` already draws.
+    bool node_action(const std::string& node_id,
+                     const std::string& action,
+                     const nlohmann::json& extra,
+                     std::string& out_error);
 
 private:
     struct Impl;

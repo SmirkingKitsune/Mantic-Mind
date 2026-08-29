@@ -315,6 +315,27 @@ bool EngineDashboard::share(const std::string& fingerprint,
     return true;
 }
 
+bool EngineDashboard::node_action(const std::string& node_id,
+                                  const std::string& action,
+                                  const nlohmann::json& extra,
+                                  std::string& out_error) {
+    out_error.clear();
+    nlohmann::json body = extra.is_object() ? extra : nlohmann::json::object();
+    const auto r = impl_->client().post(
+        "/v1/cluster/engines/nodes/" + node_id + "/" + action, body);
+    // 202 is the SUCCESS here, and `ok()` covering 2xx is what makes that work
+    // without a special case. A 409 — another operation already running on that
+    // node — falls through to the error path carrying the node's own sentence,
+    // which is the right outcome: nothing was started, and saying "started"
+    // would be the exact lie this whole change exists to remove.
+    if (!r.ok()) {
+        out_error = server_error(r);
+        return false;
+    }
+    refresh_now();
+    return true;
+}
+
 // ── Renderers ─────────────────────────────────────────────────────────────────
 
 Element render_engine_config(const EngineSnapshot& snap) {
@@ -671,6 +692,59 @@ Component engine_tab(EngineDashboard& dashboard, int& selected_node, bool& force
         }
     });
 
+    // ── Per-node engine actions ───────────────────────────────────────────────
+    //
+    // All five target the SELECTED node, for the reason Share does: the
+    // conformance table is what the operator is reading when they decide to act,
+    // and a node-id text field would ask them to retype what is already
+    // highlighted.
+    //
+    // No accelerator or variant pickers here. Choosing a build variant is a
+    // decision made against that node's own troubleshooting report — release
+    // assets, CUDA architectures, a compile assessment — and none of that
+    // crosses the conformance route. Offering a variant menu control cannot
+    // populate would produce a list whose every entry might fail. `recover`
+    // therefore sends `retry`, which is the action an operator wants from here
+    // nine times in ten; the report-driven choices stay on the node's screen
+    // until control has a route that carries the report.
+    auto node_action = [form, &dashboard, &selected_node](const std::string& action,
+                                                          const nlohmann::json& extra,
+                                                          const std::string& done) {
+        const auto snap = dashboard.snapshot();
+        if (selected_node < 0 || selected_node >= static_cast<int>(snap.nodes.size())) {
+            form->status = "no node selected";
+            form->status_ok = false;
+            return;
+        }
+        const auto& node = snap.nodes[static_cast<std::size_t>(selected_node)];
+        const auto name = node.hostname.empty() ? node.node_id : node.hostname;
+        std::string err;
+        if (dashboard.node_action(node.node_id, action, extra, err)) {
+            // "started", not "done". The node answered 202 and went to work; the
+            // activity panel below carries it from here. A status line claiming
+            // completion would be wrong for the entire duration of a build,
+            // which is the only duration that matters.
+            form->status = done + " started on " + name + " — watch Activity";
+            form->status_ok = true;
+        } else {
+            form->status = name + ": " + err;
+            form->status_ok = false;
+        }
+    };
+
+    auto provision_button = Button("Provision", [node_action] {
+        node_action("provision", nlohmann::json::object(), "provisioning");
+    });
+    auto check_update_button = Button("Check update", [node_action] {
+        node_action("check-update", nlohmann::json::object(), "update check");
+    });
+    auto diagnose_button = Button("Diagnose", [node_action] {
+        node_action("diagnose", nlohmann::json::object(), "diagnostics");
+    });
+    auto retry_button = Button("Retry build", [node_action] {
+        node_action("recover", nlohmann::json{{"action", "retry"}}, "retry");
+    });
+
     auto vllm_container = Container::Vertical({
         vllm_install, vllm_version,
         max_model_len, max_num_seqs, max_num_batched_tokens, tp, pp, gpu_util,
@@ -687,7 +761,14 @@ Component engine_tab(EngineDashboard& dashboard, int& selected_node, bool& force
     });
 
     auto edit_button = Button("Configure (e)", [form] { form->open = true; });
-    auto action_row = Container::Horizontal({edit_button, resync_button, share_button});
+    // Two rows: cluster-wide actions above, per-node ones below. The split is
+    // the distinction an operator has to keep straight — Resync touches every
+    // node behind the version, the second row touches exactly the highlighted
+    // one — and a single row of seven buttons would hide it.
+    auto cluster_row = Container::Horizontal({edit_button, resync_button, share_button});
+    auto node_row = Container::Horizontal(
+        {provision_button, check_update_button, diagnose_button, retry_button});
+    auto action_row = Container::Vertical({cluster_row, node_row});
 
     auto container = Container::Vertical({action_row, Maybe(form_container, &form->open)});
 

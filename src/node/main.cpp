@@ -29,6 +29,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <mutex>
 #include <set>
@@ -1106,6 +1107,63 @@ int main(int argc, char** argv) {
         return llama;
     };
 
+    // -- The one worker every llama.cpp action runs on -------------------------
+    //
+    // ONE, where there were two: update+switch shared a flag, recovery had its
+    // own, and the pair could both be "not running" while contending for
+    // `llama_operation_mutex` inside their workers. That made "busy" a lie in
+    // exactly the case an operator cares about - a recovery pressed during a
+    // build reported started, then sat on a mutex for the rest of the compile.
+    // Every one of these calls through the same provisioner under the same
+    // lock, so one flag is the true shape of the constraint.
+    //
+    // Returns whether a worker took the job. Both callers need that answer now:
+    // the TUI to leave its buttons disabled, and the API to answer 409 rather
+    // than 202. The TUI's callbacks are `void`-typed, which discards it - that
+    // is fine, it drives its own busy state from NodeActionProgress.
+    std::atomic<bool> llama_action_running{false};
+    std::thread llama_action_thread;
+    // Take the flag without spawning anything, for a caller that already has a
+    // thread of its own. The auto-update poll is the one such caller, and it
+    // has to hold this or "busy" would be false while it built for an hour.
+    auto claim_llama_action = [&]() {
+        bool expected = false;
+        return llama_action_running.compare_exchange_strong(expected, true);
+    };
+    auto dispatch_llama_action = [&](std::function<void()> work) -> bool {
+        if (!claim_llama_action()) return false;
+        // Joining the PREVIOUS worker, which the flag guarantees has finished
+        // its work - the flag is cleared last. This never blocks meaningfully;
+        // it reaps rather than waits.
+        if (llama_action_thread.joinable()) llama_action_thread.join();
+        llama_action_thread = std::thread([&, work = std::move(work)]() {
+            work();
+            llama_action_running = false;
+        });
+        return true;
+    };
+
+    auto request_manual_llama_provision = [&]() {
+        return dispatch_llama_action([&]() { ensure_llama_runtime(); });
+    };
+    auto request_manual_llama_update = [&](std::string accelerator) {
+        return dispatch_llama_action(
+            [&, accelerator = std::move(accelerator)]() { do_llama_update(accelerator); });
+    };
+    auto request_manual_llama_switch = [&](std::string variant) {
+        return dispatch_llama_action(
+            [&, variant = std::move(variant)]() { do_llama_switch(variant); });
+    };
+    auto request_manual_llama_check_update = [&]() {
+        return dispatch_llama_action([&]() { check_llama_update(); });
+    };
+    auto request_manual_llama_recovery = [&](std::string action, std::string variant) {
+        return dispatch_llama_action(
+            [&, action = std::move(action), variant = std::move(variant)]() {
+                do_llama_recovery(action, variant);
+            });
+    };
+
     // The update policy is now the CLUSTER's, read from the spec rather than
     // from this machine's .toml — that is the whole point of a master
     // configurator, and a node checking on its own schedule would be the first
@@ -1124,7 +1182,14 @@ int main(int argc, char** argv) {
             if (spec != nullptr && spec->update_check_interval_hours > 0)
                 interval_hours = spec->update_check_interval_hours;
 
-            if (enabled && mm::llama_runtime_usable(state.get_llama_runtime())) {
+            // Held across the check AND the update it may trigger, so an
+            // operator pressing Provision from control during a scheduled
+            // auto-update gets a 409 rather than a 202 followed by a silent
+            // wait on `llama_operation_mutex`. Skipping a cycle is the right
+            // loss: if an update is what was already running, this cycle had
+            // nothing to add.
+            if (enabled && mm::llama_runtime_usable(state.get_llama_runtime()) &&
+                claim_llama_action()) {
                 auto st = check_llama_update();
                 if (st.update_available && spec->update_policy == "auto") {
                     if (st.update_action == "unavailable") {
@@ -1137,6 +1202,7 @@ int main(int argc, char** argv) {
                         do_llama_update({});
                     }
                 }
+                llama_action_running = false;
             }
             const int64_t interval_ms =
                 static_cast<int64_t>(interval_hours) * 3600 * 1000;
@@ -1147,45 +1213,6 @@ int main(int argc, char** argv) {
         }
     });
 
-    // On-demand update worker for the TUI Update button/prompt: runs the (slow)
-    // install off the UI thread on a tracked thread that shutdown joins, so the
-    // update never outlives the objects it captures. One at a time.
-    std::atomic<bool> manual_llama_update_running{false};
-    std::thread manual_llama_update_thread;
-    auto request_manual_llama_update = [&](std::string accelerator) {
-        bool expected = false;
-        if (!manual_llama_update_running.compare_exchange_strong(expected, true)) return;
-        if (manual_llama_update_thread.joinable()) manual_llama_update_thread.join();
-        manual_llama_update_thread = std::thread(
-            [&, accelerator = std::move(accelerator)]() {
-                do_llama_update(accelerator);
-                manual_llama_update_running = false;
-            });
-    };
-    auto request_manual_llama_switch = [&](std::string variant) {
-        bool expected = false;
-        if (!manual_llama_update_running.compare_exchange_strong(expected, true)) return;
-        if (manual_llama_update_thread.joinable()) manual_llama_update_thread.join();
-        manual_llama_update_thread = std::thread(
-            [&, variant = std::move(variant)]() {
-                do_llama_switch(variant);
-                manual_llama_update_running = false;
-            });
-    };
-    std::atomic<bool> manual_llama_recovery_running{false};
-    std::thread manual_llama_recovery_thread;
-    auto request_manual_llama_recovery = [&](std::string action,
-                                             std::string variant) {
-        bool expected = false;
-        if (!manual_llama_recovery_running.compare_exchange_strong(expected, true)) return;
-        if (manual_llama_recovery_thread.joinable())
-            manual_llama_recovery_thread.join();
-        manual_llama_recovery_thread = std::thread(
-            [&, action = std::move(action), variant = std::move(variant)]() {
-                do_llama_recovery(action, variant);
-                manual_llama_recovery_running = false;
-            });
-    };
 
     std::mutex runtime_log_mutex;
     std::deque<std::string> runtime_logs;
@@ -1211,28 +1238,34 @@ int main(int argc, char** argv) {
     api_server.set_engine_manager(&engine_manager);
     api_server.set_engine_config_callback(apply_engine_config);
     api_server.set_ray_controller(&ray_controller);
+    // The API drives the SAME dispatcher the node TUI does, rather than calling
+    // the helpers directly as it used to. That is what makes control's Engines
+    // tab and this node's own screen one control plane instead of two: pressing
+    // Retry here and pressing it from control now contend for one worker and
+    // one busy flag, so the second gets a 409 instead of a second build racing
+    // the first through the provisioner.
     api_server.set_llama_provision_callback([&]() {
         MM_INFO("llama.cpp provisioning requested by user");
-        return ensure_llama_runtime();
+        return request_manual_llama_provision();
     });
     api_server.set_llama_update_callback([&](const std::string& accelerator) {
         MM_INFO("llama.cpp update requested by user (accelerator={})",
                 accelerator.empty() ? "current" : accelerator);
-        return do_llama_update(accelerator);
+        return request_manual_llama_update(accelerator);
     });
     api_server.set_llama_switch_callback([&](const std::string& variant) {
         MM_INFO("llama.cpp engine switch requested by user (variant={})", variant);
-        return do_llama_switch(variant);
+        return request_manual_llama_switch(variant);
     });
     api_server.set_llama_check_update_callback([&]() {
-        return check_llama_update();
+        return request_manual_llama_check_update();
     });
     api_server.set_llama_diagnose_callback([&]() {
-        return do_llama_recovery("diagnose", {});
+        return request_manual_llama_recovery("diagnose", {});
     });
     api_server.set_llama_recovery_callback(
         [&](const std::string& action, const std::string& variant) {
-            return do_llama_recovery(action, variant);
+            return request_manual_llama_recovery(action, variant);
         });
     api_server.set_remember_api_key_callback([&](const std::string& key) {
         remembered_api_keys.push_back(key);
@@ -1446,13 +1479,9 @@ int main(int argc, char** argv) {
     // check and aborts rather than holding shutdown for the rest of the build.
     engine_manager.shutdown();
     if (llama_update_check_thread.joinable()) llama_update_check_thread.join();
-    if (manual_llama_update_thread.joinable()) {
+    if (llama_action_thread.joinable()) {
         state.request_action_cancel();
-        manual_llama_update_thread.join();
-    }
-    if (manual_llama_recovery_thread.joinable()) {
-        state.request_action_cancel();
-        manual_llama_recovery_thread.join();
+        llama_action_thread.join();
     }
 
     state.stop_metrics_poll();

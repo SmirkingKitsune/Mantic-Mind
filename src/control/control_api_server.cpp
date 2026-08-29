@@ -1337,6 +1337,56 @@ void ControlApiServer::proxy_engine_get(const SlotId& engine_id,
     res.set_content(upstream->body, "application/json");
 }
 
+void ControlApiServer::proxy_node_engine_action(const NodeId& node_id,
+                                                const std::string& engine_id,
+                                                const std::string& action,
+                                                const std::string& body,
+                                                httplib::Response& res) const {
+    NodeInfo node;
+    try {
+        node = registry_.get_node(node_id);
+    } catch (const std::exception&) {
+        res.status = 404;
+        res.set_content(nlohmann::json{{"error", "no such node"}, {"node_id", node_id}}.dump(),
+                        "application/json");
+        return;
+    }
+    // Refused BEFORE the round trip, and with the node's name in it. A
+    // disconnected node is the ordinary reason one of these fails, and
+    // "connection refused" bubbling up as a 502 tells an operator less than
+    // this does about a node control already knows is down.
+    if (!node.connected) {
+        res.status = 409;
+        res.set_content(nlohmann::json{{"error", "node is not connected"},
+                                       {"node_id", node_id},
+                                       {"hostname", node.hostname}}
+                            .dump(),
+                        "application/json");
+        return;
+    }
+
+    httplib::Client cli(node.url);
+    // 30 s is generous for a handler that only starts a worker, and deliberately
+    // NOT sized for a build: if this ever needs minutes, the node has gone back
+    // to running the work inline and that is the bug to fix, not the timeout.
+    cli.set_read_timeout(30);
+    if (!node.api_key.empty()) cli.set_bearer_token_auth(node.api_key);
+    auto upstream = cli.Post(("/api/node/engines/" + engine_id + "/" + action).c_str(),
+                             body.empty() ? std::string("{}") : body,
+                             "application/json");
+    if (!upstream) {
+        res.status = 502;
+        res.set_content(nlohmann::json{{"error", "node unreachable"},
+                                       {"node_id", node_id},
+                                       {"hostname", node.hostname}}
+                            .dump(),
+                        "application/json");
+        return;
+    }
+    res.status = upstream->status;
+    res.set_content(upstream->body, "application/json");
+}
+
 bool ControlApiServer::authorize_external_request(const httplib::Request& req,
                                                   httplib::Response& res) const {
     // external_api_token_ is only for public control clients. Internal node
@@ -4713,6 +4763,60 @@ void ControlApiServer::register_routes() {
                             .dump(),
                         "application/json");
     });
+
+    // ── Per-node engine actions ──────────────────────────────────────────────
+    //
+    // The gap these close: the node has had provision / check-update / switch /
+    // diagnose / recover since the engine work landed, and NOTHING on control
+    // ever called them. The wizard that drives them lived only in the node's own
+    // TUI, wired in-process, so recovering a node meant opening a session on
+    // that machine — on a cluster head whose entire premise is that you do not
+    // have to.
+    //
+    // Worse, the one lever control DID offer was misleading. "Resync nodes"
+    // skips any node already at the current config version, and a node bumps its
+    // version when it ACCEPTS a config, not when it conforms to one. A node that
+    // accepted v3 and then failed its build sits at v3 forever: resync reports
+    // success and does nothing. These routes are the lever that actually moves
+    // it.
+    //
+    // Addressed by node id because that is the unit an operator is looking at in
+    // the conformance table, and because a node with no working engine has no
+    // slot to name.
+    for (const std::string action : {"provision", "check-update", "switch",
+                                     "diagnose", "recover"}) {
+        server_->Post("/v1/cluster/engines/nodes/:node_id/" + action,
+                      [this, action](const Request& req, Response& res) {
+                          // Engine id is a body field with a default rather than
+                          // a path segment: every one of these actions is
+                          // llama-cpp-only today, and the node says so by name
+                          // when it is not. Putting it in the path would invite
+                          // a caller to believe otherwise.
+                          std::string engine_id = "llama-cpp";
+                          if (!req.body.empty()) {
+                              try {
+                                  const auto j = nlohmann::json::parse(req.body);
+                                  engine_id = j.value("engine_id", engine_id);
+                              } catch (const std::exception& e) {
+                                  res.status = 400;
+                                  res.set_content(
+                                      nlohmann::json{{"error", std::string("invalid JSON body: ") +
+                                                                   e.what()}}
+                                          .dump(),
+                                      "application/json");
+                                  return;
+                              }
+                          }
+                          const auto& node_id = req.path_params.at("node_id");
+                          proxy_node_engine_action(node_id, engine_id, action, req.body, res);
+                          // Logged on the ACCEPTANCE only. A 409 or a 404 is not
+                          // work the cluster did, and an activity line for one
+                          // would read as a build that started and vanished.
+                          if (res.status == 202)
+                              publish_activity(0, "Engine " + action + " started on node " +
+                                                      node_id + " (" + engine_id + ")");
+                      });
+    }
 
     server_->Get("/v1/engines/:id/slots", [this](const Request& req, Response& res) {
         proxy_engine_get(req.path_params.at("id"), "/sequences", {}, res);

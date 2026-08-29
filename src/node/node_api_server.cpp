@@ -77,6 +77,41 @@ bool require_llama_engine(const httplib::Request& req, httplib::Response& res) {
     return false;
 }
 
+// The single answer every llama.cpp action route gives, because they all now
+// answer the same question: did a worker take the job?
+//
+// 202 rather than 200, and the distinction is the point. 200 would say the
+// action finished, and the caller would read `llama_runtime` as its OUTCOME —
+// but that snapshot is the state as the worker STARTED, so a provision that is
+// about to fail returns the healthy status it had a moment ago. Control would
+// paint green and move on. 202 plus the pre-action snapshot is honest: here is
+// where the node was, watch `action_progress` for where it goes.
+//
+// 409 for a refusal, not 200-with-a-flag: the operator pressed a button and
+// nothing happened, and that is a different outcome from the one they asked
+// for. All six actions serialise on one lock inside the node, so "busy" is a
+// real and reachable state rather than a theoretical race.
+void respond_action_started(httplib::Response& res,
+                            bool started,
+                            const std::string& action,
+                            NodeState& state) {
+    if (!started) {
+        res.status = 409;
+        res.set_content(
+            nlohmann::json{{"error", "another llama.cpp operation is already running"},
+                           {"action", action}}
+                .dump(),
+            "application/json");
+        return;
+    }
+    res.status = 202;
+    res.set_content(nlohmann::json{{"started", true},
+                                   {"action", action},
+                                   {"llama_runtime", state.get_llama_runtime()}}
+                        .dump(),
+                    "application/json");
+}
+
 // Load paths currently backing a live slot — models the store must never
 // evict out from under a running engine.
 std::set<std::string> loaded_model_paths(EngineSupervisor& engines) {
@@ -568,15 +603,10 @@ void NodeApiServer::register_routes() {
                             "application/json");
             return;
         }
-        auto runtime = want_update ? llama_update_cb_(accelerator)
-                                   : llama_provision_cb_();
-        state_.set_llama_runtime(runtime);
-        if (!runtime.last_error.empty()) state_.set_last_error(runtime.last_error);
-        if (runtime.status == "failed" || runtime.status == "disabled") res.status = 500;
-        else if (want_update && !runtime.last_error.empty()) res.status = 409;
-        else res.status = 200;
-        res.set_content(nlohmann::json{{"llama_runtime", runtime}}.dump(),
-                        "application/json");
+        const bool started = want_update ? llama_update_cb_(accelerator)
+                                         : llama_provision_cb_();
+        respond_action_started(res, started,
+                               want_update ? "update" : "provision", state_);
     });
 
     server_->Post("/api/node/engines/:id/check-update", [this](const Request& req, Response& res) {
@@ -590,10 +620,7 @@ void NodeApiServer::register_routes() {
                             "application/json");
             return;
         }
-        auto runtime = llama_check_update_cb_();
-        state_.set_llama_runtime(runtime);
-        res.set_content(nlohmann::json{{"llama_runtime", runtime}}.dump(),
-                        "application/json");
+        respond_action_started(res, llama_check_update_cb_(), "check-update", state_);
     });
 
     server_->Post("/api/node/engines/:id/switch", [this](const Request& req, Response& res) {
@@ -621,14 +648,7 @@ void NodeApiServer::register_routes() {
             res.set_content(R"({"error":"variant is required"})", "application/json");
             return;
         }
-        auto runtime = llama_switch_cb_(variant);
-        state_.set_llama_runtime(runtime);
-        if (!runtime.last_error.empty()) state_.set_last_error(runtime.last_error);
-        if (runtime.status == "failed" || runtime.status == "disabled") res.status = 500;
-        else if (!runtime.last_error.empty()) res.status = 409;
-        else res.status = 200;
-        res.set_content(nlohmann::json{{"llama_runtime", runtime}}.dump(),
-                        "application/json");
+        respond_action_started(res, llama_switch_cb_(variant), "switch", state_);
     });
 
     server_->Post("/api/node/engines/:id/diagnose", [this](const Request& req, Response& res) {
@@ -642,10 +662,7 @@ void NodeApiServer::register_routes() {
                             "application/json");
             return;
         }
-        auto runtime = llama_diagnose_cb_();
-        state_.set_llama_runtime(runtime);
-        res.set_content(nlohmann::json{{"llama_runtime", runtime}}.dump(),
-                        "application/json");
+        respond_action_started(res, llama_diagnose_cb_(), "diagnose", state_);
     });
 
     server_->Post("/api/node/engines/:id/recover", [this](const Request& req, Response& res) {
@@ -679,14 +696,7 @@ void NodeApiServer::register_routes() {
                 "application/json");
             return;
         }
-        auto runtime = llama_recovery_cb_(action, variant);
-        state_.set_llama_runtime(runtime);
-        if (!runtime.last_error.empty()) state_.set_last_error(runtime.last_error);
-        if (runtime.status == "failed") res.status = 500;
-        else if (!runtime.last_error.empty()) res.status = 409;
-        else res.status = 200;
-        res.set_content(nlohmann::json{{"llama_runtime", runtime}}.dump(),
-                        "application/json");
+        respond_action_started(res, llama_recovery_cb_(action, variant), action, state_);
     });
 
     server_->Get("/api/node/ray/status", [this](const Request& req, Response& res) {

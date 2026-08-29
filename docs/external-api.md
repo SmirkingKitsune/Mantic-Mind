@@ -470,6 +470,49 @@ Fingerprint equality is exact across `(engine_id, version, platform, arch, varia
 near-match is a wrong binary, not a close one. The receiving node re-checks the artifact against
 its own platform and arch, because control's view of a node is a report from that node.
 
+### `POST /v1/cluster/engines/nodes/{node_id}/provision` — `operator`
+### `POST /v1/cluster/engines/nodes/{node_id}/check-update` — `operator`
+### `POST /v1/cluster/engines/nodes/{node_id}/switch` — `operator`
+### `POST /v1/cluster/engines/nodes/{node_id}/diagnose` — `operator`
+### `POST /v1/cluster/engines/nodes/{node_id}/recover` — `operator`
+
+Run one engine action on one node. Control brokers to `/api/node/engines/{engine_id}/{action}`
+and passes the node's status and body through unchanged.
+
+**Why these exist, stated as the gap they close.** The node has had these actions since the
+engine work landed and nothing on control ever called them: the wizard driving them lived only
+in the node's own TUI, wired in-process. Recovering a node meant opening a session on that
+machine — on a cluster head whose premise is that you do not have to.
+
+**And why `resync` was not already enough.** `POST /v1/cluster/engines/resync` re-pushes only to
+nodes whose config *version* differs, and a node bumps its version when it **accepts** a
+configuration, not when it **conforms** to one. A node that accepted v3 and then failed its
+build sits at v3 with state `failed`: resync skips it and answers `{"resynced": true}`. These
+routes are the lever that actually moves that node.
+
+Addressed by node, not by engine — a node with no working engine has no slot to name, and
+provisioning is precisely what a node does when it has none.
+
+| field | where | meaning |
+|---|---|---|
+| `engine_id` | body, default `llama-cpp` | every action is llama.cpp-only today; the node refuses others by name with a `400` |
+| `variant` | body, **required** for `switch` | execution variant, e.g. `cuda-12`, `vulkan`, `cpu` |
+| `action` | body, **required** for `recover` | `retry` \| `target` \| `compile-anyway` \| `release` |
+| `variant` | body, required when `action: "release"` | a report variant id |
+| `update`, `accelerator` | body, `provision` only | `update: true` runs an update instead; `accelerator` is valid only with it |
+
+**`202`, not `200`.** The node starts a worker and returns; it does not run the action on the
+request. A source build is minutes, and a synchronous handler would hold a connection across it
+on both ends while control's health poll marked the node unreachable in the middle. The body
+carries `started`, the action, and `llama_runtime` **as it was when the worker started** — a
+starting point, not an outcome. Watch progress through `action_progress` on
+`GET /v1/cluster/engines/conformance`, which the Engines tab renders as its Activity panel.
+
+`409` when another llama.cpp operation is already running on that node, or when the node is not
+connected. All six actions serialise on one worker inside the node — including its scheduled
+auto-update — so an operator pressing Provision during a build is refused rather than queued
+behind it. `404` for an unknown node, `502` when the node does not answer.
+
 ---
 
 ## 6. Runtime telemetry

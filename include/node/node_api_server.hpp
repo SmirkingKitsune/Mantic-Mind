@@ -59,16 +59,31 @@ public:
 
     using RuntimeLogsProvider = std::function<std::vector<std::string>(int tail)>;
     using RememberApiKeyCallback = std::function<void(const std::string& key)>;
-    using LlamaProvisionCallback = std::function<LlamaRuntimeStatus()>;
+    /// The six llama.cpp actions START work and return; they do not run it.
+    ///
+    /// They used to run it, on the HTTP handler's own thread, and that was only
+    /// survivable while nothing called them: a source build is minutes, and the
+    /// node TUI — the sole caller — never went through HTTP at all. It
+    /// dispatched onto a worker and watched NodeActionProgress. The moment
+    /// control gained buttons for these, a synchronous handler became a
+    /// connection held open across a compile, on both ends, with control's
+    /// health poll marking the node unreachable in the middle of it.
+    ///
+    /// So the contract is the one the TUI already had: `true` means a worker
+    /// took the job, `false` means one was already running. Progress is read
+    /// back from `/api/node/status`'s `action_progress`, which control already
+    /// relays into the conformance route and the Engines tab already renders.
+    /// Nothing new had to be built to watch the work; it only had to stop
+    /// pretending the answer was ready when the request returned.
+    using LlamaProvisionCallback = std::function<bool()>;
     // accelerator is empty for the current target, or an explicit release
     // alternative selected from LlamaRuntimeStatus.
-    using LlamaUpdateCallback = std::function<LlamaRuntimeStatus(const std::string& accelerator)>;
-    using LlamaSwitchCallback = std::function<LlamaRuntimeStatus(const std::string& variant)>;
-    using LlamaCheckUpdateCallback = std::function<LlamaRuntimeStatus()>;
-    using LlamaDiagnoseCallback = std::function<LlamaRuntimeStatus()>;
+    using LlamaUpdateCallback = std::function<bool(const std::string& accelerator)>;
+    using LlamaSwitchCallback = std::function<bool(const std::string& variant)>;
+    using LlamaCheckUpdateCallback = std::function<bool()>;
+    using LlamaDiagnoseCallback = std::function<bool()>;
     using LlamaRecoveryCallback =
-        std::function<LlamaRuntimeStatus(const std::string& action,
-                                         const std::string& variant)>;
+        std::function<bool(const std::string& action, const std::string& variant)>;
     void set_runtime_logs_provider(RuntimeLogsProvider provider);
     void set_remember_api_key_callback(RememberApiKeyCallback callback);
     void set_llama_provision_callback(LlamaProvisionCallback callback);

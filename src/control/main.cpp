@@ -748,7 +748,7 @@ static void run_control_cli(uint16_t listen_port,
         if (cmd0 == "engines") {
             if (tokens.size() < 2) {
                 printer.line("usage: engines show|conform|ray|setup|set|resync|share|running|"
-                             "heat|slots ...");
+                             "heat|slots|provision|check-update|switch|diagnose|recover ...");
                 continue;
             }
             const std::string sub = mm::util::to_lower(tokens[1]);
@@ -911,8 +911,47 @@ static void run_control_cli(uint16_t listen_port,
                                  self.post("/v1/cluster/engines/share", body));
                 continue;
             }
+            // Per-node engine actions. The verb an operator reaches for when a
+            // node reports `failed` and `engines resync` did nothing — which it
+            // will, because resync skips any node already at the current config
+            // version and a node bumps that on ACCEPTING a config, not on
+            // conforming to one.
+            //
+            // The node answers 202 and works in the background, so these print a
+            // start receipt rather than an outcome. `engines conform` is where
+            // the outcome shows up.
+            if (sub == "provision" || sub == "check-update" || sub == "diagnose" ||
+                sub == "switch" || sub == "recover") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: engines " + sub + " <node_id>" +
+                                 (sub == "switch" ? " <variant>"
+                                  : sub == "recover"
+                                      ? " [retry|target|compile-anyway|release <variant>]"
+                                      : ""));
+                    continue;
+                }
+                nlohmann::json body = nlohmann::json::object();
+                if (sub == "switch") {
+                    if (tokens.size() < 4) {
+                        printer.line("usage: engines switch <node_id> <variant>");
+                        continue;
+                    }
+                    body["variant"] = tokens[3];
+                }
+                if (sub == "recover") {
+                    // Defaulted, because retry is the one an operator wants from
+                    // a REPL; the report-driven actions need the node's
+                    // troubleshooting matrix in front of you to choose between.
+                    body["action"] = tokens.size() > 3 ? tokens[3] : std::string("retry");
+                    if (tokens.size() > 4) body["variant"] = tokens[4];
+                }
+                emit_http_result(
+                    "engines " + sub,
+                    self.post("/v1/cluster/engines/nodes/" + tokens[2] + "/" + sub, body));
+                continue;
+            }
             printer.line("usage: engines show|conform|setup|set|resync|share|running|"
-                         "heat|slots ...");
+                         "heat|slots|provision|check-update|switch|diagnose|recover ...");
             continue;
         }
 

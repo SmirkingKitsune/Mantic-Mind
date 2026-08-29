@@ -142,6 +142,26 @@ private:
                           const std::string& query,
                           httplib::Response& res) const;
 
+    /// Forward one engine ACTION to a named node.
+    ///
+    /// Addressed by NODE, not by engine: provisioning is what a node does when
+    /// it has no engine yet, so `find_engine_node` — which searches live slots —
+    /// would fail on precisely the node an operator needs to fix. That
+    /// asymmetry is why this is a second helper rather than a verb on the
+    /// first.
+    ///
+    /// The node answers 202/409 and returns immediately (see
+    /// NodeApiServer's llama action callbacks), so this holds no connection
+    /// across a build and needs no long timeout. Status and body are passed
+    /// through verbatim: a 400 saying "this action exists only for llama-cpp"
+    /// is the node's sentence to say, and rewording it here would give an
+    /// operator a second vocabulary for one fault.
+    void proxy_node_engine_action(const NodeId& node_id,
+                                  const std::string& engine_id,
+                                  const std::string& action,
+                                  const std::string& body,
+                                  httplib::Response& res) const;
+
     // Runs on the AgentQueue worker thread: builds context, routes to node,
     // proxies SSE, persists messages, fires callbacks.
     void handle_chat(const AgentId& agent_id,

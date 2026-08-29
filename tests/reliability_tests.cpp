@@ -580,6 +580,129 @@ bool test_slot_lease_blocks_unload_and_suspend_while_busy() {
     return true;
 }
 
+// The node's engine ACTIONS answer while the work is still running.
+//
+// They did not. `provision`, `switch`, `recover`, `diagnose` and `check-update`
+// ran their callback inline on the HTTP handler, and a llama.cpp source build is
+// minutes — so the handler held the connection across a compile and control's
+// 30 s health poll marked the node unreachable in the middle of it. That was
+// survivable for exactly as long as nothing called these routes, which is how it
+// survived: the wizard driving them lived in the node's own TUI and never went
+// through HTTP. Roadmap D67.
+//
+// Asserted the only way that means anything — by TIMING the response against a
+// callback that is still working when it arrives. Checking the status code alone
+// would pass against a handler that blocked and then returned 202.
+bool test_engine_actions_answer_before_the_work_finishes() {
+    mm::NodeState state;
+    state.add_api_key("test-node-key");
+    mm::EngineSupervisor engines(46160, 46165, /*max_slots=*/1);
+
+    mm::NodeApiServer api(state, engines);
+
+    // The single-flight dispatcher the node wires in main(), reproduced here
+    // because it is the CONTRACT the handler codes against: true = a worker took
+    // it, false = one is already running. A test that stubbed `return true`
+    // would never reach the 409 branch.
+    std::atomic<bool> running{false};
+    std::atomic<bool> release{false};
+    std::atomic<int> ran{0};
+    std::thread worker;
+    auto dispatch = [&]() {
+        bool expected = false;
+        if (!running.compare_exchange_strong(expected, true)) return false;
+        if (worker.joinable()) worker.join();
+        worker = std::thread([&] {
+            // Stands in for the build. Long enough that a synchronous handler
+            // could not possibly have returned inside the window checked below.
+            while (!release) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            ++ran;
+            running = false;
+        });
+        return true;
+    };
+    api.set_llama_provision_callback([&] { return dispatch(); });
+    api.set_llama_recovery_callback(
+        [&](const std::string&, const std::string&) { return dispatch(); });
+
+    std::thread listener([&] { api.listen(46170); });
+    struct Teardown {
+        mm::NodeApiServer* api;
+        mm::EngineSupervisor* engines;
+        std::thread* listener;
+        std::thread* worker;
+        std::atomic<bool>* release;
+        ~Teardown() {
+            *release = true;
+            api->stop();
+            engines->stop_processes();
+            if (listener->joinable()) listener->join();
+            api->drain_workers();
+            if (worker->joinable()) worker->join();
+            engines->unload_all();
+        }
+    } teardown{&api, &engines, &listener, &worker, &release};
+
+    auto client = [] {
+        mm::HttpClient c("http://127.0.0.1:46170");
+        c.set_bearer_token("test-node-key");
+        return c;
+    };
+    bool up = false;
+    for (int i = 0; i < 200 && !up; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        up = client().get("/api/node/health").ok();
+    }
+    CHECK(up);
+
+    // ── 1. the answer arrives while the worker is still blocked ──────────────
+    const auto sent = std::chrono::steady_clock::now();
+    const auto first = client().post("/api/node/engines/llama-cpp/provision",
+                                     nlohmann::json::object());
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - sent).count();
+    CHECK(first.status == 202);
+    // Two seconds is not a tuned threshold; it is "obviously less than a build".
+    // The old handler could not return until `release` was set, which happens in
+    // this test's teardown — i.e. never, within this window.
+    CHECK(elapsed < 2000);
+    CHECK(running.load());
+    CHECK(ran.load() == 0);
+
+    // 202 carries a STARTING POINT, not an outcome — the distinction the status
+    // code exists to make.
+    const auto body = nlohmann::json::parse(first.body);
+    CHECK(body.value("started", false));
+    CHECK(body.value("action", std::string{}) == "provision");
+    CHECK(body.contains("llama_runtime"));
+
+    // ── 2. a second action while the first runs is REFUSED, not queued ───────
+    //
+    // 409 rather than a second 202: every one of these serialises on one lock
+    // inside the node, so a second "started" would be a 202 followed by a silent
+    // wait for the rest of the build. An operator pressing a button in control's
+    // Engines tab while the node's own screen is mid-build must be told.
+    const auto second = client().post("/api/node/engines/llama-cpp/recover",
+                                      nlohmann::json{{"action", "retry"}});
+    CHECK(second.status == 409);
+
+    // ── 3. and a non-llama engine is still refused by NAME ───────────────────
+    const auto wrong = client().post("/api/node/engines/soma/provision",
+                                     nlohmann::json::object());
+    CHECK(wrong.status == 400);
+    CHECK(wrong.body.find("llama-cpp") != std::string::npos);
+
+    // Let the worker finish so the run is not merely "never started".
+    release = true;
+    bool finished = false;
+    for (int i = 0; i < 400 && !finished; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        finished = ran.load() == 1 && !running.load();
+    }
+    CHECK(finished);
+    return true;
+}
+
 bool test_failed_inference_workers_are_harvested_and_drained() {
     // A generation runs on its own thread while the SSE handler streams what it
     // produces, so the node has to track those threads and eventually collect
@@ -8604,6 +8727,8 @@ int main(int argc, char** argv) {
          test_crashed_engine_releases_its_slot_and_port},
         {"failed_inference_workers_are_harvested_and_drained",
          test_failed_inference_workers_are_harvested_and_drained},
+        {"engine_actions_answer_before_the_work_finishes",
+         test_engine_actions_answer_before_the_work_finishes},
         {"concurrent_engine_config_pushes_do_not_terminate",
          test_concurrent_engine_config_pushes_do_not_terminate},
         {"engine_config_pushes_coalesce_and_reject_stale",

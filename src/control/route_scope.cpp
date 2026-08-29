@@ -194,6 +194,17 @@ std::vector<RouteScope> route_scope_table() {
         {"POST", "/v1/cluster/engines/resync", Scope::Operator},
         {"POST", "/v1/cluster/engines/share", Scope::Operator},
 
+        // Per-node engine actions. Operator, and not admin, for the same reason
+        // resync is: the blast radius is one node's engine, which is smaller
+        // than the config PUT already sitting at this scope. Read cannot have
+        // them — `provision` starts a source build, which is unbounded work on
+        // someone else's machine.
+        {"POST", "/v1/cluster/engines/nodes/:node_id/provision", Scope::Operator},
+        {"POST", "/v1/cluster/engines/nodes/:node_id/check-update", Scope::Operator},
+        {"POST", "/v1/cluster/engines/nodes/:node_id/switch", Scope::Operator},
+        {"POST", "/v1/cluster/engines/nodes/:node_id/diagnose", Scope::Operator},
+        {"POST", "/v1/cluster/engines/nodes/:node_id/recover", Scope::Operator},
+
         // ── cluster ──────────────────────────────────────────────────────────
         {"GET", "/v1/nodes", Scope::Read},
         {"GET", "/v1/nodes/discovered", Scope::Read},
