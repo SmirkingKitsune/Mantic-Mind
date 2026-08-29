@@ -121,6 +121,58 @@ DENSE_SUFFIXES = (
     # against `mlp.shared_expert.*`. One row, and it decides how much of the
     # whole shared branch reaches the residual stream.
     "mlp.shared_expert_gate.weight",
+    # ── the router bias, under the OTHER block name ──
+    #
+    # `mlp.gate.e_score_correction_bias` is listed above; Kimi spells the same
+    # role under `block_sparse_moe`, which is where its gate lives natively
+    # rather than only in a production dialect. `gqa.cpp` binds it by
+    # `naming.moe_block + ".gate.e_score_correction_bias"`, so both spellings are
+    # real and both have to be claimed here.
+    "block_sparse_moe.gate.e_score_correction_bias",
+    # ── Kimi Delta Attention ──
+    #
+    # A SECOND linear-attention family, and it does NOT reuse the `linear_attn.*`
+    # names above. Qwen3.5's GDN hangs off `linear_attn` with fused `in_proj_*`;
+    # Kimi's KDA hangs off `self_attn` with separate q/k/v projections, a
+    # per-projection short convolution, and a low-rank forget gate (`f_a`/`f_b`).
+    # Same idea, different module, different spellings — and the whole reason
+    # `soma/arch/kda.cpp` exists separately from `gdn.cpp`.
+    #
+    # `A_log` and `dt_bias` are bare nn.Parameters and carry no `.weight`, the
+    # same trap `linear_attn.A_log` documents above.
+    "self_attn.q_conv1d.weight", "self_attn.k_conv1d.weight",
+    "self_attn.v_conv1d.weight",
+    # Genuinely optional siblings: ShortConvolution builds with or without a
+    # bias, and kda.cpp binds these `optional=true`. Listed so a checkpoint that
+    # HAS them is not refused for carrying a tensor the engine would have used.
+    "self_attn.q_conv1d.bias", "self_attn.k_conv1d.bias",
+    "self_attn.v_conv1d.bias",
+    "self_attn.f_a_proj.weight", "self_attn.f_b_proj.weight",
+    "self_attn.b_proj.weight", "self_attn.A_log", "self_attn.dt_bias",
+    "self_attn.o_norm.weight",
+    # The output gate's rank is architecture, not a fallback: a full-rank
+    # checkpoint has `g_proj` and no `g_a`/`g_b`, a low-rank one the reverse.
+    # Both listed because an absent suffix costs nothing, and refusing the one
+    # the checkpoint happens to use would be the whole model.
+    "self_attn.g_proj.weight",
+    "self_attn.g_a_proj.weight", "self_attn.g_b_proj.weight",
+    # ── latent MoE ──
+    #
+    # Kimi routes experts in a COMPRESSED space: the routed contribution is
+    # projected down, summed over experts, then projected back up, with an
+    # optional norm between. `f32_model.cpp` refuses a layer that declares a
+    # latent MoE and has no down/up pair, so these are not decoration.
+    "block_sparse_moe.routed_expert_down_proj.weight",
+    "block_sparse_moe.routed_expert_up_proj.weight",
+    "block_sparse_moe.routed_expert_norm.weight",
+    # ── block residual gating ──
+    #
+    # A learned per-block residual scale, active when `attn_res_block_size != 0`.
+    # `_proj` is one row against d_model — small, resident, and read every token.
+    # Dropping these does not fail to load; it silently removes the gate, which
+    # is the failure mode this whole completeness check exists for.
+    "self_attention_res_norm.weight", "self_attention_res_proj.weight",
+    "mlp_res_norm.weight", "mlp_res_proj.weight",
 )
 
 # Named exclusions, so "unclaimed" below means genuinely unaccounted for.
@@ -132,7 +184,13 @@ DENSE_SUFFIXES = (
 # fourth architecture's weights vanished without a word.
 # Non-layer tensors, named once so the completeness check and the copy loop
 # below cannot disagree about what counts as claimed.
-TOP_LEVEL_TENSORS = ("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight")
+TOP_LEVEL_TENSORS = ("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
+                     # The residual gate's OUTPUT half, which lives beside
+                     # `model.norm` rather than inside a layer — bound by
+                     # kda.cpp against the model, not the layer. Absent from
+                     # every other family, and costing nothing when absent.
+                     "model.output_attn_res_norm.weight",
+                     "model.output_attn_res_proj.weight")
 
 IGNORED_PATTERNS = (
     ".experts.",              # routed experts: written to the expert payload
@@ -202,6 +260,40 @@ SOURCE_DIALECTS = {
         "shared_block": "block_sparse_moe.shared_experts",
         # Mixtral's expert spelling, on a model that is not Mixtral.
         "experts": {"gate": "w1.weight", "up": "w3.weight", "down": "w2.weight"},
+    },
+    # Kimi-K3: the SAME language model the fixture carries, under a wrapper.
+    #
+    # `KimiK3ForConditionalGeneration.__init__` builds exactly three submodules —
+    # `vision_tower` (MoonViT3d), `mm_projector`, and `language_model`, which is
+    # a `KimiLinearForCausalLM`. That last one is `tests/fixtures/tiny/
+    # Kimi-Linear-Tiny` verbatim, so unlike MiniMax-M3 there is NOTHING to rename
+    # below the prefix: the production shards spell `block_sparse_moe.experts.
+    # <i>.w1.weight` and so does the fixture. An empty `suffixes` is the finding,
+    # not an omission — this wrapper differs from its text model by a prefix and
+    # a vision tower, and nothing else.
+    #
+    # AND `moe_block` IS DELIBERATELY ABSENT, which is the subtle half.
+    #
+    # The key does not mean "this checkpoint's MoE block is called X". In
+    # `to_soma_name` it means "rewrite X.* to mlp.*" — it exists because
+    # MiniMax-M3 says `block_sparse_moe` where Soma binds `mlp`. Kimi binds
+    # `block_sparse_moe` itself, so declaring it here would rename every expert
+    # to a name the loader does not bind. Written out because the first attempt
+    # at this entry did exactly that, and the round trip caught it:
+    # `block_sparse_moe.experts.5.w1.weight` came back as `mlp.experts.5...`.
+    #
+    # The block names the COPY LOOP needs come from FAMILY_NAMING instead, keyed
+    # on `kimi_k3` and `kimi_linear` alike, so the wrapped and unwrapped
+    # checkpoints read one table rather than two that must agree.
+    "kimi_k3": {
+        "prefix": "language_model.",
+        "suffixes": {},
+        # The half Soma does not serve, by module prefix rather than a wildcard,
+        # so a tower that grows a new module kind lands in `unclaimed` and
+        # refuses instead of disappearing. These are the two names __init__
+        # creates beside `language_model`; `quantization_config.ignore` in the
+        # production config names the same two.
+        "drop": ("vision_tower.", "mm_projector."),
     },
 }
 
@@ -616,23 +708,41 @@ def main(argv: list[str]) -> int:
     # SOURCE spellings, which is what `get()` is asked for. `to_soma_name`
     # rewrites them on the way into the container.
     src_prefix = dialect.get("prefix", "")
-    moe_block = dialect.get(
-        "moe_block", "block_sparse_moe" if model_type == "mixtral" else "mlp")
-    # SINGULAR for the Qwen families, plural everywhere else. Mirrors
-    # `TensorNaming::shared_block` in src/soma/arch_ir.cpp — one character, and
-    # getting it wrong drops the shared expert from the container without a word
-    # because the copy loop simply finds no tensor of that name.
+    # Families whose MoE block is not `mlp` and/or whose experts are not
+    # gate/up/down. ONE table rather than three parallel `model_type ==` tests,
+    # because those have to agree with each other and nothing made them: Kimi
+    # needs the Mixtral block name AND the Mixtral expert spelling AND the
+    # default shared-expert spelling, and a checkpoint that got two of the three
+    # converts into a container missing its experts.
+    #
+    # Mirrors `TensorNaming` in src/soma/arch_ir.cpp, which is the authority —
+    # `kimi_naming()` and `qwen3_5_naming()` there are these same rows.
+    MIXTRAL_EXPERTS = {"gate": "w1.weight", "up": "w3.weight", "down": "w2.weight"}
+    FAMILY_NAMING = {
+        "mixtral": {"moe_block": "block_sparse_moe", "experts": MIXTRAL_EXPERTS},
+        # Kimi uses BOTH conventions in one layer: routed experts spelled
+        # Mixtral's way under `block_sparse_moe`, while the dense and shared
+        # blocks stay gate/up/down. That is not an inconsistency to normalise —
+        # it is what the checkpoint contains, and arch_ir.cpp carries the blocks
+        # separately for exactly this reason.
+        "kimi_linear": {"moe_block": "block_sparse_moe", "experts": MIXTRAL_EXPERTS},
+        "kimi_k3": {"moe_block": "block_sparse_moe", "experts": MIXTRAL_EXPERTS},
+        # SINGULAR shared expert. One character against the plural default, and
+        # getting it wrong drops the shared expert from the container without a
+        # word, because the copy loop simply finds no tensor of that name.
+        "qwen3_5_moe_text": {"shared_block": "mlp.shared_expert"},
+        "qwen3_5_moe": {"shared_block": "mlp.shared_expert"},
+        "qwen2_moe": {"shared_block": "mlp.shared_expert"},
+    }
+    family = FAMILY_NAMING.get(model_type or "", {})
+
+    moe_block = dialect.get("moe_block", family.get("moe_block", "mlp"))
     shared_block = dialect.get(
-        "shared_block",
-        "mlp.shared_expert"
-        if model_type in ("qwen3_5_moe_text", "qwen3_5_moe", "qwen2_moe")
-        else f"{moe_block}.shared_experts")
+        "shared_block", family.get("shared_block", f"{moe_block}.shared_experts"))
     names = dialect.get(
         "experts",
-        {"gate": "w1.weight", "up": "w3.weight", "down": "w2.weight"}
-        if model_type == "mixtral"
-        else {"gate": "gate_proj.weight", "up": "up_proj.weight",
-              "down": "down_proj.weight"})
+        family.get("experts", {"gate": "gate_proj.weight", "up": "up_proj.weight",
+                               "down": "down_proj.weight"}))
 
     dt_gate = args.quant
     dt_up = args.quant

@@ -223,4 +223,26 @@ bool HttpClient::stream_post(const std::string& path,
     return true;
 }
 
+HttpClient::SseLineCallback HttpClient::capture_first_field(std::string field,
+                                                            std::string& out) {
+    return [field = std::move(field), &out](const std::string& payload) {
+        // The payload IS the JSON — drain_sse_lines stripped `data: ` and threw
+        // away comments and keepalives before we ever see it. The four callers
+        // this replaces each searched for that prefix, never matched, and
+        // silently read the whole stream to its end capturing nothing.
+        if (payload == "[DONE]") return true;
+        try {
+            const auto j = nlohmann::json::parse(payload);
+            auto value = j.value(field, std::string{});
+            if (!value.empty()) {
+                out = std::move(value);
+                return false; // got what we came for
+            }
+        } catch (...) {
+            // A partial or non-JSON frame; keep reading.
+        }
+        return true;
+    };
+}
+
 } // namespace mm
