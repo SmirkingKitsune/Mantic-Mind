@@ -40,7 +40,16 @@ expert miss:
   tokenizer.soma          compiled tokenizer      ) all three, or
   tokenizer_oracle.bin    golden ids for the gate ) tokenizer.unsupported
   tokenizer_meta.json                             ) with the reason
+  chat_oracle.bin         conversations + the ids HF's own renderer produced,
+                          or chat_template.unsupported with the reason
 ```
+
+The compiled chat template lives INSIDE `tokenizer.soma` (format 2; version 1 is still accepted and
+means the file carries none) rather than beside it, because a template is only meaningful against the
+tokenizer that resolved it to ids — two separate files could be paired wrongly, and the symptom would
+be a served model whose prompt framing is one vocabulary out. `chat_oracle.bin` is separate because it
+is the GRADER, not the artifact: the `chat_template` conformance stage fails a container that carries a
+template with nothing to check it against.
 
 DeepSeek V4 uses the compatible indexed/sharded resident form because its resident half is itself too
 large for a single dense sidecar:
@@ -90,6 +99,19 @@ did, and it is the only place the quantization exists at all: `dtype_gate_up`, `
 `effective_groups`, `expert_bytes`, `total_expert_bytes`, `n_shards`, `layer_kinds`, `dense_tensors`,
 and `tokenizer` (`compiled` | `unsupported`). `arch_hash` covers the quant map precisely so that the
 same weights at two quantizations are two models, with two verdicts and two sets of KV checkpoints.
+
+`source_quantization` records the codec the conversion read, which is a different fact from every other
+one in the file: `none` for an ordinary bf16/f32 upload, `fp8-e4m3-block-<bx>x<by>` for a blockwise-fp8
+one. Nothing else could tell those apart, because the container records the codec it WROTE and never the
+one it was handed — and they are not the same artifact. A q4_g container built from
+`zai-org/GLM-5.3` and one built from `zai-org/GLM-5.3-BF16` hold the same architecture and different
+numbers, and only the second can be compared against bf16 weights at all.
+
+The copied `config.json` is not that record and must not be read as one. It is verbatim, so a
+blockwise-fp8 source leaves a `quantization_config` in it that describes the **upload**, not the
+container — whose experts are `dtype_gate_up`/`dtype_down` and whose dense half is F32. Nothing in the
+engine reads that key, and `verify_payload.py` asks the source directory's own `config.json` rather than
+this copy, because `--source` may legitimately point at a different upload of the same weights.
 
 For v1 containers, the dense half is stored **F32 regardless of `--quant-dense`**, and that is
 deliberate: the loader

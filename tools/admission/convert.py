@@ -205,6 +205,108 @@ SOURCE_DIALECTS = {
     },
 }
 
+# ── blockwise fp8 source checkpoints ─────────────────────────────────────────
+#
+# DeepSeek-V3 introduced the layout and it is now what a frontier MoE ships
+# FIRST: every large Linear weight stored as `F8_E4M3` beside a
+# `<tensor>_scale_inv` holding one f32 multiplier per `weight_block_size` tile,
+# with the small tensors — norms, routers, embeddings, lm_head — published
+# unquantized and named in `modules_to_not_convert`.
+#
+# GLM-5.3 is the case that forced this. It is the SAME base model as GLM-5.2 —
+# byte-identical `config.json` but for `transformers_version` — so the engine,
+# the IR and the tokenizer needed nothing at all. What it changed is the upload:
+# GLM-5.2's primary is bf16, GLM-5.3's primary is fp8 at 756 GB with the bf16
+# twin in a separate 1.5 TB repo. Refusing the primary meant "Soma supports
+# GLM-5.3" quietly meant "fetch it twice and keep the larger copy".
+#
+# This is NOT the general "re-quantize whatever is already packed", which the
+# refusal in main() still stops. Blockwise fp8 dequantizes EXACTLY — one
+# multiply per tile, no unpacking, no codebook, no shape inference — so what
+# reaches `quantize_rows` is the same fp32 matrix the bf16 upload would have
+# produced, less the fp8 rounding the publisher had already applied. AWQ, GPTQ
+# and compressed-tensors pack sub-byte levels in layouts of their own, and
+# quantizing their packed bytes yields a container that loads, streams and
+# generates noise.
+FP8_SCALE_SUFFIX = "_scale_inv"
+
+# `torch.float8_e4m3fn` is the dtype safetensors reports as `F8_E4M3`; the `fnuz`
+# variant is the same width with a different exponent bias and is what ROCm-side
+# uploads carry. Named here rather than tested inline so that adding a third
+# spelling is one edit, not a grep.
+FP8_DTYPE_NAMES = ("float8_e4m3fn", "float8_e4m3fnuz")
+
+
+def source_fp8_block(cfg: dict) -> tuple[tuple[int, int] | None, str | None]:
+    """The blockwise-fp8 tile shape of this checkpoint, or why it is refused.
+
+    Returns `(None, None)` for an ordinary bf16/f32 upload, `((bx, by), None)`
+    for one this converter dequantizes, and `(None, reason)` for a packed format
+    it must refuse. Never raises: the caller owns the refusal text.
+    """
+    quant = cfg.get("quantization_config")
+    if not isinstance(quant, dict):
+        return None, None
+    method = str(quant.get("quant_method", "?"))
+    # `fmt` is the spelling DeepSeek and GLM upload; `format` is
+    # compressed-tensors'. Reading only `format` printed "format ?" about a
+    # checkpoint that states `e4m3` plainly, which is the least useful half of a
+    # refusal message.
+    fmt = str(quant.get("fmt") or quant.get("format") or "?")
+    if method != "fp8" or fmt != "e4m3":
+        return None, f"{method}, format {fmt}"
+
+    block = quant.get("weight_block_size")
+    if not (isinstance(block, list) and len(block) == 2
+            and all(isinstance(b, int) and b > 0 for b in block)):
+        return None, (f"fp8/e4m3 with weight_block_size {block!r} — per-tensor "
+                      f"and per-channel fp8 scales are a different layout, and "
+                      f"guessing between them mis-scales every weight")
+    # ue8m0 scales are DeepSeek-V4's, and V4 has its own converter. The generic
+    # path has never been handed one, so it says so rather than assuming the
+    # exponent bias and being wrong by a power of two per tile.
+    scale_fmt = quant.get("scale_fmt")
+    if scale_fmt not in (None, "f32", "float32", "e4m3"):
+        return None, f"fp8/e4m3 with scale_fmt {scale_fmt!r}"
+    return (int(block[0]), int(block[1])), None
+
+
+def dequantize_fp8_block(w, s, block: tuple[int, int], name: str):
+    """Blockwise fp8 -> f32: one scale per `block` tile of the last two axes.
+
+    `weight_scale_inv` is the MULTIPLIER — the inverse of the divisor that pushed
+    the weight into e4m3 range — so this multiplies. Getting that backwards
+    produces a container whose every weight is off by a per-tile factor near 400,
+    and it loads, streams and answers nonsense.
+
+    The tile grid is CEILED rather than exact: a row or column count that is not
+    a multiple of the tile is covered by one more scale, so the expanded grid is
+    CROPPED to the weight rather than reshaped to it. Reshaping would silently
+    succeed on the common case where everything divides evenly and raise on the
+    one checkpoint that does not.
+
+    Leading axes are carried through untouched, which is what makes a FUSED
+    expert stack — `(experts, 2*intermediate, hidden)` — work without a second
+    code path.
+    """
+    import numpy as np
+
+    if w.ndim < 2:
+        raise SystemExit(
+            f"  REFUSED  {name} is fp8 with a blockwise scale, but it is "
+            f"{w.ndim}-D; the layout is defined on the last two axes")
+    bx, by = block
+    rows, cols = w.shape[-2], w.shape[-1]
+    want = w.shape[:-2] + (-(-rows // bx), -(-cols // by))
+    s = np.asarray(s, dtype=np.float32)
+    if s.shape != want:
+        raise SystemExit(
+            f"  REFUSED  fp8 scale for {name} is {s.shape}, expected {want} for "
+            f"a {'x'.join(str(d) for d in w.shape)} weight in {bx}x{by} tiles")
+    s = np.repeat(np.repeat(s, bx, axis=-2), by, axis=-1)
+    return w * s[..., :rows, :cols]
+
+
 _LAYER_RE = re.compile(r"^(model\.layers\.\d+\.)(.*)$")
 
 
@@ -584,21 +686,27 @@ def main(argv: list[str]) -> int:
         print("           the architecture verdict before converting.")
         return 3
 
-    # compressed-tensors ships weights already packed at 4 bits with their own
-    # scale layout. Every reader below assumes bf16/f32 source tensors and would
-    # quantize the PACKED BYTES as if they were weights — producing a container
-    # that loads, streams, and generates noise.
-    quant_cfg = cfg.get("quantization_config")
-    if isinstance(quant_cfg, dict):
-        method = quant_cfg.get("quant_method", "?")
-        fmt = quant_cfg.get("format", "?")
+    # compressed-tensors, AWQ and GPTQ ship weights already packed at 4 bits with
+    # their own scale layout. Every reader below assumes f32-widenable source
+    # tensors and would quantize the PACKED BYTES as if they were weights —
+    # producing a container that loads, streams, and generates noise.
+    #
+    # Blockwise fp8 is the one exception, and it is an exception on the merits
+    # rather than as a convenience — see FP8_SCALE_SUFFIX above.
+    fp8_block, quant_refusal = source_fp8_block(cfg)
+    if quant_refusal is not None:
         print(f"  REFUSED  {src.name}: checkpoint is already quantized "
-              f"({method}, format {fmt}).")
-        print("           convert.py quantizes FROM bf16/f32; re-quantizing "
-              "packed bytes yields a")
-        print("           container that loads and generates noise. Convert "
-              "from an unquantized upload.")
+              f"({quant_refusal}).")
+        print("           convert.py quantizes FROM f32, bf16, or blockwise fp8; "
+              "re-quantizing")
+        print("           packed bytes yields a container that loads and "
+              "generates noise. Convert")
+        print("           from an unquantized upload.")
         return 3
+    if fp8_block is not None:
+        print(f"  fp8 source: {src.name} is blockwise fp8, "
+              f"{fp8_block[0]}x{fp8_block[1]} tiles; every fp8 tensor "
+              f"dequantizes to f32 on read.")
 
     n_layers = int(cfg.get("num_hidden_layers", 0))
     if args.layers:
@@ -730,7 +838,32 @@ def main(argv: list[str]) -> int:
         # and lm_head (1.2 GB each) were correct while every per-layer tensor was
         # all zeros. The engine then emitted a uniform distribution — KL 11.93
         # nats against a reference, which is ln(151936) to five figures.
-        return handle_for(path).get_tensor(name).to(torch.float32).numpy().copy()
+        raw = handle_for(path).get_tensor(name)
+        is_fp8 = str(raw.dtype).rsplit(".", 1)[-1] in FP8_DTYPE_NAMES
+        w = raw.to(torch.float32).numpy().copy()
+        if not is_fp8:
+            # Includes every tensor an fp8 upload publishes unquantized — the
+            # norms, the router, embed_tokens, lm_head. Driven by the tensor's
+            # own DTYPE rather than by matching `modules_to_not_convert` by name:
+            # the file already states which tensors are fp8, and a second copy of
+            # that fact is a second thing that can be stale.
+            return w
+        scale_path = owner.get(name + FP8_SCALE_SUFFIX)
+        if scale_path is None:
+            # Loud, because the quiet version of this is the failure this
+            # codebase keeps paying for: an fp8 weight read without its scale is
+            # a real matrix roughly 400x too small, and it converts, loads,
+            # streams and answers nonsense.
+            raise SystemExit(
+                f"  REFUSED  {name} is stored as fp8 and no "
+                f"{name + FP8_SCALE_SUFFIX} accompanies it. Reading it unscaled "
+                f"would produce a container that loads and is wrong.")
+        # .copy() for the same reason as above — an already-f32 scale makes
+        # .to(float32) a no-op and .numpy() a view into mmapped storage that the
+        # handle cache is free to close.
+        s = handle_for(scale_path).get_tensor(
+            name + FP8_SCALE_SUFFIX).to(torch.float32).numpy().copy()
+        return dequantize_fp8_block(w, s, fp8_block, name)
 
     # ── experts ──────────────────────────────────────────────────────────────
     index: list[tuple[int, int, int]] = []
@@ -786,6 +919,14 @@ def main(argv: list[str]) -> int:
     def is_ignored(name: str) -> bool:
         if any(p in name for p in IGNORED_PATTERNS):
             return True
+        # A blockwise-fp8 scale is not a tensor this converter DROPS — it is
+        # consumed, by dequantizing the weight it belongs to. So it is claimed
+        # exactly when that weight is, which is stricter than an IGNORED_PATTERNS
+        # entry would be: a scale whose weight is unaccounted for still refuses,
+        # rather than vanishing alongside the tensor it was supposed to scale.
+        if fp8_block is not None and name.endswith(FP8_SCALE_SUFFIX):
+            weight = name[: -len(FP8_SCALE_SUFFIX)]
+            return weight in claimed_set or is_ignored(weight)
         # The vision half of a multimodal wrapper, by module prefix.
         if any(name.startswith(d) for d in dialect.get("drop", ())):
             return True
@@ -1002,6 +1143,14 @@ def main(argv: list[str]) -> int:
         "effective_groups": groups,
         "dense_tensors": len(dense),
         "align": ALIGN,
+        # What the SOURCE was, not what this container is. A q4_g container built
+        # from a bf16 upload and one built from that upload's fp8 twin are not
+        # the same artifact — only the first can be compared against bf16 weights
+        # at all — and nothing downstream could tell them apart, because the
+        # container records the codec it WROTE and never the one it read.
+        "source_quantization": (
+            f"fp8-e4m3-block-{fp8_block[0]}x{fp8_block[1]}"
+            if fp8_block is not None else "none"),
         # Whether this container can be served as TEXT. Recorded rather than left
         # to be inferred from which files happen to exist, so a consumer can tell
         # "no tokenizer was possible for this family" from "someone deleted one".

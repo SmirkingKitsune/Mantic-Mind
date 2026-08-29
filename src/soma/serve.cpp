@@ -212,7 +212,134 @@ json heat_frame_json(const HeatFrame& h) {
         {"tiers", std::move(tiers)}};
 }
 
-/// Flatten OpenAI `messages` into a prompt.
+/// One message's role, or a refusal naming the role that was sent.
+Status role_of(const json& m, MessageRole& out, ServeError& err) {
+    const auto role = m.value("role", "user");
+    if (role == "system" || role == "developer") {
+        // OpenAI renamed `system` to `developer` and every chat template still
+        // spells it `system`. Mapping is right; refusing would reject a request
+        // that is valid against the API this endpoint claims to implement.
+        out = MessageRole::System;
+    } else if (role == "user") {
+        out = MessageRole::User;
+    } else if (role == "assistant") {
+        out = MessageRole::Assistant;
+    } else if (role == "tool" || role == "function") {
+        out = MessageRole::Tool;
+    } else {
+        err = ServeError::BadRequest;
+        return {StatusCode::InvalidArgument, "unknown message role '" + role + "'"};
+    }
+    return {};
+}
+
+/// The text of one message, refusing what a text-only engine cannot represent.
+Status content_of(const json& m, std::string& out, ServeError& err) {
+    out.clear();
+    const auto it = m.find("content");
+    if (it == m.end() || it->is_null()) return {};
+    if (it->is_string()) {
+        out = it->get<std::string>();
+        return {};
+    }
+    if (!it->is_array()) {
+        err = ServeError::BadRequest;
+        return {StatusCode::InvalidArgument, "message content must be string or array"};
+    }
+    for (const auto& part : *it) {
+        const auto type = part.value("type", "");
+        if (type != "text") {
+            err = ServeError::UnsupportedContent;
+            return {StatusCode::Unsupported,
+                    "content part '" + type + "' is not supported; this engine is text-only"};
+        }
+        out += part.value("text", "");
+    }
+    return {};
+}
+
+/// Build the prompt from the container's compiled chat template.
+///
+/// REFUSES what the template cannot express rather than dropping it. A request
+/// carrying `tools` gets a 422 naming them, because the compiled scaffold covers
+/// conversation framing and not tool-call encoding — and a model told nothing
+/// about the tools it was asked to use answers fluently, in prose, about
+/// functions it never saw.
+Status build_chat_prompt(const CompiledTokenizer& tokenizer,
+                         const json& body,
+                         std::vector<TokenId>& out,
+                         ServeError& err) {
+    if (body.contains("tools") && body["tools"].is_array() && !body["tools"].empty()) {
+        err = ServeError::UnsupportedContent;
+        return {StatusCode::Unsupported,
+                "tools are not supported by the compiled chat template; it covers "
+                "conversation framing, not tool-call encoding"};
+    }
+
+    std::vector<std::string> contents;
+    std::vector<MessageRole> roles;
+    for (const auto& m : body["messages"]) {
+        if (m.contains("tool_calls") && !m["tool_calls"].empty()) {
+            err = ServeError::UnsupportedContent;
+            return {StatusCode::Unsupported,
+                    "an assistant message carrying tool_calls cannot be re-rendered "
+                    "by the compiled chat template"};
+        }
+        MessageRole role{};
+        if (auto st = role_of(m, role, err); !st.ok()) return st;
+        std::string text;
+        if (auto st = content_of(m, text, err); !st.ok()) return st;
+        // `reasoning_content` is the other spelling of a thinking block, and
+        // admission checked that this template renders the two identically
+        // before setting the flag that says so. Folding it back into the
+        // content is what lets ONE channel carry both.
+        if (tokenizer.chat_template().has(chat_flag::kAssistantSplitsThink) &&
+            role == MessageRole::Assistant && m.contains("reasoning_content") &&
+            m["reasoning_content"].is_string() &&
+            text.find("</think>") == std::string::npos) {
+            text = "<think>" + m["reasoning_content"].get<std::string>() + "</think>" + text;
+        }
+        roles.push_back(role);
+        contents.push_back(std::move(text));
+    }
+
+    std::vector<ChatMessage> messages;
+    messages.reserve(roles.size());
+    for (std::size_t i = 0; i < roles.size(); ++i) {
+        messages.push_back(ChatMessage{roles[i], contents[i], {}});
+    }
+
+    ChatOptions options;
+    options.add_generation_prompt = body.value("add_generation_prompt", true);
+    options.enable_thinking = body.value("enable_thinking", true);
+    if (body.contains("clear_thinking") && body["clear_thinking"].is_boolean()) {
+        options.clear_thinking_set = true;
+        options.clear_thinking = body["clear_thinking"].get<bool>();
+    }
+    if (body.contains("reasoning_effort") && body["reasoning_effort"].is_string()) {
+        options.reasoning_effort = body["reasoning_effort"].get<std::string>();
+    }
+
+    if (auto st = tokenizer.apply_chat_template(messages, options, out); !st.ok()) {
+        // Unsupported here is the caller asking for an option this model's
+        // template does not have. That is a request problem, not a server one,
+        // and answering 500 would send them looking in the wrong place.
+        err = (st.code() == StatusCode::Unsupported) ? ServeError::UnsupportedContent
+                                                     : ServeError::BadRequest;
+        return st;
+    }
+    return {};
+}
+
+/// Flatten OpenAI `messages` into a prompt, for a container with no compiled
+/// chat template.
+///
+/// NOT a lesser version of the same thing. `user: hi` / `assistant:` is not what
+/// any of these models was trained on, and a model served this way answers
+/// fluently to a question framed differently from every one it saw in training.
+/// It stays because it is better than a 500 and because it is VISIBLY different
+/// rather than subtly so — the alternative to an honest fallback is a template
+/// this compiler approximated, which is the failure that looks fine.
 ///
 /// Image content parts are REFUSED with 422 rather than dropped. Silently
 /// discarding them is the failure mode worth designing out: the request
@@ -506,9 +633,17 @@ struct ServeServer::Impl {
                     const std::function<void(const std::string&)>& on_delta,
                     std::string& out_text,
                     std::vector<TokenId>* out_token_ids,
-                    FinishReason& out_finish_reason) {
+                    FinishReason& out_finish_reason,
+                    // Already-assembled prompt ids, when the caller built them
+                    // from a compiled chat template. `prompt` is then only the
+                    // human-readable echo; re-encoding it would throw away the
+                    // framing the template put there and is exactly the
+                    // round-trip-through-text this design avoids.
+                    const std::vector<TokenId>* prompt_ids = nullptr) {
         std::vector<TokenId> ids;
-        if (have_tokenizer) {
+        if (prompt_ids != nullptr) {
+            ids = *prompt_ids;
+        } else if (have_tokenizer) {
             if (auto st = tokenizer.encode(prompt, ids); !st.ok()) return st;
         } else {
             // No tokenizer: fall back to BYTES, one token per byte, folded into
@@ -573,7 +708,17 @@ struct ServeServer::Impl {
             // Existing generic families retain their byte-identical generation
             // behavior; V4's codec stops on EOS before it can enter protocol
             // parsing or public content.
-            if (prompt_codec != nullptr) req.stop_token_ids = model.arch.topology.eos_token_ids;
+            //
+            // A prompt assembled from the model's OWN chat template earns the
+            // same treatment, and only now does it mean anything. A flattened
+            // `user:` / `assistant:` transcript is not a framing the model was
+            // trained to end, so it rambled to max_tokens and stopping on EOS
+            // would have changed nothing; a correctly framed turn ends with the
+            // tokens `eos_token_id` names, and running past them is the model
+            // answering its own next question.
+            if (prompt_codec != nullptr || prompt_ids != nullptr) {
+                req.stop_token_ids = model.arch.topology.eos_token_ids;
+            }
             // Cross-PROCESS warm reopen: if this conversation was checkpointed
             // before the engine was stopped, attach that cache. Same mechanism,
             // one tier up — see kv_checkpoint.hpp's "one format, three callers".
@@ -1217,7 +1362,19 @@ Status ServeServer::open(const ServeConfig& config) {
                 return;
             }
 
+            // Three ways to a prompt, in descending order of fidelity.
+            //
+            // A compiled chat template is the model's OWN framing, resolved to
+            // ids at admission and graded there against the ids its real Jinja
+            // template produces. `flatten_messages` is the fallback for a
+            // container that has none, and it is not a lesser version of the
+            // same thing — `user: hi\nassistant:` is not what any of these
+            // models was trained on. It stays because a served model with the
+            // wrong framing is better than a 500, and because it is visibly
+            // different rather than subtly so.
             std::string prompt;
+            std::vector<TokenId> prompt_ids;
+            bool templated = false;
             PromptCodecState codec_state;
             ServeError err = ServeError::None;
             if (impl_->prompt_codec) {
@@ -1229,6 +1386,17 @@ Status ServeServer::open(const ServeConfig& config) {
                     res.set_content(error_body(err, st.message()), "application/json");
                     return;
                 }
+            } else if (impl_->have_tokenizer && impl_->tokenizer.chat_template().present) {
+                if (auto st = build_chat_prompt(impl_->tokenizer, body, prompt_ids, err);
+                    !st.ok()) {
+                    res.status = http_status_for(err);
+                    res.set_content(error_body(err, st.message()), "application/json");
+                    return;
+                }
+                templated = true;
+                // The echo, for logs and for the token-count fields. Never fed
+                // back to the tokenizer — `prompt_ids` is what generates.
+                if (!impl_->tokenizer.decode(prompt_ids, prompt).ok()) prompt.clear();
             } else {
                 if (auto st = flatten_messages(body["messages"], prompt, err); !st.ok()) {
                     res.status = http_status_for(err);
@@ -1265,7 +1433,8 @@ Status ServeServer::open(const ServeConfig& config) {
                                               nullptr,
                                               text,
                                               return_token_ids ? &token_ids : nullptr,
-                                              finish);
+                                              finish,
+                                              templated ? &prompt_ids : nullptr);
                     !st.ok()) {
                     const auto kind = (st.code() == StatusCode::CapacityPressure)
                                           ? ServeError::CapacityPressure
@@ -1319,7 +1488,11 @@ Status ServeServer::open(const ServeConfig& config) {
             // the answer is complete is the thing clients notice immediately.
             res.set_chunked_content_provider(
                 "text/event-stream",
-                [this, prompt, max_tokens, sampler, served, conversation, codec_state](
+                // Captured BY VALUE: the provider outlives this handler, and
+                // `prompt_ids` is the prompt for a templated request the way
+                // `prompt` is for every other one.
+                [this, prompt, prompt_ids, templated, max_tokens, sampler, served,
+                 conversation, codec_state](
                     std::size_t, httplib::DataSink& sink) {
                     auto send = [&](const json& j) {
                         const auto s = "data: " + j.dump() + "\n\n";
@@ -1396,7 +1569,8 @@ Status ServeServer::open(const ServeConfig& config) {
                         },
                         text,
                         nullptr,
-                        finish);
+                        finish,
+                        templated ? &prompt_ids : nullptr);
                     if (!st.ok()) {
                         json e;
                         e["error"]["code"] = to_string(st.code() == StatusCode::CapacityPressure

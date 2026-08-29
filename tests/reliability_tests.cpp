@@ -7060,9 +7060,12 @@ bool test_model_registry_makes_soma_routable() {
     mm::ControlModelRegistry reg;
     std::string err;
     CHECK(reg.open(dir.string(), err));
-    // v2 added the conformance table's third state. Asserted rather than
-    // ranged: a migration that did not run is the failure this catches.
-    CHECK(reg.schema_version() == 2);
+    // v2 added the conformance table's third state; v3 added the `chat_template`
+    // stage to its name allow-list. Asserted rather than ranged: a migration
+    // that did not run is the failure this catches — and for v3 specifically,
+    // the failure it catches is silent, because the ladder is written in one
+    // transaction and a rejected stage name rolls back every row with it.
+    CHECK(reg.schema_version() == 3);
     CHECK(reg.list().empty());
     CHECK(std::filesystem::exists(dir / "control.db"));
 

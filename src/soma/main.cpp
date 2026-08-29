@@ -390,6 +390,60 @@ StageResult stage_tokenizer_roundtrip(const std::filesystem::path& dir) {
     return r;
 }
 
+/// Ladder stage: the compiled chat template against the model's own renderer.
+///
+/// Belongs on the ladder rather than in a unit test because the artifact under
+/// test is THIS container's — a conversion that produced a good tokenizer and a
+/// mispaired template would pass every test in the repository and serve a model
+/// framed as a different one. The prompt framing is the part of serving that is
+/// invisible when it is wrong: the answer still streams, still reads fluently,
+/// and is not the model that was asked for.
+StageResult stage_chat_template(const std::filesystem::path& dir) {
+    StageResult r{"chat_template", "skipped", {}};
+
+    if (std::filesystem::exists(dir / "chat_template.unsupported")) {
+        std::ifstream in(dir / "chat_template.unsupported");
+        std::string why;
+        std::getline(in, why);
+        // Refused with a reason is a known state, not a failure: `serve` falls
+        // back to flattening messages, which is honest and visibly worse.
+        r.detail["reason"] = "chat template not compiled: " + why;
+        return r;
+    }
+
+    soma::CompiledTokenizer tok;
+    if (auto st = tok.open((dir / "tokenizer.soma").string()); !st.ok()) {
+        r.detail["reason"] = "no compiled tokenizer: " + st.message();
+        return r;
+    }
+    if (!tok.chat_template().present) {
+        r.detail["reason"] = "this checkpoint shipped no chat template";
+        return r;
+    }
+    std::vector<soma::ChatOracleCase> cases;
+    if (auto st = soma::read_chat_oracle((dir / "chat_oracle.bin").string(), cases); !st.ok()) {
+        // A template with no oracle is worse than no template: it would be
+        // served and never graded. Failed, not skipped.
+        r.status = "failed";
+        r.detail["reason"] = "a chat template was compiled with nothing to grade it: " +
+                             st.message();
+        return r;
+    }
+
+    soma::RoundTripResult rt;
+    if (auto st = soma::verify_chat_template(tok, cases, rt); !st.ok()) {
+        r.status = "failed";
+        r.detail["reason"] = st.message();
+        return r;
+    }
+    r.status = rt.clean() ? "passed" : "failed";
+    r.detail = nlohmann::json{{"cases", rt.cases},
+                              {"matched", rt.encode_ok},
+                              {"flags", tok.chat_template().flags}};
+    if (!rt.first_failure.empty()) r.detail["first_failure"] = rt.first_failure;
+    return r;
+}
+
 int cmd_conform(int argc, char** argv) {
     std::string dir;
     bool as_json = false;
@@ -405,6 +459,7 @@ int cmd_conform(int argc, char** argv) {
 
     std::vector<StageResult> stages;
     stages.push_back(stage_tokenizer_roundtrip(root));
+    stages.push_back(stage_chat_template(root));
     stages.push_back(stage_quant_codec(root));
 
     // The stages that need something this process does not have, named with what

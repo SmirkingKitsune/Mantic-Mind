@@ -160,6 +160,7 @@ struct CompiledTokenizer::Impl {
     };
 
     std::vector<Added> added;
+    ChatTemplate chat;
 
     // ── pretokenizer ─────────────────────────────────────────────────────────
 
@@ -350,10 +351,11 @@ Status CompiledTokenizer::open(const std::string& path) {
     const auto* base = reinterpret_cast<const std::byte*>(raw.data());
     Reader r{base + sizeof(kMagic), base + raw.size(), true};
     const auto version = r.u32();
-    if (version != kTokenizerFormatVersion) {
+    if (version < kTokenizerMinFormatVersion || version > kTokenizerFormatVersion) {
         return {StatusCode::VersionMismatch,
-                path + ": format version " + std::to_string(version) +
-                    " != " + std::to_string(kTokenizerFormatVersion)};
+                path + ": format version " + std::to_string(version) + " is outside " +
+                    std::to_string(kTokenizerMinFormatVersion) + ".." +
+                    std::to_string(kTokenizerFormatVersion)};
     }
 
     auto& impl = *impl_;
@@ -409,6 +411,44 @@ Status CompiledTokenizer::open(const std::string& path) {
                 item.min_count = r.u32();
                 item.max_count = r.u32();
             }
+        }
+    }
+
+    // ── the compiled chat template (format 2) ────────────────────────────────
+    //
+    // A v1 file stops here and carries none. That is not a degraded v2 file: it
+    // is a tokenizer for a family whose template the compiler refused, or one
+    // compiled before templates existed, and `serve` has an honest fallback for
+    // both.
+    if (version >= 2) {
+        const auto ids = [&r]() {
+            std::vector<TokenId> v(r.u32());
+            for (auto& id : v)
+                id = r.u32();
+            return v;
+        };
+        if (r.u32() != 0) {
+            auto& chat = impl.chat;
+            chat.present = true;
+            chat.flags = r.u32();
+            chat.bos = ids();
+            const auto n_prologues = r.u32();
+            chat.prologues.resize(n_prologues);
+            for (auto& p : chat.prologues) {
+                p.effort = r.str();
+                p.enable_thinking = (r.u32() != 0);
+                p.ids = ids();
+            }
+            for (std::size_t role = 0; role < 4; ++role) {
+                chat.run_prefix[role] = ids();
+                chat.prefix[role] = ids();
+                chat.suffix[role] = ids();
+                chat.run_suffix[role] = ids();
+            }
+            chat.assistant_prefix_thinking = ids();
+            chat.thinking_close = ids();
+            chat.generation_prompt = ids();
+            chat.generation_prompt_nothink = ids();
         }
     }
 
@@ -553,6 +593,158 @@ Status CompiledTokenizer::Streamer::push(TokenId token, std::string& out_delta) 
     return {};
 }
 
+// ── the chat template ────────────────────────────────────────────────────────
+
+const std::vector<TokenId>& ChatTemplate::prologue_for(const std::string& effort,
+                                                       bool enable_thinking) const noexcept {
+    for (const auto& want_effort : {effort, std::string{}}) {
+        for (const auto& p : prologues) {
+            if (p.enable_thinking == enable_thinking && p.effort == want_effort) return p.ids;
+        }
+    }
+    return bos;
+}
+
+const ChatTemplate& CompiledTokenizer::chat_template() const noexcept {
+    return impl_->chat;
+}
+
+namespace {
+
+/// Split an assistant turn's content into `(content, reasoning)`.
+///
+/// Mirrors `split_reasoning` in tools/admission/chat_template.py, which is the
+/// implementation the oracle was generated against. Three states, not two: a
+/// template may re-emit a historical `<think>` block (GLM), remove it (Qwen3),
+/// or have no thinking channel at all — and passing a removed block through
+/// would hand the model its own scratchpad back as though it were the answer.
+void split_reasoning(const ChatTemplate& chat,
+                     const ChatMessage& message,
+                     std::size_t index,
+                     std::ptrdiff_t last_user,
+                     bool clear_thinking,
+                     std::string_view& content,
+                     std::string_view& reasoning) {
+    content = message.content;
+    reasoning = {};
+    if (message.role != MessageRole::Assistant) return;
+
+    const bool thinking_aware = chat.has(chat_flag::kSupportsThinking) ||
+                                chat.has(chat_flag::kAssistantDropsThink);
+    if (thinking_aware) {
+        static constexpr std::string_view kClose = "</think>";
+        static constexpr std::string_view kOpen = "<think>";
+        if (const auto close = content.find(kClose); close != std::string_view::npos) {
+            auto head = content.substr(0, close);
+            content = content.substr(close + kClose.size());
+            const auto open = head.rfind(kOpen);
+            reasoning = (open == std::string_view::npos) ? head : head.substr(open + kOpen.size());
+        }
+    }
+    if (chat.has(chat_flag::kAssistantDropsThink)) reasoning = {};
+    if (clear_thinking && static_cast<std::ptrdiff_t>(index) <= last_user) reasoning = {};
+
+    if (chat.has(chat_flag::kAssistantStrips)) {
+        const auto is_space = [](char c) {
+            return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+        };
+        while (!content.empty() && is_space(content.front())) content.remove_prefix(1);
+        while (!content.empty() && is_space(content.back())) content.remove_suffix(1);
+    }
+}
+
+} // namespace
+
+Status CompiledTokenizer::apply_chat_template(std::span<const ChatMessage> messages,
+                                              const ChatOptions& options,
+                                              std::vector<TokenId>& out) const {
+    out.clear();
+    const auto& chat = impl_->chat;
+    if (!chat.present) {
+        return {StatusCode::Unsupported,
+                "this container carries no compiled chat template"};
+    }
+
+    // Refuse an option this template cannot honour rather than ignoring it.
+    // Silently accepting `enable_thinking: false` on a template with no such
+    // switch tells the caller something false, and knowing which templates have
+    // one is the entire reason admission measured them.
+    if (!options.enable_thinking && !chat.has(chat_flag::kEnableThinking)) {
+        return {StatusCode::Unsupported,
+                "this model's chat template has no enable_thinking switch; it "
+                "frames every turn the same way whether or not thinking is asked for"};
+    }
+    if (options.clear_thinking_set && !chat.has(chat_flag::kClearThinkingSettable)) {
+        return {StatusCode::Unsupported,
+                "this model's chat template does not take clear_thinking; it "
+                "always " +
+                    std::string(chat.has(chat_flag::kClearThinkingDefault)
+                                    ? "drops"
+                                    : "keeps") +
+                    " reasoning from turns before the last user message"};
+    }
+    if (!options.reasoning_effort.empty() && !chat.has(chat_flag::kReasoningEffort)) {
+        return {StatusCode::Unsupported,
+                "this model's chat template does not take reasoning_effort"};
+    }
+
+    const bool clear_thinking = (options.clear_thinking_set &&
+                                 chat.has(chat_flag::kClearThinkingSettable))
+                                    ? options.clear_thinking
+                                    : chat.has(chat_flag::kClearThinkingDefault);
+
+    std::ptrdiff_t last_user = -1;
+    for (std::size_t i = 0; i < messages.size(); ++i) {
+        if (messages[i].role == MessageRole::User) last_user = static_cast<std::ptrdiff_t>(i);
+    }
+
+    const auto append = [&out](const std::vector<TokenId>& ids) {
+        out.insert(out.end(), ids.begin(), ids.end());
+    };
+    std::vector<TokenId> scratch;
+    const auto append_text = [&](std::string_view text) -> Status {
+        if (text.empty()) return {};
+        if (auto st = encode(text, scratch); !st.ok()) return st;
+        out.insert(out.end(), scratch.begin(), scratch.end());
+        return {};
+    };
+
+    append(chat.prologue_for(options.reasoning_effort, options.enable_thinking));
+
+    for (std::size_t i = 0; i < messages.size(); ++i) {
+        const auto& m = messages[i];
+        const auto role = static_cast<std::size_t>(m.role);
+        if (role >= 4) return {StatusCode::InvalidArgument, "message role out of range"};
+        if (i == 0 || messages[i - 1].role != m.role) append(chat.run_prefix[role]);
+
+        std::string_view content;
+        std::string_view reasoning;
+        split_reasoning(chat, m, i, last_user, clear_thinking, content, reasoning);
+
+        // The two assistant prefixes are ALTERNATIVES, not a base plus an
+        // insertion: prefix[Assistant] already carries the empty thinking block,
+        // so emitting both would emit it twice.
+        if (!reasoning.empty()) {
+            append(chat.assistant_prefix_thinking);
+            if (auto st = append_text(reasoning); !st.ok()) return st;
+            append(chat.thinking_close);
+        } else {
+            append(chat.prefix[role]);
+        }
+        if (auto st = append_text(content); !st.ok()) return st;
+        append(chat.suffix[role]);
+        if (i + 1 == messages.size() || messages[i + 1].role != m.role) {
+            append(chat.run_suffix[role]);
+        }
+    }
+
+    if (options.add_generation_prompt) {
+        append(options.enable_thinking ? chat.generation_prompt
+                                       : chat.generation_prompt_nothink);
+    }
+    return {};
+}
+
 // ── the admission gate ───────────────────────────────────────────────────────
 
 Status read_tokenizer_oracle(const std::string& path, std::vector<TokenizerOracleCase>& out) {
@@ -629,6 +821,110 @@ Status verify_roundtrip(const CompiledTokenizer& tokenizer,
             ++out.decode_ok;
         } else if (out.first_failure.empty()) {
             out.first_failure = "decode of \"" + c.text.substr(0, 40) + "\" did not round-trip";
+        }
+    }
+    return {};
+}
+
+Status read_chat_oracle(const std::string& path, std::vector<ChatOracleCase>& out) {
+    out.clear();
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return {StatusCode::NotFound, "no chat oracle at " + path};
+
+    char magic[8]{};
+    in.read(magic, 8);
+    if (std::memcmp(magic, "SOMACHAT", 8) != 0) {
+        return {StatusCode::InvalidArgument, path + ": not a chat oracle (bad magic)"};
+    }
+    const auto u32 = [&]() -> std::uint32_t {
+        std::uint32_t v = 0;
+        in.read(reinterpret_cast<char*>(&v), 4);
+        return v;
+    };
+    const auto str = [&]() {
+        std::string s(u32(), '\0');
+        if (!s.empty()) in.read(s.data(), static_cast<std::streamsize>(s.size()));
+        return s;
+    };
+    if (const auto version = u32(); version != kChatOracleFormatVersion) {
+        return {StatusCode::VersionMismatch,
+                path + ": chat oracle version " + std::to_string(version) +
+                    " != " + std::to_string(kChatOracleFormatVersion)};
+    }
+    out.resize(u32());
+    for (auto& c : out) {
+        const auto n = u32();
+        c.roles.resize(n);
+        c.contents.resize(n);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            const auto role = u32();
+            if (role >= 4) return {StatusCode::InvalidArgument, path + ": role out of range"};
+            c.roles[i] = static_cast<MessageRole>(role);
+            c.contents[i] = str();
+        }
+        c.options.add_generation_prompt = (u32() != 0);
+        c.options.enable_thinking = (u32() != 0);
+        // Tri-state on the wire: 0 unset, 1 false, 2 true. "Unset" is a
+        // different request from "false" on every template whose own default is
+        // true, and collapsing the two would make the oracle unable to grade the
+        // case that distinguishes GLM-5.2 from GLM-5.3.
+        const auto clear = u32();
+        c.options.clear_thinking_set = (clear != 0);
+        c.options.clear_thinking = (clear == 2);
+        c.options.reasoning_effort = str();
+        c.ids.resize(u32());
+        for (auto& id : c.ids)
+            id = u32();
+    }
+    if (!in) return {StatusCode::InvalidArgument, path + ": truncated chat oracle"};
+    return {};
+}
+
+Status verify_chat_template(const CompiledTokenizer& tokenizer,
+                            const std::vector<ChatOracleCase>& cases,
+                            RoundTripResult& out) {
+    out = {};
+    out.cases = static_cast<std::uint32_t>(cases.size());
+    if (cases.empty()) {
+        // An empty oracle passes every check there is, which is exactly why it
+        // must not be allowed to look like one.
+        return {StatusCode::InvalidArgument, "the chat oracle is empty; nothing to verify"};
+    }
+    // There is no decode half here — a prompt is assembled, never round-tripped
+    // — so decode_ok tracks encode_ok to keep `clean()` meaning what it says
+    // rather than silently reporting half a result as a pass.
+    std::vector<TokenId> ids;
+    std::vector<ChatMessage> messages;
+    for (std::size_t c = 0; c < cases.size(); ++c) {
+        const auto& oracle = cases[c];
+        messages.clear();
+        for (std::size_t i = 0; i < oracle.roles.size(); ++i) {
+            messages.push_back(ChatMessage{oracle.roles[i], oracle.contents[i], {}});
+        }
+        const auto st = tokenizer.apply_chat_template(messages, oracle.options, ids);
+        if (!st.ok()) {
+            if (out.first_failure.empty()) {
+                out.first_failure = "case " + std::to_string(c) + ": " + st.message();
+            }
+            continue;
+        }
+        if (ids == oracle.ids) {
+            ++out.encode_ok;
+            ++out.decode_ok;
+            continue;
+        }
+        if (!out.first_failure.empty()) continue;
+        out.first_failure = "case " + std::to_string(c) + " (" +
+                            std::to_string(oracle.roles.size()) + " message(s)): got " +
+                            std::to_string(ids.size()) + " ids, want " +
+                            std::to_string(oracle.ids.size());
+        for (std::size_t i = 0; i < ids.size() && i < oracle.ids.size(); ++i) {
+            if (ids[i] != oracle.ids[i]) {
+                out.first_failure += " (first diff at " + std::to_string(i) + ": " +
+                                     std::to_string(ids[i]) + " vs " +
+                                     std::to_string(oracle.ids[i]) + ")";
+                break;
+            }
         }
     }
     return {};

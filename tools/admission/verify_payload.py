@@ -58,12 +58,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from convert import (  # noqa: E402
     DTYPE_ID,
+    FP8_DTYPE_NAMES,
+    FP8_SCALE_SUFFIX,
     MAGIC,
     align_up,
+    dequantize_fp8_block,
     expert_reader,
     group_bytes,
     layer_kinds,
     quantize_rows,
+    source_fp8_block,
     usable_group,
 )
 
@@ -260,8 +264,15 @@ def rel_rms(a, b) -> float:
 # ── source access ────────────────────────────────────────────────────────────
 
 
-def source_reader(src: Path):
-    """Lazy per-shard handles, as convert.py does. 282 shards cannot all be open."""
+def source_reader(src: Path, fp8_block: tuple[int, int] | None = None):
+    """Lazy per-shard handles, as convert.py does. 282 shards cannot all be open.
+
+    `fp8_block` makes this read a blockwise-fp8 upload the same way convert.py
+    did. It has to: this pass re-quantizes the SOURCE expert and demands the
+    container's bytes back exactly, so reading the source unscaled would fail
+    every sampled expert on a container that is perfectly correct — and the
+    obvious reading of that failure is a payload bug that does not exist.
+    """
     import torch
     from safetensors import safe_open
 
@@ -291,7 +302,18 @@ def source_reader(src: Path):
         path = owner.get(name)
         if path is None:
             return None
-        return handle_for(path).get_tensor(name).to(torch.float32).numpy().copy()
+        raw = handle_for(path).get_tensor(name)
+        w = raw.to(torch.float32).numpy().copy()
+        if (fp8_block is None
+                or str(raw.dtype).rsplit(".", 1)[-1] not in FP8_DTYPE_NAMES):
+            return w
+        scale_path = owner.get(name + FP8_SCALE_SUFFIX)
+        if scale_path is None:
+            raise Failure(f"{name} is fp8 with no {name + FP8_SCALE_SUFFIX} "
+                          f"beside it; the source cannot be read")
+        s = handle_for(scale_path).get_tensor(
+            name + FP8_SCALE_SUFFIX).to(torch.float32).numpy().copy()
+        return dequantize_fp8_block(w, s, fp8_block, name)
 
     return get
 
@@ -380,7 +402,16 @@ def main(argv: list[str]) -> int:
         picks.append((rng.choice(moe_layers), rng.randrange(n_experts)))
     picks = sorted(set(picks))
 
-    get = source_reader(src)
+    # The SOURCE's config, not the container's copy of it, even though the copy is
+    # verbatim and would usually answer the same. This is a question about how the
+    # checkpoint on disk encodes its weights, and `--source` may point somewhere
+    # other than where the container was built from — a re-downloaded upload, or
+    # the bf16 twin of an fp8 one. Asking the container would then describe a
+    # different directory than the one about to be read.
+    src_cfg = src / "config.json"
+    fp8_block = source_fp8_block(
+        json.loads(src_cfg.read_text(encoding="utf-8")) if src_cfg.is_file() else cfg)[0]
+    get = source_reader(src, fp8_block)
     shard_files = sorted(container.glob("experts-*.bin"))
     handles = {}
 

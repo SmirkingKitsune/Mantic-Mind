@@ -1,8 +1,8 @@
 {
   "add_prefix_space": false,
-  "chat_oracle_cases": 19,
+  "chat_oracle_cases": 17,
   "chat_template": "compiled",
-  "chat_template_flags": 127,
+  "chat_template_flags": 79,
   "corpus_size": 37,
   "n_added": 36,
   "n_classes": 14,
@@ -12,6 +12,6 @@
   "nfc_unstable_dropped": 0,
   "normalizer": null,
   "program": "glm",
-  "source": "models\\zai-org\\GLM-5.2",
+  "source": "models\\zai-org\\GLM-5.3",
   "total_oracle_tokens": 336
 }

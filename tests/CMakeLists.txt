@@ -194,6 +194,19 @@ if(Python3_Interpreter_FOUND)
                      "${CMAKE_SOURCE_DIR}"
                      "${CMAKE_CURRENT_BINARY_DIR}/minimax_dialect_tmp")
 
+    # A blockwise-fp8 upload must convert to the same container as its bf16 twin.
+    # GLM-5.3 is the case: the same base model as GLM-5.2, published fp8-first,
+    # so the alternative to dequantizing was fetching the 1.5 TB twin of a 756 GB
+    # repo. Every committed fixture is f32, so this manufactures the input —
+    # quantizing the fixture blockwise and writing BOTH halves, which makes the
+    # comparison byte-exact rather than tolerance-based — and checks the refusal
+    # stayed narrow. Skips itself when torch/safetensors are absent.
+    add_test(NAME mm_fp8_source
+             COMMAND "${MM_ADMISSION_PY}"
+                     "${CMAKE_SOURCE_DIR}/tools/ci/check_fp8_source.py"
+                     "${CMAKE_SOURCE_DIR}"
+                     "${CMAKE_CURRENT_BINARY_DIR}/fp8_source_tmp")
+
     # Opt-in release smoke for a real Linux multi-node vLLM/Ray deployment.
     # The script skips unless its control URL and agent ID are supplied.
     add_test(NAME mm_vllm_ray_smoke
@@ -204,6 +217,6 @@ if(Python3_Interpreter_FOUND)
     # exits 0 and reads as Passed, which is how mm_fused_experts ran nothing for
     # its whole existence while showing green.
     set_tests_properties(mm_fused_experts mm_verify_payload mm_minimax_dialect
-                         mm_vllm_ray_smoke PROPERTIES
+                         mm_fp8_source mm_vllm_ray_smoke PROPERTIES
                          SKIP_RETURN_CODE 77)
 endif()
