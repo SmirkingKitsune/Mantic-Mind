@@ -15,6 +15,7 @@
 #include "soma/threading.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -397,6 +398,8 @@ bool available() noexcept {
 #define SOMA_IS_512 false
 #endif
 
+#if defined(SOMA_HAS_AVX2)
+
 float qdot_q4g(const std::byte* p,
                std::uint32_t cols,
                std::uint32_t g,
@@ -470,6 +473,83 @@ float vmax(const float* x, std::uint32_t n) noexcept {
 void scale(float* x, float s, std::uint32_t n) noexcept {
     avx2::scale(x, s, n);
 }
+
+#else // !SOMA_HAS_AVX2
+
+// ── no vector tier in this build ─────────────────────────────────────────────
+//
+// aarch64 and every other non-x86-64 target: src/soma/CMakeLists.txt omits the
+// AVX2 translation units, so there is nothing for these to dispatch to. They
+// still have to be DEFINED — kernels_simd.hpp is architecture-neutral and
+// kernels_f32.cpp names simd::dot() inside its `available()` branch, so the
+// symbols are referenced on every host regardless of what got compiled.
+//
+// Reaching one is a contract violation, not a host-capability question: detect()
+// returns Scalar unconditionally in this build, so available() is false and
+// every call site in this library already branches to the scalar reference
+// (qdot_row here, the plain loops in kernels_f32.cpp). Aborting rather than
+// returning 0 is deliberate — these are noexcept and return floats that flow
+// straight into logits, so a silent wrong answer would surface as a numerics
+// bug a long way from a missing `if (simd::available())`.
+//
+// Deleting these definitions instead is not an option, and neither is leaving
+// them undefined: that is precisely what broke the aarch64 build, as an
+// undefined reference to soma::simd::avx2::* out of kernels_quant.cpp.
+
+namespace {
+
+[[noreturn]] void no_simd_tier(const char* name) noexcept {
+    std::fprintf(stderr,
+                 "soma: simd::%s called on a build with no SIMD tier; "
+                 "call sites must check simd::available() first\n",
+                 name);
+    std::abort();
+}
+
+} // namespace
+
+float qdot_q4g(
+    const std::byte*, std::uint32_t, std::uint32_t, const float*, const float*) noexcept {
+    no_simd_tier("qdot_q4g");
+}
+
+float qdot_q6g(const std::byte*, std::uint32_t, std::uint32_t, const float*) noexcept {
+    no_simd_tier("qdot_q6g");
+}
+
+float qdot_q8_0(const std::byte*, std::uint32_t, std::uint32_t, const float*) noexcept {
+    no_simd_tier("qdot_q8_0");
+}
+
+float qdot_q4_0(const std::byte*, std::uint32_t, std::uint32_t, const float*) noexcept {
+    no_simd_tier("qdot_q4_0");
+}
+
+float dot(const float*, const float*, std::uint32_t) noexcept {
+    no_simd_tier("dot");
+}
+
+void matvec(const float*, const float*, std::uint32_t, std::uint32_t, float*) noexcept {
+    no_simd_tier("matvec");
+}
+
+void axpy(float, const float*, std::uint32_t, float*) noexcept {
+    no_simd_tier("axpy");
+}
+
+float sumsq(const float*, std::uint32_t) noexcept {
+    no_simd_tier("sumsq");
+}
+
+float vmax(const float*, std::uint32_t) noexcept {
+    no_simd_tier("vmax");
+}
+
+void scale(float*, float, std::uint32_t) noexcept {
+    no_simd_tier("scale");
+}
+
+#endif // SOMA_HAS_AVX2
 
 #undef SOMA_IS_512
 

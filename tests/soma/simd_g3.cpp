@@ -469,6 +469,13 @@ int main(int argc, char** argv) {
     // 512-bit datapath and should not, but that is a claim about this silicon,
     // so it is measured rather than assumed — and a regression here is a reason
     // to drop the tier, not to keep it for tidiness.
+    //
+    // Compiled out, not just skipped at runtime: this is the one section that
+    // names the per-tier kernels directly rather than going through the
+    // dispatchers, so it needs those translation units to EXIST. They do not on
+    // aarch64, nor on an x86-64 host whose compiler cannot emit AVX-512, and the
+    // `tier == Avx512` guard below is a runtime check that cannot help a linker.
+#if defined(SOMA_HAS_AVX512)
     if (tier == soma::simd::SimdTier::Avx512) {
         std::cout << "\n5. AVX-512 vs AVX2\n";
 
@@ -618,6 +625,7 @@ int main(int argc, char** argv) {
         }
         check(tail_exact, "AVX-512 masked tail is exact for every remainder");
     }
+#endif // SOMA_HAS_AVX512
 
     std::cout << "\n" << (g_failures == 0 ? "OK" : std::to_string(g_failures) + " FAILURES")
               << "\n";

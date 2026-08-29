@@ -149,7 +149,13 @@ if(SOMA_SIMD_SOURCES)
         set_source_files_properties(${SOMA_SIMD_SOURCES}
                                     PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
     endif()
-    target_compile_definitions(mm_soma PRIVATE SOMA_HAS_AVX2=1)
+    # PUBLIC, not PRIVATE: which tiers this library actually CONTAINS is part of
+    # its interface, not an implementation detail. soma_simd_g3 names the per-tier
+    # kernels directly (that is the point of declaring them in the header — see
+    # kernels_simd.hpp), so a consumer has to be able to compile those references
+    # out when the tier was never built. PRIVATE here is what left the aarch64
+    # test target with undefined references to soma::simd::avx2::*.
+    target_compile_definitions(mm_soma PUBLIC SOMA_HAS_AVX2=1)
 endif()
 
 if(SOMA_AVX512_SOURCE)
@@ -161,7 +167,11 @@ if(SOMA_AVX512_SOURCE)
             ${SOMA_AVX512_SOURCE}
             PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512dq;-mavx512bw;-mavx512vl")
     endif()
-    target_compile_definitions(mm_soma PRIVATE SOMA_HAS_AVX512=1)
+    # PUBLIC for the same reason as SOMA_HAS_AVX2 above, and it is not only an
+    # aarch64 concern: an x86-64 host whose compiler cannot emit AVX-512 does not
+    # build kernels_avx512.cpp either, so the tier-comparison section of
+    # soma_simd_g3 has to compile out there too.
+    target_compile_definitions(mm_soma PUBLIC SOMA_HAS_AVX512=1)
 endif()
 
 # nlohmann/json for config.json and the safetensors header; OpenSSL for

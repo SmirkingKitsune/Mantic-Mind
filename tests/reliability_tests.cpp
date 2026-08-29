@@ -6231,6 +6231,35 @@ bool test_llama_runtime_variant_matrix() {
     CHECK(!find(s390x, "vulkan")->platform_supported);
     CHECK(!find(s390x, "cuda-13")->platform_supported);
 
+    // A CUDA arm64 host (DGX Spark GB10, Grace, Jetson) compiles llama.cpp the
+    // same way an x64 one does. llama.cpp publishes no Linux CUDA archive for
+    // any architecture, so the variant must be offered as a SOURCE build rather
+    // than withheld: source_supported is what switch_runtime() and the
+    // "compile anyway" override both key off.
+    cfg.arch = "aarch64";
+    const auto linux_arm = mm::llama_runtime_variants(
+        {"llama-b2000-bin-ubuntu-arm64.tar.gz",
+         "llama-b2000-bin-ubuntu-vulkan-arm64.tar.gz",
+         "llama-b2000-bin-ubuntu-x64.tar.gz",
+         "llama-b2000-bin-ubuntu-rocm-7.14-x64.tar.gz"}, cfg);
+    CHECK(find(linux_arm, "cuda-13")->platform_supported);
+    CHECK(find(linux_arm, "cuda-13")->source_supported);
+    CHECK(!find(linux_arm, "cuda-13")->release_available);
+    CHECK(find(linux_arm, "cuda-12")->source_supported);
+    CHECK(find(linux_arm, "cpu")->release_available);      // ubuntu-arm64
+    CHECK(find(linux_arm, "vulkan")->release_available);   // ubuntu-vulkan-arm64
+    CHECK(!find(linux_arm, "rocm")->platform_supported);   // x64-only toolchain
+
+    // Windows on ARM does publish a CUDA 13 asset pair.
+    cfg.platform = "windows";
+    const auto windows_arm = mm::llama_runtime_variants(
+        {"llama-b2000-bin-win-cpu-arm64.zip",
+         "llama-b2000-bin-win-cuda-13.4-arm64.zip",
+         "cudart-llama-bin-win-cuda-13.4-arm64.zip"}, cfg);
+    CHECK(find(windows_arm, "cuda-13")->release_available);
+    CHECK(!find(windows_arm, "cuda-12")->release_available); // no 12.x arm64 asset
+    CHECK(find(windows_arm, "cuda-12")->source_supported);
+
     cfg.platform = "macos";
     cfg.arch = "apple-silicon";
     const auto apple = mm::llama_runtime_variants(
@@ -6486,6 +6515,40 @@ bool test_llama_nvcc_architecture_preflight_and_diagnostics() {
     CHECK(compatible != refreshed.troubleshooting.checks.end());
     CHECK(compatible->status == "pass");
     CHECK(!compatible->blocking);
+
+    // A DGX Spark (GB10, sm_121, aarch64) compiles sm_121a, but CUDA 13's
+    // --list-gpu-arch prints ONLY base architectures — no compute_121a, and not
+    // even the compute_90a that CUDA 12 used to print. Requiring the literal
+    // feature target in that listing made every sm_121 host fail the preflight
+    // with "does not support compute_121a" against a toolkit that compiles it.
+    // The output below is verbatim from CUDA 13.0.88 on aarch64.
+    mm::LlamaProvisionConfig spark = cfg;
+    spark.arch = "aarch64";
+    spark.cuda_arch = "121";
+    mm::LlamaCommandRunner spark_runner = runner;
+    spark_runner.capture_output = [&](const std::vector<std::string>& argv,
+                                      const std::filesystem::path& cwd) {
+        if (argv.size() == 2 && argv[0] == "/usr/bin/nvcc" &&
+            argv[1] == "--list-gpu-arch")
+            return std::string{"compute_75 compute_80 compute_86 compute_87 "
+                               "compute_88 compute_89 compute_90 compute_100 "
+                               "compute_110 compute_103 compute_120 compute_121"};
+        if (argv.size() == 2 && argv[0] == "/usr/bin/nvcc" && argv[1] == "--version")
+            return std::string{"Cuda compilation tools, release 13.0, V13.0.88"};
+        return runner.capture_output(argv, cwd);
+    };
+    mm::LlamaCppProvisioner spark_provisioner(spark, spark_runner);
+    const auto spark_status = spark_provisioner.diagnose_environment();
+    const auto spark_arch_check = std::find_if(
+        spark_status.troubleshooting.checks.begin(),
+        spark_status.troubleshooting.checks.end(),
+        [](const auto& check) { return check.id == "cuda-architecture"; });
+    CHECK(spark_arch_check != spark_status.troubleshooting.checks.end());
+    CHECK(spark_arch_check->status == "pass");
+    CHECK(!spark_arch_check->blocking);
+    // The escape hatch has to survive too: it keys off source_supported, which
+    // the x64-only variant gate used to clear on every arm64 CUDA host.
+    CHECK(spark_status.troubleshooting.can_override_checks);
 
     // CUDA 13 removes sm_52. Older CMake compiler-identification paths can
     // still try that default before target CUDA_ARCHITECTURES take effect;

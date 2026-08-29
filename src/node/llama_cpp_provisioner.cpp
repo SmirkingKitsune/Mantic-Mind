@@ -234,8 +234,21 @@ bool cuda_blackwell_baseline_target_failure(const std::string& failure_detail) {
     return baseline_target && architecture_specific_feature;
 }
 
+// `nvcc --list-gpu-arch` enumerates BASE architectures. CUDA 12 also printed the
+// architecture-specific entries (compute_90a, compute_120a); CUDA 13 prints none
+// of them — a 13.0 toolkit that compiles sm_121a happily lists only compute_121.
+// So a feature target is accepted when EITHER form is listed.
+//
+// This does not weaken the check into a formality. A toolkit too old for the GPU
+// lists neither form (CUDA 12.7 stops at compute_90, so sm_120a and sm_120 both
+// miss), which is the case this gate exists to catch. Whether the `a` variant
+// itself assembles is settled by the probe compile that runs immediately after,
+// not by parsing a list whose contents are a toolkit-version accident.
 bool nvcc_supports_arch(const std::string& output, const std::string& target) {
-    const std::regex token("(^|[\\s,])compute_" + target + "([\\s,]|$)",
+    std::string accepted = target;
+    if (!target.empty() && target.back() == 'a')
+        accepted += "|" + target.substr(0, target.size() - 1);
+    const std::regex token("(^|[\\s,])compute_(" + accepted + ")([\\s,]|$)",
                            std::regex::icase);
     return std::regex_search(output, token);
 }
@@ -854,11 +867,17 @@ std::vector<LlamaInstallStep> build_source_plan(const LlamaProvisionConfig& cfg,
                   "else{(Get-Command nvcc -ErrorAction Stop).Source}; ";
             ps << "& $nvcc --version | Select-Object -Last 1; ";
             if (!cuda_targets.empty()) {
+                // --list-gpu-arch names base architectures; CUDA 13 never prints
+                // the architecture-specific "a" entries CUDA 12 did, so accept
+                // either spelling. A toolkit too old for this GPU lists neither,
+                // and the probe compile below proves sm_<arch> itself assembles.
                 ps << "$supported=((& $nvcc --list-gpu-arch 2>$null) -join ' '); "
                       "$requested='" << cuda_target_arg << "' -split ','; "
-                      "foreach($arch in $requested){$target='compute_'+$arch; "
-                      "if($supported -notmatch ('(^|\\s)'+[regex]::Escape($target)+'(\\s|$)')){"
-                      "$hint=if($arch -eq '120a'){' CUDA Toolkit 12.8 or newer is required for sm_120a.'}else{''}; "
+                      "foreach($arch in $requested){$base=$arch -replace 'a$',''; "
+                      "$target='compute_('+[regex]::Escape($arch)+'|'+[regex]::Escape($base)+')'; "
+                      "if($supported -notmatch ('(^|\\s)'+$target+'(\\s|$)')){"
+                      "$hint=if($arch -eq '120a'){' CUDA Toolkit 12.8 or newer is required for sm_120a.'}"
+                      "elseif($arch -match '^12[0-9]a$'){' CUDA Toolkit 13.0 or newer is required for sm_'+$arch+'; 12.8 covers only sm_120a.'}else{''}; "
                       "throw ('Selected NVCC '+$nvcc+' does not support compute_'+$arch+'.'+$hint+"
                       "' The CUDA version shown by nvidia-smi is driver compatibility, not the installed compiler version.')}}; ";
                 ps << "$probe=Join-Path $env:TEMP ('mantic-mind-cuda-'+[guid]::NewGuid().ToString('N')+'.cu'); "
@@ -916,11 +935,22 @@ if [ "$backend" = "cuda" ]; then
   if [ -n "$cuda_arches" ]; then
     supported=$("$nvcc_path" --list-gpu-arch 2>/dev/null || true)
     for arch in $(printf '%s' "$cuda_arches" | tr ',' ' '); do
-      if ! printf '%s\n' "$supported" | tr '[:space:]' '\n' | grep -Fqx "compute_$arch"; then
+      # --list-gpu-arch names base architectures; CUDA 13 never prints the
+      # architecture-specific "a" entries CUDA 12 did, so accept either spelling.
+      # A toolkit too old for this GPU lists neither, and the probe compile below
+      # is what proves sm_$arch itself assembles.
+      base=${arch%a}
+      if ! printf '%s\n' "$supported" | tr '[:space:]' '\n' \
+        | grep -Eqx "compute_($arch|$base)"; then
         echo "Selected NVCC $nvcc_path does not support compute_$arch." >&2
-        if [ "$arch" = "120a" ]; then
-          echo "CUDA Toolkit 12.8 or newer is required to compile for sm_120a." >&2
-        fi
+        case "$arch" in
+          120a)
+            echo "CUDA Toolkit 12.8 or newer is required to compile for sm_120a." >&2
+            ;;
+          12*a)
+            echo "CUDA Toolkit 13.0 or newer is required to compile for sm_$arch; 12.8 covers only sm_120a." >&2
+            ;;
+        esac
         echo "The CUDA version shown by nvidia-smi is driver compatibility, not the installed compiler version." >&2
         exit 3
       fi
@@ -1143,10 +1173,21 @@ std::vector<LlamaRuntimeVariant> llama_runtime_variants(
     };
     const std::string archive_suffix = "-" + arch_rx + "(\\.tar\\.gz|\\.zip)$";
 
-    add("cuda-12", "CUDA 12", "cuda", (win || linux) && x64, true,
+    // CUDA is not x64-only. NVIDIA ships aarch64 toolkits for Grace/GB10 and
+    // Jetson, and a llama.cpp CUDA build there is the same CMake invocation as
+    // on x64 — a DGX Spark (GB10, sm_121) is a first-class source-build target.
+    // Gating these on x64 made a CUDA arm64 host unable to select CUDA at all:
+    // switch_runtime() rejected the variant, the TUI hid it, and because
+    // can_override_checks keys off source_supported, the "compile anyway"
+    // escape hatch disappeared too. Release availability stays regex-driven and
+    // is unaffected: llama.cpp publishes no Linux CUDA archive for EITHER
+    // architecture (so Linux is always a source build), while Windows arm64
+    // does have a CUDA 13 asset that windows_cuda() now finds.
+    const bool cuda_arch_supported = x64 || arm64;
+    add("cuda-12", "CUDA 12", "cuda", (win || linux) && cuda_arch_supported, true,
         win ? windows_cuda("12")
             : asset("^llama-.*-bin-ubuntu-cuda-12[.][0-9.]*" + archive_suffix));
-    add("cuda-13", "CUDA 13", "cuda", (win || linux) && x64, true,
+    add("cuda-13", "CUDA 13", "cuda", (win || linux) && cuda_arch_supported, true,
         win ? windows_cuda("13")
             : asset("^llama-.*-bin-ubuntu-cuda-13[.][0-9.]*" + archive_suffix));
     add("vulkan", "Vulkan", "vulkan", (win || linux) && (x64 || arm64), true,
