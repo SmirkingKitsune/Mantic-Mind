@@ -58,6 +58,15 @@ target_link_libraries(mm_reliability_tests PRIVATE
     ${MM_PLATFORM_LIBS}
 )
 
+# One translation unit holding the whole reliability suite eventually exceeds
+# MSVC's 65535-section limit per object file, which it reports as C1128 against
+# line 1 — a failure that reads like a corrupt source file rather than a size
+# limit. /bigobj lifts the cap; it changes no code generation and costs nothing
+# but a slightly larger .obj.
+if(MSVC)
+    target_compile_options(mm_reliability_tests PRIVATE /bigobj)
+endif()
+
 # On Windows this binary resolves SQLiteCpp/OpenSSL/spdlog from PATH. Under
 # `ctest` that PATH is whatever the invoking shell had, so the loader fails with
 # 0xC0000135 before main() and the test reports an exception with no output at
@@ -194,6 +203,19 @@ if(Python3_Interpreter_FOUND)
                      "${CMAKE_SOURCE_DIR}"
                      "${CMAKE_CURRENT_BINARY_DIR}/minimax_dialect_tmp")
 
+    # The SECOND wrapper convert.py knows how to unwrap, and a different shape of
+    # risk: Kimi-K3 renames nothing below its `language_model.` prefix, so its
+    # dialect is a prefix and a drop list with an EMPTY suffix map. An entry that
+    # looks like it cannot be wrong is exactly the one worth testing — declaring
+    # `moe_block` on it renames every expert to a name the loader does not bind,
+    # which is what the first draft did. Also asserts the unwrapped fixture still
+    # converts, since two identical refusals would compare equal.
+    add_test(NAME mm_kimi_dialect
+             COMMAND "${MM_ADMISSION_PY}"
+                     "${CMAKE_SOURCE_DIR}/tools/ci/check_kimi_dialect.py"
+                     "${CMAKE_SOURCE_DIR}"
+                     "${CMAKE_CURRENT_BINARY_DIR}/kimi_dialect_tmp")
+
     # Opt-in release smoke for a real Linux multi-node vLLM/Ray deployment.
     # The script skips unless its control URL and agent ID are supplied.
     add_test(NAME mm_vllm_ray_smoke
@@ -204,6 +226,6 @@ if(Python3_Interpreter_FOUND)
     # exits 0 and reads as Passed, which is how mm_fused_experts ran nothing for
     # its whole existence while showing green.
     set_tests_properties(mm_fused_experts mm_verify_payload mm_minimax_dialect
-                         mm_vllm_ray_smoke PROPERTIES
+                         mm_kimi_dialect mm_vllm_ray_smoke PROPERTIES
                          SKIP_RETURN_CODE 77)
 endif()

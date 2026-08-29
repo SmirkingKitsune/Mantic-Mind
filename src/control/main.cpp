@@ -1109,21 +1109,7 @@ static void run_control_cli(uint16_t listen_port,
                 self.stream_post(
                     "/v1/models/" + tokens[2] + "/reprofile",
                     nlohmann::json::object(),
-                    [&op_id](const std::string& line) {
-                        const auto pos = line.find("data:");
-                        if (pos == std::string::npos) return true;
-                        try {
-                            const auto j =
-                                nlohmann::json::parse(mm::util::trim(line.substr(pos + 5)));
-                            const auto id = j.value("operation_id", std::string{});
-                            if (!id.empty()) {
-                                op_id = id;
-                                return false;
-                            }
-                        } catch (...) {
-                        }
-                        return true;
-                    },
+                    mm::HttpClient::capture_first_field("operation_id", op_id),
                     &status,
                     &error_body);
                 if (!op_id.empty())
@@ -1203,18 +1189,7 @@ static void run_control_cli(uint16_t listen_port,
                 std::string error_body;
                 const bool connected = self.stream_post(
                     "/v1/models/admit", body,
-                    [&op_id](const std::string& line) {
-                        const auto pos = line.find("data:");
-                        if (pos == std::string::npos) return true;
-                        try {
-                            const auto j =
-                                nlohmann::json::parse(mm::util::trim(line.substr(pos + 5)));
-                            const auto id = j.value("operation_id", std::string{});
-                            if (!id.empty()) { op_id = id; return false; }
-                        } catch (...) {
-                        }
-                        return true;
-                    },
+                    mm::HttpClient::capture_first_field("operation_id", op_id),
                     &status, &error_body);
 
                 if (!op_id.empty()) {

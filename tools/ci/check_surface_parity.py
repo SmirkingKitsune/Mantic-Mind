@@ -458,6 +458,34 @@ def main() -> int:
                     f"{NODE_TUI} calls {m}() and this check has no node-API route mapped "
                     f"for it — either add the route or record why it needs none")
 
+    # ── 2c. no SSE consumer re-strips the `data: ` prefix ─────────────────────
+    #
+    # Here because this file's subject is operator surfaces that actually work,
+    # and this is the way one stopped: `HttpClient`'s line callback is handed the
+    # PAYLOAD — `util::drain_sse_lines` removed `data: ` and dropped the
+    # keepalives — but the header comment claimed it got "each raw `data: ...`
+    # line". Four starters believed it, searched for a prefix that is never
+    # there, captured nothing, and reported "admission started but reported no
+    # operation id" about admissions that had started correctly (D68).
+    #
+    # A grep, and honest about being one: it cannot tell a correct consumer from
+    # an incorrect one in general. What it CAN do is catch the exact literal that
+    # produced four identical bugs, in the files where an operator surface talks
+    # to a stream. `HttpClient::capture_first_field` is the shared helper that
+    # should make writing this by hand unnecessary.
+    SSE_CONSUMERS = TUI_FILES + [CLI]
+    for rel in SSE_CONSUMERS:
+        f = root / rel
+        if not f.exists():
+            continue
+        for n, line in enumerate(f.read_text(encoding="utf-8", errors="replace")
+                                 .splitlines(), 1):
+            if 'find("data:")' in line or 'rfind("data:"' in line:
+                failures.append(
+                    f"{rel}:{n} searches an SSE payload for a `data:` prefix that "
+                    f"drain_sse_lines already removed — the payload IS the JSON. Use "
+                    f"HttpClient::capture_first_field, or parse it directly")
+
     # ── 3. the mapping table cannot rot ───────────────────────────────────────
     # A mapped mutator that no longer appears in the TUI means the entry is
     # stale. Reported, not fatal: removing a TUI button is progress, and the

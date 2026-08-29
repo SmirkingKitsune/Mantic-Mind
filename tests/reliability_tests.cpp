@@ -703,6 +703,99 @@ bool test_engine_actions_answer_before_the_work_finishes() {
     return true;
 }
 
+// An SSE client is handed the PAYLOAD, and the admission starters searched it
+// for a prefix that is never there.
+//
+// `POST /v1/models/admit` answers only as a stream, so the operation id is
+// learned from the first frame. All four starters — the Admissions tab and the
+// `models admit` / `models reprofile` CLI verbs — did
+// `line.find("data:")` and bailed on npos. But `util::drain_sse_lines` strips
+// `data: ` before the callback ever runs, so npos is what they ALWAYS got: the
+// id was never captured, the stream was never dropped, and a perfectly healthy
+// admission reported "admission started but reported no operation id" while
+// converting away in the background. `http_client.hpp` said the callback got
+// "each raw `data: ...` line", and four sites believed it. Roadmap D68.
+//
+// Pinned against a server that writes the frames control actually writes —
+// `stream_admission`'s exact `"data: " + json + "\n\n"`, with a keepalive
+// comment ahead of them, because a client that mistakes a keepalive for a frame
+// is the other half of this seam.
+bool test_sse_payload_is_delivered_without_its_data_prefix() {
+    httplib::Server server;
+    std::atomic<int> frames_written{0};
+    server.Post("/v1/models/admit", [&](const httplib::Request&, httplib::Response& res) {
+        res.set_chunked_content_provider(
+            "text/event-stream", [&](std::size_t, httplib::DataSink& sink) {
+                // A keepalive FIRST. drain_sse_lines must drop it; a client that
+                // hands it to the callback would try to parse ": keepalive".
+                if (frames_written == 0) {
+                    static const std::string beat = ": keepalive\n\n";
+                    ++frames_written;
+                    return sink.write(beat.data(), beat.size());
+                }
+                const auto frame = "data: " +
+                    nlohmann::json{{"operation_id", "op-abc-123"},
+                                   {"stage", "fetch"},
+                                   {"detail", "queued"},
+                                   {"done", false}}.dump() + "\n\n";
+                ++frames_written;
+                if (!sink.write(frame.data(), frame.size())) return false;
+                // Keeps going deliberately. The starter is supposed to hang up
+                // after the first id rather than ride a conversion for hours,
+                // and a server that stopped on its own would hide a client that
+                // never does.
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                return true;
+            });
+    });
+    std::thread listener([&] { server.listen("127.0.0.1", 46180); });
+    struct Teardown {
+        httplib::Server* server;
+        std::thread* listener;
+        ~Teardown() {
+            server->stop();
+            if (listener->joinable()) listener->join();
+        }
+    } teardown{&server, &listener};
+    for (int i = 0; i < 200 && !server.is_running(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK(server.is_running());
+
+    // ── The shared callback captures the id ──────────────────────────────────
+    std::string operation_id;
+    int status = 0;
+    std::string error_body;
+    mm::HttpClient c("http://127.0.0.1:46180");
+    c.set_timeouts(10, 30, 30);
+    const auto sent = std::chrono::steady_clock::now();
+    (void)c.stream_post("/v1/models/admit", nlohmann::json::object(),
+                        mm::HttpClient::capture_first_field("operation_id", operation_id),
+                        &status, &error_body);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - sent).count();
+    CHECK(operation_id == "op-abc-123");
+
+    // ── and hangs up, rather than reading the conversion to its end ──────────
+    //
+    // The server writes forever; only the client's `return false` ends this.
+    // Without it the call would sit here until the read timeout, which is the
+    // second half of what the broken starters did.
+    CHECK(elapsed < 5000);
+
+    // ── the payload really has no `data:` in it, which is the whole defect ───
+    //
+    // Asserted directly rather than inferred from the success above: this is the
+    // sentence the header got wrong, and a test that only checked the happy path
+    // would pass against a client that stripped a prefix that was still present.
+    std::string buf = ": keepalive\n\ndata: {\"operation_id\":\"op-abc-123\"}\n\n";
+    const auto payloads = mm::util::drain_sse_lines(buf);
+    CHECK(payloads.size() == 1);
+    CHECK(payloads[0].find("data:") == std::string::npos);
+    CHECK(nlohmann::json::parse(payloads[0]).value("operation_id", std::string{}) ==
+          "op-abc-123");
+    return true;
+}
+
 bool test_failed_inference_workers_are_harvested_and_drained() {
     // A generation runs on its own thread while the SSE handler streams what it
     // produces, so the node has to track those threads and eventually collect
@@ -8729,6 +8822,8 @@ int main(int argc, char** argv) {
          test_failed_inference_workers_are_harvested_and_drained},
         {"engine_actions_answer_before_the_work_finishes",
          test_engine_actions_answer_before_the_work_finishes},
+        {"sse_payload_is_delivered_without_its_data_prefix",
+         test_sse_payload_is_delivered_without_its_data_prefix},
         {"concurrent_engine_config_pushes_do_not_terminate",
          test_concurrent_engine_config_pushes_do_not_terminate},
         {"engine_config_pushes_coalesce_and_reject_stale",
