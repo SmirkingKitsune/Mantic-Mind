@@ -1360,6 +1360,16 @@ Status ServeServer::open(const ServeConfig& config) {
                                 "application/json");
                 return;
             }
+            for (const auto* field : {"add_generation_prompt", "enable_thinking"}) {
+                const auto option = body.find(field);
+                if (option != body.end() && !option->is_boolean()) {
+                    res.status = http_status_for(ServeError::BadRequest);
+                    res.set_content(error_body(ServeError::BadRequest,
+                                               std::string(field) + " must be a boolean"),
+                                    "application/json");
+                    return;
+                }
+            }
 
             // Three ways to a prompt, in descending order of fidelity.
             //
