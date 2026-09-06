@@ -300,21 +300,7 @@ std::string AdmissionDashboard::admit(const std::string& source,
     const bool connected = c.stream_post(
         "/v1/models/admit",
         body,
-        [&operation_id](const std::string& line) {
-            const auto pos = line.find("data:");
-            if (pos == std::string::npos) return true;
-            try {
-                const auto j = nlohmann::json::parse(util::trim(line.substr(pos + 5)));
-                const auto id = j.value("operation_id", std::string{});
-                if (!id.empty()) {
-                    operation_id = id;
-                    return false; // got what we came for
-                }
-            } catch (...) {
-                // A heartbeat or a partial frame; keep reading.
-            }
-            return true;
-        },
+        HttpClient::capture_first_field("operation_id", operation_id),
         &status,
         &error_body);
 
@@ -354,20 +340,7 @@ std::string AdmissionDashboard::reprofile(std::int64_t model_id, std::string& ou
     const bool connected = c.stream_post(
         "/v1/models/" + std::to_string(model_id) + "/reprofile",
         nlohmann::json::object(),
-        [&operation_id](const std::string& line) {
-            const auto pos = line.find("data:");
-            if (pos == std::string::npos) return true;
-            try {
-                const auto j = nlohmann::json::parse(util::trim(line.substr(pos + 5)));
-                const auto id = j.value("operation_id", std::string{});
-                if (!id.empty()) {
-                    operation_id = id;
-                    return false;
-                }
-            } catch (...) {
-            }
-            return true;
-        },
+        HttpClient::capture_first_field("operation_id", operation_id),
         &status,
         &error_body);
 
