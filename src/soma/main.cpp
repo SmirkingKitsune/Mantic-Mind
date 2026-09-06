@@ -425,8 +425,8 @@ StageResult stage_chat_template(const std::filesystem::path& dir) {
         // A template with no oracle is worse than no template: it would be
         // served and never graded. Failed, not skipped.
         r.status = "failed";
-        r.detail["reason"] = "a chat template was compiled with nothing to grade it: " +
-                             st.message();
+        r.detail["reason"] =
+            "a chat template was compiled with nothing to grade it: " + st.message();
         return r;
     }
 
@@ -437,9 +437,8 @@ StageResult stage_chat_template(const std::filesystem::path& dir) {
         return r;
     }
     r.status = rt.clean() ? "passed" : "failed";
-    r.detail = nlohmann::json{{"cases", rt.cases},
-                              {"matched", rt.encode_ok},
-                              {"flags", tok.chat_template().flags}};
+    r.detail = nlohmann::json{
+        {"cases", rt.cases}, {"matched", rt.encode_ok}, {"flags", tok.chat_template().flags}};
     if (!rt.first_failure.empty()) r.detail["first_failure"] = rt.first_failure;
     return r;
 }

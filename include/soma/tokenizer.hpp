@@ -248,5 +248,4 @@ Status verify_chat_template(const CompiledTokenizer& tokenizer,
                             const std::vector<ChatOracleCase>& cases,
                             RoundTripResult& out);
 
-
 } // namespace soma

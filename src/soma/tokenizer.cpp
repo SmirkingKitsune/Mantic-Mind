@@ -629,8 +629,8 @@ void split_reasoning(const ChatTemplate& chat,
     reasoning = {};
     if (message.role != MessageRole::Assistant) return;
 
-    const bool thinking_aware = chat.has(chat_flag::kSupportsThinking) ||
-                                chat.has(chat_flag::kAssistantDropsThink);
+    const bool thinking_aware =
+        chat.has(chat_flag::kSupportsThinking) || chat.has(chat_flag::kAssistantDropsThink);
     if (thinking_aware) {
         static constexpr std::string_view kClose = "</think>";
         static constexpr std::string_view kOpen = "<think>";
@@ -648,8 +648,10 @@ void split_reasoning(const ChatTemplate& chat,
         const auto is_space = [](char c) {
             return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
         };
-        while (!content.empty() && is_space(content.front())) content.remove_prefix(1);
-        while (!content.empty() && is_space(content.back())) content.remove_suffix(1);
+        while (!content.empty() && is_space(content.front()))
+            content.remove_prefix(1);
+        while (!content.empty() && is_space(content.back()))
+            content.remove_suffix(1);
     }
 }
 
@@ -661,8 +663,7 @@ Status CompiledTokenizer::apply_chat_template(std::span<const ChatMessage> messa
     out.clear();
     const auto& chat = impl_->chat;
     if (!chat.present) {
-        return {StatusCode::Unsupported,
-                "this container carries no compiled chat template"};
+        return {StatusCode::Unsupported, "this container carries no compiled chat template"};
     }
 
     // Refuse an option this template cannot honour rather than ignoring it.
@@ -678,9 +679,7 @@ Status CompiledTokenizer::apply_chat_template(std::span<const ChatMessage> messa
         return {StatusCode::Unsupported,
                 "this model's chat template does not take clear_thinking; it "
                 "always " +
-                    std::string(chat.has(chat_flag::kClearThinkingDefault)
-                                    ? "drops"
-                                    : "keeps") +
+                    std::string(chat.has(chat_flag::kClearThinkingDefault) ? "drops" : "keeps") +
                     " reasoning from turns before the last user message"};
     }
     if (!options.reasoning_effort.empty() && !chat.has(chat_flag::kReasoningEffort)) {
@@ -688,10 +687,10 @@ Status CompiledTokenizer::apply_chat_template(std::span<const ChatMessage> messa
                 "this model's chat template does not take reasoning_effort"};
     }
 
-    const bool clear_thinking = (options.clear_thinking_set &&
-                                 chat.has(chat_flag::kClearThinkingSettable))
-                                    ? options.clear_thinking
-                                    : chat.has(chat_flag::kClearThinkingDefault);
+    const bool clear_thinking =
+        (options.clear_thinking_set && chat.has(chat_flag::kClearThinkingSettable))
+            ? options.clear_thinking
+            : chat.has(chat_flag::kClearThinkingDefault);
 
     std::ptrdiff_t last_user = -1;
     for (std::size_t i = 0; i < messages.size(); ++i) {
@@ -739,8 +738,7 @@ Status CompiledTokenizer::apply_chat_template(std::span<const ChatMessage> messa
     }
 
     if (options.add_generation_prompt) {
-        append(options.enable_thinking ? chat.generation_prompt
-                                       : chat.generation_prompt_nothink);
+        append(options.enable_thinking ? chat.generation_prompt : chat.generation_prompt_nothink);
     }
     return {};
 }

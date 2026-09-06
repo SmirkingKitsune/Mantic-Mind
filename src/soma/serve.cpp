@@ -295,8 +295,7 @@ Status build_chat_prompt(const CompiledTokenizer& tokenizer,
         // content is what lets ONE channel carry both.
         if (tokenizer.chat_template().has(chat_flag::kAssistantSplitsThink) &&
             role == MessageRole::Assistant && m.contains("reasoning_content") &&
-            m["reasoning_content"].is_string() &&
-            text.find("</think>") == std::string::npos) {
+            m["reasoning_content"].is_string() && text.find("</think>") == std::string::npos) {
             text = "<think>" + m["reasoning_content"].get<std::string>() + "</think>" + text;
         }
         roles.push_back(role);
@@ -1491,9 +1490,15 @@ Status ServeServer::open(const ServeConfig& config) {
                 // Captured BY VALUE: the provider outlives this handler, and
                 // `prompt_ids` is the prompt for a templated request the way
                 // `prompt` is for every other one.
-                [this, prompt, prompt_ids, templated, max_tokens, sampler, served,
-                 conversation, codec_state](
-                    std::size_t, httplib::DataSink& sink) {
+                [this,
+                 prompt,
+                 prompt_ids,
+                 templated,
+                 max_tokens,
+                 sampler,
+                 served,
+                 conversation,
+                 codec_state](std::size_t, httplib::DataSink& sink) {
                     auto send = [&](const json& j) {
                         const auto s = "data: " + j.dump() + "\n\n";
                         return sink.write(s.data(), s.size());
