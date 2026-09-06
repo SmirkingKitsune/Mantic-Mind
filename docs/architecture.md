@@ -69,7 +69,9 @@ seam was therefore designed against **GQA** (Qwen3-MoE, Mixtral, GPT-OSS, Llama-
 (DeepSeek-V2-Lite, Moonlight) simultaneously. Both now run through it.
 
 A **third** family has since gone through it, and it is the one to read this section against:
-**MLA + DSA** (GLM-5.2) — DeepSeek Sparse Attention with IndexShare. It is MLA plus a learned sparse
+**MLA + DSA** (GLM-5.2, and GLM-5.3 unchanged — the same base model under a new post-training, whose
+`config.json` differs from 5.2's only in `transformers_version`) — DeepSeek Sparse Attention with
+IndexShare. It is MLA plus a learned sparse
 key selector, and 57 of its 78 layers own no indexer weights at all; they reuse a selection computed
 by a different layer. The seam carried it without changing shape: one opaque `ArchLayerPayload` on
 the per-forward workspace. The concern recorded here earlier — that per-layer function pointers had

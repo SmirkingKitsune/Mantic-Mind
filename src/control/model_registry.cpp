@@ -448,6 +448,50 @@ struct ControlModelRegistry::Impl {
             db->exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (2)");
             tx.commit();
         }
+
+        if (!has_version(3)) {
+            SQLite::Transaction tx(*db);
+            // `chat_template`, the ladder stage that grades a container's compiled
+            // chat template against the ids the model's own Jinja renderer
+            // produced.
+            //
+            // WORTH KNOWING BEFORE ADDING THE NEXT STAGE: this CHECK constraint
+            // is a second, control-side allow-list of the stage names `soma
+            // conform` emits, and the two are coupled across a process boundary
+            // with nothing to keep them in step. Adding the stage without this
+            // migration does not lose that one row — `record_conformance` writes
+            // the ladder in ONE transaction, so the constraint violation rolls
+            // back ALL of them and the model is admitted with an empty ladder.
+            // It presents as "conformance never ran", four layers away from the
+            // stage that was actually added.
+            //
+            // SQLite cannot alter a CHECK constraint, so the table is rebuilt.
+            db->exec(R"(
+                CREATE TABLE conformance_v3 (
+                    model_id INTEGER NOT NULL REFERENCES model(id) ON DELETE CASCADE,
+                    stage    TEXT    NOT NULL
+                             CHECK (stage IN ('fp32_tiny_tf',
+                                              'quant_tiny_greedy',
+                                              'real_logit_kl',
+                                              'accuracy_floor',
+                                              'tokenizer_roundtrip',
+                                              'quant_codec',
+                                              'chat_template')),
+                    status   TEXT    NOT NULL
+                             CHECK (status IN ('passed', 'failed', 'skipped')),
+                    passed   INTEGER NOT NULL,
+                    detail   TEXT,
+                    ran_at   INTEGER NOT NULL,
+                    PRIMARY KEY (model_id, stage)
+                ))");
+            db->exec("INSERT INTO conformance_v3(model_id, stage, status, passed, detail, ran_at) "
+                     "SELECT model_id, stage, status, passed, detail, ran_at FROM conformance");
+            db->exec("DROP TABLE conformance");
+            db->exec("ALTER TABLE conformance_v3 RENAME TO conformance");
+
+            db->exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (3)");
+            tx.commit();
+        }
     }
 
     static AdmittedModel read_row(SQLite::Statement& q) {

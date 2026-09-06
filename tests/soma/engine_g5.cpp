@@ -723,6 +723,27 @@ int main(int argc, char** argv) {
         }
         const auto port = sup.slots().front().port;
 
+        // These are optional, but PRESENT is not the same thing as boolean.
+        // nlohmann::json::value<bool> throws for every one of these otherwise,
+        // after the JSON parsing catch has already ended.
+        std::cout << "\n8a. malformed optional booleans are client errors\n";
+        for (const auto* field : {"add_generation_prompt", "enable_thinking"}) {
+            for (const auto& bad : std::vector<json>{nullptr, "false", 0}) {
+                httplib::Client cli("127.0.0.1", port);
+                cli.set_read_timeout(10);
+                const json body{{"messages", json::array({user_msg("hello")})}, {field, bad}};
+                const auto res = cli.Post("/v1/chat/completions", body.dump(), "application/json");
+                json error = json::value_t::discarded;
+                if (res) error = json::parse(res->body, nullptr, false);
+                const bool structured_bad_request =
+                    res && res->status == 400 && error.is_object() && error.contains("error") &&
+                    error["error"].value("code", std::string{}) == "bad_request";
+                check(structured_bad_request,
+                      std::string(field) + ": " + bad.type_name() + " is a structured 400",
+                      res ? std::to_string(res->status) + " " + res->body : "no response");
+            }
+        }
+
         // max_tokens = 1 on the opening turn, so the cache holds exactly the
         // prompt: the single generated token is sampled from the last prefill row
         // and never fed back. That makes turn 2's prompt a genuine extension

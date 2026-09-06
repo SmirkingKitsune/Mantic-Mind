@@ -304,6 +304,23 @@ if(BUILD_TESTING)
     add_test(NAME soma_tokenizer_g0
              COMMAND soma_tokenizer_g0 "${CMAKE_SOURCE_DIR}/tests/fixtures/tokenizers")
 
+    # ── G0 chat template ──────────────────────────────────────────────────────
+    # The prompt framing is the one part of serving that is invisible when it is
+    # wrong: a model handed `user: hi\nassistant:` instead of
+    # `<|user|>hi<|assistant|><think>` still answers, still streams, still reads
+    # fluently, and is not the model that was trained. Nothing downstream catches
+    # it — the weights are right, the tokenizer round-trips, and the KL against a
+    # reference is computed on whatever prompt was actually built.
+    #
+    # Graded against the ids the model's OWN Jinja renderer produced, not against
+    # a second copy of this engine's opinion of them.
+    add_executable(soma_chat_template_g0
+                   ${CMAKE_SOURCE_DIR}/tests/soma/chat_template_g0.cpp)
+    target_link_libraries(soma_chat_template_g0 PRIVATE mm_soma)
+
+    add_test(NAME soma_chat_template_g0
+             COMMAND soma_chat_template_g0 "${CMAKE_SOURCE_DIR}/tests/fixtures/tokenizers")
+
     # ── G1 quantized path ─────────────────────────────────────────────────────
     # Quantized vs fp32, per dtype. The fp32 path is the reference because G0
     # already tied it to transformers; comparing quantized output to the oracle
