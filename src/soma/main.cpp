@@ -62,7 +62,10 @@ int usage() {
                  "  soma stamp DIR\n"
                  "               verify a converted v2 container's role descriptor, then\n"
                  "               bind its index to the canonical C++ IR arch_hash. Shards\n"
-                 "               are not rewritten; serve refuses an unstamped container.\n";
+                 "               are not rewritten; serve refuses an unstamped container.\n"
+                 "  soma verify  DIR\n"
+                 "               re-read every expert and check its recorded digest.\n"
+                 "               Run after copying a container to a node.\n";
     return 2;
 }
 
@@ -851,15 +854,80 @@ int cmd_stamp(int argc, char** argv) {
         return 1;
     }
     // stamp_container validates the same parsed snapshot it writes.
-    if (auto st = soma::stamp_container(dir, arch); !st.ok()) {
+    soma::StampReport report;
+    if (auto st = soma::stamp_container(dir, arch, "soma.container", &report); !st.ok()) {
         std::cerr << "stamp: " << st.message() << "\n";
         return 1;
     }
     const auto& identity = arch.container_arch_hash.empty() ? arch.arch_hash
                                                             : arch.container_arch_hash;
-    std::cout << "stamped " << (root / "soma.container").string() << "\n"
+    // "stamped" only when something was written. An exact repeat reads nothing
+    // and proves nothing new, and printing the same word for both would let an
+    // operator believe a re-run had re-checked the payload.
+    std::cout << (report.wrote ? "stamped   " : "unchanged ")
+              << (root / "soma.container").string() << "\n"
               << "arch_hash " << identity << "\n";
+    // Which guarantee this is. "Confirmed" means the shards still hash to what
+    // the converter measured with the tensors in memory; "recorded" only pins
+    // what is on disk now, which is all that can be said for a container
+    // converted before digests existed.
+    if (report.wrote) {
+        std::cout << "digests   " << (report.had_digests ? "confirmed" : "recorded") << " over "
+                  << report.experts_checked << " experts" << "\n";
+    } else {
+        std::cout << "digests   not re-read; run `soma verify` to check the payload" << "\n";
+    }
     return 0;
+}
+
+
+// ── verify ───────────────────────────────────────────────────────────────────
+//
+// The question `stamp` does not ask twice: are these still the bytes we recorded?
+//
+// Everything else in this file checks SHAPE. The index packs canonically, the
+// shard files are exactly the size those ranges imply, the roles carry the dtypes
+// the IR names — and a shard of precisely the right length full of wrong bytes
+// passes all of it. A container is written once and then copied: control streams
+// it to a node, it sits there, and it is read for months. This is what to run at
+// the far end of that.
+int cmd_verify(int argc, char** argv) {
+    if (argc != 1 || argv[0][0] == '-') return usage();
+    const std::string dir = argv[0];
+    const std::filesystem::path root(dir);
+
+    if (!std::filesystem::exists(root / "container_meta.json")) {
+        std::cerr << "verify: no container_meta.json in " << dir
+                  << "; this is not a converted container\n";
+        return 1;
+    }
+
+    // No resolve_arch here, and that is the point: a node holding a copied
+    // container can check it without being able to resolve — or even support —
+    // its architecture. Whether the container matches an IR is `stamp`'s question.
+    //
+    // Both indexes when both exist. The auxiliary DSpark payload is as copyable,
+    // and as corruptible, as the base one.
+    int failures = 0, checked_indexes = 0;
+    for (const char* index : {"soma.container", "soma.dspark"}) {
+        if (!std::filesystem::exists(root / index)) continue;
+        ++checked_indexes;
+        soma::PayloadReport report;
+        const auto st = soma::verify_payload(dir, report, index);
+        std::cout << std::left << std::setw(16) << index;
+        if (st.ok()) {
+            std::cout << "OK        " << report.experts_checked << " experts, "
+                      << (report.bytes_checked >> 20) << " MiB\n";
+        } else {
+            std::cout << "FAILED    " << st.message() << "\n";
+            ++failures;
+        }
+    }
+    if (checked_indexes == 0) {
+        std::cerr << "verify: no soma.container in " << dir << "\n";
+        return 1;
+    }
+    return failures == 0 ? 0 : 1;
 }
 
 } // namespace
@@ -871,6 +939,7 @@ int main(int argc, char** argv) {
     if (cmd == "plan") return cmd_plan(argc - 2, argv + 2);
     if (cmd == "conform") return cmd_conform(argc - 2, argv + 2);
     if (cmd == "stamp") return cmd_stamp(argc - 2, argv + 2);
+    if (cmd == "verify") return cmd_verify(argc - 2, argv + 2);
     if (cmd == "--help" || cmd == "-h") {
         usage();
         return 0;

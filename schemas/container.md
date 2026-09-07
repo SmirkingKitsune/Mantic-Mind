@@ -186,6 +186,12 @@ version gate instead of parsing the descriptor bytes as sizes and indexes.
 | Bit | Name | Meaning |
 |---|---|---|
 | `0x1` | `per_role_quant` | the role descriptor below is present |
+| `0x2` | `expert_digests` | a per-expert digest table follows the index |
+
+`0x2` was added with **no version bump**, which is this mechanism working as
+designed: every v2 reader already refuses a bit it does not know, so no v2 build
+can walk past the digest table and misread what follows. The role descriptor
+needed the bump only because v1 readers ignored the word entirely.
 
 ### Role descriptor
 
@@ -220,6 +226,56 @@ Index entry, one per `(layer, expert)` in layer-major order:
 | `u64` | `offset` — into that shard, 4 KB-aligned |
 | `u32` | `length` |
 
+### Digest table
+
+Present iff `flags & 0x2`, immediately after the entries:
+
+```
+n_layers × n_experts × u64
+```
+
+One per slot, in the same order, so the entry stride stays 16 bytes and every
+offset computation that predates the table keeps working. Each value is the first
+8 bytes of the SHA-256 of that expert's `length` bytes, little-endian. A
+zero-length slot — a dense layer's — stores `0` rather than the digest of an empty
+string, so a missing entry and a real one are never confusable.
+
+**A corruption check, not a tamper check.** It answers whether these bytes survived
+being written, streamed to a node, and left on a disk for a month, which is the
+question a cluster that copies container directories actually has. Truncation to
+64 bits keeps the table at 8 B per expert — 125 KB for DeepSeek V4's 15,616 — with
+a per-expert false-accept rate of 2^-64 against accidental damage. It is not
+collision-resistant and nothing should read it as evidence against a deliberate
+substitution. SHA-256 because OpenSSL is already linked for `arch_hash` and
+`hashlib` is in Python's standard library: one obvious implementation per side,
+no new dependency on either.
+
+Three places check it, and they answer different questions:
+
+| | reads | catches |
+|---|---|---|
+| the converter | the tensors, once | nothing — it *writes* the table |
+| `soma stamp` | every expert when writing a stamp | damage between conversion and initial admission |
+| `soma verify DIR` | every shard, on demand | damage in transit or at rest; needs no source checkpoint |
+| the read path | each expert, on first touch | a bad byte at the moment it would enter the model |
+
+The read path hashes bytes already in the destination buffer once per expert per
+store opening. This assumes immutable files during that opening; later disk
+changes require `soma verify` or reopening the store to detect. Hashing cost
+depends on the CPU and storage. The bandwidth probe reads directly without
+hashing, changing the model's verification policy, or marking experts verified.
+
+An unchanged stamp is a no-op and explicitly reports that payload was not
+re-read. Use `soma verify` after transfer. Containers without digest tables remain
+readable; verification reports unsupported until a table is recorded. Recording
+digests for an old container establishes a baseline for its current bytes and
+does not prove those bytes survived the original conversion unchanged.
+
+Everything else in this format checks *shape*: that the ranges pack canonically,
+that each shard file is exactly the size those ranges imply, that the roles carry
+the dtypes the IR names. **A correctly sized file full of wrong bytes satisfies all
+of it.** Until the table existed, nothing read a payload byte at all.
+
 `expert_bytes` is uniform for any single model and quantization, so the index is strictly redundant
 today. It is written anyway: variable-length experts are plausible (mixed per-expert precision, pruned
 experts), and a format that assumed uniformity would need a version bump to allow them.
@@ -243,7 +299,8 @@ verifies the mandatory role descriptor against it, and then stamps the hash into
 the index. `convert.py` cannot do it: the canonical hash is defined
 by the C++ IR canonicalization and a second implementation in Python would agree
 until it did not. Only the small index file is rewritten — through a temporary plus
-a rename — so stamping a 61 GB container costs a few hundred kilobytes of I/O.
+a rename. Initial stamping also reads every expert to check or establish its
+digest; only the small index is rewritten.
 
 Until this command existed, nothing stamped anything, so the mismatch branch could
 never fire on any container ever written. Unstamped is therefore refused rather
@@ -300,3 +357,6 @@ costs a read-modify-write on every miss.
   container is immutable.
 - **Kernel choices.** Registry too, for the same reason — and because they are host-specific while the
   container is portable.
+- **A digest of the dense half.** Dense tensors and alignment padding are outside
+  this digest table. Same-size corruption of dense tensor values is not detected
+  by this change.

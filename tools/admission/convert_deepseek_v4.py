@@ -18,8 +18,29 @@ import struct
 from pathlib import Path
 from typing import Any
 
-from convert import (ALIGN, DTYPE_ID, FLAG_PER_ROLE_QUANT, FORMAT_VERSION, MAGIC,
-                     align_up, quantize_rows, role_descriptor, usable_group)
+from convert import (ALIGN, DTYPE_ID, FLAG_EXPERT_DIGESTS, FLAG_PER_ROLE_QUANT,
+                     FORMAT_VERSION, MAGIC, align_up, digest_table, expert_digest,
+                     quantize_rows, role_descriptor, usable_group)
+
+
+def digests_from_shard(path: Path, entries: list) -> list[int]:
+    """Recover a completed layer's digests by reading the shard back.
+
+    Only for a RESUMED conversion whose manifest predates the digest table. The
+    alternative — leaving the table out because one layer's digests are missing —
+    would make an interrupted conversion produce a weaker container than an
+    uninterrupted one, which is exactly the sort of difference nobody would think
+    to look for later.
+    """
+    out: list[int] = []
+    with open(path, "rb") as fh:
+        for off, length in entries:
+            if int(length) == 0:
+                out.append(0)
+                continue
+            fh.seek(int(off))
+            out.append(expert_digest(fh.read(int(length))))
+    return out
 
 PINNED_REVISION = "72e1d3230f6c080a530b0a1d46f8eb4602340597"
 PINNED_CONFIG_SHA256 = "9dd2a89255469e120b333668ef5a169b7ae46c00f6bbab786bf0be457546aec0"
@@ -464,6 +485,7 @@ def run(args) -> int:
     # Routed experts: one atomic file per layer makes resume validation cheap and
     # ensures no partial shard can masquerade as complete.
     all_index: list[tuple[int, int, int]] = []
+    all_digests: list[int] = []
     total_payload = 0
     uniform_len = -1
     effective_groups: dict[str, int] = {}
@@ -486,6 +508,7 @@ def run(args) -> int:
                 and len(entries) == n_experts):
             tmp = final.with_suffix(".bin.tmp")
             offsets = []
+            layer_digests: list[int] = []
             off = 0
             fused_gate_up = None
             fused_down = None
@@ -515,6 +538,7 @@ def run(args) -> int:
                         role_groups[role] = group
                         blob += packed
                     offsets.append([off, len(blob)])
+                    layer_digests.append(expert_digest(bytes(blob)))
                     fh.write(blob)
                     pad = align_up(off + len(blob)) - (off + len(blob))
                     if pad:
@@ -525,10 +549,16 @@ def run(args) -> int:
                     elif uniform_len != len(blob):
                         uniform_len = 0
             os.replace(tmp, final)
-            done = {"file_bytes": final.stat().st_size, "entries": offsets}
+            done = {"file_bytes": final.stat().st_size, "entries": offsets,
+                    "digests": layer_digests}
             manifest["completed_expert_layers"][str(layer)] = done
             save_manifest()
             entries = offsets
+        if done.get("digests") is None:
+            done["digests"] = digests_from_shard(final, entries)
+            manifest["completed_expert_layers"][str(layer)] = done
+            save_manifest()
+        all_digests.extend(int(d) for d in done["digests"])
         for off, length in entries:
             all_index.append((layer, int(off), int(length)))
             total_payload += int(length)
@@ -608,6 +638,7 @@ def run(args) -> int:
     dspark_all_index: list[tuple[int, int, int]] = []
     dspark_total_payload = 0
     dspark_uniform_len = -1
+    dspark_all_digests: list[int] = []
     dspark_dense_weight_map: dict[str, str] = {}
     dspark_qweight_map: dict[str, dict[str, Any]] = {}
     dspark_dense_total = 0
@@ -621,6 +652,7 @@ def run(args) -> int:
                     and len(entries) == n_experts):
                 tmp = final.with_suffix(".bin.tmp")
                 offsets = []
+                stage_digests: list[int] = []
                 off = 0
                 with open(tmp, "wb") as fh:
                     for expert in range(n_experts):
@@ -635,6 +667,7 @@ def run(args) -> int:
                             dspark_role_groups[role] = group
                             blob += packed
                         offsets.append([off, len(blob)])
+                        stage_digests.append(expert_digest(bytes(blob)))
                         fh.write(blob)
                         padded = align_up(off + len(blob))
                         if padded > off + len(blob):
@@ -645,10 +678,16 @@ def run(args) -> int:
                         elif dspark_uniform_len != len(blob):
                             dspark_uniform_len = 0
                 os.replace(tmp, final)
-                done = {"file_bytes": final.stat().st_size, "entries": offsets}
+                done = {"file_bytes": final.stat().st_size, "entries": offsets,
+                        "digests": stage_digests}
                 manifest["completed_dspark_expert_layers"][str(stage)] = done
                 save_manifest()
                 entries = offsets
+            if done.get("digests") is None:
+                done["digests"] = digests_from_shard(final, entries)
+                manifest["completed_dspark_expert_layers"][str(stage)] = done
+                save_manifest()
+            dspark_all_digests.extend(int(d) for d in done["digests"])
             for off, length in entries:
                 dspark_all_index.append((stage, int(off), int(length)))
                 dspark_total_payload += int(length)
@@ -735,7 +774,8 @@ def run(args) -> int:
 
         with open(out_dir / "soma.dspark.tmp", "wb") as ix:
             ix.write(MAGIC)
-            ix.write(struct.pack("<II", FORMAT_VERSION, FLAG_PER_ROLE_QUANT))
+            ix.write(struct.pack("<II", FORMAT_VERSION,
+                                 FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS))
             ix.write(struct.pack("<I", 0))
             ix.write(struct.pack("<IIII", DSPARK_STAGES, n_experts,
                                  DSPARK_STAGES, DTYPE_ID[dt_gate]))
@@ -746,6 +786,7 @@ def run(args) -> int:
                                  dspark_total_payload))
             for shard_id, off, length in dspark_all_index:
                 ix.write(struct.pack("<IQI", shard_id, off, length))
+            ix.write(digest_table(dspark_all_digests))
         os.replace(out_dir / "soma.dspark.tmp", out_dir / "soma.dspark")
 
     # This field describes tensors left out of the converted container, not the
@@ -768,7 +809,8 @@ def run(args) -> int:
 
     with open(out_dir / "soma.container.tmp", "wb") as ix:
         ix.write(MAGIC)
-        ix.write(struct.pack("<II", FORMAT_VERSION, FLAG_PER_ROLE_QUANT))
+        ix.write(struct.pack("<II", FORMAT_VERSION,
+                             FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS))
         ix.write(struct.pack("<I", 0))
         ix.write(struct.pack("<IIII", n_layers, n_experts, n_layers, DTYPE_ID[dt_gate]))
         ix.write(struct.pack("<I", role_groups.get("gate", args.group)))
@@ -776,6 +818,7 @@ def run(args) -> int:
         ix.write(struct.pack("<QQ", max(uniform_len, 0), total_payload))
         for shard, off, length in all_index:
             ix.write(struct.pack("<IQI", shard, off, length))
+        ix.write(digest_table(all_digests))
     os.replace(out_dir / "soma.container.tmp", out_dir / "soma.container")
     shutil.copy2(src / "config.json", out_dir / "config.json")
 

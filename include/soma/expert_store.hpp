@@ -36,7 +36,39 @@ inline constexpr std::uint32_t kContainerVersion = 2;
 /// ignored this word, so the role descriptor also requires a version bump: a
 /// flag cannot retroactively make an old reader fail closed.
 inline constexpr std::uint32_t kFlagPerRoleQuant = 1u << 0;
-inline constexpr std::uint32_t kKnownContainerFlags = kFlagPerRoleQuant;
+
+/// A per-expert digest table follows the index.
+///
+/// A flag alone this time, with no version bump, and that is the mechanism above
+/// working as intended: every v2 reader already refuses a bit it does not know,
+/// so a v2 build cannot walk past this table and misread what follows it. The
+/// role descriptor needed the bump only because v1 readers ignored the word.
+inline constexpr std::uint32_t kFlagExpertDigests = 1u << 1;
+
+inline constexpr std::uint32_t kKnownContainerFlags = kFlagPerRoleQuant | kFlagExpertDigests;
+
+/// The first 8 bytes of the SHA-256 of one expert's bytes, little-endian.
+///
+/// A CORRUPTION check, not a tamper check. It answers "did these bytes survive
+/// being written, copied between nodes, and sat on for a month", which is the
+/// question a cluster that streams container directories over the network
+/// actually has. Truncation to 64 bits keeps the table at 8 B per expert — 125 KB
+/// for DeepSeek V4's 15,616 — while leaving a per-expert false-accept rate of
+/// 2^-64 against accidental damage. It is not collision-resistant and nothing
+/// should treat it as evidence against a deliberate substitution.
+///
+/// SHA-256 because OpenSSL is already linked for arch_hash and Python's hashlib
+/// is in the standard library: one obvious implementation on each side, and no
+/// new dependency on either.
+using ExpertDigest = std::uint64_t;
+
+/// Zero-length slots — the dense layers — store this rather than the digest of
+/// an empty string, so a missing entry and a real one are never confusable.
+inline constexpr ExpertDigest kNoDigest = 0;
+
+/// Compute one expert's digest. Exposed so the verifier and the writer cannot
+/// disagree about what is being hashed.
+ExpertDigest expert_digest(CByteSpan bytes) noexcept;
 
 /// One expert role's quantization, as the shards were actually written.
 ///
@@ -68,6 +100,23 @@ static_assert(static_cast<std::uint32_t>(DType::Q5_G) == 5, "container dtype wir
 static_assert(static_cast<std::uint32_t>(DType::Q4_G) == 6, "container dtype wire id");
 static_assert(static_cast<std::uint32_t>(DType::Q4_0) == 7, "container dtype wire id");
 
+/// What to do with the digest table on the read path.
+enum class PayloadPolicy : std::uint8_t {
+    /// Verify each expert once, the first time it is read.
+    ///
+    /// The cost is one SHA-256 pass over bytes already in the destination buffer,
+    /// paid once per expert per process — not per read, which would roughly double
+    /// miss latency for no added coverage. What it buys is that a bad byte is
+    /// caught at the moment it would otherwise enter the model, on the node that
+    /// has it, rather than surfacing as one cluster member quietly giving
+    /// different answers.
+    VerifyOnFirstRead,
+    /// Read without checking. For a container with no digest table this is the
+    /// only available behaviour, and it is what the bandwidth probe uses so that
+    /// it measures the disk rather than the hash.
+    Trust,
+};
+
 enum class IdentityPolicy : std::uint8_t {
     RequireStamped,
     AllowUnstamped,
@@ -90,6 +139,9 @@ struct OpenOptions {
     /// documented legacy-v1 reader; a hash mismatch and an empty expected
     /// identity are still errors.
     IdentityPolicy identity = IdentityPolicy::RequireStamped;
+
+    /// Ignored when the container carries no digest table.
+    PayloadPolicy payload = PayloadPolicy::VerifyOnFirstRead;
 };
 
 /// Sidecar index entry. Fixed-size and POD so the index loads with one read.
@@ -116,6 +168,12 @@ struct ContainerHeader {
     RoleQuant gate;
     RoleQuant up;
     RoleQuant down;
+
+    /// Present only when `flags & kFlagExpertDigests`. Nothing before this
+    /// checked a single payload byte: validate_ranges() proves the ranges pack
+    /// canonically and the shard files are exactly the right size, which a
+    /// perfectly sized file full of wrong bytes satisfies completely.
+    bool has_digests = false;
 };
 
 /// Write a container's identity into its index, in place.
@@ -142,9 +200,55 @@ struct ContainerHeader {
 /// Rewrites the small index file only — the shards are not touched, and the
 /// write goes through a temporary plus rename so an interrupted stamp leaves the
 /// previous index intact.
+/// What a stamp actually did, so the caller can state which guarantee it holds.
+///
+/// "Digests confirmed" and "digests recorded" are different claims: the first
+/// says the shards still hash to what the converter measured while it had the
+/// tensors in memory, the second only pins whatever is on disk right now. A
+/// command that printed the same line for both would overstate the weaker one.
+struct StampReport {
+    bool had_digests = false;      ///< the converter had already recorded them
+    bool wrote = false;            ///< false when the stamp was an exact repeat
+    std::uint64_t experts_checked = 0;
+};
+
 Status stamp_container(const std::string& model_dir,
                        const ArchIr& arch,
-                       const std::string& index_file = "soma.container");
+                       const std::string& index_file = "soma.container",
+                       StampReport* report = nullptr);
+
+/// What a full payload check found.
+struct PayloadReport {
+    std::uint64_t experts_checked = 0;
+    std::uint64_t bytes_checked = 0;
+    std::uint64_t mismatches = 0;
+    /// The first expert whose bytes disagreed, so the report names one place to
+    /// look rather than a count.
+    LayerIndex first_bad_layer = 0;
+    ExpertId first_bad_expert = 0;
+};
+
+/// Read every expert and check it against the container's digest table.
+///
+/// The check nothing performed before it. `validate_ranges()` proves the index
+/// packs canonically and that each shard file is exactly the size those ranges
+/// imply — all of which a correctly sized file full of wrong bytes satisfies. A
+/// container is written once and then COPIED: control streams it to a node, it
+/// sits on that node's disk, and it is read months later. Every step after the
+/// conversion can damage it, and until this existed none of them was checked.
+///
+/// Refuses a container with no digest table rather than reporting success over a
+/// check it did not make.
+///
+/// Takes no ArchIr, deliberately. "Do these bytes still hash to what was
+/// recorded" is well posed without one, and requiring an IR would put this out of
+/// reach of the two callers that need it most: a node that holds a copied
+/// container and cannot resolve its architecture, and the auxiliary DSpark index,
+/// whose IR only the speculative backend can build. Whether the container matches
+/// an IR is a different question, and open() and stamp_container() ask it.
+Status verify_payload(const std::string& model_dir,
+                      PayloadReport& out,
+                      const std::string& index_file = "soma.container");
 
 /// Reads expert bytes from disk. Owns the file handles, the sidecar index, and
 /// the bounded background load pool.

@@ -14,7 +14,10 @@
 
 #include "soma/quant_format.hpp"
 
+#include <openssl/sha.h>
+
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -105,6 +108,21 @@ struct Writer {
     void raw(std::string_view s) { out.append(s); }
 };
 
+} // namespace
+
+ExpertDigest expert_digest(CByteSpan bytes) noexcept {
+    std::array<unsigned char, SHA256_DIGEST_LENGTH> full{};
+    SHA256(reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size(), full.data());
+    // Little-endian, so the C++ and Python sides agree without either of them
+    // having to state a byte order twice.
+    ExpertDigest out = 0;
+    for (std::size_t i = 0; i < sizeof(out); ++i)
+        out |= static_cast<ExpertDigest>(full[i]) << (8 * i);
+    return out;
+}
+
+namespace {
+
 bool dtype_from_id(std::uint32_t id, DType& out) noexcept {
     if (id > static_cast<std::uint32_t>(DType::Q4_0)) return false;
     out = static_cast<DType>(id);
@@ -126,6 +144,8 @@ struct ParsedIndex {
     std::uint32_t group = 0;
     std::uint64_t total_bytes = 0;
     std::vector<ExpertLocation> entries;
+    /// Parallel to `entries`, or empty when the container carries no table.
+    std::vector<ExpertDigest> digests;
 };
 
 Status parse_index(const std::string& path, std::string_view raw, ParsedIndex& out) {
@@ -265,6 +285,22 @@ Status parse_index(const std::string& path, std::string_view raw, ParsedIndex& o
         e.length = c.read<std::uint32_t>();
     }
     if (!c.ok) return {StatusCode::InvalidArgument, path + ": truncated index"};
+
+    // The digest table, after the entries rather than widened into them: the entry
+    // stride stays 16 bytes, so every offset computation in the reader and in the
+    // Python tools keeps working unchanged.
+    if ((h.flags & kFlagExpertDigests) != 0) {
+        if (entries > c.remaining() / sizeof(ExpertDigest)) {
+            return {StatusCode::InvalidArgument,
+                    path + ": digest table does not fit in the bytes remaining"};
+        }
+        out.digests.resize(entries);
+        for (auto& digest : out.digests)
+            digest = c.read<ExpertDigest>();
+        if (!c.ok) return {StatusCode::InvalidArgument, path + ": truncated digest table"};
+        h.has_digests = true;
+    }
+
     if (!c.empty()) return {StatusCode::InvalidArgument, path + ": trailing bytes after index"};
     return {};
 }
@@ -349,6 +385,10 @@ std::string serialize_index(const ParsedIndex& ix) {
         w.put<std::uint32_t>(e.shard);
         w.put<std::uint64_t>(e.offset);
         w.put<std::uint32_t>(e.length);
+    }
+    if ((ix.header.flags & kFlagExpertDigests) != 0) {
+        for (const auto digest : ix.digests)
+            w.put<ExpertDigest>(digest);
     }
     return std::move(w.out);
 }
@@ -490,6 +530,63 @@ private:
     Handle h_ = kInvalid;
 };
 
+namespace {
+
+/// The shard-prefix an index file's payload lives under.
+///
+/// One place, because stamp, verify and open all have to agree and a container
+/// whose auxiliary index was checked against the base shards would report a
+/// mismatch that says nothing about either.
+const char* shard_prefix_for(const std::string& index_file) {
+    return index_file == "soma.dspark" ? "dspark-experts-" : "experts-";
+}
+
+/// Read every live expert once, in index order, and hand its bytes to `sink`.
+///
+/// Opens the shards directly rather than going through ExpertStore, because both
+/// callers run when the container is not yet fit to open through the front door:
+/// stamp is what makes it openable, and verify has to work on a container whose
+/// digests are the thing in doubt.
+///
+/// Index order, not random: this is a sequential sweep of files that are about to
+/// be read end to end, and it is the one place in this file where readahead is
+/// what you want.
+template <typename Sink>
+Status walk_experts(const ParsedIndex& ix,
+                    const std::string& dir,
+                    const std::string& index_file,
+                    Sink&& sink) {
+    const auto& h = ix.header;
+    std::vector<ShardFile> shards(h.n_shards);
+    for (std::uint32_t i = 0; i < h.n_shards; ++i) {
+        char name[32];
+        std::snprintf(name, sizeof(name), "%s%05u.bin", shard_prefix_for(index_file), i);
+        if (!shards[i].open(fs::path(dir) / name)) {
+            return {StatusCode::NotFound, std::string("missing shard ") + name};
+        }
+    }
+
+    std::vector<std::byte> buf;
+    for (std::size_t slot = 0; slot < ix.entries.size(); ++slot) {
+        const auto& e = ix.entries[slot];
+        if (e.length == 0) continue; // a dense layer's empty slot
+        if (e.shard >= shards.size()) {
+            return {StatusCode::InvalidArgument,
+                    "expert " + std::to_string(slot) + " names shard " + std::to_string(e.shard)};
+        }
+        if (buf.size() < e.length) buf.resize(e.length);
+        if (!shards[e.shard].read_at(e.offset, buf.data(), e.length)) {
+            return {StatusCode::IoError,
+                    "cannot read expert " + std::to_string(slot) + " from shard " +
+                        std::to_string(e.shard)};
+        }
+        sink(slot, CByteSpan(buf.data(), e.length));
+    }
+    return {};
+}
+
+} // namespace
+
 struct ExpertStore::Impl {
     ContainerHeader header{};
     std::vector<ExpertLocation> index;
@@ -497,6 +594,17 @@ struct ExpertStore::Impl {
     /// Atomic: incremented from every thread that reads, with no lock held.
     std::atomic<std::uint64_t> bytes_read{0};
     std::string dir;
+
+    PayloadPolicy payload = PayloadPolicy::Trust;
+    std::vector<ExpertDigest> digests;
+    /// One byte per slot, not a bitset: a bitset would need read-modify-write on
+    /// a shared word, and the whole point of this array is that it is touched
+    /// from every reading thread with no lock held. A byte per expert is 15 KB
+    /// for the largest model in the roadmap.
+    ///
+    /// The race is benign by construction — two threads may both verify the same
+    /// expert and both store 1 — so this needs atomicity, not ordering.
+    std::unique_ptr<std::atomic<std::uint8_t>[]> verified;
 
     std::size_t slot(LayerIndex layer, ExpertId expert) const noexcept {
         return static_cast<std::size_t>(layer) * header.n_experts + expert;
@@ -729,6 +837,18 @@ Status ExpertStore::open_indexed(const std::string& model_dir,
     if (auto st = validate_ranges(parsed, arch, model_dir, shard_prefix); !st.ok()) return st;
     impl_->index = std::move(parsed.entries);
 
+    // Armed only when there is a table to check against. A container written
+    // before digests existed reads exactly as it did; the alternative — refusing
+    // it — would strand every container already converted for the sake of a check
+    // that is additive.
+    if (h.has_digests && opts.payload == PayloadPolicy::VerifyOnFirstRead) {
+        impl_->digests = std::move(parsed.digests);
+        impl_->verified = std::make_unique<std::atomic<std::uint8_t>[]>(impl_->index.size());
+        for (std::size_t i = 0; i < impl_->index.size(); ++i)
+            impl_->verified[i].store(0, std::memory_order_relaxed);
+        impl_->payload = PayloadPolicy::VerifyOnFirstRead;
+    }
+
     std::vector<std::uint64_t> shard_sizes;
     shard_sizes.reserve(h.n_shards);
     for (std::uint32_t s = 0; s < h.n_shards; ++s) {
@@ -814,6 +934,26 @@ StatusCode ExpertStore::read(LayerIndex layer, ExpertId expert, ByteSpan dst) no
     if (!f.valid()) return StatusCode::IoError;
     if (!f.read_at(loc.offset, dst.data(), loc.length)) return StatusCode::IoError;
     impl_->bytes_read.fetch_add(loc.length, std::memory_order_relaxed);
+
+    // Verified ONCE per expert, over the bytes already sitting in the caller's
+    // buffer — no second read, and no cost at all on a cache hit, because a hit
+    // never reaches this function.
+    //
+    // Per read rather than per expert would roughly double miss latency (SHA-256
+    // runs at about the speed of a good NVMe read) and buy nothing: the bytes on
+    // disk do not change between two reads of the same expert within one process,
+    // and if they did, the next process would catch it.
+    if (impl_->payload == PayloadPolicy::VerifyOnFirstRead && impl_->verified != nullptr &&
+        loc.length > 0 && impl_->verified[s].load(std::memory_order_relaxed) == 0) {
+        if (expert_digest(CByteSpan(dst.data(), loc.length)) != impl_->digests[s]) {
+            // Deliberately NOT latched into the store. The caller is told this
+            // expert is corrupt on every read of it, because a store that answered
+            // "corrupt" once and then went quiet would let a retry loop feed the
+            // bad bytes straight into the model.
+            return StatusCode::DataCorruption;
+        }
+        impl_->verified[s].store(1, std::memory_order_relaxed);
+    }
     return StatusCode::Ok;
 }
 
@@ -831,9 +971,70 @@ ExpertStore::read_async(LayerIndex layer, ExpertId expert, ByteSpan dst) noexcep
     return p;
 }
 
+namespace {
+
+/// Read an index file whole. Both entry points below want the bytes, not a
+/// stream, because the file is small by design and parsing it twice from two
+/// different reads is how a checker and a writer end up describing two files.
+Status read_index_file(const fs::path& path, std::string& out) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return {StatusCode::NotFound, "cannot open " + path.string()};
+    out.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    return {};
+}
+
+} // namespace
+
+Status verify_payload(const std::string& model_dir,
+                      PayloadReport& out,
+                      const std::string& index_file) try {
+    out = {};
+    const fs::path index_path = fs::path(model_dir) / index_file;
+    std::string raw;
+    if (auto st = read_index_file(index_path, raw); !st.ok()) {
+        return {StatusCode::NotFound, "no " + index_file + " in " + model_dir};
+    }
+
+    ParsedIndex ix;
+    if (auto st = parse_index(index_path.string(), raw, ix); !st.ok()) return st;
+    if (!ix.header.has_digests) {
+        return {StatusCode::Unsupported,
+                index_path.string() +
+                    " carries no digest table, so there is nothing to check the payload against. "
+                    "Reconvert it with the current converter, or run `soma stamp` to record the "
+                    "bytes it has now"};
+    }
+    const auto n_experts = ix.header.n_experts;
+    auto st = walk_experts(ix, model_dir, index_file, [&](std::size_t slot, CByteSpan bytes) {
+        ++out.experts_checked;
+        out.bytes_checked += bytes.size();
+        if (expert_digest(bytes) == ix.digests[slot]) return;
+        if (out.mismatches == 0) {
+            out.first_bad_layer = static_cast<LayerIndex>(slot / n_experts);
+            out.first_bad_expert = static_cast<ExpertId>(slot % n_experts);
+        }
+        ++out.mismatches;
+    });
+    if (!st.ok()) return st;
+
+    if (out.mismatches > 0) {
+        return {StatusCode::DataCorruption,
+                std::to_string(out.mismatches) + " of " + std::to_string(out.experts_checked) +
+                    " experts do not match their digest, first at layer " +
+                    std::to_string(out.first_bad_layer) + " expert " +
+                    std::to_string(out.first_bad_expert) +
+                    "; the shards were damaged after they were written"};
+    }
+    return {};
+} catch (const std::bad_alloc&) {
+    return {StatusCode::OutOfMemory, "verify_payload ran out of memory"};
+}
+
 Status stamp_container(const std::string& model_dir,
                        const ArchIr& arch,
-                       const std::string& index_file) try {
+                       const std::string& index_file,
+                       StampReport* report) try {
+    if (report != nullptr) *report = {};
     const fs::path index_path = fs::path(model_dir) / index_file;
     std::string raw;
     {
@@ -911,22 +1112,70 @@ Status stamp_container(const std::string& model_dir,
                     "...; requantization changes the hash, and these are the same bytes"};
     }
 
-    if (auto st = validate_ranges(ix, arch, model_dir,
-                                  index_file == "soma.dspark" ? "dspark-experts-" : "experts-");
-        !st.ok()) return st;
+    if (auto st = validate_ranges(ix, arch, model_dir, shard_prefix_for(index_file)); !st.ok())
+        return st;
 
     // Exact repeat is a true no-op: admission may safely run stamp on every
     // pass without changing mtimes or exposing a replacement race to readers.
+    //
+    // Checked BEFORE the payload pass below, so the no-op stays a no-op rather
+    // than becoming a full re-read of the container every time admission runs.
+    // Re-reading an already-stamped container is `soma verify`'s job, and it is a
+    // different question — "are these still the bytes we recorded", asked after a
+    // transfer, rather than "is this container what the IR says it is".
+    constexpr std::uint32_t kStampedFlags = kFlagPerRoleQuant | kFlagExpertDigests;
     const auto gate_id = static_cast<std::uint32_t>(gate.dtype);
     if (ix.header.version == kContainerVersion && ix.header.arch_hash == identity &&
-        ix.header.flags == kFlagPerRoleQuant && ix.dtype_id == gate_id &&
-        ix.group == gate.group) {
+        ix.header.flags == kStampedFlags && ix.dtype_id == gate_id && ix.group == gate.group) {
+        if (report != nullptr) report->had_digests = true;
         return {};
     }
+    if (report != nullptr) report->had_digests = ix.header.has_digests;
 
+    // PAYLOAD. The one pass in this function that reads a shard byte.
+    //
+    // Everything above proves the container is SHAPED right: ranges pack
+    // canonically, shard files are exactly the implied size, the roles carry the
+    // dtypes the IR names. A shard of exactly the right size full of wrong bytes
+    // satisfies all of it. This is the moment to notice, because it is the last
+    // point before the container is copied to nodes and read for months.
+    //
+    // Computing a digest is not the same laundering risk as manufacturing a quant
+    // map: there is no authoritative source for which role owns which dtype other
+    // than the descriptor, but the payload IS the authority on its own digest. The
+    // guarantee differs, though, and stamp says which one it recorded — bytes
+    // confirmed unchanged since conversion, or bytes pinned as they are now.
+    std::vector<ExpertDigest> computed(ix.entries.size(), kNoDigest);
+    if (auto st = walk_experts(ix, model_dir, index_file,
+                               [&](std::size_t slot, CByteSpan bytes) {
+                                   computed[slot] = expert_digest(bytes);
+                               });
+        !st.ok())
+        return st;
+
+    if (ix.header.has_digests) {
+        for (std::size_t slot = 0; slot < computed.size(); ++slot) {
+            if (ix.digests[slot] == computed[slot]) continue;
+            return {StatusCode::DataCorruption,
+                    "refusing to stamp: layer " +
+                        std::to_string(slot / std::max<std::size_t>(ix.header.n_experts, 1)) +
+                        " expert " +
+                        std::to_string(slot % std::max<std::size_t>(ix.header.n_experts, 1)) +
+                        " does not match the digest the converter recorded; the shards changed "
+                        "after they were written"};
+        }
+    }
+
+    if (report != nullptr) {
+        for (const auto& e : ix.entries)
+            if (e.length != 0) ++report->experts_checked;
+        report->wrote = true;
+    }
+
+    ix.digests = std::move(computed);
     ix.header.version = kContainerVersion;
     ix.header.arch_hash = identity;
-    ix.header.flags = kFlagPerRoleQuant;
+    ix.header.flags = kStampedFlags;
     ix.header.gate = gate;
     ix.header.up = up;
     ix.header.down = down;
@@ -992,14 +1241,17 @@ Status ExpertStore::measure_bandwidth(std::uint64_t& bytes_per_second) {
         maxlen = std::max(maxlen, e.length);
     std::vector<std::byte> buf(maxlen);
 
-    const auto before = impl_->bytes_read.load(std::memory_order_relaxed);
+    // Probe directly so concurrent model reads retain verification. Probe I/O
+    // neither changes the shared policy nor marks any expert verified.
+
     const auto t0 = std::chrono::steady_clock::now();
     std::uint64_t moved = 0;
     for (std::size_t i = 0; i < samples; ++i) {
         const auto slot = order[i];
-        const auto layer = static_cast<LayerIndex>(slot / impl_->header.n_experts);
-        const auto expert = static_cast<ExpertId>(slot % impl_->header.n_experts);
-        if (read(layer, expert, buf) != StatusCode::Ok) {
+        const auto& loc = impl_->index[slot];
+        if (loc.length == 0) continue;
+        if (loc.shard >= impl_->shards.size() ||
+            !impl_->shards[loc.shard].read_at(loc.offset, buf.data(), loc.length)) {
             return {StatusCode::IoError, "bandwidth probe read failed"};
         }
         moved += impl_->index[slot].length;
@@ -1009,7 +1261,6 @@ Status ExpertStore::measure_bandwidth(std::uint64_t& bytes_per_second) {
 
     // The probe's own traffic is not a cache miss the engine caused, so it does
     // not belong in the hit-rate accounting.
-    impl_->bytes_read.store(before, std::memory_order_relaxed);
 
     if (secs <= 0.0) return {StatusCode::Internal, "bandwidth probe took no measurable time"};
     bytes_per_second = static_cast<std::uint64_t>(static_cast<double>(moved) / secs);

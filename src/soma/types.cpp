@@ -58,6 +58,8 @@ const char* to_string(StatusCode code) noexcept {
         return "cancelled";
     case StatusCode::Internal:
         return "internal";
+    case StatusCode::DataCorruption:
+        return "data_corruption";
     }
     return "unknown";
 }

@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import struct
@@ -47,6 +48,26 @@ ROLE_ID = {"gate": 2, "up": 3, "down": 4}
 # cannot see. V2 makes this descriptor mandatory; the version bump is required
 # because shipped V1 readers ignored flags and would otherwise misparse it.
 FLAG_PER_ROLE_QUANT = 1 << 0
+
+# A per-expert digest table follows the index. A flag with no version bump: every
+# v2 reader already refuses a bit it does not know, so it cannot walk past this
+# table and misread what comes after it.
+FLAG_EXPERT_DIGESTS = 1 << 1
+
+
+def expert_digest(blob: bytes) -> int:
+    """First 8 bytes of the SHA-256 of one expert, little-endian.
+
+    Computed HERE, where the bytes are already in hand, rather than by a later
+    pass that would have to read the whole container back. It is a corruption
+    check and not a tamper check: what it answers is whether these bytes survived
+    being written, streamed to a node and left on a disk for a month.
+    """
+    return int.from_bytes(hashlib.sha256(blob).digest()[:8], "little")
+
+
+def digest_table(digests: list[int]) -> bytes:
+    return b"".join(struct.pack("<Q", d) for d in digests)
 
 
 def role_descriptor(dt_gate: str, dt_up: str, dt_down: str,
@@ -1007,6 +1028,10 @@ def main(argv: list[str]) -> int:
 
     # ── experts ──────────────────────────────────────────────────────────────
     index: list[tuple[int, int, int]] = []
+    # Parallel to `index`, including the zero-length slots a dense layer
+    # contributes, which carry 0 rather than the digest of an empty string so a
+    # missing entry and a real one can never be confused.
+    digests: list[int] = []
     shard_idx = 0
     shard_off = 0
     total = 0
@@ -1184,6 +1209,7 @@ def main(argv: list[str]) -> int:
         if kinds[layer] == "dense":
             # Zero-length slots keep the (layer, expert) index arithmetic intact.
             index.extend((shard_idx, shard_off, 0) for _ in range(n_experts))
+            digests.extend(0 for _ in range(n_experts))
             continue
         read, layout = expert_reader(get, layer, moe_block, names, src_prefix)
         if read is None:
@@ -1217,6 +1243,7 @@ def main(argv: list[str]) -> int:
                 fh = open(out_dir / f"experts-{shard_idx:05d}.bin", "wb")
 
             index.append((shard_idx, shard_off, len(blob)))
+            digests.append(expert_digest(blob))
             fh.write(blob)
             total += len(blob)
 
@@ -1254,7 +1281,8 @@ def main(argv: list[str]) -> int:
     arch_hash = b""
     with open(out_dir / "soma.container", "wb") as ix:
         ix.write(MAGIC)
-        ix.write(struct.pack("<II", FORMAT_VERSION, FLAG_PER_ROLE_QUANT))
+        ix.write(struct.pack("<II", FORMAT_VERSION,
+                             FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS))
         ix.write(struct.pack("<I", len(arch_hash)))
         ix.write(arch_hash)
         ix.write(struct.pack("<IIII", n_layers, n_experts, shard_idx + 1, DTYPE_ID[dt_gate]))
@@ -1263,6 +1291,7 @@ def main(argv: list[str]) -> int:
         ix.write(struct.pack("<QQ", max(uniform_len, 0), total))
         for shard, off, length in index:
             ix.write(struct.pack("<IQI", shard, off, length))
+        ix.write(digest_table(digests))
 
     # The container must be self-describing: load_f32_model() adapts the IR from
     # config.json in the directory it is pointed at, so a container without one

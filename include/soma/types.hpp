@@ -40,6 +40,13 @@ enum class StatusCode : std::uint8_t {
     CapacityPressure, ///< admission refused; maps to the node's structured error
     Cancelled,
     Internal,
+    /// The read succeeded and returned the wrong bytes.
+    ///
+    /// Deliberately not IoError: nothing failed. The distinction is the whole
+    /// point of the check — an operator who reads "io_error" goes looking at the
+    /// disk, and an operator who reads "data_corruption" goes looking at what
+    /// wrote or copied the file.
+    DataCorruption,
 };
 
 /// Error type for **cold paths only** — load, admission, checkpoint I/O, config.

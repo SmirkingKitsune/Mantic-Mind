@@ -58,6 +58,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from convert import (  # noqa: E402
     DTYPE_ID,
+    FLAG_EXPERT_DIGESTS,
     FLAG_PER_ROLE_QUANT,
     FORMAT_VERSION,
     FP8_DTYPE_NAMES,
@@ -65,6 +66,7 @@ from convert import (  # noqa: E402
     MAGIC,
     align_up,
     dequantize_fp8_block,
+    expert_digest,
     expert_reader,
     group_bytes,
     layer_kinds,
@@ -84,7 +86,7 @@ REL_RMS_CEILING = {"q8_0": 0.03, "q6_g": 0.08, "q5_g": 0.15,
 ID_TO_DTYPE = {v: k for k, v in DTYPE_ID.items()}
 
 # The flag bits this reader understands. Everything else is fatal.
-KNOWN_FLAGS = FLAG_PER_ROLE_QUANT
+KNOWN_FLAGS = FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS
 
 # soma::TensorRole, for reporting the descriptor in readable terms.
 ID_TO_ROLE = {2: "gate", 3: "up", 4: "down"}
@@ -157,18 +159,32 @@ def read_index(path: Path) -> dict:
     uniform_len, total = take("<QQ", "expert sizes")
 
     want = n_layers * n_experts
-    have = (len(raw) - off) // ENTRY.size
-    if have != want:
+    # The entry block is a fixed size the header declares, so it is measured
+    # forwards rather than by dividing what is left over: the digest table follows
+    # it, and "everything after the header is entries" stopped being true.
+    entry_bytes = want * ENTRY.size
+    if entry_bytes > len(raw) - off:
+        have = (len(raw) - off) // ENTRY.size
         raise Failure(f"index holds {have} slots, header declares "
                       f"{n_layers} x {n_experts} = {want}")
-    if (len(raw) - off) % ENTRY.size:
-        raise Failure(f"index has {(len(raw) - off) % ENTRY.size} trailing bytes")
-
     entries = [ENTRY.unpack_from(raw, off + i * ENTRY.size) for i in range(want)]
+    off += entry_bytes
+
+    digests: list[int] = []
+    if reserved & FLAG_EXPERT_DIGESTS:
+        if want * 8 > len(raw) - off:
+            raise Failure(f"{path.name}: truncated digest table")
+        digests = list(struct.unpack_from(f"<{want}Q", raw, off))
+        off += want * 8
+
+    if off != len(raw):
+        raise Failure(f"index has {len(raw) - off} trailing bytes")
+
     return {"version": version, "reserved": reserved, "arch_hash": arch_hash,
             "n_layers": n_layers, "n_experts": n_experts, "n_shards": n_shards,
             "dtype_id": dtype_id, "group": group, "roles": roles,
-            "uniform_len": uniform_len, "total": total, "entries": entries}
+            "uniform_len": uniform_len, "total": total, "entries": entries,
+            "digests": digests}
 
 
 def check_structure(container: Path, ix: dict, meta: dict, kinds: list[str]) -> list[str]:
@@ -441,6 +457,52 @@ def main(argv: list[str]) -> int:
         else:
             print(json.dumps(report, indent=2))
         return 0
+
+    # ── digests ──────────────────────────────────────────────────────────────
+    #
+    # Runs BEFORE the source comparison below and does not need a source at all,
+    # which is the point: the machine most likely to be holding a damaged
+    # container is a node that was streamed one, and a node has the container and
+    # nothing else. The comparison below can only run where the original
+    # checkpoint also lives, which in practice is the admission host alone.
+    if ix["digests"]:
+        bad: list[str] = []
+        checked = 0
+        shard_handles: dict = {}
+        try:
+            for slot, (shard, off, length) in enumerate(ix["entries"]):
+                if length == 0:
+                    continue
+                fh = shard_handles.get(shard)
+                if fh is None:
+                    fh = open(container / f"experts-{shard:05d}.bin", "rb")
+                    shard_handles[shard] = fh
+                fh.seek(off)
+                checked += 1
+                if expert_digest(fh.read(length)) != ix["digests"][slot]:
+                    layer, expert = divmod(slot, ix["n_experts"])
+                    if len(bad) < 8:
+                        bad.append(f"layer {layer} expert {expert}")
+        finally:
+            for fh in shard_handles.values():
+                fh.close()
+        report["digests"] = "failed" if bad else "passed"
+        report["digests_checked"] = checked
+        if bad:
+            report["digests_bad"] = bad
+            if not args.json:
+                print(f"    digests    FAILED {len(bad)} of {checked}: {', '.join(bad)}")
+                print("  FAILED   the shards were damaged after they were written")
+            else:
+                print(json.dumps(report, indent=2))
+            return 1
+        if not args.json:
+            print(f"    digests    {checked} experts match the recorded digests")
+    else:
+        report["digests"] = "skipped"
+        report["digests_reason"] = "container carries no digest table"
+        if not args.json:
+            print("    digests    skipped — this container carries no digest table")
 
     src = Path(args.source or meta.get("source", ""))
     if not src.is_dir():

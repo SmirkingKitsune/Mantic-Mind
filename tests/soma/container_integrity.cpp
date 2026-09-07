@@ -249,7 +249,10 @@ int main(int argc, char** argv) {
             auto bytes = read_file(path);
             const auto o = offsets(bytes);
             put_u32(bytes, 8, 1);
-            put_u32(bytes, 12, 0);
+            // Clear the role bit ONLY. Zeroing the whole word would also drop
+            // kFlagExpertDigests, and the digest table would then read as trailing
+            // bytes — a different refusal than the one this case is about.
+            put_u32(bytes, 12, u32(bytes, 12) & ~soma::kFlagPerRoleQuant);
             bytes.erase(bytes.begin() + o.descriptor_count,
                         bytes.begin() + o.descriptor_count + 4 + 3 * 12);
             write_file(path, bytes);
@@ -263,7 +266,10 @@ int main(int argc, char** argv) {
             const auto path = dir / "soma.container";
             auto bytes = read_file(path);
             const auto o = offsets(bytes);
-            put_u32(bytes, 12, 0);
+            // Clear the role bit ONLY. Zeroing the whole word would also drop
+            // kFlagExpertDigests, and the digest table would then read as trailing
+            // bytes — a different refusal than the one this case is about.
+            put_u32(bytes, 12, u32(bytes, 12) & ~soma::kFlagPerRoleQuant);
             bytes.erase(bytes.begin() + o.descriptor_count,
                         bytes.begin() + o.descriptor_count + 4 + 3 * 12);
             write_file(path, bytes);
@@ -307,6 +313,125 @@ int main(int argc, char** argv) {
             const auto st = open_with(dir, arch);
             check(!st.ok() && st.code() == soma::StatusCode::VersionMismatch,
                   "unknown must-understand flags are rejected", st.message());
+        }
+
+
+        std::cout << "\npayload digests\n";
+
+        // The first section in this file that reads a shard byte. Everything above
+        // proves the container is SHAPED right — canonical ranges, exact shard
+        // sizes, the roles the IR names — all of which a correctly sized file full
+        // of wrong bytes satisfies completely.
+        const auto corrupt_one_expert = [&](const fs::path& dir) {
+            const auto shard = dir / "experts-00000.bin";
+            auto bytes = read_file(shard);
+            if (bytes.size() < 64) throw std::runtime_error("shard is too small to damage");
+            // Mid-payload and size-preserving, which is what bit rot and a partial
+            // copy both look like.
+            bytes[bytes.size() / 2] = static_cast<char>(bytes[bytes.size() / 2] ^ 0xFF);
+            write_file(shard, bytes);
+        };
+
+        {
+            const auto dir = case_dir(root, fixture, "digest-verify-clean");
+            soma::PayloadReport report;
+            const auto st = soma::verify_payload(dir.string(), report);
+            check(st.ok() && report.experts_checked > 0 && report.mismatches == 0,
+                  "an undamaged container verifies, and says how much it read",
+                  std::to_string(report.experts_checked) + " experts");
+        }
+
+        {
+            const auto dir = case_dir(root, fixture, "digest-verify-damaged");
+            corrupt_one_expert(dir);
+            soma::PayloadReport report;
+            const auto st = soma::verify_payload(dir.string(), report);
+            check(!st.ok() && st.code() == soma::StatusCode::DataCorruption &&
+                      report.mismatches == 1,
+                  "one flipped byte in a correctly sized shard is caught", st.message());
+        }
+
+        {
+            // The read path, which is what stands between damaged bytes and the
+            // model. Nothing else in this file exercises it.
+            const auto dir = case_dir(root, fixture, "digest-read-path");
+            corrupt_one_expert(dir);
+            soma::ExpertStore store;
+            soma::OpenOptions opts;
+            check(store.open(dir.string(), arch, opts).ok(),
+                  "a damaged container still OPENS — nothing has been read yet", "");
+            std::uint64_t bandwidth = 0;
+            check(store.measure_bandwidth(bandwidth).ok(),
+                  "bandwidth probe reads without certifying payload", "");
+
+            bool found = false;
+            std::vector<std::byte> buf(store.header().expert_bytes);
+            for (soma::LayerIndex l = 0; l < store.header().n_layers && !found; ++l) {
+                for (soma::ExpertId e = 0; e < store.header().n_experts && !found; ++e) {
+                    if (store.locate(l, e).length == 0) continue;
+                    found = store.read(l, e, buf) == soma::StatusCode::DataCorruption;
+                    if (found)
+                        check(store.read(l, e, buf) == soma::StatusCode::DataCorruption,
+                              "a retry cannot admit a corrupt expert", "");
+                }
+            }
+            check(found, "and the damaged expert is refused at read, not decoded", "");
+        }
+
+        {
+            const auto dir = case_dir(root, fixture, "digest-trust-policy");
+            corrupt_one_expert(dir);
+            soma::ExpertStore store;
+            soma::OpenOptions opts;
+            opts.payload = soma::PayloadPolicy::Trust;
+            check(store.open(dir.string(), arch, opts).ok(), "Trust opens the same container", "");
+            std::vector<std::byte> buf(store.header().expert_bytes);
+            bool any_refused = false;
+            for (soma::LayerIndex l = 0; l < store.header().n_layers; ++l)
+                for (soma::ExpertId e = 0; e < store.header().n_experts; ++e)
+                    if (store.locate(l, e).length != 0 &&
+                        store.read(l, e, buf) == soma::StatusCode::DataCorruption)
+                        any_refused = true;
+            check(!any_refused, "and Trust really does skip the check it opts out of", "");
+        }
+
+        {
+            const auto dir = case_dir(root, fixture, "digest-stamp-refuses");
+            corrupt_one_expert(dir);
+            // Force a real stamp rather than the idempotent no-op, so the payload
+            // pass actually runs.
+            const auto path = dir / "soma.container";
+            auto bytes = read_file(path);
+            const auto hash_len = u32(bytes, 16);
+            bytes.erase(bytes.begin() + 20, bytes.begin() + 20 + hash_len);
+            put_u32(bytes, 16, 0);
+            write_file(path, bytes);
+            const auto st = soma::stamp_container(dir.string(), arch);
+            check(!st.ok() && st.code() == soma::StatusCode::DataCorruption,
+                  "stamp will not certify a container whose payload changed", st.message());
+        }
+
+        {
+            // A container converted before digests existed must keep working. The
+            // check is additive, and refusing one would strand every container
+            // already on disk for the sake of evidence it never had.
+            const auto dir = case_dir(root, fixture, "no-digest-table");
+            const auto path = dir / "soma.container";
+            auto bytes = read_file(path);
+            // n_layers and n_experts sit immediately after the length-prefixed hash.
+            const std::size_t after_hash = 20u + u32(bytes, 16);
+            const auto slots = static_cast<std::size_t>(u32(bytes, after_hash)) *
+                               u32(bytes, after_hash + 4);
+            bytes.resize(bytes.size() - static_cast<std::size_t>(slots) * 8);
+            put_u32(bytes, 12, u32(bytes, 12) & ~soma::kFlagExpertDigests);
+            write_file(path, bytes);
+            check(open_with(dir, arch).ok(), "a container with no digest table still opens", "");
+
+            soma::PayloadReport report;
+            const auto st = soma::verify_payload(dir.string(), report);
+            check(!st.ok() && st.code() == soma::StatusCode::Unsupported,
+                  "but verify says it cannot check, rather than reporting success",
+                  st.message());
         }
 
         {

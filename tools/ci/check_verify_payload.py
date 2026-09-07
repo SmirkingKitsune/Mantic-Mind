@@ -13,8 +13,12 @@ refused everything would satisfy a bare "exit non-zero" test.
   truncated shard        -> STRUCTURE, and named as truncation
   trailing bytes         -> STRUCTURE, unaccounted tail
   index offset shifted   -> STRUCTURE, gap/overlap in the shard's packing
-  one flipped byte       -> EXACT, byte-for-byte against a re-quantized source
-  two experts swapped    -> DECODE's decoy margin, i.e. right bytes, wrong slot
+  one flipped byte       -> DIGESTS, and EXACT once the digest table is stripped
+  two experts swapped    -> DIGESTS, and DECODE's decoy margin once it is stripped
+
+Every payload case runs twice: once as the current converter writes containers,
+and once with the digest table removed, because that is what a container converted
+before digests existed looks like and those checks are the only ones it has.
 
 The swap case is the one that justifies the decode pass existing at all: it is
 the failure that structure cannot see (every length and offset is still perfect)
@@ -33,7 +37,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools" / "admission"))
 
-from convert import FLAG_PER_ROLE_QUANT  # noqa: E402  (needs the path above)
+from convert import FLAG_EXPERT_DIGESTS, FLAG_PER_ROLE_QUANT  # noqa: E402  (needs the path)
 
 VERIFY = ROOT / "tools" / "admission" / "verify_payload.py"
 CONVERT = ROOT / "tools" / "admission" / "convert.py"
@@ -77,6 +81,28 @@ def first_live_slot(container: Path) -> tuple[int, int, int, int]:
     raise SystemExit("fixture has no live slots")
 
 
+def strip_digests(d: Path) -> Path:
+    """Remove the digest table from a container, in place.
+
+    A container converted before digests existed looks exactly like this, and the
+    source-comparison passes are the only checks it has. Those passes must not rot
+    behind the faster one, so every case that the digests would now catch is run a
+    second time with the table removed.
+    """
+    from verify_payload import read_index
+
+    path = d / "soma.container"
+    ix = read_index(path)
+    if not ix["digests"]:
+        return d
+    raw = bytearray(path.read_bytes())
+    (flags,) = struct.unpack_from("<I", raw, 12)
+    struct.pack_into("<I", raw, 12, flags & ~FLAG_EXPERT_DIGESTS)
+    del raw[len(raw) - ix["n_layers"] * ix["n_experts"] * 8:]
+    path.write_bytes(bytes(raw))
+    return d
+
+
 def fail(case: str, why: str) -> None:
     print(f"  FAILED  {case}: {why}")
     globals()["FAILURES"] += 1
@@ -92,7 +118,8 @@ def expect_caught(case: str, container: Path, source: Path, pass_name: str, need
     blob = json.dumps(rep).lower()
     if rep.get(pass_name) != "failed":
         return fail(case, f"expected the {pass_name} pass to fail, got "
-                          f"structure={rep.get('structure')} content={rep.get('content')}")
+                          f"structure={rep.get('structure')} digests={rep.get('digests')} "
+                          f"content={rep.get('content')}")
     if needle.lower() not in blob:
         return fail(case, f"caught it, but never said {needle!r}: "
                           f"{rep.get('reason') or rep.get('failures')}")
@@ -176,9 +203,26 @@ def main() -> int:
         b = f.read(1)
         f.seek(off + length // 2)
         f.write(bytes([b[0] ^ 0xFF]))
-    expect_caught("one flipped byte", d, FIXTURE, "content", "differs from a re-quantized")
+    # Caught by the DIGEST pass now, not the source comparison — which is the
+    # point of the digests: this is the check a node can run, having received a
+    # container and nothing to compare it against.
+    expect_caught("one flipped byte", d, FIXTURE, "digests", "layer")
 
-    # 5. Two experts swapped. Structure is perfect; only the decoy margin sees it.
+    # The same damage with the digest table stripped, so the source comparison is
+    # still exercised. It is the only check available for a container converted
+    # before digests existed, and it must not rot behind the faster one.
+    d = strip_digests(fresh("flipped_nodigest"))
+    with open(d / shard_name, "r+b") as f:
+        f.seek(off + length // 2)
+        b = f.read(1)
+        f.seek(off + length // 2)
+        f.write(bytes([b[0] ^ 0xFF]))
+    expect_caught("one flipped byte, no digest table", d, FIXTURE, "content",
+                  "differs from a re-quantized")
+
+    # 5. Two experts swapped. Structure is perfect: every length and offset still
+    # matches. The digests catch it because each expert now hashes to its
+    # neighbour's value; with them stripped, only the decoy margin can.
     d = fresh("swapped")
     raw_ix = (d / "soma.container").read_bytes()
     base = index_header_len(d)
@@ -196,17 +240,20 @@ def main() -> int:
         f.write(b)
         f.seek(o1)
         f.write(a)
+    expect_caught("two experts swapped", d, FIXTURE, "digests", "layer")
+
+    strip_digests(d)
     code, rep = run_verify(d, FIXTURE)
     if code == 0:
-        fail("two experts swapped", "reported OK")
+        fail("two experts swapped, no digest table", "reported OK")
     elif rep.get("structure") != "passed":
-        fail("two experts swapped",
+        fail("two experts swapped, no digest table",
              "the structure pass failed, so this did not exercise the decode pass")
     elif not any("wrong slot" in f for f in rep.get("failures", [])):
-        fail("two experts swapped",
+        fail("two experts swapped, no digest table",
              f"content failed but not via the decoy margin: {rep.get('failures')}")
     else:
-        print("  ok      two experts swapped -> content (decoy margin)")
+        print("  ok      two experts swapped, no digest table -> content (decoy margin)")
 
     # 6. --structure-only must not silently claim the contents were checked.
     code, rep = run_verify(good, FIXTURE, "--structure-only")
@@ -218,7 +265,7 @@ def main() -> int:
     if FAILURES:
         print(f"  FAILED  {FAILURES} case(s)")
         return 1
-    print("  OK       verify_payload catches all 5 corruptions and stays honest about scope")
+    print("  OK       verify_payload catches all 5 corruptions, with and without digests")
     shutil.rmtree(work, ignore_errors=True)
     return 0
 
