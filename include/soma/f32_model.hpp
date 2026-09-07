@@ -161,6 +161,17 @@ struct F32Model {
 
     /// Owns every quantized tensor, so the WeightRefs above stay valid.
     std::vector<QTensor> quantized;
+
+    /// Owns every tensor WIDENED from a narrower on-disk dtype.
+    ///
+    /// A container may store its resident matrices at the source checkpoint's own
+    /// precision — bf16, for every real MoE checkpoint shipped so far — because
+    /// upcasting them to f32 on the way to disk doubles the artifact and adds no
+    /// information. Widening is exact and happens here instead.
+    ///
+    /// References point into the inner vectors' allocations, which remain stable
+    /// when the outer vector grows. Quantization scratch is not retained here.
+    std::vector<std::vector<float>> widened;
     QuantMap quant_map{};
 
     /// When set, routed experts are STREAMED from here instead of read from the
@@ -382,6 +393,10 @@ struct LayerBindCtx {
     const SafeTensors* weights = nullptr;
     const QuantMap* quant = nullptr;
     std::vector<QTensor>* owner = nullptr; ///< keeps quantized tensors alive
+    /// Keeps tensors widened from bf16/f16 alive. Null means the caller cannot
+    /// accept a narrow tensor, and binding one is refused rather than silently
+    /// reading its bytes as f32.
+    std::vector<std::vector<float>>* widened = nullptr;
     LayerIndex layer = 0;
     std::string prefix; ///< optional exact layer prefix for auxiliary graphs
 
@@ -393,6 +408,7 @@ struct ModelBindCtx {
     const SafeTensors* weights = nullptr;
     const QuantMap* quant = nullptr;
     std::vector<QTensor>* owner = nullptr;
+    std::vector<std::vector<float>>* widened = nullptr;
 };
 
 /// fp32 bind, for norms.

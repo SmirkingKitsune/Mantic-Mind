@@ -161,15 +161,13 @@ void rope(std::span<float> x, std::uint32_t pos, const ArchIr& a, bool inverse =
     }
 }
 
-bool bind_f32(const F32Model& model, const std::string& name, std::span<const float>& out) {
-    const auto* tv = model.weights.find(name);
-    if (tv == nullptr || tv->dtype != DType::F32) return false;
-    out = tv->f32();
-    return true;
+bool bind_f32(F32Model& model, const std::string& name, std::span<const float>& out) {
+    ModelBindCtx ctx{&model.weights, &model.quant_map, &model.quantized, &model.widened};
+    return bind_model_f32(ctx, name.c_str(), out).ok();
 }
 
 bool bind_weight(F32Model& model, const std::string& name, WeightRef& out) {
-    ModelBindCtx ctx{&model.weights, &model.quant_map, &model.quantized};
+    ModelBindCtx ctx{&model.weights, &model.quant_map, &model.quantized, &model.widened};
     return bind_model_weight(ctx, name.c_str(), TensorRole::DraftHead, out).ok();
 }
 

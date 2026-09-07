@@ -216,6 +216,18 @@ if(Python3_Interpreter_FOUND)
                      "${CMAKE_SOURCE_DIR}"
                      "${CMAKE_CURRENT_BINARY_DIR}/fp8_source_tmp")
 
+    # Every real MoE upload is bf16, and the resident half used to be upcast to
+    # f32 on the way to disk — doubling a file that is then stored, transferred to
+    # every node and read at every startup, for no added information. Every
+    # committed fixture is f32, so this manufactures the bf16 input and requires
+    # the smaller container to be SMALLER AND NOT DIFFERENT: byte-identical expert
+    # payload, and a dense half that widens back exactly.
+    add_test(NAME mm_bf16_source
+             COMMAND "${MM_ADMISSION_PY}"
+                     "${CMAKE_SOURCE_DIR}/tools/ci/check_bf16_source.py"
+                     "${CMAKE_SOURCE_DIR}"
+                     "${CMAKE_CURRENT_BINARY_DIR}/bf16_source_tmp")
+
     # The SECOND wrapper convert.py knows how to unwrap, and a different shape of
     # risk: Kimi-K3 renames nothing below its `language_model.` prefix, so its
     # dialect is a prefix and a drop list with an EMPTY suffix map. An entry that
@@ -239,6 +251,6 @@ if(Python3_Interpreter_FOUND)
     # exits 0 and reads as Passed, which is how mm_fused_experts ran nothing for
     # its whole existence while showing green.
     set_tests_properties(mm_fused_experts mm_verify_payload mm_minimax_dialect
-                         mm_fp8_source mm_kimi_dialect mm_vllm_ray_smoke PROPERTIES
-                         SKIP_RETURN_CODE 77)
+                         mm_fp8_source mm_bf16_source mm_kimi_dialect mm_vllm_ray_smoke
+                         PROPERTIES SKIP_RETURN_CODE 77)
 endif()

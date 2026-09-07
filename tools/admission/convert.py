@@ -54,6 +54,12 @@ FLAG_PER_ROLE_QUANT = 1 << 0
 # table and misread what comes after it.
 FLAG_EXPERT_DIGESTS = 1 << 1
 
+# Source precisions the resident half may keep, because the engine widens them
+# EXACTLY. Anything else — f32 already, or a dequantized fp8 block whose values
+# are genuinely f32 now — is stored f32, since narrowing it would discard bits the
+# checkpoint had.
+NARROW_TORCH_DTYPES = ("torch.bfloat16", "torch.float16")
+
 
 def expert_digest(blob: bytes) -> int:
     """First 8 bytes of the SHA-256 of one expert, little-endian.
@@ -761,6 +767,12 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--quant", default="q4_g", help="gate/up dtype")
     ap.add_argument("--expert-down", default=None, help="down dtype (defaults to --quant)")
     ap.add_argument("--group", type=int, default=128)
+    ap.add_argument("--dense-storage", choices=("source", "f32"), default="source",
+                    help="precision for the RESIDENT matrices on disk. `source` keeps the "
+                         "checkpoint's own (bf16 for every real MoE upload so far), which the "
+                         "engine widens exactly at load; `f32` upcasts them, doubling this "
+                         "half for no added information. Neither changes what serve LOADS "
+                         "them at — that is --quant-dense, and it needs no reconversion.")
     ap.add_argument("--shard-bytes", type=int, default=4 * 1024 ** 3)
     ap.add_argument("--layers", type=int, default=0, help="limit layers (debug)")
     ap.add_argument("--source-revision", default=None,
@@ -904,6 +916,7 @@ def main(argv: list[str]) -> int:
                                "down": "down_proj.weight"}))
 
     dt_gate = args.quant
+    dense_storage = getattr(args, "dense_storage", "source")
     dt_up = args.quant
     dt_down = args.expert_down or args.quant
     for d in (dt_gate, dt_up, dt_down):
@@ -978,6 +991,23 @@ def main(argv: list[str]) -> int:
         h.__enter__()
         open_handles[path] = h
         return h
+
+    def get_raw(name: str):
+        """The tensor AS STORED, for the dense half that keeps its own precision.
+
+        Separate from get() rather than a flag on it, because the two answer
+        different questions: everything that gets QUANTIZED needs f32 values, and
+        anything merely COPIED to the resident half needs the bytes the checkpoint
+        already has. Widening the second kind on the way to disk doubles the
+        artifact and adds nothing — bf16 is the top 16 bits of an f32, so the
+        engine's widening at load is exact.
+        """
+        path = owner.get(name)
+        if path is None:
+            return None
+        # .clone() for the same reason get() calls .copy(): the tensor is a view
+        # into an mmap owned by a handle this cache may evict.
+        return handle_for(path).get_tensor(name).clone()
 
     def get(name: str):
         path = owner.get(name)
@@ -1262,15 +1292,34 @@ def main(argv: list[str]) -> int:
     fh.close()
 
     # ── dense half ───────────────────────────────────────────────────────────
-    from safetensors.numpy import save_file
+    from safetensors.torch import save_file
 
     # Iterates the SAME list the completeness check was built from, so "claimed"
     # and "copied" cannot drift into disagreement.
-    dense: dict[str, "np.ndarray"] = {}
+    #
+    # Two dtypes, by shape and by what the source already is. A 2-D MATRIX is
+    # copied at the checkpoint's own precision when `--dense-storage source` and
+    # that precision is losslessly widenable — which for every real MoE checkpoint
+    # shipped so far means bf16, and halves this file. The 1-D CONTROLS — norms,
+    # router logits, sinks — stay f32 whatever the source was: they are kilobytes
+    # beside the matrices, the engine binds them as zero-copy views, and keeping
+    # them full precision costs nothing worth counting.
+    #
+    # An f32 source stays f32. Storing it narrow would be the one thing this must
+    # never do: lose bits the checkpoint actually had.
+    dense: dict = {}
+    narrow = 0
     for name in claimed:
+        soma_name = to_soma_name(name, dialect)
+        if dense_storage == "source":
+            raw = get_raw(name)
+            if raw is not None and raw.dim() == 2 and str(raw.dtype) in NARROW_TORCH_DTYPES:
+                dense[soma_name] = raw.contiguous()
+                narrow += 1
+                continue
         t = get(name)
         if t is not None:
-            dense[to_soma_name(name, dialect)] = t
+            dense[soma_name] = torch.from_numpy(t)
 
     save_file(dense, str(out_dir / "dense.safetensors"))
 
@@ -1315,6 +1364,12 @@ def main(argv: list[str]) -> int:
         "expert_bytes": uniform_len,
         "total_expert_bytes": total,
         "dtype_gate_up": dt_gate,
+        # What the resident matrices are ON DISK, which is not what they are
+        # loaded at. `--quant-dense` still chooses the latter per host without
+        # reconverting a byte; this only says whether the converter upcast them
+        # on the way out.
+        "dense_storage": dense_storage,
+        "dense_narrow_tensors": narrow,
         "dtype_down": dt_down,
         "group": args.group,
         "effective_groups": groups,

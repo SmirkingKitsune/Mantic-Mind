@@ -862,9 +862,67 @@ int check_dense_sizing(const fs::path& tiny_root) {
     return bad;
 }
 
+int check_narrow_binding() {
+    int failures = 0;
+    for (const auto dtype : {soma::DType::BF16, soma::DType::F16}) {
+        const bool bf = dtype == soma::DType::BF16;
+        const std::uint16_t bits[] = {0, 0x8000, 1, 0x8001,
+            static_cast<std::uint16_t>(bf ? 0x3f80 : 0x3c00),
+            static_cast<std::uint16_t>(bf ? 0xc000 : 0xc000),
+            static_cast<std::uint16_t>(bf ? 0x0080 : 0x0400),
+            static_cast<std::uint16_t>(bf ? 0x3fc0 : 0x3e00)};
+        const float expected[] = {0, -0.0f, std::ldexp(1.0f, bf ? -133 : -24),
+            -std::ldexp(1.0f, bf ? -133 : -24), 1, -2,
+            std::ldexp(1.0f, bf ? -126 : -14), 1.5f};
+        const auto path = fs::temp_directory_path() /
+            (bf ? "soma-bind-bf16.safetensors" : "soma-bind-f16.safetensors");
+        std::string header = std::string("{\"weight\":{\"dtype\":\"") +
+            (bf ? "BF16" : "F16") + "\",\"shape\":[1,8],\"data_offsets\":[0,16]}}";
+        while (header.size() % 8) header += ' ';
+        {
+            std::ofstream file(path, std::ios::binary);
+            const std::uint64_t length = header.size();
+            file.write(reinterpret_cast<const char*>(&length), sizeof(length));
+            file.write(header.data(), header.size());
+            file.write(reinterpret_cast<const char*>(bits), sizeof(bits));
+        }
+        {
+            soma::SafeTensors st;
+            soma::QuantMap map;
+            std::vector<soma::QTensor> quantized;
+            std::vector<std::vector<float>> widened;
+            soma::ModelBindCtx ctx{&st, &map, &quantized, &widened};
+            soma::WeightRef weight;
+            if (!st.open(path.string()).ok() ||
+                !soma::bind_model_weight(ctx, "weight", soma::TensorRole::Embed, weight).ok()) {
+                ++failures;
+            } else {
+                for (std::size_t i = 0; i < 8; ++i) {
+                    if (weight.f32[i] != expected[i] ||
+                        std::signbit(weight.f32[i]) != std::signbit(expected[i])) ++failures;
+                }
+                // Growing the outer owner must not invalidate earlier spans.
+                for (int i = 0; i < 100; ++i) widened.emplace_back(8);
+                if (weight.f32[4] != 1) ++failures;
+                const auto retained = widened.size();
+                map.embed = {soma::DType::Q4_G, 8};
+                soma::QTensor reference;
+                if (!soma::quantize_tensor(expected, 1, 8, soma::DType::Q4_G, 8, reference).ok() ||
+                    !soma::bind_model_weight(ctx, "weight", soma::TensorRole::Embed, weight).ok() ||
+                    widened.size() != retained || quantized.empty() ||
+                    quantized.back().data != reference.data) ++failures;
+            }
+        }
+        fs::remove(path);
+    }
+    std::cout << "narrow resident binding and quantization scratch: "
+              << (failures ? "FAIL" : "OK") << '\n';
+    return failures;
+}
+
 int main(int argc, char** argv) {
     const fs::path root = (argc > 1) ? fs::path(argv[1]) : fs::path("tests/fixtures");
-    int failures = 0;
+    int failures = check_narrow_binding();
 
     std::cout << "container round-trip\n";
     const fs::path cdir = root / "containers";

@@ -193,9 +193,12 @@ Status compute_plan(const ArchIr& arch, const HostBudget& budget, PlanDocument& 
             }
         } else {
             // SharedExpert, matching how the loader binds these and how the
-            // converter stores them — F32 in dense.safetensors, never quantized.
-            // Sizing them with the EXPERT roles charged q4 for tensors that are
-            // f32 on disk, so the resident half was under-estimated for every
+            // converter stores them — unquantized in dense.safetensors, at the
+            // source's own precision, and widened on load. This counts the LOADED
+            // size, which is what competes for RAM and is unchanged by whether the
+            // file holds bf16 or f32. Sizing them with the EXPERT roles charged q4
+            // for tensors that are not quantized at all, so the resident half was
+            // under-estimated for every
             // model with a dense layer. Same mis-assignment as the loader's, and
             // it had to be fixed in both or the plan and the load would disagree
             // about the same bytes.

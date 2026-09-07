@@ -1637,10 +1637,11 @@ Status apply_container_quant(std::string_view meta_json, ArchIr& io) {
     // MLA layers and a 155k-token vocabulary that omission is tens of gigabytes
     // of resident memory (roadmap D17).
     //
-    // DISK stays F32 either way: dense.safetensors holds full precision and the
-    // loader quantizes into RAM. That is a feature rather than a compromise —
-    // the resident precision can be changed without reconverting a single byte,
-    // which is exactly what the expert half cannot do.
+    // DISK stays UNQUANTIZED either way: dense.safetensors holds the resident half
+    // losslessly, at the source checkpoint's own precision — bf16 for a bf16
+    // upload — and the loader widens and quantizes into RAM. That is a feature
+    // rather than a compromise: the resident precision can be changed without
+    // reconverting a single byte, which is exactly what the expert half cannot do.
     //
     // Router is deliberately absent. `TensorRole::Router` "MUST be F32.
     // Enforced at admission, not by convention" — one f32 matrix per layer is

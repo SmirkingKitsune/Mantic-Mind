@@ -56,21 +56,114 @@ Status read_text(const fs::path& p, std::string& out) {
     return {};
 }
 
-Status bind_tensor(const SafeTensors& st, const std::string& name, std::span<const float>& out) {
+/// bf16 and f16 to f32, exactly.
+///
+/// bf16 is the top 16 bits of an f32, so widening it is a shift and cannot lose
+/// anything — which is the whole reason a container may store its resident
+/// matrices at the source's own precision rather than upcasting them on the way
+/// to disk. f16 needs real work: a narrower exponent, its own subnormals, and its
+/// own inf/nan encoding.
+float widen_bf16(std::uint16_t bits) noexcept {
+    const std::uint32_t wide = static_cast<std::uint32_t>(bits) << 16;
+    float out = 0.0f;
+    std::memcpy(&out, &wide, sizeof(out));
+    return out;
+}
+
+float widen_f16(std::uint16_t bits) noexcept {
+    const std::uint32_t sign = static_cast<std::uint32_t>(bits & 0x8000u) << 16;
+    std::uint32_t exp = (bits >> 10) & 0x1Fu;
+    std::uint32_t mant = bits & 0x3FFu;
+    std::uint32_t wide = 0;
+    if (exp == 0) {
+        if (mant != 0) {
+            // Subnormal: renormalize into f32's much wider exponent range, where
+            // every f16 subnormal is an ordinary normal number.
+            exp = 127 - 15 + 1;
+            while ((mant & 0x400u) == 0) {
+                mant <<= 1;
+                --exp;
+            }
+            mant &= 0x3FFu;
+            wide = (exp << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1Fu) {
+        wide = 0x7F800000u | (mant << 13); // inf, or nan with its payload kept
+    } else {
+        wide = ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+    wide |= sign;
+    float out = 0.0f;
+    std::memcpy(&out, &wide, sizeof(out));
+    return out;
+}
+
+/// Materialize a narrow tensor as f32 into `owner`, and hand back a view of it.
+///
+/// Costs an allocation where an f32 tensor costs none — the reader mmaps, so an
+/// f32 weight is bound as a zero-copy view straight into the mapped file. That is
+/// the trade a narrow container makes: half the bytes on disk, across the network
+/// and at startup, against resident pages that are anonymous rather than
+/// file-backed. The plan already counts these bytes as resident either way.
+Status widen_tensor(const TensorView& tv,
+                    const std::string& name,
+                    std::vector<std::vector<float>>* owner,
+                    std::span<const float>& out) {
+    if (owner == nullptr) {
+        return {StatusCode::Unsupported,
+                name + " is " + to_string(tv.dtype) +
+                    " and this bind site cannot widen it; it has nowhere to keep the result"};
+    }
+    const auto n = tv.elements();
+    if (tv.bytes.size() != n * 2) {
+        return {StatusCode::InvalidArgument, name + ": narrow tensor size disagrees with shape"};
+    }
+    owner->emplace_back(n);
+    auto& dst = owner->back();
+    const auto* src = reinterpret_cast<const std::uint16_t*>(tv.bytes.data());
+    if (tv.dtype == DType::BF16) {
+        for (std::size_t i = 0; i < n; ++i) dst[i] = widen_bf16(src[i]);
+    } else {
+        for (std::size_t i = 0; i < n; ++i) dst[i] = widen_f16(src[i]);
+    }
+    out = std::span<const float>(dst.data(), dst.size());
+    return {};
+}
+
+bool is_narrow_float(DType dtype) noexcept {
+    return dtype == DType::BF16 || dtype == DType::F16;
+}
+
+/// The 1-D controls: norms, router logits, attention sinks.
+///
+/// A CONTAINER stores these f32 — they are kilobytes beside the matrices, and
+/// keeping them full precision buys a zero-copy view for nothing worth counting.
+/// A raw HF checkpoint is another matter: a real one is bf16 throughout, norms
+/// included, and refusing them here meant the direct-source path could not load
+/// any real bf16 upload at all. The tiny fixtures are f32, which is why that went
+/// unnoticed.
+Status bind_tensor(const SafeTensors& st,
+                   std::vector<std::vector<float>>* widened,
+                   const std::string& name,
+                   std::span<const float>& out) {
     const TensorView* tv = nullptr;
     if (auto s = st.require(name, tv); !s.ok()) return s;
-    if (tv->dtype != DType::F32) {
-        return {StatusCode::Unsupported,
-                name + " is " + to_string(tv->dtype) + "; the G0 path is fp32 only"};
+    if (tv->dtype == DType::F32) {
+        out = tv->f32();
+        return {};
     }
-    out = tv->f32();
-    return {};
+    if (!is_narrow_float(tv->dtype)) {
+        return {StatusCode::Unsupported,
+                name + " is " + to_string(tv->dtype) + "; expected fp32, bf16 or fp16"};
+    }
+    return widen_tensor(*tv, name, widened, out);
 }
 
 Status bind_weight_view(const TensorView& tv,
                         const std::string& name,
                         const QuantSpec& spec,
                         std::vector<QTensor>& owner,
+                        std::vector<std::vector<float>>* widened,
                         WeightRef& out) {
     if (tv.rank() != 2) {
         return {StatusCode::InvalidArgument,
@@ -89,15 +182,29 @@ Status bind_weight_view(const TensorView& tv,
         out = WeightRef::from_quantized_bytes(tv.bytes, tv.dtype, tv.group, rows, cols);
         return {};
     }
-    if (tv.dtype != DType::F32) {
+    if (tv.dtype != DType::F32 && !is_narrow_float(tv.dtype)) {
         return {StatusCode::Unsupported, name + " is not fp32 or a Soma qweight"};
     }
+
+    // f32 stays a zero-copy view into the mapped file; a narrow tensor is widened
+    // into persistent storage only when the final weight is f32. Quantized
+    // weights need scratch for this tensor only, not a second resident copy.
+    std::vector<std::vector<float>> scratch;
+    std::span<const float> values;
+    if (tv.dtype == DType::F32) {
+        values = tv.f32();
+    } else if (auto s = widen_tensor(tv, name,
+                                    is_quantized(spec.dtype) ? &scratch : widened, values);
+               !s.ok()) {
+        return s;
+    }
+
     if (!is_quantized(spec.dtype)) {
-        out = WeightRef::from_f32(tv.f32(), rows, cols);
+        out = WeightRef::from_f32(values, rows, cols);
         return {};
     }
     owner.emplace_back();
-    if (auto s = quantize_tensor(tv.f32(),
+    if (auto s = quantize_tensor(values,
                                  rows,
                                  cols,
                                  spec.dtype,
@@ -118,7 +225,8 @@ Status bind_weight_view(const TensorView& tv,
 Status bind_weight(F32Model& model, const std::string& name, TensorRole role, WeightRef& out) {
     const TensorView* tv = nullptr;
     if (auto s = model.weights.require(name, tv); !s.ok()) return s;
-    return bind_weight_view(*tv, name, model.quant_map.for_role(role), model.quantized, out);
+    return bind_weight_view(*tv, name, model.quant_map.for_role(role), model.quantized,
+                            &model.widened, out);
 }
 
 Status
@@ -193,7 +301,8 @@ Status bind_fused_glu(F32Model& model,
     if (gu->rank() != 2 || dn->rank() != 2) {
         return {StatusCode::InvalidArgument, where + "expected rank-2 gate_up_proj and down_proj"};
     }
-    if (gu->dtype != DType::F32 || dn->dtype != DType::F32) {
+    if ((gu->dtype != DType::F32 && !is_narrow_float(gu->dtype)) ||
+        (dn->dtype != DType::F32 && !is_narrow_float(dn->dtype))) {
         return {StatusCode::Unsupported, where + "not fp32 in the checkpoint"};
     }
     if (gu->dim(0) != 2 * static_cast<std::int64_t>(inter) || gu->dim(1) != d_model ||
@@ -205,13 +314,18 @@ Status bind_fused_glu(F32Model& model,
                     std::to_string(d_model) + " d_model"};
     }
 
-    const auto src = gu->f32();
-    const auto half = static_cast<std::size_t>(inter) * d_model;
-    if (auto s = bind_block(model, src.subspan(0, half), inter, d_model, role, gate); !s.ok())
+    const auto half = static_cast<std::size_t>(inter) * d_model *
+                      (gu->dtype == DType::F32 ? 4 : 2);
+    TensorView slice = *gu;
+    slice.shape = {inter, d_model};
+    slice.bytes = gu->bytes.subspan(0, half);
+    const auto& spec = model.quant_map.for_role(role);
+    if (auto s = bind_weight_view(slice, where, spec, model.quantized, &model.widened, gate); !s.ok())
         return s;
-    if (auto s = bind_block(model, src.subspan(half, half), inter, d_model, role, up); !s.ok())
+    slice.bytes = gu->bytes.subspan(half, half);
+    if (auto s = bind_weight_view(slice, where, spec, model.quantized, &model.widened, up); !s.ok())
         return s;
-    return bind_block(model, dn->f32(), d_model, inter, role, down);
+    return bind_weight_view(*dn, dn->name, spec, model.quantized, &model.widened, down);
 }
 
 /// The FUSED expert layout: every expert stacked into one rank-3 tensor.
@@ -304,7 +418,7 @@ Status bind_layer_f32(const LayerBindCtx& ctx,
                       bool optional) {
     const auto n = ctx.name(suffix);
     if (optional && ctx.weights->find(n) == nullptr) return {};
-    return bind_tensor(*ctx.weights, n, out);
+    return bind_tensor(*ctx.weights, ctx.widened, n, out);
 }
 
 Status bind_layer_weight(
@@ -313,7 +427,7 @@ Status bind_layer_weight(
     const TensorView* tv = nullptr;
     if (optional && ctx.weights->find(n) == nullptr) return {};
     if (auto s = ctx.weights->require(n, tv); !s.ok()) return s;
-    return bind_weight_view(*tv, n, ctx.quant->for_role(role), *ctx.owner, out);
+    return bind_weight_view(*tv, n, ctx.quant->for_role(role), *ctx.owner, ctx.widened, out);
 }
 
 Status bind_model_f32(const ModelBindCtx& ctx,
@@ -321,7 +435,7 @@ Status bind_model_f32(const ModelBindCtx& ctx,
                       std::span<const float>& out,
                       bool optional) {
     if (optional && ctx.weights->find(name) == nullptr) return {};
-    return bind_tensor(*ctx.weights, name, out);
+    return bind_tensor(*ctx.weights, ctx.widened, name, out);
 }
 
 Status bind_model_weight(
@@ -329,7 +443,8 @@ Status bind_model_weight(
     const TensorView* tv = nullptr;
     if (optional && ctx.weights->find(name) == nullptr) return {};
     if (auto s = ctx.weights->require(name, tv); !s.ok()) return s;
-    return bind_weight_view(*tv, std::string(name), ctx.quant->for_role(role), *ctx.owner, out);
+    return bind_weight_view(*tv, std::string(name), ctx.quant->for_role(role), *ctx.owner,
+                            ctx.widened, out);
 }
 
 void F32Workspace::reserve(const ArchIr& arch, std::uint32_t max_tokens) {
@@ -501,10 +616,15 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
     out.quantized.reserve(static_cast<std::size_t>(arch.topology.n_layers) *
                               (3 * static_cast<std::size_t>(arch.router.n_experts) + 14) +
                           2);
+    // An allocation hint only: moving inner vectors preserves their data.
+    // Only weights and controls retained as f32 consume persistent slots.
+    out.widened.reserve(static_cast<std::size_t>(arch.topology.n_layers) *
+                            (3 * static_cast<std::size_t>(arch.router.n_experts) + 14) +
+                        2);
     if (auto s = bind_weight(out, "model.embed_tokens.weight", TensorRole::Embed, out.embed);
         !s.ok())
         return s;
-    if (auto s = bind_tensor(out.weights, "model.norm.weight", out.out_norm); !s.ok()) return s;
+    if (auto s = bind_tensor(out.weights, &out.widened, "model.norm.weight", out.out_norm); !s.ok()) return s;
 
     if (auto s = bind_weight_optional(out, "lm_head.weight", TensorRole::Embed, out.out_head);
         !s.ok())
@@ -520,7 +640,7 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
     }
 
     if (backend->bind_model != nullptr) {
-        ModelBindCtx ctx{&out.weights, &out.quant_map, &out.quantized};
+        ModelBindCtx ctx{&out.weights, &out.quant_map, &out.quantized, &out.widened};
         if (const auto rc = backend->bind_model(arch, ctx, out.arch_payload);
             rc != StatusCode::Ok) {
             return {rc, "binding architecture model weights failed"};
@@ -533,10 +653,10 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
         lw.kind = arch.topology.layer_kinds[l];
         const auto p = layer_prefix(l);
 
-        if (auto s = bind_tensor(out.weights, p + "input_layernorm.weight", lw.input_norm); !s.ok())
+        if (auto s = bind_tensor(out.weights, &out.widened, p + "input_layernorm.weight", lw.input_norm); !s.ok())
             return s;
         if (auto s =
-                bind_tensor(out.weights, p + "post_attention_layernorm.weight", lw.post_attn_norm);
+                bind_tensor(out.weights, &out.widened, p + "post_attention_layernorm.weight", lw.post_attn_norm);
             !s.ok())
             return s;
 
@@ -548,6 +668,7 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
         ctx.weights = &out.weights;
         ctx.quant = &out.quant_map;
         ctx.owner = &out.quantized;
+        ctx.widened = &out.widened;
         ctx.layer = l;
         if (const auto rc = backend->bind_layer(arch, ctx, lw.attn); rc != StatusCode::Ok) {
             return {rc, "binding attention weights failed at layer " + std::to_string(l)};
@@ -555,7 +676,7 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
 
         if (lw.kind == LayerKind::Moe) {
             const auto& nm = arch.naming;
-            if (auto s = bind_tensor(out.weights, p + nm.moe_block + '.' + nm.router, lw.router);
+            if (auto s = bind_tensor(out.weights, &out.widened, p + nm.moe_block + '.' + nm.router, lw.router);
                 !s.ok())
                 return s;
 
@@ -670,8 +791,9 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
                                 "down_proj/up_proj"};
                 }
                 if (arch.ffn.routed_expert_norm) {
-                    if (auto s = bind_tensor(
-                            out.weights, p + blk + ".routed_expert_norm.weight", lw.latent_norm);
+                    if (auto s = bind_tensor(out.weights, &out.widened,
+                                             p + blk + ".routed_expert_norm.weight",
+                                             lw.latent_norm);
                         !s.ok())
                         return s;
                 }

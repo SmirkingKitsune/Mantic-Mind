@@ -133,15 +133,31 @@ numbers, and only the second can be compared against bf16 weights at all.
 
 The copied `config.json` is not that record and must not be read as one. It is verbatim, so a
 blockwise-fp8 source leaves a `quantization_config` in it that describes the **upload**, not the
-container — whose experts are `dtype_gate_up`/`dtype_down` and whose dense half is F32. Nothing in the
+container — whose experts are `dtype_gate_up`/`dtype_down` and whose dense half is unquantized. Nothing in the
 engine reads that key, and `verify_payload.py` asks the source directory's own `config.json` rather than
 this copy, because `--source` may legitimately point at a different upload of the same weights.
 
-For ordinary containers, the dense half is stored **F32 regardless of `--quant-dense`**, and that is
-deliberate: the loader
-quantizes it into RAM per the role's spec, so the resident precision can be changed without
-reconverting a byte — which is exactly what the expert half cannot do. `--quant-dense` is therefore a
-flag on `plan` and `serve`, not on the converter.
+For ordinary containers, the dense half is stored **unquantized regardless of `--quant-dense`**, and
+that is deliberate: the loader quantizes it into RAM per the role's spec, so the resident precision can
+be changed without reconverting a byte — which is exactly what the expert half cannot do.
+`--quant-dense` is therefore a flag on `plan` and `serve`, not on the converter.
+
+**Unquantized is not the same as f32.** `--dense-storage source` (the default) copies the resident
+matrices in BF16 or F16 when that is the checkpoint's precision, halving their payload.
+BF16 is the top 16 bits of an F32, so the engine's widening at load is exact, and
+upcasting on the way to disk merely moved that widening earlier onto a file that then has to be stored,
+transferred to every node and read at every startup. An f32 source stays f32 in full; storing it narrow
+would lose bits the checkpoint actually had. `--dense-storage f32` restores F32 storage.
+
+The 1-D **controls** — norms, router biases, sinks — stay f32 whatever the source was. They are
+kilobytes beside the matrices and the engine binds them as zero-copy views, so full precision costs
+nothing worth counting. `container_meta.json` records `dense_storage` and `dense_narrow_tensors`.
+
+The trade this makes is worth naming: an f32 matrix is bound as a zero-copy view straight into the
+mapped file, while a narrow one is widened into memory the model owns. Same resident bytes either way —
+which is what the plan already counts — but anonymous pages rather than reclaimable file-backed ones,
+paid once at load. `tools/ci/check_bf16_source.py` pins the part that must not move: the expert payload
+is byte-identical from either source, and every dense tensor widens back exactly.
 
 The tokenizer is compiled INTO the container, before the expert loop, and the outcome is recorded in
 `container_meta.json` and repeated in the converter's final summary. It is NON-FATAL: most families'
@@ -152,7 +168,7 @@ meaningless text, and `conform` reports `tokenizer_roundtrip` as skipped rather 
 
 The ordinary **dense half stays in safetensors** deliberately. It is loaded once, in full, at startup — none of
 the four requirements above apply to it, and keeping a standard format means it stays inspectable with
-ordinary tools.
+ordinary tools, at whichever precision it was stored.
 
 V4 is the exception described above: large resident matrices are translated offline into the chosen
 Soma QTensor layout and bound directly from `dense-q-*.bin`; lossless controls remain inspectable
@@ -340,7 +356,7 @@ conformance enforces the same strict boundary as serving.
 
 **The stamp is the CONTAINER's identity, not the loaded model's.** These differ in
 one direction: `--quant-dense` chooses the precision of the resident half at load,
-and since that half is stored F32 on disk precisely so the choice costs no
+and since that half is stored unquantized on disk precisely so the choice costs no
 reconversion, it moves `arch_hash` without moving one byte of the container. The
 stamp covers the IR carrying the map `container_meta.json` declares — what the
 shards actually are — which the engine tracks as `ArchIr::container_arch_hash`.
