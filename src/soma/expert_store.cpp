@@ -21,6 +21,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -466,7 +467,14 @@ public:
     ShardFile(const ShardFile&) = delete;
     ShardFile& operator=(const ShardFile&) = delete;
 
-    bool open(const std::filesystem::path& p) noexcept {
+    enum class Io : std::uint8_t { Buffered, Unbuffered };
+
+    /// Unbuffered opens FAIL, routinely, and that is expected rather than
+    /// exceptional: tmpfs refuses O_DIRECT outright, and so do several network
+    /// and overlay filesystems — including the 9p mount a WSL build reads its own
+    /// fixtures through. Callers treat a false return as "not available here" and
+    /// fall back, which is why this reports rather than throws.
+    bool open(const std::filesystem::path& p, Io io = Io::Buffered) noexcept {
         close();
 #if defined(_WIN32)
         h_ = ::CreateFileW(p.wstring().c_str(),
@@ -474,12 +482,52 @@ public:
                            FILE_SHARE_READ,
                            nullptr,
                            OPEN_EXISTING,
-                           FILE_ATTRIBUTE_NORMAL,
+                           io == Io::Unbuffered
+                               ? (FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN)
+                               : FILE_ATTRIBUTE_NORMAL,
                            nullptr);
+#elif defined(O_DIRECT)
+        h_ = ::open(p.c_str(), io == Io::Unbuffered ? (O_RDONLY | O_DIRECT) : O_RDONLY);
 #else
+        // macOS has no O_DIRECT; F_NOCACHE is the equivalent, applied after the
+        // open rather than as a flag.
         h_ = ::open(p.c_str(), O_RDONLY);
+        if (h_ != kInvalid && io == Io::Unbuffered) {
+#if defined(F_NOCACHE)
+            if (::fcntl(h_, F_NOCACHE, 1) != 0) {
+                close();
+                return false;
+            }
+#else
+            close();
+            return false;
+#endif
+        }
 #endif
         return valid();
+    }
+
+    /// Ask the OS to forget a range it has cached. Returns false when the
+    /// platform offers no way to say it.
+    ///
+    /// Advice is best effort, even after flushing recent conversion writes.
+    bool flush_for_probe() const noexcept {
+#if defined(POSIX_FADV_DONTNEED)
+        return valid() && ::fsync(h_) == 0;
+#else
+        return false;
+#endif
+    }
+
+    bool drop_from_cache(std::uint64_t offset, std::uint64_t len) const noexcept {
+#if defined(POSIX_FADV_DONTNEED)
+        return valid() && ::posix_fadvise(h_, static_cast<off_t>(offset),
+                                          static_cast<off_t>(len), POSIX_FADV_DONTNEED) == 0;
+#else
+        (void)offset;
+        (void)len;
+        return false;
+#endif
     }
 
     bool valid() const noexcept { return h_ != kInvalid; }
@@ -531,6 +579,69 @@ private:
 };
 
 namespace {
+
+/// A page-aligned buffer, which an unbuffered read requires and `new`/`vector` do
+/// not give: both align to alignof(max_align_t), typically 16.
+class AlignedBuffer {
+public:
+    AlignedBuffer() = default;
+    AlignedBuffer(const AlignedBuffer&) = delete;
+    AlignedBuffer& operator=(const AlignedBuffer&) = delete;
+    ~AlignedBuffer() { reset(); }
+
+    bool allocate(std::size_t bytes) noexcept {
+        reset();
+        if (bytes == 0) return true;
+        const auto rounded = (bytes + kDirectIoAlign - 1) / kDirectIoAlign * kDirectIoAlign;
+#if defined(_WIN32)
+        p_ = ::_aligned_malloc(rounded, kDirectIoAlign);
+#else
+        p_ = std::aligned_alloc(kDirectIoAlign, rounded);
+#endif
+        size_ = (p_ != nullptr) ? rounded : 0;
+        return p_ != nullptr;
+    }
+
+    void* data() const noexcept { return p_; }
+    std::size_t size() const noexcept { return size_; }
+
+private:
+    void reset() noexcept {
+        if (p_ == nullptr) return;
+#if defined(_WIN32)
+        ::_aligned_free(p_);
+#else
+        std::free(p_);
+#endif
+        p_ = nullptr;
+        size_ = 0;
+    }
+
+    void* p_ = nullptr;
+    std::size_t size_ = 0;
+};
+
+/// Force the probe off its unbuffered path.
+///
+/// Same shape and the same reason as SOMA_SIMD_TIER: the only way to know what a
+/// mechanism is worth is to be able to turn it off under a fixed workload. Here
+/// that answers a question an operator will actually ask — "is this host's
+/// bandwidth figure the drive or the page cache?" — by letting them measure both
+/// and compare. It is also the only way to exercise the fallback on a machine
+/// whose filesystems all accept O_DIRECT.
+bool probe_direct_disabled() noexcept {
+#if defined(_MSC_VER)
+    char* buf = nullptr;
+    std::size_t len = 0;
+    const bool have = (_dupenv_s(&buf, &len, "SOMA_PROBE_NO_DIRECT") == 0 && buf != nullptr);
+    const std::string v = have ? std::string(buf) : std::string();
+    std::free(buf);
+#else
+    const char* raw = std::getenv("SOMA_PROBE_NO_DIRECT");
+    const std::string v = raw ? std::string(raw) : std::string();
+#endif
+    return !v.empty() && v != "0" && v != "false";
+}
 
 /// The shard-prefix an index file's payload lives under.
 ///
@@ -594,6 +705,8 @@ struct ExpertStore::Impl {
     /// Atomic: incremented from every thread that reads, with no lock held.
     std::atomic<std::uint64_t> bytes_read{0};
     std::string dir;
+    /// Kept so the bandwidth probe can open its own handles onto the same shards.
+    std::string shard_prefix;
 
     PayloadPolicy payload = PayloadPolicy::Trust;
     std::vector<ExpertDigest> digests;
@@ -654,6 +767,7 @@ Status ExpertStore::open_indexed(const std::string& model_dir,
                                  OpenOptions opts) try {
     close();
     impl_->dir = model_dir;
+    impl_->shard_prefix = shard_prefix;
 
     const fs::path index_path = fs::path(model_dir) / index_file;
     std::ifstream in(index_path, std::ios::binary);
@@ -1214,47 +1328,125 @@ catch (const std::bad_alloc&) {
     return {StatusCode::IoError, "insufficient memory to stamp container index"};
 }
 
-Status ExpertStore::measure_bandwidth(std::uint64_t& bytes_per_second) {
+const char* to_string(BandwidthMethod method) noexcept {
+    switch (method) {
+    case BandwidthMethod::Unbuffered:
+        return "unbuffered";
+    case BandwidthMethod::CacheEvicted:
+        return "cache-eviction-advised";
+    case BandwidthMethod::Buffered:
+        return "buffered";
+    }
+    return "unknown";
+}
+
+Status ExpertStore::measure_bandwidth(std::uint64_t& bytes_per_second, BandwidthReport* report) {
     bytes_per_second = 0;
+    if (report != nullptr) *report = {};
     if (impl_->index.empty()) {
         return {StatusCode::InvalidArgument, "no container open"};
     }
 
-    // Measured with reads THE SIZE OF THIS MODEL'S EXPERTS, and in a random
-    // order.
+    // Measured with reads THE SIZE OF THIS MODEL'S EXPERTS, in a random order,
+    // and COLD.
     //
-    // Both matter. A 2.4 MB read and an 88 MB read do not achieve the same
-    // bandwidth on the same drive, and a sequential sweep measures readahead
-    // rather than the random-access pattern routing actually produces. Using a
-    // spec-sheet number, or a sequential benchmark, is how a verdict ends up
-    // confidently wrong.
+    // All three matter. A 2.4 MB read and an 88 MB read do not achieve the same
+    // bandwidth on the same drive; a sequential sweep measures readahead rather
+    // than the random access routing actually produces; and a warm read measures
+    // the page cache, which on a container the converter has just written is most
+    // of it. The third was the one that was missing, and it fails in the
+    // dangerous direction — a probe reporting memcpy speed says streaming is
+    // affordable on a host where it is not.
     const std::size_t n = impl_->index.size();
-    const std::size_t samples = std::min<std::size_t>(n, 64);
 
-    std::vector<std::size_t> order(n);
-    std::iota(order.begin(), order.end(), 0u);
+    std::vector<std::size_t> order;
+    order.reserve(n);
+    std::uint32_t maxlen = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (impl_->index[i].length == 0) continue; // a dense layer's empty slot
+        order.push_back(i);
+        maxlen = std::max(maxlen, impl_->index[i].length);
+    }
+    if (order.empty()) return {StatusCode::InvalidArgument, "container holds no routed experts"};
+    if (maxlen > std::numeric_limits<std::uint32_t>::max() - (kDirectIoAlign - 1))
+        return {StatusCode::InvalidArgument, "padded expert read exceeds supported length"};
+
     std::mt19937 rng(20260729);
     std::shuffle(order.begin(), order.end(), rng);
+    const std::size_t samples = std::min<std::size_t>(order.size(), 64);
 
-    std::uint32_t maxlen = 0;
-    for (const auto& e : impl_->index)
-        maxlen = std::max(maxlen, e.length);
-    std::vector<std::byte> buf(maxlen);
+    // The probe's OWN handles and its OWN buffer, which is what lets it read
+    // unbuffered at all. An unbuffered read needs an aligned destination and a
+    // length rounded up to the block size; ExpertStore::read() has neither, since
+    // it writes into an exact-length buffer the memory tier allocated. Here both
+    // ends belong to the probe.
+    //
+    // Reading into the PADDING is safe by construction: every shard is padded to
+    // kDirectIoAlign and validate_ranges() has already required the file to be
+    // exactly that size, so the rounded-up read never crosses EOF.
+    auto method =
+        probe_direct_disabled() ? BandwidthMethod::CacheEvicted : BandwidthMethod::Unbuffered;
+    std::vector<ShardFile> probe(method == BandwidthMethod::Unbuffered ? impl_->header.n_shards
+                                                                      : 0u);
+    const auto& prefix = impl_->shard_prefix;
+    for (std::uint32_t i = 0; i < probe.size() && method == BandwidthMethod::Unbuffered; ++i) {
+        char name[32];
+        std::snprintf(name, sizeof(name), "%s%05u.bin", prefix.c_str(), i);
+        if (!probe[i].open(fs::path(impl_->dir) / name, ShardFile::Io::Unbuffered)) {
+            method = BandwidthMethod::CacheEvicted;
+        }
+    }
+
+    AlignedBuffer buf;
+    if (method != BandwidthMethod::Unbuffered) {
+        // Fall back to the store's own buffered handles, dropping each range from
+        // the page cache immediately before reading it. Whether the platform has
+        // any way to say that is checked on the first range rather than assumed,
+        // so a system with no fadvise reports `buffered` and not a stronger claim.
+        //
+        // The check is that the advice was ACCEPTED, not that pages were provably
+        // evicted — nothing portable reports the latter. On a RAM-backed
+        // filesystem it will be accepted and do nothing, but there the number is
+        // not misleading either: the file really is memory, and that is what the
+        // storage costs.
+        probe.clear();
+        bool flushed = true;
+        for (const auto& shard : impl_->shards)
+            if (!shard.flush_for_probe()) flushed = false;
+        const auto& first = impl_->index[order[0]];
+        method = flushed && impl_->shards[first.shard].drop_from_cache(
+                                first.offset, (first.length + kDirectIoAlign - 1) /
+                                                  kDirectIoAlign * kDirectIoAlign)
+                     ? BandwidthMethod::CacheEvicted
+                     : BandwidthMethod::Buffered;
+    }
+    if (!buf.allocate(maxlen)) {
+        return {StatusCode::OutOfMemory, "cannot allocate the bandwidth probe buffer"};
+    }
+
+    const auto read_one = [&](const ExpertLocation& loc) noexcept {
+        if (loc.shard >= impl_->shards.size()) return false;
+        if (!probe.empty()) {
+            const auto padded = static_cast<std::uint32_t>(
+                (loc.length + kDirectIoAlign - 1) / kDirectIoAlign * kDirectIoAlign);
+            return probe[loc.shard].valid() &&
+                   probe[loc.shard].read_at(loc.offset, buf.data(), padded);
+        }
+        if (method == BandwidthMethod::CacheEvicted &&
+            !impl_->shards[loc.shard].drop_from_cache(
+                loc.offset, (loc.length + kDirectIoAlign - 1) / kDirectIoAlign * kDirectIoAlign))
+            method = BandwidthMethod::Buffered;
+        return impl_->shards[loc.shard].read_at(loc.offset, buf.data(), loc.length);
+    };
 
     // Probe directly so concurrent model reads retain verification. Probe I/O
     // neither changes the shared policy nor marks any expert verified.
-
     const auto t0 = std::chrono::steady_clock::now();
     std::uint64_t moved = 0;
     for (std::size_t i = 0; i < samples; ++i) {
-        const auto slot = order[i];
-        const auto& loc = impl_->index[slot];
-        if (loc.length == 0) continue;
-        if (loc.shard >= impl_->shards.size() ||
-            !impl_->shards[loc.shard].read_at(loc.offset, buf.data(), loc.length)) {
-            return {StatusCode::IoError, "bandwidth probe read failed"};
-        }
-        moved += impl_->index[slot].length;
+        const auto& loc = impl_->index[order[i]];
+        if (!read_one(loc)) return {StatusCode::IoError, "bandwidth probe read failed"};
+        moved += loc.length;
     }
     const double secs =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -1264,6 +1456,12 @@ Status ExpertStore::measure_bandwidth(std::uint64_t& bytes_per_second) {
 
     if (secs <= 0.0) return {StatusCode::Internal, "bandwidth probe took no measurable time"};
     bytes_per_second = static_cast<std::uint64_t>(static_cast<double>(moved) / secs);
+    if (report != nullptr) {
+        report->bytes_per_second = bytes_per_second;
+        report->method = method;
+        report->bytes_moved = moved;
+        report->samples = static_cast<std::uint32_t>(samples);
+    }
     return {};
 }
 

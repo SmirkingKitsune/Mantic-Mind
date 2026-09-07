@@ -60,11 +60,19 @@ int main(int argc, char** argv) {
               << (loc.offset % soma::kDirectIoAlign == 0 ? "  (aligned)" : "  UNALIGNED") << "\n";
 
     std::uint64_t bw = 0;
-    if (auto st = store.measure_bandwidth(bw); st.ok()) {
+    soma::BandwidthReport bw_report;
+    if (auto st = store.measure_bandwidth(bw, &bw_report); st.ok()) {
+        // The METHOD, not just the number. A buffered figure on a container this
+        // host has just written is page-cache speed, and a plan built on it is
+        // optimistic by roughly an order of magnitude.
         std::cout << "  random-read BW   " << std::setprecision(0)
                   << (static_cast<double>(bw) / 1e6) << " MB/s at "
                   << std::setprecision(2) << (static_cast<double>(h.expert_bytes) / 1e6)
-                  << " MB reads\n";
+                  << " MB reads, " << soma::to_string(bw_report.method)
+                  << (bw_report.method != soma::BandwidthMethod::Unbuffered
+                          ? "  (UPPER BOUND: cache bypass not guaranteed)"
+                          : "")
+                  << "\n";
     } else {
         std::cout << "  bandwidth probe  " << st.message() << "\n";
         return 1;

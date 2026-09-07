@@ -24,8 +24,21 @@ inline constexpr LayerIndex kInvalidLayer = ~LayerIndex{0};
 inline constexpr ExpertId kInvalidExpert = ~ExpertId{0};
 inline constexpr SeqId kInvalidSeq = ~SeqId{0};
 
-/// Expert reads are issued O_DIRECT where the platform supports it, so every
-/// offset and length in the container is aligned to this boundary.
+/// Every expert range STARTS on this boundary, and each shard is padded to it.
+///
+/// Two things this is not. Expert LENGTHS are not aligned — the padding sits
+/// between experts, so a range is `length` bytes followed by up to 4 KB - 1 of
+/// filler. And ordinary expert reads are NOT unbuffered: this said they were
+/// issued O_DIRECT for as long as the constant existed, while every read went
+/// through the page cache, which memory_hierarchy.hpp separately (and correctly)
+/// describes as a free L2. Both could not be true.
+///
+/// What the alignment buys is real, and is why it stays. No expert shares a page
+/// with its neighbour, so reading one touches the minimum number of pages and
+/// never pulls in part of another. It also keeps unbuffered reads LEGAL for a
+/// caller that can meet the other two conditions — an aligned destination and a
+/// length rounded up into the padding — which the bandwidth probe does and the
+/// memory tier, which allocates an exact-length std::vector, does not.
 inline constexpr std::size_t kDirectIoAlign = 4096;
 
 enum class StatusCode : std::uint8_t {

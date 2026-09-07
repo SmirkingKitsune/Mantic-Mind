@@ -229,9 +229,14 @@ noise — four independent accumulators overlap FMA latency instead of serializi
 
 ## G2 — streaming from disk, one architecture
 
-**Build:** container writer, sidecar index, `ExpertStore` with aligned/`O_DIRECT` reads, `MemoryHierarchy`
+**Build:** container writer, sidecar index, `ExpertStore` with aligned reads, `MemoryHierarchy`
 (RAM LRU + pin + heat), async readahead, the bounded load pool, router-lookahead prefetch, the profiler,
 the verdict function, `plan --json`.
+
+*Built as buffered reads over 4 KB-aligned ranges, not `O_DIRECT` as this line originally said.* The
+page cache is a deliberate free L2 under `MemoryHierarchy`, and the two cannot both be true; only the
+bandwidth probe reads unbuffered, because only it owns an aligned destination. See
+`schemas/container.md` and `include/soma/types.hpp`.
 
 **First real model: Qwen3-30B-A3B** — GQA, fine-grained (128 experts, top-8, 2.4 MB experts at q4,
 6.3% active fraction).

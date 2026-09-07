@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -69,6 +70,18 @@ void copy_fixture(const fs::path& source, const fs::path& dest) {
     fs::copy(source, dest,
              fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
     if (ec) throw fs::filesystem_error("copy fixture", source, dest, ec);
+}
+
+/// Portable setenv/unsetenv, for the one test that has to flip a probe override.
+void set_env(const char* name, const char* value) {
+#if defined(_WIN32)
+    _putenv_s(name, value == nullptr ? "" : value);
+#else
+    if (value == nullptr)
+        ::unsetenv(name);
+    else
+        ::setenv(name, value, 1);
+#endif
 }
 
 soma::Status open_with(const fs::path& dir,
@@ -302,6 +315,58 @@ int main(int argc, char** argv) {
             const auto st = open_with(dir, arch);
             check(!st.ok() && st.message().find("unknown expert role") != std::string::npos,
                   "wide role ids cannot alias valid u8 enum values", st.message());
+        }
+
+
+        std::cout << "\ncold bandwidth probe\n";
+
+        // The probe's number feeds the verdict, so what it measures decides
+        // whether a host is told streaming is affordable. It used to read through
+        // the page cache, which on a container just written by the converter is
+        // memcpy: 5793 MB/s against 26 MB/s unbuffered, on one file on one host.
+        {
+            const auto dir = case_dir(root, fixture, "probe-method");
+            soma::ExpertStore store;
+            check(store.open(dir.string(), arch).ok(), "probe fixture opens", "");
+
+            std::uint64_t bw = 0;
+            soma::BandwidthReport report;
+            // Measured on its own line. Folding the call into check()'s condition
+            // while the detail argument reads `bw` leaves the two unsequenced, and
+            // the detail printed 0 B/s beside a passing check.
+            const auto probe_st = store.measure_bandwidth(bw, &report);
+            check(probe_st.ok() && bw > 0, "the probe reports a rate",
+                  std::to_string(bw) + " B/s");
+            check(report.bytes_per_second == bw && report.samples > 0 &&
+                      report.bytes_moved > 0,
+                  "and a report consistent with it",
+                  std::to_string(report.samples) + " samples");
+
+            // The method is a property of the filesystem under the fixture, so
+            // this asserts it is NAMED rather than which one it is. Reporting the
+            // weakest silently is the failure being guarded against: a caller
+            // deriving a verdict has to be able to see that the figure came from a
+            // warm cache.
+            check(std::string(soma::to_string(report.method)) != "unknown",
+                  "and names how it read", soma::to_string(report.method));
+        }
+
+        {
+            // The fallback, which no filesystem on a given host may exercise.
+            // Forced, so the path that runs where O_DIRECT is refused is not
+            // shipped untested.
+            const auto dir = case_dir(root, fixture, "probe-fallback");
+            set_env("SOMA_PROBE_NO_DIRECT", "1");
+            soma::ExpertStore store;
+            check(store.open(dir.string(), arch).ok(), "fallback fixture opens", "");
+            std::uint64_t bw = 0;
+            soma::BandwidthReport report;
+            const auto st = store.measure_bandwidth(bw, &report);
+            set_env("SOMA_PROBE_NO_DIRECT", nullptr);
+            check(st.ok() && bw > 0, "the fallback probe still measures", st.message());
+            check(report.method != soma::BandwidthMethod::Unbuffered,
+                  "and does not claim unbuffered when it was refused",
+                  soma::to_string(report.method));
         }
 
         {

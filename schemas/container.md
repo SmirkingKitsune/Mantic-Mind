@@ -16,8 +16,17 @@ expert miss:
 1. **One expert = one contiguous byte range.** A routed expert is gate + up + down. Upstream stores those
    as three separate tensors, so fetching one expert means three seeks. Here they are concatenated, and a
    single read fetches the whole SwiGLU triple.
-2. **4 KB-aligned offsets**, so `O_DIRECT` / unbuffered reads are legal. Misaligned ranges force a
-   read-modify-write through the page cache, which is exactly the layer streaming is trying to bypass.
+2. **4 KB-aligned offsets**, so no expert range shares a page with its neighbour and an unbuffered read
+   of one is legal. Reading an expert therefore touches the minimum number of pages and never pulls in
+   part of another.
+
+   **Ordinary expert reads are buffered**, and the OS page cache is a deliberate free L2 under
+   `MemoryHierarchy` (`include/soma/memory_hierarchy.hpp`). Three comments used to claim reads were
+   issued `O_DIRECT`; none ever were, and the claim contradicted the L2 design it sat beside. What the
+   alignment actually buys is the paragraph above, plus keeping unbuffered reads *available* to a caller
+   that can meet the other two conditions — an aligned destination and a length rounded up into the
+   padding. The bandwidth probe does both (see below); the memory tier, which allocates an exact-length
+   `std::vector`, does neither, and adopting unbuffered reads on the serving path would start there.
 3. **A sidecar index**, so a miss never parses a JSON header. The safetensors header for a 61 GB
    checkpoint is megabytes of JSON; re-parsing it per miss is absurd, and caching it in memory means
    holding a structure whose only purpose is answering a question the index answers in one lookup.
@@ -275,6 +284,28 @@ Everything else in this format checks *shape*: that the ranges pack canonically,
 that each shard file is exactly the size those ranges imply, that the roles carry
 the dtypes the IR names. **A correctly sized file full of wrong bytes satisfies all
 of it.** Until the table existed, nothing read a payload byte at all.
+
+### Measuring bandwidth
+
+`ExpertStore::measure_bandwidth()` reads at this model's expert size in random order,
+attempting to bypass the local OS page cache. It reports the method used:
+
+| method | how | what the number means |
+|---|---|---|
+| `unbuffered` | `O_DIRECT` / `FILE_FLAG_NO_BUFFERING` on the probe's own handles | local page cache bypassed; device/server caches may remain |
+| `cache-eviction-advised` | writes flushed, eviction advised for each padded range | cache bypass is not guaranteed |
+| `buffered` | neither was available | **an upper bound; may be page-cache speed** |
+
+The probe can do what the serving path cannot because it owns both ends: its own handles, its own
+4 KB-aligned buffer, and a read length rounded up into the inter-expert padding — safe because every
+shard is itself padded to the boundary and `validate_ranges()` has already required the file to be
+exactly that size.
+
+This matters when supplying the measured rate as `HostBudget::disk_bandwidth` for a verdict.
+The planner currently uses a default or caller-supplied rate, not an automatic probe. Measured warm,
+the fixture container reports **5793 MB/s**; measured unbuffered on the same file on the same host, **26
+MB/s**. A verdict built on the first number says streaming is affordable on a host where it is not.
+`SOMA_PROBE_NO_DIRECT=1` forces the fallback path, so the two can be compared on real hardware.
 
 `expert_bytes` is uniform for any single model and quantization, so the index is strictly redundant
 today. It is written anyway: variable-length experts are plausible (mixed per-expert precision, pruned

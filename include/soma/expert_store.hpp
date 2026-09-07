@@ -7,7 +7,8 @@
 //
 //   * one expert = one contiguous byte range, gate/up/down interleaved so a
 //     single read fetches the whole SwiGLU triple
-//   * 4 KB-aligned offsets, for O_DIRECT
+//   * 4 KB-aligned offsets, so no expert range shares a page with its neighbour
+//     and an unbuffered read of one is legal
 //   * a sidecar expert_id -> (shard, offset, len) index, so a cache miss never
 //     parses a safetensors header
 //   * fused 3D expert tensors pre-transposed
@@ -217,6 +218,34 @@ Status stamp_container(const std::string& model_dir,
                        const std::string& index_file = "soma.container",
                        StampReport* report = nullptr);
 
+/// How measure_bandwidth() got its number.
+///
+/// Reported rather than assumed, because the three differ by more than a
+/// constant. A buffered re-read of a file the converter has just written measures
+/// memcpy from the page cache — often 10x the drive — and a verdict derived from
+/// that number says `stream` is cheap on a host where it is not. The probe cannot
+/// always avoid it, so it says which one it got.
+enum class BandwidthMethod : std::uint8_t {
+    /// O_DIRECT / FILE_FLAG_NO_BUFFERING. Bypasses the local OS page cache;
+    /// device and remote-server caches can still affect the measurement.
+    Unbuffered,
+    /// Buffered, after flushing writes and advising eviction for every range.
+    /// Advice success does not prove eviction; this remains an estimate.
+    CacheEvicted,
+    /// Neither was available. TREAT THIS NUMBER AS AN UPPER BOUND: it may be
+    /// page-cache speed, and on a freshly converted container it usually is.
+    Buffered,
+};
+
+const char* to_string(BandwidthMethod method) noexcept;
+
+struct BandwidthReport {
+    std::uint64_t bytes_per_second = 0;
+    BandwidthMethod method = BandwidthMethod::Buffered;
+    std::uint64_t bytes_moved = 0;
+    std::uint32_t samples = 0;
+};
+
 /// What a full payload check found.
 struct PayloadReport {
     std::uint64_t experts_checked = 0;
@@ -311,7 +340,16 @@ public:
     /// number. A 2.4 MB read and an 88 MB read do not achieve the same bandwidth
     /// on the same drive, and using one headline figure is how a verdict ends up
     /// confidently wrong.
-    Status measure_bandwidth(std::uint64_t& bytes_per_second);
+    ///
+    /// Reads COLD wherever the platform allows it. The probe opens its own
+    /// unbuffered handles and reads into its own aligned buffer, so it can do what
+    /// the ordinary read path cannot: `read()` writes into a destination the
+    /// memory tier owns, which is neither aligned nor padded, while the probe owns
+    /// both ends. Where an unbuffered open is refused, each range is advised out
+    /// of the page cache first. `report` says which happened, and a caller
+    /// deriving a verdict from this number should look at it — a buffered figure
+    /// on a freshly converted container is memcpy speed, not disk speed.
+    Status measure_bandwidth(std::uint64_t& bytes_per_second, BandwidthReport* report = nullptr);
 
     std::uint64_t bytes_read() const noexcept;
 

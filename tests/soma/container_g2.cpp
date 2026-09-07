@@ -208,7 +208,8 @@ int check_container(const fs::path& fixture, const fs::path& container) {
     }
 
     std::uint64_t bw = 0;
-    const auto bw_st = store.measure_bandwidth(bw);
+    soma::BandwidthReport bw_report;
+    const auto bw_st = store.measure_bandwidth(bw, &bw_report);
 
     std::cout << "   " << h.n_layers << "L x " << h.n_experts << "E, expert=" << h.expert_bytes
               << " B (gate/up q4_g + down q6_g), " << h.n_shards << " shard(s)\n"
@@ -217,7 +218,8 @@ int check_container(const fs::path& fixture, const fs::path& container) {
     if (bw_st.ok()) {
         std::cout << "   random-read bandwidth at " << (h.expert_bytes / 1024)
                   << " KiB reads: " << std::fixed << std::setprecision(0)
-                  << (static_cast<double>(bw) / 1e6) << " MB/s\n";
+                  << (static_cast<double>(bw) / 1e6) << " MB/s ("
+                  << soma::to_string(bw_report.method) << ")\n";
     }
     (void)d;
     (void)fi;

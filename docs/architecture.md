@@ -268,7 +268,9 @@ Streaming imposes hard requirements on the on-disk container, all satisfied at a
 
 - **One expert = one contiguous byte range.** Gate/up/down interleaved so a single read fetches the
   whole SwiGLU triple.
-- **4 KB-aligned offsets** for `O_DIRECT`.
+- **4 KB-aligned offsets**, so no expert shares a page with its neighbour and an unbuffered read of
+  one is legal. Serving reads are buffered — the page cache is a deliberate free L2 — and only the
+  bandwidth probe reads unbuffered, because only it owns an aligned destination.
 - **Sidecar index** `expert_id → (shard, offset, len)`, so a cache miss never parses a safetensors
   header.
 - **Pre-transposed** fused 3D expert tensors.
