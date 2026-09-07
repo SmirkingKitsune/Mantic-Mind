@@ -151,6 +151,58 @@ DENSE_SUFFIXES = (
     # against `mlp.shared_expert.*`. One row, and it decides how much of the
     # whole shared branch reaches the residual stream.
     "mlp.shared_expert_gate.weight",
+    # ── the router bias, under the OTHER block name ──
+    #
+    # `mlp.gate.e_score_correction_bias` is listed above; Kimi spells the same
+    # role under `block_sparse_moe`, which is where its gate lives natively
+    # rather than only in a production dialect. `gqa.cpp` binds it by
+    # `naming.moe_block + ".gate.e_score_correction_bias"`, so both spellings are
+    # real and both have to be claimed here.
+    "block_sparse_moe.gate.e_score_correction_bias",
+    # ── Kimi Delta Attention ──
+    #
+    # A SECOND linear-attention family, and it does NOT reuse the `linear_attn.*`
+    # names above. Qwen3.5's GDN hangs off `linear_attn` with fused `in_proj_*`;
+    # Kimi's KDA hangs off `self_attn` with separate q/k/v projections, a
+    # per-projection short convolution, and a low-rank forget gate (`f_a`/`f_b`).
+    # Same idea, different module, different spellings — and the whole reason
+    # `soma/arch/kda.cpp` exists separately from `gdn.cpp`.
+    #
+    # `A_log` and `dt_bias` are bare nn.Parameters and carry no `.weight`, the
+    # same trap `linear_attn.A_log` documents above.
+    "self_attn.q_conv1d.weight", "self_attn.k_conv1d.weight",
+    "self_attn.v_conv1d.weight",
+    # Genuinely optional siblings: ShortConvolution builds with or without a
+    # bias, and kda.cpp binds these `optional=true`. Listed so a checkpoint that
+    # HAS them is not refused for carrying a tensor the engine would have used.
+    "self_attn.q_conv1d.bias", "self_attn.k_conv1d.bias",
+    "self_attn.v_conv1d.bias",
+    "self_attn.f_a_proj.weight", "self_attn.f_b_proj.weight",
+    "self_attn.b_proj.weight", "self_attn.A_log", "self_attn.dt_bias",
+    "self_attn.o_norm.weight",
+    # The output gate's rank is architecture, not a fallback: a full-rank
+    # checkpoint has `g_proj` and no `g_a`/`g_b`, a low-rank one the reverse.
+    # Both listed because an absent suffix costs nothing, and refusing the one
+    # the checkpoint happens to use would be the whole model.
+    "self_attn.g_proj.weight",
+    "self_attn.g_a_proj.weight", "self_attn.g_b_proj.weight",
+    # ── latent MoE ──
+    #
+    # Kimi routes experts in a COMPRESSED space: the routed contribution is
+    # projected down, summed over experts, then projected back up, with an
+    # optional norm between. `f32_model.cpp` refuses a layer that declares a
+    # latent MoE and has no down/up pair, so these are not decoration.
+    "block_sparse_moe.routed_expert_down_proj.weight",
+    "block_sparse_moe.routed_expert_up_proj.weight",
+    "block_sparse_moe.routed_expert_norm.weight",
+    # ── block residual gating ──
+    #
+    # A learned per-block residual scale, active when `attn_res_block_size != 0`.
+    # `_proj` is one row against d_model — small, resident, and read every token.
+    # Dropping these does not fail to load; it silently removes the gate, which
+    # is the failure mode this whole completeness check exists for.
+    "self_attention_res_norm.weight", "self_attention_res_proj.weight",
+    "mlp_res_norm.weight", "mlp_res_proj.weight",
 )
 
 # Named exclusions, so "unclaimed" below means genuinely unaccounted for.
@@ -162,7 +214,13 @@ DENSE_SUFFIXES = (
 # fourth architecture's weights vanished without a word.
 # Non-layer tensors, named once so the completeness check and the copy loop
 # below cannot disagree about what counts as claimed.
-TOP_LEVEL_TENSORS = ("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight")
+TOP_LEVEL_TENSORS = ("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
+                     # The residual gate's OUTPUT half, which lives beside
+                     # `model.norm` rather than inside a layer — bound by
+                     # kda.cpp against the model, not the layer. Absent from
+                     # every other family, and costing nothing when absent.
+                     "model.output_attn_res_norm.weight",
+                     "model.output_attn_res_proj.weight")
 
 IGNORED_PATTERNS = (
     ".experts.",              # routed experts: written to the expert payload
@@ -233,7 +291,143 @@ SOURCE_DIALECTS = {
         # Mixtral's expert spelling, on a model that is not Mixtral.
         "experts": {"gate": "w1.weight", "up": "w3.weight", "down": "w2.weight"},
     },
+    # Kimi-K3: the SAME language model the fixture carries, under a wrapper.
+    #
+    # `KimiK3ForConditionalGeneration.__init__` builds exactly three submodules —
+    # `vision_tower` (MoonViT3d), `mm_projector`, and `language_model`, which is
+    # a `KimiLinearForCausalLM`. That last one is `tests/fixtures/tiny/
+    # Kimi-Linear-Tiny` verbatim, so unlike MiniMax-M3 there is NOTHING to rename
+    # below the prefix: the production shards spell `block_sparse_moe.experts.
+    # <i>.w1.weight` and so does the fixture. An empty `suffixes` is the finding,
+    # not an omission — this wrapper differs from its text model by a prefix and
+    # a vision tower, and nothing else.
+    #
+    # AND `moe_block` IS DELIBERATELY ABSENT, which is the subtle half.
+    #
+    # The key does not mean "this checkpoint's MoE block is called X". In
+    # `to_soma_name` it means "rewrite X.* to mlp.*" — it exists because
+    # MiniMax-M3 says `block_sparse_moe` where Soma binds `mlp`. Kimi binds
+    # `block_sparse_moe` itself, so declaring it here would rename every expert
+    # to a name the loader does not bind. Written out because the first attempt
+    # at this entry did exactly that, and the round trip caught it:
+    # `block_sparse_moe.experts.5.w1.weight` came back as `mlp.experts.5...`.
+    #
+    # The block names the COPY LOOP needs come from FAMILY_NAMING instead, keyed
+    # on `kimi_k3` and `kimi_linear` alike, so the wrapped and unwrapped
+    # checkpoints read one table rather than two that must agree.
+    "kimi_k3": {
+        "prefix": "language_model.",
+        "suffixes": {},
+        # The half Soma does not serve, by module prefix rather than a wildcard,
+        # so a tower that grows a new module kind lands in `unclaimed` and
+        # refuses instead of disappearing. These are the two names __init__
+        # creates beside `language_model`; `quantization_config.ignore` in the
+        # production config names the same two.
+        "drop": ("vision_tower.", "mm_projector."),
+    },
 }
+
+# ── blockwise fp8 source checkpoints ─────────────────────────────────────────
+#
+# DeepSeek-V3 introduced the layout and it is now what a frontier MoE ships
+# FIRST: every large Linear weight stored as `F8_E4M3` beside a
+# `<tensor>_scale_inv` holding one f32 multiplier per `weight_block_size` tile,
+# with the small tensors — norms, routers, embeddings, lm_head — published
+# unquantized and named in `modules_to_not_convert`.
+#
+# GLM-5.3 is the case that forced this. It is the SAME base model as GLM-5.2 —
+# byte-identical `config.json` but for `transformers_version` — so the engine,
+# the IR and the tokenizer needed nothing at all. What it changed is the upload:
+# GLM-5.2's primary is bf16, GLM-5.3's primary is fp8 at 756 GB with the bf16
+# twin in a separate 1.5 TB repo. Refusing the primary meant "Soma supports
+# GLM-5.3" quietly meant "fetch it twice and keep the larger copy".
+#
+# This is NOT the general "re-quantize whatever is already packed", which the
+# refusal in main() still stops. Blockwise fp8 dequantizes EXACTLY — one
+# multiply per tile, no unpacking, no codebook, no shape inference — so what
+# reaches `quantize_rows` is the same fp32 matrix the bf16 upload would have
+# produced, less the fp8 rounding the publisher had already applied. AWQ, GPTQ
+# and compressed-tensors pack sub-byte levels in layouts of their own, and
+# quantizing their packed bytes yields a container that loads, streams and
+# generates noise.
+FP8_SCALE_SUFFIX = "_scale_inv"
+
+# `torch.float8_e4m3fn` is the dtype safetensors reports as `F8_E4M3`; the `fnuz`
+# variant is the same width with a different exponent bias and is what ROCm-side
+# uploads carry. Named here rather than tested inline so that adding a third
+# spelling is one edit, not a grep.
+FP8_DTYPE_NAMES = ("float8_e4m3fn", "float8_e4m3fnuz")
+
+
+def source_fp8_block(cfg: dict) -> tuple[tuple[int, int] | None, str | None]:
+    """The blockwise-fp8 tile shape of this checkpoint, or why it is refused.
+
+    Returns `(None, None)` for an ordinary bf16/f32 upload, `((bx, by), None)`
+    for one this converter dequantizes, and `(None, reason)` for a packed format
+    it must refuse. Never raises: the caller owns the refusal text.
+    """
+    quant = cfg.get("quantization_config")
+    if not isinstance(quant, dict):
+        return None, None
+    method = str(quant.get("quant_method", "?"))
+    # `fmt` is the spelling DeepSeek and GLM upload; `format` is
+    # compressed-tensors'. Reading only `format` printed "format ?" about a
+    # checkpoint that states `e4m3` plainly, which is the least useful half of a
+    # refusal message.
+    fmt = str(quant.get("fmt") or quant.get("format") or "?")
+    if method != "fp8" or fmt != "e4m3":
+        return None, f"{method}, format {fmt}"
+
+    block = quant.get("weight_block_size")
+    if not (isinstance(block, list) and len(block) == 2
+            and all(isinstance(b, int) and b > 0 for b in block)):
+        return None, (f"fp8/e4m3 with weight_block_size {block!r} — per-tensor "
+                      f"and per-channel fp8 scales are a different layout, and "
+                      f"guessing between them mis-scales every weight")
+    # ue8m0 scales are DeepSeek-V4's, and V4 has its own converter. The generic
+    # path has never been handed one, so it says so rather than assuming the
+    # exponent bias and being wrong by a power of two per tile.
+    scale_fmt = quant.get("scale_fmt")
+    if scale_fmt not in (None, "f32", "float32", "e4m3"):
+        return None, f"fp8/e4m3 with scale_fmt {scale_fmt!r}"
+    return (int(block[0]), int(block[1])), None
+
+
+def dequantize_fp8_block(w, s, block: tuple[int, int], name: str):
+    """Blockwise fp8 -> f32: one scale per `block` tile of the last two axes.
+
+    `weight_scale_inv` is the MULTIPLIER — the inverse of the divisor that pushed
+    the weight into e4m3 range — so this multiplies. Getting that backwards
+    produces a container whose every weight is off by a per-tile factor near 400,
+    and it loads, streams and answers nonsense.
+
+    The tile grid is CEILED rather than exact: a row or column count that is not
+    a multiple of the tile is covered by one more scale, so the expanded grid is
+    CROPPED to the weight rather than reshaped to it. Reshaping would silently
+    succeed on the common case where everything divides evenly and raise on the
+    one checkpoint that does not.
+
+    Leading axes are carried through untouched, which is what makes a FUSED
+    expert stack — `(experts, 2*intermediate, hidden)` — work without a second
+    code path.
+    """
+    import numpy as np
+
+    if w.ndim < 2:
+        raise SystemExit(
+            f"  REFUSED  {name} is fp8 with a blockwise scale, but it is "
+            f"{w.ndim}-D; the layout is defined on the last two axes")
+    bx, by = block
+    rows, cols = w.shape[-2], w.shape[-1]
+    want = w.shape[:-2] + (-(-rows // bx), -(-cols // by))
+    s = np.asarray(s, dtype=np.float32)
+    if s.shape != want:
+        raise SystemExit(
+            f"  REFUSED  fp8 scale for {name} is {s.shape}, expected {want} for "
+            f"a {'x'.join(str(d) for d in w.shape)} weight in {bx}x{by} tiles")
+    s = np.repeat(np.repeat(s, bx, axis=-2), by, axis=-1)
+    return w * s[..., :rows, :cols]
+
 
 _LAYER_RE = re.compile(r"^(model\.layers\.\d+\.)(.*)$")
 
@@ -614,21 +808,27 @@ def main(argv: list[str]) -> int:
         print("           the architecture verdict before converting.")
         return 3
 
-    # compressed-tensors ships weights already packed at 4 bits with their own
-    # scale layout. Every reader below assumes bf16/f32 source tensors and would
-    # quantize the PACKED BYTES as if they were weights — producing a container
-    # that loads, streams, and generates noise.
-    quant_cfg = cfg.get("quantization_config")
-    if isinstance(quant_cfg, dict):
-        method = quant_cfg.get("quant_method", "?")
-        fmt = quant_cfg.get("format", "?")
+    # compressed-tensors, AWQ and GPTQ ship weights already packed at 4 bits with
+    # their own scale layout. Every reader below assumes f32-widenable source
+    # tensors and would quantize the PACKED BYTES as if they were weights —
+    # producing a container that loads, streams, and generates noise.
+    #
+    # Blockwise fp8 is the one exception, and it is an exception on the merits
+    # rather than as a convenience — see FP8_SCALE_SUFFIX above.
+    fp8_block, quant_refusal = source_fp8_block(cfg)
+    if quant_refusal is not None:
         print(f"  REFUSED  {src.name}: checkpoint is already quantized "
-              f"({method}, format {fmt}).")
-        print("           convert.py quantizes FROM bf16/f32; re-quantizing "
-              "packed bytes yields a")
-        print("           container that loads and generates noise. Convert "
-              "from an unquantized upload.")
+              f"({quant_refusal}).")
+        print("           convert.py quantizes FROM f32, bf16, or blockwise fp8; "
+              "re-quantizing")
+        print("           packed bytes yields a container that loads and "
+              "generates noise. Convert")
+        print("           from an unquantized upload.")
         return 3
+    if fp8_block is not None:
+        print(f"  fp8 source: {src.name} is blockwise fp8, "
+              f"{fp8_block[0]}x{fp8_block[1]} tiles; every fp8 tensor "
+              f"dequantizes to f32 on read.")
 
     n_layers = int(cfg.get("num_hidden_layers", 0))
     if args.layers:
@@ -646,23 +846,41 @@ def main(argv: list[str]) -> int:
     # SOURCE spellings, which is what `get()` is asked for. `to_soma_name`
     # rewrites them on the way into the container.
     src_prefix = dialect.get("prefix", "")
-    moe_block = dialect.get(
-        "moe_block", "block_sparse_moe" if model_type == "mixtral" else "mlp")
-    # SINGULAR for the Qwen families, plural everywhere else. Mirrors
-    # `TensorNaming::shared_block` in src/soma/arch_ir.cpp — one character, and
-    # getting it wrong drops the shared expert from the container without a word
-    # because the copy loop simply finds no tensor of that name.
+    # Families whose MoE block is not `mlp` and/or whose experts are not
+    # gate/up/down. ONE table rather than three parallel `model_type ==` tests,
+    # because those have to agree with each other and nothing made them: Kimi
+    # needs the Mixtral block name AND the Mixtral expert spelling AND the
+    # default shared-expert spelling, and a checkpoint that got two of the three
+    # converts into a container missing its experts.
+    #
+    # Mirrors `TensorNaming` in src/soma/arch_ir.cpp, which is the authority —
+    # `kimi_naming()` and `qwen3_5_naming()` there are these same rows.
+    MIXTRAL_EXPERTS = {"gate": "w1.weight", "up": "w3.weight", "down": "w2.weight"}
+    FAMILY_NAMING = {
+        "mixtral": {"moe_block": "block_sparse_moe", "experts": MIXTRAL_EXPERTS},
+        # Kimi uses BOTH conventions in one layer: routed experts spelled
+        # Mixtral's way under `block_sparse_moe`, while the dense and shared
+        # blocks stay gate/up/down. That is not an inconsistency to normalise —
+        # it is what the checkpoint contains, and arch_ir.cpp carries the blocks
+        # separately for exactly this reason.
+        "kimi_linear": {"moe_block": "block_sparse_moe", "experts": MIXTRAL_EXPERTS},
+        "kimi_k3": {"moe_block": "block_sparse_moe", "experts": MIXTRAL_EXPERTS},
+        # SINGULAR shared expert. One character against the plural default, and
+        # getting it wrong drops the shared expert from the container without a
+        # word, because the copy loop simply finds no tensor of that name.
+        "qwen3_5_moe_text": {"shared_block": "mlp.shared_expert"},
+        "qwen3_5_moe": {"shared_block": "mlp.shared_expert"},
+        "qwen2_moe": {"shared_block": "mlp.shared_expert"},
+    }
+    family = FAMILY_NAMING.get(model_type or "", {})
+
+    moe_block = dialect.get("moe_block", family.get("moe_block", "mlp"))
     shared_block = dialect.get(
-        "shared_block",
-        "mlp.shared_expert"
-        if model_type in ("qwen3_5_moe_text", "qwen3_5_moe", "qwen2_moe")
-        else f"{moe_block}.shared_experts")
+        "shared_block", family.get("shared_block", f"{moe_block}.shared_experts"))
     names = dialect.get(
         "experts",
-        {"gate": "w1.weight", "up": "w3.weight", "down": "w2.weight"}
-        if model_type == "mixtral"
-        else {"gate": "gate_proj.weight", "up": "up_proj.weight",
-              "down": "down_proj.weight"})
+        family.get("experts", {"gate": "gate_proj.weight", "up": "up_proj.weight",
+                               "down": "down_proj.weight"}))
 
     dt_gate = args.quant
     dt_up = args.quant
@@ -760,7 +978,32 @@ def main(argv: list[str]) -> int:
         # and lm_head (1.2 GB each) were correct while every per-layer tensor was
         # all zeros. The engine then emitted a uniform distribution — KL 11.93
         # nats against a reference, which is ln(151936) to five figures.
-        return handle_for(path).get_tensor(name).to(torch.float32).numpy().copy()
+        raw = handle_for(path).get_tensor(name)
+        is_fp8 = str(raw.dtype).rsplit(".", 1)[-1] in FP8_DTYPE_NAMES
+        w = raw.to(torch.float32).numpy().copy()
+        if not is_fp8:
+            # Includes every tensor an fp8 upload publishes unquantized — the
+            # norms, the router, embed_tokens, lm_head. Driven by the tensor's
+            # own DTYPE rather than by matching `modules_to_not_convert` by name:
+            # the file already states which tensors are fp8, and a second copy of
+            # that fact is a second thing that can be stale.
+            return w
+        scale_path = owner.get(name + FP8_SCALE_SUFFIX)
+        if scale_path is None:
+            # Loud, because the quiet version of this is the failure this
+            # codebase keeps paying for: an fp8 weight read without its scale is
+            # a real matrix roughly 400x too small, and it converts, loads,
+            # streams and answers nonsense.
+            raise SystemExit(
+                f"  REFUSED  {name} is stored as fp8 and no "
+                f"{name + FP8_SCALE_SUFFIX} accompanies it. Reading it unscaled "
+                f"would produce a container that loads and is wrong.")
+        # .copy() for the same reason as above — an already-f32 scale makes
+        # .to(float32) a no-op and .numpy() a view into mmapped storage that the
+        # handle cache is free to close.
+        s = handle_for(scale_path).get_tensor(
+            name + FP8_SCALE_SUFFIX).to(torch.float32).numpy().copy()
+        return dequantize_fp8_block(w, s, fp8_block, name)
 
     # ── experts ──────────────────────────────────────────────────────────────
     index: list[tuple[int, int, int]] = []
@@ -822,6 +1065,14 @@ def main(argv: list[str]) -> int:
     def is_ignored(name: str) -> bool:
         if any(p in name for p in IGNORED_PATTERNS):
             return True
+        # A blockwise-fp8 scale is not a tensor this converter DROPS — it is
+        # consumed, by dequantizing the weight it belongs to. So it is claimed
+        # exactly when that weight is, which is stricter than an IGNORED_PATTERNS
+        # entry would be: a scale whose weight is unaccounted for still refuses,
+        # rather than vanishing alongside the tensor it was supposed to scale.
+        if fp8_block is not None and name.endswith(FP8_SCALE_SUFFIX):
+            weight = name[: -len(FP8_SCALE_SUFFIX)]
+            return weight in claimed_set or is_ignored(weight)
         # The vision half of a multimodal wrapper, by module prefix.
         if any(name.startswith(d) for d in dialect.get("drop", ())):
             return True
@@ -1041,6 +1292,14 @@ def main(argv: list[str]) -> int:
         "effective_groups_by_role": role_groups,
         "dense_tensors": len(dense),
         "align": ALIGN,
+        # What the SOURCE was, not what this container is. A q4_g container built
+        # from a bf16 upload and one built from that upload's fp8 twin are not
+        # the same artifact — only the first can be compared against bf16 weights
+        # at all — and nothing downstream could tell them apart, because the
+        # container records the codec it WROTE and never the one it read.
+        "source_quantization": (
+            f"fp8-e4m3-block-{fp8_block[0]}x{fp8_block[1]}"
+            if fp8_block is not None else "none"),
         # Whether this container can be served as TEXT. Recorded rather than left
         # to be inferred from which files happen to exist, so a consumer can tell
         # "no tokenizer was possible for this family" from "someone deleted one".

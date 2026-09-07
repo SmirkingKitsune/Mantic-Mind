@@ -41,8 +41,19 @@ import sys
 import unicodedata
 from pathlib import Path
 
-FORMAT_VERSION = 1
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import chat_template  # noqa: E402
+
+# 2 adds the compiled chat template. The engine accepts 1 as well: a v1 file
+# simply carries no template, which is a real state (a family whose template this
+# compiler refuses, or a fixture compiled before templates existed) rather than a
+# defect. Bumping instead of appending-and-hoping means a truncated file is still
+# a truncated file.
+FORMAT_VERSION = 2
+ORACLE_FORMAT_VERSION = 1
 MAGIC = b"SOMATOK\0"
+CHAT_ORACLE_MAGIC = b"SOMACHAT"
 
 FLAG_NFC = 1 << 0
 FLAG_BYTE_FALLBACK = 1 << 1
@@ -414,6 +425,58 @@ def w_bytes(fh, b: bytes) -> None:
     fh.write(b)
 
 
+def w_ids(fh, ids) -> None:
+    w_u32(fh, len(ids))
+    for i in ids:
+        w_u32(fh, i)
+
+
+def write_chat_section(fh, sc, encode) -> None:
+    """The compiled template, in the layout src/soma/tokenizer.cpp reads back."""
+    w_u32(fh, sc.flags)
+    w_ids(fh, encode(sc.bos))
+    w_u32(fh, len(sc.prologues))
+    for (effort, thinking), text in sorted(sc.prologues.items()):
+        w_bytes(fh, effort.encode("utf-8"))
+        w_u32(fh, 1 if thinking else 0)
+        w_ids(fh, encode(text))
+    for idx in range(len(chat_template.ROLES)):
+        w_ids(fh, encode(sc.run_prefix[idx]))
+        w_ids(fh, encode(sc.prefix[idx]))
+        w_ids(fh, encode(sc.suffix[idx]))
+        w_ids(fh, encode(sc.run_suffix[idx]))
+    w_ids(fh, encode(sc.assistant_prefix_thinking))
+    w_ids(fh, encode(sc.thinking_close))
+    w_ids(fh, encode(sc.generation_prompt))
+    w_ids(fh, encode(sc.generation_prompt_nothink))
+
+
+def compile_chat(src: Path, encode):
+    """`(status, reason, oracle_cases, scaffold)` for this checkpoint's template.
+
+    Never raises. A template this compiler cannot express is a REFUSAL with a
+    reason, not a failed conversion — the same call `compile_tokenizer.py` makes
+    about a pretokenizer it does not recognize, and for the same reason: a
+    container without a compiled template still serves, visibly worse, while one
+    with an approximated template serves wrongly and looks fine.
+    """
+    try:
+        text = chat_template.load_template(src)
+    except chat_template.Unsupported as e:
+        return "unsupported", str(e), [], None
+    if text is None:
+        return "absent", None, [], None
+    try:
+        render = chat_template.make_renderer(text)
+        scaffold = chat_template.extract(render)
+        cases = chat_template.verify(scaffold, render, encode)
+    except chat_template.Unsupported as e:
+        return "unsupported", str(e), [], None
+    except Exception as e:  # a template that will not render at all
+        return "unsupported", f"{type(e).__name__}: {e}", [], None
+    return "compiled", None, cases, scaffold
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -557,6 +620,55 @@ def main(argv: list[str]) -> int:
     from tokenizers import Tokenizer
     hf = Tokenizer.from_file(str(tj_path))
 
+    def encode(text: str) -> list[int]:
+        return hf.encode(text, add_special_tokens=False).ids if text else []
+
+    # ── the chat template, compiled or refused ───────────────────────────────
+    #
+    # Appended to tokenizer.soma rather than written beside it, because a
+    # template is only meaningful against the tokenizer that resolved it to ids:
+    # two files could be paired wrongly and the symptom would be a served model
+    # whose prompt framing is one vocabulary out.
+    #
+    # A refusal is NON-FATAL for the same reason a missing tokenizer is: the
+    # container still serves, `soma serve` falls back to flattening messages, and
+    # the reason is on disk. Refusing the whole conversion over it would be
+    # disproportionate to a gap the container can be used without.
+    chat_status, chat_reason, chat_cases, scaffold = compile_chat(src, encode)
+    chat_unsupported = out_dir / "chat_template.unsupported"
+    chat_unsupported.unlink(missing_ok=True)
+    if chat_reason:
+        chat_unsupported.write_text(chat_reason + "\n", encoding="utf-8")
+
+    with open(tok_path, "ab") as fh:
+        w_u32(fh, 1 if scaffold is not None else 0)
+        if scaffold is not None:
+            write_chat_section(fh, scaffold, encode)
+
+    if chat_cases:
+        with open(out_dir / "chat_oracle.bin", "wb") as fh:
+            fh.write(CHAT_ORACLE_MAGIC)
+            w_u32(fh, ORACLE_FORMAT_VERSION)
+            w_u32(fh, len(chat_cases))
+            for case in chat_cases:
+                w_u32(fh, len(case["messages"]))
+                for m in case["messages"]:
+                    w_u32(fh, chat_template.ROLES.index(m["role"]))
+                    w_bytes(fh, m["content"].encode("utf-8"))
+                w_u32(fh, 1 if case.get("add_generation_prompt") else 0)
+                w_u32(fh, 1 if case.get("enable_thinking", True) else 0)
+                # Tri-state: the caller may not have expressed a preference, and
+                # "unset" is a different request from "false" whenever the
+                # template's own default is true.
+                requested = case.get("clear_thinking")
+                w_u32(fh, 0 if requested is None else (2 if requested else 1))
+                w_bytes(fh, (case.get("reasoning_effort") or "").encode("utf-8"))
+                w_u32(fh, len(case["ids"]))
+                for i in case["ids"]:
+                    w_u32(fh, i)
+    else:
+        (out_dir / "chat_oracle.bin").unlink(missing_ok=True)
+
     texts = corpus([a["content"] for a in added])
 
     # NFC normalization is not implemented in the engine (C++ has no Unicode
@@ -584,7 +696,7 @@ def main(argv: list[str]) -> int:
     oracle_path = out_dir / "tokenizer_oracle.bin"
     with open(oracle_path, "wb") as fh:
         fh.write(b"SOMATORC")
-        w_u32(fh, FORMAT_VERSION)
+        w_u32(fh, ORACLE_FORMAT_VERSION)
         w_u32(fh, len(texts))
         for text, ids in zip(texts, encoded):
             w_bytes(fh, text.encode("utf-8"))
@@ -605,6 +717,13 @@ def main(argv: list[str]) -> int:
         "nfc_implemented_in_engine": False,
         "nfc_unstable_dropped": len(nfc_unstable),
         "total_oracle_tokens": sum(len(e) for e in encoded),
+        # `absent` (the checkpoint ships none), `compiled`, or `unsupported`
+        # with the reason in chat_template.unsupported. Recorded rather than
+        # inferred from which files exist, so "this family's template is not
+        # expressible" reads differently from "someone deleted one".
+        "chat_template": chat_status,
+        "chat_template_flags": scaffold.flags if scaffold is not None else 0,
+        "chat_oracle_cases": len(chat_cases),
     }
     (out_dir / "tokenizer_meta.json").write_text(
         json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -612,7 +731,9 @@ def main(argv: list[str]) -> int:
     print(f"  OK       {src.name:<32} program={program_name:<5} vocab={n_vocab} "
           f"merges={len(merges)} classes={len(pool.classes)} "
           f"corpus={len(texts)} tokens={meta['total_oracle_tokens']} "
-          f"({tok_path.stat().st_size/1e6:.1f} MB)")
+          f"chat={chat_status} ({tok_path.stat().st_size/1e6:.1f} MB)")
+    if chat_reason:
+        print(f"           chat template NOT compiled: {chat_reason[:160]}")
     return 0
 
 

@@ -33,7 +33,8 @@ A snapshot, not a definition — the gate table above says what each gate MEANS,
 happened. Kept short on purpose: a long status section is one that stops being updated.
 
 **Four attention families go through the seam:** GQA (Qwen3-MoE, Mixtral, OLMoE), MLA
-(DeepSeek-V2-Lite, Moonlight), MLA+DSA (GLM-5.2), and compressed+sparse (DeepSeek V4). Both fp32 entry
+(DeepSeek-V2-Lite, Moonlight), MLA+DSA (GLM-5.2, and GLM-5.3 on the same weights), and
+compressed+sparse (DeepSeek V4). Both fp32 entry
 points are implemented for all four — teacher-forced and cached decode — and the cached path is
 asserted equal to the teacher-forced one across each fixture's cache boundaries.
 
@@ -4301,6 +4302,217 @@ produce a subtly different model — it produces a 7.8e-01 one.
 
 ---
 
+## GLM-5.3: the model that needed no engine work, and one converter change
+
+`zai-org/GLM-5.3` shipped as a post-training refresh of GLM-5.2, and its release notes say so in one
+line: *the same base model*. That claim is checkable rather than trusted, and it checks out: GLM-5.2's
+`config.json` and `zai-org/GLM-5.3-BF16`'s are both 3,732 bytes and differ in one field,
+`transformers_version` (5.12.0 → 5.15.0). The fp8 upload's adds a `quantization_config` and nothing
+else.
+
+Which means: same `model_type` `glm_moe_dsa`, same 78 layers with the same three dense, same 256 routed experts
+at top-8 with one shared, same `kv_lora_rank` 512 / `q_lora_rank` 2048 / `qk_nope` 192 / `qk_rope` 64 /
+`v_head_dim` 256, same 32x128 indexer at `index_topk` 2048, same 78-entry `indexer_types` map with its
+21 `full` layers, same `vocab_size` 154880, same three EOS ids, and a `tokenizer.json` of identical size
+(20,217,442 bytes) beside an identical `tokenizer_config.json`.
+
+So nothing in `include/soma/`, `src/soma/arch/mla.cpp`, `arch_ir.cpp`, `arch_registry.cpp` or
+`compile_tokenizer.py` moved, and nothing should have. **The seam did its job by being boring**: a
+family is keyed on `model_type`, GLM-5.3 declares the one already registered, and a new fixture would
+have been a second copy of the GLM-5.2 fixture testing the same code against the same numbers. That
+would be coverage in the accounting sense and nothing in the useful one, so `tests/fixtures/tiny/GLM-5.2`
+stands for both and says so.
+
+### What DID change is the upload, and it was refused
+
+GLM-5.2's primary upload is bf16 across 282 shards. GLM-5.3's primary upload is **fp8** across 141
+(756 GB), with the bf16 twin published separately as `zai-org/GLM-5.3-BF16` at ~1.5 TB. `convert.py`
+refused any checkpoint carrying a `quantization_config` at all, so "Soma supports GLM-5.3" would have
+meant "fetch the model twice and keep the larger copy" — on a host whose whole premise is that the
+weights do not fit.
+
+The refusal was right about what it was written for and too wide by one format. compressed-tensors, AWQ
+and GPTQ pack sub-byte levels with their own scale layouts, and quantizing their packed bytes as if the
+bytes were weights produces a container that loads, streams and generates noise; that is still refused,
+and `check_fp8_source.py` asserts it still is. Blockwise fp8 is different **in kind**, not in degree:
+`F8_E4M3` levels beside a `<tensor>_scale_inv` of one f32 multiplier per `weight_block_size` tile
+dequantize exactly, with one multiply and nothing to infer. What reaches `quantize_rows` is the same
+fp32 matrix the bf16 upload would have produced, less the rounding the publisher already applied.
+
+Three decisions in that change are worth keeping:
+
+- **The dtype decides, not the config.** An fp8 upload publishes its norms, routers, embeddings and
+  output head unquantized, and names every one of them: `modules_to_not_convert` runs to hundreds of
+  entries and is seven eighths of GLM-5.3's `config.json`. Matching that list by name would be a second
+  copy of a fact the file already states in every tensor header, so `get()` dequantizes exactly the
+  tensors that ARE fp8 instead. Matching by name is how a norm gets scaled by a tile grid it never had.
+- **A missing scale refuses.** An fp8 weight read without its scale is a real matrix roughly 400x too
+  small: it converts, it loads, it streams, and it answers nonsense. That is this codebase's recurring
+  failure shape, so it is a hard stop naming the tensor rather than a fallback.
+- **The tile grid is ceiled and CROPPED, not reshaped.** A reshape passes on every dimension that
+  divides evenly, which on a real checkpoint is all of them — 6144 and 2048 over 128 — and raises on the
+  first model that does not.
+
+### The check that makes it byte-exact rather than plausible
+
+Nothing in the repository could exercise this: every committed fixture is f32, and the checkpoints that
+would exercise it start at 756 GB. `tools/ci/check_fp8_source.py` (ctest `mm_fp8_source`) manufactures
+the input, and manufactures it in the shape that removes the tolerance. It quantizes the committed
+GLM-5.2 fixture blockwise and keeps **both** halves — the fp8 levels with their scales, and the exact f32
+product of the two — writes them as two checkpoints differing in nothing else, converts both, and
+requires `experts-00000.bin` and `dense.safetensors` to be byte-identical. The f32 side already holds
+exactly what correct dequantization must produce, so any tolerance at all would be hiding something.
+
+The tile shapes are chosen rather than convenient: 16x16 divides the fixture evenly, and 48x16 and 16x48
+each leave a ragged remainder AND are non-square. That last property is not decoration — it was added
+after a mutation run. With square tiles only, expanding the scale grid by `by` rows and `bx` columns is
+indistinguishable from doing it correctly, and the first version of this check passed a deliberately
+axis-swapped `np.repeat`. Four mutations are now caught: divide-instead-of-multiply, swapped tile axes,
+crop-from-the-wrong-end, and skipping the dequantization entirely.
+
+`verify_payload.py` needed the same reader, and that is not housekeeping. It re-quantizes the SOURCE
+expert and demands the container's bytes back exactly, so reading an fp8 source unscaled fails every
+sampled expert on a container that is perfectly correct — measured at `rel_rms 0.9998` against a `q4_g`
+ceiling of 0.30, with the decoy margin collapsed to 1.0002. The obvious reading of that report is a
+payload bug that does not exist.
+
+### The chat template, which is what "behaves right" actually meant
+
+Serving GLM-5.3's weights and serving GLM-5.3 are different achievements, and
+before this only the first was true. `soma serve` flattened OpenAI `messages`
+into `user: hi\nassistant:` for **every** model — `ChatTemplate` and
+`apply_chat_template` were declared in `include/soma/tokenizer.hpp` with no
+definition and no caller anywhere in the tree — so a model trained on
+`[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hi<|assistant|><think>` was
+being handed prose. It answered. It streamed. It read fluently. **That is the
+whole problem**: nothing downstream can catch a wrong prompt framing, because the
+weights are right, the tokenizer round-trips, and the logit-KL is computed
+against whatever prompt was actually built. GLM-5.3's `reasoning_effort` and
+`clear_thinking` — the release's headline controls — were unreachable.
+
+**The template is measured, not interpreted.** GLM-5.3's is 10,465 bytes of Jinja
+macros, namespaces, `break`, and tool-call plumbing. A C++ reimplementation would
+be a second renderer obliged to stay bug-for-bug identical with the first
+forever, and its drift would present as a fluent answer to a differently-framed
+question. So `tools/admission/chat_template.py` runs the REAL renderer at
+admission against probe conversations built from sentinels, reads the scaffolding
+off the text around each sentinel, resolves it to token ids, and leaves the
+engine nothing to do but concatenate.
+
+That is only sound if every seam falls where BPE cannot merge across it — a
+property of the TOKENIZER, not of the template — so it is proven per model rather
+than assumed. `verify()` renders whole conversations, tokenizes each as one
+string, and requires the piecewise assembly to match id for id.
+
+**Six behaviours had to be measured because reading the source would have gotten
+them wrong.** Every one of these was found by the battery, not by reasoning:
+
+| | GLM-5.2 | GLM-5.3 | Qwen3-30B |
+|---|---|---|---|
+| `clear_thinking` default | **drop** prior reasoning | **keep** it | drop |
+| `clear_thinking` settable | yes | yes | no |
+| `enable_thinking` | yes — removes the whole `Reasoning Effort` block | **no such switch** | yes |
+| `reasoning_effort` | `high` only | `low`/`high` | — |
+| assistant content | stripped | stripped | passed through |
+| prior reasoning | re-emitted | re-emitted | **removed** |
+
+The first row is the one that matters most: **GLM-5.2 and GLM-5.3 implement the
+same option with opposite defaults.** A compiler written by reading either
+model's template would have been confidently wrong about the other, and the
+symptom would have been a prompt that silently omits or invents a reasoning
+block. The third row is why the flags are comparisons along one axis at a time:
+an earlier version set `enable_thinking` for GLM-5.3 because *some* prologue
+varied, when it varied by effort — and the engine then accepted
+`enable_thinking: false` and changed nothing, which is precisely the lie the
+refusal exists to prevent.
+
+**Unsupported options refuse rather than being ignored**, which is the entire
+payoff of having measured them. `enable_thinking: false` against GLM-5.3 is a
+422 naming the reason, not a silent success. An *unrecognized* `reasoning_effort`
+is NOT refused — GLM renders `medium` as `Max` rather than erroring, and an
+engine stricter than the model is also wrong. `tools` and assistant `tool_calls`
+are refused: the scaffold covers conversation framing, not tool-call encoding,
+and a model told nothing about the tools it was asked to use answers fluently,
+in prose, about functions it never saw.
+
+**One consequence worth naming: a correctly framed turn can now END.** `stop_token_ids` was set only
+for DeepSeek-V4's prompt codec; every other model ran to `max_tokens`. That was harmless while the
+prompt was a flattened transcript — the model was not given a framing it had been trained to close, so
+stopping on EOS would have changed nothing — and it stops being harmless the moment the framing is
+right. A templated request now stops on the model's own `eos_token_id`, because running past it is the
+model answering its own next question.
+
+**Adding the stage cost a control-side migration, and the coupling is worth knowing about.**
+`conformance.stage` carries a `CHECK (stage IN ...)` allow-list in `control.db` — a second, separate
+list of the stage names `soma conform` emits, kept in step by nothing. `record_conformance` writes the
+whole ladder in ONE transaction, so an unlisted name does not lose its own row: it rolls back every
+row, and the model is admitted with an empty ladder. It presented as "conformance never ran", four
+layers from the stage that had been added. Schema v3 adds the name; `reliability_tests` asserts the
+version exactly, which is what turns a skipped migration into a failure instead of a silence.
+
+**The gate.** `soma_chat_template_g0` grades the engine against the ids HF's own
+Jinja renderer produced for the same conversation — 17/17 on GLM-5.3, 19/19 on
+GLM-5.2 — and separately checks that each refusal fires. `soma conform` gained a
+`chat_template` stage so the artifact under test is *this container's*: a
+conversion pairing a good tokenizer with a mismatched template would pass every
+unit test in the repository and serve a model framed as a different one.
+
+That stage was checked against the mistake it exists for, by handing it GLM-5.3's
+compiled template and GLM-5.2's oracle — a mispairing between two models whose
+tokenizers are interchangeable and whose templates are not:
+
+```
+chat_template  failed  {"cases":19,"matched":14,
+                        "first_failure":"case 3 (3 message(s)): got 32 ids,
+                                         want 28 (first diff at 19: 3820 vs 154842)"}
+```
+
+Case 3 is `user, assistant-with-reasoning, user`, and 154842 is `</think>`. The
+two models disagree at exactly the byte where their `clear_thinking` defaults
+diverge: 5.2 closes an empty thinking block where 5.3 emits the prior turn's
+reasoning. Five of nineteen conversations differ; fourteen are identical. A
+tolerance-based check, or one that sampled a single turn, would have called that
+a pass.
+
+**GLM-5.2's committed tokenizer fixture was regenerated, and that is a separate decision.** It had to
+be, to carry a chat template at all — and a second graded family is most of what makes this mechanism
+believable rather than shaped around one model. Regenerating it also revealed the committed file was
+already STALE against the current compiler: it declared 7 pretokenizer classes where the compiler now
+emits 14, and an NFC-unstable drop count that today's code cannot produce for a tokenizer with no
+normalizer. So the fixture had drifted from the tool that makes it, and nothing was checking. It is
+recorded here rather than folded into the GLM-5.3 work silently, per the rule in CLAUDE.md that
+another model's fixture is not scratch space: `soma_tokenizer_g0` passes GLM-5.2 at 37/37 encode,
+37/37 decode, 37/37 stream on the regenerated file, and `soma_chat_template_g0` grades it 19/19.
+
+**Qwen3 is refused, and the refusal is the mechanism working.** Its framing
+extracts cleanly — the run-prefix/run-suffix split was generalized for it, since
+Qwen closes a run of tool results with `<|im_end|>` where GLM opens one with
+`<|observation|>` — and its non-tool conversations reproduce exactly. But
+`<tool_response>` is ordinary text in Qwen's vocabulary rather than a special
+token, so a tool conversation assembled piecewise comes to 59 ids where the whole
+string comes to 57: a BPE merge reaches across the seam. `verify()` catches that
+and refuses the whole template with the case named, and `serve` keeps today's
+flattening for Qwen3. Compiling per-role rather than all-or-nothing would recover
+its chat path; that is deferred, not done.
+
+### What is NOT claimed
+
+No GLM-5.3 container has been built. The engine work was zero by inspection, the converter work is
+tested to byte-equality on a fixture, and the chat template is graded id-for-id against the model's own
+renderer — but the 756 GB end-to-end run that GLM-5.2 has in the table above (convert, verify, plan,
+conform, serve) has not been done for 5.3, and the fp8 path has never met a real checkpoint.
+`source_quantization` in `container_meta.json` is what will tell those two runs apart afterwards,
+because nothing else in the file records the codec a conversion READ.
+
+The chat template's HTTP wiring is **compiled but not exercised end to end**. `apply_chat_template` is
+graded on real conversations by `soma_chat_template_g0` and by the `chat_template` conformance stage,
+and `/v1/chat/completions` was changed to call it — but no test stands a server up and inspects the
+prompt it built, because that needs a model whose weights and whose 154,880-entry tokenizer belong
+together, and every committed fixture has a 512-token vocabulary. The layer that is unproven is the
+thin one: JSON parsing, role mapping, and turning a refusal into a 422.
+
+---
+
 ## Cross-cutting: CI from day one
 
 Established at G0, extended each gate. Current CI is 3 Release jobs invoking raw `cmake`, one CTest
@@ -4352,6 +4564,8 @@ possible auth fault and was a retry budget written six times with three differen
 
 | # | Defect | Found | Severity |
 |---|---|---|---|
+| ~~D69~~ | **The Kimi family could not be converted at all — not the Kimi-K3 wrapper, and not the unwrapped `kimi_linear` fixture the engine is graded against.** Reported as "add kimi_k3 to SOURCE_DIALECTS", and that entry was necessary but nowhere near sufficient: adding it alone would have moved the refusal from `multimodal wrapper` to `52 source tensor(s) match no known role`. **The gap was on the converter side only.** `arch_ir.cpp` has routed `kimi_k3` and `kimi_linear` to `MlaKda` with a `kimi_naming()` table since the hybrid landed; `kda.cpp` binds the KDA block, the block-residual gates and `model.output_attn_res_*`; `f32_model.cpp` binds the latent-MoE `routed_expert_{down,up}_proj` and refuses a layer that declares one without them; `soma plan` answers, and `tests/fixtures/tiny/Kimi-Linear-Tiny` is a token-exact oracle Soma matches. Every one of those reads a CONTAINER, and `convert.py` could not write one — so the whole family was servable in principle and unadmittable in practice. **Twenty roles added, each cross-checked against the binding that consumes it** rather than transcribed from the checkpoint: Kimi's KDA hangs off `self_attn` with per-projection short convolutions and a low-rank forget gate, where Qwen3.5's GDN hangs off `linear_attn` with fused `in_proj_*` — the same idea, a different module, and the reason `kda.cpp` exists beside `gdn.cpp`. Also the latent-MoE projections, the residual gates, `block_sparse_moe.gate.e_score_correction_bias` (the bias under the OTHER block name), both output-gate ranks, and the optional conv biases. **And a naming table, because three parallel `model_type ==` conditionals had to agree**: Kimi needs the Mixtral block name AND the Mixtral expert spelling AND the default shared-expert spelling, and a checkpoint that got two of three converts into a container missing its experts — which is what the first run did (`no expert tensors at model.layers.1.mlp.experts.*`). `FAMILY_NAMING` now mirrors `TensorNaming` in arch_ir.cpp, keyed for `kimi_k3` and `kimi_linear` alike. **The dialect itself is a prefix and a drop list with an EMPTY suffix map**, because `KimiK3ForConditionalGeneration` builds exactly `vision_tower`, `mm_projector`, and a `language_model` that IS `KimiLinearForCausalLM` — nothing below the prefix is renamed. `moe_block` is deliberately ABSENT from it, and that is the subtle half: the key does not describe a checkpoint, it MEANS "rewrite this block to `mlp`", which is right for MiniMax and renames every Kimi expert to a name the loader does not bind. The first draft declared it; a name round-trip caught it before it reached the fixture. **`check_kimi_dialect.py` (ctest `mm_kimi_dialect`)** rewrites the committed fixture into the wrapper dialect, converts both, and asserts byte-identical expert payloads and name-identical dense halves — plus that both hybrid halves and the latent MoE actually reached the container, since a dialect that dropped one still produces a container that loads. It converts the NATIVE fixture first, because two identical refusals compare equal. **Mutation-verified three ways**: declaring `moe_block`, shortening the `drop` list, and removing one role all fail it. End-to-end, the converted wrapper plans as `attention_family: mla+kda`, `modality: vision+text`, 27 vision layers declared and not served. **Not fixed, and not a defect**: `moonshotai/Kimi-K3` itself is still refused, because it ships `compressed-tensors` mxfp4 and convert.py quantizes from bf16/f32 — re-quantizing packed bytes yields a container that loads and generates noise. An unquantized upload is what this unblocks. | operator report (D68 follow-up) | **High — an architecture the engine fully supports could not be admitted by any route.** |
+| ~~D68~~ | **Every way of starting an admission reported failure for admissions that had started correctly.** `POST /v1/models/admit` answers only as a stream, so all four starters — the Admissions tab, `AdmissionDashboard::reprofile`, and the `models admit` / `models reprofile` CLI verbs — learn the operation id from the first frame. All four did `line.find("data:")` and returned early on `npos`. **But `util::drain_sse_lines` strips `data: ` before the callback ever runs**, and drops comments, keepalives and blank separators with it: the argument is the JSON itself. `npos` was therefore what they ALWAYS got. The id was never captured, the stream was never dropped after the first frame as its own comment promised, and the operator was told `admission started but reported no operation id` while control converted away in the background — a message that is, read literally, exactly what happened. **The cause was a sentence.** `http_client.hpp` said the callback is called "for each raw `data: ...` line"; `util.hpp` said, correctly, that payloads come back "after the `data: ` prefix". Four sites believed the header, which is what a header is for. The two SSE consumers written against the actual behaviour — the chat stream in the TUI and the CLI — name their parameter `data` and parse it directly, and always worked. **Fixed at the cause and at every site**: the comment now states the contract and warns that returning false makes httplib report a cancelled transfer, so a caller must check what it captured BEFORE it checks the return value (which is why the successful path returns `false` from `stream_post` and always did). The four copies became one `HttpClient::capture_first_field`. **Test pins the seam rather than the symptom**: a fake server writes the frames `stream_admission` actually writes — a keepalive comment first, then `"data: " + json + "\n\n"` forever — and asserts both that the id is captured and that the client HANGS UP instead of riding the stream. **Mutation-verified**: restoring the prefix search makes the test hang until the read timeout, which is precisely what production did. A grep guard in `check_surface_parity.py` catches the literal in any operator surface, itself mutation-verified. | operator report (`moonshotai/Kimi-K3` admission) | **High — admission and reprofile could not be started from any surface without reporting a false failure, and the real refusal reason never reached the operator.** |
 | ~~D67~~ | **Control could configure a cluster it could not repair: five node provisioning routes existed and nothing anywhere called them.** `POST /api/node/engines/:id/{provision,check-update,switch,diagnose,recover}` shipped with the engine work. A grep of the whole control tree for those paths returned nothing — control's only outbound engine calls were `engine-config`, the three artifact-brokering routes, and a **read-only** `proxy_engine_get`. The wizard that drives them lived in the NODE's TUI, wired to in-process callbacks, so repairing a node meant opening a session on that machine, on a cluster head whose premise is that you do not have to. **And the one lever control did offer was misleading in exactly the case it was reached for**: `engines resync` re-pushes only to nodes whose config *version* differs, and a node bumps its version on ACCEPTING a config, not on conforming to one — so a node that accepted v3 and then failed its build sits at v3 with state `failed`, is skipped by both `push_engine_config_to_all()` and the health-poll convergence loop, and gets `{"resynced": true}` for its trouble. Reported as "I can't seem to control the provisioning from control in the TUI", which was precisely right. **Fixed in three parts, because a proxy alone would have shipped a hang.** (1) The node's five action routes now START work and return `202` instead of running it on the HTTP handler — they were synchronous, and a source build is minutes, so the first real caller would have held a connection across a compile on both ends while control's 30 s health poll marked the node unreachable in the middle of it. That was survivable only while nothing called them. The body carries the runtime as it was when the worker STARTED, which is why the code is 202: a 200 would invite a caller to read a pre-action snapshot as an outcome and paint green over a build about to fail. (2) All six node-side actions — **including the scheduled auto-update**, which previously held `llama_operation_mutex` while both busy flags read false — now serialise on ONE worker behind ONE flag, so a second request gets a `409` rather than a 202 followed by a silent wait. Two flags where the constraint is one lock is a busy state that lies. (3) Control gained `POST /v1/cluster/engines/nodes/{id}/{action}`, brokered to the node and passing its status and body through verbatim, plus the Engines tab's second button row (acting on the selected node, mirroring Share) and `engines provision|check-update|switch|diagnose|recover` in `--mode cli`. Addressed by NODE, not by engine: `find_engine_node` searches live slots, and a node needing provisioning is precisely one with no slot to name. `switch` is the single deliberate TUI gap — choosing a build variant needs that node's troubleshooting report, which does not cross the conformance route, and a menu control cannot populate is a list whose every entry might fail. **The check that would have caught this now exists**: `check_surface_parity.py` watched control's TUI only, so a node-TUI-only capability was invisible to it by construction — the same shape of mistake as watching three references and calling that every channel. It gained a node half asserting every node-TUI mutation callback names a registered `/api/node` route, **mutation-verified in both directions** (renaming `recover` fails; adding an unmapped callback fails). | operator report | **High — a node whose engine build failed could not be recovered from control at all, and the button that looked like it should reported success while doing nothing.** |
 | ~~D66~~ | **`prepare_model_for_node()` could never transfer a model directory, so an admitted Soma container was never sent to a remote node.** `transfer_model_to_node()` handles directories properly — it walks them with `recursive_directory_iterator` and streams each file to `/api/node/models/receive` under its relative path. But both callers resolved through `util::resolve_existing_local_model_path()`, which matches **`is_regular_file` only**, so the directory branch was unreachable from placement and a container fell through to "pass the ref along untouched" — the path an UNADMITTED model gets. On a single machine this is invisible, because control's absolute container path also resolves on the node; on a real cluster the node is handed a path that does not exist there and fails at load time, as a missing model rather than as a transfer that never happened. Soma's models are always container directories, so this was the normal case for the engine the branch exists to serve. **Fixed by SPLITTING the resolver, not widening it**: `resolve_existing_local_model_ref()` accepts a file or a directory, and only the two sites that mean "a model, whatever shape" use it — the model in `prepare_model_for_node()` and `model_cache_id()`. The other three callers genuinely mean *file* and were left alone: the projector is always a single mmproj, and the config validator is explicitly scoped to llama.cpp, which loads a GGUF; widening the shared predicate would have made both quietly accept a directory they cannot load. **Tested through real placement rather than the helper**, because the claim is "a container reaches the streaming branch when an agent is placed" — the test counts what the fake node RECEIVES (all three files, with `experts/layer0.bin` keeping its relative path, since a flattened transfer would land every shard in the container root and fail at load). **Mutation-verified**, and the mutation is the point: with the file-only resolver restored, `ensure_agent_running()` still SUCCEEDS and zero files arrive — which is exactly how this defect hid. Found because a D65 test refused to pass against a directory. | D65 implementation | Resolved |
 | ~~D65~~ | **`disk_mb` was zero for every placement, because nothing could say whether a node already held the model.** The disk axis was enforced — `evaluate_fit()` checks it first and unconditionally — but only ever against the 8 GiB headroom, never against a model's actual demand. The reason was sound: a container the target already holds is not an ADDITIONAL cost, and `NodeInfo` carried no local-model list, so charging the full size would have rejected exactly the nodes that are cheapest to place on. **The missing piece was an input, and the node already had it** — `GET /api/node/models/local?id=` answers `present`, and its own comment says "so control can skip a transfer the node already holds". Control simply never asked. Now `/api/node/status` reports `local_model_ids` from the model store, the health poll carries them into `NodeInfo`, and placement charges the container's measured size only to candidates whose list lacks the id. **The shape change that made it possible**: `NodeRegistry::nodes_with_capacity_for()` takes a per-node demand function, because a single `ResourceFootprint` cannot express "free if you already hold it" — the same claim the verdict makes, that a cost is a property of (model, host), not of the model. The uniform-demand overload is now implemented in terms of it, so there is one ranking implementation rather than two that must agree. **The id derivation is shared, not reimplemented**: `model_cache_id()` calls the same `manifest_cache_id()` that `prepare_model_for_node()` names the transfer with — two derivations would drift, and the failure would be silent, since every node would look empty and every placement would be over-charged forever. A test asserts exactly that (a foreign id does not count as residency) and is **mutation-verified**. Residency is a poll-age HINT and safe both ways: a stale "resident" under-charges and the transfer path's own `make_room_for()` evicts to fit; a stale "absent" over-charges and prefers another node. | D62 resolution | Resolved |
