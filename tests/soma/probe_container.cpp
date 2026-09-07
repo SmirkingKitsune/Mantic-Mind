@@ -5,14 +5,13 @@
 // production expert is ~3 MB. Those do not achieve the same bandwidth on the
 // same drive, and using the small number would make every verdict pessimistic.
 //
-// Usage: probe_container <container_dir> <source_config.json>
+// Usage: probe_container <container_dir>
 
 #include "soma/expert_store.hpp"
 #include "soma/plan.hpp"
 #include "soma/quant_format.hpp"
 
 #include <filesystem>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -21,32 +20,17 @@
 namespace fs = std::filesystem;
 
 int main(int argc, char** argv) {
-    if (argc < 3) {
-        std::cerr << "usage: probe_container <container_dir> <source_config.json>\n";
+    if (argc != 2) {
+        std::cerr << "usage: probe_container <container_dir>\n";
         return 2;
     }
     const fs::path cdir(argv[1]);
-    const fs::path cfg_path(argv[2]);
-
-    std::ifstream in(cfg_path);
-    if (!in) {
-        std::cerr << "cannot read " << cfg_path.string() << "\n";
-        return 2;
-    }
-    std::ostringstream ss;
-    ss << in.rdbuf();
 
     soma::ArchIr arch;
-    if (auto st = soma::adapt_hf_config(ss.str(), arch); !st.ok()) {
-        std::cerr << "adapt failed: " << st.message() << "\n";
+    if (auto st = soma::resolve_arch(cdir.string(), {}, arch); !st.ok()) {
+        std::cerr << "resolve failed: " << st.message() << "\n";
         return 2;
     }
-
-    // The IR must describe the container's precision, or the expert-size
-    // cross-check refuses the open — which is the point of that check.
-    arch.quantization.expert_gate = {soma::DType::Q4_G, 128};
-    arch.quantization.expert_up = {soma::DType::Q4_G, 128};
-    arch.quantization.expert_down = {soma::DType::Q6_G, 128};
 
     soma::ExpertStore store;
     if (auto st = store.open(cdir.string(), arch); !st.ok()) {

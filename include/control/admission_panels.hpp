@@ -162,7 +162,7 @@ ftxui::Element render_admission_list(const AdmissionSnapshot& snap, int selected
 /// run, which one it is on, and the gauge.
 ///
 /// Renders the WHOLE ladder rather than only the current stage, because "convert
-/// 3 of 7" answers a different question from "convert" — the first tells an
+/// 3 of 8" answers a different question from "convert" — the first tells an
 /// operator whether to wait.
 ftxui::Element render_admission_detail(const AdmissionSnapshot& snap, int selected);
 

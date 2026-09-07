@@ -18,6 +18,7 @@
 #include "soma/expert_store.hpp"
 #include "soma/f32_model.hpp"
 #include "soma/memory_hierarchy.hpp"
+#include "soma/plan.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -112,8 +113,22 @@ int main(int argc, char** argv) {
         std::cerr << "load failed: " << st.message() << "\n";
         return 2;
     }
+    // The IR handed to the store must be the IR the CONTAINER was built from, not
+    // one assembled from the source beside it. They differ for any model whose
+    // container_meta.json says something config.json does not — DeepSeek V4's
+    // DSpark descriptor is in the arch_hash, and the source directory carries no
+    // meta to declare it — so a source-built IR is a different model as far as
+    // the stamp is concerned, and it is right to say so.
+    soma::ArchIr container_arch;
+    if (auto st = soma::resolve_arch((root / "containers" / name).string(), {}, container_arch);
+        !st.ok()) {
+        std::cerr << "container identity failed: " << st.message() << "\n";
+        return 2;
+    }
+
     soma::ExpertStore store;
-    if (auto st = store.open((root / "containers" / name).string(), model.arch); !st.ok()) {
+    if (auto st = store.open((root / "containers" / name).string(), container_arch);
+        !st.ok()) {
         std::cerr << "container open failed: " << st.message() << "\n";
         return 2;
     }

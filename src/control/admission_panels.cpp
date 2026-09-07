@@ -24,9 +24,9 @@ namespace {
 /// client that wants to draw the stages not yet reached has to know the shapes.
 /// There are exactly three, and the LENGTH identifies them:
 ///
-///   3  an already-converted container (what reprofile runs)
-///   7  a local source: no fetch
-///   8  a repo id: fetch first
+///   4  an already-converted container (what reprofile runs)
+///   8  a local source: no fetch
+///   9  a repo id: fetch first
 ///
 /// Keyed on the count rather than assumed, because a single flat list indexed by
 /// position is wrong the moment `fetch` is absent — every label shifts by one
@@ -35,16 +35,19 @@ namespace {
 ///
 /// An unrecognized count returns EMPTY, and the renderer then draws positions
 /// without names. A server that grows a stage should make this client say "step
-/// 3 of 9" rather than confidently mislabel nine stages: position comes from the
+/// 3 of 10" rather than confidently mislabel ten stages: position comes from the
 /// wire and stays right, names are the part this can be wrong about, and
 /// inventing them is worse than omitting them.
 const std::vector<std::string>& ladder_for(int total_steps) {
-    static const std::vector<std::string> container = {"profile", "conformance", "finalize"};
+    static const std::vector<std::string> container = {"stamp", "profile", "conformance",
+                                                        "finalize"};
     static const std::vector<std::string> local = {
-        "convert", "tokenize", "oracle", "reference", "profile", "conformance", "finalize"};
+        "convert", "tokenize", "stamp", "oracle", "reference", "profile", "conformance",
+        "finalize"};
     static const std::vector<std::string> fetched = {"fetch",
                                                      "convert",
                                                      "tokenize",
+                                                     "stamp",
                                                      "oracle",
                                                      "reference",
                                                      "profile",
@@ -475,7 +478,7 @@ Element render_admission_detail(const AdmissionSnapshot& snap, int selected) {
     rows.push_back(hbox({text(" detail   ") | dim, text(truncate(op.detail, 70))}));
 
     // The whole ladder, not just the current rung. "convert" alone does not tell
-    // an operator whether to wait; "convert, 3 of 7" does.
+    // an operator whether to wait; "convert, 3 of 8" does.
     if (op.total_steps > 0) {
         Elements ladder;
         const auto& names = ladder_for(op.total_steps);

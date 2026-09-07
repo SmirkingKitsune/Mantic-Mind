@@ -1,7 +1,7 @@
 {
   "align": 4096,
   "config_sha256": "6feff8bd2e7409edc671c595588b38c1a9c35c4cb810a3338585966cd28bf94a",
-  "container_version": 1,
+  "container_version": 2,
   "dense_sharded": true,
   "dense_tensors": 66,
   "dspark": "not-present",
@@ -11,6 +11,11 @@
   "effective_groups": {
     "q4_g": 64,
     "q6_g": 32
+  },
+  "effective_groups_by_role": {
+    "down": 32,
+    "gate": 64,
+    "up": 64
   },
   "expert_bytes": 4352,
   "group": 128,

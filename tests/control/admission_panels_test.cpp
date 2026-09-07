@@ -45,7 +45,7 @@ mm::AdmissionView running_op() {
     op.stage = "convert";
     op.detail = "shard 3/12";
     op.step = 2;
-    op.total_steps = 7;
+    op.total_steps = 8;
     op.fraction = 0.28;
     op.started_at_ms = 1000;
     return op;
@@ -86,12 +86,12 @@ int main() {
         const auto list = draw(mm::render_admission_list(snap, 0));
         check(has(list, "Qwen3-30B-A3B"), "list shows the source");
         check(has(list, "running"), "a live operation reads as running");
-        check(has(list, "2/7"), "list shows step of total, not just the stage");
+        check(has(list, "2/8"), "list shows step of total, not just the stage");
 
         const auto detail = draw(mm::render_admission_detail(snap, 0));
         check(has(detail, "convert"), "detail names the current stage");
         // The whole ladder, because "convert" alone does not tell an operator
-        // whether to wait; "convert, 2 of 7" does. 7 steps is the local-source
+        // whether to wait; "convert, 2 of 8" does. 8 steps is the local-source
         // shape — no fetch — and getting that wrong is what a flat position-
         // indexed list did: every label shifted by one and `finalize` was never
         // drawn.
@@ -107,7 +107,7 @@ int main() {
         mm::AdmissionSnapshot snap;
         snap.reachable = true;
         auto op = running_op();
-        op.total_steps = 9; // no such ladder today
+        op.total_steps = 10; // no such ladder today
         op.step = 3;
         snap.operations.push_back(op);
         const auto detail = draw(mm::render_admission_detail(snap, 0));
@@ -117,19 +117,20 @@ int main() {
     }
 
     // ── The container ladder ──────────────────────────────────────────────────
-    // What reprofile runs: three stages, starting at profile. A list that always
+    // What reprofile runs: four stages, starting at stamp. A list that always
     // began at `fetch` would label these convert/tokenize/oracle.
     {
         mm::AdmissionSnapshot snap;
         snap.reachable = true;
         auto op = running_op();
-        op.total_steps = 3;
+        op.total_steps = 4;
         op.step = 1;
-        op.stage = "profile";
+        op.stage = "stamp";
         snap.operations.push_back(op);
         const auto detail = draw(mm::render_admission_detail(snap, 0));
-        check(has(detail, "profile"), "container ladder starts at profile");
-        check(has(detail, "conformance"), "container ladder names its second stage");
+        check(has(detail, "stamp"), "container ladder starts at stamp");
+        check(has(detail, "profile"), "container ladder names its second stage");
+        check(has(detail, "conformance"), "container ladder names conformance");
         check(!has(detail, "convert"), "container ladder does not claim a convert stage");
     }
 

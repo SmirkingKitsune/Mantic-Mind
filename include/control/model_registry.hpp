@@ -119,7 +119,7 @@ struct AdmissionOperation;
 struct AdmissionTools {
     std::string python = "python"; ///< MM_ADMISSION_PYTHON
     std::string tools_dir = "tools/admission";
-    std::string soma_path = "soma"; ///< for `soma plan --json`
+    std::string soma_path = "soma"; ///< for `soma plan`, `stamp`, and `conform`
     std::string containers_dir = "data/containers";
 
     /// Where fetched repos land. Separate from containers_dir because these are
@@ -268,8 +268,8 @@ public:
     bool heat(std::int64_t id, bool bucketed, std::string& out_json) const;
 
     // ── admission ────────────────────────────────────────────────────────────
-    /// Long-running: fetch, convert, compile the tokenizer, run the conformance
-    /// ladder, profile, write registry rows, compute a verdict. Runs on its own
+    /// Long-running: fetch, convert, compile the tokenizer, stamp the container,
+    /// run the conformance ladder, profile, write registry rows, compute a verdict. Runs on its own
     /// thread and reports through the sink.
     ///
     /// Requires the `operator` scope. This is why scopes exist at all: hours of

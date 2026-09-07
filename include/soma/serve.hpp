@@ -78,6 +78,14 @@ struct ServeConfig {
     float speculative_confidence_threshold = 0.0f; // --dspark-confidence-threshold
 
     std::uint32_t telemetry_hz = kDefaultTelemetryHz; // --telemetry-hz
+
+    /// Serve an unstamped or legacy-v1 container.            // --allow-unstamped
+    /// An escape hatch, not a default. Without the stamp, the checks that remain
+    /// compare the container against the quantization map recorded in its own
+    /// container_meta.json — self-consistent by construction, and blind to the IR
+    /// having moved since. Run `soma stamp <dir>` instead; this exists for a
+    /// container that cannot be reconverted or stamped right now.
+    bool allow_unstamped = false;
 };
 
 /// Reasons the server refuses a request, mapped to HTTP by the implementation.

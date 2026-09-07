@@ -2946,7 +2946,9 @@ every converted container, `arch.quantization` was whatever `adapt_hf_config` de
 was hashed and the value was never populated, which means **every container of a given architecture
 hashed identically no matter what it was converted at**. Fixing (1) alone would have changed nothing.
 `apply_container_quant` now overlays `container_meta.json` — not a second description of the
-architecture, but the record of a conversion, and the only place the quantization exists.
+architecture, but the record of a conversion and the source used to resolve the IR. Container v2
+also repeats each routed role's dtype and effective group in the binary index, so the runtime can
+compare the two representations before decoding any expert bytes.
 
 A consequence worth stating: a container whose `container_meta.json` is unreadable now **fails the
 plan** rather than one stage of the conformance ladder. That is correct — the quantization is

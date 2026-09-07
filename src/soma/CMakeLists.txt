@@ -348,6 +348,17 @@ if(BUILD_TESTING)
     add_test(NAME soma_container_g2
              COMMAND soma_container_g2 "${CMAKE_SOURCE_DIR}/tests/fixtures")
 
+    # The integrity boundary is header-level and adversarial: empty/mismatched
+    # stamps, legacy versions, malformed descriptors, and the equal-byte-count
+    # role permutation that a total-size check cannot see.
+    add_executable(soma_container_integrity
+                   ${CMAKE_SOURCE_DIR}/tests/soma/container_integrity.cpp)
+    target_link_libraries(soma_container_integrity PRIVATE mm_soma)
+
+    add_test(NAME soma_container_integrity
+             COMMAND soma_container_integrity
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/containers/Qwen3.5-MoE-Tiny")
+
     # ── G2 streaming path ─────────────────────────────────────────────────────
     # LRU, eviction safety under a live borrow, the thrash gate, prefetch gating,
     # heat bootstrap, and measured-vs-predicted bytes/token. Run with a cache far
@@ -736,7 +747,7 @@ endif()
 # ── Roadmap status ────────────────────────────────────────────────────────────
 # G0–G4 are implemented by mm_soma and the conformance targets above. G5 remains:
 #
-#   G5  soma executable — serve | plan --json | admit-verify
+#   G5  soma executable — serve | plan --json | conform | stamp
 #
 # src/soma/arch_registry.cpp is the ONE core TU permitted to include soma/arch/;
 # it holds resolve_f32_backend() and resolve_attention_backend().

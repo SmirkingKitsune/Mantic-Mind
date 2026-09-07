@@ -75,8 +75,20 @@ int main(int argc, char** argv) {
     }
     model.arch.quantization = qmodel.arch.quantization;
 
+    // Resolved from the CONTAINER rather than assembled here. The IR above
+    // carries a quant map assigned after load_f32_model() hashed it, so its
+    // arch_hash still describes the all-F32 default — invisible while nothing
+    // stamped containers, and a mismatch the moment one did.
+    soma::ArchIr container_arch;
+    if (auto st = soma::resolve_arch((root / "containers" / name).string(), {}, container_arch);
+        !st.ok()) {
+        std::cerr << "container identity failed: " << st.message() << "\n";
+        return 2;
+    }
+
     soma::ExpertStore store;
-    if (auto st = store.open((root / "containers" / name).string(), model.arch); !st.ok()) {
+    if (auto st = store.open((root / "containers" / name).string(), container_arch);
+        !st.ok()) {
         std::cerr << "container open failed: " << st.message() << "\n";
         return 2;
     }

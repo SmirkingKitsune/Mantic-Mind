@@ -953,7 +953,11 @@ Status ServeServer::open(const ServeConfig& config) {
             im.plan_doc.expert_cache_bytes < im.plan_doc.expert_bytes) {
             return {StatusCode::CapacityPressure, im.plan_doc.verdict_reason};
         }
-        if (auto st = im.store.open(config.model_dir, im.model.arch); !st.ok()) return st;
+        OpenOptions store_opts;
+        store_opts.identity = config.allow_unstamped ? IdentityPolicy::AllowUnstamped
+                                                     : IdentityPolicy::RequireStamped;
+        if (auto st = im.store.open(config.model_dir, im.model.arch, store_opts); !st.ok())
+            return st;
         MemoryBudget b;
         // Schema v2 requires exact admission: compute_plan reserves resident
         // weights and every selected KV slot before deriving this remainder.
@@ -1561,6 +1565,8 @@ Status parse_serve_config(int argc, const char* const* argv, ServeConfig& out) {
                 return {StatusCode::InvalidArgument, "--quant-dense requires a dtype"};
             }
             out.quant_dense = argv[++i];
+        } else if (a == "--allow-unstamped") {
+            out.allow_unstamped = true;
         }
     }
     if (out.model_dir.empty()) {

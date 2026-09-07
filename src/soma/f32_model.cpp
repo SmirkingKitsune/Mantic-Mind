@@ -399,10 +399,16 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
     // payloads. Config.json only says the upstream source declared DSpark; this
     // overlay proves the three draft stages are actually present and supplies
     // their exact byte accounting.
+    bool from_container = false;
+    QuantMap as_converted{};
     if (fs::exists(root / "container_meta.json")) {
         std::string meta_text;
         if (auto s = read_text(root / "container_meta.json", meta_text); !s.ok()) return s;
         if (auto s = apply_container_quant(meta_text, out.arch); !s.ok()) return s;
+        // What the SHARDS are, before `quant` below replaces the map with what
+        // this LOAD asked for. See ArchIr::container_arch_hash.
+        as_converted = out.arch.quantization;
+        from_container = true;
     }
 
     // The IR for MLA is complete and validated — MlaSpec was co-designed with
@@ -466,6 +472,11 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
     // container's own /internal/plan: `dense_resident_bytes` agreed to the byte
     // and the hashes did not (roadmap D42).
     if (auto s = compute_arch_hash(out.arch, out.arch.arch_hash); !s.ok()) return s;
+    if (from_container) {
+        ArchIr as_built = out.arch;
+        as_built.quantization = as_converted;
+        if (auto s = compute_arch_hash(as_built, out.arch.container_arch_hash); !s.ok()) return s;
+    }
 
     if (auto s = out.weights.open_dir(dir); !s.ok()) return s;
 
@@ -785,7 +796,7 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
     // disagree about a layout.
     {
         const auto fi = arch.ffn.expert_intermediate;
-        const auto d = arch.topology.d_model;
+        const auto d = arch.routed_expert_width();
         if (fi > 0 && d > 0) {
             const auto sz = [&](std::uint32_t rows, std::uint32_t cols, TensorRole role) {
                 const auto& spec = out.quant_map.for_role(role);
@@ -1145,7 +1156,7 @@ ExpertHandle acquire_expert(const F32Model& model, LayerIndex layer, ExpertId ex
     const auto blob = h.pin.bytes();
     const auto need = static_cast<std::size_t>(model.expert_gate_bytes) + model.expert_up_bytes +
                       model.expert_down_bytes;
-    if (blob.size() < need) {
+    if (blob.size() != need) {
         // The container's expert is smaller than the IR's layout implies. Refuse
         // rather than read past the section boundary into the next projection —
         // that would produce finite, wrong numbers.
@@ -1154,7 +1165,7 @@ ExpertHandle acquire_expert(const F32Model& model, LayerIndex layer, ExpertId ex
     }
 
     const auto fi = model.arch.ffn.expert_intermediate;
-    const auto d = model.arch.topology.d_model;
+    const auto d = model.arch.routed_expert_width();
     const auto& qm = model.quant_map;
     const auto grp = [](const QuantSpec& s, std::uint32_t cols) {
         return effective_group(cols, s.group ? s.group : kDefaultGroup);

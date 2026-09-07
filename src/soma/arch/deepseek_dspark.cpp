@@ -222,7 +222,9 @@ StatusCode bind_model(F32Model& model, const std::string&) noexcept {
     p->draft_arch.topology.layer_kinds.assign(p->draft_arch.topology.n_layers, LayerKind::Moe);
     p->draft_arch.router.n_hash_layers = 0;
     p->draft_arch.speculative.present = false;
-    p->draft_arch.arch_hash.clear(); // auxiliary container is gated by size/shape
+    // The auxiliary index belongs to the draft topology and has no independently
+    // computed identity yet. Its open uses the typed SkipArchHash policy below;
+    // an empty string is not a hidden authorization mechanism.
     const auto fi = model.arch.ffn.expert_intermediate, d = model.d_model();
     const auto sz = [&](std::uint32_t rows, std::uint32_t cols, TensorRole role) {
         const auto& s = model.quant_map.for_role(role);
@@ -240,7 +242,10 @@ StatusCode
 start_runtime(F32Model& model, const std::string& dir, std::uint64_t cache_bytes) noexcept {
     auto* p = model.speculative_payload.as<Payload>();
     if (p == nullptr) return StatusCode::Internal;
-    if (auto st = p->store.open_indexed(dir, p->draft_arch, "soma.dspark", "dspark-experts-");
+    OpenOptions opts;
+    opts.identity = IdentityPolicy::SkipArchHash;
+    if (auto st = p->store.open_indexed(
+            dir, p->draft_arch, "soma.dspark", "dspark-experts-", opts);
         !st.ok())
         return st.code();
     MemoryBudget b;

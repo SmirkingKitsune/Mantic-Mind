@@ -217,6 +217,10 @@ RealLogitKlResult run_real_logit_kl(const std::string& container_dir,
     r.loaded = true;
 
     ExpertStore store;
+    // Conformance reads the same bytes serving will read, so it must enforce the
+    // same admission boundary. The control pipeline stamps before invoking this
+    // stage; a direct operator invocation gets a useful refusal instead of a
+    // misleading result over an unbound payload.
     if (auto st = store.open(container_dir, model.arch); !st.ok()) {
         r.detail = "container open failed: " + st.message();
         return r;

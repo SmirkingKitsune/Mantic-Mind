@@ -58,6 +58,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from convert import (  # noqa: E402
     DTYPE_ID,
+    FLAG_PER_ROLE_QUANT,
+    FORMAT_VERSION,
     MAGIC,
     align_up,
     expert_reader,
@@ -77,6 +79,12 @@ REL_RMS_CEILING = {"q8_0": 0.03, "q6_g": 0.08, "q5_g": 0.15,
 
 ID_TO_DTYPE = {v: k for k, v in DTYPE_ID.items()}
 
+# The flag bits this reader understands. Everything else is fatal.
+KNOWN_FLAGS = FLAG_PER_ROLE_QUANT
+
+# soma::TensorRole, for reporting the descriptor in readable terms.
+ID_TO_ROLE = {2: "gate", 3: "up", 4: "down"}
+
 
 class Failure(Exception):
     pass
@@ -90,18 +98,59 @@ def read_index(path: Path) -> dict:
     if raw[:8] != MAGIC:
         raise Failure(f"{path.name}: bad magic {raw[:8]!r}, expected {MAGIC!r}")
     off = 8
-    version, reserved = struct.unpack_from("<II", raw, off)
-    off += 8
-    (hash_len,) = struct.unpack_from("<I", raw, off)
-    off += 4
+
+    def take(fmt: str, what: str) -> tuple:
+        nonlocal off
+        size = struct.calcsize(fmt)
+        if size > len(raw) - off:
+            raise Failure(f"{path.name}: truncated {what}")
+        values = struct.unpack_from(fmt, raw, off)
+        off += size
+        return values
+
+    version, reserved = take("<II", "version/flags")
+    if version not in (1, FORMAT_VERSION):
+        raise Failure(f"{path.name}: unsupported container version {version}")
+    if reserved & ~KNOWN_FLAGS:
+        raise Failure(f"{path.name}: flags 0x{reserved & ~KNOWN_FLAGS:08x} are not understood "
+                      f"by this build")
+    (hash_len,) = take("<I", "arch_hash length")
+    if hash_len > len(raw) - off:
+        raise Failure(f"{path.name}: truncated arch_hash")
     arch_hash = raw[off:off + hash_len]
     off += hash_len
-    n_layers, n_experts, n_shards, dtype_id = struct.unpack_from("<IIII", raw, off)
-    off += 16
-    (group,) = struct.unpack_from("<I", raw, off)
-    off += 4
-    uniform_len, total = struct.unpack_from("<QQ", raw, off)
-    off += 16
+    n_layers, n_experts, n_shards, dtype_id = take("<IIII", "dimensions/dtype")
+    (group,) = take("<I", "legacy group")
+
+    # The per-role quantization descriptor, present only when the flag says so.
+    # Unknown flag bits are fatal here for the same reason they are in the engine:
+    # a bit this reader does not know means a field it cannot see, so every offset
+    # after it is a guess that would not fail — it would produce a plausible index
+    # pointing at the wrong bytes.
+    roles: dict[int, tuple[int, int]] = {}
+    if reserved & FLAG_PER_ROLE_QUANT:
+        (n_roles,) = take("<I", "role count")
+        if n_roles != 3:
+            raise Failure(f"{path.name}: role descriptor has {n_roles} entries; expected 3")
+        for _ in range(n_roles):
+            role_id, dtype_of_role, group_of_role = take("<III", "role descriptor")
+            if role_id not in ID_TO_ROLE:
+                raise Failure(f"{path.name}: unknown expert role id {role_id}")
+            if role_id in roles:
+                raise Failure(f"{path.name}: duplicate {ID_TO_ROLE[role_id]} descriptor")
+            if dtype_of_role not in ID_TO_DTYPE:
+                raise Failure(f"{path.name}: unknown dtype id {dtype_of_role} for "
+                              f"{ID_TO_ROLE[role_id]}")
+            if group_of_role == 0:
+                raise Failure(f"{path.name}: zero effective group for {ID_TO_ROLE[role_id]}")
+            roles[role_id] = (dtype_of_role, group_of_role)
+    if version == FORMAT_VERSION and set(roles) != set(ID_TO_ROLE):
+        raise Failure(f"{path.name}: v{FORMAT_VERSION} requires exactly gate, up, and down "
+                      "quant descriptors")
+    if roles and roles[2] != (dtype_id, group):
+        raise Failure(f"{path.name}: legacy expert dtype/group contradicts the gate descriptor")
+
+    uniform_len, total = take("<QQ", "expert sizes")
 
     want = n_layers * n_experts
     have = (len(raw) - off) // ENTRY.size
@@ -114,8 +163,8 @@ def read_index(path: Path) -> dict:
     entries = [ENTRY.unpack_from(raw, off + i * ENTRY.size) for i in range(want)]
     return {"version": version, "reserved": reserved, "arch_hash": arch_hash,
             "n_layers": n_layers, "n_experts": n_experts, "n_shards": n_shards,
-            "dtype_id": dtype_id, "group": group, "uniform_len": uniform_len,
-            "total": total, "entries": entries}
+            "dtype_id": dtype_id, "group": group, "roles": roles,
+            "uniform_len": uniform_len, "total": total, "entries": entries}
 
 
 def check_structure(container: Path, ix: dict, meta: dict, kinds: list[str]) -> list[str]:
@@ -123,12 +172,43 @@ def check_structure(container: Path, ix: dict, meta: dict, kinds: list[str]) -> 
     notes: list[str] = []
     n_layers, n_experts = ix["n_layers"], ix["n_experts"]
 
-    if ix["version"] != 1:
-        raise Failure(f"container_version {ix['version']}, expected 1")
+    if ix["version"] != FORMAT_VERSION:
+        raise Failure(f"container_version {ix['version']}, expected {FORMAT_VERSION}; "
+                      "reconvert with the current converter")
+    if "container_version" in meta and int(meta["container_version"]) != ix["version"]:
+        raise Failure(f"index says container_version={ix['version']}, "
+                      f"container_meta.json says {meta['container_version']}")
     for key, got in (("n_layers", n_layers), ("n_experts", n_experts),
                      ("n_shards", ix["n_shards"])):
         if key in meta and int(meta[key]) != got:
             raise Failure(f"index says {key}={got}, container_meta.json says {meta[key]}")
+
+    # The per-role descriptor against the conversion record. The two are written
+    # by the same run, so agreeing proves little on its own — but disagreeing
+    # means one of them was edited, and the engine reads the descriptor while
+    # everything else here reads the meta.
+    if ix["roles"]:
+        want = {"gate": meta.get("dtype_gate_up"), "up": meta.get("dtype_gate_up"),
+                "down": meta.get("dtype_down")}
+        groups = meta.get("effective_groups_by_role", {})
+        seen = []
+        for role_id, (dtype_of_role, group_of_role) in sorted(ix["roles"].items()):
+            role = ID_TO_ROLE.get(role_id, str(role_id))
+            name = ID_TO_DTYPE.get(dtype_of_role, f"id {dtype_of_role}")
+            seen.append(f"{role}={name}@{group_of_role}")
+            if want.get(role) and want[role] != name:
+                raise Failure(f"index says {role} experts are {name}, "
+                              f"container_meta.json says {want[role]}")
+            expected_group = int(groups.get(role, meta.get("group", group_of_role)))
+            if group_of_role != expected_group:
+                raise Failure(f"index says {role} experts use group {group_of_role}, "
+                              f"container_meta.json says {expected_group}")
+        notes.append("per-role quant  " + " ".join(seen))
+    else:
+        notes.append("per-role quant  absent (pre-descriptor container)")
+    notes.append("arch_hash       " +
+                 (ix["arch_hash"].decode("ascii", "replace") if ix["arch_hash"]
+                  else "UNSTAMPED - run `soma stamp <dir>`; serve will refuse it"))
 
     shard_paths = sorted(container.glob("experts-*.bin"))
     if len(shard_paths) != ix["n_shards"]:

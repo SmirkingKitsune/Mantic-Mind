@@ -67,10 +67,11 @@ std::string ref_key(const std::string& ref) {
 /// cannot disagree. They did: a container admission advertised 2 total steps and
 /// then emitted steps 3, 4 and 5, which a progress bar reads as 250%.
 std::vector<std::string> admission_stages(bool container_is_ready, bool needs_fetch) {
-    if (container_is_ready) return {"profile", "conformance", "finalize"};
+    if (container_is_ready) return {"stamp", "profile", "conformance", "finalize"};
     std::vector<std::string> s;
     if (needs_fetch) s.push_back("fetch");
-    s.insert(s.end(), {"convert", "tokenize", "oracle", "reference", "profile", "conformance", "finalize"});
+    s.insert(s.end(), {"convert", "tokenize", "stamp", "oracle", "reference", "profile",
+                       "conformance", "finalize"});
     return s;
 }
 
@@ -1682,6 +1683,39 @@ void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
                     "usable but will not detokenize", progress.operation_id, trc);
             emit("tokenize", "tokenizer compilation failed; continuing without it", 0.72);
         }
+    }
+
+    // ── 2a. bind the index to the canonical C++ IR ──────────────────────────
+    //
+    // Conversion deliberately cannot compute arch_hash: duplicating the C++ IR
+    // canonicalization in Python would create two definitions of model identity.
+    // This is a required admission stage, including for preconverted containers
+    // and reprofile. stamp is idempotent, so an unchanged container incurs no
+    // rewrite; any role-map or prior-hash disagreement is fatal.
+    if (!arch_unsupported) {
+        const auto target = container_is_ready ? local_source : container;
+        const double stamp_fraction = container_is_ready ? 0.10 : 0.73;
+        emit("stamp", "binding the container to its architecture", stamp_fraction);
+        std::string stamp_out, err;
+        const int src = run_streamed_command(
+            {tools.soma_path, "stamp", target}, fs::current_path(),
+            [&](const std::string& line, bool is_stderr) {
+                if (!is_stderr && !util::trim(line).empty()) stamp_out += util::trim(line) + " ";
+            },
+            canceled, &err);
+        if (canceled()) {
+            progress.canceled = true;
+            fail("canceled during container stamping");
+            return;
+        }
+        if (src != 0) {
+            fail("soma stamp failed (exit " + std::to_string(src) + ")" +
+                 (err.empty() ? "" : ": " + util::trim(err)));
+            return;
+        }
+        emit("stamp", stamp_out.empty() ? "stamped" : util::trim(stamp_out), stamp_fraction);
+    } else {
+        emit("stamp", "not run; this architecture produced no container", 0.73);
     }
 
     // ── 2b. the conformance oracle ───────────────────────────────────────────

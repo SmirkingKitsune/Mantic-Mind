@@ -749,6 +749,22 @@ struct ArchIr {
     std::uint32_t schema_version = kArchIrSchemaVersion;
     std::string arch_hash;
 
+    /// The identity of the CONTAINER, as distinct from the identity of the model
+    /// this IR describes. Empty when the source is not a converted container.
+    ///
+    /// The two differ, and only in one direction. `--quant-dense` chooses the
+    /// precision of the resident half at LOAD — the converter stores it F32 on
+    /// disk precisely so that choice costs no reconversion — so it changes
+    /// `arch_hash` (which covers every role) while changing not one byte of the
+    /// container. A container stamped with `arch_hash` would therefore be refused
+    /// by the very serve invocation the F32-on-disk decision exists to allow.
+    ///
+    /// So this is the hash of the same IR carrying the map that
+    /// container_meta.json declares, before any caller overlay: what the shards
+    /// on disk actually are. Equal to `arch_hash` whenever no overlay was
+    /// applied. NOT part of the hash itself.
+    std::string container_arch_hash;
+
     std::string source_repo;
     std::string source_revision;
     std::string source_model_type;

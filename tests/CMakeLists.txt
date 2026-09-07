@@ -109,7 +109,7 @@ message(STATUS "admission tests will run under: ${MM_ADMISSION_PY}")
 # progress parsing, the resolved path, and the two ways a fetch can lie about
 # succeeding.
 set_tests_properties(mm_reliability_tests PROPERTIES
-    ENVIRONMENT "MM_TEST_SOMA_PATH=$<TARGET_FILE:soma>;MM_TEST_MODEL_DIR=${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/Qwen3-30B-A3B;MM_TEST_PYTHON=${Python3_EXECUTABLE};MM_TEST_CONTAINER_DIR=${CMAKE_SOURCE_DIR}/tests/fixtures/containers/Qwen3-30B-A3B;MM_TEST_PROCESS_HELPER_PATH=$<TARGET_FILE:mm_process_exec_tests>")
+    ENVIRONMENT "MM_TEST_SOMA_PATH=$<TARGET_FILE:soma>;MM_TEST_MODEL_DIR=${CMAKE_SOURCE_DIR}/tests/fixtures/tiny/Qwen3-30B-A3B;MM_TEST_PYTHON=${MM_ADMISSION_PY};MM_TEST_CONTAINER_DIR=${CMAKE_SOURCE_DIR}/tests/fixtures/containers/Qwen3-30B-A3B;MM_TEST_PROCESS_HELPER_PATH=$<TARGET_FILE:mm_process_exec_tests>")
 
 if(Python3_Interpreter_FOUND)
     # The direction require_complete_coverage() cannot walk. It asserts every

@@ -28,7 +28,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 MAGIC = b"SOMACTNR"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 ALIGN = 4096
 
 # Mirrors soma::DType. Kept as an explicit table rather than an enum import
@@ -36,6 +36,36 @@ ALIGN = 4096
 # two drift, not silently renumber.
 DTYPE_ID = {"f32": 0, "f16": 1, "bf16": 2, "q8_0": 3, "q6_g": 4, "q5_g": 5,
             "q4_g": 6, "q4_0": 7}
+
+# Wire ids for the roles the descriptor names, from soma::TensorRole. Pinned in
+# the engine by a static_assert, so reordering that enum breaks the build there
+# rather than silently changing what these bytes mean.
+ROLE_ID = {"gate": 2, "up": 3, "down": 4}
+
+# Container `flags`. MUST-UNDERSTAND on the reading side: a reader that meets a
+# bit it does not know refuses the container instead of parsing past a field it
+# cannot see. V2 makes this descriptor mandatory; the version bump is required
+# because shipped V1 readers ignored flags and would otherwise misparse it.
+FLAG_PER_ROLE_QUANT = 1 << 0
+
+
+def role_descriptor(dt_gate: str, dt_up: str, dt_down: str,
+                    role_groups: dict[str, int], requested: int) -> bytes:
+    """gate/up/down, each with the dtype and the EFFECTIVE group it was written at.
+
+    The header's single `expert_dtype` cannot express the default map — gate/up at
+    q4_g with down at q6_g — so a reader had only the byte TOTAL to check the IR
+    against. That is a proxy: gate, up and down all hold `expert_intermediate x
+    d_model` elements, so any map permuting dtypes between roles totals identically.
+    Nothing produces such a map today, because container_meta.json welds gate and up
+    to one field — but that is a property of this JSON schema rather than of the
+    format, and the descriptor lets the reader check the roles directly.
+    """
+    out = struct.pack("<I", 3)
+    for role, dt in (("gate", dt_gate), ("up", dt_up), ("down", dt_down)):
+        out += struct.pack("<III", ROLE_ID[role], DTYPE_ID[dt],
+                           role_groups.get(role, requested))
+    return out
 
 # Roles whose tensors stay resident. Everything not listed here and not a routed
 # expert is an error rather than a silent omission — a dropped tensor produces a
@@ -739,6 +769,12 @@ def main(argv: list[str]) -> int:
     total = 0
     uniform_len = -1
     groups: dict[str, int] = {}
+    # Keyed by ROLE as well, because the effective group is a property of the row
+    # width and not of the dtype. gate/up quantize along d_model and down along
+    # expert_intermediate, so two roles sharing a dtype but not a width collapse
+    # onto one another in `groups` and the last one written wins. That is what the
+    # engine reads back as the container's group.
+    role_groups: dict[str, int] = {}
 
     kinds = layer_kinds(cfg, n_layers)
     n_moe = sum(1 for k in kinds if k == "moe")
@@ -920,6 +956,7 @@ def main(argv: list[str]) -> int:
                     return 3
                 packed, g = quantize_rows(t, dt, args.group)
                 groups[dt] = g
+                role_groups[role] = g
                 blob += packed
 
             if shard_off + len(blob) > args.shard_bytes and shard_off > 0:
@@ -966,11 +1003,12 @@ def main(argv: list[str]) -> int:
     arch_hash = b""
     with open(out_dir / "soma.container", "wb") as ix:
         ix.write(MAGIC)
-        ix.write(struct.pack("<II", FORMAT_VERSION, 0))
+        ix.write(struct.pack("<II", FORMAT_VERSION, FLAG_PER_ROLE_QUANT))
         ix.write(struct.pack("<I", len(arch_hash)))
         ix.write(arch_hash)
         ix.write(struct.pack("<IIII", n_layers, n_experts, shard_idx + 1, DTYPE_ID[dt_gate]))
-        ix.write(struct.pack("<I", groups.get(dt_gate, args.group)))
+        ix.write(struct.pack("<I", role_groups.get("gate", args.group)))
+        ix.write(role_descriptor(dt_gate, dt_up, dt_down, role_groups, args.group))
         ix.write(struct.pack("<QQ", max(uniform_len, 0), total))
         for shard, off, length in index:
             ix.write(struct.pack("<IQI", shard, off, length))
@@ -1000,6 +1038,7 @@ def main(argv: list[str]) -> int:
         "dtype_down": dt_down,
         "group": args.group,
         "effective_groups": groups,
+        "effective_groups_by_role": role_groups,
         "dense_tensors": len(dense),
         "align": ALIGN,
         # Whether this container can be served as TEXT. Recorded rather than left

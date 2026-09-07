@@ -493,12 +493,18 @@ resolve_arch(const std::string& model_dir, const std::string& quant_overlay_json
     // detecting it. The field was in the hash and the value never arrived.
     //
     // container_meta.json is not a second description of the architecture — it is
-    // the record of a conversion, written by the converter, and it is the only
-    // place the quantization exists at all.
+    // the conversion record from which the IR is resolved. V2 repeats routed
+    // dtypes/effective groups in the binary index so ExpertStore can compare the
+    // two before decoding bytes.
+    bool from_container = false;
+    QuantMap as_converted{};
     if (std::ifstream meta_in(root / "container_meta.json", std::ios::binary); meta_in) {
         std::string meta_text((std::istreambuf_iterator<char>(meta_in)),
                               std::istreambuf_iterator<char>());
         if (auto st = apply_container_quant(meta_text, arch); !st.ok()) return st;
+        // What the SHARDS are, captured before any caller overlay can move it.
+        as_converted = arch.quantization;
+        from_container = true;
     }
 
     // The caller's HYPOTHETICAL map, applied last so it wins over whatever the
@@ -522,6 +528,21 @@ resolve_arch(const std::string& model_dir, const std::string& quant_overlay_json
     // A plan that omitted it left admission with nothing to record a model
     // under, so every unconverted model would have collided on the empty string.
     if (auto st = compute_arch_hash(arch, arch.arch_hash); !st.ok()) return st;
+
+    // And the CONTAINER's identity alongside it, which is not the same thing.
+    //
+    // `--quant-dense` names the precision of the resident half at load. The
+    // converter stores that half F32 on disk so the choice costs no reconversion,
+    // so it moves `arch_hash` — which covers every role — without moving a byte of
+    // the container. Stamping and gating on `arch_hash` alone would make the
+    // container refuse exactly the serve invocation that decision exists to
+    // permit; caught by `soma_container_g2` the first time a container was ever
+    // actually stamped.
+    if (from_container) {
+        ArchIr as_built = arch;
+        as_built.quantization = as_converted;
+        if (auto st = compute_arch_hash(as_built, arch.container_arch_hash); !st.ok()) return st;
+    }
     return {};
 }
 

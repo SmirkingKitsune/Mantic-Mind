@@ -54,8 +54,8 @@ int check_container(const fs::path& fixture, const fs::path& container) {
         return gap ? 0 : 1;
     }
 
-    // Resolve the conversion's own map. V1 containers carry only expert dtypes
-    // and keep resident tensors F32; V4 additionally carries dtype_dense and a
+    // Resolve the conversion's own map. Ordinary containers keep resident
+    // tensors F32; V4 additionally carries dtype_dense and a
     // prequantized resident index which correctly refuses an all-F32 load.
     soma::ArchIr container_arch;
     if (auto st = soma::resolve_arch(container.string(), {}, container_arch); !st.ok()) {

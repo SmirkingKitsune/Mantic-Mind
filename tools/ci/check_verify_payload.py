@@ -33,6 +33,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools" / "admission"))
 
+from convert import FLAG_PER_ROLE_QUANT  # noqa: E402  (needs the path above)
+
 VERIFY = ROOT / "tools" / "admission" / "verify_payload.py"
 CONVERT = ROOT / "tools" / "admission" / "convert.py"
 FIXTURE = ROOT / "tests" / "fixtures" / "tiny" / "GLM-5.2"
@@ -50,9 +52,17 @@ def run_verify(container: Path, source: Path, *extra: str):
 
 
 def index_header_len(container: Path) -> int:
+    """Bytes before the first index entry. Every case below patches entries by
+    offset, so this has to track the header exactly — including the optional
+    per-role quantization descriptor, whose presence the flags word declares."""
     raw = (container / "soma.container").read_bytes()
+    (flags,) = struct.unpack_from("<I", raw, 12)
     (hash_len,) = struct.unpack_from("<I", raw, 16)
-    return 8 + 8 + 4 + hash_len + 16 + 4 + 16
+    n = 8 + 8 + 4 + hash_len + 16 + 4
+    if flags & FLAG_PER_ROLE_QUANT:
+        (n_roles,) = struct.unpack_from("<I", raw, n)
+        n += 4 + 12 * n_roles
+    return n + 16
 
 
 def first_live_slot(container: Path) -> tuple[int, int, int, int]:

@@ -1,7 +1,7 @@
 {
   "align": 4096,
-  "config_sha256": "ea43ba679beec6435687f5cae5e34a3c71fc345053c1b3f73ca7565a9bbcf268",
-  "container_version": 1,
+  "config_sha256": "aca2ed6f864815f228f1e17bdee3a99a6e8c601ed2ef8040821b41b6f4780859",
+  "container_version": 2,
   "dense_sharded": true,
   "dense_tensors": 66,
   "dspark": "present",
@@ -29,6 +29,11 @@
   "dtype_gate_up": "f32",
   "effective_groups": {
     "f32": 32
+  },
+  "effective_groups_by_role": {
+    "down": 32,
+    "gate": 64,
+    "up": 64
   },
   "expert_bytes": 24576,
   "group": 128,

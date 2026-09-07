@@ -18,8 +18,8 @@ import struct
 from pathlib import Path
 from typing import Any
 
-from convert import (ALIGN, DTYPE_ID, FORMAT_VERSION, MAGIC, align_up,
-                     quantize_rows)
+from convert import (ALIGN, DTYPE_ID, FLAG_PER_ROLE_QUANT, FORMAT_VERSION, MAGIC,
+                     align_up, quantize_rows, role_descriptor, usable_group)
 
 PINNED_REVISION = "72e1d3230f6c080a530b0a1d46f8eb4602340597"
 PINNED_CONFIG_SHA256 = "9dd2a89255469e120b333668ef5a169b7ae46c00f6bbab786bf0be457546aec0"
@@ -467,6 +467,17 @@ def run(args) -> int:
     total_payload = 0
     uniform_len = -1
     effective_groups: dict[str, int] = {}
+    # Seeded from the CONFIG, then overwritten by whatever the quantization loops
+    # actually observe. A resumed conversion writes its indexes without having
+    # re-quantized anything, so the observed values are simply not available — and
+    # that is not a theoretical case: this model's fixture is 64 x 32, both below
+    # the default group of 128, so an index that fell back to the REQUESTED group
+    # would carry a descriptor the engine then refuses.
+    _seed = {"gate": usable_group(int(cfg["hidden_size"]), args.group),
+             "up": usable_group(int(cfg["hidden_size"]), args.group),
+             "down": usable_group(int(cfg["moe_intermediate_size"]), args.group)}
+    role_groups: dict[str, int] = dict(_seed)
+    dspark_role_groups: dict[str, int] = dict(_seed)
     for layer in range(n_layers):
         final = out_dir / f"experts-{layer:05d}.bin"
         done = manifest["completed_expert_layers"].get(str(layer))
@@ -489,7 +500,9 @@ def run(args) -> int:
             with open(tmp, "wb") as fh:
                 for expert in range(n_experts):
                     blob = bytearray()
-                    for proj, dtype in (("w1", dt_gate), ("w3", dt_gate), ("w2", dt_down)):
+                    for proj, role, dtype in (("w1", "gate", dt_gate),
+                                              ("w3", "up", dt_gate),
+                                              ("w2", "down", dt_down)):
                         if fixture_mode:
                             if proj == "w1": arr = fused_gate_up[expert, :inter]
                             elif proj == "w3": arr = fused_gate_up[expert, inter:]
@@ -499,6 +512,7 @@ def run(args) -> int:
                             arr = get(name)
                         packed, group = quantize_rows(arr, dtype, args.group)
                         effective_groups[dtype] = group
+                        role_groups[role] = group
                         blob += packed
                     offsets.append([off, len(blob)])
                     fh.write(blob)
@@ -611,12 +625,14 @@ def run(args) -> int:
                 with open(tmp, "wb") as fh:
                     for expert in range(n_experts):
                         blob = bytearray()
-                        for proj, dtype in (("w1", dt_gate), ("w3", dt_gate),
-                                            ("w2", dt_down)):
+                        for proj, role, dtype in (("w1", "gate", dt_gate),
+                                                  ("w3", "up", dt_gate),
+                                                  ("w2", "down", dt_down)):
                             name = (f"model.dspark.layers.{stage}.ffn.experts."
                                     f"{expert}.{proj}.weight")
                             packed, group = quantize_rows(get_dspark(name), dtype, args.group)
                             effective_groups[dtype] = group
+                            dspark_role_groups[role] = group
                             blob += packed
                         offsets.append([off, len(blob)])
                         fh.write(blob)
@@ -719,11 +735,13 @@ def run(args) -> int:
 
         with open(out_dir / "soma.dspark.tmp", "wb") as ix:
             ix.write(MAGIC)
-            ix.write(struct.pack("<II", FORMAT_VERSION, 0))
+            ix.write(struct.pack("<II", FORMAT_VERSION, FLAG_PER_ROLE_QUANT))
             ix.write(struct.pack("<I", 0))
             ix.write(struct.pack("<IIII", DSPARK_STAGES, n_experts,
                                  DSPARK_STAGES, DTYPE_ID[dt_gate]))
-            ix.write(struct.pack("<I", args.group))
+            ix.write(struct.pack("<I", dspark_role_groups.get("gate", args.group)))
+            ix.write(role_descriptor(dt_gate, dt_gate, dt_down, dspark_role_groups,
+                                     args.group))
             ix.write(struct.pack("<QQ", max(dspark_uniform_len, 0),
                                  dspark_total_payload))
             for shard_id, off, length in dspark_all_index:
@@ -750,10 +768,11 @@ def run(args) -> int:
 
     with open(out_dir / "soma.container.tmp", "wb") as ix:
         ix.write(MAGIC)
-        ix.write(struct.pack("<II", FORMAT_VERSION, 0))
+        ix.write(struct.pack("<II", FORMAT_VERSION, FLAG_PER_ROLE_QUANT))
         ix.write(struct.pack("<I", 0))
         ix.write(struct.pack("<IIII", n_layers, n_experts, n_layers, DTYPE_ID[dt_gate]))
-        ix.write(struct.pack("<I", args.group))
+        ix.write(struct.pack("<I", role_groups.get("gate", args.group)))
+        ix.write(role_descriptor(dt_gate, dt_gate, dt_down, role_groups, args.group))
         ix.write(struct.pack("<QQ", max(uniform_len, 0), total_payload))
         for shard, off, length in all_index:
             ix.write(struct.pack("<IQI", shard, off, length))
@@ -797,6 +816,7 @@ def run(args) -> int:
         "expert_bytes": uniform_len, "total_expert_bytes": total_payload,
         "dtype_gate_up": dt_gate, "dtype_down": dt_down, "dtype_dense": args.quant,
         "group": args.group, "effective_groups": effective_groups,
+        "effective_groups_by_role": role_groups,
         "dense_tensors": len(dense_weight_map), "quantized_resident_tensors": len(qweight_map),
         "lossless_resident_bytes": dense_total, "quantized_resident_bytes": qweight_total,
         "dense_sharded": True,

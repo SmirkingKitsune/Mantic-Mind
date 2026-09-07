@@ -7191,11 +7191,11 @@ bool test_admission_pipeline_runs_and_reports() {
     // the registry row at the end. Conversion is skipped by pointing at a
     // container that already exists, which is exactly what reprofile() does.
     const char* soma_path = std::getenv("MM_TEST_SOMA_PATH");
-    const char* model_dir = std::getenv("MM_TEST_MODEL_DIR");
+    const char* model_dir = std::getenv("MM_TEST_CONTAINER_DIR");
     if (soma_path == nullptr || model_dir == nullptr) {
         // Skipped rather than silently passing: CTest passes both, and a
         // developer running the binary by hand should be told why this is quiet.
-        std::cout << "  (skipped: MM_TEST_SOMA_PATH / MM_TEST_MODEL_DIR unset)\n";
+        std::cout << "  (skipped: MM_TEST_SOMA_PATH / MM_TEST_CONTAINER_DIR unset)\n";
         return true;
     }
 
@@ -7241,33 +7241,27 @@ bool test_admission_pipeline_runs_and_reports() {
     // not the absence of further frames.
     CHECK(last.finished_at_ms >= last.started_at_ms);
 
-    // The tiny fixture is a raw HF checkpoint, not a converted container, so it
-    // carries no arch_hash — and without an identity there is nothing to key a
-    // row on. Refused with that reason rather than recorded under an empty hash,
-    // which would collide with every other unconverted model.
-    if (!last.last_error.empty()) {
-        CHECK(last.last_error.find("arch_hash") != std::string::npos);
-        CHECK(reg.list().empty());
-    } else {
-        CHECK(last.model_id > 0);
-        const auto admitted = reg.find_by_id(last.model_id);
-        CHECK(admitted.has_value());
-        // Straight from `soma plan --json`, which is why those fields were added
-        // to the plan document: control has no other view of the model.
-        CHECK(admitted->n_experts > 0);
-        CHECK(admitted->top_k > 0);
-        CHECK(admitted->active_fraction > 0.0);
-        CHECK(!admitted->attention_family.empty());
-    }
+    CHECK(last.last_error.empty());
+    CHECK(last.model_id > 0);
+    const auto admitted = reg.find_by_id(last.model_id);
+    CHECK(admitted.has_value());
+    // Straight from `soma plan --json`, which is why those fields were added
+    // to the plan document: control has no other view of the model.
+    CHECK(admitted->n_experts > 0);
+    CHECK(admitted->top_k > 0);
+    CHECK(admitted->active_fraction > 0.0);
+    CHECK(!admitted->attention_family.empty());
 
     // Progress is STAGED, and the operation is retrievable after it ends — an
     // SSE connection will not survive a real conversion, so a client that
     // reconnects has to be able to find out how it went.
-    bool saw_profile = false, saw_finalize = false;
+    bool saw_stamp = false, saw_profile = false, saw_finalize = false;
     for (const auto& f : frames) {
+        if (f.stage == "stamp") saw_stamp = true;
         if (f.stage == "profile") saw_profile = true;
         if (f.stage == "finalize") saw_finalize = true;
     }
+    CHECK(saw_stamp);
     CHECK(saw_profile);
     CHECK(saw_finalize);
     CHECK(reg.operation(op).has_value());
@@ -7470,7 +7464,7 @@ bool test_admission_fetch_stage() {
     // either would leave the ladder reporting fewer stages while still saying
     // "no failures", which reads as a pass.
     const std::vector<std::string> want{"fetch",     "convert",     "tokenize",
-                                        "oracle",    "reference",   "profile",
+                                        "stamp",     "oracle",      "reference",   "profile",
                                         "conformance", "finalize"};
     std::size_t at = 0;
     std::int64_t peak_bytes = 0, peak_total = 0;
@@ -7481,7 +7475,7 @@ bool test_admission_fetch_stage() {
         peak_bytes = std::max(peak_bytes, f.bytes_done);
         peak_total = std::max(peak_total, f.bytes_total);
     }
-    CHECK(at == want.size()); // all six seen, in order
+    CHECK(at == want.size()); // every stage seen, in order
 
     // The byte counters are the reason fetch is worth a stage of its own: it is
     // the only one whose remaining time a client can estimate.
@@ -7750,8 +7744,11 @@ bool test_requantization_is_a_new_admission() {
     const char* python = std::getenv("MM_TEST_PYTHON");
     const char* soma_path = std::getenv("MM_TEST_SOMA_PATH");
     const char* container_dir = std::getenv("MM_TEST_CONTAINER_DIR");
-    if (python == nullptr || soma_path == nullptr || container_dir == nullptr) {
-        std::cout << "  (pipeline half skipped: MM_TEST_PYTHON / SOMA_PATH / CONTAINER_DIR unset)\n";
+    const char* source_dir = std::getenv("MM_TEST_MODEL_DIR");
+    if (python == nullptr || soma_path == nullptr || container_dir == nullptr ||
+        source_dir == nullptr) {
+        std::cout << "  (pipeline half skipped: MM_TEST_PYTHON / SOMA_PATH / CONTAINER_DIR / "
+                     "MODEL_DIR unset)\n";
         return true;
     }
 
@@ -7759,27 +7756,14 @@ bool test_requantization_is_a_new_admission() {
     const auto tools_dir = dir / "tools";
     std::filesystem::create_directories(tools_dir);
 
-    // A stub convert that RESPECTS --quant, so the two admissions differ in the
-    // way a real conversion would. It copies the fixture and rewrites the
-    // container's declared quantization; that is exactly the field `soma plan`
-    // reads to build the IR the hash is taken over.
+    // Conversion is real here. A metadata-only stub used to claim q8 while
+    // copying q4 bytes, which is precisely the role-layout corruption the stamp
+    // stage now refuses. The tiny source keeps two genuine conversions cheap.
     {
         std::ofstream f(tools_dir / "convert.py", std::ios::binary);
-        f << "import json, os, shutil, sys\n"
-             "src = os.environ['MM_STUB_CONTAINER']\n"
-             "out = sys.argv[sys.argv.index('--out') + 1]\n"
-             "quant = sys.argv[sys.argv.index('--quant') + 1]\n"
-             "down = sys.argv[sys.argv.index('--expert-down') + 1]\n"
-             "group = int(sys.argv[sys.argv.index('--group') + 1])\n"
-             "shutil.rmtree(out, ignore_errors=True)\n"
-             "shutil.copytree(src, out)\n"
-             "p = os.path.join(out, 'container_meta.json')\n"
-             "m = json.load(open(p))\n"
-             "m['dtype_gate_up'] = quant\n"
-             "m['dtype_down'] = down\n"
-             "m['group'] = group\n"
-             "json.dump(m, open(p, 'w'))\n"
-             "print('    layer 1/1  0.00 GB', flush=True)\n";
+        f << "import os, subprocess, sys\n"
+             "raise SystemExit(subprocess.call([sys.executable, "
+             "os.environ['MM_REAL_CONVERT'], *sys.argv[1:]]))\n";
         std::ofstream t(tools_dir / "compile_tokenizer.py", std::ios::binary);
         t << "print('stub tokenizer', flush=True)\n";
         // Stands in for the real oracle builder, which needs torch and must not
@@ -7821,15 +7805,21 @@ bool test_requantization_is_a_new_admission() {
 
 #ifdef _WIN32
     _putenv_s("MM_STUB_CONTAINER", container_dir);
+    const auto real_convert = std::filesystem::path(container_dir)
+                                  .parent_path().parent_path().parent_path().parent_path() /
+                              "tools" / "admission" / "convert.py";
+    _putenv_s("MM_REAL_CONVERT", real_convert.string().c_str());
 #else
     setenv("MM_STUB_CONTAINER", container_dir, 1);
+    const auto real_convert = std::filesystem::path(container_dir)
+                                  .parent_path().parent_path().parent_path().parent_path() /
+                              "tools" / "admission" / "convert.py";
+    setenv("MM_REAL_CONVERT", real_convert.string().c_str(), 1);
 #endif
 
-    // The source is a raw config the architecture check can read.
-    const auto source = dir / "weights";
-    std::filesystem::create_directories(source);
-    std::filesystem::copy_file(std::filesystem::path(container_dir) / "config.json",
-                               source / "config.json");
+    // The real tiny checkpoint: config plus safetensors, so the converter really
+    // rewrites the bytes at each requested quantization.
+    const std::filesystem::path source(source_dir);
 
     struct Run {
         std::vector<mm::AdmissionProgress> frames;
@@ -7969,8 +7959,8 @@ bool test_requantization_is_a_new_admission() {
 
         // By name it is deterministic rather than arbitrary: repeated calls
         // agree, which is the property that was missing.
-        const auto once = reg.resolve("weights");
-        const auto twice = reg.resolve("weights");
+        const auto once = reg.resolve(source.filename().string());
+        const auto twice = reg.resolve(source.filename().string());
         CHECK(once.has_value() && twice.has_value());
         CHECK(once->id == twice->id);
     }

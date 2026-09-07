@@ -1,8 +1,9 @@
 // Soma — the engine executable.
 //
-//   soma serve   --model-dir DIR [--port N] [--host H] [--ctx-size N] ...
-//   soma plan    --model-dir DIR [--json]
-//   soma conform --model-dir DIR [--json]
+//   soma serve        --model-dir DIR [--port N] [--host H] [--ctx-size N] ...
+//   soma plan         --model-dir DIR [--json]
+//   soma conform      --model-dir DIR [--json]
+//   soma stamp        DIR
 //
 // `plan` exists as a subcommand of the same binary rather than a separate tool
 // because the planner it runs is the one the server runs: an operator asking
@@ -11,6 +12,7 @@
 
 #include "soma/arch_ir.hpp"
 #include "soma/conformance.hpp"
+#include "soma/expert_store.hpp"
 #include "soma/plan.hpp"
 #include "soma/quant_format.hpp"
 #include "soma/safetensors.hpp"
@@ -44,6 +46,8 @@ int usage() {
                  "               [--ram-budget BYTES] [--pin BYTES] [--kv-dir DIR]\n"
                  "               [--quant-dense DTYPE]  quantize the RESIDENT half at load\n"
                  "               [--served-name NAME]\n"
+                 "               [--allow-unstamped]  open an unstamped or legacy-v1\n"
+                 "                                    container (development only)\n"
                  "  soma plan    --model-dir DIR [--json]\n"
                  "               [--quant DTYPE] [--expert-down DTYPE] [--quant-dense DTYPE]\n"
                  "               [--group N]\n"
@@ -54,7 +58,11 @@ int usage() {
                  "(default 1.0)\n"
                  "               the verdict is a property of (model, quantization, host);\n"
                  "               these ASK about a quantization and a host, and convert nothing\n"
-                 "  soma conform --model-dir DIR [--json]\n";
+                 "  soma conform --model-dir DIR [--json]\n"
+                 "  soma stamp DIR\n"
+                 "               verify a converted v2 container's role descriptor, then\n"
+                 "               bind its index to the canonical C++ IR arch_hash. Shards\n"
+                 "               are not rewritten; serve refuses an unstamped container.\n";
     return 2;
 }
 
@@ -748,6 +756,58 @@ int cmd_serve(int argc, char** argv) {
     return 0;
 }
 
+
+// ── stamp ────────────────────────────────────────────────────────────────────
+//
+// The step the container format has always assumed and nothing performed.
+//
+// `arch_hash` is the model's identity — the registry keys rows on it, KV
+// checkpoints gate on it, and ExpertStore refuses a container across a mismatch.
+// convert.py deliberately leaves it empty, because the canonical hash is defined
+// by the C++ IR canonicalization and a second implementation in Python would
+// agree until it did not. That was the right call and it left the gate dormant:
+// every container ever written was unstamped, so the mismatch branch could not
+// fire, and the only remaining guard compared a byte TOTAL that cannot tell one
+// role's quantization from another's.
+//
+// This runs the SAME resolve_arch() the planner and the server run, so the hash
+// it writes is by construction the hash they will compute.
+int cmd_stamp(int argc, char** argv) {
+    if (argc != 1 || argv[0][0] == '-') return usage();
+    const std::string dir = argv[0];
+
+    const std::filesystem::path root(dir);
+    // A container, specifically. `plan` accepts a bare HF checkpoint because
+    // asking "what would this do here?" before converting is legitimate; there is
+    // no such reading of "stamp this", and stamping a directory with no shards
+    // would produce an index describing nothing.
+    if (!std::filesystem::exists(root / "container_meta.json")) {
+        std::cerr << "stamp: no container_meta.json in " << dir
+                  << "; this is not a converted container\n";
+        return 1;
+    }
+    if (!std::filesystem::exists(root / "soma.container")) {
+        std::cerr << "stamp: no soma.container in " << dir << "\n";
+        return 1;
+    }
+
+    soma::ArchIr arch;
+    if (auto st = soma::resolve_arch(dir, {}, arch); !st.ok()) {
+        std::cerr << "stamp: " << st.message() << "\n";
+        return 1;
+    }
+    // stamp_container validates the same parsed snapshot it writes.
+    if (auto st = soma::stamp_container(dir, arch); !st.ok()) {
+        std::cerr << "stamp: " << st.message() << "\n";
+        return 1;
+    }
+    const auto& identity = arch.container_arch_hash.empty() ? arch.arch_hash
+                                                            : arch.container_arch_hash;
+    std::cout << "stamped " << (root / "soma.container").string() << "\n"
+              << "arch_hash " << identity << "\n";
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -756,6 +816,7 @@ int main(int argc, char** argv) {
     if (cmd == "serve") return cmd_serve(argc - 2, argv + 2);
     if (cmd == "plan") return cmd_plan(argc - 2, argv + 2);
     if (cmd == "conform") return cmd_conform(argc - 2, argv + 2);
+    if (cmd == "stamp") return cmd_stamp(argc - 2, argv + 2);
     if (cmd == "--help" || cmd == "-h") {
         usage();
         return 0;

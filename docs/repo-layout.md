@@ -19,7 +19,7 @@ include/soma/arch/       per-architecture backends (gqa.hpp, mla.hpp)
 src/soma/                mm_soma static lib + the header self-test
 src/soma/arch/           per-architecture translation units
 src/soma/arch_registry.cpp   the ONE core TU permitted to include soma/arch/
-src/soma/main.cpp        `soma` executable: serve | plan --json | admit-verify
+src/soma/main.cpp        `soma` executable: serve | plan --json | conform | stamp
 
 include/{common,node,control}/   Mantic-Mind, unchanged in shape
 src/{common,node,control}/
