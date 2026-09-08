@@ -48,6 +48,9 @@ int usage() {
                  "               [--served-name NAME]\n"
                  "               [--allow-unstamped]  open an unstamped or legacy-v1\n"
                  "                                    container (development only)\n"
+                 "               [--allow-byte-tokenizer]  serve a container with no\n"
+                 "                                        compiled tokenizer; the text\n"
+                 "                                        it generates is meaningless\n"
                  "  soma plan    --model-dir DIR [--json]\n"
                  "               [--quant DTYPE] [--expert-down DTYPE] [--quant-dense DTYPE]\n"
                  "               [--group N]\n"
@@ -804,7 +807,15 @@ int cmd_serve(int argc, char** argv) {
     // Readiness is still the /health poll — this line is for humans.
     std::cout << "soma serve listening on " << cfg.host << ":" << cfg.port
               << "  model=" << cfg.model_dir
-              << "  verdict=" << soma::to_string(server.plan().verdict) << std::endl;
+              << "  verdict=" << soma::to_string(server.plan().verdict);
+    // Said every time, not once at open. An operator reading a log to find
+    // out why the output is gibberish should meet this line before they
+    // start looking at the weights.
+    if (!server.byte_tokenizer_reason().empty()) {
+        std::cout << "\n  WARNING: no tokenizer — encoding one token per byte. Generated "
+                     "text is MEANINGLESS (" << server.byte_tokenizer_reason() << ")";
+    }
+    std::cout << std::endl;
 
     if (auto st = server.listen(); !st.ok()) {
         std::cerr << st.message() << "\n";

@@ -726,10 +726,24 @@ int check_plan_matches_serve(const fs::path& containers) {
     check(pst.ok(), "resolved model plans", pst.ok() ? "" : pst.message());
     if (!pst.ok()) return bad;
 
-    soma::ServeConfig cfg;
-    cfg.model_dir = dir.string();
-    cfg.quant_dense = "q4_g";
-    cfg.kv_slots = host.kv_slots;
+    // No fixture container carries a compiled tokenizer, so serving one is now a
+    // deliberate opt-in. That is the point of the flag: this suite exercises the
+    // engine, the plan and the KV path, none of which need the text to mean
+    // anything — and saying so in the config is how that stays a decision rather
+    // than an accident.
+    soma::ServeConfig no_tokenizer;
+    no_tokenizer.model_dir = dir.string();
+    no_tokenizer.quant_dense = "q4_g";
+    no_tokenizer.kv_slots = host.kv_slots;
+    soma::ServeServer refused_tokenizer;
+    const auto tst_refused = refused_tokenizer.open(no_tokenizer);
+    check(!tst_refused.ok() && tst_refused.code() == soma::StatusCode::Unsupported &&
+              tst_refused.message().find("meaningless") != std::string::npos,
+          "a container with no tokenizer is refused, and says what serving it would do",
+          tst_refused.message());
+
+    soma::ServeConfig cfg = no_tokenizer;
+    cfg.allow_byte_tokenizer = true;
     soma::ServeServer server;
     const auto sst = server.open(cfg);
     check(sst.ok(), "the same container opens for serving", sst.ok() ? "" : sst.message());
@@ -740,6 +754,12 @@ int check_plan_matches_serve(const fs::path& containers) {
         check(server.plan().arch_hash == planned.arch_hash,
               "plan and serve agree on arch_hash",
               planned.arch_hash.substr(0, 16) + "...");
+        // Opting in is not the same as hiding it. The server has to be able to
+        // say why its text is meaningless, because a client that connects to an
+        // already-running one has no other way to find out.
+        check(!server.byte_tokenizer_reason().empty(),
+              "and a byte-fallback server reports itself as one",
+              server.byte_tokenizer_reason());
         server.stop();
     }
 
@@ -760,6 +780,11 @@ int check_plan_matches_serve(const fs::path& containers) {
           ust.message());
 
     const char* missing_argv[] = {"--model-dir", "fixture", "--quant-dense"};
+    const char* byte_argv[] = {"--model-dir", "fixture", "--allow-byte-tokenizer"};
+    soma::ServeConfig byte_cfg;
+    check(!byte_cfg.allow_byte_tokenizer, "byte-tokenizer fallback defaults to disabled");
+    check(soma::parse_serve_config(3, byte_argv, byte_cfg).ok() && byte_cfg.allow_byte_tokenizer,
+          "--allow-byte-tokenizer explicitly enables fallback");
     soma::ServeConfig parsed;
     const auto mst = soma::parse_serve_config(3, missing_argv, parsed);
     check(!mst.ok() && mst.code() == soma::StatusCode::InvalidArgument,

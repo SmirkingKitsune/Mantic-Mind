@@ -86,6 +86,22 @@ struct ServeConfig {
     /// having moved since. Run `soma stamp <dir>` instead; this exists for a
     /// container that cannot be reconverted or stamped right now.
     bool allow_unstamped = false;
+
+    /// Serve a container with no compiled tokenizer. // --allow-byte-tokenizer
+    ///
+    /// Off by default, because the fallback is one token per byte folded into the
+    /// vocabulary: real tokens, real weights, real logits, and text that means
+    /// nothing. That is the one failure shape this engine refuses everywhere
+    /// else — a container whose quantization map is wrong is refused, a shard
+    /// whose bytes moved is refused — and it was the last place a wrong answer
+    /// could still be returned as if it were a right one.
+    ///
+    /// It stays available because it is genuinely useful: it is how the engine,
+    /// the scheduler and the KV path are exercised on a family whose pretokenizer
+    /// is not compiled yet, which is most of them. What it must not be is the
+    /// default, and it must not be quiet — `/v1/models` reports it and so does
+    /// the line `soma serve` prints once it is listening.
+    bool allow_byte_tokenizer = false;
 };
 
 /// Reasons the server refuses a request, mapped to HTTP by the implementation.
@@ -128,6 +144,10 @@ public:
     bool ready() const noexcept;
     const PlanDocument& plan() const noexcept;
     const ServeConfig& config() const noexcept;
+
+    /// Why this server is encoding bytes rather than tokens, or empty when it is
+    /// not. Non-empty only under `--allow-byte-tokenizer`.
+    const std::string& byte_tokenizer_reason() const noexcept;
     TelemetryChannel& telemetry() noexcept;
 
 private:

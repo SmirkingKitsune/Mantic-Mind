@@ -162,9 +162,22 @@ is byte-identical from either source, and every dense tensor widens back exactly
 The tokenizer is compiled INTO the container, before the expert loop, and the outcome is recorded in
 `container_meta.json` and repeated in the converter's final summary. It is NON-FATAL: most families'
 pretokenizers are not compiled yet, and aborting a multi-hour conversion over a tokenizer would be
-disproportionate to a gap the container can be used without. A container without one still serves —
-`soma serve` falls back to one token per byte, which produces real tokens from real weights and
-meaningless text, and `conform` reports `tokenizer_roundtrip` as skipped rather than passed.
+disproportionate to a gap the container can be used without. Without a compiled tokenizer, the fallback
+is one token per byte, which produces real tokens from real weights and meaningless text.
+`soma serve` refuses that fallback unless `--allow-byte-tokenizer` is supplied, and
+`conform` reports `tokenizer_roundtrip` as skipped rather than passed.
+
+That refusal is the point of recording `tokenizer` in the meta at all. Three arrivals, three sentences:
+a family whose pretokenizer is not compiled yet is a known gap; a container whose meta says `compiled`
+with no `tokenizer.soma` beside it has lost a file; one that will not open is broken. The fallback stays
+reachable because it is how the engine, the scheduler and the KV path are exercised on the families that
+have no compiled pretokenizer — which is most of them — but it is a decision now, and a loud one:
+`GET /v1/models` reports `"tokenizer": "byte-fallback"` with the reason, and the line `soma serve`
+prints once it is listening carries the same warning. A client connecting to a server already running
+has no other way to learn that its text means nothing.
+
+On a node, the flag travels in the agent's `extra_args`. The engine descriptor does not add it — a node
+choosing that for an operator would put the decision back where it was.
 
 The ordinary **dense half stays in safetensors** deliberately. It is loaded once, in full, at startup — none of
 the four requirements above apply to it, and keeping a standard format means it stays inspectable with

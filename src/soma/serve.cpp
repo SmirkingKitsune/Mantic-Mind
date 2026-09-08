@@ -383,6 +383,11 @@ struct ServeServer::Impl {
     KvCheckpointStore checkpoints;
     CompiledTokenizer tokenizer;
     bool have_tokenizer = false;
+    /// Non-empty only when serving WITHOUT one, under --allow-byte-tokenizer.
+    /// Carried so the state is reportable rather than merely true, since a
+    /// client connecting to an already-running server has no other way to
+    /// learn that its text is byte-fallback.
+    std::string byte_tokenizer_reason;
     const PromptCodec* prompt_codec = nullptr;
     bool speculative_selected = false;
 
@@ -1023,6 +1028,9 @@ ServeServer::~ServeServer() {
 
 Status ServeServer::open(const ServeConfig& config) {
     auto& im = *impl_;
+    im.have_tokenizer = false;
+    im.tokenizer.close();
+    im.byte_tokenizer_reason.clear();
     im.cfg = config;
     if (config.model_dir.empty()) {
         return {StatusCode::InvalidArgument, "--model-dir is required"};
@@ -1140,10 +1148,56 @@ Status ServeServer::open(const ServeConfig& config) {
         }
     }
 
+    // The tokenizer, and the refusal when there is not one.
+    //
+    // Without it the encoder falls back to one token per byte folded into the
+    // vocabulary. That path produces real tokens from real weights and real
+    // logits, and text that means nothing — a wrong answer shaped exactly like a
+    // right one, which is the failure this engine refuses everywhere else. It was
+    // the last place one could still be served silently.
+    //
+    // The three ways to arrive here are different problems and get different
+    // sentences: a family whose pretokenizer is not compiled yet is a known gap,
+    // a container whose meta claims a tokenizer that is not on disk has lost a
+    // file, and one that will not open is broken. container_meta.json records
+    // `tokenizer` for exactly this distinction and nothing consumed it until now.
     const auto tok = fs::path(config.model_dir) / "tokenizer.soma";
+    std::string tokenizer_problem;
     if (fs::exists(tok)) {
-        im.have_tokenizer = im.tokenizer.open(tok.string()).ok();
+        if (auto st = im.tokenizer.open(tok.string()); st.ok()) {
+            im.have_tokenizer = true;
+        } else {
+            tokenizer_problem = "tokenizer.soma will not load: " + st.message();
+        }
+    } else {
+        std::string declared;
+        std::ifstream meta_in(fs::path(config.model_dir) / "container_meta.json",
+                              std::ios::binary);
+        if (meta_in) {
+            try {
+                json meta;
+                meta_in >> meta;
+                declared = meta.value("tokenizer", std::string{});
+            } catch (const std::exception&) {
+                declared.clear();
+            }
+        }
+        tokenizer_problem =
+            (declared == "compiled")
+                ? "container_meta.json records a compiled tokenizer and tokenizer.soma is not "
+                  "here; the container has lost a file"
+                : "no tokenizer was compiled for this family";
     }
+
+    if (!im.have_tokenizer && !config.allow_byte_tokenizer) {
+        return {StatusCode::Unsupported,
+                config.model_dir + ": " + tokenizer_problem +
+                    ". Serving would encode one token per byte, which generates real tokens from "
+                    "real weights and meaningless text. Pass --allow-byte-tokenizer to do that "
+                    "deliberately — it is how the engine is exercised on a family whose "
+                    "pretokenizer is not compiled yet"};
+    }
+    im.byte_tokenizer_reason = im.have_tokenizer ? std::string{} : tokenizer_problem;
 
     if (!config.checkpoint_dir.empty()) {
         (void)im.checkpoints.open(config.checkpoint_dir, im.model.arch);
@@ -1340,12 +1394,22 @@ Status ServeServer::open(const ServeConfig& config) {
                     res.set_content(text, "text/plain");
                 });
 
-    im.http.Get("/v1/models", [served](const httplib::Request&, httplib::Response& res) {
-        json j;
-        j["object"] = "list";
-        j["data"] = json::array({json{{"id", served}, {"object", "model"}, {"owned_by", "soma"}}});
-        res.set_content(j.dump(), "application/json");
-    });
+    const std::string byte_reason = im.byte_tokenizer_reason;
+    im.http.Get("/v1/models",
+                [served, byte_reason](const httplib::Request&, httplib::Response& res) {
+                    json model{{"id", served}, {"object", "model"}, {"owned_by", "soma"}};
+                    // Reported, not merely known. A client that connects to a
+                    // running server cannot otherwise tell that every completion
+                    // it receives is byte-fallback text.
+                    if (!byte_reason.empty()) {
+                        model["tokenizer"] = "byte-fallback";
+                        model["tokenizer_reason"] = byte_reason;
+                    }
+                    json j;
+                    j["object"] = "list";
+                    j["data"] = json::array({model});
+                    res.set_content(j.dump(), "application/json");
+                });
 
     im.http.Post(
         "/v1/chat/completions",
@@ -1667,6 +1731,10 @@ const ServeConfig& ServeServer::config() const noexcept {
     return impl_->cfg;
 }
 
+const std::string& ServeServer::byte_tokenizer_reason() const noexcept {
+    return impl_->byte_tokenizer_reason;
+}
+
 Status parse_serve_config(int argc, const char* const* argv, ServeConfig& out) {
     // Env first, CLI second, so CLI wins. Both are supported because the node
     // launches with argv while a container image is configured with env, and
@@ -1756,6 +1824,8 @@ Status parse_serve_config(int argc, const char* const* argv, ServeConfig& out) {
             out.quant_dense = argv[++i];
         } else if (a == "--allow-unstamped") {
             out.allow_unstamped = true;
+        } else if (a == "--allow-byte-tokenizer") {
+            out.allow_byte_tokenizer = true;
         }
     }
     if (out.model_dir.empty()) {

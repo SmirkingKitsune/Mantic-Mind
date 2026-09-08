@@ -288,6 +288,7 @@ int main(int argc, char** argv) {
         // build_launch is pure, so the argv is testable without spawning.
         mm::EngineLoadRequest req;
         req.model_path = model;
+        req.settings.extra_args = {"--allow-byte-tokenizer"}; // same fixture, same reason
         req.port = 8123;
         req.settings.ctx_size = 12345;
         req.settings.parallel = 3;
@@ -361,7 +362,12 @@ int main(int argc, char** argv) {
 
         mm::EngineLoadRequest req;
         req.model_path = model;
+        req.settings.extra_args = {"--allow-byte-tokenizer"}; // same fixture, same reason
         req.port = 8124;
+        // Through extra_args, deliberately, and not by the descriptor adding it.
+        // The fixture has no compiled tokenizer, and `soma serve` now refuses one
+        // rather than generating meaningless text; a node must make that an
+        // operator's choice per agent, not a default it applies for them.
         auto spec = mm::EngineRegistry::instance().find("soma")->build_launch(req);
         spec.readiness.timeout_seconds = 60;
 
@@ -377,6 +383,21 @@ int main(int argc, char** argv) {
         }
         check(proc.state() == mm::ProcessState::Ready, "state is Ready");
         check(proc.url() == "http://127.0.0.1:8124", "url()", proc.url());
+
+        httplib::Client models_client("127.0.0.1", 8124);
+        models_client.set_read_timeout(5);
+        const auto models_response = models_client.Get("/v1/models");
+        bool reports_fallback = false;
+        if (models_response && models_response->status == 200) {
+            const auto listing = json::parse(models_response->body, nullptr, false);
+            if (!listing.is_discarded() && listing.contains("data") &&
+                listing["data"].is_array() && listing["data"].size() == 1) {
+                const auto& entry = listing["data"][0];
+                reports_fallback = entry.value("tokenizer", std::string{}) == "byte-fallback" &&
+                                   !entry.value("tokenizer_reason", std::string{}).empty();
+            }
+        }
+        check(reports_fallback, "/v1/models reports byte-tokenizer fallback and its reason");
 
         proc.stop();
         check(proc.state() == mm::ProcessState::Stopped, "state is Stopped after stop()");
@@ -403,6 +424,7 @@ int main(int argc, char** argv) {
 
         mm::EngineLoadRequest req;
         req.model_path = model;
+        req.settings.extra_args = {"--allow-byte-tokenizer"}; // same fixture, same reason
         req.port = 8125;
         auto spec = mm::EngineRegistry::instance().find("soma")->build_launch(req);
         spec.readiness.timeout_seconds = 60;
@@ -474,6 +496,7 @@ int main(int argc, char** argv) {
 
         mm::EngineLoadRequest req;
         req.model_path = model;
+        req.settings.extra_args = {"--allow-byte-tokenizer"}; // same fixture, same reason
         req.settings.ctx_size = 4096;
         req.settings.n_threads = 4;
 
@@ -541,6 +564,7 @@ int main(int argc, char** argv) {
         mm::EngineSupervisor sup(8220, 8230, /*max_slots=*/2);
         mm::EngineLoadRequest req;
         req.model_path = model;
+        req.settings.extra_args = {"--allow-byte-tokenizer"}; // same fixture, same reason
 
         const auto slot = sup.load("soma", req, "agent-c");
         check(!slot.empty(), "engine loaded", slot);
@@ -715,6 +739,7 @@ int main(int argc, char** argv) {
 
         mm::EngineLoadRequest req;
         req.model_path = model;
+        req.settings.extra_args = {"--allow-byte-tokenizer"}; // same fixture, same reason
         const auto slot = sup.load("soma", req, "agent-e");
         check(!slot.empty(), "engine loaded", slot);
         if (slot.empty()) {
@@ -863,6 +888,7 @@ int main(int argc, char** argv) {
         mm::EngineSupervisor sup(8290, 8300, /*max_slots=*/1);
         mm::EngineLoadRequest req;
         req.model_path = model;
+        req.settings.extra_args = {"--allow-byte-tokenizer"}; // same fixture, same reason
         const auto slot = sup.load("soma", req, "agent-stream");
         check(!slot.empty(), "engine loaded", slot);
         if (!slot.empty()) {
@@ -926,6 +952,7 @@ int main(int argc, char** argv) {
         mm::EngineSupervisor sup(8280, 8290, /*max_slots=*/1);
         mm::EngineLoadRequest req;
         req.model_path = model;
+        req.settings.extra_args = {"--allow-byte-tokenizer"}; // same fixture, same reason
         const auto slot = sup.load("soma", req, "agent-f");
         check(!slot.empty(), "engine loaded", slot);
         if (slot.empty()) {
@@ -1064,6 +1091,7 @@ int main(int argc, char** argv) {
         mm::EngineSupervisor sup(8300, 8310, /*max_slots=*/1);
         mm::EngineLoadRequest req;
         req.model_path = container.empty() ? model : container;
+        req.settings.extra_args = {"--allow-byte-tokenizer"}; // same fixture, same reason
         const auto slot = sup.load("soma", req, "agent-t");
         check(!slot.empty(), "engine loaded", slot);
         if (slot.empty()) {
