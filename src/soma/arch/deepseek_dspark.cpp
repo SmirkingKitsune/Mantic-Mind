@@ -618,6 +618,26 @@ bool draft_ffn(const F32Model& model,
             selected[e] = original[e] + l.route_bias[e];
         }
         f32::top_k(selected, E, K, ids, vals);
+
+        // The whole top-k is known HERE, and every one of these experts is about
+        // to be read. Queue them together so the loader pool has all K in flight
+        // while the first acquire below is still waiting on its own read.
+        //
+        // Without this the row paid K miss latencies end to end, one at a time,
+        // with the pool idle between them — and it is the SPECULATIVE path, so
+        // that chain runs per draft token and is discarded outright when the
+        // guess is wrong. The main forward has queued its union this way since
+        // G2 (f32_model.cpp); this loop was written against acquire() directly
+        // and never picked the discipline up.
+        //
+        // Bounded by what the cache can hold: queueing more than that evicts an
+        // expert this same row is going to ask for, turning a latency win into
+        // extra I/O. prefetch_ahead() is the CERTAIN path and consults no
+        // per-layer gate — these are not guesses.
+        const auto cap = p.memory.cap_per_layer();
+        const auto queued = (cap == 0) ? ids.size() : std::min<std::size_t>(ids.size(), cap);
+        p.memory.prefetch_ahead(stage, std::span<const ExpertId>(ids.data(), queued));
+
         float sum = 0.0f;
         for (const auto id : ids)
             sum += original[id];
