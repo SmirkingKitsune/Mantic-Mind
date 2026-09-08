@@ -73,6 +73,25 @@ struct HeatSnapshot {
     std::vector<HeatCell> cells;
 };
 
+/// Parse the JSON `ControlModelRegistry::heat()` emits into a HeatSnapshot.
+///
+/// The registry's shape rather than the telemetry frame's, deliberately. The
+/// frame is a bucketed grid of counts for a picture: it drops `decayed`, which is
+/// the field the bootstrap ranks by, and at Bucketed resolution it drops expert
+/// identity too. The registry row keeps both because it is a record rather than a
+/// rendering.
+///
+/// Cells are bounds-checked against the dimensions the CALLER states, not trusted
+/// from the file: a snapshot taken against a different quantization of the same
+/// architecture has the same layer and expert counts, one taken against a
+/// different model does not, and an out-of-range index would reach past the slot
+/// table. `out_of_range` counts what was dropped so the caller can say so.
+Status parse_heat_snapshot(const std::string& text,
+                           std::uint32_t n_layers,
+                           std::uint32_t n_experts,
+                           HeatSnapshot& out,
+                           std::uint32_t& out_of_range);
+
 struct MemoryBudget {
     std::uint64_t ram_expert_cache_bytes = 0;
     std::uint64_t vram_hot_bytes = 0; ///< v1: always 0

@@ -788,8 +788,9 @@ int check_plan_matches_serve(const fs::path& containers) {
         check(wst.ok(), "a server opens with a heat snapshot", wst.ok() ? "" : wst.message());
         if (wst.ok()) {
             std::uint32_t pinned = 0, resident = 0;
+            double seconds = 0.0;
             std::string reason;
-            warm_server.warm_state(pinned, resident, reason);
+            warm_server.warm_state(pinned, resident, seconds, reason);
             // The claim that matters: pinned experts are RESIDENT, not merely
             // marked. A pinned slot holding nothing counts against occupancy and
             // cannot be evicted for an expert that is actually in use.
@@ -814,8 +815,9 @@ int check_plan_matches_serve(const fs::path& containers) {
         check(sst2.ok(), "a stale snapshot still serves", sst2.ok() ? "" : sst2.message());
         if (sst2.ok()) {
             std::uint32_t pinned = 0, resident = 0;
+            double seconds = 0.0;
             std::string reason;
-            stale_server.warm_state(pinned, resident, reason);
+            stale_server.warm_state(pinned, resident, seconds, reason);
             check(pinned == 0 && !reason.empty(),
                   "and says it warmed nothing rather than pretending otherwise", reason);
             stale_server.stop();
@@ -830,8 +832,10 @@ int check_plan_matches_serve(const fs::path& containers) {
         const auto malformed_status = malformed_server.open(stale);
         check(malformed_status.ok(), "malformed heat fields are advisory, not exceptions");
         std::uint32_t malformed_pins = 0, malformed_resident = 0;
+        double malformed_seconds = 0.0;
         std::string malformed_reason;
-        malformed_server.warm_state(malformed_pins, malformed_resident, malformed_reason);
+        malformed_server.warm_state(
+            malformed_pins, malformed_resident, malformed_seconds, malformed_reason);
         check(malformed_pins == 0 && !malformed_reason.empty(), "malformed cells do not alias valid experts");
         malformed_server.stop();
         missing.heat_path = (fs::temp_directory_path() / "soma-g2-no-such-heat.json").string();
@@ -840,8 +844,9 @@ int check_plan_matches_serve(const fs::path& containers) {
         check(mst2.ok(), "an unreadable snapshot still serves", mst2.ok() ? "" : mst2.message());
         if (mst2.ok()) {
             std::uint32_t pinned = 0, resident = 0;
+            double seconds = 0.0;
             std::string reason;
-            missing_server.warm_state(pinned, resident, reason);
+            missing_server.warm_state(pinned, resident, seconds, reason);
             check(pinned == 0 && reason.find("cannot read") != std::string::npos,
                   "and names the file it could not read", reason);
             missing_server.stop();

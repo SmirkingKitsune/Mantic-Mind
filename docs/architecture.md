@@ -320,6 +320,22 @@ an engine one.
 Reads currently follow global heat order, not physical shard order. Concurrent warming and
 heat-ordered container layouts are not implemented by this change.
 
+**Is heat-ordering the container worth building?** That is a measurement, not an argument, and
+`soma heat-layout DIR --heat FILE [--pin BYTES]` inspects the layout without reading payloads.
+It selects unique experts by `decayed` heat (input order breaks ties), truncated at the pin budget.
+This is a candidate set: serving additionally applies cache-capacity limits and requires successful
+reads. The diagnostic reports maximal contiguous padded ranges in shard/offset order, not the order
+in which startup actually reads the experts.
+
+Packing estimates preserve existing shard membership: one hot prefix per touched layer/shard pair,
+or one global hot prefix per touched shard. Adjacent prefixes can merge, so these are packing targets,
+not guaranteed minimal run counts. Span includes address gaps and alignment padding; it is not a
+measurement of bytes read or physical device travel.
+
+Serving reports bootstrap wall time, including ranking, reads, and any integrity verification. Compare
+like-for-like hosts, cache state, and verification state before and after any future repack. No speedup
+is established by the run-count ratio alone; read merging and physical repacking are not implemented.
+
 ---
 
 ## 6. KV persistence — one format, three callers

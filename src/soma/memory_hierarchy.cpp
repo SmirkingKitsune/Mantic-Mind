@@ -14,6 +14,8 @@
 
 #include "soma/expert_store.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -26,6 +28,8 @@
 #include <vector>
 
 namespace soma {
+
+using json = nlohmann::json;
 
 namespace {
 
@@ -549,6 +553,65 @@ void MemoryHierarchy::unpin(LayerIndex layer, ExpertId expert) noexcept {
     }
 }
 
+Status parse_heat_snapshot(const std::string& text,
+                           std::uint32_t n_layers,
+                           std::uint32_t n_experts,
+                           HeatSnapshot& out,
+                           std::uint32_t& out_of_range) {
+    out = {};
+    out.n_layers = n_layers;
+    out.n_experts = n_experts;
+    out_of_range = 0;
+    json j;
+    try {
+        j = json::parse(text);
+    } catch (const std::exception& e) {
+        return {StatusCode::InvalidArgument, std::string("not valid JSON: ") + e.what()};
+    }
+    if (!j.contains("experts") || !j["experts"].is_array()) {
+        return {StatusCode::InvalidArgument, "no `experts` array"};
+    }
+    for (const auto& cell : j["experts"]) {
+        if (!cell.is_object()) continue;
+        const auto valid_uint = [](const json& value, std::uint64_t limit) {
+            return (value.is_number_unsigned() ||
+                    (value.is_number_integer() && value.get<std::int64_t>() >= 0)) &&
+                   value.get<std::uint64_t>() <= limit;
+        };
+        if (!cell.contains("layer") || !cell.contains("expert") ||
+            !valid_uint(cell["layer"], UINT32_MAX) ||
+            !valid_uint(cell["expert"], UINT32_MAX) ||
+            (cell.contains("count") && !valid_uint(cell["count"], UINT64_MAX)) ||
+            (cell.contains("decayed") &&
+             (!cell["decayed"].is_number() ||
+              !std::isfinite(cell["decayed"].get<double>()) ||
+              cell["decayed"].get<double>() < 0 ||
+              cell["decayed"].get<double>() > std::numeric_limits<float>::max()))) {
+            ++out_of_range;
+            continue;
+        }
+        HeatCell c;
+        c.layer = cell.value("layer", ~std::uint32_t{0});
+        c.expert = cell.value("expert", ~std::uint32_t{0});
+        c.count = cell.value("count", std::uint64_t{0});
+        c.decayed = cell.value("decayed", 0.0f);
+        // Bounds-checked against THIS container, not trusted from the file. A
+        // snapshot taken against a different quantization of the same
+        // architecture has the same layer and expert counts; one taken against a
+        // different model does not, and pinning by an out-of-range index would
+        // reach past the slot table.
+        if (c.layer >= n_layers || c.expert >= n_experts) {
+            ++out_of_range;
+            continue;
+        }
+        out.cells.push_back(c);
+    }
+    if (out.cells.empty()) {
+        return {StatusCode::InvalidArgument, "no usable cells for this container"};
+    }
+    return {};
+}
+
 Status MemoryHierarchy::apply_heat_bootstrap(const HeatSnapshot& heat, Bootstrap* out) {
     auto& impl = *impl_;
     if (out != nullptr) *out = {};
@@ -560,7 +623,7 @@ Status MemoryHierarchy::apply_heat_bootstrap(const HeatSnapshot& heat, Bootstrap
     ranked.reserve(heat.cells.size());
     for (const auto& c : heat.cells)
         ranked.push_back(&c);
-    std::sort(ranked.begin(), ranked.end(), [](const HeatCell* a, const HeatCell* b) {
+    std::stable_sort(ranked.begin(), ranked.end(), [](const HeatCell* a, const HeatCell* b) {
         return a->decayed > b->decayed;
     });
 

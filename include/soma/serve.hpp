@@ -168,6 +168,7 @@ public:
     /// resident. Both zero when no snapshot was given.
     void warm_state(std::uint32_t& pinned,
                     std::uint32_t& resident,
+                    double& seconds,
                     std::string& reason) const noexcept;
     TelemetryChannel& telemetry() noexcept;
 

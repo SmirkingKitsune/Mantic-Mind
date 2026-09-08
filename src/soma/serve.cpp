@@ -195,74 +195,15 @@ struct WarmReport {
     std::uint32_t pinned = 0;
     std::uint32_t resident = 0;   ///< actually read in, not merely marked
     std::uint32_t out_of_range = 0; ///< named an expert this container lacks
+    /// Wall time for bootstrap ranking, reads, and integrity verification.
+    ///
+    /// Reported because it is the number a heat-ORDERED container would move, and
+    /// having it from the same host before and after is the only honest way to
+    /// find out whether that repack is worth doing. `soma heat-layout` says how
+    /// scattered the ranges are; this measures the full bootstrap, not scatter alone.
+    double seconds = 0.0;
     std::string reason;           ///< non-empty when nothing was warmed
 };
-
-/// Parse the JSON `ControlModelRegistry::heat()` emits into a HeatSnapshot.
-///
-/// The registry's shape rather than the telemetry frame's, deliberately. The
-/// frame is a bucketed grid of counts for a picture: it drops `decayed`, which is
-/// the field the bootstrap ranks by, and at Bucketed resolution it drops expert
-/// identity too. The registry row keeps both because it is a record rather than a
-/// rendering.
-Status parse_heat_snapshot(const std::string& text,
-                           std::uint32_t n_layers,
-                           std::uint32_t n_experts,
-                           HeatSnapshot& out,
-                           std::uint32_t& out_of_range) {
-    out = {};
-    out.n_layers = n_layers;
-    out.n_experts = n_experts;
-    out_of_range = 0;
-    json j;
-    try {
-        j = json::parse(text);
-    } catch (const std::exception& e) {
-        return {StatusCode::InvalidArgument, std::string("not valid JSON: ") + e.what()};
-    }
-    if (!j.contains("experts") || !j["experts"].is_array()) {
-        return {StatusCode::InvalidArgument, "no `experts` array"};
-    }
-    for (const auto& cell : j["experts"]) {
-        if (!cell.is_object()) continue;
-        const auto valid_uint = [](const json& value, std::uint64_t limit) {
-            return (value.is_number_unsigned() ||
-                    (value.is_number_integer() && value.get<std::int64_t>() >= 0)) &&
-                   value.get<std::uint64_t>() <= limit;
-        };
-        if (!cell.contains("layer") || !cell.contains("expert") ||
-            !valid_uint(cell["layer"], UINT32_MAX) ||
-            !valid_uint(cell["expert"], UINT32_MAX) ||
-            (cell.contains("count") && !valid_uint(cell["count"], UINT64_MAX)) ||
-            (cell.contains("decayed") &&
-             (!cell["decayed"].is_number() ||
-              !std::isfinite(cell["decayed"].get<double>()) ||
-              cell["decayed"].get<double>() < 0 ||
-              cell["decayed"].get<double>() > std::numeric_limits<float>::max()))) {
-            ++out_of_range;
-            continue;
-        }
-        HeatCell c;
-        c.layer = cell.value("layer", ~std::uint32_t{0});
-        c.expert = cell.value("expert", ~std::uint32_t{0});
-        c.count = cell.value("count", std::uint64_t{0});
-        c.decayed = cell.value("decayed", 0.0f);
-        // Bounds-checked against THIS container, not trusted from the file. A
-        // snapshot taken against a different quantization of the same
-        // architecture has the same layer and expert counts; one taken against a
-        // different model does not, and pinning by an out-of-range index would
-        // reach past the slot table.
-        if (c.layer >= n_layers || c.expert >= n_experts) {
-            ++out_of_range;
-            continue;
-        }
-        out.cells.push_back(c);
-    }
-    if (out.cells.empty()) {
-        return {StatusCode::InvalidArgument, "no usable cells for this container"};
-    }
-    return {};
-}
 
 /// Pin the hottest experts a snapshot names, and READ them in.
 ///
@@ -292,8 +233,11 @@ WarmReport warm_from_heat(const ServeConfig& config,
         return out;
     }
     MemoryHierarchy::Bootstrap bootstrap;
-    if (auto st = memory.apply_heat_bootstrap(snap, &bootstrap); !st.ok()) {
-        out.reason = st.message();
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto boot = memory.apply_heat_bootstrap(snap, &bootstrap);
+    out.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (!boot.ok()) {
+        out.reason = boot.message();
         return out;
     }
     out.pinned = bootstrap.pinned;
@@ -1864,9 +1808,11 @@ const std::string& ServeServer::byte_tokenizer_reason() const noexcept {
 
 void ServeServer::warm_state(std::uint32_t& pinned,
                              std::uint32_t& resident,
+                             double& seconds,
                              std::string& reason) const noexcept {
     pinned = impl_->warm_report.pinned;
     resident = impl_->warm_report.resident;
+    seconds = impl_->warm_report.seconds;
     reason = impl_->warm_report.reason;
 }
 

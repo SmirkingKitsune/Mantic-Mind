@@ -174,6 +174,12 @@ if(Python3_Interpreter_FOUND)
     # both readings produce a container that loads and runs — so this compares
     # the two readers against each other on the same weights rather than
     # trusting either. Skips itself when numpy/safetensors are absent.
+    add_test(NAME mm_heat_layout
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_SOURCE_DIR}/tools/ci/check_heat_layout.py"
+                     "$<TARGET_FILE:soma>"
+                     "${CMAKE_SOURCE_DIR}/tests/fixtures/containers/DeepSeek-V2-Lite")
+
     add_test(NAME mm_fused_experts
              COMMAND "${MM_ADMISSION_PY}"
                      "${CMAKE_SOURCE_DIR}/tools/ci/check_fused_experts.py"

@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -30,6 +31,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <set>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -71,7 +73,11 @@ int usage() {
                  "               are not rewritten; serve refuses an unstamped container.\n"
                  "  soma verify  DIR\n"
                  "               re-read every expert and check its recorded digest.\n"
-                 "               Run after copying a container to a node.\n";
+                 "               Run after copying a container to a node.\n"
+                 "  soma heat-layout DIR --heat FILE [--pin BYTES] [--json]\n"
+                 "               how scattered the pinned hot set is under this layout,\n"
+                 "               and what packing it in heat order could collapse it to.\n"
+                 "               Measure before repacking, and again after.\n";
     return 2;
 }
 
@@ -815,11 +821,13 @@ int cmd_serve(int argc, char** argv) {
     // out why the output is gibberish should meet this line before they
     // start looking at the weights.
     std::uint32_t warm_pinned = 0, warm_resident = 0;
+    double warm_seconds = 0.0;
     std::string warm_reason;
-    server.warm_state(warm_pinned, warm_resident, warm_reason);
+    server.warm_state(warm_pinned, warm_resident, warm_seconds, warm_reason);
     if (warm_pinned > 0) {
         std::cout << "\n  warm: " << warm_resident << " of " << warm_pinned
-                  << " pinned experts resident from the heat snapshot";
+                  << " pinned experts resident from the heat snapshot in " << std::fixed
+                  << std::setprecision(2) << warm_seconds << "s";
         if (!warm_reason.empty()) std::cout << "; " << warm_reason;
     } else if (!warm_reason.empty()) {
         // Said out loud rather than swallowed. A stale or unreadable snapshot is
@@ -958,6 +966,212 @@ int cmd_verify(int argc, char** argv) {
     return failures == 0 ? 0 : 1;
 }
 
+
+// -- heat-layout -------------------------------------------------------------
+//
+// Does packing a container in heat order actually buy anything?
+//
+// The warm pass reads the pinned set at startup. Under the current layout those
+// experts sit wherever their INDEX order puts them, so the reads are scattered;
+// under a heat-ordered layout the hot set would be a contiguous prefix and the
+// same warm-up would be one sequential run per layer. How much that is worth
+// depends on how scattered it is today, which is a property of the model and its
+// measured heat and cannot be reasoned out from the format.
+//
+// So this measures it rather than arguing about it. Run it before deciding to
+// build the repack, and again afterwards to see whether the repack delivered.
+int cmd_heat_layout(int argc, char** argv) {
+    std::string dir, heat_path;
+    bool as_json = false;
+    std::uint64_t pin_bytes = 0;
+    for (int i = 0; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--heat" && i + 1 < argc)
+            heat_path = argv[++i];
+        else if (a == "--pin" && i + 1 < argc) {
+            const std::string value = argv[++i];
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), pin_bytes);
+            if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size()) {
+                std::cerr << "heat-layout: --pin requires an unsigned byte count\n";
+                return 2;
+            }
+        }
+        else if (a == "--json")
+            as_json = true;
+        else if (!a.empty() && a.front() != '-' && dir.empty())
+            dir = a;
+        else {
+            std::cerr << "heat-layout: unexpected or incomplete argument " << a << "\n";
+            return 2;
+        }
+    }
+    if (dir.empty() || heat_path.empty()) return usage();
+
+    soma::ArchIr arch;
+    if (auto st = soma::resolve_arch(dir, {}, arch); !st.ok()) {
+        std::cerr << "heat-layout: " << st.message() << "\n";
+        return 1;
+    }
+
+    std::string text;
+    {
+        std::ifstream in(heat_path, std::ios::binary);
+        if (!in) {
+            std::cerr << "heat-layout: cannot read " << heat_path << "\n";
+            return 1;
+        }
+        text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+
+    soma::HeatSnapshot snap;
+    std::uint32_t out_of_range = 0;
+    if (auto st = soma::parse_heat_snapshot(
+            text, arch.topology.n_layers, arch.router.n_experts, snap, out_of_range);
+        !st.ok()) {
+        std::cerr << "heat-layout: " << heat_path << ": " << st.message() << "\n";
+        return 1;
+    }
+
+    soma::ExpertStore store;
+    soma::OpenOptions opts;
+    // The layout is readable without an identity: this asks where bytes SIT, not
+    // whether they are the right bytes, and a container mid-admission is exactly
+    // when someone would want to ask.
+    opts.identity = soma::IdentityPolicy::AllowUnstamped;
+    if (auto st = store.open(dir, arch, opts); !st.ok()) {
+        std::cerr << "heat-layout: " << st.message() << "\n";
+        return 1;
+    }
+
+    // Pin-budget candidate set. Serving additionally limits pins by available
+    // cache capacity and successful reads; this read-only diagnostic does not.
+    std::vector<const soma::HeatCell*> ranked;
+    ranked.reserve(snap.cells.size());
+    for (const auto& c : snap.cells)
+        ranked.push_back(&c);
+    std::stable_sort(ranked.begin(), ranked.end(),
+                     [](const soma::HeatCell* a, const soma::HeatCell* b) {
+                         return a->decayed > b->decayed;
+                     });
+
+    struct Range {
+        std::uint32_t shard = 0;
+        std::uint64_t offset = 0;
+        std::uint32_t length = 0;
+        soma::LayerIndex layer = 0;
+    };
+    const auto expert_bytes = store.header().expert_bytes;
+    std::vector<Range> pinned;
+    std::set<std::pair<soma::LayerIndex, soma::ExpertId>> seen;
+    std::uint64_t pinned_bytes = 0;
+    for (const auto* c : ranked) {
+        if (!seen.emplace(c->layer, c->expert).second) continue;
+        if (pin_bytes > 0 && expert_bytes > pin_bytes - pinned_bytes) break;
+        const auto loc = store.locate(c->layer, c->expert);
+        if (loc.length == 0) continue; // a dense layer, whose slot is empty
+        pinned.push_back({loc.shard, loc.offset, loc.length, c->layer});
+        pinned_bytes += loc.length;
+    }
+    if (pinned.empty()) {
+        std::cerr << "heat-layout: the snapshot pins nothing in this container\n";
+        return 1;
+    }
+
+    // Runs under the CURRENT layout: maximal groups whose padded ranges abut, in
+    // shard/offset order. That is what a reader could merge into one request, and
+    // what a drive sees as one sequential stretch.
+    std::sort(pinned.begin(), pinned.end(), [](const Range& a, const Range& b) {
+        return a.shard != b.shard ? a.shard < b.shard : a.offset < b.offset;
+    });
+    const auto padded = [](std::uint64_t off, std::uint32_t len) {
+        const auto end = off + len;
+        return (end + soma::kDirectIoAlign - 1) / soma::kDirectIoAlign * soma::kDirectIoAlign;
+    };
+    std::uint64_t runs = 1;
+    std::set<soma::LayerIndex> layers_touched;
+    std::set<std::uint32_t> shards_touched;
+    std::set<std::pair<std::uint32_t, soma::LayerIndex>> shard_layers;
+    for (std::size_t i = 0; i < pinned.size(); ++i) {
+        layers_touched.insert(pinned[i].layer);
+        shards_touched.insert(pinned[i].shard);
+        shard_layers.emplace(pinned[i].shard, pinned[i].layer);
+        if (i == 0) continue;
+        const auto& prev = pinned[i - 1];
+        const auto& cur = pinned[i];
+        if (cur.shard != prev.shard || padded(prev.offset, prev.length) != cur.offset) ++runs;
+    }
+
+    // Bytes from the first pinned byte to the last, per shard. The gap between
+    // this and pinned_bytes is what the drive travels over without wanting.
+    std::uint64_t span = 0;
+    {
+        std::uint32_t shard = pinned.front().shard;
+        std::uint64_t lo = pinned.front().offset, hi = lo;
+        for (const auto& r : pinned) {
+            if (r.shard != shard) {
+                span += hi - lo;
+                shard = r.shard;
+                lo = r.offset;
+            }
+            hi = padded(r.offset, r.length);
+        }
+        span += hi - lo;
+    }
+
+    // What ordering could achieve. Per-layer keeps the layer-major grouping the
+    // container already has and makes each layer hot prefix contiguous; global
+    // abandons that grouping and makes the whole hot set one run per shard.
+    const auto ideal_per_layer = static_cast<std::uint64_t>(shard_layers.size());
+    const auto ideal_global = static_cast<std::uint64_t>(shards_touched.size());
+
+    if (as_json) {
+        std::cout << nlohmann::json{{"model_dir", dir},
+                                    {"selection", "pin-budget candidates; cache capacity not modeled"},
+                                    {"pinned_experts", pinned.size()},
+                                    {"pinned_bytes", pinned_bytes},
+                                    {"runs", runs},
+                                    {"runs_ideal_per_layer", ideal_per_layer},
+                                    {"runs_ideal_global", ideal_global},
+                                    {"span_bytes", span},
+                                    {"layers_touched", layers_touched.size()},
+                                    {"out_of_range", out_of_range}}
+                         .dump(2)
+                  << "\n";
+        return 0;
+    }
+
+    const auto mib = [](std::uint64_t b) { return static_cast<double>(b) / (1024.0 * 1024.0); };
+    std::cout << std::fixed << std::setprecision(1)
+              << "pinned        " << pinned.size() << " experts, " << mib(pinned_bytes) << " MiB\n"
+              << "runs          " << runs << "   contiguous stretches under the current layout\n"
+              << "  heat-order  " << ideal_per_layer << " per-layer, " << ideal_global
+              << " global   packing targets with existing shard membership\n"
+              << "span          " << mib(span) << " MiB   first pinned byte to last\n"
+              << "  skipped     " << mib(span - std::min(span, pinned_bytes))
+              << " MiB   address gaps and alignment padding, not measured I/O\n"
+              << "selection     pin-budget candidates; serving cache limits are not modeled\n";
+    if (out_of_range > 0) {
+        std::cout << "ignored       " << out_of_range
+                  << " cells naming experts this container does not have\n";
+    }
+    // The verdict, in both directions. Heat ordering is not automatically better:
+    // when the pinned set is most of the container the current layout is already
+    // one contiguous run, and imposing a per-layer hot prefix would SPLIT it.
+    // Reporting a ratio without saying which way it points would read as a win in
+    // exactly the case where there is nothing to win.
+    std::cout << "\n";
+    if (runs <= ideal_per_layer) {
+        std::cout << "no run-count reduction indicated by this per-layer packing estimate: "
+                  << runs << " current, " << ideal_per_layer << " estimated\n";
+    } else {
+        const double collapse =
+            static_cast<double>(runs) / static_cast<double>(std::max<std::uint64_t>(ideal_per_layer, 1));
+        std::cout << "per-layer packing target: " << runs << " runs to " << ideal_per_layer
+                  << " (" << collapse << "x ratio; not a measured speedup)\n";
+    }
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -968,6 +1182,7 @@ int main(int argc, char** argv) {
     if (cmd == "conform") return cmd_conform(argc - 2, argv + 2);
     if (cmd == "stamp") return cmd_stamp(argc - 2, argv + 2);
     if (cmd == "verify") return cmd_verify(argc - 2, argv + 2);
+    if (cmd == "heat-layout") return cmd_heat_layout(argc - 2, argv + 2);
     if (cmd == "--help" || cmd == "-h") {
         usage();
         return 0;
