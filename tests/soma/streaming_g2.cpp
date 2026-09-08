@@ -200,6 +200,23 @@ int main(int argc, char** argv) {
 
         check(after_hit == before, "recently-touched slot survived", "0 still resident");
         check(after_miss == before + 1, "LRU victim was the least-recently-used", "1 evicted");
+        soma::HeatSnapshot hot;
+        hot.n_layers = h.n_layers;
+        hot.n_experts = h.n_experts;
+        for (const soma::ExpertId id : {0u, 0u, 1u, 2u}) {
+            soma::HeatCell cell;
+            cell.layer = L0;
+            cell.expert = id;
+            cell.count = 100 - id;
+            cell.decayed = static_cast<float>(cell.count);
+            hot.cells.push_back(cell);
+        }
+        soma::MemoryHierarchy::Bootstrap result;
+        check(m2.apply_heat_bootstrap(hot, &result).ok() && result.pinned == 2 &&
+                  result.pinned_bytes == 2 * h.expert_bytes,
+              "heat bootstrap deduplicates and leaves a pageable slot");
+        const auto unseen = m2.acquire(L0, 3);
+        check(!unseen.bytes().empty(), "an unseen route still loads after warming");
     }
 
     // ── 3. thrash gate ───────────────────────────────────────────────────────

@@ -763,6 +763,95 @@ int check_plan_matches_serve(const fs::path& containers) {
         server.stop();
     }
 
+    // ── --heat: the return half of a loop that only ran outward ─────────────
+    //
+    // Serving measures heat and publishes it; nothing brought it back, so every
+    // restart began cold and --pin reserved a budget it never filled.
+    {
+        const auto heat_file = fs::temp_directory_path() / "soma-g2-heat.json";
+        {
+            std::ofstream out(heat_file, std::ios::binary);
+            out << R"({"model_id":1,"bucketed":false,"experts":[)"
+                << R"({"layer":1,"expert":1,"count":90,"decayed":90.0,"tier":"ram"},)"
+                << R"({"layer":1,"expert":1,"count":90,"decayed":90.0,"tier":"ram"},)"
+                << R"({"layer":2,"expert":2,"count":80,"decayed":80.0,"tier":"ram"},)"
+                // Out of range for this container: a snapshot taken against a
+                // different model must be survivable, not fatal.
+                << R"({"layer":999,"expert":999,"count":70,"decayed":70.0,"tier":"ram"}]})";
+        }
+
+        soma::ServeConfig warm = cfg;
+        warm.heat_path = heat_file.string();
+        warm.pin_bytes = 1u << 20;
+        soma::ServeServer warm_server;
+        const auto wst = warm_server.open(warm);
+        check(wst.ok(), "a server opens with a heat snapshot", wst.ok() ? "" : wst.message());
+        if (wst.ok()) {
+            std::uint32_t pinned = 0, resident = 0;
+            std::string reason;
+            warm_server.warm_state(pinned, resident, reason);
+            // The claim that matters: pinned experts are RESIDENT, not merely
+            // marked. A pinned slot holding nothing counts against occupancy and
+            // cannot be evicted for an expert that is actually in use.
+            check(pinned == 2 && resident == pinned && reason.find("skipped 1") != std::string::npos,
+                  "the heat snapshot pins experts AND reads them in",
+                  std::to_string(resident) + " resident of " + std::to_string(pinned) +
+                      " pinned" + (reason.empty() ? "" : "; " + reason));
+            warm_server.stop();
+        }
+
+        // A snapshot naming nothing this container has is advisory, not fatal:
+        // starting cold is the alternative it competes with.
+        const auto stale_file = fs::temp_directory_path() / "soma-g2-heat-stale.json";
+        {
+            std::ofstream out(stale_file, std::ios::binary);
+            out << R"({"experts":[{"layer":999,"expert":999,"count":1,"decayed":1.0}]})";
+        }
+        soma::ServeConfig stale = cfg;
+        stale.heat_path = stale_file.string();
+        soma::ServeServer stale_server;
+        const auto sst2 = stale_server.open(stale);
+        check(sst2.ok(), "a stale snapshot still serves", sst2.ok() ? "" : sst2.message());
+        if (sst2.ok()) {
+            std::uint32_t pinned = 0, resident = 0;
+            std::string reason;
+            stale_server.warm_state(pinned, resident, reason);
+            check(pinned == 0 && !reason.empty(),
+                  "and says it warmed nothing rather than pretending otherwise", reason);
+            stale_server.stop();
+        }
+
+        soma::ServeConfig missing = cfg;
+        {
+            std::ofstream out(stale_file, std::ios::binary);
+            out << R"({"experts":[{"layer":"wrong","expert":0},{"layer":4294967296,"expert":0},{"layer":0,"expert":0,"decayed":[]} ]})";
+        }
+        soma::ServeServer malformed_server;
+        const auto malformed_status = malformed_server.open(stale);
+        check(malformed_status.ok(), "malformed heat fields are advisory, not exceptions");
+        std::uint32_t malformed_pins = 0, malformed_resident = 0;
+        std::string malformed_reason;
+        malformed_server.warm_state(malformed_pins, malformed_resident, malformed_reason);
+        check(malformed_pins == 0 && !malformed_reason.empty(), "malformed cells do not alias valid experts");
+        malformed_server.stop();
+        missing.heat_path = (fs::temp_directory_path() / "soma-g2-no-such-heat.json").string();
+        soma::ServeServer missing_server;
+        const auto mst2 = missing_server.open(missing);
+        check(mst2.ok(), "an unreadable snapshot still serves", mst2.ok() ? "" : mst2.message());
+        if (mst2.ok()) {
+            std::uint32_t pinned = 0, resident = 0;
+            std::string reason;
+            missing_server.warm_state(pinned, resident, reason);
+            check(pinned == 0 && reason.find("cannot read") != std::string::npos,
+                  "and names the file it could not read", reason);
+            missing_server.stop();
+        }
+
+        std::error_code ec;
+        fs::remove(heat_file, ec);
+        fs::remove(stale_file, ec);
+    }
+
     soma::ServeConfig invalid = cfg;
     invalid.quant_dense = "not_a_dtype";
     soma::ServeServer refused;

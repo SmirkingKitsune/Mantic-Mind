@@ -51,6 +51,9 @@ int usage() {
                  "               [--allow-byte-tokenizer]  serve a container with no\n"
                  "                                        compiled tokenizer; the text\n"
                  "                                        it generates is meaningless\n"
+                 "               [--heat FILE]  warm the expert cache from a measured\n"
+                 "                              heat snapshot, as GET /v1/models/{id}/heat\n"
+                 "                              on control emits it\n"
                  "  soma plan    --model-dir DIR [--json]\n"
                  "               [--quant DTYPE] [--expert-down DTYPE] [--quant-dense DTYPE]\n"
                  "               [--group N]\n"
@@ -811,6 +814,20 @@ int cmd_serve(int argc, char** argv) {
     // Said every time, not once at open. An operator reading a log to find
     // out why the output is gibberish should meet this line before they
     // start looking at the weights.
+    std::uint32_t warm_pinned = 0, warm_resident = 0;
+    std::string warm_reason;
+    server.warm_state(warm_pinned, warm_resident, warm_reason);
+    if (warm_pinned > 0) {
+        std::cout << "\n  warm: " << warm_resident << " of " << warm_pinned
+                  << " pinned experts resident from the heat snapshot";
+        if (!warm_reason.empty()) std::cout << "; " << warm_reason;
+    } else if (!warm_reason.empty()) {
+        // Said out loud rather than swallowed. A stale or unreadable snapshot is
+        // not fatal — starting cold is the alternative — but an operator who
+        // passed --heat and got a cold cache should not have to infer it from
+        // the first requests being slow.
+        std::cout << "\n  WARNING: --heat did not warm anything: " << warm_reason;
+    }
     if (!server.byte_tokenizer_reason().empty()) {
         std::cout << "\n  WARNING: no tokenizer — encoding one token per byte. Generated "
                      "text is MEANINGLESS (" << server.byte_tokenizer_reason() << ")";

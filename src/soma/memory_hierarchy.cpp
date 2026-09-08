@@ -549,8 +549,9 @@ void MemoryHierarchy::unpin(LayerIndex layer, ExpertId expert) noexcept {
     }
 }
 
-Status MemoryHierarchy::apply_heat_bootstrap(const HeatSnapshot& heat) {
+Status MemoryHierarchy::apply_heat_bootstrap(const HeatSnapshot& heat, Bootstrap* out) {
     auto& impl = *impl_;
+    if (out != nullptr) *out = {};
 
     // Pin the hottest experts up to the pin budget, so the cache is not cold on
     // first run. Sorted by decayed heat rather than raw count: a pattern that has
@@ -565,8 +566,19 @@ Status MemoryHierarchy::apply_heat_bootstrap(const HeatSnapshot& heat) {
 
     std::uint64_t pinned_bytes = 0;
     std::uint32_t pinned = 0;
+    // Leave a pageable slot: pinning the entire cache makes unseen routes fail.
+    const auto cache_limit = impl.budget.ram_expert_cache_bytes;
+    const auto warm_limit = cache_limit == 0 ? UINT64_MAX :
+        (cache_limit > impl.expert_bytes ? cache_limit - impl.expert_bytes : 0);
+    const auto pin_limit = impl.budget.pin_bytes == 0 ? warm_limit :
+        std::min(warm_limit, impl.budget.pin_bytes);
+    std::vector<bool> seen(impl.slots.size(), false);
     for (const auto* c : ranked) {
-        if (impl.budget.pin_bytes > 0 && pinned_bytes + impl.expert_bytes > impl.budget.pin_bytes) {
+        if (c->layer >= impl.n_layers || c->expert >= impl.n_experts) continue;
+        const auto slot = impl.idx(c->layer, c->expert);
+        if (seen[slot]) continue;
+        seen[slot] = true;
+        if (impl.expert_bytes > pin_limit - pinned_bytes) {
             break;
         }
         pin(c->layer, c->expert);
@@ -581,9 +593,13 @@ Status MemoryHierarchy::apply_heat_bootstrap(const HeatSnapshot& heat) {
             }
         }
     }
+    if (out != nullptr) {
+        out->pinned = pinned;
+        out->pinned_bytes = pinned_bytes;
+    }
     if (pinned == 0 && !ranked.empty()) {
         return {StatusCode::CapacityPressure,
-                "heat bootstrap pinned nothing; pin budget is smaller than one expert"};
+                "heat bootstrap pinned nothing; insufficient pageable/pin capacity or expert read failed"};
     }
     return {};
 }

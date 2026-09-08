@@ -190,6 +190,122 @@ json telemetry_frame_json(const TelemetryFrame& f) {
 /// The brain grid. Cells are emitted as flat parallel arrays rather than an
 /// array of objects: at 4096 cells the object form is roughly 6x the bytes for
 /// the same information, and this goes out on every tick.
+/// What warming the cache from a heat snapshot achieved.
+struct WarmReport {
+    std::uint32_t pinned = 0;
+    std::uint32_t resident = 0;   ///< actually read in, not merely marked
+    std::uint32_t out_of_range = 0; ///< named an expert this container lacks
+    std::string reason;           ///< non-empty when nothing was warmed
+};
+
+/// Parse the JSON `ControlModelRegistry::heat()` emits into a HeatSnapshot.
+///
+/// The registry's shape rather than the telemetry frame's, deliberately. The
+/// frame is a bucketed grid of counts for a picture: it drops `decayed`, which is
+/// the field the bootstrap ranks by, and at Bucketed resolution it drops expert
+/// identity too. The registry row keeps both because it is a record rather than a
+/// rendering.
+Status parse_heat_snapshot(const std::string& text,
+                           std::uint32_t n_layers,
+                           std::uint32_t n_experts,
+                           HeatSnapshot& out,
+                           std::uint32_t& out_of_range) {
+    out = {};
+    out.n_layers = n_layers;
+    out.n_experts = n_experts;
+    out_of_range = 0;
+    json j;
+    try {
+        j = json::parse(text);
+    } catch (const std::exception& e) {
+        return {StatusCode::InvalidArgument, std::string("not valid JSON: ") + e.what()};
+    }
+    if (!j.contains("experts") || !j["experts"].is_array()) {
+        return {StatusCode::InvalidArgument, "no `experts` array"};
+    }
+    for (const auto& cell : j["experts"]) {
+        if (!cell.is_object()) continue;
+        const auto valid_uint = [](const json& value, std::uint64_t limit) {
+            return (value.is_number_unsigned() ||
+                    (value.is_number_integer() && value.get<std::int64_t>() >= 0)) &&
+                   value.get<std::uint64_t>() <= limit;
+        };
+        if (!cell.contains("layer") || !cell.contains("expert") ||
+            !valid_uint(cell["layer"], UINT32_MAX) ||
+            !valid_uint(cell["expert"], UINT32_MAX) ||
+            (cell.contains("count") && !valid_uint(cell["count"], UINT64_MAX)) ||
+            (cell.contains("decayed") &&
+             (!cell["decayed"].is_number() ||
+              !std::isfinite(cell["decayed"].get<double>()) ||
+              cell["decayed"].get<double>() < 0 ||
+              cell["decayed"].get<double>() > std::numeric_limits<float>::max()))) {
+            ++out_of_range;
+            continue;
+        }
+        HeatCell c;
+        c.layer = cell.value("layer", ~std::uint32_t{0});
+        c.expert = cell.value("expert", ~std::uint32_t{0});
+        c.count = cell.value("count", std::uint64_t{0});
+        c.decayed = cell.value("decayed", 0.0f);
+        // Bounds-checked against THIS container, not trusted from the file. A
+        // snapshot taken against a different quantization of the same
+        // architecture has the same layer and expert counts; one taken against a
+        // different model does not, and pinning by an out-of-range index would
+        // reach past the slot table.
+        if (c.layer >= n_layers || c.expert >= n_experts) {
+            ++out_of_range;
+            continue;
+        }
+        out.cells.push_back(c);
+    }
+    if (out.cells.empty()) {
+        return {StatusCode::InvalidArgument, "no usable cells for this container"};
+    }
+    return {};
+}
+
+/// Pin the hottest experts a snapshot names, and READ them in.
+///
+/// The existing bootstrap calls pin(), which reads synchronously and only marks
+/// successful reads. Report those pins rather than total cache occupancy.
+WarmReport warm_from_heat(const ServeConfig& config,
+                          const ArchIr& arch,
+                          MemoryHierarchy& memory) {
+    WarmReport out;
+    if (config.heat_path.empty()) return out;
+
+    std::string text;
+    {
+        std::ifstream in(config.heat_path, std::ios::binary);
+        if (!in) {
+            out.reason = "cannot read " + config.heat_path;
+            return out;
+        }
+        text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+
+    HeatSnapshot snap;
+    if (auto st = parse_heat_snapshot(
+            text, arch.topology.n_layers, arch.router.n_experts, snap, out.out_of_range);
+        !st.ok()) {
+        out.reason = config.heat_path + ": " + st.message();
+        return out;
+    }
+    MemoryHierarchy::Bootstrap bootstrap;
+    if (auto st = memory.apply_heat_bootstrap(snap, &bootstrap); !st.ok()) {
+        out.reason = st.message();
+        return out;
+    }
+    out.pinned = bootstrap.pinned;
+
+    // pin() reads synchronously and marks only successful reads as pinned.
+    out.resident = bootstrap.pinned;
+    if (out.out_of_range > 0) {
+        out.reason = "skipped " + std::to_string(out.out_of_range) + " invalid or out-of-range heat cells";
+    }
+    return out;
+}
+
 json heat_frame_json(const HeatFrame& h) {
     json counts = json::array();
     json tiers = json::array();
@@ -388,6 +504,10 @@ struct ServeServer::Impl {
     /// client connecting to an already-running server has no other way to
     /// learn that its text is byte-fallback.
     std::string byte_tokenizer_reason;
+    /// What --heat achieved, or why it achieved nothing.
+    /// Not `warm`: a session-warmth local by that name predates this and
+    /// shadowing it is a warning MSVC treats as an error.
+    WarmReport warm_report;
     const PromptCodec* prompt_codec = nullptr;
     bool speculative_selected = false;
 
@@ -1031,6 +1151,7 @@ Status ServeServer::open(const ServeConfig& config) {
     im.have_tokenizer = false;
     im.tokenizer.close();
     im.byte_tokenizer_reason.clear();
+    im.warm_report = {};
     im.cfg = config;
     if (config.model_dir.empty()) {
         return {StatusCode::InvalidArgument, "--model-dir is required"};
@@ -1126,6 +1247,12 @@ Status ServeServer::open(const ServeConfig& config) {
         b.pin_bytes = config.pin_bytes;
         if (auto st = im.memory.open(im.model.arch, im.store, b); !st.ok()) return st;
         im.model.streamed_experts = &im.memory;
+        im.warm_report = warm_from_heat(config, resolved, im.memory);
+    } else if (!config.heat_path.empty()) {
+        // A resident-only model holds every expert already, so there is no cache
+        // to warm and no miss for a heat snapshot to avoid. Saying so beats
+        // accepting the flag and doing nothing with it.
+        im.warm_report.reason = "this model is resident-only; there is no expert cache to warm";
     }
 
     if (im.speculative_selected) {
@@ -1735,6 +1862,14 @@ const std::string& ServeServer::byte_tokenizer_reason() const noexcept {
     return impl_->byte_tokenizer_reason;
 }
 
+void ServeServer::warm_state(std::uint32_t& pinned,
+                             std::uint32_t& resident,
+                             std::string& reason) const noexcept {
+    pinned = impl_->warm_report.pinned;
+    resident = impl_->warm_report.resident;
+    reason = impl_->warm_report.reason;
+}
+
 Status parse_serve_config(int argc, const char* const* argv, ServeConfig& out) {
     // Env first, CLI second, so CLI wins. Both are supported because the node
     // launches with argv while a container image is configured with env, and
@@ -1826,6 +1961,11 @@ Status parse_serve_config(int argc, const char* const* argv, ServeConfig& out) {
             out.allow_unstamped = true;
         } else if (a == "--allow-byte-tokenizer") {
             out.allow_byte_tokenizer = true;
+        } else if (a == "--heat") {
+            if (i + 1 >= argc) {
+                return {StatusCode::InvalidArgument, "--heat requires a path"};
+            }
+            out.heat_path = argv[++i];
         }
     }
     if (out.model_dir.empty()) {

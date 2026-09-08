@@ -174,7 +174,13 @@ public:
 
     /// Pin the hottest experts at startup from the persisted histogram, so the
     /// cache is not cold on first run.
-    Status apply_heat_bootstrap(const HeatSnapshot& heat);
+    /// Reports successful pins; pin() reads each expert before marking it.
+    struct Bootstrap {
+        std::uint32_t pinned = 0;
+        std::uint64_t pinned_bytes = 0;
+    };
+
+    Status apply_heat_bootstrap(const HeatSnapshot& heat, Bootstrap* out = nullptr);
 
     TierOccupancy occupancy() const noexcept;
     CacheStats stats() const noexcept;

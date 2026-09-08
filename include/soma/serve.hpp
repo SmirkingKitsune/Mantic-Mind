@@ -102,6 +102,21 @@ struct ServeConfig {
     /// default, and it must not be quiet — `/v1/models` reports it and so does
     /// the line `soma serve` prints once it is listening.
     bool allow_byte_tokenizer = false;
+
+    /// A measured expert-heat snapshot to warm the cache from. // --heat
+    ///
+    /// The return half of a loop that only ran outward. Serving MEASURES heat and
+    /// publishes it — telemetry to the node, the node to control, control into
+    /// `expert_heat` — and nothing ever brought it back, so every restart began
+    /// cold and `--pin` reserved a budget it never filled. This is the file that
+    /// closes it, in exactly the shape `ControlModelRegistry::heat()` already
+    /// emits: `{"experts": [{"layer", "expert", "count", "decayed"}, ...]}`.
+    ///
+    /// Advisory. A snapshot for a different model, or one naming experts this
+    /// container does not have, warms what it can and says what it skipped —
+    /// refusing to serve because a cache hint is stale would be worse than
+    /// starting cold, which is the alternative it is competing with.
+    std::string heat_path; // --heat
 };
 
 /// Reasons the server refuses a request, mapped to HTTP by the implementation.
@@ -148,6 +163,12 @@ public:
     /// Why this server is encoding bytes rather than tokens, or empty when it is
     /// not. Non-empty only under `--allow-byte-tokenizer`.
     const std::string& byte_tokenizer_reason() const noexcept;
+
+    /// How many experts `--heat` pinned, and how many of those are actually
+    /// resident. Both zero when no snapshot was given.
+    void warm_state(std::uint32_t& pinned,
+                    std::uint32_t& resident,
+                    std::string& reason) const noexcept;
     TelemetryChannel& telemetry() noexcept;
 
 private:

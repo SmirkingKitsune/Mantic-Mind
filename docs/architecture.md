@@ -295,8 +295,30 @@ in a convention.
 ### 5.6 Heat and the pinned hot set
 
 A persisted routing histogram (`expert_heat`) pins the hottest experts at startup so the cache is not
-cold on first run. Bootstrapped at admission over a calibration corpus; updated with exponential decay
-during serving.
+cold on first run. Updated with exponential decay during serving.
+
+**The loop ran outward only, for as long as it existed.** Serving measured heat and published it —
+telemetry to the node, the node to control, control into `expert_heat` — and nothing brought it back.
+`apply_heat_bootstrap()` had no serving caller, and `soma serve
+--pin BYTES` reserved a budget it never filled. Every restart began cold.
+
+`soma serve --heat FILE` closes it, taking exactly the JSON `ControlModelRegistry::heat()` already
+emits. The existing bootstrap ranks by `decayed`, then calls `pin()`, which reads each expert
+synchronously before marking it pinned. Duplicate cells count once. The pin budget bounds the hot
+set, and a bounded cache retains at least one pageable slot for unseen routes. A zero pin budget
+adds no separate limit; the pageable-slot constraint still applies.
+
+The snapshot is **advisory**. One naming experts this container does not have warms what it can and
+says what it skipped; an unreadable one names the file. Refusing to serve over a stale cache hint would
+be worse than starting cold, which is the alternative it competes with. What is warmed — or why nothing
+was — is on the line `soma serve` prints once it is listening.
+
+Passing the file is still manual: `curl` control's heat endpoint and hand it to the engine. Control has
+the data and the node builds the launch command, so automating it is a node/control change rather than
+an engine one.
+
+Reads currently follow global heat order, not physical shard order. Concurrent warming and
+heat-ordered container layouts are not implemented by this change.
 
 ---
 
