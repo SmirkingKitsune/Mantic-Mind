@@ -144,9 +144,13 @@ def main() -> int:
         shutil.rmtree(work)
     work.mkdir(parents=True)
 
+    # --no-identity: verify_payload.py never reads the identity — it is the
+    # checker a node runs, and a node may not be able to resolve the architecture
+    # at all. Asking the engine for a hash nothing here consumes would make a
+    # Python-only check depend on a built binary.
     conv = subprocess.run(
         [sys.executable, str(CONVERT), str(FIXTURE), "--out", str(good),
-         "--quant", "q4_g", "--expert-down", "q6_g", "--group", "32"],
+         "--quant", "q4_g", "--expert-down", "q6_g", "--group", "32", "--no-identity"],
         capture_output=True, text=True)
     if conv.returncode != 0:
         print(f"  FAILED  could not convert the fixture: {conv.stdout}{conv.stderr}")

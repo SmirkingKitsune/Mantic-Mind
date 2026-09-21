@@ -166,10 +166,11 @@ enum class IdentityPolicy : std::uint8_t {
 struct OpenOptions {
     /// Open a container whose `arch_hash` was never stamped.
     ///
-    /// Off by default, and that is the entire point. `soma stamp` is what
-    /// writes the hash; for as long as an unstamped container opened silently,
-    /// stamping was optional in practice, and an optional integrity check is the
-    /// one that does not run. Without the stamp the remaining checks compare the
+    /// Off by default, and that is the entire point. Conversion writes the hash
+    /// now, so an unstamped container is one that was not finished — and for as
+    /// long as such a container opened silently, the identity was optional in
+    /// practice, which is the kind of check that does not run. Without it the
+    /// remaining checks compare the
     /// container against a map read out of its own meta, so they cannot see the IR
     /// moving under a container that did not. It also enables the explicitly
     /// documented legacy-v1 reader; a hash mismatch and an empty expected
@@ -212,46 +213,38 @@ struct ContainerHeader {
     bool has_digests = false;
 };
 
-/// Write a container's identity into its index, in place.
-///
-/// V2 separates the two pieces of evidence that used to be absent or
-/// inexpressible:
-///
-///   * `arch_hash`, computed by compute_arch_hash() from the SAME canonical IR
-///     the engine loads. convert.py leaves it empty because a second hash
-///     implementation in Python would agree until it did not — which is correct,
-///     and left the gate permanently dormant because nothing else stamped it.
-///   * the per-role quantization descriptor, written by the converter, so the
-///     reader can check gate, up and down individually instead of comparing one
-///     byte total. stamp verifies this evidence; it does not manufacture it.
-///
-/// Refuses rather than stamps when the IR and the payload disagree: a stamp is
-/// an assertion that this container is what the IR says it is, and stamping past
-/// a disagreement would launder exactly the error the hash exists to catch.
-///
-/// A descriptor-less v1 index is refused: its single dtype plus byte total cannot
-/// prove which format occupies each role, so manufacturing a descriptor from the
-/// same metadata would certify the ambiguity this function exists to remove.
-///
-/// Rewrites the small index file only — the shards are not touched, and the
-/// write goes through a temporary plus rename so an interrupted stamp leaves the
-/// previous index intact.
-/// What a stamp actually did, so the caller can state which guarantee it holds.
-///
-/// "Digests confirmed" and "digests recorded" are different claims: the first
-/// says the shards still hash to what the converter measured while it had the
-/// tensors in memory, the second only pins whatever is on disk right now. A
-/// command that printed the same line for both would overstate the weaker one.
-struct StampReport {
-    bool had_digests = false;      ///< the converter had already recorded them
-    bool wrote = false;            ///< false when the stamp was an exact repeat
+/// What the identity pass read, so the caller can say how much it stands behind.
+struct IdentityReport {
     std::uint64_t experts_checked = 0;
 };
 
-Status stamp_container(const std::string& model_dir,
+/// Check that a container is what its architecture says it is. WRITES NOTHING.
+///
+/// This used to be `stamp_container()`, and it used to write. The identity now
+/// comes from the converter, which asks the engine for it through
+/// `soma arch-hash` while the container is still being built — because node
+/// cache identity is a hash over each file's (relpath, size, mtime), so a later
+/// in-place rewrite of the index re-transfers every shard to every node holding
+/// the container. A container is finished when conversion ends, and from that
+/// moment it is immutable.
+///
+/// What remains is the assertion the write used to certify, now made on demand:
+///
+///   * `arch_hash`, against compute_arch_hash() over the SAME canonical IR the
+///     engine loads. An EMPTY one is a failure rather than an invitation — there
+///     is nothing here that can fill it, and reconversion is the answer.
+///   * the per-role quantization descriptor, so the reader can check gate, up
+///     and down individually instead of comparing one byte total. This verifies
+///     that evidence; it never manufactures it.
+///   * every expert against its recorded digest, which is the only pass that
+///     reads a payload byte.
+///
+/// A descriptor-less v1 index is refused: its single dtype plus byte total cannot
+/// prove which format occupies each role.
+Status verify_identity(const std::string& model_dir,
                        const ArchIr& arch,
                        const std::string& index_file = "soma.container",
-                       StampReport* report = nullptr);
+                       IdentityReport* report = nullptr);
 
 /// How measure_bandwidth() got its number.
 ///
@@ -309,7 +302,7 @@ struct PayloadReport {
 /// reach of the two callers that need it most: a node that holds a copied
 /// container and cannot resolve its architecture, and the auxiliary DSpark index,
 /// whose IR only the speculative backend can build. Whether the container matches
-/// an IR is a different question, and open() and stamp_container() ask it.
+/// an IR is a different question, and open() and verify_identity() ask it.
 Status verify_payload(const std::string& model_dir,
                       PayloadReport& out,
                       const std::string& index_file = "soma.container");

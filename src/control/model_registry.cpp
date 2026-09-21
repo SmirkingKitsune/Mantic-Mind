@@ -67,10 +67,10 @@ std::string ref_key(const std::string& ref) {
 /// cannot disagree. They did: a container admission advertised 2 total steps and
 /// then emitted steps 3, 4 and 5, which a progress bar reads as 250%.
 std::vector<std::string> admission_stages(bool container_is_ready, bool needs_fetch) {
-    if (container_is_ready) return {"stamp", "profile", "conformance", "finalize"};
+    if (container_is_ready) return {"verify", "profile", "conformance", "finalize"};
     std::vector<std::string> s;
     if (needs_fetch) s.push_back("fetch");
-    s.insert(s.end(), {"convert", "tokenize", "stamp", "oracle", "reference", "profile",
+    s.insert(s.end(), {"convert", "tokenize", "verify", "oracle", "reference", "profile",
                        "conformance", "finalize"});
     return s;
 }
@@ -1655,9 +1655,13 @@ void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
 
         std::string err;
         const int rc = run_streamed_command(
+            // --soma, because the converter asks the engine for the container's
+            // identity while it writes it. Without a path it would search PATH and
+            // refuse, which is correct but would make admission depend on how the
+            // operator's shell happens to be set up.
             {tools.python, (tools_dir / "convert.py").string(), local_source, "--out", container,
              "--quant", tools.quant, "--expert-down", tools.expert_down, "--group",
-             std::to_string(tools.group)},
+             std::to_string(tools.group), "--soma", tools.soma_path},
             fs::current_path(),
             [&](const std::string& line, bool) {
                 // convert.py prints "    layer 12/48  3.40 GB" per layer with
@@ -1729,37 +1733,47 @@ void ControlModelRegistry::run_admission(std::shared_ptr<AdmissionOperation> op,
         }
     }
 
-    // ── 2a. bind the index to the canonical C++ IR ──────────────────────────
+    // ── 2a. check the container against the IR, and its bytes against itself ─
     //
-    // Conversion deliberately cannot compute arch_hash: duplicating the C++ IR
-    // canonicalization in Python would create two definitions of model identity.
-    // This is a required admission stage, including for preconverted containers
-    // and reprofile. stamp is idempotent, so an unchanged container incurs no
-    // rewrite; any role-map or prior-hash disagreement is fatal.
+    // This stage used to STAMP, writing the identity into the index after
+    // conversion had finished. The converter writes it now (`soma arch-hash`),
+    // because a later in-place rewrite of the index re-transfers every shard to
+    // every node holding the container — so what is left here is the check.
+    //
+    // Still required, and still required for a PRECONVERTED container, where it
+    // is the only thing standing between "someone handed us a directory" and
+    // serving it: it reads every expert against its recorded digest and compares
+    // the role descriptor and identity against the IR this host resolves.
+    //
+    // Not idempotent in the old sense — it reads the whole payload every time
+    // rather than short-circuiting on an unchanged index. That is the cost of
+    // the check being real; reprofile pays it, and a reprofile that skipped it
+    // would be asserting the bytes are fine because they were fine once.
     if (!arch_unsupported) {
         const auto target = container_is_ready ? local_source : container;
-        const double stamp_fraction = container_is_ready ? 0.10 : 0.73;
-        emit("stamp", "binding the container to its architecture", stamp_fraction);
-        std::string stamp_out, err;
+        const double verify_fraction = container_is_ready ? 0.10 : 0.73;
+        emit("verify", "checking the container against its architecture", verify_fraction);
+        std::string verify_out, err;
         const int src = run_streamed_command(
-            {tools.soma_path, "stamp", target}, fs::current_path(),
+            {tools.soma_path, "verify", target}, fs::current_path(),
             [&](const std::string& line, bool is_stderr) {
-                if (!is_stderr && !util::trim(line).empty()) stamp_out += util::trim(line) + " ";
+                if (!is_stderr && !util::trim(line).empty()) verify_out += util::trim(line) + " ";
             },
             canceled, &err);
         if (canceled()) {
             progress.canceled = true;
-            fail("canceled during container stamping");
+            fail("canceled during container verification");
             return;
         }
         if (src != 0) {
-            fail("soma stamp failed (exit " + std::to_string(src) + ")" +
+            fail("soma verify failed (exit " + std::to_string(src) + ")" +
                  (err.empty() ? "" : ": " + util::trim(err)));
             return;
         }
-        emit("stamp", stamp_out.empty() ? "stamped" : util::trim(stamp_out), stamp_fraction);
+        emit("verify", verify_out.empty() ? "verified" : util::trim(verify_out),
+             verify_fraction);
     } else {
-        emit("stamp", "not run; this architecture produced no container", 0.73);
+        emit("verify", "not run; this architecture produced no container", 0.73);
     }
 
     // ── 2b. the conformance oracle ───────────────────────────────────────────

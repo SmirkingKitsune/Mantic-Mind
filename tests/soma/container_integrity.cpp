@@ -61,6 +61,18 @@ void put_u64(std::vector<char>& bytes, std::size_t at, std::uint64_t v) {
     std::memcpy(bytes.data() + at, &v, sizeof(v));
 }
 
+/// Replace the index's length-prefixed `arch_hash`.
+///
+/// The engine no longer writes an index at all — conversion does, once — so a
+/// case that needs a container carrying some particular identity has to build it
+/// here rather than ask a C++ function to stamp one.
+void put_hash(std::vector<char>& bytes, const std::string& hex) {
+    const auto had = u32(bytes, 16);
+    bytes.erase(bytes.begin() + 20, bytes.begin() + 20 + had);
+    bytes.insert(bytes.begin() + 20, hex.begin(), hex.end());
+    put_u32(bytes, 16, static_cast<std::uint32_t>(hex.size()));
+}
+
 struct Offsets {
     std::size_t hash = 20;
     std::size_t legacy_dtype = 0;
@@ -131,18 +143,29 @@ int main(int argc, char** argv) {
             return 2;
         }
 
-        std::cout << "strict identity and stamping\n";
+        std::cout << "strict identity\n";
+        {
+            // A container the converter finished, which is now the only kind
+            // there is: the identity is written while the index is, so a
+            // stamped container and a converted one are the same thing.
+            const auto dir = case_dir(root, fixture, "as-converted");
+            soma::IdentityReport report;
+            const auto st = soma::verify_identity(dir.string(), arch, "soma.container", &report);
+            check(st.ok(), "the fixture verifies against the IR it was built from", st.message());
+            check(report.experts_checked > 0, "and the identity pass read the payload",
+                  std::to_string(report.experts_checked) + " experts");
+            check(open_with(dir, arch).ok(), "and strict open accepts it");
+        }
+
         {
             const auto dir = case_dir(root, fixture, "unstamped");
             const auto path = dir / "soma.container";
             auto bytes = read_file(path);
-            const auto hash_len = u32(bytes, 16);
-            bytes.erase(bytes.begin() + 20, bytes.begin() + 20 + hash_len);
-            put_u32(bytes, 16, 0);
+            put_hash(bytes, "");
             write_file(path, bytes);
 
             auto st = open_with(dir, arch);
-            check(!st.ok() && st.message().find("never stamped") != std::string::npos,
+            check(!st.ok() && st.message().find("no arch_hash") != std::string::npos,
                   "strict open rejects an empty on-disk hash", st.message());
             st = open_with(dir, arch, soma::IdentityPolicy::AllowUnstamped);
             check(st.ok(), "--allow-unstamped permits only the empty disk-hash case", st.message());
@@ -154,21 +177,13 @@ int main(int argc, char** argv) {
             check(!st.ok(), "the escape does not accept an IR with no expected identity",
                   st.message());
 
-            st = soma::stamp_container(dir.string(), arch);
-            check(st.ok(), "stamp fills the hash and replaces the existing index", st.message());
-            st = open_with(dir, arch);
-            check(st.ok(), "strict open accepts the newly stamped index", st.message());
-
-            const auto once = read_file(path);
-            const auto old_time = fs::file_time_type::clock::now() - std::chrono::hours(24);
-            fs::last_write_time(path, old_time, cleanup_ec);
-            st = soma::stamp_container(dir.string(), arch);
-            check(st.ok() && read_file(path) == once, "restamping is byte-for-byte idempotent",
-                  st.message());
-            if (!cleanup_ec) {
-                check(fs::last_write_time(path) == old_time,
-                      "an idempotent stamp does not rewrite the index");
-            }
+            // There is no longer anything that can fill it. That is the change:
+            // an unstamped container is unfinished, and the only way forward is
+            // to convert it again — not to patch the index in place, which would
+            // re-transfer every shard to every node holding it.
+            st = soma::verify_identity(dir.string(), arch);
+            check(!st.ok() && st.message().find("Reconvert") != std::string::npos,
+                  "verify refuses an unstamped container and says reconvert", st.message());
         }
 
         {
@@ -180,23 +195,27 @@ int main(int argc, char** argv) {
             auto st = open_with(dir, arch, soma::IdentityPolicy::AllowUnstamped);
             check(!st.ok() && st.message().find("does not match") != std::string::npos,
                   "--allow-unstamped never permits a non-empty hash mismatch", st.message());
-            st = soma::stamp_container(dir.string(), arch);
-            check(!st.ok(), "stamp refuses to overwrite a conflicting prior identity", st.message());
+            st = soma::verify_identity(dir.string(), arch);
+            check(!st.ok(), "and verify reports the identity disagreement", st.message());
         }
 
         {
+            // An expert's rows are `routed_expert_hidden` wide, which is NOT
+            // d_model when the router projects into a latent space. Both the
+            // identity check and open() have to use the former; using d_model
+            // would make every latent-MoE container look the wrong size.
             const auto dir = case_dir(root, fixture, "latent-width");
             const auto path = dir / "soma.container";
-            auto bytes = read_file(path);
-            bytes.erase(bytes.begin() + 20, bytes.begin() + 20 + u32(bytes, 16));
-            put_u32(bytes, 16, 0);
-            write_file(path, bytes);
             auto latent = arch;
             latent.ffn.routed_expert_hidden = arch.topology.d_model;
             latent.topology.d_model *= 2;
             latent.container_arch_hash.clear();
             check(soma::compute_arch_hash(latent, latent.arch_hash).ok(), "hash latent topology");
-            check(soma::stamp_container(dir.string(), latent).ok(), "stamp uses routed latent width");
+            auto bytes = read_file(path);
+            put_hash(bytes, latent.arch_hash);
+            write_file(path, bytes);
+            check(soma::verify_identity(dir.string(), latent).ok(),
+                  "the identity pass uses routed latent width");
             check(open_with(dir, latent).ok(), "strict open uses routed latent width");
         }
 
@@ -214,7 +233,8 @@ int main(int argc, char** argv) {
             if (mutation == 3) put_u32(bytes, o.legacy_dtype - 4, 0xffffffffu);
             write_file(path, bytes);
             check(!open_with(dir, arch).ok(), "strict open rejects malformed " + name);
-            check(!soma::stamp_container(dir.string(), arch).ok(), "stamp rejects malformed " + name);
+            check(!soma::verify_identity(dir.string(), arch).ok(),
+                  "verify rejects malformed " + name);
         }
 
         std::cout << "per-role quantization\n";
@@ -232,8 +252,8 @@ int main(int argc, char** argv) {
             auto st = open_with(dir, arch);
             check(!st.ok() && st.message().find("gate") != std::string::npos,
                   "equal-size gate/down dtype permutation is rejected", st.message());
-            st = soma::stamp_container(dir.string(), arch);
-            check(!st.ok(), "stamp cannot launder a role permutation", st.message());
+            st = soma::verify_identity(dir.string(), arch);
+            check(!st.ok(), "and verify reports the role permutation too", st.message());
         }
 
         {
@@ -279,9 +299,9 @@ int main(int argc, char** argv) {
             bytes.erase(bytes.begin() + o.descriptor_count,
                         bytes.begin() + o.descriptor_count + 4 + 3 * 12);
             write_file(path, bytes);
-            const auto st = soma::stamp_container(dir.string(), arch);
+            const auto st = soma::verify_identity(dir.string(), arch);
             check(!st.ok() && st.message().find("descriptorless") != std::string::npos,
-                  "stamp refuses to manufacture evidence for descriptorless v1", st.message());
+                  "verify will not read a role map out of a descriptorless v1", st.message());
         }
 
         {
@@ -570,19 +590,15 @@ int main(int argc, char** argv) {
         }
 
         {
-            const auto dir = case_dir(root, fixture, "digest-stamp-refuses");
+            // The identity pass reads the payload too, and no longer has an
+            // idempotent short-circuit to skip it: a container that verifies
+            // shape-wise but whose shards moved is caught here rather than at
+            // the first read of that one expert, months later on a node.
+            const auto dir = case_dir(root, fixture, "digest-identity-refuses");
             corrupt_one_expert(dir);
-            // Force a real stamp rather than the idempotent no-op, so the payload
-            // pass actually runs.
-            const auto path = dir / "soma.container";
-            auto bytes = read_file(path);
-            const auto hash_len = u32(bytes, 16);
-            bytes.erase(bytes.begin() + 20, bytes.begin() + 20 + hash_len);
-            put_u32(bytes, 16, 0);
-            write_file(path, bytes);
-            const auto st = soma::stamp_container(dir.string(), arch);
+            const auto st = soma::verify_identity(dir.string(), arch);
             check(!st.ok() && st.code() == soma::StatusCode::DataCorruption,
-                  "stamp will not certify a container whose payload changed", st.message());
+                  "the identity pass refuses a container whose payload changed", st.message());
         }
 
         {

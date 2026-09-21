@@ -65,13 +65,20 @@ def fail(what: str, why: str) -> None:
     FAILURES += 1
 
 
+SOMA = Path()  # set from argv in main(), before any conversion runs
+
+
 def convert(root: Path, family: str, out: Path, extra: list) -> None:
     # The source path is RELATIVE and the converter runs from the repo root:
     # container_meta.json records it verbatim, and an absolute one would pin
     # every fixture to the machine that regenerated it.
+    #
+    # --soma, because conversion asks the engine for the container's identity
+    # while it writes it. That is what makes a fixture reproducible in ONE step:
+    # there is no second, index-rewriting pass to reproduce as well.
     cmd = [sys.executable, str(root / "tools" / "admission" / "convert.py"),
            str(Path("tests") / "fixtures" / "tiny" / family),
-           "--out", str(out), "--group", "128"]
+           "--out", str(out), "--group", "128", "--soma", str(SOMA)]
     if "--quant" not in extra:
         cmd += ["--quant", "q4_g", "--expert-down", "q6_g"]
     cmd += extra
@@ -80,19 +87,6 @@ def convert(root: Path, family: str, out: Path, extra: list) -> None:
         print(r.stdout[-3000:])
         print(r.stderr[-3000:])
         raise SystemExit(f"{family}: convert exited {r.returncode}")
-
-
-def stamp(soma: Path, container: Path) -> None:
-    # Conversion leaves the container unstamped; the identity is written by the
-    # engine because the canonical hash is defined by the C++ IR canonicalization.
-    # Until `soma stamp` folds into conversion, reproducing a fixture means
-    # reproducing both halves.
-    r = subprocess.run([str(soma), "stamp", str(container)],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
-        print(r.stdout[-2000:])
-        print(r.stderr[-2000:])
-        raise SystemExit(f"{container.name}: stamp exited {r.returncode}")
 
 
 def same(a: bytes, b: bytes) -> bool:
@@ -124,7 +118,8 @@ def main() -> int:
     if len(sys.argv) < 3:
         print(__doc__)
         return 2
-    root, soma = Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve()
+    global SOMA
+    root, SOMA = Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve()
     write = "--write" in sys.argv[3:]
 
     try:
@@ -142,7 +137,6 @@ def main() -> int:
             committed = root / rel
             fresh = work / family
             convert(root, family, fresh, extra)
-            stamp(soma, fresh)
             if write:
                 for p in sorted(fresh.iterdir()):
                     shutil.copy2(p, committed / p.name)

@@ -107,7 +107,8 @@ def main(argv: list[str]) -> int:
             out_dir = tmp / f"c-{label}"
             proc = subprocess.run(
                 [sys.executable, str(convert), str(model_dir), "--out", str(out_dir),
-                 "--quant", "q4_g", "--expert-down", "q6_g", "--group", "128"],
+                 "--quant", "q4_g", "--expert-down", "q6_g", "--group", "128",
+                 "--no-identity"],
                 capture_output=True, text=True)
             if proc.returncode != 0:
                 return refuse(f"{label} conversion failed: "

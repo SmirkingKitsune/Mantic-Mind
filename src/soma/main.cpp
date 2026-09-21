@@ -3,7 +3,8 @@
 //   soma serve        --model-dir DIR [--port N] [--host H] [--ctx-size N] ...
 //   soma plan         --model-dir DIR [--json]
 //   soma conform      --model-dir DIR [--json]
-//   soma stamp        DIR
+//   soma arch-hash    DIR
+//   soma verify       DIR
 //
 // `plan` exists as a subcommand of the same binary rather than a separate tool
 // because the planner it runs is the one the server runs: an operator asking
@@ -72,13 +73,17 @@ int usage() {
                  "               the verdict is a property of (model, quantization, host);\n"
                  "               these ASK about a quantization and a host, and convert nothing\n"
                  "  soma conform --model-dir DIR [--json]\n"
-                 "  soma stamp DIR\n"
-                 "               verify a converted v2 container's role descriptor, then\n"
-                 "               bind its index to the canonical C++ IR arch_hash. Shards\n"
-                 "               are not rewritten; serve refuses an unstamped container.\n"
-                 "  soma verify  DIR\n"
-                 "               re-read every expert and check its recorded digest.\n"
-                 "               Run after copying a container to a node.\n"
+                 "  soma arch-hash DIR\n"
+                 "               print the container identity for a directory holding a\n"
+                 "               config.json and (optionally) a container_meta.json, and\n"
+                 "               nothing else. The converter calls this while writing, so a\n"
+                 "               container is stamped when it is born.\n"
+                 "  soma verify  DIR [--no-identity]\n"
+                 "               re-read every expert and check its recorded digest, and\n"
+                 "               check the container against the architecture it claims.\n"
+                 "               Run after copying a container to a node. --no-identity\n"
+                 "               drops the second half, for a host that cannot resolve\n"
+                 "               — or does not support — this architecture.\n"
                  "  soma heat-layout DIR --heat FILE [--pin BYTES] [--json]\n"
                  "               how scattered the pinned hot set is under this layout,\n"
                  "               and what packing it in heat order could collapse it to.\n"
@@ -870,76 +875,81 @@ int cmd_serve(int argc, char** argv) {
 }
 
 
-// ── stamp ────────────────────────────────────────────────────────────────────
+// ── arch-hash ────────────────────────────────────────────────────────────────
 //
-// The step the container format has always assumed and nothing performed.
+// The identity, printed and nothing else, so the CONVERTER can write it.
 //
-// `arch_hash` is the model's identity — the registry keys rows on it, KV
-// checkpoints gate on it, and ExpertStore refuses a container across a mismatch.
-// convert.py deliberately leaves it empty, because the canonical hash is defined
-// by the C++ IR canonicalization and a second implementation in Python would
-// agree until it did not. That was the right call and it left the gate dormant:
-// every container ever written was unstamped, so the mismatch branch could not
-// fire, and the only remaining guard compared a byte TOTAL that cannot tell one
-// role's quantization from another's.
+// A container used to be born unstamped and then rewritten in place by `soma
+// stamp`. That rewrite is the problem: node cache identity is a hash over each
+// file's (relpath, size, mtime), so touching one byte of the index re-transfers
+// the whole container — every shard — to every node holding it. A container that
+// is finished when conversion ends is one that can be treated as immutable, and
+// that is the property the distribution layer has been assuming all along.
 //
-// This runs the SAME resolve_arch() the planner and the server run, so the hash
-// it writes is by construction the hash they will compute.
-int cmd_stamp(int argc, char** argv) {
+// The hash still comes from here rather than from Python, for the reason it
+// always did: it is defined by the C++ IR canonicalization, and a second
+// implementation would agree until it did not. Shelling out to this keeps one
+// definition and moves only the WRITE.
+//
+// Deliberately smaller than `plan --json`, which also reports an identity: this
+// has one line of output and no dependence on a host, because its caller is a
+// script capturing stdout mid-conversion.
+int cmd_arch_hash(int argc, char** argv) {
     if (argc != 1 || argv[0][0] == '-') return usage();
     const std::string dir = argv[0];
 
-    const std::filesystem::path root(dir);
-    // A container, specifically. `plan` accepts a bare HF checkpoint because
-    // asking "what would this do here?" before converting is legitimate; there is
-    // no such reading of "stamp this", and stamping a directory with no shards
-    // would produce an index describing nothing.
-    if (!std::filesystem::exists(root / "container_meta.json")) {
-        std::cerr << "stamp: no container_meta.json in " << dir
-                  << "; this is not a converted container\n";
-        return 1;
-    }
-    if (!std::filesystem::exists(root / "soma.container")) {
-        std::cerr << "stamp: no soma.container in " << dir << "\n";
+    if (!std::filesystem::exists(std::filesystem::path(dir) / "config.json")) {
+        std::cerr << "arch-hash: no config.json in " << dir
+                  << "; the identity is derived from the architecture\n";
         return 1;
     }
 
     soma::ArchIr arch;
     if (auto st = soma::resolve_arch(dir, {}, arch); !st.ok()) {
-        std::cerr << "stamp: " << st.message() << "\n";
+        std::cerr << "arch-hash: " << st.message() << "\n";
         return 1;
     }
-    // stamp_container validates the same parsed snapshot it writes.
-    soma::StampReport report;
-    if (auto st = soma::stamp_container(dir, arch, "soma.container", &report); !st.ok()) {
-        std::cerr << "stamp: " << st.message() << "\n";
+
+    // The CONTAINER's identity, which is not `arch_hash`. `--quant-dense` names
+    // the precision of the resident half at load and moves arch_hash without
+    // moving a byte on disk, so a container stamped with arch_hash would refuse
+    // exactly the serve invocation that option exists to permit.
+    //
+    // The two COINCIDE here, because they diverge only under a quantization
+    // overlay and this resolves without one. The fallback is for a directory
+    // with no container_meta.json — a bare checkpoint — where resolve_arch()
+    // leaves container_arch_hash empty because there is no conversion to
+    // describe. Asking what a not-yet-converted checkpoint would hash to is a
+    // legitimate question, and it is not the converter's caller asking it.
+    const auto& identity =
+        arch.container_arch_hash.empty() ? arch.arch_hash : arch.container_arch_hash;
+    if (identity.empty()) {
+        std::cerr << "arch-hash: the resolved IR carries no identity\n";
         return 1;
     }
-    const auto& identity = arch.container_arch_hash.empty() ? arch.arch_hash
-                                                            : arch.container_arch_hash;
-    // "stamped" only when something was written. An exact repeat reads nothing
-    // and proves nothing new, and printing the same word for both would let an
-    // operator believe a re-run had re-checked the payload.
-    std::cout << (report.wrote ? "stamped   " : "unchanged ")
-              << (root / "soma.container").string() << "\n"
-              << "arch_hash " << identity << "\n";
-    // Which guarantee this is. "Confirmed" means the shards still hash to what
-    // the converter measured with the tensors in memory; "recorded" only pins
-    // what is on disk now, which is all that can be said for a container
-    // converted before digests existed.
-    if (report.wrote) {
-        std::cout << "digests   " << (report.had_digests ? "confirmed" : "recorded") << " over "
-                  << report.experts_checked << " experts" << "\n";
-    } else {
-        std::cout << "digests   not re-read; run `soma verify` to check the payload" << "\n";
-    }
+    std::cout << identity << "\n";
     return 0;
 }
 
 
 // ── verify ───────────────────────────────────────────────────────────────────
 //
-// The question `stamp` does not ask twice: are these still the bytes we recorded?
+// Is this container still sound? Two halves, reported separately because they
+// need different things and fail for different reasons.
+//
+// PAYLOAD asks "are these still the bytes that were recorded", and needs no
+// architecture at all — which is what lets a node holding a copied container
+// check it without being able to resolve, or even support, the family it came
+// from. Both indexes when both exist: the auxiliary DSpark payload is as
+// copyable, and as corruptible, as the base one.
+//
+// IDENTITY asks "is this container what its architecture says it is", and needs
+// the IR. It used to be `soma stamp`'s question, asked while stamping; the
+// converter writes the identity now (see `soma arch-hash`), so all that is left
+// is the check, and it belongs beside the other one. On by default: an optional
+// integrity check is the one that does not run. `--no-identity` is for the host
+// that genuinely cannot answer it, and it SAYS it was skipped rather than
+// reporting a pass that covered less than it appears to.
 //
 // Everything else in this file checks SHAPE. The index packs canonically, the
 // shard files are exactly the size those ranges imply, the roles carry the dtypes
@@ -948,8 +958,18 @@ int cmd_stamp(int argc, char** argv) {
 // it to a node, it sits there, and it is read for months. This is what to run at
 // the far end of that.
 int cmd_verify(int argc, char** argv) {
-    if (argc != 1 || argv[0][0] == '-') return usage();
-    const std::string dir = argv[0];
+    std::string dir;
+    bool identity = true;
+    for (int i = 0; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--no-identity")
+            identity = false;
+        else if (!a.empty() && a[0] != '-' && dir.empty())
+            dir = a;
+        else
+            return usage();
+    }
+    if (dir.empty()) return usage();
     const std::filesystem::path root(dir);
 
     if (!std::filesystem::exists(root / "container_meta.json")) {
@@ -958,19 +978,12 @@ int cmd_verify(int argc, char** argv) {
         return 1;
     }
 
-    // No resolve_arch here, and that is the point: a node holding a copied
-    // container can check it without being able to resolve — or even support —
-    // its architecture. Whether the container matches an IR is `stamp`'s question.
-    //
-    // Both indexes when both exist. The auxiliary DSpark payload is as copyable,
-    // and as corruptible, as the base one.
-    int failures = 0, checked_indexes = 0;
+    int failures = 0;
     for (const char* index : {"soma.container", "soma.dspark"}) {
         if (!std::filesystem::exists(root / index)) continue;
-        ++checked_indexes;
         soma::PayloadReport report;
         const auto st = soma::verify_payload(dir, report, index);
-        std::cout << std::left << std::setw(16) << index;
+        std::cout << std::left << std::setw(16) << index << std::setw(10) << "payload";
         if (st.ok()) {
             std::cout << "OK        " << report.experts_checked << " experts, "
                       << (report.bytes_checked >> 20) << " MiB\n";
@@ -979,10 +992,38 @@ int cmd_verify(int argc, char** argv) {
             ++failures;
         }
     }
-    if (checked_indexes == 0) {
-        std::cerr << "verify: no soma.container in " << dir << "\n";
+    // A directory with an auxiliary index and no base one is not a container at
+    // all: the DSpark payload is an augmentation of something, and the something
+    // is what carries the architecture. Said here rather than left to the
+    // identity pass below, which would report it as an identity failure.
+    if (!std::filesystem::exists(root / "soma.container")) {
+        std::cerr << "verify: no soma.container in " << dir
+                  << "; an auxiliary index alone is not a container\n";
         return 1;
     }
+
+    // The base index only. `soma.dspark` carries no identity by construction —
+    // its architecture is the parent container's, and the typed SkipArchHash
+    // policy is how the reader says so.
+    std::cout << std::left << std::setw(16) << "soma.container" << std::setw(10) << "identity";
+    if (!identity) {
+        std::cout << "skipped   --no-identity; the payload check above covers bytes, "
+                     "not architecture\n";
+        return failures == 0 ? 0 : 1;
+    }
+    soma::ArchIr arch;
+    if (auto st = soma::resolve_arch(dir, {}, arch); !st.ok()) {
+        std::cout << "FAILED    " << st.message() << "\n";
+        return 1;
+    }
+    soma::IdentityReport id_report;
+    if (auto st = soma::verify_identity(dir, arch, "soma.container", &id_report); !st.ok()) {
+        std::cout << "FAILED    " << st.message() << "\n";
+        return 1;
+    }
+    const auto& expected =
+        arch.container_arch_hash.empty() ? arch.arch_hash : arch.container_arch_hash;
+    std::cout << "OK        " << expected << "\n";
     return failures == 0 ? 0 : 1;
 }
 
@@ -1200,8 +1241,18 @@ int main(int argc, char** argv) {
     if (cmd == "serve") return cmd_serve(argc - 2, argv + 2);
     if (cmd == "plan") return cmd_plan(argc - 2, argv + 2);
     if (cmd == "conform") return cmd_conform(argc - 2, argv + 2);
-    if (cmd == "stamp") return cmd_stamp(argc - 2, argv + 2);
+    if (cmd == "arch-hash") return cmd_arch_hash(argc - 2, argv + 2);
     if (cmd == "verify") return cmd_verify(argc - 2, argv + 2);
+    if (cmd == "stamp") {
+        // Removed rather than renamed. It wrote, and the whole point of the
+        // change is that nothing writes an index after conversion; leaving a
+        // silent alias would let a script keep "stamping" a container that was
+        // only ever being read.
+        std::cerr << "`soma stamp` is gone: conversion writes the identity now, and "
+                     "`soma verify DIR`\nchecks it. A container with no identity has to "
+                     "be reconverted.\n";
+        return 2;
+    }
     if (cmd == "heat-layout") return cmd_heat_layout(argc - 2, argv + 2);
     if (cmd == "--help" || cmd == "-h") {
         usage();

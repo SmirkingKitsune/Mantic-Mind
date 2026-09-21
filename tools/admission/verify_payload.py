@@ -245,7 +245,7 @@ def check_structure(container: Path, ix: dict, meta: dict, kinds: list[str]) -> 
         notes.append("per-role quant  absent (pre-descriptor container)")
     notes.append("arch_hash       " +
                  (ix["arch_hash"].decode("ascii", "replace") if ix["arch_hash"]
-                  else "UNSTAMPED - run `soma stamp <dir>`; serve will refuse it"))
+                  else "UNSTAMPED - reconvert without --no-identity; serve refuses it"))
 
     shard_paths = sorted(container.glob("experts-*.bin"))
     if len(shard_paths) != ix["n_shards"]:

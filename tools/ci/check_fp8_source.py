@@ -164,7 +164,7 @@ def convert(root: Path, model_dir: Path, out_dir: Path):
     return subprocess.run(
         [sys.executable, str(root / "tools" / "admission" / "convert.py"),
          str(model_dir), "--out", str(out_dir),
-         "--quant", "q4_g", "--expert-down", "q6_g", "--group", "128"],
+         "--quant", "q4_g", "--expert-down", "q6_g", "--group", "128", "--no-identity"],
         capture_output=True, text=True)
 
 

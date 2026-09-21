@@ -97,9 +97,9 @@ unchanged.
 Legacy v1 indexes remain parseable only behind the explicit development escape
 `soma serve --allow-unstamped`. Strict serving refuses them because v1 did not
 require a per-role descriptor, so even a populated hash cannot rule out a
-same-size role permutation. A descriptorless v1 index cannot be safely stamped;
-reconvert it with the current converter. Transitional v1 indexes that already
-carry a complete descriptor can be validated and upgraded by `soma stamp`.
+same-size role permutation. Reconvert either kind with the current converter:
+nothing upgrades an index in place any more, because nothing writes one after
+conversion (see **Write-once** below).
 
 **There is no `arch.json` FILE in a container.** This listing named one and no converter has ever
 written it. The IR is ADAPTED from `config.json` at load, by the same `resolve_arch()` that
@@ -116,7 +116,7 @@ did: `dtype_gate_up`, `dtype_down`, `group`,
 `layer_kinds`, `dense_tensors`, and `tokenizer` (`compiled` | `unsupported`).
 The v2 binary header independently repeats each routed role's dtype and effective
 group; the runtime compares that descriptor with the IR resolved from this
-record, while the stamp binds the resolved record to the canonical hash.
+record, while the identity binds the resolved record to the canonical hash.
 
 `effective_groups` is keyed by **dtype**, which is wrong whenever two roles share a dtype but not a
 row width — gate/up quantize along `d_model` and down along `expert_intermediate`, so the two collide
@@ -275,8 +275,7 @@ message saying so, and the bit is never reused. The retired table's digests were
 the first 8 bytes of the SHA-256 of an expert's payload alone, which binds no
 slot, so two experts with identical bytes had identical digests. Accepting it
 silently would leave such a container looking checked while a swap passed through
-it. Reconversion is the only route forward; `soma stamp` cannot upgrade one,
-because it reads the index through the same parser that refuses it.
+it. Reconversion is the only route forward; nothing upgrades an index in place.
 
 ### Role descriptor
 
@@ -379,7 +378,7 @@ Four places touch it, and they answer different questions:
 | | reads | catches |
 |---|---|---|
 | the converter | the tensors, once | nothing — it *writes* the table |
-| `soma stamp` | every expert when writing a stamp | damage between conversion and initial admission |
+| `soma verify DIR` (identity pass) | every expert, against the IR as well | damage between conversion and admission, and a container that is not what its architecture says |
 | `soma verify DIR` | every shard, on demand | damage in transit or at rest; needs no source checkpoint |
 | the read path | each expert, on first touch | a bad byte at the moment it would enter the model |
 
@@ -410,11 +409,9 @@ has to happen in that one place, and the precondition is now met: digests are
 mandatory and domain-separated, so a permuted layout that moved its payloads with
 its offsets would be caught by the digest table even with the ordering rule gone.
 
-An unchanged stamp is a no-op and explicitly reports that payload was not
-re-read. Use `soma verify` after transfer. Recording digests for a container that
-was converted without them establishes a baseline for its current bytes and does
-not prove those bytes survived the original conversion unchanged — which is why
-`soma stamp` says which of the two it did.
+Use `soma verify` after a transfer. It has no idempotent short-circuit: it reads
+the payload every time, because a check that skipped the read when nothing looked
+different would be asserting the bytes are fine because they were fine once.
 
 Everything else in this format checks *shape*: that the ranges pack canonically,
 that each shard file is exactly the size those ranges imply, that the roles carry
@@ -450,8 +447,9 @@ experts), and a format that assumed uniformity would need a version bump to allo
 Every MoE slot must have that exact length; dense-layer slots must be empty.
 Within each shard, live ranges must follow the index order from offset zero,
 with only alignment padding between them and after the last range. Aliases,
-gaps, missing experts, and unexpected shard bytes are refused by both open and
-stamp. Shard count is bounded by the index entry count and 100,000.
+gaps, missing experts, and unexpected shard bytes are refused by open and by
+both halves of `soma verify`. Shard count is bounded by the index entry count and
+100,000.
 
 DSpark auxiliary indexes skip the architecture hash through an explicit internal
 policy, but still require v2 role descriptors and the same range checks.
@@ -460,27 +458,60 @@ policy, but still require v2 role descriptors and the same range checks.
 outright. Requantization changes the hash, and reading q4 bytes as q6 produces
 finite, wrong numbers rather than an error.
 
-The hash is written by `soma stamp DIR`, which resolves the
-container's IR through the same `resolve_arch()` the planner and the server use,
-verifies the mandatory role descriptor against it, and then stamps the hash into
-the index. `convert.py` cannot do it: the canonical hash is defined
-by the C++ IR canonicalization and a second implementation in Python would agree
-until it did not. Only the small index file is rewritten — through a temporary plus
-a rename. Stamping also reads every expert and checks it against the table the
-converter recorded, so a container damaged between conversion and admission is
-refused rather than certified; only the small index is rewritten.
+### Write-once
 
-Until this command existed, nothing stamped anything, so the mismatch branch could
-never fire on any container ever written. Unstamped is therefore refused rather
-than accepted. `soma serve --allow-unstamped` is the development-only escape;
-conformance enforces the same strict boundary as serving.
+**The converter writes the hash, and nothing rewrites it afterwards.**
 
-**The stamp is the CONTAINER's identity, not the loaded model's.** These differ in
+`convert.py` still does not compute it: the canonical hash is defined by the C++
+IR canonicalization, and a second implementation in Python would agree until it
+did not. It asks the engine, with `soma arch-hash DIR`, which resolves the IR
+through the same `resolve_arch()` the planner and the server use and prints one
+line. So the definition stays in one place and only the WRITE moved.
+
+This is why the move matters. Node cache identity is a hash over each file's
+`(relpath, size, mtime)` (`src/control/agent_scheduler.cpp`), so **touching one
+byte of the index re-transfers the whole container — every shard — to every node
+holding it.** `soma stamp` did exactly that after conversion, and any future
+repack would too. A container that is finished when conversion ends is one that
+can be treated as immutable, which is what the distribution layer has been
+assuming all along.
+
+It also changes what "reproducible" means for a container: one command produces
+it, rather than a conversion plus an engine pass whose result had to be
+reproduced as well. `tools/ci/check_fixture_containers.py` depends on that.
+
+Consequences, all of them deliberate:
+
+- **`soma stamp` is gone.** Not renamed, not aliased — a silent alias would let a
+  script keep "stamping" a container it was only ever reading. It exits 2 with a
+  pointer to `soma verify`.
+- **An unstamped container cannot be repaired**, only reconverted. Nothing can
+  fill an empty `arch_hash` without rewriting the index.
+- **Ordering inside the converter is now load-bearing.** `config.json` and
+  `container_meta.json` are written first, because the identity is derived from
+  both — the quantization is part of it — and `soma.container` is written last.
+  Its presence is therefore the signal that a conversion finished.
+- **`--no-identity`** writes an unstamped container, for development and for the
+  CI checks that compare two conversions' payloads and never read an identity. It
+  warns, and serve refuses the result without `--allow-unstamped`.
+
+The checking half survives as the identity pass of `soma verify DIR`: it resolves
+the IR, compares the mandatory role descriptor and the recorded hash against it,
+and reads every expert against the digest table. `--no-identity` drops that half
+for a host that cannot resolve — or does not support — the architecture, and says
+it was skipped rather than reporting a pass that covered less than it appears to.
+
+Unstamped is refused at open rather than accepted. `soma serve --allow-unstamped`
+is the development-only escape; conformance enforces the same strict boundary as
+serving.
+
+**The recorded hash is the CONTAINER's identity, not the loaded model's.** These differ in
 one direction: `--quant-dense` chooses the precision of the resident half at load,
 and since that half is stored unquantized on disk precisely so the choice costs no
 reconversion, it moves `arch_hash` without moving one byte of the container. The
-stamp covers the IR carrying the map `container_meta.json` declares — what the
-shards actually are — which the engine tracks as `ArchIr::container_arch_hash`.
+index covers the IR carrying the map `container_meta.json` declares — what the
+shards actually are — which the engine tracks as `ArchIr::container_arch_hash`,
+and which is what `soma arch-hash` prints.
 
 ### `experts-*.bin`
 

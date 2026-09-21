@@ -94,22 +94,6 @@ struct Cursor {
     }
 };
 
-/// The index file's counterpart to Cursor. Only stamp_container() writes, and it
-/// writes the WHOLE file rather than patching a field, because `arch_hash` is
-/// length-prefixed: stamping an empty hash moves every byte after it.
-struct Writer {
-    std::string out;
-
-    template <typename T>
-    void put(T v) {
-        char buf[sizeof(T)];
-        std::memcpy(buf, &v, sizeof(T));
-        out.append(buf, sizeof(T));
-    }
-
-    void raw(std::string_view s) { out.append(s); }
-};
-
 } // namespace
 
 ExpertDigest expert_digest(LayerIndex layer, ExpertId expert, CByteSpan bytes) noexcept {
@@ -172,9 +156,9 @@ bool dtype_from_id(std::uint32_t id, DType& out) noexcept {
 
 /// Everything the index file holds, parsed once.
 ///
-/// Shared by open_indexed() and stamp_container() so a reader and the writer that
-/// rewrites what it read cannot disagree about the layout — which is the failure
-/// this whole change is about.
+/// Shared by open_indexed() and verify_identity() so two readers asking different
+/// questions of the same file cannot disagree about its layout — which is the
+/// failure this whole change is about.
 struct ParsedIndex {
     ContainerHeader header;
     /// The legacy single-dtype pair. Preserved verbatim on rewrite: it cannot
@@ -334,8 +318,8 @@ Status parse_index(const std::string& path, std::string_view raw, ParsedIndex& o
     if ((h.flags & kFlagExpertDigestsLegacy) != 0) {
         return {StatusCode::VersionMismatch,
                 path + " carries the retired 8-byte digest table, which binds no expert "
-                       "identity. Reconvert it with the current converter: `soma stamp` "
-                       "cannot upgrade it, because it will not read this table either"};
+                       "identity. Reconvert it with the current converter; nothing can "
+                       "upgrade this table in place"};
     }
 
     // The digest table, after the entries rather than widened into them: the entry
@@ -360,7 +344,7 @@ Status parse_index(const std::string& path, std::string_view raw, ParsedIndex& o
     return {};
 }
 
-// Validate the exact parsed snapshot that will be used or stamped.
+// Validate the exact parsed snapshot the caller is about to use.
 /// The half of the layout invariant that needs no architecture.
 ///
 /// Split out because the two callers hold different amounts of context and were
@@ -436,44 +420,6 @@ Status validate_ranges(const ParsedIndex& ix, const ArchIr& arch,
     return validate_layout(ix, dir, prefix);
 }
 
-std::string serialize_index(const ParsedIndex& ix) {
-    Writer w;
-    w.raw(std::string_view(kMagic, sizeof(kMagic)));
-    w.put<std::uint32_t>(ix.header.version);
-    w.put<std::uint32_t>(ix.header.flags);
-    w.put<std::uint32_t>(static_cast<std::uint32_t>(ix.header.arch_hash.size()));
-    w.raw(ix.header.arch_hash);
-    w.put<std::uint32_t>(ix.header.n_layers);
-    w.put<std::uint32_t>(ix.header.n_experts);
-    w.put<std::uint32_t>(ix.header.n_shards);
-    w.put<std::uint32_t>(ix.dtype_id);
-    w.put<std::uint32_t>(ix.group);
-    if ((ix.header.flags & kFlagPerRoleQuant) != 0) {
-        w.put<std::uint32_t>(3u);
-        const auto role = [&](TensorRole r, const RoleQuant& q) {
-            w.put<std::uint32_t>(static_cast<std::uint32_t>(r));
-            w.put<std::uint32_t>(static_cast<std::uint32_t>(q.dtype));
-            w.put<std::uint32_t>(q.group);
-        };
-        role(TensorRole::ExpertGate, ix.header.gate);
-        role(TensorRole::ExpertUp, ix.header.up);
-        role(TensorRole::ExpertDown, ix.header.down);
-    }
-    w.put<std::uint64_t>(ix.header.expert_bytes);
-    w.put<std::uint64_t>(ix.total_bytes);
-    for (const auto& e : ix.entries) {
-        w.put<std::uint32_t>(e.shard);
-        w.put<std::uint64_t>(e.offset);
-        w.put<std::uint32_t>(e.length);
-    }
-    if ((ix.header.flags & kFlagExpertDigestsV2) != 0) {
-        for (const auto& digest : ix.digests) {
-            w.raw(std::string_view(reinterpret_cast<const char*>(digest.bytes.data()),
-                                   digest.bytes.size()));
-        }
-    }
-    return std::move(w.out);
-}
 
 /// The role's quantization as the IR describes it, reduced to what a row of that
 /// shape would actually have been written at.
@@ -483,31 +429,6 @@ RoleQuant role_from_ir(const ArchIr& arch, TensorRole role, std::uint32_t cols) 
     return {spec.dtype, effective_group(cols, requested)};
 }
 
-Status replace_index(const fs::path& from, const fs::path& to) {
-#if defined(_WIN32)
-    const auto from_w = from.wstring();
-    const auto to_w = to.wstring();
-    if (!::MoveFileExW(from_w.c_str(),
-                       to_w.c_str(),
-                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        const std::error_code ec(static_cast<int>(::GetLastError()), std::system_category());
-        std::error_code ignored;
-        fs::remove(from, ignored);
-        return {StatusCode::IoError,
-                "cannot replace " + to.string() + ": " + ec.message()};
-    }
-#else
-    std::error_code ec;
-    fs::rename(from, to, ec);
-    if (ec) {
-        std::error_code ignored;
-        fs::remove(from, ignored);
-        return {StatusCode::IoError,
-                "cannot replace " + to.string() + ": " + ec.message()};
-    }
-#endif
-    return {};
-}
 
 } // namespace
 
@@ -726,7 +647,7 @@ bool probe_direct_disabled() noexcept {
 
 /// The shard-prefix an index file's payload lives under.
 ///
-/// One place, because stamp, verify and open all have to agree and a container
+/// One place, because every reader has to agree and a container
 /// whose auxiliary index was checked against the base shards would report a
 /// mismatch that says nothing about either.
 const char* shard_prefix_for(const std::string& index_file) {
@@ -736,9 +657,9 @@ const char* shard_prefix_for(const std::string& index_file) {
 /// Read every live expert once, in index order, and hand its bytes to `sink`.
 ///
 /// Opens the shards directly rather than going through ExpertStore, because both
-/// callers run when the container is not yet fit to open through the front door:
-/// stamp is what makes it openable, and verify has to work on a container whose
-/// digests are the thing in doubt.
+/// callers run when the container may not be fit to open through the front door:
+/// they are the checks that decide whether it is, and verify in particular has to
+/// work on a container whose digests are the thing in doubt.
 ///
 /// Index order, not random: this is a sequential sweep of files that are about to
 /// be read end to end, and it is the one place in this file where readahead is
@@ -864,19 +785,19 @@ Status ExpertStore::open_indexed(const std::string& model_dir,
 
     // arch_hash gate.
     //
-    // An empty hash means the container was written but never STAMPED: convert.py
-    // cannot compute it, because the canonical hash is defined by the C++ IR
-    // canonicalization and a second implementation in Python would agree until it
-    // did not. Stamping is `soma stamp`'s job.
+    // An empty hash means the container was never finished. The converter asks
+    // the engine for the identity through `soma arch-hash` while it writes, so
+    // the only ways to produce one now are `--no-identity` or a converter older
+    // than that change. Python still does not compute the hash itself: it is
+    // defined by the C++ IR canonicalization, and a second implementation would
+    // agree until it did not.
     //
-    // UNSTAMPED IS NOW REFUSED, where it used to be accepted silently. The old
+    // UNSTAMPED IS REFUSED, where it used to be accepted silently. The old
     // reading was that an unstamped container is merely un-gated, and everything
     // else the gate covers — the IR moving under a container that did not move,
     // which is what requantization and a changed family default both look like —
     // then goes uncaught, because the checks below compare the container against a
-    // map read out of that same container's own meta. Accepting unstamped by
-    // default also made `stamp` optional, and an optional integrity check is
-    // the one that does not run.
+    // map read out of that same container's own meta.
     //
     // DSpark's auxiliary container uses the typed SkipArchHash policy below;
     // clearing a string is never treated as authority to bypass identity.
@@ -913,10 +834,10 @@ Status ExpertStore::open_indexed(const std::string& model_dir,
     if (h.arch_hash.empty() && opts.identity == IdentityPolicy::RequireStamped) {
         return {StatusCode::ArchMismatch,
                 index_path.string() +
-                    " carries no arch_hash: it was converted but never stamped. Run "
-                    "`soma stamp " + model_dir +
-                    "` to bind it to the IR it was built from, or pass --allow-unstamped to "
-                    "use the development-only structural and role checks without identity"};
+                    " carries no arch_hash: it was written by a converter that did not "
+                    "stamp it, or with --no-identity. Reconvert it with the current "
+                    "converter, or pass --allow-unstamped to use the development-only "
+                    "structural and role checks without identity"};
     }
 
     // MISMATCHED is refused. Reading q4 bytes as q6 produces finite, wrong
@@ -1043,14 +964,13 @@ Status ExpertStore::open_indexed(const std::string& model_dir,
     // validator rather than a change to the threat model.
     //
     // `PayloadPolicy::Trust` is the escape, and it already says the right thing:
-    // the caller is asking to read without checking. `soma stamp` records a table
-    // for a container that lacks one, without reconverting.
+    // the caller is asking to read without checking. Nothing can add a table to a
+    // container that lacks one — that is a rewrite, and the index is written once.
     if (!h.has_digests && opts.payload != PayloadPolicy::Trust) {
         return {StatusCode::Unsupported,
                 index_path.string() +
-                    " carries no digest table, so nothing would check the bytes it hands the "
-                    "model. Run `soma stamp " +
-                    model_dir + "` to record one"};
+                    " carries no digest table, so nothing would check the bytes it hands "
+                    "the model. Reconvert it with the current converter"};
     }
 
     if (h.has_digests && opts.payload == PayloadPolicy::VerifyOnFirstRead) {
@@ -1213,9 +1133,8 @@ Status verify_payload(const std::string& model_dir,
     if (!ix.header.has_digests) {
         return {StatusCode::Unsupported,
                 index_path.string() +
-                    " carries no digest table, so there is nothing to check the payload against. "
-                    "Reconvert it with the current converter, or run `soma stamp` to record the "
-                    "bytes it has now"};
+                    " carries no digest table, so there is nothing to check the payload "
+                    "against. Reconvert it with the current converter"};
     }
     // Structure before payload, and the SAME structure open() requires.
     //
@@ -1255,10 +1174,10 @@ Status verify_payload(const std::string& model_dir,
     return {StatusCode::OutOfMemory, "verify_payload ran out of memory"};
 }
 
-Status stamp_container(const std::string& model_dir,
+Status verify_identity(const std::string& model_dir,
                        const ArchIr& arch,
                        const std::string& index_file,
-                       StampReport* report) try {
+                       IdentityReport* report) try {
     if (report != nullptr) *report = {};
     const fs::path index_path = fs::path(model_dir) / index_file;
     std::string raw;
@@ -1276,7 +1195,7 @@ Status stamp_container(const std::string& model_dir,
         arch.container_arch_hash.empty() ? arch.arch_hash : arch.container_arch_hash;
     if (identity.empty()) {
         return {StatusCode::InvalidArgument,
-                "the resolved IR carries no arch_hash, so there is nothing to stamp"};
+                "the resolved IR carries no arch_hash, so there is nothing to compare against"};
     }
     if (arch.ffn.expert_intermediate == 0 || arch.topology.d_model == 0) {
         return {StatusCode::InvalidArgument,
@@ -1285,9 +1204,20 @@ Status stamp_container(const std::string& model_dir,
     }
     if (!ix.header.has_role_quant) {
         return {StatusCode::ArchMismatch,
-                "refusing to stamp a descriptorless v1 container: its byte total cannot prove "
-                "which same-sized expert role owns which dtype. Reconvert it with the current "
-                "converter, or use --allow-unstamped only for development"};
+                "descriptorless v1 container: its byte total cannot prove which same-sized "
+                "expert role owns which dtype. Reconvert it with the current converter, or "
+                "use --allow-unstamped only for development"};
+    }
+    // Empty is a FAILURE, not an invitation. This function used to fill it, and a
+    // container that reached here unstamped simply got one; now the converter
+    // writes it, so an empty hash means the container was never finished — and
+    // nothing here can finish it without rewriting the index, which is the
+    // rewrite this change exists to remove.
+    if (ix.header.arch_hash.empty()) {
+        return {StatusCode::ArchMismatch,
+                index_path.string() + " carries no arch_hash: it was written by a converter "
+                "that did not stamp it, or with --no-identity. Reconvert it with the current "
+                "converter, which asks the engine for the identity while it writes"};
     }
 
     const auto fi = arch.ffn.expert_intermediate;
@@ -1296,18 +1226,13 @@ Status stamp_container(const std::string& model_dir,
     const auto up = role_from_ir(arch, TensorRole::ExpertUp, d);
     const auto down = role_from_ir(arch, TensorRole::ExpertDown, fi);
 
-    // VERIFY, then stamp.
-    //
-    // A stamp asserts that this container is what the IR says it is. Stamping
-    // past a disagreement would launder precisely the error the hash exists to
-    // catch — and it would do so permanently, because from then on the container
-    // opens without objection.
+    // The byte total the IR implies, against the one the index declares.
     const auto implied = expert_bytes_for(arch, fi, d, TensorRole::ExpertGate) +
                          expert_bytes_for(arch, fi, d, TensorRole::ExpertUp) +
                          expert_bytes_for(arch, d, fi, TensorRole::ExpertDown);
     if (ix.header.expert_bytes > 0 && implied != ix.header.expert_bytes) {
         return {StatusCode::ArchMismatch,
-                "refusing to stamp: the container's experts are " +
+                "the container's experts are " +
                     std::to_string(ix.header.expert_bytes) +
                     " B but the IR's quantization map implies " + std::to_string(implied) +
                     " B. container_meta.json does not describe these shards"};
@@ -1320,7 +1245,7 @@ Status stamp_container(const std::string& model_dir,
     if (!same(ix.header.gate, gate) || !same(ix.header.up, up) ||
         !same(ix.header.down, down)) {
         return {StatusCode::ArchMismatch,
-                "refusing to stamp: this container describes expert roles as " +
+                "this container describes expert roles as " +
                     std::string(to_string(ix.header.gate.dtype)) + "/" +
                     std::string(to_string(ix.header.up.dtype)) + "/" +
                     std::string(to_string(ix.header.down.dtype)) +
@@ -1329,118 +1254,55 @@ Status stamp_container(const std::string& model_dir,
                     std::string(to_string(down.dtype)) +
                     "; an equal byte total cannot prove those layouts equivalent"};
     }
-    if (!ix.header.arch_hash.empty() && ix.header.arch_hash != identity) {
+    if (ix.header.arch_hash != identity) {
         return {StatusCode::ArchMismatch,
-                "refusing to re-stamp: this container already carries arch_hash " +
-                    ix.header.arch_hash.substr(0, 16) + "... and the IR now hashes to " +
-                    identity.substr(0, 16) +
+                "this container carries arch_hash " + ix.header.arch_hash.substr(0, 16) +
+                    "... and the IR hashes to " + identity.substr(0, 16) +
                     "...; requantization changes the hash, and these are the same bytes"};
     }
 
     if (auto st = validate_ranges(ix, arch, model_dir, shard_prefix_for(index_file)); !st.ok())
         return st;
 
-    // Exact repeat is a true no-op: admission may safely run stamp on every
-    // pass without changing mtimes or exposing a replacement race to readers.
-    //
-    // Checked BEFORE the payload pass below, so the no-op stays a no-op rather
-    // than becoming a full re-read of the container every time admission runs.
-    // Re-reading an already-stamped container is `soma verify`'s job, and it is a
-    // different question — "are these still the bytes we recorded", asked after a
-    // transfer, rather than "is this container what the IR says it is".
-    constexpr std::uint32_t kStampedFlags = kFlagPerRoleQuant | kFlagExpertDigestsV2;
-    const auto gate_id = static_cast<std::uint32_t>(gate.dtype);
-    if (ix.header.version == kContainerVersion && ix.header.arch_hash == identity &&
-        ix.header.flags == kStampedFlags && ix.dtype_id == gate_id && ix.group == gate.group) {
-        if (report != nullptr) report->had_digests = true;
-        return {};
-    }
-    if (report != nullptr) report->had_digests = ix.header.has_digests;
-
     // PAYLOAD. The one pass in this function that reads a shard byte.
     //
     // Everything above proves the container is SHAPED right: ranges pack
     // canonically, shard files are exactly the implied size, the roles carry the
-    // dtypes the IR names. A shard of exactly the right size full of wrong bytes
-    // satisfies all of it. This is the moment to notice, because it is the last
-    // point before the container is copied to nodes and read for months.
-    //
-    // Computing a digest is not the same laundering risk as manufacturing a quant
-    // map: there is no authoritative source for which role owns which dtype other
-    // than the descriptor, but the payload IS the authority on its own digest. The
-    // guarantee differs, though, and stamp says which one it recorded — bytes
-    // confirmed unchanged since conversion, or bytes pinned as they are now.
-    std::vector<ExpertDigest> computed(ix.entries.size());
-    const auto stamp_n_experts = std::max<std::uint32_t>(ix.header.n_experts, 1);
+    // dtypes the IR names, the identity matches. A shard of exactly the right
+    // size full of wrong bytes satisfies all of it.
+    if (!ix.header.has_digests) {
+        return {StatusCode::Unsupported,
+                index_path.string() + " carries no digest table, so its payload cannot be "
+                "checked at all. Reconvert it with the current converter"};
+    }
+    const auto n_experts = std::max<std::uint32_t>(ix.header.n_experts, 1);
+    std::size_t checked = 0;
+    Status mismatch;
     if (auto st = walk_experts(ix, model_dir, index_file,
                                [&](std::size_t slot, CByteSpan bytes) {
-                                   computed[slot] =
-                                       expert_digest(static_cast<LayerIndex>(slot / stamp_n_experts),
-                                                     static_cast<ExpertId>(slot % stamp_n_experts),
-                                                     bytes);
+                                   if (!mismatch.ok()) return;
+                                   ++checked;
+                                   const auto layer = static_cast<LayerIndex>(slot / n_experts);
+                                   const auto expert = static_cast<ExpertId>(slot % n_experts);
+                                   if (expert_digest(layer, expert, bytes) == ix.digests[slot])
+                                       return;
+                                   mismatch = {StatusCode::DataCorruption,
+                                               "layer " + std::to_string(layer) + " expert " +
+                                                   std::to_string(expert) +
+                                                   " does not match the digest the converter "
+                                                   "recorded; the shards changed after they "
+                                                   "were written"};
                                });
         !st.ok())
         return st;
+    if (!mismatch.ok()) return mismatch;
 
-    if (ix.header.has_digests) {
-        for (std::size_t slot = 0; slot < computed.size(); ++slot) {
-            if (ix.digests[slot] == computed[slot]) continue;
-            return {StatusCode::DataCorruption,
-                    "refusing to stamp: layer " +
-                        std::to_string(slot / std::max<std::size_t>(ix.header.n_experts, 1)) +
-                        " expert " +
-                        std::to_string(slot % std::max<std::size_t>(ix.header.n_experts, 1)) +
-                        " does not match the digest the converter recorded; the shards changed "
-                        "after they were written"};
-        }
-    }
-
-    if (report != nullptr) {
-        for (const auto& e : ix.entries)
-            if (e.length != 0) ++report->experts_checked;
-        report->wrote = true;
-    }
-
-    ix.digests = std::move(computed);
-    ix.header.version = kContainerVersion;
-    ix.header.arch_hash = identity;
-    ix.header.flags = kStampedFlags;
-    ix.header.gate = gate;
-    ix.header.up = up;
-    ix.header.down = down;
-    ix.dtype_id = gate_id;
-    ix.group = gate.group;
-    const auto bytes = serialize_index(ix);
-
-    // Temp plus rename, matching what the V4 converter does for the same file.
-    // An interrupted stamp that left a half-written index would destroy a
-    // container the shards of which are perfectly intact.
-    static std::atomic<std::uint64_t> stamp_sequence{0};
-#if defined(_WIN32)
-    const auto process_id = static_cast<std::uint64_t>(::GetCurrentProcessId());
-#else
-    const auto process_id = static_cast<std::uint64_t>(::getpid());
-#endif
-    const auto stamp_id = stamp_sequence.fetch_add(1, std::memory_order_relaxed);
-    const fs::path tmp = index_path.string() + ".tmp." + std::to_string(process_id) + "." +
-                         std::to_string(stamp_id);
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out) return {StatusCode::IoError, "cannot write " + tmp.string()};
-        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-        out.flush();
-        out.close();
-        if (!out) {
-            std::error_code ignored;
-            fs::remove(tmp, ignored);
-            return {StatusCode::IoError, "short write to " + tmp.string()};
-        }
-    }
-    return replace_index(tmp, index_path);
+    if (report != nullptr) report->experts_checked = checked;
+    return {};
 }
 
 catch (const std::bad_alloc&) {
-    return {StatusCode::IoError, "insufficient memory to stamp container index"};
+    return {StatusCode::IoError, "insufficient memory to verify container index"};
 }
 
 const char* to_string(BandwidthMethod method) noexcept {

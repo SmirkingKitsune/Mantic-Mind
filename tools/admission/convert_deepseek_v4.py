@@ -19,8 +19,9 @@ from pathlib import Path
 from typing import Any
 
 from convert import (ALIGN, DTYPE_ID, EXPERT_DIGEST_BYTES, FLAG_EXPERT_DIGESTS_V2,
-                     FLAG_PER_ROLE_QUANT, FORMAT_VERSION, MAGIC, align_up, digest_table,
-                     expert_digest, quantize_rows, role_descriptor, usable_group)
+                     FLAG_PER_ROLE_QUANT, FORMAT_VERSION, MAGIC, align_up,
+                     container_identity, digest_table, expert_digest, quantize_rows,
+                     role_descriptor, usable_group)
 
 DIGEST_HEX = EXPERT_DIGEST_BYTES * 2
 
@@ -827,19 +828,10 @@ def run(args) -> int:
     qtmp.write_text(json.dumps(qindex, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(qtmp, out_dir / "dense.qweights.index.json")
 
-    with open(out_dir / "soma.container.tmp", "wb") as ix:
-        ix.write(MAGIC)
-        ix.write(struct.pack("<II", FORMAT_VERSION,
-                             FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS_V2))
-        ix.write(struct.pack("<I", 0))
-        ix.write(struct.pack("<IIII", n_layers, n_experts, n_layers, DTYPE_ID[dt_gate]))
-        ix.write(struct.pack("<I", role_groups.get("gate", args.group)))
-        ix.write(role_descriptor(dt_gate, dt_gate, dt_down, role_groups, args.group))
-        ix.write(struct.pack("<QQ", max(uniform_len, 0), total_payload))
-        for shard, off, length in all_index:
-            ix.write(struct.pack("<IQI", shard, off, length))
-        ix.write(digest_table(all_digests))
-    os.replace(out_dir / "soma.container.tmp", out_dir / "soma.container")
+    # The config first, and the INDEX last — see below. Both `soma arch-hash` and
+    # anything that later opens this container resolve the IR from the config
+    # sitting beside the payload, so it has to land before the identity is asked
+    # for.
     shutil.copy2(src / "config.json", out_dir / "config.json")
 
     # DSpark is an additive, resumable conversion. Do not invalidate a tokenizer
@@ -912,6 +904,33 @@ def run(args) -> int:
         })
     (out_dir / "container_meta.json").write_text(
         json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    # ── index, written last and written finished ─────────────────────────────
+    #
+    # After container_meta.json, because `soma arch-hash` resolves the IR from
+    # the config AND the record — the quantization is part of the container's
+    # identity. Writing the index last also makes its presence the signal that a
+    # conversion finished: a run that dies earlier leaves a directory a resume
+    # will rebuild rather than one that looks loadable.
+    arch_hash = b"" if args.no_identity else container_identity(out_dir, args.soma)
+    if args.no_identity:
+        print("  WARNING  --no-identity: this container is unstamped and serve will "
+              "refuse it")
+    with open(out_dir / "soma.container.tmp", "wb") as ix:
+        ix.write(MAGIC)
+        ix.write(struct.pack("<II", FORMAT_VERSION,
+                             FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS_V2))
+        ix.write(struct.pack("<I", len(arch_hash)))
+        ix.write(arch_hash)
+        ix.write(struct.pack("<IIII", n_layers, n_experts, n_layers, DTYPE_ID[dt_gate]))
+        ix.write(struct.pack("<I", role_groups.get("gate", args.group)))
+        ix.write(role_descriptor(dt_gate, dt_gate, dt_down, role_groups, args.group))
+        ix.write(struct.pack("<QQ", max(uniform_len, 0), total_payload))
+        for shard, off, length in all_index:
+            ix.write(struct.pack("<IQI", shard, off, length))
+        ix.write(digest_table(all_digests))
+    os.replace(out_dir / "soma.container.tmp", out_dir / "soma.container")
+
     print(f"  OK       {len(all_index)} experts, {total_payload / 1e9:.3f} GB routed, "
           f"{(dense_total + qweight_total) / 1e9:.3f} GB resident, tokenizer {tokenizer_status}" +
           (f", DSpark {dspark_total_payload / 1e9:.3f} GB routed + "

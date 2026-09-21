@@ -105,7 +105,8 @@ def convert(repo: Path, model_dir: Path, out: Path) -> None:
     # sibling module; the script path is absolute so the two cannot fight.
     cmd = [sys.executable, str((repo / "tools/admission/convert.py").resolve()),
            str(model_dir.resolve()),
-           "--out", str(out.resolve()), "--quant", "q8_0", "--group", "32"]
+           "--out", str(out.resolve()), "--quant", "q8_0", "--group", "32",
+           "--no-identity"]
     r = subprocess.run(cmd, capture_output=True, text=True,
                        cwd=str((repo / "tools/admission").resolve()))
     if r.returncode != 0:

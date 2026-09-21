@@ -20,8 +20,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
+import shutil
 import struct
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -93,6 +96,53 @@ def expert_digest(layer: int, expert: int, blob: bytes) -> bytes:
     h.update(struct.pack("<IIQ", layer, expert, len(blob)))
     h.update(blob)
     return h.digest()
+
+
+def find_soma(explicit: "str | None") -> "str | None":
+    """The engine binary, for the one thing Python must not compute itself."""
+    for candidate in (explicit, os.environ.get("MM_SOMA_PATH")):
+        if candidate:
+            return candidate if Path(candidate).is_file() else None
+    return shutil.which("soma")
+
+
+def container_identity(out_dir: Path, soma: "str | None") -> bytes:
+    """The canonical container identity, from the engine, as index bytes.
+
+    Asked for HERE, while the container is being written, rather than patched in
+    afterwards by `soma stamp`. The rewrite was the problem: node cache identity
+    is a hash over each file's (relpath, size, mtime), so touching one byte of
+    the index re-transfers every shard to every node holding the container. A
+    container finished at conversion is one that can be treated as immutable.
+
+    The hash still comes from C++ — it is defined by the IR canonicalization, and
+    a second implementation here would agree until it did not. Only the WRITE
+    moved. Note the directory must already hold config.json and container_meta.json
+    when this is called, which is why the index is now written last.
+
+    Returned as ASCII hex, which is what the index stores: the reader compares it
+    as text against what resolve_arch() produces, and 32 raw bytes would not be
+    greppable in a file operators do read by hand.
+    """
+    exe = find_soma(soma)
+    if exe is None:
+        raise SystemExit(
+            "  REFUSED  cannot find the soma engine, so this container could not be "
+            "stamped.\n"
+            "           Pass --soma PATH or set MM_SOMA_PATH. An unstamped container "
+            "is refused\n"
+            "           at serve, so writing one would only move the failure later. "
+            "Use\n"
+            "           --no-identity if you are deliberately building one for a test.")
+    r = subprocess.run([exe, "arch-hash", str(out_dir)], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit(f"  REFUSED  soma arch-hash exited {r.returncode}: "
+                         f"{(r.stderr or r.stdout).strip()}")
+    identity = r.stdout.strip()
+    if len(identity) != 64 or any(c not in "0123456789abcdef" for c in identity):
+        raise SystemExit(f"  REFUSED  soma arch-hash printed {identity!r}, "
+                         f"which is not a hash")
+    return identity.encode("ascii")
 
 
 def digest_table(digests: "list[bytes]") -> bytes:
@@ -808,6 +858,12 @@ def main(argv: list[str]) -> int:
                     help="refuse reuse of a compatible conversion manifest")
     ap.add_argument("--include-dspark", action="store_true",
                     help="augment DeepSeek-V4 with its three-stage DSpark draft model")
+    ap.add_argument("--soma", default=None,
+                    help="path to the soma engine, which computes the container "
+                         "identity (default: $MM_SOMA_PATH, then PATH)")
+    ap.add_argument("--no-identity", action="store_true",
+                    help="write an unstamped container. Development only: serve "
+                         "refuses one without --allow-unstamped")
     ap.add_argument("--test-fixture", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args(argv[1:])
 
@@ -1350,30 +1406,16 @@ def main(argv: list[str]) -> int:
 
     save_file(dense, str(out_dir / "dense.safetensors"))
 
-    # ── index ────────────────────────────────────────────────────────────────
-    # arch_hash is left empty here: it is computed by the engine from the
-    # canonical IR, and inventing a second hash function in Python would give two
-    # answers that agree until they do not.
-    arch_hash = b""
-    with open(out_dir / "soma.container", "wb") as ix:
-        ix.write(MAGIC)
-        ix.write(struct.pack("<II", FORMAT_VERSION,
-                             FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS_V2))
-        ix.write(struct.pack("<I", len(arch_hash)))
-        ix.write(arch_hash)
-        ix.write(struct.pack("<IIII", n_layers, n_experts, shard_idx + 1, DTYPE_ID[dt_gate]))
-        ix.write(struct.pack("<I", role_groups.get("gate", args.group)))
-        ix.write(role_descriptor(dt_gate, dt_up, dt_down, role_groups, args.group))
-        ix.write(struct.pack("<QQ", max(uniform_len, 0), total))
-        for shard, off, length in index:
-            ix.write(struct.pack("<IQI", shard, off, length))
-        ix.write(digest_table(digests))
-
-    # The container must be self-describing: load_f32_model() adapts the IR from
-    # config.json in the directory it is pointed at, so a container without one
-    # cannot be opened at all.
-    import shutil
-    # VERBATIM, including `vision_config` for a wrapper. The IR then reports
+    # ── the descriptive half, BEFORE the index ───────────────────────────────
+    #
+    # Order matters now. `soma arch-hash` resolves the IR from config.json and
+    # container_meta.json in this directory, so both must exist before the index
+    # can carry an identity — and the index is the only file that carries one.
+    # The container must be self-describing in any case: load_f32_model() adapts
+    # the IR from config.json in the directory it is pointed at, so a container
+    # without one cannot be opened at all.
+    #
+    # The config is copied VERBATIM, including `vision_config` for a wrapper. The IR then reports
     # `vision+text` and the plan states which half is being served -- which is
     # the whole job of ModalitySpec, and the opposite of what writing a
     # text-only config here would achieve.
@@ -1418,6 +1460,25 @@ def main(argv: list[str]) -> int:
     }
     (out_dir / "container_meta.json").write_text(
         json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    # ── index, written last and written finished ─────────────────────────────
+    arch_hash = b"" if args.no_identity else container_identity(out_dir, args.soma)
+    if args.no_identity:
+        print("  WARNING  --no-identity: this container is unstamped and serve will "
+              "refuse it")
+    with open(out_dir / "soma.container", "wb") as ix:
+        ix.write(MAGIC)
+        ix.write(struct.pack("<II", FORMAT_VERSION,
+                             FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS_V2))
+        ix.write(struct.pack("<I", len(arch_hash)))
+        ix.write(arch_hash)
+        ix.write(struct.pack("<IIII", n_layers, n_experts, shard_idx + 1, DTYPE_ID[dt_gate]))
+        ix.write(struct.pack("<I", role_groups.get("gate", args.group)))
+        ix.write(role_descriptor(dt_gate, dt_up, dt_down, role_groups, args.group))
+        ix.write(struct.pack("<QQ", max(uniform_len, 0), total))
+        for shard, off, length in index:
+            ix.write(struct.pack("<IQI", shard, off, length))
+        ix.write(digest_table(digests))
 
     padded = sum(align_up(l) for _, _, l in index)
     print(f"  OK       {len(index)} experts, {total / 1e9:.3f} GB payload, "

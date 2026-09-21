@@ -39,15 +39,15 @@ namespace {
 /// wire and stays right, names are the part this can be wrong about, and
 /// inventing them is worse than omitting them.
 const std::vector<std::string>& ladder_for(int total_steps) {
-    static const std::vector<std::string> container = {"stamp", "profile", "conformance",
+    static const std::vector<std::string> container = {"verify", "profile", "conformance",
                                                         "finalize"};
     static const std::vector<std::string> local = {
-        "convert", "tokenize", "stamp", "oracle", "reference", "profile", "conformance",
+        "convert", "tokenize", "verify", "oracle", "reference", "profile", "conformance",
         "finalize"};
     static const std::vector<std::string> fetched = {"fetch",
                                                      "convert",
                                                      "tokenize",
-                                                     "stamp",
+                                                     "verify",
                                                      "oracle",
                                                      "reference",
                                                      "profile",

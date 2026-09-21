@@ -7387,13 +7387,13 @@ bool test_admission_pipeline_runs_and_reports() {
     // Progress is STAGED, and the operation is retrievable after it ends — an
     // SSE connection will not survive a real conversion, so a client that
     // reconnects has to be able to find out how it went.
-    bool saw_stamp = false, saw_profile = false, saw_finalize = false;
+    bool saw_verify = false, saw_profile = false, saw_finalize = false;
     for (const auto& f : frames) {
-        if (f.stage == "stamp") saw_stamp = true;
+        if (f.stage == "verify") saw_verify = true;
         if (f.stage == "profile") saw_profile = true;
         if (f.stage == "finalize") saw_finalize = true;
     }
-    CHECK(saw_stamp);
+    CHECK(saw_verify);
     CHECK(saw_profile);
     CHECK(saw_finalize);
     CHECK(reg.operation(op).has_value());
@@ -7596,7 +7596,7 @@ bool test_admission_fetch_stage() {
     // either would leave the ladder reporting fewer stages while still saying
     // "no failures", which reads as a pass.
     const std::vector<std::string> want{"fetch",     "convert",     "tokenize",
-                                        "stamp",     "oracle",      "reference",   "profile",
+                                        "verify",    "oracle",      "reference",   "profile",
                                         "conformance", "finalize"};
     std::size_t at = 0;
     std::int64_t peak_bytes = 0, peak_total = 0;

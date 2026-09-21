@@ -125,10 +125,10 @@ int main() {
         auto op = running_op();
         op.total_steps = 4;
         op.step = 1;
-        op.stage = "stamp";
+        op.stage = "verify";
         snap.operations.push_back(op);
         const auto detail = draw(mm::render_admission_detail(snap, 0));
-        check(has(detail, "stamp"), "container ladder starts at stamp");
+        check(has(detail, "verify"), "container ladder starts at verify");
         check(has(detail, "profile"), "container ladder names its second stage");
         check(has(detail, "conformance"), "container ladder names conformance");
         check(!has(detail, "convert"), "container ladder does not claim a convert stage");

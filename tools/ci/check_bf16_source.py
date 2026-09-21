@@ -60,7 +60,7 @@ def convert(root: Path, src: Path, out: Path, *extra: str) -> bool:
     r = subprocess.run(
         [sys.executable, str(root / "tools" / "admission" / "convert.py"), str(src),
          "--out", str(out), "--quant", "q4_g", "--expert-down", "q6_g",
-         "--group", "128", *extra],
+         "--group", "128", "--no-identity", *extra],
         capture_output=True, text=True)
     if r.returncode != 0:
         fail(f"convert {src.name} exited {r.returncode}: {r.stdout[-400:]}{r.stderr[-400:]}")
