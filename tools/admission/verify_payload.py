@@ -297,23 +297,30 @@ def check_structure(container: Path, ix: dict, meta: dict, kinds: list[str]) -> 
         per_shard.setdefault(shard, []).append((off, length, slot))
 
     for shard, slots in per_shard.items():
-        # Walked in INDEX order, which is the order they were appended in — not
-        # sorted by offset.
+        # Sorted by OFFSET, which is a tiling test rather than a packing-order one.
         #
-        # Sorting here made this check a tiling test: any permutation whose ranges
-        # happened to pack perfectly passed. The engine's own check walks the index
-        # and requires each range to start where the previous one ended
-        # (`validate_ranges` in src/soma/expert_store.cpp), so the two validators
-        # disagreed, and the permissive one was the one an operator runs after a
-        # transfer. A container with two experts swapped — payloads moved with
-        # them, so every digest still matches — passed here and was refused by
-        # `soma serve`.
+        # This file used to walk index order deliberately, because the engine did:
+        # each range had to start where the previous INDEX entry's padded range
+        # ended, so index order was layout order and a permuted container was a
+        # structural failure. Sorting here would have made this permissive where
+        # the engine was strict — and an earlier version of this check did exactly
+        # that, so a container the engine refused passed the tool an operator runs
+        # after a transfer.
+        #
+        # The engine relaxed to the same tiling invariant once digests became
+        # mandatory and domain-separated (`validate_layout` in
+        # src/soma/expert_store.cpp), because a digest binds (layer, expert,
+        # length) and therefore catches the swap this ordering rule was carrying:
+        # an expert read from another expert's slot fails its digest whether or
+        # not the ranges still look canonical. So the two sides sort now, and they
+        # sort together — the rule is that they agree, not which rule they hold.
+        slots.sort(key=lambda s: s[0])
         cursor = 0
         for off, length, slot in slots:
             layer, expert = divmod(slot, n_experts)
             if off != cursor:
                 raise Failure(f"layer {layer} expert {expert}: starts at {off}, but the "
-                              f"previous slot in shard {shard} ends aligned at {cursor} "
+                              f"ranges below it in shard {shard} end aligned at {cursor} "
                               f"— {'overlap' if off < cursor else 'gap'}")
             cursor = align_up(off + length)
         # The converter pads after every expert, including the last in a shard, so

@@ -399,7 +399,8 @@ Every part of that earns its place:
   corruption check. Hashing the payload alone gives two experts with identical
   bytes identical digests, so they stay interchangeable — plausible for zeroed or
   pruned slots, and routine in the tiny fixtures. Binding `(layer, expert)` is the
-  check that has to hold before index order can stop being structural.
+  check that had to hold before index order could stop being structural, which it
+  now has.
 - The **length** is in the preimage as well as implied by it, so a truncated range
   cannot hash as a shorter expert that legitimately ends there.
 - **Full width** rather than the retired 8-byte truncation. The hash was computed
@@ -426,9 +427,9 @@ for a month, and whether each one is still in the slot it was written to.
 **Why it is mandatory.** Optional meant "the container decides whether anything
 checks the bytes it hands the model", which is a decision no container should get
 to make — and the containers that most needed a table were exactly the old ones
-that had none. It also has to be mandatory before the layout can be relaxed
-(below): once index order is no longer structural, a permuted layout is caught by
-the digests or by nothing. `PayloadPolicy::Trust` is the escape for a caller that
+that had none. It also had to be mandatory before the layout could be
+relaxed (below): now that index order is not structural, a permuted layout is
+caught by the digests or by nothing. `PayloadPolicy::Trust` is the escape for a caller that
 has already verified the payload another way; it opts out of *checking* a table,
 not out of *having* one. Offline, `verify_payload.py --skip-digests` is the same
 escape, and exists so the slower source comparison it short-circuits does not rot.
@@ -448,11 +449,31 @@ changes require `soma verify` or reopening the store to detect. Hashing cost
 depends on the CPU and storage. The bandwidth probe reads directly without
 hashing, changing the model's verification policy, or marking experts verified.
 
-**Digests do not subsume the layout.** Index order *is* layout order: each live
-range starts where the previous one ended, aligned up. That is what makes two
-experts exchanging places a **structural** failure rather than one only a digest
-could see — and a swap that moves the payloads with the offsets leaves every
-digest valid and every range tiling the shard perfectly, so nothing else would.
+**The layout rule is a tiling invariant, not a packing order.** Per shard, the
+padded ranges must be disjoint and must exactly cover `[0, shard_size)`. Nothing
+requires them to appear in index order.
+
+It used to. Each live range had to start where the previous INDEX entry's padded
+range ended, which is strictly stronger, and the extra strength was doing exactly
+one job: catching two experts whose index entries had been exchanged without
+their payloads moving. Digests do that job now and do it better — a digest binds
+`(layer, expert, length)`, so an expert read out of another expert's slot fails
+whether or not the ranges still look canonical. The old rule could see that one
+case; it could not see the same swap done *properly*, with payloads moved along
+with the offsets, because that satisfied index-order packing perfectly.
+
+So the strictness was buying one detection that something else already covers,
+and charging for it the one thing the format most needs to be able to express: a
+shard whose experts sit in an order the index does not dictate. That is what a
+heat-ordered layout IS, and `soma heat-layout` measured 32–45x scatter on real
+geometry under the old rule.
+
+Both cases are pinned, on both sides of the language boundary. A permuted
+container whose payloads moved with it must be ACCEPTED; a container whose index
+entries were swapped and whose payloads were not must be refused by the digests.
+`tests/soma/container_integrity.cpp` and `tools/ci/check_verify_payload.py` each
+assert both, because the two validators have drifted over precisely this question
+before.
 
 One definition enforces it (`validate_layout()` in `src/soma/expert_store.cpp`),
 because there are two callers with different context and they had already drifted
@@ -464,10 +485,39 @@ the architecture. The layout half needs no IR, and both now run it. Before this,
 `open()` refused, which is the wrong way round for the check an operator runs
 *after* a transfer.
 
-Relaxing this to a tiling invariant is what would permit heat-ordered layouts. It
-has to happen in that one place, and the precondition is now met: digests are
-mandatory and domain-separated, so a permuted layout that moved its payloads with
-its offsets would be caught by the digest table even with the ordering rule gone.
+The relaxation happened in that one place, and `tools/admission/repack.py` is
+what it was for.
+
+### Repacking
+
+`repack.py <container> --out DIR --heat FILE` writes a NEW container holding the
+same experts, ordered so the pinned set is a contiguous prefix of each shard. On
+the tiny fixture that is 13 read runs collapsing to 1 — the ideal, one per shard
+the pinned set touches — and `soma heat-layout` measured 32–45x scatter on real
+geometry before there was anything to fix it with.
+
+Three properties make it safe, and each is checked rather than asserted:
+
+- **The bytes do not change.** Every payload is copied verbatim.
+  `tools/ci/check_repack.py` compares each expert against the source DIRECTLY,
+  not through the digest table — the repack copies that table, so checking the
+  output against it would be checking the tool against its own assumption.
+- **The digests survive the move.** A digest binds `(layer, expert, length)` and
+  the payload, *not* the offset, so relocating an expert leaves it valid. The
+  table is copied and re-indexed, and `soma verify` on the output matches it
+  against bytes that have moved — which is the guarantee worth having.
+- **The identity does not move.** `arch_hash` covers the architecture and the
+  quantization map, so a repacked container IS the same model: the registry keys
+  it the same way and KV checkpoints written against the original still gate. It
+  is recomputed with `soma arch-hash` and required to match, rather than copied
+  on faith.
+
+**Always a new directory, never in place.** Node cache identity is a hash over
+each file's `(relpath, size, mtime)`, so rewriting a container in place
+re-transfers every shard to every node holding it — the most expensive possible
+way to save a few seconds of startup. Repacking onto the input is refused. And
+because the two carry the same `arch_hash`, the output REPLACES the input rather
+than coexisting with it.
 
 Use `soma verify` after a transfer. It has no idempotent short-circuit: it reads
 the payload every time, because a check that skipped the read when nothing looked
@@ -505,11 +555,12 @@ today. It is written anyway: variable-length experts are plausible (mixed per-ex
 experts), and a format that assumed uniformity would need a version bump to allow them.
 
 Every MoE slot must have that exact length; dense-layer slots must be empty.
-Within each shard, live ranges must follow the index order from offset zero,
-with only alignment padding between them and after the last range. Aliases,
-gaps, missing experts, and unexpected shard bytes are refused by open and by
-both halves of `soma verify`. Shard count is bounded by the index entry count and
-100,000.
+Within each shard, the live ranges must TILE it: sorted by offset they start at
+zero, each begins exactly where the previous one's padded range ended, and the
+last one's padding reaches the end of the file. Their order in the index is not
+constrained. Overlaps, gaps, missing experts, and unexpected shard bytes are
+refused by open and by both halves of `soma verify`. Shard count is bounded by
+the index entry count and 100,000.
 
 DSpark auxiliary indexes skip the architecture hash through an explicit internal
 policy, but still require v2 role descriptors and the same range checks.

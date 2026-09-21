@@ -203,6 +203,17 @@ if(Python3_Interpreter_FOUND)
                      "${CMAKE_SOURCE_DIR}/tools/ci/check_container_record.py"
                      "${CMAKE_SOURCE_DIR}" "$<TARGET_FILE:soma>")
 
+    # The repack rewrites a container with its experts in heat order, and every
+    # claim it makes is that only their PLACEMENT changed. This checks the bytes
+    # directly rather than through the digest table the repack copies, confirms
+    # the identity does not move, and confirms repacking in place is refused —
+    # an in-place rewrite would re-transfer every shard to every node holding
+    # the container.
+    add_test(NAME mm_repack
+             COMMAND "${MM_ADMISSION_PY}"
+                     "${CMAKE_SOURCE_DIR}/tools/ci/check_repack.py"
+                     "${CMAKE_SOURCE_DIR}" "$<TARGET_FILE:soma>")
+
     add_test(NAME mm_fixture_containers
              COMMAND "${MM_ADMISSION_PY}"
                      "${CMAKE_SOURCE_DIR}/tools/ci/check_fixture_containers.py"

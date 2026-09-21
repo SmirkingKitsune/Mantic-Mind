@@ -16,6 +16,7 @@ refused everything would satisfy a bare "exit non-zero" test.
   one flipped byte       -> DIGESTS, and EXACT under --skip-digests
   two experts swapped    -> DIGESTS, and DECODE's decoy margin under --skip-digests
   no digest table at all -> REFUSED before any pass runs
+  a PERMUTED layout      -> accepted, because that is now a legal container
 
 Every payload case runs twice: once as written, and once under --skip-digests,
 because the digests now short-circuit the source comparison for every kind of
@@ -276,7 +277,49 @@ def main() -> int:
         else:
             print(f"  ok      no digest table{label}  -> refused")
 
-    # 6. --structure-only must not silently claim the contents were checked.
+    # 6. A permuted layout, done properly: two experts exchange their index
+    # entries AND their payloads. Every expert still sits in its own slot, so
+    # every digest matches and the ranges still tile the shard exactly.
+    #
+    # This must be ACCEPTED. It is what a heat-ordered repack produces, and it is
+    # the reason the engine's layout rule was relaxed from strict index-order
+    # packing to a tiling invariant once digests became mandatory and
+    # domain-separated. The case is here rather than only in the C++ test because
+    # the two validators have drifted apart over exactly this before — the tool an
+    # operator runs after a transfer blessed a container `soma serve` refused —
+    # and a relaxation applied to one side and not the other is the same bug with
+    # the sign flipped.
+    d = fresh("permuted")
+    raw_ix = bytearray((d / "soma.container").read_bytes())
+    base = index_header_len(d)
+    s0, o0, l0 = struct.unpack_from("<IQI", raw_ix, base + slot * 16)
+    s1, o1, l1 = struct.unpack_from("<IQI", raw_ix, base + (slot + 1) * 16)
+    if (s0, l0) != (s1, l1):
+        print("  FAILED  permutation case needs two same-size slots in one shard")
+        return 1
+    struct.pack_into("<IQI", raw_ix, base + slot * 16, s0, o1, l0)
+    struct.pack_into("<IQI", raw_ix, base + (slot + 1) * 16, s1, o0, l1)
+    (d / "soma.container").write_bytes(bytes(raw_ix))
+    with open(d / shard_name, "r+b") as f:
+        f.seek(o0)
+        a = f.read(l0)
+        f.seek(o1)
+        b = f.read(l1)
+        f.seek(o0)
+        f.write(b)
+        f.seek(o1)
+        f.write(a)
+    code, rep = run_verify(d, FIXTURE)
+    if code != 0:
+        fail("permuted layout", f"a legal permuted container was refused: "
+                               f"{rep.get('reason') or rep.get('failures')}")
+    elif rep.get("digests") != "passed" or rep.get("structure") != "passed":
+        fail("permuted layout", f"accepted, but not by both passes: "
+                                f"structure={rep.get('structure')} digests={rep.get('digests')}")
+    else:
+        print("  ok      permuted layout  -> accepted by structure and digests")
+
+    # 7. --structure-only must not silently claim the contents were checked.
     code, rep = run_verify(good, FIXTURE, "--structure-only")
     if code != 0 or rep.get("content") != "skipped":
         fail("--structure-only", f"content should read 'skipped', got {rep.get('content')}")
@@ -287,7 +330,7 @@ def main() -> int:
         print(f"  FAILED  {FAILURES} case(s)")
         return 1
     print("  OK       verify_payload catches all 5 corruptions, with and without digests, "
-          "and refuses a container carrying none")
+          "refuses a container carrying none, and accepts a permuted layout")
     shutil.rmtree(work, ignore_errors=True)
     return 0
 

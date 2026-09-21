@@ -382,35 +382,80 @@ Status parse_index(const std::string& path, std::string_view raw, ParsedIndex& o
 /// only thing the IR was needed for in this walk.
 Status validate_layout(const ParsedIndex& ix, const std::string& dir, const std::string& prefix) {
     const auto& h = ix.header;
-    std::vector<std::uint64_t> ends(h.n_shards, 0);
+
+    // A TILING INVARIANT, not a packing order.
+    //
+    // The rule used to be that each live range starts exactly where the previous
+    // INDEX entry's padded range ended — so index order was layout order, and a
+    // permuted layout was a structural failure. That is a strictly stronger
+    // statement than "the shard is fully and exactly covered", and the extra
+    // strength was doing one job: catching a pair of experts whose index entries
+    // had been exchanged without their payloads moving.
+    //
+    // Digests do that job now, and do it better. A digest binds (layer, expert,
+    // length) as well as the bytes, so an expert read from another expert's slot
+    // fails its digest whether or not the ranges still look canonical — which is
+    // the case the old ordering rule could see, plus the case it could not: a
+    // swap that moved the payloads WITH the offsets satisfied index-order packing
+    // perfectly. Mandatory, domain-separated digests were the precondition for
+    // relaxing this, and they are why it can be relaxed without losing anything.
+    //
+    // What this still refuses, which is everything that matters for safety:
+    // overlapping ranges, gaps between them, a shard that is larger than its
+    // ranges account for, and a total that disagrees with the header. What it now
+    // PERMITS is a shard whose experts sit in an order the index does not
+    // dictate — which is the whole point, because heat-ordered layout is exactly
+    // that, and `soma heat-layout` measured 32-45x scatter on real geometry.
+    std::vector<std::vector<const ExpertLocation*>> by_shard(h.n_shards);
     std::uint64_t total = 0;
     for (const auto& e : ix.entries) {
         if (e.length == 0) continue;
-        // Index order IS the layout order today, and that is what makes a swapped
-        // pair a structural failure rather than one only a digest can see. When
-        // that rule is relaxed to a tiling invariant, it must be relaxed HERE, in
-        // one place, with digests mandatory first.
-        if (e.shard >= ends.size() || e.offset != ends[e.shard]) {
-            return {StatusCode::InvalidArgument, "expert ranges are aliased or noncanonical"};
+        if (e.shard >= by_shard.size()) {
+            return {StatusCode::InvalidArgument, "expert names a shard that does not exist"};
         }
         const auto end = e.offset + e.length;
         if (end < e.offset || end > std::numeric_limits<std::uint64_t>::max() - kDirectIoAlign) {
             return {StatusCode::InvalidArgument, "expert range overflows"};
         }
-        ends[e.shard] = (end + kDirectIoAlign - 1) / kDirectIoAlign * kDirectIoAlign;
         if (total > std::numeric_limits<std::uint64_t>::max() - e.length)
             return {StatusCode::InvalidArgument, "expert total overflows"};
         total += e.length;
+        by_shard[e.shard].push_back(&e);
     }
     if (total != ix.total_bytes)
         return {StatusCode::InvalidArgument, "indexed expert total disagrees with header"};
-    for (std::size_t s = 0; s < ends.size(); ++s) {
+
+    for (std::size_t s = 0; s < by_shard.size(); ++s) {
+        auto& ranges = by_shard[s];
+        // O(n log n) over the live entries of one shard. The whole index is
+        // ~15k entries for DeepSeek V4, sorted once at open, against a read of
+        // the shard files that follows — this is not the expensive part.
+        std::sort(ranges.begin(), ranges.end(),
+                  [](const ExpertLocation* a, const ExpertLocation* b) {
+                      return a->offset < b->offset;
+                  });
+        std::uint64_t cursor = 0;
+        for (const auto* e : ranges) {
+            // Equality in BOTH directions. Less would be an overlap, more would
+            // be a gap, and a gap is bytes in a shard that no expert accounts
+            // for — which is what a truncated write leaves behind.
+            if (e->offset != cursor) {
+                return {StatusCode::InvalidArgument,
+                        "expert ranges do not tile the shard: a range starts at " +
+                            std::to_string(e->offset) + " where " + std::to_string(cursor) +
+                            " was expected, so they overlap or leave a gap"};
+            }
+            const auto end = e->offset + e->length;
+            cursor = (end + kDirectIoAlign - 1) / kDirectIoAlign * kDirectIoAlign;
+        }
         char number[24];
         std::snprintf(number, sizeof(number), "%05u.bin", static_cast<unsigned>(s));
         std::error_code ec;
         const auto size = fs::file_size(fs::path(dir) / (prefix + number), ec);
-        if (ec || ends[s] == 0 || size != ends[s])
-            return {StatusCode::InvalidArgument, "shard size disagrees with canonical expert ranges"};
+        if (ec || cursor == 0 || size != cursor) {
+            return {StatusCode::InvalidArgument,
+                    "shard size disagrees with the ranges the index claims fill it"};
+        }
     }
     return {};
 }
@@ -676,15 +721,22 @@ const char* shard_prefix_for(const std::string& index_file) {
     return index_file == "soma.dspark" ? "dspark-experts-" : "experts-";
 }
 
-/// Read every live expert once, in index order, and hand its bytes to `sink`.
+/// Read every live expert once, in OFFSET order, and hand its bytes to `sink`.
 ///
 /// Opens the shards directly rather than going through ExpertStore, because both
 /// callers run when the container may not be fit to open through the front door:
 /// they are the checks that decide whether it is, and verify in particular has to
 /// work on a container whose digests are the thing in doubt.
 ///
-/// Index order, not random: this is a sequential sweep of files that are about to
-/// be read end to end, and it is the one place in this file where readahead is
+/// Offset order, not index order, and the difference started mattering when the
+/// layout rule became a tiling invariant: index order used to BE offset order, so
+/// walking the entries was already a sequential sweep. A heat-ordered container
+/// is exactly the case where it is not, and walking its index would scatter reads
+/// across a file that is about to be read end to end. The sink is handed the slot
+/// number, so nothing downstream cares which order it arrives in.
+///
+/// Sequential, not random: this is a sweep of files that are about to be read end
+/// to end, and it is the one place in this file where readahead is
 /// what you want.
 template <typename Sink>
 Status walk_experts(const ParsedIndex& ix,
@@ -701,10 +753,22 @@ Status walk_experts(const ParsedIndex& ix,
         }
     }
 
-    std::vector<std::byte> buf;
+    // (shard, offset) order. validate_layout() has already proved these tile
+    // their shards, so this is a single forward pass per file.
+    std::vector<std::size_t> order;
+    order.reserve(ix.entries.size());
     for (std::size_t slot = 0; slot < ix.entries.size(); ++slot) {
+        if (ix.entries[slot].length != 0) order.push_back(slot); // skip dense layers' empty slots
+    }
+    std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+        const auto& ea = ix.entries[a];
+        const auto& eb = ix.entries[b];
+        return ea.shard != eb.shard ? ea.shard < eb.shard : ea.offset < eb.offset;
+    });
+
+    std::vector<std::byte> buf;
+    for (const auto slot : order) {
         const auto& e = ix.entries[slot];
-        if (e.length == 0) continue; // a dense layer's empty slot
         if (e.shard >= shards.size()) {
             return {StatusCode::InvalidArgument,
                     "expert " + std::to_string(slot) + " names shard " + std::to_string(e.shard)};
@@ -980,12 +1044,12 @@ Status ExpertStore::open_indexed(const std::string& model_dir,
     // A digest table is now REQUIRED, where it used to be additive.
     //
     // It stopped being optional the moment it became the only thing standing
-    // between a mis-ordered container and the model. `validate_layout()` catches
-    // a permutation today because index order is layout order; when that is
-    // relaxed to allow heat-ordered placement, the digests are what remains —
-    // and a check that some containers carry and others do not is no check at
-    // all. Making it mandatory now means the relaxation is a change to one
-    // validator rather than a change to the threat model.
+    // between a mis-ordered container and the model. `validate_layout()` used to
+    // catch a permutation because index order was layout order; it is a tiling
+    // invariant now, so heat-ordered placement is legal and the digests are what
+    // remains. A check that some containers carry and others do not is no check
+    // at all, which is why this had to become mandatory FIRST — the relaxation
+    // was then a change to one validator rather than to the threat model.
     //
     // `PayloadPolicy::Trust` is the escape, and it already says the right thing:
     // the caller is asking to read without checking. Nothing can add a table to a

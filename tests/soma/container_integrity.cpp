@@ -501,14 +501,20 @@ int main(int argc, char** argv) {
         }
 
         {
-            // A PERMUTED container: two experts exchange both their index offsets
-            // and their payload bytes. Every digest still matches, the ranges
-            // still tile the shard perfectly, and only index order tells it apart.
+            // A PERMUTED container, which is now LEGAL — and the pair of cases
+            // below is the whole argument for why relaxing the layout rule lost
+            // nothing.
             //
-            // `verify_payload()` used to report OK on exactly this while `open()`
-            // refused it — so the check an operator runs after a transfer blessed
-            // a container serving would reject. Both now refuse it for the same
-            // reason, and this is what keeps them from drifting apart again.
+            // The rule used to be that each range starts where the previous INDEX
+            // entry's padded range ended, so index order was layout order. That
+            // caught one thing the tiling invariant does not: two experts whose
+            // entries were exchanged. It also FORBADE a heat-ordered layout, which
+            // is the same shape and the reason `soma heat-layout` exists.
+            //
+            // First: the exchange done properly, payloads moving with the offsets.
+            // Every expert still sits in its own slot, so every digest matches and
+            // the ranges still tile the shard exactly. This must be ACCEPTED, or a
+            // repack has nowhere to go.
             const auto dir = case_dir(root, fixture, "permuted-layout");
             const auto path = dir / "soma.container";
             auto bytes = read_file(path);
@@ -527,8 +533,6 @@ int main(int argc, char** argv) {
             put_u64(bytes, entry(1) + 4, off_a);
             write_file(path, bytes);
 
-            // Move the payloads with them, so the digests stay valid and the only
-            // thing wrong is the ORDER.
             const auto shard = dir / "experts-00000.bin";
             auto payload = read_file(shard);
             std::vector<char> a(payload.begin() + static_cast<std::ptrdiff_t>(off_a),
@@ -543,12 +547,43 @@ int main(int argc, char** argv) {
 
             soma::PayloadReport report;
             const auto verified = soma::verify_payload(dir.string(), report);
-            check(!verified.ok() &&
-                      verified.message().find("noncanonical") != std::string::npos,
-                  "verify refuses a permuted layout, as open() does", verified.message());
-
+            check(verified.ok(), "a permuted layout whose payloads moved with it verifies",
+                  verified.message());
             const auto opened = open_with(dir, arch, soma::IdentityPolicy::AllowUnstamped);
-            check(!opened.ok(), "and open() still refuses it too", opened.message());
+            check(opened.ok(), "and open() accepts it too", opened.message());
+        }
+
+        {
+            // Second: the exchange done WRONG — index entries swapped, payloads
+            // left where they were. This is what the ordering rule used to catch,
+            // and it is the case that has to stay caught or the relaxation was a
+            // regression dressed as a feature.
+            //
+            // The digests catch it, and catch it for a better reason: a digest
+            // binds (layer, expert, length), so an expert read out of another
+            // expert's slot fails whether or not the ranges look canonical. The
+            // old rule could only see this one because the offsets stopped being
+            // sorted; it could not see the same swap done properly at all.
+            const auto dir = case_dir(root, fixture, "permuted-entries-only");
+            const auto path = dir / "soma.container";
+            auto bytes = read_file(path);
+            const auto o = offsets(bytes);
+            const std::size_t entries_at = o.roles + 36u + 16u;
+            const auto entry = [&](std::size_t slot) { return entries_at + slot * 16u; };
+            const auto off_a = u64(bytes, entry(0) + 4);
+            const auto off_b = u64(bytes, entry(1) + 4);
+            put_u64(bytes, entry(0) + 4, off_b);
+            put_u64(bytes, entry(1) + 4, off_a);
+            write_file(path, bytes);
+
+            soma::PayloadReport report;
+            const auto verified = soma::verify_payload(dir.string(), report);
+            check(!verified.ok() && verified.code() == soma::StatusCode::DataCorruption,
+                  "two entries swapped without their payloads is caught by the digests",
+                  verified.message());
+            check(report.mismatches == 2,
+                  "and both slots are named, not just the first",
+                  std::to_string(report.mismatches) + " mismatches");
         }
 
         {

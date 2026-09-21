@@ -159,6 +159,48 @@ def digest_table(digests: "list[bytes]") -> bytes:
     return b"".join(digests)
 
 
+def write_index(path: Path, *, arch_hash: bytes, n_layers: int, n_experts: int,
+                n_shards: int, dt_gate: str, dt_up: str, dt_down: str,
+                role_groups: dict, requested_group: int, uniform_len: int,
+                total_bytes: int, entries: list, digests: "list[bytes]",
+                auxiliary: bool = False) -> None:
+    """Write a `soma.container` (or `soma.dspark`) index. THE writer.
+
+    Extracted because there are three callers now — both converters and the
+    repack tool — and an index format with three writers is an index format with
+    three dialects. The engine has none: it deleted its own serializer when
+    conversion became the only thing that writes one (see **Write-once** in
+    schemas/container.md), so this function is the single authority on what an
+    index looks like, in either language.
+
+    `entries` is (shard, offset, length) per slot and `digests` is parallel to it,
+    both in SLOT order — layer-major, expert-minor — because that is what the
+    index is indexed by. Their order on DISK is a separate question the caller
+    answers with the offsets it passes, and since the layout rule became a tiling
+    invariant the two need not agree.
+    """
+    assert len(entries) == len(digests) == n_layers * n_experts, (
+        f"{len(entries)} entries and {len(digests)} digests for "
+        f"{n_layers} x {n_experts} slots")
+    flags = FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS_V2
+    if auxiliary:
+        flags |= FLAG_AUXILIARY_INDEX
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "wb") as ix:
+        ix.write(MAGIC)
+        ix.write(struct.pack("<II", FORMAT_VERSION, flags))
+        ix.write(struct.pack("<I", len(arch_hash)))
+        ix.write(arch_hash)
+        ix.write(struct.pack("<IIII", n_layers, n_experts, n_shards, DTYPE_ID[dt_gate]))
+        ix.write(struct.pack("<I", role_groups.get("gate", requested_group)))
+        ix.write(role_descriptor(dt_gate, dt_up, dt_down, role_groups, requested_group))
+        ix.write(struct.pack("<QQ", max(uniform_len, 0), total_bytes))
+        for shard, off, length in entries:
+            ix.write(struct.pack("<IQI", shard, off, length))
+        ix.write(digest_table(digests))
+    os.replace(tmp, path)
+
+
 def role_descriptor(dt_gate: str, dt_up: str, dt_down: str,
                     role_groups: dict[str, int], requested: int) -> bytes:
     """gate/up/down, each with the dtype and the EFFECTIVE group it was written at.
@@ -1512,19 +1554,11 @@ def main(argv: list[str]) -> int:
     if args.no_identity:
         print("  WARNING  --no-identity: this container is unstamped and serve will "
               "refuse it")
-    with open(out_dir / "soma.container", "wb") as ix:
-        ix.write(MAGIC)
-        ix.write(struct.pack("<II", FORMAT_VERSION,
-                             FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS_V2))
-        ix.write(struct.pack("<I", len(arch_hash)))
-        ix.write(arch_hash)
-        ix.write(struct.pack("<IIII", n_layers, n_experts, shard_idx + 1, DTYPE_ID[dt_gate]))
-        ix.write(struct.pack("<I", role_groups.get("gate", args.group)))
-        ix.write(role_descriptor(dt_gate, dt_up, dt_down, role_groups, args.group))
-        ix.write(struct.pack("<QQ", max(uniform_len, 0), total))
-        for shard, off, length in index:
-            ix.write(struct.pack("<IQI", shard, off, length))
-        ix.write(digest_table(digests))
+    write_index(out_dir / "soma.container", arch_hash=arch_hash, n_layers=n_layers,
+                n_experts=n_experts, n_shards=shard_idx + 1, dt_gate=dt_gate,
+                dt_up=dt_up, dt_down=dt_down, role_groups=role_groups,
+                requested_group=args.group, uniform_len=uniform_len, total_bytes=total,
+                entries=index, digests=digests)
 
     padded = sum(align_up(l) for _, _, l in index)
     print(f"  OK       {len(index)} experts, {total / 1e9:.3f} GB payload, "

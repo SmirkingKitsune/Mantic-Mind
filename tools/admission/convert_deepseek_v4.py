@@ -21,7 +21,7 @@ from typing import Any
 from convert import (ALIGN, DTYPE_ID, EXPERT_DIGEST_BYTES, FLAG_AUXILIARY_INDEX,
                      FLAG_EXPERT_DIGESTS_V2, FLAG_PER_ROLE_QUANT, FORMAT_VERSION, MAGIC,
                      align_up, container_identity, digest_table, expert_digest,
-                     quantize_rows, role_descriptor, usable_group)
+                     quantize_rows, role_descriptor, usable_group, write_index)
 
 import record
 
@@ -803,23 +803,14 @@ def run(args) -> int:
                        encoding="utf-8")
         os.replace(tmp, out_dir / "dspark.qweights.index.json")
 
-        with open(out_dir / "soma.dspark.tmp", "wb") as ix:
-            ix.write(MAGIC)
-            ix.write(struct.pack("<II", FORMAT_VERSION,
-                                 FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS_V2 |
-                                 FLAG_AUXILIARY_INDEX))
-            ix.write(struct.pack("<I", 0))
-            ix.write(struct.pack("<IIII", DSPARK_STAGES, n_experts,
-                                 DSPARK_STAGES, DTYPE_ID[dt_gate]))
-            ix.write(struct.pack("<I", dspark_role_groups.get("gate", args.group)))
-            ix.write(role_descriptor(dt_gate, dt_gate, dt_down, dspark_role_groups,
-                                     args.group))
-            ix.write(struct.pack("<QQ", max(dspark_uniform_len, 0),
-                                 dspark_total_payload))
-            for shard_id, off, length in dspark_all_index:
-                ix.write(struct.pack("<IQI", shard_id, off, length))
-            ix.write(digest_table(dspark_all_digests))
-        os.replace(out_dir / "soma.dspark.tmp", out_dir / "soma.dspark")
+        # No arch_hash: the draft's architecture belongs to the container it
+        # augments, and the auxiliary flag is how the file says so.
+        write_index(out_dir / "soma.dspark", arch_hash=b"", n_layers=DSPARK_STAGES,
+                    n_experts=n_experts, n_shards=DSPARK_STAGES, dt_gate=dt_gate,
+                    dt_up=dt_gate, dt_down=dt_down, role_groups=dspark_role_groups,
+                    requested_group=args.group, uniform_len=dspark_uniform_len,
+                    total_bytes=dspark_total_payload, entries=dspark_all_index,
+                    digests=dspark_all_digests, auxiliary=True)
 
     # This field describes tensors left out of the converted container, not the
     # names they had upstream.  A DSpark augmentation may resume a manifest
@@ -944,20 +935,11 @@ def run(args) -> int:
     if args.no_identity:
         print("  WARNING  --no-identity: this container is unstamped and serve will "
               "refuse it")
-    with open(out_dir / "soma.container.tmp", "wb") as ix:
-        ix.write(MAGIC)
-        ix.write(struct.pack("<II", FORMAT_VERSION,
-                             FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS_V2))
-        ix.write(struct.pack("<I", len(arch_hash)))
-        ix.write(arch_hash)
-        ix.write(struct.pack("<IIII", n_layers, n_experts, n_layers, DTYPE_ID[dt_gate]))
-        ix.write(struct.pack("<I", role_groups.get("gate", args.group)))
-        ix.write(role_descriptor(dt_gate, dt_gate, dt_down, role_groups, args.group))
-        ix.write(struct.pack("<QQ", max(uniform_len, 0), total_payload))
-        for shard, off, length in all_index:
-            ix.write(struct.pack("<IQI", shard, off, length))
-        ix.write(digest_table(all_digests))
-    os.replace(out_dir / "soma.container.tmp", out_dir / "soma.container")
+    write_index(out_dir / "soma.container", arch_hash=arch_hash, n_layers=n_layers,
+                n_experts=n_experts, n_shards=n_layers, dt_gate=dt_gate,
+                dt_up=dt_gate, dt_down=dt_down, role_groups=role_groups,
+                requested_group=args.group, uniform_len=uniform_len,
+                total_bytes=total_payload, entries=all_index, digests=all_digests)
 
     print(f"  OK       {len(all_index)} experts, {total_payload / 1e9:.3f} GB routed, "
           f"{(dense_total + qweight_total) / 1e9:.3f} GB resident, tokenizer {tokenizer_status}" +
