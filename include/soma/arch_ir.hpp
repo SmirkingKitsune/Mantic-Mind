@@ -528,6 +528,13 @@ struct SpeculativeSpec {
     float profiled_speedup = 0.0f; ///< host measurement; excluded from arch_hash
 };
 
+/// The warm speedup `--speculative auto` requires before it will select a draft
+/// head. One definition, because `plan` and `serve` must agree about what `auto`
+/// means — two copies of a threshold is how they stop agreeing. The profiler
+/// reports its own `auto_threshold` for the reader's benefit; the engine does not
+/// read it, so the number that decides lives exactly here.
+inline constexpr float kSpeculativeAutoSpeedup = 1.05f;
+
 struct Topology {
     std::uint32_t n_layers = 0;
     std::uint32_t d_model = 0;
@@ -842,6 +849,30 @@ Status adapt_hf_config(std::string_view json, ArchIr& out);
 /// this runs on the path that plans an UNCONVERTED checkpoint too, where there
 /// is no conversion to describe.
 Status apply_container_quant(std::string_view meta_json, ArchIr& io);
+
+/// Read a measured speculative-decoding profile, as
+/// `tools/admission/profile_deepseek_v4_dspark.py` writes it.
+///
+/// The return half of a loop that only ran outward, and the second one found:
+/// the profiler measures a draft head's warm speedup on THIS host, writes a
+/// report, and nothing carried the number back. `--speculative auto` gates on it,
+/// `docs/architecture.md` documents that as the mechanism, and the key it read
+/// was written by nothing in the tree — so the branch could never be taken.
+///
+/// It arrives per host rather than from the container because it is a host
+/// measurement, which `SpeculativeSpec::profiled_speedup` has always said on the
+/// field itself. The same container runs on a fast node and a slow one; a speedup
+/// baked into it would carry one host's answer to every other. That is the rule
+/// the container already states for the heat map and for kernel choices, both of
+/// which live outside it "because they are host-specific while the container is
+/// portable" (schemas/container.md).
+///
+/// Refuses a profile whose run did not pass or whose output diverged from the
+/// autoregressive reference: a draft that is fast and WRONG must not enable
+/// itself. The 1.05 threshold is deliberately NOT read from the report — the
+/// engine owns what is fast enough, and a threshold recorded in two places is the
+/// duplication this format work exists to remove.
+Status read_speculative_profile(const std::string& path, float& speedup_out);
 
 /// Structural validation. Rejects on any condition in schemas/arch-ir.md §9,
 /// including a non-F32 router.

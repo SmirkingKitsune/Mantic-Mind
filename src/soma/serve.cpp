@@ -448,6 +448,10 @@ struct ServeServer::Impl {
     /// client connecting to an already-running server has no other way to
     /// learn that its text is byte-fallback.
     std::string byte_tokenizer_reason;
+    /// Why a supplied --speculative-profile was not used, or empty. An operator
+    /// who passed one and got the autoregressive path should not have to infer
+    /// why from the absence of speculation.
+    std::string speculative_profile_reason;
     /// What --heat achieved, or why it achieved nothing.
     /// Not `warm`: a session-warmth local by that name predates this and
     /// shadowing it is a warning MSVC treats as an error.
@@ -1137,10 +1141,27 @@ Status ServeServer::open(const ServeConfig& config) {
         return {StatusCode::Unsupported,
                 "--speculative dspark requires a DSpark-capable converted container"};
     }
+    // The measured profile, from this host, for `auto` to decide on. Advisory in
+    // the same way `--heat` is: a profile that cannot be read leaves `auto` where
+    // it would have been anyway — off — and says so rather than failing a serve
+    // over a tuning hint.
+    if (!config.speculative_profile_path.empty()) {
+        float measured = 0.0f;
+        if (auto st = read_speculative_profile(config.speculative_profile_path, measured);
+            st.ok()) {
+            resolved.speculative.profiled_speedup = measured;
+        } else {
+            im.speculative_profile_reason = st.message();
+        }
+    }
+
+    // `auto` requires a measurement. Nothing wrote the key this used to read, so
+    // this branch was dead for the whole life of the flag; it is reachable now
+    // only when someone supplies a profile taken here.
     im.speculative_selected =
         config.speculative == SpeculativeMode::Required ||
         (config.speculative == SpeculativeMode::Auto && resolved.speculative.present &&
-         resolved.speculative.profiled_speedup >= 1.05f);
+         resolved.speculative.profiled_speedup >= kSpeculativeAutoSpeedup);
 
     HostBudget host;
     host.ram_total_bytes = config.ram_budget_bytes ? config.ram_budget_bytes * 2 : (8ull << 30);
@@ -1806,6 +1827,10 @@ const std::string& ServeServer::byte_tokenizer_reason() const noexcept {
     return impl_->byte_tokenizer_reason;
 }
 
+const std::string& ServeServer::speculative_profile_reason() const noexcept {
+    return impl_->speculative_profile_reason;
+}
+
 void ServeServer::warm_state(std::uint32_t& pinned,
                              std::uint32_t& resident,
                              double& seconds,
@@ -1912,6 +1937,11 @@ Status parse_serve_config(int argc, const char* const* argv, ServeConfig& out) {
                 return {StatusCode::InvalidArgument, "--heat requires a path"};
             }
             out.heat_path = argv[++i];
+        } else if (a == "--speculative-profile") {
+            if (i + 1 >= argc) {
+                return {StatusCode::InvalidArgument, "--speculative-profile requires a path"};
+            }
+            out.speculative_profile_path = argv[++i];
         }
     }
     if (out.model_dir.empty()) {

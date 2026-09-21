@@ -117,6 +117,19 @@ struct ServeConfig {
     /// refusing to serve because a cache hint is stale would be worse than
     /// starting cold, which is the alternative it is competing with.
     std::string heat_path; // --heat
+
+    /// A measured speculative profile for THIS host. // --speculative-profile
+    ///
+    /// `--speculative auto` gates on a measured warm speedup. The number used to
+    /// be read from `container_meta.json` — a host measurement in a portable
+    /// artifact — and was written there by nothing, so the branch could never be
+    /// taken. It now arrives the way heat does: from whoever measured it, per
+    /// host, in the shape `tools/admission/profile_deepseek_v4_dspark.py` writes.
+    ///
+    /// Without it `auto` means off. That is not a regression — it is what `auto`
+    /// has always done, said out loud. `--speculative dspark` remains the way to
+    /// run a draft head that has not been profiled here.
+    std::string speculative_profile_path; // --speculative-profile
 };
 
 /// Reasons the server refuses a request, mapped to HTTP by the implementation.
@@ -163,6 +176,10 @@ public:
     /// Why this server is encoding bytes rather than tokens, or empty when it is
     /// not. Non-empty only under `--allow-byte-tokenizer`.
     const std::string& byte_tokenizer_reason() const noexcept;
+
+    /// Why a supplied speculative profile was not used, or empty when none was
+    /// supplied or it was accepted.
+    const std::string& speculative_profile_reason() const noexcept;
 
     /// How many experts `--heat` pinned, and how many of those are actually
     /// resident. Both zero when no snapshot was given.

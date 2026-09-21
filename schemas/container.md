@@ -188,6 +188,37 @@ Soma QTensor layout and bound directly from `dense-q-*.bin`; lossless controls r
 SafeTensors. A serve-time resident dtype that disagrees with this prequantized index is refused rather
 than silently requantized.
 
+### The transfer set and the admission set
+
+A container directory holds two kinds of thing, and for a long time nothing distinguished them.
+
+**The model** is what a node needs in order to serve: `soma.container`, `experts-*.bin`, the dense
+half, the tokenizer artifacts, `config.json`, `container_meta.json`.
+
+**The admission artifacts** are what *control* needs in order to judge it, and control writes them into
+the same directory after conversion: `conformance/` holds the tiny-random oracle and
+`conformance/reference.bin` a teacher-forced bf16 pass over the real checkpoint, with `*-build/` as
+their scratch (`src/control/model_registry.cpp`). `soma conform` is the only reader, and it runs only
+during admission, on the host that already has the container.
+
+**Only the model transfers.** `transfer_model_to_node()` walked the directory recursively and shipped
+every regular file, so every node received both oracles with every model — `positions × vocab` float
+arrays, order of 300 MB apiece for a 151936-token vocabulary at the conformance gate's 500-position
+minimum, for a judgement that had already happened on control and that no node re-runs.
+
+**And only the model counts toward the cache identity.** That identity is a hash of per-file
+`(path, size, mtime)` (`src/control/agent_scheduler.cpp`), so before this an admission write into a
+container invalidated a copy every node already held and re-transferred the whole model to the whole
+fleet. The conformance stage did that by construction.
+
+One predicate, `is_admission_artifact()`, governs both, so the two can never disagree about what a
+container is. The rule is the leading path component: `conformance`, or anything ending `-build`. It
+matches on the leading component rather than anywhere in the path, so a model file that happens to be
+called `conformance.bin` still ships.
+
+Anything admission adds in future belongs under one of those prefixes, or it will be sent to every node
+in the fleet.
+
 ### `soma.container`
 
 All integers little-endian.
@@ -417,6 +448,10 @@ costs a read-modify-write on every miss.
   container is immutable.
 - **Kernel choices.** Registry too, for the same reason — and because they are host-specific while the
   container is portable.
+- **A measured speculative speedup.** Same rule, and it was being broken: `dspark_profiled_speedup`
+  sat in `container_meta.json`, gated `--speculative auto` in both `plan` and `serve`, and was written
+  by nothing — so the branch was unreachable, and had it ever been written it would have carried one
+  host's measurement to every other. It is supplied per host with `--speculative-profile` instead.
 - **A digest of the dense half.** Dense tensors and alignment padding are outside
   this digest table. Same-size corruption of dense tensor values is not detected
   by this change.

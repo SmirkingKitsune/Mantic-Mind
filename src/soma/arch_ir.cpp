@@ -5,6 +5,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <fstream>
+#include <iterator>
 #include <sstream>
 
 using json = nlohmann::json;
@@ -1659,10 +1662,65 @@ Status apply_container_quant(std::string_view meta_json, ArchIr& io) {
         d.resident_bytes = j.value("dspark_resident_bytes", std::uint64_t{0});
         d.expert_bytes = j.value("dspark_expert_bytes", std::uint64_t{0});
         d.kv_bytes_per_sequence = j.value("dspark_kv_bytes_per_sequence", std::uint64_t{0});
-        d.profiled_speedup = j.value("dspark_profiled_speedup", 0.0f);
+        // `profiled_speedup` is deliberately NOT read from here.
+        //
+        // It is a host measurement — `arch_ir.hpp` says so on the field itself —
+        // and this record describes a PORTABLE artifact. The same container runs
+        // on a fast node and a slow one; a speedup baked into it would carry one
+        // host's answer to every other. That is the rule the container already
+        // states for the heat map and for kernel choices, both of which live in
+        // the registry "because they are host-specific while the container is
+        // portable" (schemas/container.md).
+        //
+        // It was read here, and gated on in two places, and written by nothing in
+        // the tree — so `--speculative auto` could never fire. The measurement now
+        // arrives the same way heat does: from whoever made it, per host.
         set(io.quantization.draft_head,
             j.value("dtype_dspark", j.value("dtype_dense", std::string{})));
     }
+    return {};
+}
+
+Status read_speculative_profile(const std::string& path, float& speedup_out) {
+    speedup_out = 0.0f;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return {StatusCode::NotFound, "cannot read " + path};
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+
+    nlohmann::json j;
+    try {
+        j = nlohmann::json::parse(text);
+    } catch (const std::exception& e) {
+        return {StatusCode::InvalidArgument, path + ": not valid JSON: " + e.what()};
+    }
+
+    // A run that did not finish measured nothing. The profiler writes the same
+    // artifact on the way in, on failure, and on success, so the status is the
+    // only thing separating a result from a stub.
+    if (const auto status = j.value("status", std::string{}); status != "passed") {
+        return {StatusCode::InvalidArgument,
+                path + ": profile status is '" + (status.empty() ? "unset" : status) +
+                    "', not 'passed'"};
+    }
+    if (!j.contains("comparison") || !j["comparison"].is_object()) {
+        return {StatusCode::InvalidArgument, path + ": no comparison block"};
+    }
+    const auto& c = j["comparison"];
+
+    // Speed is not the only question. A draft head that is faster and produces
+    // DIFFERENT tokens is not an optimization, and enabling it on a speed number
+    // alone is exactly the kind of fast wrong answer this engine refuses
+    // everywhere else.
+    if (!c.value("exact_token_equivalence", false)) {
+        return {StatusCode::InvalidArgument,
+                path + ": the profiled draft did not reproduce the autoregressive tokens"};
+    }
+
+    const auto speedup = c.value("profiled_speedup", 0.0);
+    if (!(speedup > 0.0) || !std::isfinite(speedup)) {
+        return {StatusCode::InvalidArgument, path + ": no usable profiled_speedup"};
+    }
+    speedup_out = static_cast<float>(speedup);
     return {};
 }
 

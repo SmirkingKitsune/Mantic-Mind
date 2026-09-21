@@ -28,6 +28,38 @@ namespace mm {
 
 namespace {
 
+/// Is this file an ADMISSION artifact rather than part of the model?
+///
+/// A container directory holds two different kinds of thing, and until now
+/// nothing distinguished them. The model is what a node needs in order to serve:
+/// the index, the shards, the dense half, the tokenizer, config.json. The
+/// admission artifacts are what CONTROL needs in order to judge the model, and
+/// control writes them into the same directory after conversion —
+/// `<container>/conformance/` holds the tiny-random oracle, and
+/// `<container>/conformance/reference.bin` a teacher-forced bf16 pass over the
+/// real checkpoint (`model_registry.cpp`), with `*-build/` as their scratch.
+///
+/// `transfer_model_to_node()` walks the directory recursively and ships every
+/// regular file, so every node was receiving both. They are `positions × vocab`
+/// float arrays — for a 151936-token vocabulary over the gate's 500-position
+/// minimum that is ~300 MB each, sent to every node, for a judgement that already
+/// happened on control and that no node ever re-runs. `soma conform` is the only
+/// reader and it only ever runs during admission.
+///
+/// The same rule governs the cache identity below, and that half matters just as
+/// much: identity is a hash of per-file (path, size, mtime), so an admission
+/// write into the container changed the id of a model every node already held and
+/// forced the whole thing to transfer again.
+bool is_admission_artifact(const std::filesystem::path& relative) {
+    const auto first = relative.begin();
+    if (first == relative.end()) return false;
+    const auto head = first->generic_string();
+    // `conformance/` is the artifact; `*-build/` is where it is assembled before
+    // the rename. Matching on the leading component rather than anywhere in the
+    // path keeps a model file called `conformance.bin` shippable.
+    return head == "conformance" || (head.size() > 6 && head.ends_with("-build"));
+}
+
 std::optional<std::string> transfer_model_to_node(const NodeInfo& node,
                                                   const std::string& model_ref,
                                                   bool pin,
@@ -60,6 +92,7 @@ std::optional<std::string> transfer_model_to_node(const NodeInfo& node,
             std::error_code file_ec;
             if (!it->is_regular_file(file_ec)) continue;
             const fs::path relative = fs::relative(it->path(), root, file_ec);
+            if (!file_ec && is_admission_artifact(relative)) continue;
             const auto size = static_cast<int64_t>(it->file_size(file_ec));
             files.push_back({it->path().string(), relative.generic_string(), size});
             total_size += size;
@@ -168,6 +201,11 @@ std::string file_manifest_identity(const std::string& ref) {
             std::error_code size_ec;
             std::error_code time_ec;
             const auto relative = fs::relative(it->path(), resolved, relative_ec);
+            // The identity covers what is TRANSFERRED, so that writing an
+            // admission artifact into a container does not invalidate a copy
+            // every node already holds. Without this, the conformance stage
+            // re-transferred the whole model to the whole fleet.
+            if (!relative_ec && is_admission_artifact(relative)) continue;
             const auto size = it->file_size(size_ec);
             const auto modified = it->last_write_time(time_ec);
             entries.push_back(

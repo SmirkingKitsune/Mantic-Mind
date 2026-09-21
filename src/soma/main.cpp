@@ -56,12 +56,17 @@ int usage() {
                  "               [--heat FILE]  warm the expert cache from a measured\n"
                  "                              heat snapshot, as GET /v1/models/{id}/heat\n"
                  "                              on control emits it\n"
+                 "               [--speculative-profile FILE]  a warm speedup measured\n"
+                 "                              ON THIS HOST; `auto` needs one and means\n"
+                 "                              off without it\n"
                  "  soma plan    --model-dir DIR [--json]\n"
                  "               [--quant DTYPE] [--expert-down DTYPE] [--quant-dense DTYPE]\n"
                  "               [--group N]\n"
                  "               [--ram SIZE] [--ram-free SIZE] [--disk-bw SIZE] [--ctx N]\n"
                  "               [--kv-slots N]\n"
                  "               [--speculative off|auto|dspark]\n"
+                 "               [--speculative-profile FILE]  same input `serve` uses,\n"
+                 "                              so a plan cannot promise what serve declines\n"
                  "               [--min-tok-s RATE]   slowest generation you will accept "
                  "(default 1.0)\n"
                  "               the verdict is a property of (model, quantization, host);\n"
@@ -589,6 +594,7 @@ int cmd_plan(int argc, char** argv) {
     float min_tok_s = 0.0f; ///< 0 = unstated; compute_plan applies the default
     enum class PlanSpeculation { Off, Auto, Required };
     PlanSpeculation speculation = PlanSpeculation::Off;
+    std::string speculative_profile;
 
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
@@ -642,6 +648,8 @@ int cmd_plan(int argc, char** argv) {
                 std::cerr << "plan: --speculative wants off, auto, or dspark\n";
                 return 2;
             }
+        } else if (a == "--speculative-profile" && i + 1 < argc) {
+            speculative_profile = next();
         } else if (a == "--min-tok-s") {
             const auto text = next();
             char* end = nullptr;
@@ -693,19 +701,24 @@ int cmd_plan(int argc, char** argv) {
     if (speculation == PlanSpeculation::Required) {
         host.speculative = true;
     } else if (speculation == PlanSpeculation::Auto) {
-        // Match serve's conservative auto policy.  Absence, malformed metadata,
-        // or an unprofiled draft all mean autoregressive planning; explicit
-        // `dspark` remains the way to inspect the auxiliary footprint before a
-        // speed profile exists.
-        try {
-            std::ifstream meta_in(std::filesystem::path(dir) / "container_meta.json");
-            nlohmann::json meta;
-            if (meta_in && (meta_in >> meta)) {
-                host.speculative = meta.value("dspark", std::string{}) == "present" &&
-                                   meta.value("dspark_profiled_speedup", 0.0) >= 1.05;
+        // Match serve's auto policy, from the same inputs, so a plan cannot
+        // predict a speculative run that serve would decline.
+        //
+        // The speedup used to be read from `container_meta.json` here. It is a
+        // HOST measurement — the same container is fast on one node and slow on
+        // another — and nothing in the tree ever wrote that key, so this branch
+        // could not be taken. It now comes from a profile measured here, and
+        // without one `auto` plans autoregressive. `--speculative dspark` remains
+        // the way to inspect the auxiliary footprint before any profile exists.
+        soma::ArchIr probe;
+        if (soma::resolve_arch(dir, {}, probe).ok() && probe.speculative.present &&
+            !speculative_profile.empty()) {
+            float measured = 0.0f;
+            if (auto st = soma::read_speculative_profile(speculative_profile, measured); st.ok()) {
+                host.speculative = measured >= soma::kSpeculativeAutoSpeedup;
+            } else {
+                std::cerr << "plan: --speculative-profile ignored: " << st.message() << "\n";
             }
-        } catch (const std::exception&) {
-            host.speculative = false;
         }
     }
     // Left at 0 when unstated, which compute_plan reads as "use the default" —
@@ -835,6 +848,13 @@ int cmd_serve(int argc, char** argv) {
         // passed --heat and got a cold cache should not have to infer it from
         // the first requests being slow.
         std::cout << "\n  WARNING: --heat did not warm anything: " << warm_reason;
+    }
+    if (!server.speculative_profile_reason().empty()) {
+        // A profile that was passed and not used leaves the autoregressive path
+        // silently. Saying why beats letting an operator conclude the draft head
+        // is broken when the report simply did not pass.
+        std::cout << "\n  WARNING: --speculative-profile ignored: "
+                  << server.speculative_profile_reason();
     }
     if (!server.byte_tokenizer_reason().empty()) {
         std::cout << "\n  WARNING: no tokenizer — encoding one token per byte. Generated "

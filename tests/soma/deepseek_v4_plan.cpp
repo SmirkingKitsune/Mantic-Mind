@@ -115,6 +115,64 @@ int main(int argc, char** argv) {
     CHECK(plan.kv_bytes_at_ctx == kv_1m);
     CHECK(plan.arch_supported);
 
+    // ── the measured profile `--speculative auto` gates on ──────────────────
+    //
+    // It used to be read from container_meta.json — a HOST measurement in a
+    // PORTABLE artifact — and written there by nothing in the tree, so the auto
+    // branch could not be taken at all. It now arrives per host, and a container
+    // must not be able to supply it.
+    CHECK(capable.speculative.profiled_speedup == 0.0f);
+    {
+        const auto tmp = fs::temp_directory_path() / "soma-v4-speculative-profile";
+        std::error_code ec;
+        fs::create_directories(tmp, ec);
+        const auto write = [&](const char* name, const char* body) {
+            const auto path = tmp / name;
+            std::ofstream out(path, std::ios::binary | std::ios::trunc);
+            out << body;
+            return path.string();
+        };
+
+        float measured = -1.0f;
+        const auto fast = write("fast.json",
+                                R"json({"status":"passed","comparison":{
+                                  "exact_token_equivalence":true,"profiled_speedup":1.42}})json");
+        CHECK(soma::read_speculative_profile(fast, measured).ok());
+        CHECK(measured > 1.41f && measured < 1.43f);
+        CHECK(measured >= soma::kSpeculativeAutoSpeedup);
+
+        // The real measurement from this project's one profiled host: 0.795x.
+        // It parses fine and is simply not fast enough — the reader reports the
+        // number and the ENGINE owns the threshold, so the report cannot enable
+        // itself by carrying its own.
+        const auto slow = write("slow.json",
+                                R"json({"status":"passed","comparison":{
+                                  "exact_token_equivalence":true,"profiled_speedup":0.795,
+                                  "auto_threshold":0.1,"auto_eligible":true}})json");
+        CHECK(soma::read_speculative_profile(slow, measured).ok());
+        CHECK(measured < soma::kSpeculativeAutoSpeedup);
+
+        // Fast and WRONG is not an optimization.
+        const auto divergent = write("divergent.json",
+                                     R"json({"status":"passed","comparison":{
+                                       "exact_token_equivalence":false,
+                                       "profiled_speedup":9.99}})json");
+        CHECK(!soma::read_speculative_profile(divergent, measured).ok());
+        CHECK(measured == 0.0f);
+
+        // The profiler writes the same artifact on the way in and on failure, so
+        // the status is the only thing separating a result from a stub.
+        const auto unfinished = write("unfinished.json",
+                                      R"json({"status":"running","comparison":{
+                                        "exact_token_equivalence":true,
+                                        "profiled_speedup":1.42}})json");
+        CHECK(!soma::read_speculative_profile(unfinished, measured).ok());
+
+        CHECK(!soma::read_speculative_profile(write("garbage.json", "{not json"), measured).ok());
+        CHECK(!soma::read_speculative_profile((tmp / "absent.json").string(), measured).ok());
+        fs::remove_all(tmp, ec);
+    }
+
     auto speculative_host = roomy;
     speculative_host.speculative = true;
     soma::PlanDocument capable_base_plan;

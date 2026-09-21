@@ -98,9 +98,19 @@ decoding. Batch sizes above one fall back to the ordinary path.
 
 The first backend is DeepSeek V4's three-stage DSpark head. Its checkpoint-trained query block is five
 tokens even though the generic runtime cap defaults to seven, so the backend clamps each proposal to
-five. `--speculative dspark` selects it explicitly. `auto` selects it only when the converted metadata
-contains a measured `dspark_profiled_speedup >= 1.05`; an unprofiled or slower draft stays on the
-autoregressive path. Telemetry exposes proposed and accepted token counts so loading a head cannot be
+five. `--speculative dspark` selects it explicitly. `auto` selects it only when a measured warm speedup
+of at least `1.05` is supplied for **this host**, with `--speculative-profile FILE` in the shape
+`tools/admission/profile_deepseek_v4_dspark.py` writes; an unprofiled or slower draft stays on the
+autoregressive path.
+
+That number used to be read from `container_meta.json`, and **nothing in the tree ever wrote it**, so
+the branch could not be taken — `auto` was silently equivalent to `off` for the whole life of the flag.
+It was the wrong home besides: a speedup is a property of *(model, host)*, which
+`SpeculativeSpec::profiled_speedup` said on the field itself, and the container is portable. It now
+arrives per host, the way heat does. A profile that did not finish, or whose draft did not reproduce
+the autoregressive tokens, is refused rather than believed — fast and wrong is not an optimization —
+and the `1.05` threshold lives in the engine (`kSpeculativeAutoSpeedup`), not in the report, so a report
+cannot raise its own bar. Telemetry exposes proposed and accepted token counts so loading a head cannot be
 mistaken for actually exercising it.
 
 The representative full-weight CPU/streaming profile measured `0.795x` warm speed with 34.62% draft

@@ -2950,6 +2950,20 @@ bool test_container_directory_transfers_to_a_node() {
         out << "payload-" << rel;
     }
 
+    // The admission artifacts control writes into the container after conversion:
+    // the tiny-random oracle and the teacher-forced bf16 reference. They are what
+    // CONTROL needs to judge the model; a node never reads either, and on a real
+    // model they are `positions x vocab` float arrays — hundreds of megabytes
+    // apiece, shipped to every node with every transfer until this was filtered.
+    std::filesystem::create_directories(container / "conformance");
+    std::filesystem::create_directories(container / "reference-build");
+    for (const auto& rel : {std::string("conformance/oracle.bin"),
+                            std::string("conformance/reference.bin"),
+                            std::string("reference-build/oracle.bin")}) {
+        std::ofstream out(container / rel, std::ios::binary | std::ios::trunc);
+        out << "admission-" << rel;
+    }
+
     const uint16_t port = find_free_test_port();
     CHECK(port != 0);
     const std::string url = "http://127.0.0.1:" + std::to_string(port);
@@ -3044,7 +3058,29 @@ bool test_container_directory_transfers_to_a_node() {
         // land every shard in the container root and fail at load.
         RECORD(std::find(received_paths.begin(), received_paths.end(), "experts/layer0.bin") !=
                received_paths.end());
+        // And the admission artifacts stay on control. Named individually rather
+        // than left to the count above, so a regression says WHAT leaked instead
+        // of only that the total moved.
+        for (const char* artifact : {"conformance/oracle.bin",
+                                     "conformance/reference.bin",
+                                     "reference-build/oracle.bin"}) {
+            RECORD(std::find(received_paths.begin(), received_paths.end(), artifact) ==
+                   received_paths.end());
+        }
     }
+
+    // The other half of the same rule: the cache identity covers the transfer
+    // set, so an admission write into a container a node already holds does not
+    // change its id and force the whole model across the wire again. Before this,
+    // the conformance stage re-transferred every model to the whole fleet.
+    const auto id_before = scheduler.model_cache_id(cfg);
+    {
+        std::ofstream out(container / "conformance" / "late-arrival.bin",
+                          std::ios::binary | std::ios::trunc);
+        out << "written by admission after the model was already distributed";
+    }
+    RECORD(!id_before.empty());
+    RECORD(scheduler.model_cache_id(cfg) == id_before);
 
     registry.stop_health_poll();
     server.stop();
