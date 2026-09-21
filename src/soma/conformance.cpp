@@ -180,7 +180,7 @@ QuantMap container_quant_map(const std::string& container_dir, const QuantMap& f
                            std::istreambuf_iterator<char>());
     ArchIr arch;
     arch.quantization = fallback;
-    if (auto st = apply_container_quant(text, arch); !st.ok()) return fallback;
+    if (auto st = read_container_record(text, arch); !st.ok()) return fallback;
     return arch.quantization;
 }
 

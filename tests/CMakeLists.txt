@@ -192,6 +192,17 @@ if(Python3_Interpreter_FOUND)
     # config_sha256 matching no config.json anywhere. Regeneration stays a
     # legitimate act; this is what makes a deliberate one distinguishable from an
     # accident. Skips itself when numpy/safetensors/torch are absent.
+    # container_meta.json has one schema and two implementations of it — the
+    # writer in tools/admission/record.py and the reader in arch_ir.cpp. They
+    # cannot share a declaration across the language boundary, so this drives
+    # both against the same mutated records and requires them to agree about
+    # every one. A field added to one side and forgotten on the other is exactly
+    # the defect that left `--speculative auto` unreachable for months.
+    add_test(NAME mm_container_record
+             COMMAND "${MM_ADMISSION_PY}"
+                     "${CMAKE_SOURCE_DIR}/tools/ci/check_container_record.py"
+                     "${CMAKE_SOURCE_DIR}" "$<TARGET_FILE:soma>")
+
     add_test(NAME mm_fixture_containers
              COMMAND "${MM_ADMISSION_PY}"
                      "${CMAKE_SOURCE_DIR}/tools/ci/check_fixture_containers.py"

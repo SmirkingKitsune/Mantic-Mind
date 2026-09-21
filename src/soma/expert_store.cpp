@@ -173,7 +173,18 @@ struct ParsedIndex {
     std::vector<ExpertDigest> digests;
 };
 
-Status parse_index(const std::string& path, std::string_view raw, ParsedIndex& out) {
+/// Which kind of index the caller asked for, checked against what it got.
+///
+/// Passed in rather than inferred from the filename, because inferring it from
+/// the filename is the thing kFlagAuxiliaryIndex exists to stop.
+enum class IndexKind { Base, Auxiliary };
+
+IndexKind kind_for(const std::string& index_file) {
+    return index_file == "soma.dspark" ? IndexKind::Auxiliary : IndexKind::Base;
+}
+
+Status parse_index(const std::string& path, std::string_view raw, ParsedIndex& out,
+                   IndexKind expected) {
     if (raw.size() < sizeof(kMagic) || std::memcmp(raw.data(), kMagic, sizeof(kMagic)) != 0) {
         return {StatusCode::InvalidArgument, path + ": bad magic"};
     }
@@ -204,6 +215,17 @@ Status parse_index(const std::string& path, std::string_view raw, ParsedIndex& o
                         return std::string(b);
                     }() +
                     " that this build does not understand; it was written by a newer converter"};
+    }
+
+    const bool auxiliary = (h.flags & kFlagAuxiliaryIndex) != 0;
+    if (auxiliary != (expected == IndexKind::Auxiliary)) {
+        return {StatusCode::InvalidArgument,
+                path + (auxiliary
+                            ? " is an AUXILIARY index — its n_layers field counts draft "
+                              "stages and its identity belongs to the container it augments "
+                              "— but it was opened as the model's own"
+                            : " is the model's own index, but it was opened as an auxiliary "
+                              "one")};
     }
 
     const auto hash_len = c.read<std::uint32_t>();
@@ -779,7 +801,9 @@ Status ExpertStore::open_indexed(const std::string& model_dir,
     const std::string raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 
     ParsedIndex parsed;
-    if (auto st = parse_index(index_path.string(), raw, parsed); !st.ok()) return st;
+    if (auto st = parse_index(index_path.string(), raw, parsed, kind_for(index_file));
+        !st.ok())
+        return st;
     impl_->header = parsed.header;
     auto& h = impl_->header;
 
@@ -1129,7 +1153,8 @@ Status verify_payload(const std::string& model_dir,
     }
 
     ParsedIndex ix;
-    if (auto st = parse_index(index_path.string(), raw, ix); !st.ok()) return st;
+    if (auto st = parse_index(index_path.string(), raw, ix, kind_for(index_file)); !st.ok())
+        return st;
     if (!ix.header.has_digests) {
         return {StatusCode::Unsupported,
                 index_path.string() +
@@ -1188,7 +1213,8 @@ Status verify_identity(const std::string& model_dir,
     }
 
     ParsedIndex ix;
-    if (auto st = parse_index(index_path.string(), raw, ix); !st.ok()) return st;
+    if (auto st = parse_index(index_path.string(), raw, ix, kind_for(index_file)); !st.ok())
+        return st;
 
     // The container's identity, which is what open() compares against.
     const std::string& identity =

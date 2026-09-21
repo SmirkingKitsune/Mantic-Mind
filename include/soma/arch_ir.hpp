@@ -836,19 +836,35 @@ Status parse_arch_ir(std::string_view json, ArchIr& out);
 /// guessing defaults and producing a model that runs and is wrong.
 Status adapt_hf_config(std::string_view json, ArchIr& out);
 
-/// Overlay a converted container's `container_meta.json` onto an IR built from
-/// config.json.
+/// Overlay a quantization map onto an IR built from config.json.
 ///
 /// The quantization is part of the model's IDENTITY — arch_hash covers the quant
 /// map precisely so that the same weights at two quantizations are two models
 /// with two verdicts and two sets of KV checkpoints. config.json does not carry
-/// it; container_meta.json is the record of the conversion and the only place it
-/// exists.
+/// it; the conversion record is the only place it exists.
 ///
-/// A missing or unparseable field leaves the IR's default rather than failing:
-/// this runs on the path that plans an UNCONVERTED checkpoint too, where there
-/// is no conversion to describe.
+/// PARTIAL BY CONTRACT, which is why it is separate from read_container_record()
+/// below. `--quant-dense` is expressed as a fragment in the record's SHAPE —
+/// `{"dtype_dense": "q8_0"}` and nothing else — so this has to treat every field
+/// as optional. That is correct for an overlay and was quietly wrong for the
+/// record: reading both through one lenient function is how `j.value(key,
+/// default)` came to mean "absent on purpose" and "nobody ever wrote it" at the
+/// same time.
 Status apply_container_quant(std::string_view meta_json, ArchIr& io);
+
+/// Read a converted container's `container_meta.json`, schema first.
+///
+/// COMPLETE BY CONTRACT. Every field the schema declares for this record's
+/// discriminators must be present, and a field the discriminators say does not
+/// apply must be absent. The schema is declared once, in
+/// `tools/admission/record.py`, which is also the only writer; this is the
+/// reader's half of it and refuses what that module would refuse to write.
+///
+/// Deliberate repetition, per the rule in record.py: the writer and the reader
+/// are in different languages and cannot share a declaration, so they are pinned
+/// by `tools/ci/check_container_record.py`, which drives both against the same
+/// mutations and requires them to agree about every one.
+Status read_container_record(std::string_view meta_json, ArchIr& io);
 
 /// Read a measured speculative-decoding profile, as
 /// `tools/admission/profile_deepseek_v4_dspark.py` writes it.

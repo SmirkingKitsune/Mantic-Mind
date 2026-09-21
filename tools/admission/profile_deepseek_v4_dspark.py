@@ -231,13 +231,13 @@ def validate_identity(source: Path, container: Path, soma: Path) -> dict[str, An
         "dspark": "present",
         "dspark_stages": 3,
         "dspark_tensors": 7009,
-        "omitted_mtp_tensors": 0,
+        "omitted_tensors": 0,
     }
     for key, expected in required.items():
         if meta.get(key) != expected:
             raise ValueError(f"container {key}={meta.get(key)!r}, expected {expected!r}")
 
-    manifest = container / "conversion-manifest.json"
+    manifest = container / "convert-build" / "conversion-manifest.json"
     return {
         "source_revision": revision,
         "config_sha256": config_hash,

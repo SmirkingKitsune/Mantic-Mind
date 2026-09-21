@@ -1585,6 +1585,153 @@ Status parse_arch_ir(std::string_view text, ArchIr& out) {
             "use adapt_hf_config() to read an upstream config.json"};
 }
 
+namespace {
+
+/// The conversion record's schema, reader's half.
+///
+/// The writer's half is `tools/admission/record.py`, and this is a deliberate
+/// second transcription: the two are in different languages and cannot share a
+/// declaration. What makes the repetition legitimate rather than drift is that
+/// `tools/ci/check_container_record.py` drives BOTH against the same mutated
+/// records and requires them to agree about every one — a record this accepts
+/// and Python rejects, or the reverse, fails that check.
+///
+/// Kept as a flat table rather than folded into the reads below, so that adding
+/// a field to the record is one line here and one line there, and forgetting
+/// either is what the CI check notices.
+constexpr int kRecordVersion = 1;
+
+struct RecordField {
+    const char* name;
+    /// nullptr for "always"; otherwise the discriminator field, which must equal
+    /// `when_value` for this one to be required.
+    const char* when_key;
+    const char* when_value;
+};
+
+constexpr RecordField kRecordFields[] = {
+    {"record_version", nullptr, nullptr},
+    {"container_version", nullptr, nullptr},
+    {"source", nullptr, nullptr},
+    {"source_repo", nullptr, nullptr},
+    {"source_revision", nullptr, nullptr},
+    {"config_sha256", nullptr, nullptr},
+    {"index_sha256", nullptr, nullptr},
+    {"source_quantization", nullptr, nullptr},
+    {"omitted_namespaces", nullptr, nullptr},
+    {"omitted_tensors", nullptr, nullptr},
+    {"model_type", nullptr, nullptr},
+    {"n_layers", nullptr, nullptr},
+    {"n_experts", nullptr, nullptr},
+    {"n_shards", nullptr, nullptr},
+    {"expert_bytes", nullptr, nullptr},
+    {"total_expert_bytes", nullptr, nullptr},
+    {"dtype_gate_up", nullptr, nullptr},
+    {"dtype_down", nullptr, nullptr},
+    {"group", nullptr, nullptr},
+    {"effective_groups_by_role", nullptr, nullptr},
+    {"dense_storage", nullptr, nullptr},
+    {"dense_narrow_tensors", nullptr, nullptr},
+    {"tokenizer", nullptr, nullptr},
+    {"dspark", nullptr, nullptr},
+    {"dtype_dense", "dense_storage", "quantized"},
+    {"lossless_resident_bytes", "dense_storage", "quantized"},
+    {"quantized_resident_bytes", "dense_storage", "quantized"},
+    {"dspark_format", "dspark", "present"},
+    {"dspark_tensors", "dspark", "present"},
+    {"dspark_stages", "dspark", "present"},
+    {"dspark_target_layer_ids", "dspark", "present"},
+    {"dspark_trained_block_size", "dspark", "present"},
+    {"dspark_noise_token_id", "dspark", "present"},
+    {"dspark_markov_rank", "dspark", "present"},
+    {"dspark_confidence_head", "dspark", "present"},
+    {"dspark_expert_bytes", "dspark", "present"},
+    {"dspark_total_expert_bytes", "dspark", "present"},
+    {"dspark_resident_bytes", "dspark", "present"},
+    {"dspark_lossless_resident_bytes", "dspark", "present"},
+    {"dspark_quantized_resident_bytes", "dspark", "present"},
+    {"dspark_kv_bytes_per_sequence", "dspark", "present"},
+    {"dtype_dspark", "dspark", "present"},
+};
+
+Status validate_container_record(const nlohmann::json& j) {
+    if (!j.is_object()) {
+        return {StatusCode::InvalidArgument, "container_meta.json is not a JSON object"};
+    }
+    const auto version = j.value("record_version", -1);
+    if (version != kRecordVersion) {
+        return {StatusCode::VersionMismatch,
+                "container_meta.json record_version is " +
+                    (version < 0 ? std::string("absent") : std::to_string(version)) +
+                    ", this build reads " + std::to_string(kRecordVersion) +
+                    ". Reconvert it with the current converter"};
+    }
+
+    // Every complaint, not the first. One reconversion should be enough to fix
+    // a record, and a reader that stops at the first missing field turns that
+    // into as many round trips as there are mistakes.
+    std::string missing, unexpected;
+    for (const auto& f : kRecordFields) {
+        const bool required =
+            f.when_key == nullptr || j.value(f.when_key, std::string{}) == f.when_value;
+        const bool present = j.contains(f.name);
+        if (required && !present) {
+            missing += (missing.empty() ? "" : ", ");
+            missing += f.name;
+        } else if (!required && present) {
+            unexpected += (unexpected.empty() ? "" : ", ");
+            unexpected += std::string(f.name) + " (" + f.when_key + " is not \"" +
+                          f.when_value + "\")";
+        }
+    }
+    if (!missing.empty()) {
+        return {StatusCode::InvalidArgument,
+                "container_meta.json is missing required field(s): " + missing +
+                    ". A field that does not apply carries an explicit empty value or is "
+                    "governed by a discriminator; it is never simply left out"};
+    }
+    if (!unexpected.empty()) {
+        return {StatusCode::InvalidArgument,
+                "container_meta.json carries field(s) its own discriminators say do not "
+                "apply: " + unexpected};
+    }
+
+    // UNKNOWN FIELDS ARE REFUSED, on the same reasoning as the index's
+    // must-understand flags: a key this build cannot see may be the one that
+    // changes what a key it can see means. `record_version` should have caught
+    // that first — a converter adding a field bumps it — so reaching here means
+    // the two disagree, and the safe reading of a disagreement is to stop.
+    std::string unknown;
+    for (const auto& [key, _] : j.items()) {
+        const bool declared = std::any_of(std::begin(kRecordFields), std::end(kRecordFields),
+                                          [&](const RecordField& f) { return key == f.name; });
+        if (declared) continue;
+        unknown += (unknown.empty() ? "" : ", ");
+        unknown += key;
+    }
+    if (!unknown.empty()) {
+        return {StatusCode::InvalidArgument,
+                "container_meta.json carries field(s) this build does not know: " + unknown +
+                    ". Nothing reads them, and a record_version that did not change says "
+                    "they were not meant to be new"};
+    }
+    return {};
+}
+
+} // namespace
+
+Status read_container_record(std::string_view meta_json, ArchIr& io) {
+    nlohmann::json j;
+    try {
+        j = nlohmann::json::parse(meta_json);
+    } catch (const std::exception& e) {
+        return {StatusCode::InvalidArgument,
+                std::string("container_meta.json is not valid JSON: ") + e.what()};
+    }
+    if (auto st = validate_container_record(j); !st.ok()) return st;
+    return apply_container_quant(meta_json, io);
+}
+
 Status apply_container_quant(std::string_view meta_json, ArchIr& io) {
     nlohmann::json j;
     try {

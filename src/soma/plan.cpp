@@ -504,7 +504,7 @@ resolve_arch(const std::string& model_dir, const std::string& quant_overlay_json
     if (std::ifstream meta_in(root / "container_meta.json", std::ios::binary); meta_in) {
         std::string meta_text((std::istreambuf_iterator<char>(meta_in)),
                               std::istreambuf_iterator<char>());
-        if (auto st = apply_container_quant(meta_text, arch); !st.ok()) return st;
+        if (auto st = read_container_record(meta_text, arch); !st.ok()) return st;
         // What the SHARDS are, captured before any caller overlay can move it.
         as_converted = arch.quantization;
         from_container = true;

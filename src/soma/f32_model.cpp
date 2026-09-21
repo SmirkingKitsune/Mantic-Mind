@@ -519,7 +519,7 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
     if (fs::exists(root / "container_meta.json")) {
         std::string meta_text;
         if (auto s = read_text(root / "container_meta.json", meta_text); !s.ok()) return s;
-        if (auto s = apply_container_quant(meta_text, out.arch); !s.ok()) return s;
+        if (auto s = read_container_record(meta_text, out.arch); !s.ok()) return s;
         // What the SHARDS are, before `quant` below replaces the map with what
         // this LOAD asked for. See ArchIr::container_arch_hash.
         as_converted = out.arch.quantization;

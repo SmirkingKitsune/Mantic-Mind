@@ -756,6 +756,19 @@ int cmd_plan(int argc, char** argv) {
     }
 
     if (auto st = soma::compute_plan(dir, host, doc, overlay); !st.ok()) {
+        // A record that EXISTS and cannot be read is fatal.
+        //
+        // The fallback below re-plans from config.json alone, which is right for
+        // a bare checkpoint and was quietly wrong for a container: a broken
+        // conversion record degraded into a plan that looked like an answer and
+        // carried an empty arch_hash, because planning "as if unconverted" is a
+        // perfectly computable thing to do and nothing said it had happened.
+        // resolve_arch() already handles the no-record case on its own, so the
+        // only way to reach here WITH a record is that the record is bad.
+        if (std::filesystem::exists(std::filesystem::path(dir) / "container_meta.json")) {
+            std::cerr << "plan failed: " << st.message() << "\n";
+            return 1;
+        }
         std::string cfg_text;
         soma::ArchIr arch;
         std::ifstream in(std::filesystem::path(dir) / "config.json", std::ios::binary);

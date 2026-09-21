@@ -367,7 +367,7 @@ def validate_static(source: Path, container: Path, require_dspark: bool) -> dict
             raise ValueError(f"config {key}={config.get(key)!r}, expected {expected!r}")
 
     meta_path = container / "container_meta.json"
-    manifest_path = container / "conversion-manifest.json"
+    manifest_path = container / "convert-build" / "conversion-manifest.json"
     meta = read_json(meta_path)
     manifest = read_json(manifest_path)
     required_meta = {
@@ -399,20 +399,20 @@ def validate_static(source: Path, container: Path, require_dspark: bool) -> dict
             "dspark_resident_bytes": DSPARK_RESIDENT_BYTES,
             "dspark_kv_bytes_per_sequence": DSPARK_KV_BYTES,
             "dtype_dspark": "q4_g",
-            "omitted_mtp_namespaces": [],
+            "omitted_namespaces": [],
         })
     else:
         required_meta.update({
             "dspark": "omitted",
-            "omitted_mtp_namespaces": OMITTED_MTP_NAMESPACES,
+            "omitted_namespaces": OMITTED_MTP_NAMESPACES,
         })
     for key, expected in required_meta.items():
         if meta.get(key) != expected:
             raise ValueError(f"container {key}={meta.get(key)!r}, expected {expected!r}")
     expected_omitted = 0 if require_dspark else DSPARK_TENSORS
-    if meta.get("omitted_mtp_tensors") != expected_omitted:
+    if meta.get("omitted_tensors") != expected_omitted:
         raise ValueError(
-            f"container omitted_mtp_tensors={meta.get('omitted_mtp_tensors')!r}, "
+            f"container omitted_tensors={meta.get('omitted_tensors')!r}, "
             f"expected {expected_omitted}"
         )
 
@@ -525,11 +525,27 @@ def validate_static(source: Path, container: Path, require_dspark: bool) -> dict
 
     loaded_names: list[str] = []
     quantized_payload_bytes = 0
+    lossless_index_bytes = 0
     for name in ("dense.safetensors.index.json", "dense.qweights.index.json"):
         sidecar = read_json(container / name)
         loaded_names.extend(sidecar.get("weight_map", {}).keys())
+        total = int(sidecar.get("metadata", {}).get("total_size", 0))
         if name == "dense.qweights.index.json":
-            quantized_payload_bytes = int(sidecar.get("metadata", {}).get("total_size", 0))
+            quantized_payload_bytes = total
+        else:
+            lossless_index_bytes = total
+    # The same cross-check the DSpark half has had all along, and the reason the
+    # record keeps these two byte counts at all: a number recorded in two places
+    # and compared in none is drift with a head start. Both halves are checked
+    # now, rather than one by accident of where the check happened to be written.
+    if lossless_index_bytes != meta.get("lossless_resident_bytes"):
+        raise ValueError(
+            f"container lossless_resident_bytes={meta.get('lossless_resident_bytes')!r} "
+            f"disagrees with dense.safetensors.index.json ({lossless_index_bytes})")
+    if quantized_payload_bytes != meta.get("quantized_resident_bytes"):
+        raise ValueError(
+            f"container quantized_resident_bytes={meta.get('quantized_resident_bytes')!r} "
+            f"disagrees with dense.qweights.index.json ({quantized_payload_bytes})")
     loaded_mtp = sorted(name for name in loaded_names if name.startswith("mtp."))
     if loaded_mtp:
         raise ValueError(f"converted container loads MTP tensors: {loaded_mtp[:3]}")

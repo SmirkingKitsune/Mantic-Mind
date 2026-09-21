@@ -1,15 +1,11 @@
 {
-  "align": 4096,
+  "config_sha256": "c2b6d29e0c600681d76585a8a954f2a9ddd9c87dd1f1c2a9f91fe6f59b35cfc9",
   "container_version": 2,
   "dense_narrow_tensors": 0,
   "dense_storage": "source",
-  "dense_tensors": 46,
+  "dspark": "not-present",
   "dtype_down": "q6_g",
   "dtype_gate_up": "q4_g",
-  "effective_groups": {
-    "q4_g": 64,
-    "q6_g": 32
-  },
   "effective_groups_by_role": {
     "down": 32,
     "gate": 64,
@@ -17,19 +13,18 @@
   },
   "expert_bytes": 4352,
   "group": 128,
-  "layer_kinds": [
-    "dense",
-    "moe",
-    "moe",
-    "moe"
-  ],
+  "index_sha256": "",
   "model_type": "deepseek_v2",
   "n_experts": 16,
   "n_layers": 4,
-  "n_moe_layers": 3,
   "n_shards": 1,
+  "omitted_namespaces": [],
+  "omitted_tensors": 0,
+  "record_version": 1,
   "source": "tests\\fixtures\\tiny\\DeepSeek-V2-Lite",
   "source_quantization": "none",
+  "source_repo": "",
+  "source_revision": "",
   "tokenizer": "unsupported",
   "total_expert_bytes": 208896
 }

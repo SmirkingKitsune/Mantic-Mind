@@ -29,6 +29,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import record
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 MAGIC = b"SOMACTNR"
@@ -66,6 +68,12 @@ FLAG_EXPERT_DIGESTS_LEGACY = 1 << 1
 FLAG_EXPERT_DIGESTS_V2 = 1 << 2
 
 EXPERT_DIGEST_BYTES = 32
+
+# This index describes an AUXILIARY payload — a draft model — rather than the
+# model's own experts. `soma.dspark` writes its STAGE count into the n_layers
+# field and carries no identity of its own, and until this bit existed nothing
+# in the file said so: a reader knew only because of the filename it was handed.
+FLAG_AUXILIARY_INDEX = 1 << 3
 
 # Source precisions the resident half may keep, because the engine widens them
 # EXACTLY. Anything else — f32 already, or a dequantized fp8 block whose values
@@ -852,6 +860,10 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--layers", type=int, default=0, help="limit layers (debug)")
     ap.add_argument("--source-revision", default=None,
                     help="expected immutable Hub revision (V4 is pinned)")
+    ap.add_argument("--source-repo", default=None,
+                    help="upstream repository id. Recorded verbatim; a container "
+                         "converted from a local directory records '' rather than "
+                         "leaving the field out")
     ap.add_argument("--validate-only", action="store_true",
                     help="check config/tensor coverage without reading payloads")
     ap.add_argument("--no-resume", action="store_true",
@@ -1036,6 +1048,11 @@ def main(argv: list[str]) -> int:
     # enumerate its keys.
     owner: dict[str, str] = {}
     index_json = src / "model.safetensors.index.json"
+    # Hashed here, where it is already being opened. A single-file checkpoint
+    # records '' — the field is always present, because "this source had no
+    # index" and "nobody wrote the field" are different facts.
+    index_sha = (hashlib.sha256(index_json.read_bytes()).hexdigest()
+                 if index_json.is_file() else "")
     if index_json.is_file():
         try:
             wm = json.loads(index_json.read_text(encoding="utf-8")).get("weight_map", {})
@@ -1198,17 +1215,18 @@ def main(argv: list[str]) -> int:
                     for s in ("gate_proj", "up_proj", "down_proj", "gate_up_proj")]
     claimed_set = set(claimed)
 
-    def is_ignored(name: str) -> bool:
-        if any(p in name for p in IGNORED_PATTERNS):
-            return True
-        # A blockwise-fp8 scale is not a tensor this converter DROPS — it is
-        # consumed, by dequantizing the weight it belongs to. So it is claimed
-        # exactly when that weight is, which is stricter than an IGNORED_PATTERNS
-        # entry would be: a scale whose weight is unaccounted for still refuses,
-        # rather than vanishing alongside the tensor it was supposed to scale.
-        if fp8_block is not None and name.endswith(FP8_SCALE_SUFFIX):
-            weight = name[: -len(FP8_SCALE_SUFFIX)]
-            return weight in claimed_set or is_ignored(weight)
+    def is_dropped(name: str) -> bool:
+        """Is this tensor deliberately left OUT of the container?
+
+        Split out of is_ignored() rather than reimplemented beside it, because
+        the record now states what was dropped and a second transcription of
+        these rules would drift from the one that does the dropping.
+
+        The distinction is exactly the one is_ignored() blurs: `.experts.` and
+        `shared_experts.` are ignored HERE and written elsewhere, so a conversion
+        that reported them as omitted would claim to have discarded most of the
+        model.
+        """
         # The vision half of a multimodal wrapper, by module prefix.
         if any(name.startswith(d) for d in dialect.get("drop", ())):
             return True
@@ -1236,6 +1254,25 @@ def main(argv: list[str]) -> int:
             return True
         m = re.match(r"model\.layers\.(\d+)\.", name)
         return m is not None and int(m.group(1)) >= n_layers
+
+    def is_ignored(name: str) -> bool:
+        if any(p in name for p in IGNORED_PATTERNS):
+            return True
+        # A blockwise-fp8 scale is not a tensor this converter DROPS — it is
+        # consumed, by dequantizing the weight it belongs to. So it is claimed
+        # exactly when that weight is, which is stricter than an IGNORED_PATTERNS
+        # entry would be: a scale whose weight is unaccounted for still refuses,
+        # rather than vanishing alongside the tensor it was supposed to scale.
+        if fp8_block is not None and name.endswith(FP8_SCALE_SUFFIX):
+            weight = name[: -len(FP8_SCALE_SUFFIX)]
+            return weight in claimed_set or is_ignored(weight)
+        return is_dropped(name)
+
+    # What this conversion deliberately left out — a vision tower, a projector,
+    # an MTP head. Recorded rather than inferred from what is missing, because a
+    # consumer cannot tell a dropped namespace from a broken conversion.
+    omitted = [n for n in owner if is_dropped(n)]
+    omitted_namespaces = sorted({record.omitted_namespace(n) for n in omitted})
 
     unclaimed = sorted(n for n in owner if n not in claimed_set and not is_ignored(n))
     if unclaimed:
@@ -1421,43 +1458,52 @@ def main(argv: list[str]) -> int:
     # text-only config here would achieve.
     shutil.copy2(src / "config.json", out_dir / "config.json")
 
-    meta = {
-        "container_version": FORMAT_VERSION,
-        "source": str(src),
-        "model_type": model_type,
-        "n_layers": n_layers,
-        "n_moe_layers": n_moe,
-        "layer_kinds": kinds,
-        "n_experts": n_experts,
-        "n_shards": shard_idx + 1,
-        "expert_bytes": uniform_len,
-        "total_expert_bytes": total,
-        "dtype_gate_up": dt_gate,
-        # What the resident matrices are ON DISK, which is not what they are
-        # loaded at. `--quant-dense` still chooses the latter per host without
-        # reconverting a byte; this only says whether the converter upcast them
-        # on the way out.
-        "dense_storage": dense_storage,
-        "dense_narrow_tensors": narrow,
-        "dtype_down": dt_down,
-        "group": args.group,
-        "effective_groups": groups,
-        "effective_groups_by_role": role_groups,
-        "dense_tensors": len(dense),
-        "align": ALIGN,
+    # Through record.build(), which is the ONE writer. Every field it takes is
+    # declared in record.py with a one-line justification, and a field that is
+    # missing, unknown, or contradicted by a discriminator refuses the conversion
+    # here rather than at some reader months later. See that module's header for
+    # why absence is never expressed by leaving a key out.
+    meta = record.build(
+        container_version=FORMAT_VERSION,
+        source=str(src),
+        source_repo=args.source_repo or "",
+        source_revision=args.source_revision or "",
+        config_sha256=hashlib.sha256((src / "config.json").read_bytes()).hexdigest(),
+        index_sha256=index_sha,
         # What the SOURCE was, not what this container is. A q4_g container built
         # from a bf16 upload and one built from that upload's fp8 twin are not
         # the same artifact — only the first can be compared against bf16 weights
         # at all — and nothing downstream could tell them apart, because the
         # container records the codec it WROTE and never the one it read.
-        "source_quantization": (
-            f"fp8-e4m3-block-{fp8_block[0]}x{fp8_block[1]}"
-            if fp8_block is not None else "none"),
+        source_quantization=(f"fp8-e4m3-block-{fp8_block[0]}x{fp8_block[1]}"
+                             if fp8_block is not None else "none"),
+        omitted_namespaces=omitted_namespaces,
+        omitted_tensors=len(omitted),
+        model_type=model_type,
+        n_layers=n_layers,
+        n_experts=n_experts,
+        n_shards=shard_idx + 1,
+        expert_bytes=uniform_len,
+        total_expert_bytes=total,
+        dtype_gate_up=dt_gate,
+        dtype_down=dt_down,
+        group=args.group,
+        effective_groups_by_role=role_groups,
+        # What the resident matrices are ON DISK, which is not what they are
+        # loaded at. `--quant-dense` still chooses the latter per host without
+        # reconverting a byte; this only says whether the converter upcast them
+        # on the way out.
+        dense_storage=dense_storage,
+        dense_narrow_tensors=narrow,
         # Whether this container can be served as TEXT. Recorded rather than left
         # to be inferred from which files happen to exist, so a consumer can tell
         # "no tokenizer was possible for this family" from "someone deleted one".
-        "tokenizer": tokenizer_status,
-    }
+        tokenizer=tokenizer_status,
+        # This converter handles no family that ships a draft model; the field is
+        # written anyway, because "this source had none" and "nobody considered
+        # the question" are different answers and a reader needs the first.
+        dspark="not-present",
+    )
     (out_dir / "container_meta.json").write_text(
         json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 

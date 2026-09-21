@@ -56,9 +56,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import record  # noqa: E402  (needs the path above)
+
 from convert import (  # noqa: E402
     DTYPE_ID,
     EXPERT_DIGEST_BYTES,
+    FLAG_AUXILIARY_INDEX,
     FLAG_EXPERT_DIGESTS_LEGACY,
     FLAG_EXPERT_DIGESTS_V2,
     FLAG_PER_ROLE_QUANT,
@@ -93,7 +96,8 @@ ID_TO_DTYPE = {v: k for k, v in DTYPE_ID.items()}
 # carrying it is refused below. The unknown-flag message says "written by a newer
 # converter", which is exactly backwards for a container older than this reader;
 # keeping the bit known lets that case reach the message that is true of it.
-KNOWN_FLAGS = FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS_V2 | FLAG_EXPERT_DIGESTS_LEGACY
+KNOWN_FLAGS = (FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS_V2 |
+               FLAG_EXPERT_DIGESTS_LEGACY | FLAG_AUXILIARY_INDEX)
 
 # soma::TensorRole, for reporting the descriptor in readable terms.
 ID_TO_ROLE = {2: "gate", 3: "up", 4: "down"}
@@ -207,6 +211,14 @@ def read_index(path: Path) -> dict:
 def check_structure(container: Path, ix: dict, meta: dict, kinds: list[str]) -> list[str]:
     """Every slot, against the shard files that exist. No source, no tensor reads."""
     notes: list[str] = []
+
+    # The record against its own schema, FIRST. Everything below compares the
+    # index to fields of this record, and comparing against a field that should
+    # not be there — or defaulting one that is missing — is how a structural
+    # check comes to pass for a container the engine will refuse to open.
+    if problems := record.validate(meta):
+        raise Failure("container_meta.json does not satisfy its schema: " +
+                      "; ".join(problems))
     n_layers, n_experts = ix["n_layers"], ix["n_experts"]
 
     if ix["version"] != FORMAT_VERSION:

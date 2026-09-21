@@ -69,8 +69,11 @@ large for a single dense sidecar:
   dense-00000.safetensors …              top-level then one lossless layer shard
   dense.qweights.index.json              mmap index for runtime-layout QTensor payloads
   dense-q-00000.bin …                    quantized embeddings/projections/shared experts/head
-  conversion-manifest.json               pinned revision, config/index hashes, completed shards,
-                                         and the committed DSpark/omission state
+  convert-build/conversion-manifest.json  resume state: completed shards, their entries
+                                         and digests. NOT part of the container —
+                                         `-build/` is excluded from the transfer set
+                                         and from node cache identity, so rewriting
+                                         it on a resume re-transfers nothing
 ```
 
 With `convert.py --include-dspark`, the pinned `mtp.0/1/2` source tensors are translated into stable
@@ -110,19 +113,66 @@ The IR is still a real persisted artifact elsewhere: admission stores it in the 
 column, and `GET /v1/models/{id}` returns it. What does not exist is a copy of it sitting beside the
 weights.
 
-`container_meta.json` is not a second description of the architecture. It records what the CONVERSION
-did: `dtype_gate_up`, `dtype_down`, `group`,
-`effective_groups`, `effective_groups_by_role`, `expert_bytes`, `total_expert_bytes`, `n_shards`,
-`layer_kinds`, `dense_tensors`, and `tokenizer` (`compiled` | `unsupported`).
-The v2 binary header independently repeats each routed role's dtype and effective
-group; the runtime compares that descriptor with the IR resolved from this
-record, while the identity binds the resolved record to the canonical hash.
+### `container_meta.json` — the conversion record
 
-`effective_groups` is keyed by **dtype**, which is wrong whenever two roles share a dtype but not a
-row width — gate/up quantize along `d_model` and down along `expert_intermediate`, so the two collide
-in that dict and the last one written wins. `effective_groups_by_role` is the one to read; the
-dtype-keyed dict stays for readers that already consume it. `arch_hash` covers the quant map precisely so that the
-same weights at two quantizations are two models, with two verdicts and two sets of KV checkpoints.
+Not a second description of the architecture; that is `config.json`'s job and
+`config.json`'s alone. This records what the CONVERSION did, and **it has a
+schema**: every field is declared once, with a one-line justification, in
+`tools/admission/record.py`. That module is also the only writer — both
+converters go through `record.build()` — and the reader's half is
+`validate_container_record()` in `src/soma/arch_ir.cpp`.
+
+**What it cost to not have one.** Three dialects had grown from two writers with
+nothing declaring which was which: 21 keys from the general converter, 30 from
+DeepSeek-V4, 45 with DSpark. Ten keys were written by somebody and read by
+nobody. Others were read by somebody and written by nobody for containers that
+reader would actually see — and because every C++ reader used `j.value(key,
+default)`, **a key nobody wrote was indistinguishable from a key absent on
+purpose**. `dspark_profiled_speedup` gated `--speculative auto` in two commands
+for months while no writer emitted it; the branch could not be taken, and nothing
+said so.
+
+**Absence is never expressed by leaving a key out.** A field that does not apply
+carries an explicit empty value (`""`, `[]`, `0`) or is governed by a
+DISCRIMINATOR — a field that is always present and whose value says which others
+must be:
+
+| discriminator | values | governs |
+|---|---|---|
+| `dense_storage` | `source` · `f32` · `quantized` | `dtype_dense`, `lossless_resident_bytes`, `quantized_resident_bytes` |
+| `dspark` | `present` · `omitted` · `not-present` | the thirteen `dspark_*` fields and `dtype_dspark` |
+
+A field the discriminators say does not apply is refused if present, so the two
+readings a missing key used to have — "not applicable here" and "the writer
+broke" — can no longer be confused.
+
+**The schema is transcribed twice** — Python writes, C++ reads, and they cannot
+share a declaration across the language boundary. That is the repetition the rule
+below permits only when something checks it, and
+`tools/ci/check_container_record.py` is that something: it drives both halves
+against the same 94 one-at-a-time mutations of a base record and a DSpark record
+and requires them to agree about every one. It caught a field transcribed into
+one side and not the other the first time it ran.
+
+**THE RULE this establishes.** *Every fact has exactly one authority. Any
+repetition must be (a) deliberate, (b) checked at open, and (c) documented as
+such at both sites.* The binary index's per-role quantization descriptor passes
+all three — it is repeated so the runtime can check it before decoding a byte,
+and `open()` does exactly that. `lossless_resident_bytes` passes, because
+`validate_deepseek_v4_full.py` compares it against the `total_size` its
+safetensors index declares. A quant map recorded four times and reconciled once
+does not pass, and `effective_groups` — keyed by **dtype**, which is wrong
+whenever two roles share a dtype but not a row width — did not pass and is gone.
+`effective_groups_by_role` is the one to read.
+
+`arch_hash` covers the quant map precisely so that the same weights at two
+quantizations are two models, with two verdicts and two sets of KV checkpoints.
+
+**A record that exists and cannot be read is fatal.** `soma plan` used to fall
+back to planning from `config.json` alone when `resolve_arch` failed, which is
+right for a bare checkpoint and was quietly wrong for a container: a broken
+record degraded into a plan that looked like an answer and carried an empty
+`arch_hash`. The fallback now applies only when there is no record at all.
 
 `source_quantization` records the codec the conversion read, which is a different fact from every other
 one in the file: `none` for an ordinary bf16/f32 upload, `fp8-e4m3-block-<bx>x<by>` for a blockwise-fp8
@@ -257,6 +307,16 @@ version gate instead of parsing the descriptor bytes as sizes and indexes.
 | `0x1` | `per_role_quant` | the role descriptor below is present |
 | `0x2` | `expert_digests_legacy` | **retired.** An 8-byte-per-slot table follows. Refused. |
 | `0x4` | `expert_digests` | a 32-byte-per-slot table follows the index |
+| `0x8` | `auxiliary_index` | this index describes a DRAFT payload, not the model's experts |
+
+`0x8` is how `soma.dspark` says what it is. It writes its STAGE count into the
+`n_layers` field and carries no identity of its own, because its architecture
+belongs to the container it augments — and until this bit existed, nothing in the
+file said so. A reader knew it held an auxiliary index only from the filename it
+had been handed, so a caller that passed the wrong one got a plausible index over
+the wrong shards. The caller still says which kind it wants; the two are compared
+and a disagreement is refused, because "I asked for the base index and got the
+draft" is a mistake worth naming rather than a fact to adopt.
 
 Both digest bits were added with **no version bump**, which is this mechanism
 working as designed: every v2 reader already refuses a bit it does not know, so no

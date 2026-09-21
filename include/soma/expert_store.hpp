@@ -56,8 +56,23 @@ inline constexpr std::uint32_t kFlagExpertDigestsLegacy = 1u << 1;
 /// parse.
 inline constexpr std::uint32_t kFlagExpertDigestsV2 = 1u << 2;
 
+/// This index describes an AUXILIARY payload, not the model's own experts.
+///
+/// `soma.dspark` writes its STAGE count into the `n_layers` field and its own
+/// identity nowhere, because its architecture belongs to the container it
+/// augments. Until this bit existed nothing in the file said so: a reader knew
+/// it was holding an auxiliary index only because of the filename the caller had
+/// passed, and a caller that passed the wrong one got a plausible index over the
+/// wrong shards.
+///
+/// The bit makes the file answer for itself. The caller still says which kind it
+/// wants — the two are compared, and a disagreement is refused, because "I asked
+/// for the base index and got an auxiliary one" is a mistake worth naming rather
+/// than a fact to adopt.
+inline constexpr std::uint32_t kFlagAuxiliaryIndex = 1u << 3;
+
 inline constexpr std::uint32_t kKnownContainerFlags =
-    kFlagPerRoleQuant | kFlagExpertDigestsLegacy | kFlagExpertDigestsV2;
+    kFlagPerRoleQuant | kFlagExpertDigestsLegacy | kFlagExpertDigestsV2 | kFlagAuxiliaryIndex;
 
 /// The SHA-256 of one expert's identity and bytes, in full.
 ///

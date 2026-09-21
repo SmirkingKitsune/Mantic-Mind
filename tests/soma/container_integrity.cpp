@@ -400,6 +400,22 @@ int main(int argc, char** argv) {
         }
 
         {
+            // The auxiliary bit is how `soma.dspark` says what it is. The base
+            // fixture is not auxiliary, so setting the bit must be refused —
+            // otherwise a reader that was handed the wrong file would read a
+            // plausible index over the wrong shards, which is precisely what
+            // inferring the kind from the filename allowed.
+            const auto dir = case_dir(root, fixture, "auxiliary-claim");
+            const auto path = dir / "soma.container";
+            auto bytes = read_file(path);
+            put_u32(bytes, 12, u32(bytes, 12) | soma::kFlagAuxiliaryIndex);
+            write_file(path, bytes);
+            const auto st = open_with(dir, arch);
+            check(!st.ok() && st.message().find("AUXILIARY") != std::string::npos,
+                  "a base index claiming to be auxiliary is refused", st.message());
+        }
+
+        {
             const auto dir = case_dir(root, fixture, "unknown-flag");
             const auto path = dir / "soma.container";
             auto bytes = read_file(path);

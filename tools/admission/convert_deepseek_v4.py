@@ -18,10 +18,12 @@ import struct
 from pathlib import Path
 from typing import Any
 
-from convert import (ALIGN, DTYPE_ID, EXPERT_DIGEST_BYTES, FLAG_EXPERT_DIGESTS_V2,
-                     FLAG_PER_ROLE_QUANT, FORMAT_VERSION, MAGIC, align_up,
-                     container_identity, digest_table, expert_digest, quantize_rows,
-                     role_descriptor, usable_group)
+from convert import (ALIGN, DTYPE_ID, EXPERT_DIGEST_BYTES, FLAG_AUXILIARY_INDEX,
+                     FLAG_EXPERT_DIGESTS_V2, FLAG_PER_ROLE_QUANT, FORMAT_VERSION, MAGIC,
+                     align_up, container_identity, digest_table, expert_digest,
+                     quantize_rows, role_descriptor, usable_group)
+
+import record
 
 DIGEST_HEX = EXPERT_DIGEST_BYTES * 2
 
@@ -405,7 +407,15 @@ def run(args) -> int:
         return 0
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = out_dir / "conversion-manifest.json"
+    # NOT at the container root. Node cache identity is a hash over each file's
+    # (relpath, size, mtime), and `is_admission_artifact()` excludes any
+    # top-level component ending in "-build" from both the transfer set and that
+    # hash — so a resumed conversion rewriting its manifest no longer re-transfers
+    # every shard to every node holding the container. It is build state, and the
+    # container is write-once.
+    build_dir = out_dir / "convert-build"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = build_dir / "conversion-manifest.json"
     manifest = {
         "format": 1, "source_revision": requested, "config_sha256": config_sha,
         "index_sha256": index_sha,
@@ -796,7 +806,8 @@ def run(args) -> int:
         with open(out_dir / "soma.dspark.tmp", "wb") as ix:
             ix.write(MAGIC)
             ix.write(struct.pack("<II", FORMAT_VERSION,
-                                 FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS_V2))
+                                 FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS_V2 |
+                                 FLAG_AUXILIARY_INDEX))
             ix.write(struct.pack("<I", 0))
             ix.write(struct.pack("<IIII", DSPARK_STAGES, n_experts,
                                  DSPARK_STAGES, DTYPE_ID[dt_gate]))
@@ -858,31 +869,47 @@ def run(args) -> int:
             (out_dir / "tokenizer.unsupported").write_text(
                 f"{type(exc).__name__}: {exc}\n", encoding="utf-8")
 
-    meta = {
+    # Through record.build(), the same one writer the general converter uses. The
+    # two used to assemble their own dicts and had drifted into 21 keys and 30,
+    # with no declaration of which was which — so a reader could not tell a field
+    # this family does not have from a field somebody forgot.
+    fields = {
         "container_version": FORMAT_VERSION,
         "source": str(src),
         "source_repo": ("fixture/DeepSeek-V4-Pro-0813" if fixture_mode
                         else "deepseek-ai/DeepSeek-V4-Pro-0813"),
-        "source_revision": requested, "config_sha256": config_sha,
+        "source_revision": requested,
+        "config_sha256": config_sha,
         "index_sha256": index_sha,
-        "model_type": "deepseek_v4", "n_layers": n_layers,
-        "n_moe_layers": n_layers, "layer_kinds": ["moe"] * n_layers,
-        "n_experts": n_experts, "n_shards": n_layers,
-        "expert_bytes": uniform_len, "total_expert_bytes": total_payload,
-        "dtype_gate_up": dt_gate, "dtype_down": dt_down, "dtype_dense": args.quant,
-        "group": args.group, "effective_groups": effective_groups,
+        # This family publishes bf16; there is no fp8 twin to confuse it with.
+        "source_quantization": "none",
+        "omitted_tensors": (0 if include_dspark else len(omitted_mtp)),
+        "omitted_namespaces": ([] if include_dspark else mtp_namespaces),
+        "model_type": "deepseek_v4",
+        "n_layers": n_layers,
+        "n_experts": n_experts,
+        "n_shards": n_layers,
+        "expert_bytes": uniform_len,
+        "total_expert_bytes": total_payload,
+        "dtype_gate_up": dt_gate,
+        "dtype_down": dt_down,
+        "group": args.group,
         "effective_groups_by_role": role_groups,
-        "dense_tensors": len(dense_weight_map), "quantized_resident_tensors": len(qweight_map),
-        "lossless_resident_bytes": dense_total, "quantized_resident_bytes": qweight_total,
-        "dense_sharded": True,
-        "align": ALIGN, "tokenizer": tokenizer_status,
+        # This converter PACKS the resident half rather than storing it at source
+        # precision, which is what makes dtype_dense meaningful here and absent
+        # everywhere else. The discriminator says so rather than leaving a reader
+        # to infer it from which key happens to be present.
+        "dense_storage": "quantized",
+        "dense_narrow_tensors": 0,
+        "dtype_dense": args.quant,
+        "lossless_resident_bytes": dense_total,
+        "quantized_resident_bytes": qweight_total,
+        "tokenizer": tokenizer_status,
         "dspark": ("present" if include_dspark else
                     ("not-present" if fixture_mode else "omitted")),
-        "omitted_mtp_tensors": (0 if include_dspark else len(omitted_mtp)),
-        "omitted_mtp_namespaces": ([] if include_dspark else mtp_namespaces),
     }
     if include_dspark:
-        meta.update({
+        fields.update({
             "dspark_format": 1,
             "dspark_tensors": len(omitted_mtp),
             "dspark_stages": DSPARK_STAGES,
@@ -893,15 +920,16 @@ def run(args) -> int:
             "dspark_confidence_head": True,
             "dspark_expert_bytes": dspark_uniform_len,
             "dspark_total_expert_bytes": dspark_total_payload,
+            "dspark_resident_bytes": dspark_dense_total + dspark_qweight_total,
             "dspark_lossless_resident_bytes": dspark_dense_total,
             "dspark_quantized_resident_bytes": dspark_qweight_total,
-            "dspark_resident_bytes": dspark_dense_total + dspark_qweight_total,
             "dspark_kv_bytes_per_sequence": (
                 DSPARK_STAGES * int(cfg["sliding_window"]) * int(cfg["head_dim"]) * 2
                 if fixture_mode else DSPARK_KV_BYTES_PER_SEQUENCE
             ),
             "dtype_dspark": args.quant,
         })
+    meta = record.build(**fields)
     (out_dir / "container_meta.json").write_text(
         json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 

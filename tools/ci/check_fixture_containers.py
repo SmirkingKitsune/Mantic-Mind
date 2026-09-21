@@ -94,8 +94,12 @@ def same(a: bytes, b: bytes) -> bool:
 
 
 def compare(name: str, fresh: Path, committed: Path) -> None:
-    fresh_files = {p.name for p in fresh.iterdir()}
-    old_files = {p.name for p in committed.iterdir()}
+    # Files only, one level deep. `convert-build/` holds resume state, which is
+    # deliberately outside the container's transfer set and outside its cache
+    # identity; comparing it would be comparing how the conversion was run rather
+    # than what it produced.
+    fresh_files = {p.name for p in fresh.iterdir() if p.is_file()}
+    old_files = {p.name for p in committed.iterdir() if p.is_file()}
     for missing in sorted(old_files - fresh_files):
         fail(name, f"{missing} is committed but the converter no longer writes it")
     for extra in sorted(fresh_files - old_files):
@@ -138,7 +142,9 @@ def main() -> int:
             fresh = work / family
             convert(root, family, fresh, extra)
             if write:
-                for p in sorted(fresh.iterdir()):
+                # Files only, matching compare(): convert-build/ is resume state
+                # and belongs to the run, not to the container.
+                for p in sorted(x for x in fresh.iterdir() if x.is_file()):
                     shutil.copy2(p, committed / p.name)
                 print(f"  wrote   {rel}")
                 continue
