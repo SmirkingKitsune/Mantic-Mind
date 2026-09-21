@@ -307,31 +307,29 @@ Status parse_index(const std::string& path, std::string_view raw, ParsedIndex& o
 }
 
 // Validate the exact parsed snapshot that will be used or stamped.
-Status validate_ranges(const ParsedIndex& ix, const ArchIr& arch,
-                       const std::string& dir, const std::string& prefix) {
+/// The half of the layout invariant that needs no architecture.
+///
+/// Split out because the two callers hold different amounts of context and were
+/// enforcing different rules as a result. `validate_ranges()` has an IR and can
+/// also check topology and the uniform expert length; `verify_payload()`
+/// deliberately has none, so that a node holding a copied container can check it
+/// without being able to resolve — or even support — its architecture.
+///
+/// That asymmetry had quietly become a disagreement: `soma verify` and
+/// `verify_payload.py` both accepted a PERMUTED container that `open()` refuses,
+/// so the post-transfer check blessed a container serve would reject. Liveness
+/// comes from `length != 0` here rather than from the layer kind, which is the
+/// only thing the IR was needed for in this walk.
+Status validate_layout(const ParsedIndex& ix, const std::string& dir, const std::string& prefix) {
     const auto& h = ix.header;
-    const auto d = arch.routed_expert_width();
-    const auto fi = arch.ffn.expert_intermediate;
-    if (h.n_layers != arch.topology.n_layers || h.n_experts != arch.router.n_experts ||
-        arch.topology.layer_kinds.size() != h.n_layers || d == 0 || fi == 0) {
-        return {StatusCode::ArchMismatch, "container requires complete matching expert topology"};
-    }
-    const auto expected = expert_bytes_for(arch, fi, d, TensorRole::ExpertGate) +
-                          expert_bytes_for(arch, fi, d, TensorRole::ExpertUp) +
-                          expert_bytes_for(arch, d, fi, TensorRole::ExpertDown);
-    if (expected == 0 || expected > std::numeric_limits<std::uint32_t>::max() ||
-        h.expert_bytes != expected) {
-        return {StatusCode::ArchMismatch, "container requires the exact uniform expert length"};
-    }
     std::vector<std::uint64_t> ends(h.n_shards, 0);
     std::uint64_t total = 0;
-    for (std::size_t i = 0; i < ix.entries.size(); ++i) {
-        const auto& e = ix.entries[i];
-        const bool moe = arch.is_moe_layer(static_cast<LayerIndex>(i / h.n_experts));
-        if ((moe && e.length != expected) || (!moe && e.length != 0)) {
-            return {StatusCode::InvalidArgument, "expert slot presence/length disagrees with layer kind"};
-        }
-        if (!moe) continue;
+    for (const auto& e : ix.entries) {
+        if (e.length == 0) continue;
+        // Index order IS the layout order today, and that is what makes a swapped
+        // pair a structural failure rather than one only a digest can see. When
+        // that rule is relaxed to a tiling invariant, it must be relaxed HERE, in
+        // one place, with digests mandatory first.
         if (e.shard >= ends.size() || e.offset != ends[e.shard]) {
             return {StatusCode::InvalidArgument, "expert ranges are aliased or noncanonical"};
         }
@@ -355,6 +353,33 @@ Status validate_ranges(const ParsedIndex& ix, const ArchIr& arch,
             return {StatusCode::InvalidArgument, "shard size disagrees with canonical expert ranges"};
     }
     return {};
+}
+
+Status validate_ranges(const ParsedIndex& ix, const ArchIr& arch,
+                       const std::string& dir, const std::string& prefix) {
+    const auto& h = ix.header;
+    const auto d = arch.routed_expert_width();
+    const auto fi = arch.ffn.expert_intermediate;
+    if (h.n_layers != arch.topology.n_layers || h.n_experts != arch.router.n_experts ||
+        arch.topology.layer_kinds.size() != h.n_layers || d == 0 || fi == 0) {
+        return {StatusCode::ArchMismatch, "container requires complete matching expert topology"};
+    }
+    const auto expected = expert_bytes_for(arch, fi, d, TensorRole::ExpertGate) +
+                          expert_bytes_for(arch, fi, d, TensorRole::ExpertUp) +
+                          expert_bytes_for(arch, d, fi, TensorRole::ExpertDown);
+    if (expected == 0 || expected > std::numeric_limits<std::uint32_t>::max() ||
+        h.expert_bytes != expected) {
+        return {StatusCode::ArchMismatch, "container requires the exact uniform expert length"};
+    }
+    // What only an IR can say: which slots are supposed to hold an expert at all.
+    for (std::size_t i = 0; i < ix.entries.size(); ++i) {
+        const auto& e = ix.entries[i];
+        const bool moe = arch.is_moe_layer(static_cast<LayerIndex>(i / h.n_experts));
+        if ((moe && e.length != expected) || (!moe && e.length != 0)) {
+            return {StatusCode::InvalidArgument, "expert slot presence/length disagrees with layer kind"};
+        }
+    }
+    return validate_layout(ix, dir, prefix);
 }
 
 std::string serialize_index(const ParsedIndex& ix) {
@@ -1118,6 +1143,16 @@ Status verify_payload(const std::string& model_dir,
                     "Reconvert it with the current converter, or run `soma stamp` to record the "
                     "bytes it has now"};
     }
+    // Structure before payload, and the SAME structure open() requires.
+    //
+    // Without this, `soma verify` reported OK on a container `open()` refuses:
+    // a swapped pair of experts whose payloads moved with them has valid digests
+    // and a perfect tiling, and only index order tells it apart. The post-transfer
+    // check must not bless what serving will reject.
+    if (auto st = validate_layout(ix, model_dir, shard_prefix_for(index_file)); !st.ok()) {
+        return st;
+    }
+
     const auto n_experts = ix.header.n_experts;
     auto st = walk_experts(ix, model_dir, index_file, [&](std::size_t slot, CByteSpan bytes) {
         ++out.experts_checked;

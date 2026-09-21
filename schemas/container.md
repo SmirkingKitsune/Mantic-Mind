@@ -334,6 +334,26 @@ changes require `soma verify` or reopening the store to detect. Hashing cost
 depends on the CPU and storage. The bandwidth probe reads directly without
 hashing, changing the model's verification policy, or marking experts verified.
 
+**Digests do not subsume the layout.** Index order *is* layout order: each live
+range starts where the previous one ended, aligned up. That is what makes two
+experts exchanging places a **structural** failure rather than one only a digest
+could see — and a swap that moves the payloads with the offsets leaves every
+digest valid and every range tiling the shard perfectly, so nothing else would.
+
+One definition enforces it (`validate_layout()` in `src/soma/expert_store.cpp`),
+because there are two callers with different context and they had already drifted
+apart: `open()` requires an architecture and could check topology and the uniform
+expert length as well, while `soma verify` deliberately has none so that a node
+holding a copied container can check it without resolving — or even supporting —
+the architecture. The layout half needs no IR, and both now run it. Before this,
+`soma verify` and `verify_payload.py` both passed a permuted container that
+`open()` refused, which is the wrong way round for the check an operator runs
+*after* a transfer.
+
+Relaxing this to a tiling invariant is what would permit heat-ordered layouts. It
+has to happen in that one place, and only once digests are mandatory and
+domain-separated — a permuted layout would otherwise be caught by nothing.
+
 An unchanged stamp is a no-op and explicitly reports that payload was not
 re-read. Use `soma verify` after transfer. Containers without digest tables remain
 readable; verification reports unsupported until a table is recorded. Recording

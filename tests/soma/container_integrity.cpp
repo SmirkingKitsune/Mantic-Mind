@@ -51,6 +51,16 @@ void put_u32(std::vector<char>& bytes, std::size_t at, std::uint32_t v) {
     std::memcpy(bytes.data() + at, &v, sizeof(v));
 }
 
+std::uint64_t u64(const std::vector<char>& bytes, std::size_t at) {
+    std::uint64_t v = 0;
+    std::memcpy(&v, bytes.data() + at, sizeof(v));
+    return v;
+}
+
+void put_u64(std::vector<char>& bytes, std::size_t at, std::uint64_t v) {
+    std::memcpy(bytes.data() + at, &v, sizeof(v));
+}
+
 struct Offsets {
     std::size_t hash = 20;
     std::size_t legacy_dtype = 0;
@@ -404,6 +414,57 @@ int main(int argc, char** argv) {
             check(st.ok() && report.experts_checked > 0 && report.mismatches == 0,
                   "an undamaged container verifies, and says how much it read",
                   std::to_string(report.experts_checked) + " experts");
+        }
+
+        {
+            // A PERMUTED container: two experts exchange both their index offsets
+            // and their payload bytes. Every digest still matches, the ranges
+            // still tile the shard perfectly, and only index order tells it apart.
+            //
+            // `verify_payload()` used to report OK on exactly this while `open()`
+            // refused it — so the check an operator runs after a transfer blessed
+            // a container serving would reject. Both now refuse it for the same
+            // reason, and this is what keeps them from drifting apart again.
+            const auto dir = case_dir(root, fixture, "permuted-layout");
+            const auto path = dir / "soma.container";
+            auto bytes = read_file(path);
+            const auto o = offsets(bytes);
+            const std::size_t entries_at = o.roles + 36u + 16u; // 3 roles, then the two u64 sizes
+            const auto entry = [&](std::size_t slot) { return entries_at + slot * 16u; };
+
+            const auto off_a = u64(bytes, entry(0) + 4);
+            const auto off_b = u64(bytes, entry(1) + 4);
+            const auto len_a = u32(bytes, entry(0) + 12);
+            const auto len_b = u32(bytes, entry(1) + 12);
+            check(len_a > 0 && len_b > 0 && off_a != off_b,
+                  "the permutation fixture has two live experts to exchange", "");
+
+            put_u64(bytes, entry(0) + 4, off_b);
+            put_u64(bytes, entry(1) + 4, off_a);
+            write_file(path, bytes);
+
+            // Move the payloads with them, so the digests stay valid and the only
+            // thing wrong is the ORDER.
+            const auto shard = dir / "experts-00000.bin";
+            auto payload = read_file(shard);
+            std::vector<char> a(payload.begin() + static_cast<std::ptrdiff_t>(off_a),
+                                payload.begin() + static_cast<std::ptrdiff_t>(off_a + len_a));
+            std::vector<char> b(payload.begin() + static_cast<std::ptrdiff_t>(off_b),
+                                payload.begin() + static_cast<std::ptrdiff_t>(off_b + len_b));
+            std::copy(b.begin(), b.end(),
+                      payload.begin() + static_cast<std::ptrdiff_t>(off_a));
+            std::copy(a.begin(), a.end(),
+                      payload.begin() + static_cast<std::ptrdiff_t>(off_b));
+            write_file(shard, payload);
+
+            soma::PayloadReport report;
+            const auto verified = soma::verify_payload(dir.string(), report);
+            check(!verified.ok() &&
+                      verified.message().find("noncanonical") != std::string::npos,
+                  "verify refuses a permuted layout, as open() does", verified.message());
+
+            const auto opened = open_with(dir, arch, soma::IdentityPolicy::AllowUnstamped);
+            check(!opened.ok(), "and open() still refuses it too", opened.message());
         }
 
         {

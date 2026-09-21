@@ -268,7 +268,17 @@ def check_structure(container: Path, ix: dict, meta: dict, kinds: list[str]) -> 
         per_shard.setdefault(shard, []).append((off, length, slot))
 
     for shard, slots in per_shard.items():
-        slots.sort()
+        # Walked in INDEX order, which is the order they were appended in — not
+        # sorted by offset.
+        #
+        # Sorting here made this check a tiling test: any permutation whose ranges
+        # happened to pack perfectly passed. The engine's own check walks the index
+        # and requires each range to start where the previous one ended
+        # (`validate_ranges` in src/soma/expert_store.cpp), so the two validators
+        # disagreed, and the permissive one was the one an operator runs after a
+        # transfer. A container with two experts swapped — payloads moved with
+        # them, so every digest still matches — passed here and was refused by
+        # `soma serve`.
         cursor = 0
         for off, length, slot in slots:
             layer, expert = divmod(slot, n_experts)
