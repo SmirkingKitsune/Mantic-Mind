@@ -273,7 +273,7 @@ int main(int argc, char** argv) {
             const auto o = offsets(bytes);
             put_u32(bytes, 8, 1);
             // Clear the role bit ONLY. Zeroing the whole word would also drop
-            // kFlagExpertDigests, and the digest table would then read as trailing
+            // kFlagExpertDigestsV2, and the digest table would then read as trailing
             // bytes — a different refusal than the one this case is about.
             put_u32(bytes, 12, u32(bytes, 12) & ~soma::kFlagPerRoleQuant);
             bytes.erase(bytes.begin() + o.descriptor_count,
@@ -290,7 +290,7 @@ int main(int argc, char** argv) {
             auto bytes = read_file(path);
             const auto o = offsets(bytes);
             // Clear the role bit ONLY. Zeroing the whole word would also drop
-            // kFlagExpertDigests, and the digest table would then read as trailing
+            // kFlagExpertDigestsV2, and the digest table would then read as trailing
             // bytes — a different refusal than the one this case is about.
             put_u32(bytes, 12, u32(bytes, 12) & ~soma::kFlagPerRoleQuant);
             bytes.erase(bytes.begin() + o.descriptor_count,
@@ -390,8 +390,56 @@ int main(int argc, char** argv) {
                   "unknown must-understand flags are rejected", st.message());
         }
 
-
         std::cout << "\npayload digests\n";
+        // ── the digest preimage, frozen ─────────────────────────────────────
+        //
+        // The container codec is implemented twice: here and in Python
+        // (`expert_digest` in tools/admission/convert.py). Two implementations
+        // agree until they do not, and a digest is the one field where a silent
+        // disagreement is invisible — every container would simply fail to verify
+        // on the other side.
+        //
+        // These vectors were computed by the PYTHON side and pinned here, so a
+        // change to either preimage breaks this rather than the fleet. Note the
+        // third and fourth: identical bytes at swapped (layer, expert) must hash
+        // differently, which is the whole point of binding the identity.
+        {
+            const auto hex = [](const soma::ExpertDigest& d) {
+                std::string out;
+                for (const auto b : d.bytes) {
+                    char pair[3];
+                    std::snprintf(pair, sizeof(pair), "%02x", b);
+                    out += pair;
+                }
+                return out;
+            };
+            const auto digest_of = [&](soma::LayerIndex l, soma::ExpertId e,
+                                       const std::vector<unsigned char>& v) {
+                return hex(soma::expert_digest(
+                    l, e, soma::CByteSpan(reinterpret_cast<const std::byte*>(v.data()), v.size())));
+            };
+            const std::vector<unsigned char> none;
+            const std::vector<unsigned char> abc{0x61, 0x62, 0x63};
+            std::vector<unsigned char> ramp(256);
+            for (std::size_t k = 0; k < ramp.size(); ++k) ramp[k] = static_cast<unsigned char>(k);
+
+            check(digest_of(0, 0, none) ==
+                      "7fbae7e65e11bbb6d40abeda64bb915a77ec22e5ed9415f19c10683779f4bc13",
+                  "digest preimage matches Python (empty payload)", "");
+            check(digest_of(0, 0, abc) ==
+                      "fecd8373be48d512c333f6705e90c640078e7b4f40baa2c2b5a6e5a5edab2f1d",
+                  "digest preimage matches Python (abc)", "");
+            check(digest_of(1, 2, abc) ==
+                      "84378a479312be7400a51603281ee5de82df175fcef55d44ee079b7396864a46",
+                  "and binds the layer and expert", "");
+            check(digest_of(2, 1, abc) ==
+                      "d970640df4f228840849c2cf3491b8538ac7b7d99be8927be8b366d2657bf2a8",
+                  "so identical bytes at swapped slots do not collide", "");
+            check(digest_of(61, 255, ramp) ==
+                      "aaab14f6afdaca223b498e40248683057c73f3fcc20a7409b264474d8dd084b2",
+                  "and a 256-byte payload agrees too", "");
+        }
+
 
         // The first section in this file that reads a shard byte. Everything above
         // proves the container is SHAPED right — canonical ranges, exact shard
@@ -538,9 +586,10 @@ int main(int argc, char** argv) {
         }
 
         {
-            // A container converted before digests existed must keep working. The
-            // check is additive, and refusing one would strand every container
-            // already on disk for the sake of evidence it never had.
+            // A digest table is now required, where it was once additive. It is
+            // the only check that survives relaxing index order, so a container
+            // that carries one and a container that does not cannot both be
+            // servable — that is a check in name only.
             const auto dir = case_dir(root, fixture, "no-digest-table");
             const auto path = dir / "soma.container";
             auto bytes = read_file(path);
@@ -548,16 +597,43 @@ int main(int argc, char** argv) {
             const std::size_t after_hash = 20u + u32(bytes, 16);
             const auto slots = static_cast<std::size_t>(u32(bytes, after_hash)) *
                                u32(bytes, after_hash + 4);
-            bytes.resize(bytes.size() - static_cast<std::size_t>(slots) * 8);
-            put_u32(bytes, 12, u32(bytes, 12) & ~soma::kFlagExpertDigests);
+            bytes.resize(bytes.size() - slots * soma::kExpertDigestBytes);
+            put_u32(bytes, 12, u32(bytes, 12) & ~soma::kFlagExpertDigestsV2);
             write_file(path, bytes);
-            check(open_with(dir, arch).ok(), "a container with no digest table still opens", "");
+
+            const auto opened = open_with(dir, arch);
+            check(!opened.ok() && opened.message().find("no digest table") != std::string::npos,
+                  "a container with no digest table is refused, and says how to fix it",
+                  opened.message());
+
+            // The escape is the policy that already means "read without
+            // checking", rather than a second flag saying the same thing.
+            soma::ExpertStore trusting;
+            soma::OpenOptions trust;
+            trust.payload = soma::PayloadPolicy::Trust;
+            check(trusting.open(dir.string(), arch, trust).ok(),
+                  "and PayloadPolicy::Trust is the one way past it", "");
 
             soma::PayloadReport report;
             const auto st = soma::verify_payload(dir.string(), report);
             check(!st.ok() && st.code() == soma::StatusCode::Unsupported,
-                  "but verify says it cannot check, rather than reporting success",
+                  "verify still says it cannot check, rather than reporting success",
                   st.message());
+        }
+
+        {
+            // The retired 8-byte table is refused rather than read: its digests
+            // bind no identity, so accepting them would leave a container looking
+            // checked while a swap slipped through.
+            const auto dir = case_dir(root, fixture, "legacy-digest-table");
+            const auto path = dir / "soma.container";
+            auto bytes = read_file(path);
+            put_u32(bytes, 12,
+                    (u32(bytes, 12) & ~soma::kFlagExpertDigestsV2) | soma::kFlagExpertDigestsLegacy);
+            write_file(path, bytes);
+            const auto opened = open_with(dir, arch, soma::IdentityPolicy::AllowUnstamped);
+            check(!opened.ok() && opened.message().find("retired") != std::string::npos,
+                  "the retired 8-byte digest table is refused", opened.message());
         }
 
         {

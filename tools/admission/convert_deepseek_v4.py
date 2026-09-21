@@ -18,29 +18,47 @@ import struct
 from pathlib import Path
 from typing import Any
 
-from convert import (ALIGN, DTYPE_ID, FLAG_EXPERT_DIGESTS, FLAG_PER_ROLE_QUANT,
-                     FORMAT_VERSION, MAGIC, align_up, digest_table, expert_digest,
-                     quantize_rows, role_descriptor, usable_group)
+from convert import (ALIGN, DTYPE_ID, EXPERT_DIGEST_BYTES, FLAG_EXPERT_DIGESTS_V2,
+                     FLAG_PER_ROLE_QUANT, FORMAT_VERSION, MAGIC, align_up, digest_table,
+                     expert_digest, quantize_rows, role_descriptor, usable_group)
+
+DIGEST_HEX = EXPERT_DIGEST_BYTES * 2
 
 
-def digests_from_shard(path: Path, entries: list) -> list[int]:
+def digests_from_shard(path: Path, entries: list, layer: int) -> list[str]:
     """Recover a completed layer's digests by reading the shard back.
 
-    Only for a RESUMED conversion whose manifest predates the digest table. The
-    alternative — leaving the table out because one layer's digests are missing —
-    would make an interrupted conversion produce a weaker container than an
-    uninterrupted one, which is exactly the sort of difference nobody would think
-    to look for later.
+    Only for a RESUMED conversion whose manifest predates the CURRENT digest
+    table. The alternative — leaving the table out because one layer's digests
+    are missing — would make an interrupted conversion produce a weaker container
+    than an uninterrupted one, which is exactly the sort of difference nobody
+    would think to look for later.
+
+    `layer` is needed because a digest binds the slot it sits in, not only the
+    bytes; recovering one without knowing where it goes is not possible.
     """
-    out: list[int] = []
+    out: list[str] = []
     with open(path, "rb") as fh:
-        for off, length in entries:
+        for expert, (off, length) in enumerate(entries):
             if int(length) == 0:
-                out.append(0)
+                out.append("00" * EXPERT_DIGEST_BYTES)
                 continue
             fh.seek(int(off))
-            out.append(expert_digest(fh.read(int(length))))
+            out.append(expert_digest(layer, expert, fh.read(int(length))).hex())
     return out
+
+
+def manifest_digests_usable(done: dict, entries: list) -> bool:
+    """Whether a resumed manifest's digests are the ones this build writes.
+
+    Digests were 64-bit ints over the payload alone, and are now full SHA-256
+    over the payload AND the slot. A manifest written by the older converter
+    holds the former; it is recorded the same way and means something else, so it
+    is recomputed rather than trusted.
+    """
+    have = done.get("digests")
+    return (isinstance(have, list) and len(have) == len(entries) and
+            all(isinstance(d, str) and len(d) == DIGEST_HEX for d in have))
 
 PINNED_REVISION = "72e1d3230f6c080a530b0a1d46f8eb4602340597"
 PINNED_CONFIG_SHA256 = "9dd2a89255469e120b333668ef5a169b7ae46c00f6bbab786bf0be457546aec0"
@@ -485,7 +503,7 @@ def run(args) -> int:
     # Routed experts: one atomic file per layer makes resume validation cheap and
     # ensures no partial shard can masquerade as complete.
     all_index: list[tuple[int, int, int]] = []
-    all_digests: list[int] = []
+    all_digests: list[bytes] = []
     total_payload = 0
     uniform_len = -1
     effective_groups: dict[str, int] = {}
@@ -508,7 +526,7 @@ def run(args) -> int:
                 and len(entries) == n_experts):
             tmp = final.with_suffix(".bin.tmp")
             offsets = []
-            layer_digests: list[int] = []
+            layer_digests: list[str] = []
             off = 0
             fused_gate_up = None
             fused_down = None
@@ -538,7 +556,7 @@ def run(args) -> int:
                         role_groups[role] = group
                         blob += packed
                     offsets.append([off, len(blob)])
-                    layer_digests.append(expert_digest(bytes(blob)))
+                    layer_digests.append(expert_digest(layer, expert, bytes(blob)).hex())
                     fh.write(blob)
                     pad = align_up(off + len(blob)) - (off + len(blob))
                     if pad:
@@ -554,11 +572,11 @@ def run(args) -> int:
             manifest["completed_expert_layers"][str(layer)] = done
             save_manifest()
             entries = offsets
-        if done.get("digests") is None:
-            done["digests"] = digests_from_shard(final, entries)
+        if not manifest_digests_usable(done, entries):
+            done["digests"] = digests_from_shard(final, entries, layer)
             manifest["completed_expert_layers"][str(layer)] = done
             save_manifest()
-        all_digests.extend(int(d) for d in done["digests"])
+        all_digests.extend(bytes.fromhex(d) for d in done["digests"])
         for off, length in entries:
             all_index.append((layer, int(off), int(length)))
             total_payload += int(length)
@@ -638,7 +656,7 @@ def run(args) -> int:
     dspark_all_index: list[tuple[int, int, int]] = []
     dspark_total_payload = 0
     dspark_uniform_len = -1
-    dspark_all_digests: list[int] = []
+    dspark_all_digests: list[bytes] = []
     dspark_dense_weight_map: dict[str, str] = {}
     dspark_qweight_map: dict[str, dict[str, Any]] = {}
     dspark_dense_total = 0
@@ -652,7 +670,7 @@ def run(args) -> int:
                     and len(entries) == n_experts):
                 tmp = final.with_suffix(".bin.tmp")
                 offsets = []
-                stage_digests: list[int] = []
+                stage_digests: list[str] = []
                 off = 0
                 with open(tmp, "wb") as fh:
                     for expert in range(n_experts):
@@ -667,7 +685,9 @@ def run(args) -> int:
                             dspark_role_groups[role] = group
                             blob += packed
                         offsets.append([off, len(blob)])
-                        stage_digests.append(expert_digest(bytes(blob)))
+                        # The stage IS the layer inside the auxiliary container,
+                        # which is how its index already numbers these slots.
+                        stage_digests.append(expert_digest(stage, expert, bytes(blob)).hex())
                         fh.write(blob)
                         padded = align_up(off + len(blob))
                         if padded > off + len(blob):
@@ -683,11 +703,11 @@ def run(args) -> int:
                 manifest["completed_dspark_expert_layers"][str(stage)] = done
                 save_manifest()
                 entries = offsets
-            if done.get("digests") is None:
-                done["digests"] = digests_from_shard(final, entries)
+            if not manifest_digests_usable(done, entries):
+                done["digests"] = digests_from_shard(final, entries, stage)
                 manifest["completed_dspark_expert_layers"][str(stage)] = done
                 save_manifest()
-            dspark_all_digests.extend(int(d) for d in done["digests"])
+            dspark_all_digests.extend(bytes.fromhex(d) for d in done["digests"])
             for off, length in entries:
                 dspark_all_index.append((stage, int(off), int(length)))
                 dspark_total_payload += int(length)
@@ -775,7 +795,7 @@ def run(args) -> int:
         with open(out_dir / "soma.dspark.tmp", "wb") as ix:
             ix.write(MAGIC)
             ix.write(struct.pack("<II", FORMAT_VERSION,
-                                 FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS))
+                                 FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS_V2))
             ix.write(struct.pack("<I", 0))
             ix.write(struct.pack("<IIII", DSPARK_STAGES, n_experts,
                                  DSPARK_STAGES, DTYPE_ID[dt_gate]))
@@ -810,7 +830,7 @@ def run(args) -> int:
     with open(out_dir / "soma.container.tmp", "wb") as ix:
         ix.write(MAGIC)
         ix.write(struct.pack("<II", FORMAT_VERSION,
-                             FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS))
+                             FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS_V2))
         ix.write(struct.pack("<I", 0))
         ix.write(struct.pack("<IIII", n_layers, n_experts, n_layers, DTYPE_ID[dt_gate]))
         ix.write(struct.pack("<I", role_groups.get("gate", args.group)))

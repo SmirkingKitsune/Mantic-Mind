@@ -13,12 +13,15 @@ refused everything would satisfy a bare "exit non-zero" test.
   truncated shard        -> STRUCTURE, and named as truncation
   trailing bytes         -> STRUCTURE, unaccounted tail
   index offset shifted   -> STRUCTURE, gap/overlap in the shard's packing
-  one flipped byte       -> DIGESTS, and EXACT once the digest table is stripped
-  two experts swapped    -> DIGESTS, and DECODE's decoy margin once it is stripped
+  one flipped byte       -> DIGESTS, and EXACT under --skip-digests
+  two experts swapped    -> DIGESTS, and DECODE's decoy margin under --skip-digests
+  no digest table at all -> REFUSED before any pass runs
 
-Every payload case runs twice: once as the current converter writes containers,
-and once with the digest table removed, because that is what a container converted
-before digests existed looks like and those checks are the only ones it has.
+Every payload case runs twice: once as written, and once under --skip-digests,
+because the digests now short-circuit the source comparison for every kind of
+damage it used to be the only check for, and an unreachable check rots. The flag
+is not a convenience for this file — it mirrors the engine's PayloadPolicy::Trust,
+which exists for the same reason and has the same effect.
 
 The swap case is the one that justifies the decode pass existing at all: it is
 the failure that structure cannot see (every length and offset is still perfect)
@@ -37,7 +40,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools" / "admission"))
 
-from convert import FLAG_EXPERT_DIGESTS, FLAG_PER_ROLE_QUANT  # noqa: E402  (needs the path)
+from convert import (EXPERT_DIGEST_BYTES, FLAG_EXPERT_DIGESTS_V2,  # noqa: E402
+                     FLAG_PER_ROLE_QUANT)
 
 VERIFY = ROOT / "tools" / "admission" / "verify_payload.py"
 CONVERT = ROOT / "tools" / "admission" / "convert.py"
@@ -84,21 +88,18 @@ def first_live_slot(container: Path) -> tuple[int, int, int, int]:
 def strip_digests(d: Path) -> Path:
     """Remove the digest table from a container, in place.
 
-    A container converted before digests existed looks exactly like this, and the
-    source-comparison passes are the only checks it has. Those passes must not rot
-    behind the faster one, so every case that the digests would now catch is run a
-    second time with the table removed.
+    Not a way to exercise the slower passes any more — --skip-digests does that,
+    and it is what the engine's own escape hatch does. This builds a container
+    shape the format no longer permits, purely so the refusal can be tested.
     """
     from verify_payload import read_index
 
     path = d / "soma.container"
     ix = read_index(path)
-    if not ix["digests"]:
-        return d
     raw = bytearray(path.read_bytes())
     (flags,) = struct.unpack_from("<I", raw, 12)
-    struct.pack_into("<I", raw, 12, flags & ~FLAG_EXPERT_DIGESTS)
-    del raw[len(raw) - ix["n_layers"] * ix["n_experts"] * 8:]
+    struct.pack_into("<I", raw, 12, flags & ~FLAG_EXPERT_DIGESTS_V2)
+    del raw[len(raw) - ix["n_layers"] * ix["n_experts"] * EXPERT_DIGEST_BYTES:]
     path.write_bytes(bytes(raw))
     return d
 
@@ -111,8 +112,9 @@ def fail(case: str, why: str) -> None:
 FAILURES = 0
 
 
-def expect_caught(case: str, container: Path, source: Path, pass_name: str, needle: str):
-    code, rep = run_verify(container, source)
+def expect_caught(case: str, container: Path, source: Path, pass_name: str, needle: str,
+                  *extra: str):
+    code, rep = run_verify(container, source, *extra)
     if code == 0:
         return fail(case, "verify_payload reported OK on a container we damaged")
     blob = json.dumps(rep).lower()
@@ -208,21 +210,22 @@ def main() -> int:
     # container and nothing to compare it against.
     expect_caught("one flipped byte", d, FIXTURE, "digests", "layer")
 
-    # The same damage with the digest table stripped, so the source comparison is
-    # still exercised. It is the only check available for a container converted
-    # before digests existed, and it must not rot behind the faster one.
-    d = strip_digests(fresh("flipped_nodigest"))
+    # The same damage with the digests waived, so the source comparison is still
+    # exercised. It is the only check a caller who opted out of the digests has,
+    # and it must not rot behind the faster one.
+    d = fresh("flipped_skipped")
     with open(d / shard_name, "r+b") as f:
         f.seek(off + length // 2)
         b = f.read(1)
         f.seek(off + length // 2)
         f.write(bytes([b[0] ^ 0xFF]))
-    expect_caught("one flipped byte, no digest table", d, FIXTURE, "content",
-                  "differs from a re-quantized")
+    expect_caught("one flipped byte, --skip-digests", d, FIXTURE, "content",
+                  "differs from a re-quantized", "--skip-digests")
 
     # 5. Two experts swapped. Structure is perfect: every length and offset still
-    # matches. The digests catch it because each expert now hashes to its
-    # neighbour's value; with them stripped, only the decoy margin can.
+    # matches. The digests catch it because a digest binds the slot as well as the
+    # bytes, so each expert now hashes to a value belonging to the other slot;
+    # with them waived, only the decoy margin can.
     d = fresh("swapped")
     raw_ix = (d / "soma.container").read_bytes()
     base = index_header_len(d)
@@ -242,18 +245,32 @@ def main() -> int:
         f.write(a)
     expect_caught("two experts swapped", d, FIXTURE, "digests", "layer")
 
-    strip_digests(d)
-    code, rep = run_verify(d, FIXTURE)
+    code, rep = run_verify(d, FIXTURE, "--skip-digests")
     if code == 0:
-        fail("two experts swapped, no digest table", "reported OK")
+        fail("two experts swapped, --skip-digests", "reported OK")
     elif rep.get("structure") != "passed":
-        fail("two experts swapped, no digest table",
+        fail("two experts swapped, --skip-digests",
              "the structure pass failed, so this did not exercise the decode pass")
     elif not any("wrong slot" in f for f in rep.get("failures", [])):
-        fail("two experts swapped, no digest table",
+        fail("two experts swapped, --skip-digests",
              f"content failed but not via the decoy margin: {rep.get('failures')}")
     else:
-        print("  ok      two experts swapped, no digest table -> content (decoy margin)")
+        print("  ok      two experts swapped, --skip-digests -> content (decoy margin)")
+
+    # 5b. A container with NO digest table is refused outright, before any pass
+    # runs — the same refusal the engine makes at open(). --skip-digests does not
+    # rescue it: waiving a check is not the same as there being nothing to check,
+    # and a container that cannot be verified anywhere should never have shipped.
+    d = strip_digests(fresh("no_digest_table"))
+    for label, extra in (("", ()), (", even with --skip-digests", ("--skip-digests",))):
+        code, rep = run_verify(d, FIXTURE, *extra)
+        reason = json.dumps(rep).lower()
+        if code == 0:
+            fail(f"no digest table{label}", "reported OK")
+        elif "no digest table" not in reason:
+            fail(f"no digest table{label}", f"refused, but never said why: {reason[:200]}")
+        else:
+            print(f"  ok      no digest table{label}  -> refused")
 
     # 6. --structure-only must not silently claim the contents were checked.
     code, rep = run_verify(good, FIXTURE, "--structure-only")
@@ -265,7 +282,8 @@ def main() -> int:
     if FAILURES:
         print(f"  FAILED  {FAILURES} case(s)")
         return 1
-    print("  OK       verify_payload catches all 5 corruptions, with and without digests")
+    print("  OK       verify_payload catches all 5 corruptions, with and without digests, "
+          "and refuses a container carrying none")
     shutil.rmtree(work, ignore_errors=True)
     return 0
 

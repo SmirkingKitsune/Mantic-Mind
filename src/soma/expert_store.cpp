@@ -14,6 +14,7 @@
 
 #include "soma/quant_format.hpp"
 
+#include <openssl/evp.h>
 #include <openssl/sha.h>
 
 #include <algorithm>
@@ -111,14 +112,53 @@ struct Writer {
 
 } // namespace
 
-ExpertDigest expert_digest(CByteSpan bytes) noexcept {
-    std::array<unsigned char, SHA256_DIGEST_LENGTH> full{};
-    SHA256(reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size(), full.data());
-    // Little-endian, so the C++ and Python sides agree without either of them
-    // having to state a byte order twice.
-    ExpertDigest out = 0;
-    for (std::size_t i = 0; i < sizeof(out); ++i)
-        out |= static_cast<ExpertDigest>(full[i]) << (8 * i);
+ExpertDigest expert_digest(LayerIndex layer, ExpertId expert, CByteSpan bytes) noexcept {
+    // A tagged, length-bound preimage, spelled out here because Python reproduces
+    // it byte for byte and "the SHA-256 of the expert" did not say enough.
+    //
+    //   "soma/expert\0" ‖ u32le(layer) ‖ u32le(expert) ‖ u64le(length) ‖ payload
+    //
+    // The tag keeps this from colliding with a bare SHA-256 of the same bytes
+    // taken for some other purpose. The identity keeps two experts with identical
+    // payloads — plausible for zeroed or pruned slots, and routine in the tiny
+    // fixtures — from having identical digests, which is what makes the table a
+    // placement check and not only a corruption check. The length is in the
+    // preimage as well as implied by it so that a truncated range cannot hash as
+    // a shorter expert that legitimately ends there.
+    static constexpr char kTag[] = "soma/expert";
+    std::array<unsigned char, sizeof(kTag) + 16> prefix{};
+    std::memcpy(prefix.data(), kTag, sizeof(kTag)); // includes the NUL
+    const auto put32 = [&](std::size_t at, std::uint32_t v) {
+        for (std::size_t i = 0; i < 4; ++i)
+            prefix[at + i] = static_cast<unsigned char>((v >> (8 * i)) & 0xFF);
+    };
+    const auto put64 = [&](std::size_t at, std::uint64_t v) {
+        for (std::size_t i = 0; i < 8; ++i)
+            prefix[at + i] = static_cast<unsigned char>((v >> (8 * i)) & 0xFF);
+    };
+    put32(sizeof(kTag), layer);
+    put32(sizeof(kTag) + 4, expert);
+    put64(sizeof(kTag) + 8, static_cast<std::uint64_t>(bytes.size()));
+
+    // EVP rather than the one-shot SHA256(): the preimage is a small prefix
+    // followed by a payload that can be megabytes, and concatenating them to use
+    // the one-shot form would memcpy every expert an extra time on the read path.
+    // The SHA256_Init/Update/Final trio would stream too, but it is deprecated in
+    // OpenSSL 3.0 and this build treats that as an error.
+    ExpertDigest out{};
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (ctx == nullptr) return out;
+    unsigned int written = 0;
+    const bool ok = EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) == 1 &&
+                    EVP_DigestUpdate(ctx, prefix.data(), prefix.size()) == 1 &&
+                    (bytes.empty() || EVP_DigestUpdate(ctx, bytes.data(), bytes.size()) == 1) &&
+                    EVP_DigestFinal_ex(ctx, out.bytes.data(), &written) == 1;
+    EVP_MD_CTX_free(ctx);
+    // An all-zero digest is the dense-slot sentinel, so a silent failure here
+    // would make a live expert look like an empty slot. Nothing can throw from a
+    // noexcept function, but the caller compares digests and an all-zero one can
+    // only ever mismatch — which is the safe direction.
+    if (!ok || written != kExpertDigestBytes) out = ExpertDigest{};
     return out;
 }
 
@@ -287,17 +327,31 @@ Status parse_index(const std::string& path, std::string_view raw, ParsedIndex& o
     }
     if (!c.ok) return {StatusCode::InvalidArgument, path + ": truncated index"};
 
+    // The retired 8-byte table. Refused rather than read: its digests bind no
+    // identity, so they cannot answer the question the reader now asks of them,
+    // and silently accepting a weaker table would leave a container looking
+    // checked when a swap would slip through it.
+    if ((h.flags & kFlagExpertDigestsLegacy) != 0) {
+        return {StatusCode::VersionMismatch,
+                path + " carries the retired 8-byte digest table, which binds no expert "
+                       "identity. Reconvert it with the current converter: `soma stamp` "
+                       "cannot upgrade it, because it will not read this table either"};
+    }
+
     // The digest table, after the entries rather than widened into them: the entry
     // stride stays 16 bytes, so every offset computation in the reader and in the
     // Python tools keeps working unchanged.
-    if ((h.flags & kFlagExpertDigests) != 0) {
-        if (entries > c.remaining() / sizeof(ExpertDigest)) {
+    if ((h.flags & kFlagExpertDigestsV2) != 0) {
+        if (entries > c.remaining() / kExpertDigestBytes) {
             return {StatusCode::InvalidArgument,
                     path + ": digest table does not fit in the bytes remaining"};
         }
         out.digests.resize(entries);
-        for (auto& digest : out.digests)
-            digest = c.read<ExpertDigest>();
+        for (auto& digest : out.digests) {
+            const auto stored = c.bytes(kExpertDigestBytes);
+            if (!c.ok) break;
+            std::memcpy(digest.bytes.data(), stored.data(), kExpertDigestBytes);
+        }
         if (!c.ok) return {StatusCode::InvalidArgument, path + ": truncated digest table"};
         h.has_digests = true;
     }
@@ -412,9 +466,11 @@ std::string serialize_index(const ParsedIndex& ix) {
         w.put<std::uint64_t>(e.offset);
         w.put<std::uint32_t>(e.length);
     }
-    if ((ix.header.flags & kFlagExpertDigests) != 0) {
-        for (const auto digest : ix.digests)
-            w.put<ExpertDigest>(digest);
+    if ((ix.header.flags & kFlagExpertDigestsV2) != 0) {
+        for (const auto& digest : ix.digests) {
+            w.raw(std::string_view(reinterpret_cast<const char*>(digest.bytes.data()),
+                                   digest.bytes.size()));
+        }
     }
     return std::move(w.out);
 }
@@ -976,10 +1032,27 @@ Status ExpertStore::open_indexed(const std::string& model_dir,
     if (auto st = validate_ranges(parsed, arch, model_dir, shard_prefix); !st.ok()) return st;
     impl_->index = std::move(parsed.entries);
 
-    // Armed only when there is a table to check against. A container written
-    // before digests existed reads exactly as it did; the alternative — refusing
-    // it — would strand every container already converted for the sake of a check
-    // that is additive.
+    // A digest table is now REQUIRED, where it used to be additive.
+    //
+    // It stopped being optional the moment it became the only thing standing
+    // between a mis-ordered container and the model. `validate_layout()` catches
+    // a permutation today because index order is layout order; when that is
+    // relaxed to allow heat-ordered placement, the digests are what remains —
+    // and a check that some containers carry and others do not is no check at
+    // all. Making it mandatory now means the relaxation is a change to one
+    // validator rather than a change to the threat model.
+    //
+    // `PayloadPolicy::Trust` is the escape, and it already says the right thing:
+    // the caller is asking to read without checking. `soma stamp` records a table
+    // for a container that lacks one, without reconverting.
+    if (!h.has_digests && opts.payload != PayloadPolicy::Trust) {
+        return {StatusCode::Unsupported,
+                index_path.string() +
+                    " carries no digest table, so nothing would check the bytes it hands the "
+                    "model. Run `soma stamp " +
+                    model_dir + "` to record one"};
+    }
+
     if (h.has_digests && opts.payload == PayloadPolicy::VerifyOnFirstRead) {
         impl_->digests = std::move(parsed.digests);
         impl_->verified = std::make_unique<std::atomic<std::uint8_t>[]>(impl_->index.size());
@@ -1084,7 +1157,8 @@ StatusCode ExpertStore::read(LayerIndex layer, ExpertId expert, ByteSpan dst) no
     // and if they did, the next process would catch it.
     if (impl_->payload == PayloadPolicy::VerifyOnFirstRead && impl_->verified != nullptr &&
         loc.length > 0 && impl_->verified[s].load(std::memory_order_relaxed) == 0) {
-        if (expert_digest(CByteSpan(dst.data(), loc.length)) != impl_->digests[s]) {
+        if (expert_digest(layer, expert, CByteSpan(dst.data(), loc.length)) !=
+            impl_->digests[s]) {
             // Deliberately NOT latched into the store. The caller is told this
             // expert is corrupt on every read of it, because a store that answered
             // "corrupt" once and then went quiet would let a retry loop feed the
@@ -1157,7 +1231,9 @@ Status verify_payload(const std::string& model_dir,
     auto st = walk_experts(ix, model_dir, index_file, [&](std::size_t slot, CByteSpan bytes) {
         ++out.experts_checked;
         out.bytes_checked += bytes.size();
-        if (expert_digest(bytes) == ix.digests[slot]) return;
+        const auto l = static_cast<LayerIndex>(slot / n_experts);
+        const auto e = static_cast<ExpertId>(slot % n_experts);
+        if (expert_digest(l, e, bytes) == ix.digests[slot]) return;
         if (out.mismatches == 0) {
             out.first_bad_layer = static_cast<LayerIndex>(slot / n_experts);
             out.first_bad_expert = static_cast<ExpertId>(slot % n_experts);
@@ -1272,7 +1348,7 @@ Status stamp_container(const std::string& model_dir,
     // Re-reading an already-stamped container is `soma verify`'s job, and it is a
     // different question — "are these still the bytes we recorded", asked after a
     // transfer, rather than "is this container what the IR says it is".
-    constexpr std::uint32_t kStampedFlags = kFlagPerRoleQuant | kFlagExpertDigests;
+    constexpr std::uint32_t kStampedFlags = kFlagPerRoleQuant | kFlagExpertDigestsV2;
     const auto gate_id = static_cast<std::uint32_t>(gate.dtype);
     if (ix.header.version == kContainerVersion && ix.header.arch_hash == identity &&
         ix.header.flags == kStampedFlags && ix.dtype_id == gate_id && ix.group == gate.group) {
@@ -1294,10 +1370,14 @@ Status stamp_container(const std::string& model_dir,
     // than the descriptor, but the payload IS the authority on its own digest. The
     // guarantee differs, though, and stamp says which one it recorded — bytes
     // confirmed unchanged since conversion, or bytes pinned as they are now.
-    std::vector<ExpertDigest> computed(ix.entries.size(), kNoDigest);
+    std::vector<ExpertDigest> computed(ix.entries.size());
+    const auto stamp_n_experts = std::max<std::uint32_t>(ix.header.n_experts, 1);
     if (auto st = walk_experts(ix, model_dir, index_file,
                                [&](std::size_t slot, CByteSpan bytes) {
-                                   computed[slot] = expert_digest(bytes);
+                                   computed[slot] =
+                                       expert_digest(static_cast<LayerIndex>(slot / stamp_n_experts),
+                                                     static_cast<ExpertId>(slot % stamp_n_experts),
+                                                     bytes);
                                });
         !st.ok())
         return st;

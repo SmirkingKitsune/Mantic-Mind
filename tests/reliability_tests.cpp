@@ -7753,6 +7753,13 @@ bool test_admission_fetch_stage() {
             CHECK(remove_tree(dir));
             return true;
         }
+        // The fixture carries `tokenizer.unsupported`, because its tiny checkpoint
+        // holds no tokenizer files. That marker short-circuits the stage to
+        // "skipped" before it ever opens tokenizer.soma, so leaving it here would
+        // make this case assert on a stage that never ran. A real compile step
+        // that produced a tokenizer would have removed it for the same reason.
+        std::error_code marker_ec;
+        std::filesystem::remove(broken / "tokenizer.unsupported", marker_ec);
         std::filesystem::copy_file(tok_dir / "Qwen3-30B-A3B" / "tokenizer.soma",
                                    broken / "tokenizer.soma");
         std::filesystem::copy_file(tok_dir / "OLMoE-1B-7B-0924" / "tokenizer_oracle.bin",

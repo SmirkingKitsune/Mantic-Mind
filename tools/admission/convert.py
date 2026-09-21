@@ -49,10 +49,20 @@ ROLE_ID = {"gate": 2, "up": 3, "down": 4}
 # because shipped V1 readers ignored flags and would otherwise misparse it.
 FLAG_PER_ROLE_QUANT = 1 << 0
 
-# A per-expert digest table follows the index. A flag with no version bump: every
-# v2 reader already refuses a bit it does not know, so it cannot walk past this
-# table and misread what comes after it.
-FLAG_EXPERT_DIGESTS = 1 << 1
+# The digest bits. Neither needed a version bump: every v2 reader already refuses
+# a bit it does not know, so it cannot walk past a table it cannot parse and
+# misread what comes after it.
+#
+# The retired 8-byte table. Kept reserved rather than reused, so the bit can
+# never mean something else and quietly reinterpret an old container. V2 is a
+# NEW bit for the same reason: widening the table under the old one would have
+# left every older reader computing a length three quarters short.
+FLAG_EXPERT_DIGESTS_LEGACY = 1 << 1
+
+# 32 bytes per slot, each binding the expert's identity as well as its bytes.
+FLAG_EXPERT_DIGESTS_V2 = 1 << 2
+
+EXPERT_DIGEST_BYTES = 32
 
 # Source precisions the resident half may keep, because the engine widens them
 # EXACTLY. Anything else — f32 already, or a dequantized fp8 block whose values
@@ -61,19 +71,34 @@ FLAG_EXPERT_DIGESTS = 1 << 1
 NARROW_TORCH_DTYPES = ("torch.bfloat16", "torch.float16")
 
 
-def expert_digest(blob: bytes) -> int:
-    """First 8 bytes of the SHA-256 of one expert, little-endian.
+def expert_digest(layer: int, expert: int, blob: bytes) -> bytes:
+    r"""The SHA-256 of one expert's identity and bytes, in full.
 
-    Computed HERE, where the bytes are already in hand, rather than by a later
-    pass that would have to read the whole container back. It is a corruption
-    check and not a tamper check: what it answers is whether these bytes survived
-    being written, streamed to a node and left on a disk for a month.
+    The preimage is spelled out because the engine reproduces it byte for byte
+    (`expert_digest` in src/soma/expert_store.cpp), and "the SHA-256 of the
+    expert" did not say enough:
+
+        b"soma/expert\0" + u32le(layer) + u32le(expert) + u64le(len) + blob
+
+    The tag keeps this from colliding with a bare SHA-256 of the same bytes taken
+    for another purpose; the identity keeps two experts with IDENTICAL payloads
+    from having identical digests, which is what makes the table a placement check
+    and not only a corruption check.
+
+    Computed here, where the bytes are already in hand, rather than by a later
+    pass that would read the whole container back.
     """
-    return int.from_bytes(hashlib.sha256(blob).digest()[:8], "little")
+    h = hashlib.sha256()
+    h.update(b"soma/expert" + bytes(1))
+    h.update(struct.pack("<IIQ", layer, expert, len(blob)))
+    h.update(blob)
+    return h.digest()
 
 
-def digest_table(digests: list[int]) -> bytes:
-    return b"".join(struct.pack("<Q", d) for d in digests)
+def digest_table(digests: "list[bytes]") -> bytes:
+    for d in digests:
+        assert len(d) == EXPERT_DIGEST_BYTES, "digest table entry is not 32 bytes"
+    return b"".join(digests)
 
 
 def role_descriptor(dt_gate: str, dt_up: str, dt_down: str,
@@ -1059,9 +1084,9 @@ def main(argv: list[str]) -> int:
     # ── experts ──────────────────────────────────────────────────────────────
     index: list[tuple[int, int, int]] = []
     # Parallel to `index`, including the zero-length slots a dense layer
-    # contributes, which carry 0 rather than the digest of an empty string so a
-    # missing entry and a real one can never be confused.
-    digests: list[int] = []
+    # contributes, which carry all-zero bytes rather than the digest of an empty
+    # payload so a missing entry and a real one can never be confused.
+    digests: "list[bytes]" = []
     shard_idx = 0
     shard_off = 0
     total = 0
@@ -1239,7 +1264,9 @@ def main(argv: list[str]) -> int:
         if kinds[layer] == "dense":
             # Zero-length slots keep the (layer, expert) index arithmetic intact.
             index.extend((shard_idx, shard_off, 0) for _ in range(n_experts))
-            digests.extend(0 for _ in range(n_experts))
+            # A dense layer's empty slots: all-zero, distinguishable from any
+            # real digest, which a zero-length hash would not be.
+            digests.extend(bytes(EXPERT_DIGEST_BYTES) for _ in range(n_experts))
             continue
         read, layout = expert_reader(get, layer, moe_block, names, src_prefix)
         if read is None:
@@ -1273,7 +1300,7 @@ def main(argv: list[str]) -> int:
                 fh = open(out_dir / f"experts-{shard_idx:05d}.bin", "wb")
 
             index.append((shard_idx, shard_off, len(blob)))
-            digests.append(expert_digest(blob))
+            digests.append(expert_digest(layer, e, bytes(blob)))
             fh.write(blob)
             total += len(blob)
 
@@ -1331,7 +1358,7 @@ def main(argv: list[str]) -> int:
     with open(out_dir / "soma.container", "wb") as ix:
         ix.write(MAGIC)
         ix.write(struct.pack("<II", FORMAT_VERSION,
-                             FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS))
+                             FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS_V2))
         ix.write(struct.pack("<I", len(arch_hash)))
         ix.write(arch_hash)
         ix.write(struct.pack("<IIII", n_layers, n_experts, shard_idx + 1, DTYPE_ID[dt_gate]))

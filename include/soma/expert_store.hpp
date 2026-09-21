@@ -20,6 +20,7 @@
 #include "soma/arch_ir.hpp"
 #include "soma/types.hpp"
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -38,38 +39,72 @@ inline constexpr std::uint32_t kContainerVersion = 2;
 /// flag cannot retroactively make an old reader fail closed.
 inline constexpr std::uint32_t kFlagPerRoleQuant = 1u << 0;
 
-/// A per-expert digest table follows the index.
+/// A truncated, unbound per-expert digest table follows the index. **Retired.**
 ///
-/// A flag alone this time, with no version bump, and that is the mechanism above
-/// working as intended: every v2 reader already refuses a bit it does not know,
-/// so a v2 build cannot walk past this table and misread what follows it. The
-/// role descriptor needed the bump only because v1 readers ignored the word.
-inline constexpr std::uint32_t kFlagExpertDigests = 1u << 1;
+/// Written by converters up to `8a1ee20d`. Superseded by `kFlagExpertDigestsV2`
+/// below; the bit is kept reserved so it can never be reused for something else
+/// and quietly reinterpret an old table.
+inline constexpr std::uint32_t kFlagExpertDigestsLegacy = 1u << 1;
 
-inline constexpr std::uint32_t kKnownContainerFlags = kFlagPerRoleQuant | kFlagExpertDigests;
-
-/// The first 8 bytes of the SHA-256 of one expert's bytes, little-endian.
+/// A per-expert digest table follows the index: 32 bytes per slot, each binding
+/// the expert's identity as well as its bytes.
 ///
-/// A CORRUPTION check, not a tamper check. It answers "did these bytes survive
-/// being written, copied between nodes, and sat on for a month", which is the
-/// question a cluster that streams container directories over the network
-/// actually has. Truncation to 64 bits keeps the table at 8 B per expert — 125 KB
-/// for DeepSeek V4's 15,616 — while leaving a per-expert false-accept rate of
-/// 2^-64 against accidental damage. It is not collision-resistant and nothing
-/// should treat it as evidence against a deliberate substitution.
+/// A new bit rather than a wider table under the old one. Changing a block's
+/// stride in place is exactly the silent mis-parse the version gate exists for,
+/// whereas a new must-understand bit makes an older build refuse the container
+/// outright — which is the correct answer, since it cannot check what it cannot
+/// parse.
+inline constexpr std::uint32_t kFlagExpertDigestsV2 = 1u << 2;
+
+inline constexpr std::uint32_t kKnownContainerFlags =
+    kFlagPerRoleQuant | kFlagExpertDigestsLegacy | kFlagExpertDigestsV2;
+
+/// The SHA-256 of one expert's identity and bytes, in full.
+///
+/// Two things changed from the 8-byte form, and the second is the one that
+/// matters:
+///
+///   * **Full width.** The truncation was never paying for itself — the hash is
+///     computed in full either way and 24 bytes were thrown away, so the saving
+///     was 24 B per expert of INDEX (375 KB on DeepSeek V4's 15,616) in exchange
+///     for a permanent "is 64 bits enough" question. It is also the wrong
+///     substrate to build provenance on later.
+///   * **Domain separation.** The old digest hashed bytes alone, so two experts
+///     with identical bytes had identical digests and remained interchangeable —
+///     which is precisely the check that has to hold once index order stops being
+///     structural. Binding `(layer, expert, length)` makes the digest a PLACEMENT
+///     check as well as a corruption check.
+///
+/// Still a corruption check, not a tamper check: it answers "did these bytes
+/// survive being written, copied between nodes, and sat on for a month", which is
+/// the question a cluster that streams container directories actually has. It
+/// binds an expert to its slot within one container, not a container to an
+/// origin — that needs a signature, and a key story this project does not have.
 ///
 /// SHA-256 because OpenSSL is already linked for arch_hash and Python's hashlib
-/// is in the standard library: one obvious implementation on each side, and no
-/// new dependency on either.
-using ExpertDigest = std::uint64_t;
+/// is in the standard library: one obvious implementation on each side.
+struct ExpertDigest {
+    std::array<std::uint8_t, 32> bytes{};
 
-/// Zero-length slots — the dense layers — store this rather than the digest of
-/// an empty string, so a missing entry and a real one are never confusable.
-inline constexpr ExpertDigest kNoDigest = 0;
+    friend bool operator==(const ExpertDigest& a, const ExpertDigest& b) noexcept {
+        return a.bytes == b.bytes;
+    }
+};
+
+/// Zero-length slots — the dense layers — store all-zero rather than the digest
+/// of an empty string, so a missing entry and a real one are never confusable.
+inline constexpr std::size_t kExpertDigestBytes = 32;
 
 /// Compute one expert's digest. Exposed so the verifier and the writer cannot
 /// disagree about what is being hashed.
-ExpertDigest expert_digest(CByteSpan bytes) noexcept;
+///
+/// The preimage is `"soma/expert\0"` then little-endian `u32 layer`, `u32 expert`,
+/// `u64 length`, then the payload. Spelled out because a second implementation in
+/// Python has to reproduce it exactly, and "hash the bytes" left no room to say
+/// which bytes.
+ExpertDigest expert_digest(LayerIndex layer,
+                           ExpertId expert,
+                           CByteSpan bytes) noexcept;
 
 /// One expert role's quantization, as the shards were actually written.
 ///
@@ -170,7 +205,7 @@ struct ContainerHeader {
     RoleQuant up;
     RoleQuant down;
 
-    /// Present only when `flags & kFlagExpertDigests`. Nothing before this
+    /// Present only when `flags & kFlagExpertDigestsV2`. Nothing before this
     /// checked a single payload byte: validate_ranges() proves the ranges pack
     /// canonically and the shard files are exactly the right size, which a
     /// perfectly sized file full of wrong bytes satisfies completely.

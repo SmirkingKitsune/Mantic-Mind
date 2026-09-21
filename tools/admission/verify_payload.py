@@ -42,7 +42,7 @@ Offline only. Never a runtime dependency.
 
 Usage:
     verify_payload.py <container_dir> [--source DIR] [--samples N] [--seed S]
-                      [--structure-only] [--json]
+                      [--structure-only] [--skip-digests] [--json]
 """
 
 from __future__ import annotations
@@ -58,7 +58,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from convert import (  # noqa: E402
     DTYPE_ID,
-    FLAG_EXPERT_DIGESTS,
+    EXPERT_DIGEST_BYTES,
+    FLAG_EXPERT_DIGESTS_LEGACY,
+    FLAG_EXPERT_DIGESTS_V2,
     FLAG_PER_ROLE_QUANT,
     FORMAT_VERSION,
     FP8_DTYPE_NAMES,
@@ -86,7 +88,12 @@ REL_RMS_CEILING = {"q8_0": 0.03, "q6_g": 0.08, "q5_g": 0.15,
 ID_TO_DTYPE = {v: k for k, v in DTYPE_ID.items()}
 
 # The flag bits this reader understands. Everything else is fatal.
-KNOWN_FLAGS = FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS
+#
+# The retired 8-byte digest bit stays listed here even though a container
+# carrying it is refused below. The unknown-flag message says "written by a newer
+# converter", which is exactly backwards for a container older than this reader;
+# keeping the bit known lets that case reach the message that is true of it.
+KNOWN_FLAGS = FLAG_PER_ROLE_QUANT | FLAG_EXPERT_DIGESTS_V2 | FLAG_EXPERT_DIGESTS_LEGACY
 
 # soma::TensorRole, for reporting the descriptor in readable terms.
 ID_TO_ROLE = {2: "gate", 3: "up", 4: "down"}
@@ -170,12 +177,22 @@ def read_index(path: Path) -> dict:
     entries = [ENTRY.unpack_from(raw, off + i * ENTRY.size) for i in range(want)]
     off += entry_bytes
 
-    digests: list[int] = []
-    if reserved & FLAG_EXPERT_DIGESTS:
-        if want * 8 > len(raw) - off:
-            raise Failure(f"{path.name}: truncated digest table")
-        digests = list(struct.unpack_from(f"<{want}Q", raw, off))
-        off += want * 8
+    # A digest table is no longer optional, and the retired 8-byte one no longer
+    # counts as having had one. Both refusals mirror the engine, which will not
+    # open such a container either: a checker that inspects containers the engine
+    # rejects reports on something nothing will ever run.
+    if reserved & FLAG_EXPERT_DIGESTS_LEGACY:
+        raise Failure(f"{path.name}: carries the retired 8-byte digest table, which binds no "
+                      "expert identity. Reconvert it with the current converter")
+    if not reserved & FLAG_EXPERT_DIGESTS_V2:
+        raise Failure(f"{path.name}: carries no digest table, so nothing would check the bytes "
+                      "it hands the model. Reconvert it with the current converter")
+    table = want * EXPERT_DIGEST_BYTES
+    if table > len(raw) - off:
+        raise Failure(f"{path.name}: truncated digest table")
+    digests = [raw[off + i * EXPERT_DIGEST_BYTES:off + (i + 1) * EXPERT_DIGEST_BYTES]
+               for i in range(want)]
+    off += table
 
     if off != len(raw):
         raise Failure(f"index has {len(raw) - off} trailing bytes")
@@ -432,6 +449,10 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--samples", type=int, default=8, help="RANDOM experts to sample")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--structure-only", action="store_true")
+    ap.add_argument("--skip-digests", action="store_true",
+                    help="do not check the digest table (mirrors the engine's "
+                         "PayloadPolicy::Trust); makes the slower source comparison "
+                         "run against damage the digests would have caught first")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv[1:])
 
@@ -475,7 +496,12 @@ def main(argv: list[str]) -> int:
     # container is a node that was streamed one, and a node has the container and
     # nothing else. The comparison below can only run where the original
     # checkpoint also lives, which in practice is the admission host alone.
-    if ix["digests"]:
+    if args.skip_digests:
+        report["digests"] = "skipped"
+        report["digests_reason"] = "--skip-digests"
+        if not args.json:
+            print("    digests    skipped, by request")
+    else:
         bad: list[str] = []
         checked = 0
         shard_handles: dict = {}
@@ -489,8 +515,8 @@ def main(argv: list[str]) -> int:
                     shard_handles[shard] = fh
                 fh.seek(off)
                 checked += 1
-                if expert_digest(fh.read(length)) != ix["digests"][slot]:
-                    layer, expert = divmod(slot, ix["n_experts"])
+                layer, expert = divmod(slot, ix["n_experts"])
+                if expert_digest(layer, expert, fh.read(length)) != ix["digests"][slot]:
                     if len(bad) < 8:
                         bad.append(f"layer {layer} expert {expert}")
         finally:
@@ -508,11 +534,6 @@ def main(argv: list[str]) -> int:
             return 1
         if not args.json:
             print(f"    digests    {checked} experts match the recorded digests")
-    else:
-        report["digests"] = "skipped"
-        report["digests_reason"] = "container carries no digest table"
-        if not args.json:
-            print("    digests    skipped — this container carries no digest table")
 
     src = Path(args.source or meta.get("source", ""))
     if not src.is_dir():

@@ -1,6 +1,8 @@
 {
   "align": 4096,
   "container_version": 2,
+  "dense_narrow_tensors": 0,
+  "dense_storage": "source",
   "dense_tensors": 129,
   "dtype_down": "q6_g",
   "dtype_gate_up": "q4_g",
@@ -31,6 +33,7 @@
   "n_moe_layers": 5,
   "n_shards": 1,
   "source": "tests\\fixtures\\tiny\\GLM-5.2",
+  "source_quantization": "none",
   "tokenizer": "unsupported",
   "total_expert_bytes": 348160
 }

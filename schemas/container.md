@@ -255,12 +255,28 @@ version gate instead of parsing the descriptor bytes as sizes and indexes.
 | Bit | Name | Meaning |
 |---|---|---|
 | `0x1` | `per_role_quant` | the role descriptor below is present |
-| `0x2` | `expert_digests` | a per-expert digest table follows the index |
+| `0x2` | `expert_digests_legacy` | **retired.** An 8-byte-per-slot table follows. Refused. |
+| `0x4` | `expert_digests` | a 32-byte-per-slot table follows the index |
 
-`0x2` was added with **no version bump**, which is this mechanism working as
-designed: every v2 reader already refuses a bit it does not know, so no v2 build
-can walk past the digest table and misread what follows. The role descriptor
-needed the bump only because v1 readers ignored the word entirely.
+Both digest bits were added with **no version bump**, which is this mechanism
+working as designed: every v2 reader already refuses a bit it does not know, so no
+v2 build can walk past a digest table and misread what follows. The role
+descriptor needed the bump only because v1 readers ignored the word entirely.
+
+`0x4` is a **new bit rather than a wider table under `0x2`**, and that choice is
+the whole reason this cost nothing. Changing a block's stride in place is exactly
+the silent mis-parse the version gate exists to prevent: a reader that knows `0x2`
+would have found 8 bytes per slot where 32 now sit, computed a table length three
+quarters short, and reported trailing bytes — or, with the wrong slot count, not
+reported anything. Under a new bit that reader refuses the container by name.
+
+`0x2` is **retired and reserved**: a container carrying it is refused with a
+message saying so, and the bit is never reused. The retired table's digests were
+the first 8 bytes of the SHA-256 of an expert's payload alone, which binds no
+slot, so two experts with identical bytes had identical digests. Accepting it
+silently would leave such a container looking checked while a swap passed through
+it. Reconversion is the only route forward; `soma stamp` cannot upgrade one,
+because it reads the index through the same parser that refuses it.
 
 ### Role descriptor
 
@@ -297,29 +313,68 @@ Index entry, one per `(layer, expert)` in layer-major order:
 
 ### Digest table
 
-Present iff `flags & 0x2`, immediately after the entries:
+**Mandatory.** Every container this converter writes carries one, and a container
+without one is refused at `open()` — see *Why it is mandatory* below. Present iff
+`flags & 0x4`, immediately after the entries:
 
 ```
-n_layers × n_experts × u64
+n_layers × n_experts × 32 bytes
 ```
 
 One per slot, in the same order, so the entry stride stays 16 bytes and every
-offset computation that predates the table keeps working. Each value is the first
-8 bytes of the SHA-256 of that expert's `length` bytes, little-endian. A
-zero-length slot — a dense layer's — stores `0` rather than the digest of an empty
-string, so a missing entry and a real one are never confusable.
+offset computation that predates the table keeps working. A zero-length slot — a
+dense layer's — stores 32 zero bytes rather than the digest of an empty preimage,
+so a missing entry and a real one are never confusable.
 
-**A corruption check, not a tamper check.** It answers whether these bytes survived
-being written, streamed to a node, and left on a disk for a month, which is the
-question a cluster that copies container directories actually has. Truncation to
-64 bits keeps the table at 8 B per expert — 125 KB for DeepSeek V4's 15,616 — with
-a per-expert false-accept rate of 2^-64 against accidental damage. It is not
-collision-resistant and nothing should read it as evidence against a deliberate
-substitution. SHA-256 because OpenSSL is already linked for `arch_hash` and
-`hashlib` is in Python's standard library: one obvious implementation per side,
-no new dependency on either.
+Each value is the full SHA-256 of a **tagged, identity-bound** preimage:
 
-Three places check it, and they answer different questions:
+```
+"soma/expert\0" ‖ u32le(layer) ‖ u32le(expert) ‖ u64le(length) ‖ payload
+```
+
+Every part of that earns its place:
+
+- The **tag** keeps this from colliding with a bare SHA-256 of the same bytes
+  taken somewhere else for some other purpose.
+- The **identity** is what makes the table a *placement* check and not only a
+  corruption check. Hashing the payload alone gives two experts with identical
+  bytes identical digests, so they stay interchangeable — plausible for zeroed or
+  pruned slots, and routine in the tiny fixtures. Binding `(layer, expert)` is the
+  check that has to hold before index order can stop being structural.
+- The **length** is in the preimage as well as implied by it, so a truncated range
+  cannot hash as a shorter expert that legitimately ends there.
+- **Full width** rather than the retired 8-byte truncation. The hash was computed
+  in full either way and 24 bytes were discarded, so the saving was 24 B per
+  expert of *index* — 375 KB on DeepSeek V4's 15,616 — bought with a permanent "is
+  64 bits enough" question and the wrong substrate to build provenance on.
+
+SHA-256 because OpenSSL is already linked for `arch_hash` and `hashlib` is in
+Python's standard library: one obvious implementation per side, no new dependency
+on either. The two implementations are pinned against each other by frozen
+vectors in `tests/soma/container_integrity.cpp`, computed on the Python side, so a
+change to either preimage breaks a test rather than the fleet.
+
+**Still a corruption check, not a tamper check** — for a reason that has moved.
+The 64-bit form was not collision-resistant at all; this one is, and it binds an
+expert to its slot. What it does not do is bind the *container* to an origin: the
+table sits in the index beside the payload and is unsigned, so anything that can
+rewrite a shard can rewrite the table to match. Tamper-evidence needs a signature
+over the index, and a key story this project does not have. The honest claim is
+narrower than "SHA-256 therefore secure" and wider than it used to be: it answers
+whether these bytes survived being written, streamed to a node and left on a disk
+for a month, and whether each one is still in the slot it was written to.
+
+**Why it is mandatory.** Optional meant "the container decides whether anything
+checks the bytes it hands the model", which is a decision no container should get
+to make — and the containers that most needed a table were exactly the old ones
+that had none. It also has to be mandatory before the layout can be relaxed
+(below): once index order is no longer structural, a permuted layout is caught by
+the digests or by nothing. `PayloadPolicy::Trust` is the escape for a caller that
+has already verified the payload another way; it opts out of *checking* a table,
+not out of *having* one. Offline, `verify_payload.py --skip-digests` is the same
+escape, and exists so the slower source comparison it short-circuits does not rot.
+
+Four places touch it, and they answer different questions:
 
 | | reads | catches |
 |---|---|---|
@@ -351,14 +406,15 @@ the architecture. The layout half needs no IR, and both now run it. Before this,
 *after* a transfer.
 
 Relaxing this to a tiling invariant is what would permit heat-ordered layouts. It
-has to happen in that one place, and only once digests are mandatory and
-domain-separated — a permuted layout would otherwise be caught by nothing.
+has to happen in that one place, and the precondition is now met: digests are
+mandatory and domain-separated, so a permuted layout that moved its payloads with
+its offsets would be caught by the digest table even with the ordering rule gone.
 
 An unchanged stamp is a no-op and explicitly reports that payload was not
-re-read. Use `soma verify` after transfer. Containers without digest tables remain
-readable; verification reports unsupported until a table is recorded. Recording
-digests for an old container establishes a baseline for its current bytes and
-does not prove those bytes survived the original conversion unchanged.
+re-read. Use `soma verify` after transfer. Recording digests for a container that
+was converted without them establishes a baseline for its current bytes and does
+not prove those bytes survived the original conversion unchanged — which is why
+`soma stamp` says which of the two it did.
 
 Everything else in this format checks *shape*: that the ranges pack canonically,
 that each shard file is exactly the size those ranges imply, that the roles carry
@@ -410,8 +466,9 @@ verifies the mandatory role descriptor against it, and then stamps the hash into
 the index. `convert.py` cannot do it: the canonical hash is defined
 by the C++ IR canonicalization and a second implementation in Python would agree
 until it did not. Only the small index file is rewritten — through a temporary plus
-a rename. Initial stamping also reads every expert to check or establish its
-digest; only the small index is rewritten.
+a rename. Stamping also reads every expert and checks it against the table the
+converter recorded, so a container damaged between conversion and admission is
+refused rather than certified; only the small index is rewritten.
 
 Until this command existed, nothing stamped anything, so the mismatch branch could
 never fire on any container ever written. Unstamped is therefore refused rather

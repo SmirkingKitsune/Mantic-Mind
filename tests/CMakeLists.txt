@@ -185,6 +185,18 @@ if(Python3_Interpreter_FOUND)
                      "${CMAKE_SOURCE_DIR}/tools/ci/check_fused_experts.py"
                      "${CMAKE_SOURCE_DIR}")
 
+    # Nine container directories are committed and every container-dependent gate
+    # reads one, but they are build output: only convert.py plus the tiny
+    # checkpoint says what they should hold. Nothing re-derived them, so they
+    # drifted silently — five lost their tokenizer marker, one recorded a
+    # config_sha256 matching no config.json anywhere. Regeneration stays a
+    # legitimate act; this is what makes a deliberate one distinguishable from an
+    # accident. Skips itself when numpy/safetensors/torch are absent.
+    add_test(NAME mm_fixture_containers
+             COMMAND "${MM_ADMISSION_PY}"
+                     "${CMAKE_SOURCE_DIR}/tools/ci/check_fixture_containers.py"
+                     "${CMAKE_SOURCE_DIR}" "$<TARGET_FILE:soma>")
+
     # verify_payload.py is what stands between a 460 GB expert payload and an
     # admission that never read it (roadmap D27). A checker nobody has broken on
     # purpose reports "OK" for reasons unknown, so this damages a good container
