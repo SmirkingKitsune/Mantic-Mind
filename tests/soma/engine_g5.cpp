@@ -279,7 +279,7 @@ int main(int argc, char** argv) {
               "so a 400 body lists real contents, not a literal");
 
         // The capability that actually differs at this layer, and the reason the
-        // scheduler may co-locate agents on one engine but not the other.
+        // scheduler may co-locate holders on one engine but not the other.
         const auto* s = reg.find("soma");
         const auto* l = reg.find("llama-cpp");
         check(s->supports_multi_seq && !l->supports_multi_seq,
@@ -367,7 +367,7 @@ int main(int argc, char** argv) {
         // Through extra_args, deliberately, and not by the descriptor adding it.
         // The fixture has no compiled tokenizer, and `soma serve` now refuses one
         // rather than generating meaningless text; a node must make that an
-        // operator's choice per agent, not a default it applies for them.
+        // operator's choice per model, not a default it applies for them.
         auto spec = mm::EngineRegistry::instance().find("soma")->build_launch(req);
         spec.readiness.timeout_seconds = 60;
 
@@ -501,14 +501,14 @@ int main(int argc, char** argv) {
         req.settings.n_threads = 4;
 
         // An unknown engine id must not reach a hardcoded literal.
-        const auto bad = sup.load("vllm", req, "agent-x");
+        const auto bad = sup.load("vllm", req, "model-x");
         check(bad.empty(), "an unknown engine id fails");
         const std::string why = sup.last_error();
         check(why.find("soma") != std::string::npos && why.find("llama-cpp") != std::string::npos,
               "and the error lists the REGISTERED engines",
               why);
 
-        const auto slot_a = sup.load("soma", req, "agent-a");
+        const auto slot_a = sup.load("soma", req, "model-a");
         check(!slot_a.empty(), "load() starts an engine", slot_a);
         if (slot_a.empty()) {
             std::cout << "   last_error: " << sup.last_error() << "\n";
@@ -519,8 +519,8 @@ int main(int argc, char** argv) {
         // Soma's KV slot is per-sequence, so this must ATTACH.
         mm::EngineLoadRequest req_b = req;
         req_b.settings.ctx_size = 8192;
-        const auto slot_b = sup.load("soma", req_b, "agent-b");
-        check(slot_b == slot_a, "a second agent shares the engine despite a different ctx_size");
+        const auto slot_b = sup.load("soma", req_b, "model-b");
+        check(slot_b == slot_a, "a second holder shares the engine despite a different ctx_size");
         check(sup.slots().size() == 1, "so there is still exactly one process");
         check(sup.available_slot_count() == 1, "and one slot free of two");
 
@@ -528,8 +528,8 @@ int main(int argc, char** argv) {
         check(info.has_value() && info->backend == "soma",
               "SlotInfo::backend comes from the descriptor, not a literal",
               info ? info->backend : std::string("(none)"));
-        check(info && info->agent_ids.size() == 2, "both agents are attached");
-        check(sup.find_by_agent("agent-b").value_or("") == slot_a, "find_by_agent resolves");
+        check(info && info->holder_ids.size() == 2, "both holders are attached");
+        check(sup.find_by_holder("model-b").value_or("") == slot_a, "find_by_holder resolves");
 
         // A leased engine is busy and must not be evicted out from under a
         // request that is already streaming.
@@ -544,13 +544,13 @@ int main(int argc, char** argv) {
                   blocked.message);
         }
         // Lease destroyed -> the borrow is released.
-        const auto detached = sup.detach_agent(slot_a, "agent-a");
-        check(detached.ok() && detached.remaining_agents == 1,
-              "detaching one agent leaves the engine up",
-              std::to_string(detached.remaining_agents) + " remaining");
+        const auto detached = sup.detach_holder(slot_a, "model-a");
+        check(detached.ok() && detached.remaining_holders == 1,
+              "detaching one holder leaves the engine up",
+              std::to_string(detached.remaining_holders) + " remaining");
 
-        const auto last = sup.detach_agent(slot_a, "agent-b");
-        check(last.ok() && last.unloaded, "detaching the last agent unloads it");
+        const auto last = sup.detach_holder(slot_a, "model-b");
+        check(last.ok() && last.unloaded, "detaching the last holder unloads it");
         check(sup.slots().empty(), "the pool is empty");
         check(sup.available_slot_count() == 2, "and both slots are free again");
     }
@@ -566,7 +566,7 @@ int main(int argc, char** argv) {
         req.model_path = model;
         req.settings.extra_args = {"--allow-byte-tokenizer"}; // same fixture, same reason
 
-        const auto slot = sup.load("soma", req, "agent-c");
+        const auto slot = sup.load("soma", req, "model-c");
         check(!slot.empty(), "engine loaded", slot);
         if (slot.empty()) {
             std::cout << "   last_error: " << sup.last_error() << "\n";
@@ -740,7 +740,7 @@ int main(int argc, char** argv) {
         mm::EngineLoadRequest req;
         req.model_path = model;
         req.settings.extra_args = {"--allow-byte-tokenizer"}; // same fixture, same reason
-        const auto slot = sup.load("soma", req, "agent-e");
+        const auto slot = sup.load("soma", req, "model-e");
         check(!slot.empty(), "engine loaded", slot);
         if (slot.empty()) {
             std::cout << "   last_error: " << sup.last_error() << "\n";
@@ -829,7 +829,7 @@ int main(int argc, char** argv) {
               std::to_string(kv2) + " -> " + std::to_string(conv_a_kv) + " tokens");
 
         // The supervisor reports per-sequence state now, asked of the engine
-        // rather than synthesised from an agent count.
+        // rather than synthesised from a holder count.
         const auto seqs = sup.sequences(slot);
         check(seqs.size() == 2,
               "the supervisor reports per-sequence state",
@@ -889,7 +889,7 @@ int main(int argc, char** argv) {
         mm::EngineLoadRequest req;
         req.model_path = model;
         req.settings.extra_args = {"--allow-byte-tokenizer"}; // same fixture, same reason
-        const auto slot = sup.load("soma", req, "agent-stream");
+        const auto slot = sup.load("soma", req, "model-stream");
         check(!slot.empty(), "engine loaded", slot);
         if (!slot.empty()) {
             const auto port = sup.slots().front().port;
@@ -953,7 +953,7 @@ int main(int argc, char** argv) {
         mm::EngineLoadRequest req;
         req.model_path = model;
         req.settings.extra_args = {"--allow-byte-tokenizer"}; // same fixture, same reason
-        const auto slot = sup.load("soma", req, "agent-f");
+        const auto slot = sup.load("soma", req, "model-f");
         check(!slot.empty(), "engine loaded", slot);
         if (slot.empty()) {
             std::cout << "   last_error: " << sup.last_error() << "\n";
@@ -1092,7 +1092,7 @@ int main(int argc, char** argv) {
         mm::EngineLoadRequest req;
         req.model_path = container.empty() ? model : container;
         req.settings.extra_args = {"--allow-byte-tokenizer"}; // same fixture, same reason
-        const auto slot = sup.load("soma", req, "agent-t");
+        const auto slot = sup.load("soma", req, "model-t");
         check(!slot.empty(), "engine loaded", slot);
         if (slot.empty()) {
             std::cout << "   last_error: " << sup.last_error() << "\n";
@@ -1215,9 +1215,9 @@ int main(int argc, char** argv) {
     // because coexistence has no dependency on running early and a sleep would
     // only move the same race.
     //
-    // The G8 criterion: "a Soma agent and a fallback agent run concurrently on
+    // The G8 criterion: "a Soma model and a fallback model run concurrently on
     // the same node." Nothing asserted it. §5 above looks like it does and is the
-    // OPPOSITE arrangement — it loads `soma` twice and proves the two agents
+    // OPPOSITE arrangement — it loads `soma` twice and proves the two holders
     // SHARE one process. That is Soma's per-sequence KV slot, not coexistence,
     // and reading it as this criterion is the mistake that left the peer-engine
     // claim resting on unexercised code (roadmap D13).
@@ -1248,13 +1248,13 @@ int main(int argc, char** argv) {
 
         mm::EngineLoadRequest soma_req;
         soma_req.model_path = container;
-        const auto soma_slot = sup.load("soma", soma_req, "agent-soma");
+        const auto soma_slot = sup.load("soma", soma_req, "model-soma");
         check(!soma_slot.empty(), "the Soma engine loads", sup.last_error());
 
         mm::EngineLoadRequest llama_req;
         llama_req.model_path = gguf;
         llama_req.settings.ctx_size = 512;
-        const auto llama_slot = sup.load("llama-cpp", llama_req, "agent-llama");
+        const auto llama_slot = sup.load("llama-cpp", llama_req, "model-llama");
         check(!llama_slot.empty(), "the llama.cpp engine loads ALONGSIDE it",
               sup.last_error());
 

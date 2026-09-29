@@ -56,7 +56,7 @@ bool RayController::start(const RayStartConfig& cfg, std::string& error) {
                 ? cfg.node_ip + ":" + std::to_string(port_)
                 : cfg.head_address;
             const bool same_start = status_.group_id == cfg.group_id &&
-                status_.agent_id == cfg.agent_id && status_.role == cfg.role &&
+                status_.holder_id == cfg.holder_id && status_.role == cfg.role &&
                 status_.head_address == expected_head &&
                 status_.transport == cfg.transport &&
                 status_.reserved_gpus == cfg.num_gpus;
@@ -77,7 +77,7 @@ bool RayController::start(const RayStartConfig& cfg, std::string& error) {
         }
         status_.state = "starting";
         status_.group_id = cfg.group_id;
-        status_.agent_id = cfg.agent_id;
+        status_.holder_id = cfg.holder_id;
         status_.role = cfg.role;
         status_.head_address = cfg.role == "head"
             ? cfg.node_ip + ":" + std::to_string(port_) : cfg.head_address;

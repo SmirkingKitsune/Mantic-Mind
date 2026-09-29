@@ -19,6 +19,8 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 
 #include <algorithm>
 #include <cstdlib>
@@ -125,9 +127,9 @@ std::set<std::string> loaded_model_paths(EngineSupervisor& engines) {
 
 /// Classify a slot failure into a STRUCTURED code for control.
 ///
-/// What this ends: AgentScheduler decided whether to evict-and-retry by
-/// substring-matching six English phrases against this body
-/// (agent_scheduler.cpp:904). Every engine had to reproduce those literals
+/// What this ends: the control-side scheduler decided whether to
+/// evict-and-retry by substring-matching six English phrases against this body
+/// (placement_scheduler.cpp, response_indicates_capacity_pressure). Every engine had to reproduce those literals
 /// verbatim to earn a retry, and rewording any of them would have broken
 /// eviction with nothing to catch it. The phrases are still produced — they are
 /// the human-readable detail — but the DECISION now rides a code.
@@ -186,6 +188,23 @@ struct NodeApiServer::InferWorker {
     std::thread thread;
     std::atomic<bool> finished{false};
 };
+
+namespace {
+
+/// A passthrough completion in flight: the relay's lines, plus the engine's own
+/// status and body for an answer that is not a stream.
+struct PassthroughCtx {
+    std::mutex mx;
+    std::condition_variable cv;
+    std::deque<std::string> lines; ///< "data: ...\n\n", verbatim from the engine
+    bool started = false;          ///< the first stream frame has arrived
+    bool saw_done = false;         ///< the engine sent its own [DONE]
+    bool done = false;
+    int status = 0;
+    std::string body;
+};
+
+} // namespace
 
 NodeApiServer::~NodeApiServer() {
     stop();
@@ -413,18 +432,18 @@ void NodeApiServer::register_routes() {
             ? nlohmann::json(ray_controller_->status())
             : nlohmann::json(RayRuntimeStatus{});
 
-        // Backwards compat: set single-model fields from first ready slot.
+        // Backwards compat: set the single-model field from the first ready slot.
         std::string first_model;
-        std::string first_agent;
         for (const auto& s : slots) {
             if (s.state == SlotState::Ready) {
                 first_model = s.model_path;
-                first_agent = s.assigned_agent;
                 break;
             }
         }
         j["loaded_model"]  = first_model;
-        j["active_agent"]  = first_agent;
+        // The control<->node protocol this node speaks; control refuses to place
+        // on a node that speaks another (models.hpp, kNodeWireProtocol).
+        j["wire_protocol"] = kNodeWireProtocol;
 
         res.set_content(j.dump(), "application/json");
     });
@@ -762,7 +781,7 @@ void NodeApiServer::register_routes() {
             const auto j = nlohmann::json::parse(req.body);
             RayStartConfig cfg;
             cfg.group_id = j.value("group_id", std::string{});
-            cfg.agent_id = j.value("agent_id", std::string{});
+            cfg.holder_id = j.value("holder_id", std::string{});
             cfg.role = j.value("role", std::string{"head"});
             cfg.head_address = j.value("head_address", std::string{});
             cfg.node_ip = j.value("node_ip", std::string{});
@@ -859,7 +878,7 @@ void NodeApiServer::register_routes() {
             std::string model_ref  = j.value("model_path", std::string{});
             std::string mmproj_ref = j.value("mmproj_path", std::string{});
             const bool vision_enabled = j.value("vision_enabled", !mmproj_ref.empty());
-            std::string agent_id   = j.value("agent_id",   std::string{});
+            std::string holder_id  = j.value("holder_id",  std::string{});
             // Optional: identity + pin flag for a control-transferred model, so
             // the node can refresh the LRU use-queue and pinned state on load.
             const std::string model_id = j.value("model_id", std::string{});
@@ -874,12 +893,12 @@ void NodeApiServer::register_routes() {
 
             // Ray group ownership is a node-wide exclusive reservation. The
             // only process admitted while it is active is the group's vLLM
-            // server on the head, for the same agent. Workers run Ray only.
+            // server on the head, for the same holder. Workers run Ray only.
             if (ray_controller_ != nullptr) {
                 const auto ray = ray_controller_->status();
                 const bool owned_head_load = ray.active() && backend == "vllm" &&
-                    ray.role == "head" && !agent_id.empty() &&
-                    agent_id == ray.agent_id;
+                    ray.role == "head" && !holder_id.empty() &&
+                    holder_id == ray.holder_id;
                 if (!ray.group_id.empty() && !owned_head_load) {
                     res.status = 409;
                     res.set_content(
@@ -1079,7 +1098,7 @@ void NodeApiServer::register_routes() {
                     }
                 }
             }
-            auto slot_id = engines_.load(backend, load_req, agent_id);
+            auto slot_id = engines_.load(backend, load_req, holder_id);
             if (slot_id.empty()) {
                 nlohmann::json err = {{"error", "failed to load model"}};
                 auto detail = engines_.last_error();
@@ -1099,13 +1118,12 @@ void NodeApiServer::register_routes() {
                 auto slots_info = engines_.slots();
                 state_.set_slots(slots_info);
                 state_.set_loaded_model(model_path);
-                if (!agent_id.empty()) state_.set_active_agent(agent_id);
                 state_.set_last_error("");
 
                 // Refresh the local cache's use-queue and pin state for a
-                // transferred model. Pin is STICKY: a load from a preferred
-                // agent pins the model, but a later load from a non-preferred
-                // agent (pin=false) must not clear a pin another agent set —
+                // transferred model. Pin is STICKY: a load for a model pinned to
+                // this node pins it, but a later load for one that is not
+                // (pin=false) must not clear a pin another load set —
                 // otherwise the model would become evictable despite a standing
                 // preference. Unpinning is a separate, explicit lifecycle event.
                 if (model_store_) {
@@ -1158,7 +1176,6 @@ void NodeApiServer::register_routes() {
                     return;
                 }
                 state_.set_loaded_model("");
-                state_.set_active_agent("");
                 state_.set_slots({});
                 state_.set_last_error("");
             } else {
@@ -1730,25 +1747,25 @@ void NodeApiServer::register_routes() {
                         "application/json");
     });
 
-    // ── POST /api/node/detach-agent ───────────────────────────────────────────
-    // Removes an agent from a slot. The slot is unloaded once its last agent
+    // ── POST /api/node/detach-holder ──────────────────────────────────────────
+    // Removes a holder from a slot. The slot is unloaded once its last holder
     // detaches (deferred while inference is draining).
-    server_->Post("/api/node/detach-agent", [this](const Request& req, Response& res) {
+    server_->Post("/api/node/detach-holder", [this](const Request& req, Response& res) {
         if (!check_auth(req.get_header_value("Authorization"))) {
             res.status = 401; return;
         }
         try {
             auto j = nlohmann::json::parse(req.body);
-            std::string slot_id  = j.value("slot_id",  std::string{});
-            std::string agent_id = j.value("agent_id", std::string{});
-            if (slot_id.empty() || agent_id.empty()) {
+            std::string slot_id   = j.value("slot_id",   std::string{});
+            std::string holder_id = j.value("holder_id", std::string{});
+            if (slot_id.empty() || holder_id.empty()) {
                 res.status = 400;
-                res.set_content(R"({"error":"slot_id and agent_id required"})",
+                res.set_content(R"({"error":"slot_id and holder_id required"})",
                                 "application/json");
                 return;
             }
 
-            auto detach = engines_.detach_agent(slot_id, agent_id);
+            auto detach = engines_.detach_holder(slot_id, holder_id);
             state_.set_slots(engines_.slots());
             if (!detach.ok()) {
                 res.status = detach.status == EngineOpStatus::NotFound ? 404 : 500;
@@ -1759,7 +1776,7 @@ void NodeApiServer::register_routes() {
 
             res.set_content(
                 nlohmann::json{{"status", "detached"},
-                               {"remaining_agents", detach.remaining_agents},
+                               {"remaining_holders", detach.remaining_holders},
                                {"unloaded", detach.unloaded}}.dump(),
                 "application/json");
         } catch (const std::exception& e) {
@@ -1838,7 +1855,7 @@ void NodeApiServer::register_routes() {
         nlohmann::json arr = nlohmann::json::array();
         for (const auto& s : engines_.sequences(slot)) {
             arr.push_back(nlohmann::json{{"index", s.index},
-                                         {"agent_id", s.agent_id},
+                                         {"conversation", s.conversation},
                                          {"position", s.position},
                                          {"kv_tokens", s.kv_tokens},
                                          {"prefilling", s.prefilling},
@@ -1909,7 +1926,7 @@ void NodeApiServer::register_routes() {
             std::string mmproj_path = sanitize_path_for_runtime(
                 j.value("mmproj_path", std::string{}));
             const bool vision_enabled = j.value("vision_enabled", !mmproj_path.empty());
-            std::string agent_id   = j.value("agent_id", std::string{});
+            std::string holder_id  = j.value("holder_id", std::string{});
             const std::string backend = mm::util::to_lower(mm::util::trim(
                 j.value("backend", std::string{"llama-cpp"})));
             if (ray_controller_ != nullptr) {
@@ -1918,15 +1935,15 @@ void NodeApiServer::register_routes() {
                     const auto slots = engines_.slots();
                     const bool sleeping_owned_vllm = std::any_of(
                         slots.begin(), slots.end(), [&](const SlotInfo& slot) {
-                            const bool attached = slot.assigned_agent == agent_id ||
-                                std::find(slot.agent_ids.begin(), slot.agent_ids.end(),
-                                          agent_id) != slot.agent_ids.end();
+                            const bool attached =
+                                std::find(slot.holder_ids.begin(), slot.holder_ids.end(),
+                                          holder_id) != slot.holder_ids.end();
                             return slot.backend == "vllm" &&
                                    slot.state == SlotState::Suspended && attached;
                         });
                     const bool owned_restore = ray.active() && ray.role == "head" &&
-                        backend == "vllm" && !agent_id.empty() &&
-                        agent_id == ray.agent_id && sleeping_owned_vllm;
+                        backend == "vllm" && !holder_id.empty() &&
+                        holder_id == ray.holder_id && sleeping_owned_vllm;
                     if (!owned_restore) {
                         res.status = 409;
                         res.set_content(
@@ -2050,7 +2067,7 @@ void NodeApiServer::register_routes() {
                 }
                 restore_req.vllm = effective_vllm_config(*spec);
             }
-            auto slot_id = engines_.restore(backend, restore_req, kv_cache_path, agent_id);
+            auto slot_id = engines_.restore(backend, restore_req, kv_cache_path, holder_id);
             state_.set_slots(engines_.slots());
 
             if (slot_id.empty()) {
@@ -2066,7 +2083,6 @@ void NodeApiServer::register_routes() {
                 res.set_content(err.dump(), "application/json");
             } else {
                 state_.set_loaded_model(model_path);
-                if (!agent_id.empty()) state_.set_active_agent(agent_id);
                 state_.set_last_error("");
                 if (model_store_) {
                     for (const auto& id : {model_id, mmproj_model_id}) {
@@ -2273,12 +2289,12 @@ void NodeApiServer::register_routes() {
         // Shared context between LLM worker and SSE provider
         auto ctx = std::make_shared<SseInferCtx>();
 
-        // Look up agent for this slot and start streaming text tracking.
-        std::string agent_for_slot;
+        // Look up the slot's holder and start streaming text tracking.
+        std::string holder_for_slot;
         std::string model_for_slot;
         for (const auto& s : slots) {
             if (s.id == selected_slot_id) {
-                agent_for_slot = s.assigned_agent;
+                if (!s.holder_ids.empty()) holder_for_slot = s.holder_ids.front();
                 model_for_slot = s.model_path;
                 break;
             }
@@ -2286,8 +2302,7 @@ void NodeApiServer::register_routes() {
         engines_.touch(selected_slot_id);
         state_.set_slots(engines_.slots());
         if (!model_for_slot.empty()) state_.set_loaded_model(model_for_slot);
-        state_.start_streaming_text(selected_slot_id, agent_for_slot);
-        if (!agent_for_slot.empty()) state_.set_active_agent(agent_for_slot);
+        state_.start_streaming_text(selected_slot_id, holder_for_slot);
 
         // Fire the LLM call on a TRACKED background thread.
         //
@@ -2513,6 +2528,165 @@ void NodeApiServer::register_routes() {
                 return true;
             }
         );
+    });
+
+    // ── POST /api/node/engines/:slot/chat/completions ─────────────────────────
+    //
+    // An OpenAI chat completion, passed to the engine UNCHANGED and its answer
+    // relayed back unchanged. What control's stateless `:9091` listener rides
+    // on: a client that owns its own history, tools and sampling gets exactly
+    // what it sent to exactly the engine that was placed. /api/node/infer
+    // cannot do this — it re-renders the request through InferenceRequest,
+    // which folds tool calls into text and drops fields it does not model.
+    //
+    // Same discipline as /api/node/infer: the engine lease lives on a TRACKED
+    // worker thread, never on the httplib handler, so shutdown can join it
+    // before the supervisor it points into is destroyed.
+    server_->Post("/api/node/engines/:slot/chat/completions",
+                  [this](const Request& req, Response& res) {
+        if (!check_auth(req.get_header_value("Authorization"))) {
+            res.status = 401;
+            return;
+        }
+        if (draining_.load()) {
+            res.status = 503;
+            res.set_content(R"({"error":"node is shutting down"})", "application/json");
+            return;
+        }
+        const std::string slot = req.path_params.at("slot");
+        nlohmann::json body;
+        try {
+            body = nlohmann::json::parse(req.body);
+            if (!body.is_object()) throw std::invalid_argument("body must be a JSON object");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+            return;
+        }
+        const bool stream = body.value("stream", false);
+        const auto endpoint = engines_.endpoint(slot);
+        auto slot_lease = engines_.acquire(slot);
+        if (!slot_lease || !endpoint.ok()) {
+            res.status = 503;
+            res.set_content(R"({"error":"no ready engine on that slot"})", "application/json");
+            return;
+        }
+        engines_.touch(slot);
+
+        auto ctx = std::make_shared<PassthroughCtx>();
+        auto worker = std::make_shared<InferWorker>();
+        {
+            std::lock_guard<std::mutex> lk(workers_mu_);
+            if (draining_.load()) {
+                res.status = 503;
+                res.set_content(R"({"error":"node is shutting down"})", "application/json");
+                return;
+            }
+            for (auto it = workers_.begin(); it != workers_.end();) {
+                if (*it && (*it)->finished.load()) {
+                    if ((*it)->thread.joinable()) (*it)->thread.join();
+                    it = workers_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            worker->thread = std::thread([ctx, worker, body, stream, base_url = endpoint.base_url,
+                                          slot_lease = std::move(slot_lease)]() mutable {
+                // Declared first so it runs last: the stream is closed and the
+                // worker retired on every exit path, after the lease is gone.
+                struct Finalize {
+                    std::shared_ptr<PassthroughCtx> ctx;
+                    std::shared_ptr<InferWorker> worker;
+                    ~Finalize() {
+                        {
+                            std::lock_guard<std::mutex> lk(ctx->mx);
+                            ctx->done = true;
+                            ctx->cv.notify_all();
+                        }
+                        worker->finished.store(true);
+                    }
+                } finalize{ctx, worker};
+
+                HttpClient client(base_url);
+                // A generation can run for minutes; the connect budget is what
+                // should fail fast.
+                client.set_timeouts(10, 3600, 60);
+                try {
+                    if (stream) {
+                        int status = 0;
+                        std::string error_body;
+                        client.stream_post(
+                            "/v1/chat/completions", body,
+                            [ctx](const std::string& payload) {
+                                std::lock_guard<std::mutex> lk(ctx->mx);
+                                if (payload == "[DONE]") ctx->saw_done = true;
+                                ctx->lines.push_back("data: " + payload + "\n\n");
+                                ctx->started = true;
+                                ctx->cv.notify_all();
+                                return true;
+                            },
+                            &status, &error_body);
+                        std::lock_guard<std::mutex> lk(ctx->mx);
+                        ctx->status = status;
+                        ctx->body = std::move(error_body);
+                    } else {
+                        auto r = client.post("/v1/chat/completions", body);
+                        std::lock_guard<std::mutex> lk(ctx->mx);
+                        ctx->status = r.status;
+                        ctx->body = std::move(r.body);
+                    }
+                } catch (const std::exception& e) {
+                    std::lock_guard<std::mutex> lk(ctx->mx);
+                    ctx->status = 502;
+                    ctx->body = nlohmann::json{{"error", std::string("engine request failed: ") +
+                                                             e.what()}}
+                                    .dump();
+                }
+            });
+            workers_.push_back(worker);
+        }
+
+        // Wait for the first frame, or for the answer. A non-stream call, and a
+        // stream that failed before its first frame, are answered with the
+        // ENGINE's own status and body — an engine's 400 is the client's
+        // business, and a 200 wrapped around it would hide that.
+        std::unique_lock<std::mutex> lk(ctx->mx);
+        ctx->cv.wait(lk, [&] { return ctx->started || ctx->done; });
+        if (!stream || !ctx->started) {
+            ctx->cv.wait(lk, [&] { return ctx->done; });
+            res.status = ctx->status != 0 ? ctx->status : 502;
+            res.set_content(ctx->body.empty()
+                                ? std::string(R"({"error":"the engine did not answer"})")
+                                : ctx->body,
+                            "application/json");
+            return;
+        }
+        lk.unlock();
+
+        res.set_chunked_content_provider(
+            "text/event-stream", [ctx](size_t /*offset*/, httplib::DataSink& sink) -> bool {
+                std::unique_lock<std::mutex> guard(ctx->mx);
+                ctx->cv.wait(guard, [&] { return !ctx->lines.empty() || ctx->done; });
+                while (!ctx->lines.empty()) {
+                    std::string payload = std::move(ctx->lines.front());
+                    ctx->lines.pop_front();
+                    guard.unlock();
+                    if (!sink.write(payload.data(), payload.size())) return false;
+                    guard.lock();
+                }
+                if (ctx->done && ctx->lines.empty()) {
+                    // An engine that ended without its own [DONE] still ends
+                    // the stream the way an OpenAI client expects.
+                    const bool saw_done = ctx->saw_done;
+                    guard.unlock();
+                    if (!saw_done) {
+                        static const std::string fin = "data: [DONE]\n\n";
+                        sink.write(fin.data(), fin.size());
+                    }
+                    sink.done();
+                }
+                return true;
+            });
     });
 }
 

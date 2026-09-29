@@ -150,7 +150,7 @@ TtsServiceResponse TtsServiceClient::generate_voice_sample(
 
 TtsServiceResponse TtsServiceClient::synthesize(
     const TtsSynthesisRequest& request,
-    const AgentVoiceProfile& profile,
+    const VoiceProfile& profile,
     const std::string& output_audio_path) const {
     if (!config_.enabled) return disabled_response();
 

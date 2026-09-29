@@ -11,7 +11,8 @@ namespace mm {
 
 struct PerformanceSample {
     std::string request_id;
-    std::string agent_id;
+    std::string served_model_id;
+    std::string user_id; ///< empty for a stateless (:9091) request
     std::string node_id;
     std::string backend;
     std::string model;

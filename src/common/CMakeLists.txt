@@ -1,13 +1,15 @@
 set(MM_COMMON_SOURCES
     util.cpp
     logger.cpp
-    agent.cpp
-    agent_db.cpp
     runtime_client.cpp
     engine_capabilities.cpp
+    served_model.cpp
+    user.cpp
+    user_db.cpp
+    history_sanitizer.cpp
+    conversation_context.cpp
     engine_client.cpp
     engine_config.cpp
-    conversation_manager.cpp
     memory_manager.cpp
     tool_executor.cpp
     trace_provenance.cpp

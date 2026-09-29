@@ -25,7 +25,7 @@ struct PendingPair {
 
 struct StreamingTextState {
     SlotId      slot_id;
-    AgentId     agent_id;
+    HolderId    holder_id;
     std::string content;
     std::string thinking;
     int         tokens_used   = 0;
@@ -50,11 +50,9 @@ public:
     int64_t     get_last_control_contact_ms() const;
     bool        has_recent_control_contact(int64_t max_age_ms) const;
 
-    // ── Model / agent tracking (deprecated — kept for backwards compat) ─────
+    // ── Model tracking (deprecated — kept for backwards compat) ─────────────
     std::string get_loaded_model() const;
-    std::string get_active_agent() const;
     void        set_loaded_model(const std::string& model);
-    void        set_active_agent(const std::string& agent_id);
 
     // ── Multi-slot tracking ─────────────────────────────────────────────────
     std::vector<SlotInfo> get_slots() const;
@@ -112,7 +110,7 @@ public:
 
     // ── Streaming text (for TUI display of generated output) ─────────────────
     StreamingTextState get_streaming_text() const;
-    void start_streaming_text(const SlotId& slot_id, const AgentId& agent_id);
+    void start_streaming_text(const SlotId& slot_id, const HolderId& holder_id);
     void append_streaming_text(const std::string& delta_content,
                                const std::string& thinking_delta,
                                int tokens_used = 0);
@@ -144,7 +142,6 @@ private:
     bool                         registered_   = false;
     NodeId                       node_id_;
     std::string                  loaded_model_;
-    std::string                  active_agent_;
     std::vector<SlotInfo>        slots_;
     NodeHealthMetrics            metrics_;
     NodeCapabilities             capabilities_;

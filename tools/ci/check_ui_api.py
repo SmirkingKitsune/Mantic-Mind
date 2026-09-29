@@ -3,9 +3,9 @@
 
 The gate says "no panel reaches into in-process engine state", and adds that this
 is grep-verifiable. This is the grep, run as a test, because the alternative is a
-comment asking nicely — and the temptation is live: the existing TUI already holds
-`NodeRegistry&`, `AgentManager&` and `AgentScheduler&`, so a panel that needs one
-number is four keystrokes from taking it directly.
+comment asking nicely — and the temptation is live: the TUI shell still holds
+`NodeRegistry&` for the Nodes tab, so a panel that needs one number is four
+keystrokes from taking it directly.
 
 Why it matters beyond tidiness: a TUI that reads private state is a second client
 with privileges no other client has. P1 says the API is the single control plane,
@@ -14,7 +14,7 @@ in `/v1/*` stays invisible for exactly as long as the only serious consumer does
 not need the API.
 
 Rule: the Soma dashboard TU and its header may include the HTTP client, JSON, the
-standard library, and their own header. Nothing that carries engine, node, agent
+standard library, and their own header. Nothing that carries engine, node, user
 or registry state.
 
 Usage: check_ui_api.py [repo_root]
@@ -37,15 +37,21 @@ GUARDED = [
     "src/control/engine_panels.cpp",
     "include/control/admission_panels.hpp",
     "src/control/admission_panels.cpp",
+    "include/control/model_panels.hpp",
+    "src/control/model_panels.cpp",
+    "include/control/user_panels.hpp",
+    "src/control/user_panels.cpp",
 ]
 
 # Includes that carry in-process state. Matched on the include PATH, so a header
 # that merely mentions one of these words in a comment is not a violation.
 FORBIDDEN = [
     ("node_registry.hpp", "the live node list and its health poll"),
-    ("agent_manager.hpp", "agent records and their databases"),
-    ("agent_scheduler.hpp", "placement state"),
-    ("agent_queue.hpp", "in-flight request queues"),
+    ("placement_scheduler.hpp", "placement state"),
+    ("served_model_catalog.hpp", "the served-model catalog and its in-memory API keys"),
+    ("user_manager.hpp", "user records and their stores"),
+    ("user_db.hpp", "a user's store"),
+    ("conversation_queue.hpp", "in-flight request queues"),
     ("model_registry.hpp", "control.db"),
     ("engine_supervisor.hpp", "node-side engine state"),
     ("engine_process.hpp", "a live subprocess"),

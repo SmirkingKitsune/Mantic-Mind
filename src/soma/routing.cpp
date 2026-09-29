@@ -68,7 +68,7 @@ std::string BackendDecision::explain() const {
     return s + ")";
 }
 
-BackendDecision select_backend(const AgentBackendConfig& cfg,
+BackendDecision select_backend(const BackendRequest& cfg,
                                const AdmissionRecord& record) noexcept {
     BackendDecision d;
 

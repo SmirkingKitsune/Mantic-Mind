@@ -7,7 +7,7 @@
 
 namespace mm {
 
-class AgentDB;
+class UserDB;
 
 TraceEvent make_trace_event(const std::string& category,
                             const std::string& title,
@@ -17,7 +17,7 @@ TraceEvent make_trace_event(const std::string& category,
 
 void assign_trace_sequences(std::vector<TraceEvent>& events);
 
-std::vector<TraceEvent> build_context_trace_events(AgentDB& db,
+std::vector<TraceEvent> build_context_trace_events(UserDB& db,
                                                    const ConvId& conv_id,
                                                    const std::vector<Memory>& memories);
 

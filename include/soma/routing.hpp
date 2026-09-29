@@ -1,21 +1,22 @@
 #pragma once
 
-// Soma — which engine serves an agent.
+// Soma — which engine serves a served model.
 //
-// PURE, given (agent config, admission record). No node, no placement, no I/O.
-// That is deliberate: the decision can be ANSWERED without causing a placement,
-// and it is the one piece of G5 that can be tested exhaustively rather than
-// observed.
+// PURE, given (served-model config, admission record). No node, no placement,
+// no I/O. That is deliberate: the decision can be ANSWERED without causing a
+// placement, and it is the one piece of G5 that can be tested exhaustively
+// rather than observed.
 //
-// `GET /v1/agents/{id}` answers with it, and purity is what makes that safe: a
-// read route must not cause a placement. So do `GET /v1/placements` and
-// `PUT /v1/agents/{id}/backend`.
+// `GET /v1/served-models/{id}` answers with it, and purity is what makes that
+// safe: a read route must not cause a placement. So do `GET /v1/placements`
+// and `PUT /v1/served-models/{id}/backend`.
 //
-// The per-agent route did NOT carry it for as long as this comment claimed it
-// did — the handler returned config, placement, status and node compatibility
-// and no backend field at all. The sentence was true of the design and false of
-// the code, in two files at once, because the deleted `placement_engine.hpp`
-// made the same promise. Fixed rather than re-worded (roadmap D61).
+// The per-model route did NOT carry it for as long as this comment once claimed
+// it did — the handler (then per-agent) returned config, placement, status and
+// node compatibility and no backend field at all. The sentence was true of the
+// design and false of the code, in two files at once, because the deleted
+// `placement_engine.hpp` made the same promise. Fixed rather than re-worded
+// (roadmap D61).
 //
 // The policy, from docs/architecture.md §9:
 //
@@ -38,11 +39,11 @@ enum class BackendChoice : std::uint8_t {
     Soma,
 };
 
-/// Persistent, on the AGENT — not per placement.
+/// Persistent, on the SERVED MODEL — not per placement.
 ///
-/// Placement is recomputed on every `ensure_agent_running`, so a per-placement
-/// override would evaporate on the next eviction cycle and read as a flapping
-/// bug rather than as a setting that stopped applying.
+/// Placement is recomputed on every acquisition, so a per-placement override
+/// would evaporate on the next eviction cycle and read as a flapping bug rather
+/// than as a setting that stopped applying.
 enum class BackendOverride : std::uint8_t {
     Auto = 0,
     Soma,
@@ -65,10 +66,14 @@ struct AdmissionRecord {
     std::string arch_hash;
 };
 
-struct AgentBackendConfig {
+/// What the caller wants served: the operator's override and the identity of
+/// the weights. Named for the request it is rather than for whoever owns the
+/// setting — that owner has been an agent and is now a served model, and the
+/// engine policy should not have to change when it changes again.
+struct BackendRequest {
     BackendOverride override = BackendOverride::Auto;
-    /// The hash of the weights this agent will actually load. Compared against
-    /// the record's, because a verdict computed for different weights is not a
+    /// The hash of the weights that will actually load. Compared against the
+    /// record's, because a verdict computed for different weights is not a
     /// verdict for these.
     std::string arch_hash;
 };
@@ -102,7 +107,7 @@ struct BackendDecision {
 /// which is what the failure is telling you. That is a different action from
 /// flipping a routing switch, and the API should not let one masquerade as the
 /// other.
-BackendDecision select_backend(const AgentBackendConfig& cfg,
+BackendDecision select_backend(const BackendRequest& cfg,
                                const AdmissionRecord& record) noexcept;
 
 const char* to_string(BackendChoice choice) noexcept;

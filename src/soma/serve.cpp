@@ -12,7 +12,7 @@
 //     bug waiting to happen on Windows.
 //   * Capacity pressure is a STRUCTURED CODE. The existing scheduler detects it
 //     by substring-matching six English phrases against the node's error body
-//     (agent_scheduler.cpp:904), so a new engine would have to emit those exact
+//     (then agent_scheduler.cpp:904), so a new engine would have to emit those exact
 //     literals to earn an evict-and-retry. This emits
 //     {"error":{"code":"capacity_pressure"}} instead.
 

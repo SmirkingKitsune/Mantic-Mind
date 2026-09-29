@@ -2,11 +2,16 @@
 """Opt-in Linux multi-node vLLM/Ray hardware smoke.
 
 Required environment:
-  MM_TEST_VLLM_RAY_CONTROL_URL  control API base URL
-  MM_TEST_VLLM_RAY_AGENT_ID     local/auto agent backed by a small HF model
+  MM_TEST_VLLM_RAY_CONTROL_URL  control API base URL (the Mantic port, :9090)
+  MM_TEST_VLLM_RAY_OPENAI_URL   the OpenAI-compat listener (:9091)
+  MM_TEST_VLLM_RAY_MODEL_ID     a node-served model backed by a small HF model
 Optional:
-  MM_TEST_VLLM_RAY_TOKEN        bearer token
+  MM_TEST_VLLM_RAY_TOKEN        bearer token (the same one works on both ports)
   MM_TEST_VLLM_RAY_EXPECT_GLOO  1 selects the experimental fallback smoke
+
+The request goes through the stateless :9091 listener, which is the shortest
+path from a served model to its placement: no user, no conversation, nothing
+stored — only the Ray group the placement forms is under test.
 """
 
 from __future__ import annotations
@@ -31,7 +36,6 @@ def request(base: str, path: str, token: str, body: dict | None = None) -> bytes
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
-        headers["Accept"] = "text/event-stream"
     req = urllib.request.Request(base.rstrip("/") + path, data=data, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=1200) as response:
@@ -47,14 +51,15 @@ def ray_status(base: str, token: str) -> dict:
 
 def main() -> int:
     base = os.environ.get("MM_TEST_VLLM_RAY_CONTROL_URL", "").strip()
-    agent = os.environ.get("MM_TEST_VLLM_RAY_AGENT_ID", "").strip()
+    openai = os.environ.get("MM_TEST_VLLM_RAY_OPENAI_URL", "").strip()
+    model = os.environ.get("MM_TEST_VLLM_RAY_MODEL_ID", "").strip()
     token = os.environ.get("MM_TEST_VLLM_RAY_TOKEN", "").strip()
     expect_gloo = os.environ.get("MM_TEST_VLLM_RAY_EXPECT_GLOO", "").lower() in {
         "1", "true", "yes", "on"
     }
-    if platform.system() != "Linux" or not base or not agent:
-        print("SKIP: set MM_TEST_VLLM_RAY_CONTROL_URL and "
-              "MM_TEST_VLLM_RAY_AGENT_ID on a Linux multi-node cluster")
+    if platform.system() != "Linux" or not base or not openai or not model:
+        print("SKIP: set MM_TEST_VLLM_RAY_CONTROL_URL, MM_TEST_VLLM_RAY_OPENAI_URL and "
+              "MM_TEST_VLLM_RAY_MODEL_ID on a Linux multi-node cluster")
         return SKIP
 
     before = ray_status(base, token)
@@ -64,27 +69,21 @@ def main() -> int:
     if expect_gloo and not before.get("allow_experimental_gloo"):
         raise RuntimeError("Gloo smoke requested but allow_experimental_gloo is false")
 
-    stream = request(
-        base,
-        f"/v1/agents/{agent}/chat",
+    completion = json.loads(request(
+        openai,
+        "/v1/chat/completions",
         token,
-        {"message": f"Reply with the single word READY. smoke={uuid.uuid4()}"},
-    ).decode("utf-8", errors="replace")
-    done = None
-    for line in stream.splitlines():
-        if not line.startswith("data: ") or line == "data: [DONE]":
-            continue
-        try:
-            event = json.loads(line[6:])
-        except json.JSONDecodeError:
-            continue
-        if event.get("type") == "done":
-            done = event
-    if not done or not done.get("success"):
-        raise RuntimeError("chat stream did not finish successfully")
+        {"model": model,
+         "messages": [{"role": "user",
+                       "content": f"Reply with the single word READY. smoke={uuid.uuid4()}"}]},
+    ))
+    choices = completion.get("choices") or []
+    if completion.get("model") != model or not choices:
+        raise RuntimeError(f"completion did not come back for {model!r}: {completion}")
 
     after = ray_status(base, token)
-    groups = [g for g in after.get("groups", []) if g.get("agent_id") == agent]
+    # Ray groups are owned by the placement's holder: the served-model id.
+    groups = [g for g in after.get("groups", []) if g.get("served_model_id") == model]
     if not groups:
         if expect_gloo:
             print("PASS: experimental Gloo launch failed cleanly and backup served the request; "

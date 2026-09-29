@@ -11,7 +11,7 @@ namespace mm {
 
 struct RayStartConfig {
     std::string group_id;
-    std::string agent_id;
+    std::string holder_id;
     std::string role = "head";
     std::string head_address;
     std::string node_ip;

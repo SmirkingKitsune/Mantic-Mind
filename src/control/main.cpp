@@ -4,11 +4,11 @@
 #include "common/logger.hpp"
 #include "common/util.hpp"
 #include "control/control_config.hpp"
-#include "control/agent_manager.hpp"
 #include "control/model_registry.hpp"
 #include "control/node_registry.hpp"
-#include "control/agent_scheduler.hpp"
-#include "control/agent_queue.hpp"
+#include "control/placement_scheduler.hpp"
+#include "control/served_model_catalog.hpp"
+#include "control/user_manager.hpp"
 #include "control/control_api_server.hpp"
 #include "control/control_ui.hpp"
 #include "control/engine_config_store.hpp"
@@ -93,6 +93,7 @@ static mm::ControlConfig load_config(
             file.get_int("listen_port", static_cast<int>(cfg.listen_port)));
         cfg.openai_compat_port = static_cast<uint16_t>(
             file.get_int("openai_compat_port", static_cast<int>(cfg.openai_compat_port)));
+        cfg.chat_worker_threads = file.get_int("chat_worker_threads", cfg.chat_worker_threads);
         cfg.data_dir    = file.get("data_dir",  cfg.data_dir);
         cfg.admission_python      = file.get("admission_python",      cfg.admission_python);
         cfg.admission_tools_dir   = file.get("admission_tools_dir",   cfg.admission_tools_dir);
@@ -157,6 +158,7 @@ static mm::ControlConfig load_config(
         env_int("MM_CONTROL_PORT", static_cast<int>(cfg.listen_port)));
     cfg.openai_compat_port = static_cast<uint16_t>(
         env_int("MM_OPENAI_COMPAT_PORT", static_cast<int>(cfg.openai_compat_port)));
+    cfg.chat_worker_threads = env_int("MM_CHAT_WORKER_THREADS", cfg.chat_worker_threads);
     cfg.data_dir    = env("MM_DATA_DIR",    cfg.data_dir);
     cfg.admission_python      = env("MM_ADMISSION_PYTHON", cfg.admission_python);
     cfg.admission_tools_dir   = env("MM_ADMISSION_TOOLS",  cfg.admission_tools_dir);
@@ -368,17 +370,19 @@ static void print_control_usage() {
               << "  engines ray\n"
               << "  engines resync\n"
               << "  engines share <fingerprint> <target_node_id> [source_node_id]\n"
-              << "  agents list|show|create|update|delete ...\n"
-              << "  agents suspend|restore|release <agent_id>\n"
+              << "  users list|show|create|update|delete ...\n"
+              << "  catalog list|show|create|update|delete|backend ...\n"
+              << "  catalog suspend|restore|release <served_model_id> [--force]\n"
               << "  placements\n"
-              << "  chat send <agent_id> <message> [conversation_id]\n"
+              << "  chat send <user_id> <message> [conversation_id] [--model <served_model_id>]\n"
               << "  curation conv ...\n"
               << "  curation mem ...\n"
-              << "  curation local list|create|update|delete <agent_id> <conv_id> ...\n"
-              << "  curation propose <agent_id>\n"
-              << "  curation apply <agent_id> <json>\n"
-              << "  voice show|proposals|propose <agent_id>\n"
-              << "  voice approve|reject|sample <agent_id> <proposal_id>\n"
+              << "  curation local list|create|update|delete <user_id> <conv_id> ...\n"
+              << "  curation propose <user_id>\n"
+              << "  curation apply <user_id> <json>\n"
+              << "  voice show|proposals|propose <user_id>\n"
+              << "  voice approve|reject|sample <user_id> <proposal_id>\n"
+              << "  tokens list|create|delete ...   (create <label> [scopes] [user_id])\n"
               << "  activity tail [n]\n"
               << "  help\n"
               << "  quit\n";
@@ -446,7 +450,8 @@ static void run_control_cli(uint16_t listen_port,
 
     auto print_help = [&]() {
         printer.line("Use --help for the full command list.");
-        printer.line("Top-level groups: nodes, models, agents, chat, curation, activity, help, quit");
+        printer.line("Top-level groups: nodes, models, catalog, users, chat, curation, voice, "
+                     "tokens, activity, help, quit");
     };
 
     auto pretty_body = [&](const std::string& body) -> std::string {
@@ -1218,36 +1223,32 @@ static void run_control_cli(uint16_t listen_port,
             continue;
         }
 
-        if (cmd0 == "agents") {
-            if (tokens.size() < 2) {
-                printer.line("usage: agents list|show|create|update|delete|backend|"
-                             "suspend|restore|release ...");
-                continue;
-            }
-            const std::string sub = mm::util::to_lower(tokens[1]);
+        // Users: who conversations and memories belong to. A user picks a model
+        // per conversation; nothing here names one except a default.
+        if (cmd0 == "users") {
+            const std::string sub =
+                tokens.size() < 2 ? std::string{"list"} : mm::util::to_lower(tokens[1]);
             if (sub == "list") {
-                emit_http_result("agents list", self.get("/v1/agents"));
+                emit_http_result("users list", self.get("/v1/users"));
                 continue;
             }
             if (sub == "show") {
                 if (tokens.size() < 3) {
-                    printer.line("usage: agents show <agent_id>");
+                    printer.line("usage: users show <user_id>");
                     continue;
                 }
-                auto r = self.get("/v1/agents/" + tokens[2]);
-                emit_http_result("agents show", r);
+                emit_http_result("users show", self.get("/v1/users/" + tokens[2]));
                 continue;
             }
             if (sub == "create") {
                 if (tokens.size() < 3) {
-                    printer.line("usage: agents create <json>");
+                    printer.line("usage: users create <json>   e.g. {\"id\":\"alice\",\"default_model\":\"qwen3\"}");
                     continue;
                 }
-                auto payload = mm::cli::join_tokens(tokens, 2);
                 try {
-                    auto j = nlohmann::json::parse(payload);
-                    auto r = self.post("/v1/agents", j);
-                    emit_http_result("agents create", r);
+                    emit_http_result("users create",
+                                     self.post("/v1/users",
+                                               nlohmann::json::parse(mm::cli::join_tokens(tokens, 2))));
                 } catch (const std::exception& e) {
                     printer.line(std::string("error: invalid JSON: ") + e.what());
                 }
@@ -1255,71 +1256,129 @@ static void run_control_cli(uint16_t listen_port,
             }
             if (sub == "update") {
                 if (tokens.size() < 4) {
-                    printer.line("usage: agents update <agent_id> <json>");
+                    printer.line("usage: users update <user_id> <json>");
                     continue;
                 }
-                auto payload = mm::cli::join_tokens(tokens, 3);
                 try {
-                    auto j = nlohmann::json::parse(payload);
-                    auto r = self.put("/v1/agents/" + tokens[2], j);
-                    emit_http_result("agents update", r);
+                    emit_http_result("users update",
+                                     self.put("/v1/users/" + tokens[2],
+                                              nlohmann::json::parse(mm::cli::join_tokens(tokens, 3))));
                 } catch (const std::exception& e) {
                     printer.line(std::string("error: invalid JSON: ") + e.what());
                 }
                 continue;
             }
-            // Which ENGINE serves this agent — the one place an operator can
-            // overrule a verdict. `operator` on the API, and it had no CLI form,
-            // so overruling a verdict was a TUI-only act.
-            if (sub == "backend") {
-                if (tokens.size() < 4) {
-                    printer.line("usage: agents backend <agent_id> <auto|soma|fallback>");
+            if (sub == "delete") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: users delete <user_id>");
                     continue;
                 }
-                emit_http_result("agents backend",
-                                 self.put("/v1/agents/" + tokens[2] + "/backend",
+                emit_http_result("users delete", self.del("/v1/users/" + tokens[2]));
+                continue;
+            }
+            printer.line("usage: users list|show|create|update|delete ...");
+            continue;
+        }
+
+        // The served-model catalog: what users pick a model from. Admitted
+        // models Soma can serve are listed without being created; `update` on
+        // one of those writes the operator's override under the same id.
+        if (cmd0 == "catalog") {
+            if (tokens.size() < 2) {
+                printer.line("usage: catalog list|show|create|update|delete|backend|"
+                             "suspend|restore|release ...");
+                continue;
+            }
+            const std::string sub = mm::util::to_lower(tokens[1]);
+            if (sub == "list") {
+                emit_http_result("catalog list", self.get("/v1/served-models"));
+                continue;
+            }
+            if (sub == "show") {
+                if (tokens.size() < 3) {
+                    printer.line("usage: catalog show <served_model_id>");
+                    continue;
+                }
+                emit_http_result("catalog show", self.get("/v1/served-models/" + tokens[2]));
+                continue;
+            }
+            if (sub == "create" || sub == "update") {
+                const bool create = sub == "create";
+                if (tokens.size() < (create ? 3u : 4u)) {
+                    printer.line(create ? "usage: catalog create <json>"
+                                        : "usage: catalog update <served_model_id> <json>");
+                    continue;
+                }
+                try {
+                    const auto j =
+                        nlohmann::json::parse(mm::cli::join_tokens(tokens, create ? 2 : 3));
+                    emit_http_result("catalog " + sub,
+                                     create ? self.post("/v1/served-models", j)
+                                            : self.put("/v1/served-models/" + tokens[2], j));
+                } catch (const std::exception& e) {
+                    printer.line(std::string("error: invalid JSON: ") + e.what());
+                }
+                continue;
+            }
+            if (sub == "backend") {
+                if (tokens.size() < 4) {
+                    printer.line("usage: catalog backend <served_model_id> <auto|soma|fallback>");
+                    continue;
+                }
+                emit_http_result("catalog backend",
+                                 self.put("/v1/served-models/" + tokens[2] + "/backend",
                                           nlohmann::json{{"backend_override", tokens[3]}}));
                 continue;
             }
-            // Placement lifecycle. These three had no /v1 route at all until the
-            // parity audit: the scheduler could do them and the node API exposed
-            // them, and no client could ask for them.
             if (sub == "suspend" || sub == "restore" || sub == "release") {
                 if (tokens.size() < 3) {
-                    printer.line("usage: agents " + sub + " <agent_id>");
+                    printer.line("usage: catalog " + sub + " <served_model_id>" +
+                                 (sub == "release" ? " [--force]" : ""));
                     continue;
                 }
-                emit_http_result("agents " + sub,
-                                 self.post("/v1/agents/" + tokens[2] + "/" + sub,
+                const bool force = tokens.size() >= 4 && tokens[3] == "--force";
+                emit_http_result("catalog " + sub,
+                                 self.post("/v1/served-models/" + tokens[2] + "/" + sub +
+                                               (sub == "release" && force ? "?force=true" : ""),
                                            nlohmann::json::object()));
                 continue;
             }
             if (sub == "delete") {
                 if (tokens.size() < 3) {
-                    printer.line("usage: agents delete <agent_id>");
+                    printer.line("usage: catalog delete <served_model_id>");
                     continue;
                 }
-                auto r = self.del("/v1/agents/" + tokens[2]);
-                emit_http_result("agents delete", r);
+                emit_http_result("catalog delete", self.del("/v1/served-models/" + tokens[2]));
                 continue;
             }
-            printer.line("error: unknown agents subcommand");
+            printer.line("error: unknown catalog subcommand");
             continue;
         }
 
         if (cmd0 == "chat") {
             if (tokens.size() < 4 || mm::util::to_lower(tokens[1]) != "send") {
-                printer.line("usage: chat send <agent_id> <message> [conversation_id]");
+                printer.line("usage: chat send <user_id> <message> [conversation_id] "
+                             "[--model <served_model_id>]");
                 continue;
             }
-            const std::string conv_hint = tokens.size() >= 5 ? tokens[4] : "";
-            const std::string path = "/v1/agents/" + tokens[2] + "/chat";
+            std::string conv_hint;
+            std::string model;
+            for (std::size_t i = 4; i < tokens.size(); ++i) {
+                if (tokens[i] == "--model" && i + 1 < tokens.size()) {
+                    model = tokens[++i];
+                } else if (conv_hint.empty()) {
+                    conv_hint = tokens[i];
+                }
+            }
+            const std::string path = "/v1/users/" + tokens[2] + "/chat";
             nlohmann::json body = {{"message", tokens[3]}};
             if (!conv_hint.empty()) body["conversation_id"] = conv_hint;
+            if (!model.empty()) body["model"] = model;
             bool done_seen = false;
             bool done_success = false;
             std::string done_error;
             std::string done_conv_id;
+            std::string done_model_id;
             bool printed_delta = false;
             int stream_status = 0;
             std::string stream_body;
@@ -1342,8 +1401,10 @@ static void run_control_cli(uint16_t listen_port,
                         event["arguments"] = j.value("arguments", std::string{});
                     } else if (type == "done") {
                         event["conv_id"] = j.value("conv_id", std::string{});
+                        event["model_id"] = j.value("model_id", std::string{});
                         event["success"] = j.value("success", false);
                         if (j.contains("error")) event["error"] = j["error"];
+                        if (j.contains("code")) event["code"] = j["code"];
                     }
                     printer.block(event.dump());
                 } else {
@@ -1361,6 +1422,7 @@ static void run_control_cli(uint16_t listen_port,
                     done_seen = true;
                     done_success = j.value("success", false);
                     done_conv_id = j.value("conv_id", std::string{});
+                    done_model_id = j.value("model_id", std::string{});
                     done_error = j.value("error", std::string{});
                 }
                 return true;
@@ -1369,7 +1431,8 @@ static void run_control_cli(uint16_t listen_port,
             if (!json_mode && printed_delta) printer.line("");
             const bool success = stream_ok && done_seen && done_success;
             if (success) {
-                emit_result(true, "chat send", nlohmann::json{{"conv_id", done_conv_id}}, "");
+                emit_result(true, "chat send",
+                            nlohmann::json{{"conv_id", done_conv_id}, {"model_id", done_model_id}}, "");
             } else {
                 std::string error;
                 if (done_seen && !done_success) error = done_error.empty() ? "chat failed" : done_error;
@@ -1394,19 +1457,19 @@ static void run_control_cli(uint16_t listen_port,
             // propose/review loop was TUI-only in practice.
             if (group == "propose") {
                 emit_http_result("curation propose",
-                                 self.post("/v1/agents/" + tokens[2] + "/curation/proposals",
+                                 self.post("/v1/users/" + tokens[2] + "/curation/proposals",
                                            nlohmann::json::object()));
                 continue;
             }
             if (group == "apply") {
                 if (tokens.size() < 4) {
-                    printer.line("usage: curation apply <agent_id> <json>");
+                    printer.line("usage: curation apply <user_id> <json>");
                     continue;
                 }
                 try {
                     emit_http_result(
                         "curation apply",
-                        self.post("/v1/agents/" + tokens[2] + "/curation/apply",
+                        self.post("/v1/users/" + tokens[2] + "/curation/apply",
                                   nlohmann::json::parse(mm::cli::join_tokens(tokens, 3))));
                 } catch (const std::exception& e) {
                     printer.line(std::string("error: invalid JSON: ") + e.what());
@@ -1415,24 +1478,24 @@ static void run_control_cli(uint16_t listen_port,
             }
 
             // ── conversation-local memories ───────────────────────────────────
-            // Distinct from the agent-wide memories `curation mem` reaches:
+            // Distinct from the user-wide memories `curation mem` reaches:
             // these are scoped to one conversation, and all four verbs were
             // unreachable outside the TUI.
             if (group == "local") {
                 if (tokens.size() < 5) {
                     printer.line("usage: curation local list|create|update|delete "
-                                 "<agent_id> <conv_id> [memory_id] [json]");
+                                 "<user_id> <conv_id> [memory_id] [json]");
                     continue;
                 }
                 const std::string base =
-                    "/v1/agents/" + tokens[3] + "/conversations/" + tokens[4] + "/local-memories";
+                    "/v1/users/" + tokens[3] + "/conversations/" + tokens[4] + "/local-memories";
                 if (sub == "list") {
                     emit_http_result("curation local list", self.get(base));
                     continue;
                 }
                 if (sub == "create") {
                     if (tokens.size() < 6) {
-                        printer.line("usage: curation local create <agent_id> <conv_id> <json>");
+                        printer.line("usage: curation local create <user_id> <conv_id> <json>");
                         continue;
                     }
                     try {
@@ -1447,7 +1510,7 @@ static void run_control_cli(uint16_t listen_port,
                 }
                 if (sub == "update") {
                     if (tokens.size() < 7) {
-                        printer.line("usage: curation local update <agent_id> <conv_id> "
+                        printer.line("usage: curation local update <user_id> <conv_id> "
                                      "<memory_id> <json>");
                         continue;
                     }
@@ -1463,7 +1526,7 @@ static void run_control_cli(uint16_t listen_port,
                 }
                 if (sub == "delete") {
                     if (tokens.size() < 6) {
-                        printer.line("usage: curation local delete <agent_id> <conv_id> "
+                        printer.line("usage: curation local delete <user_id> <conv_id> "
                                      "<memory_id>");
                         continue;
                     }
@@ -1477,21 +1540,21 @@ static void run_control_cli(uint16_t listen_port,
             if (group == "conv") {
                 if (sub == "list") {
                     if (tokens.size() < 4) {
-                        printer.line("usage: curation conv list <agent_id>");
+                        printer.line("usage: curation conv list <user_id>");
                         continue;
                     }
-                    auto r = self.get("/v1/agents/" + tokens[3] + "/conversations");
+                    auto r = self.get("/v1/users/" + tokens[3] + "/conversations");
                     emit_http_result("curation conv list", r);
                     continue;
                 }
                 if (sub == "create") {
                     if (tokens.size() < 5) {
-                        printer.line("usage: curation conv create <agent_id> <json>");
+                        printer.line("usage: curation conv create <user_id> <json>");
                         continue;
                     }
                     try {
                         auto j = nlohmann::json::parse(mm::cli::join_tokens(tokens, 4));
-                        auto r = self.post("/v1/agents/" + tokens[3] + "/conversations", j);
+                        auto r = self.post("/v1/users/" + tokens[3] + "/conversations", j);
                         emit_http_result("curation conv create", r);
                     } catch (const std::exception& e) {
                         printer.line(std::string("error: invalid JSON: ") + e.what());
@@ -1500,10 +1563,10 @@ static void run_control_cli(uint16_t listen_port,
                 }
                 if (sub == "activate" || sub == "delete" || sub == "compact") {
                     if (tokens.size() < 5) {
-                        printer.line("usage: curation conv activate|delete|compact <agent_id> <conv_id>");
+                        printer.line("usage: curation conv activate|delete|compact <user_id> <conv_id>");
                         continue;
                     }
-                    const std::string base = "/v1/agents/" + tokens[3] + "/conversations/" + tokens[4];
+                    const std::string base = "/v1/users/" + tokens[3] + "/conversations/" + tokens[4];
                     mm::HttpResponse r;
                     if (sub == "activate") r = self.post(base + "/activate", nlohmann::json::object());
                     else if (sub == "compact") r = self.post(base + "/compact", nlohmann::json::object());
@@ -1516,30 +1579,30 @@ static void run_control_cli(uint16_t listen_port,
             if (group == "mem") {
                 if (sub == "list") {
                     if (tokens.size() < 4) {
-                        printer.line("usage: curation mem list <agent_id>");
+                        printer.line("usage: curation mem list <user_id>");
                         continue;
                     }
-                    auto r = self.get("/v1/agents/" + tokens[3] + "/memories");
+                    auto r = self.get("/v1/users/" + tokens[3] + "/memories");
                     emit_http_result("curation mem list", r);
                     continue;
                 }
                 if (sub == "delete") {
                     if (tokens.size() < 5) {
-                        printer.line("usage: curation mem delete <agent_id> <memory_id>");
+                        printer.line("usage: curation mem delete <user_id> <memory_id>");
                         continue;
                     }
-                    auto r = self.del("/v1/agents/" + tokens[3] + "/memories/" + tokens[4]);
+                    auto r = self.del("/v1/users/" + tokens[3] + "/memories/" + tokens[4]);
                     emit_http_result("curation mem delete", r);
                     continue;
                 }
                 if (sub == "extract") {
                     if (tokens.size() < 5) {
-                        printer.line("usage: curation mem extract <agent_id> <json>");
+                        printer.line("usage: curation mem extract <user_id> <json>");
                         continue;
                     }
                     try {
                         auto j = nlohmann::json::parse(mm::cli::join_tokens(tokens, 4));
-                        auto r = self.post("/v1/agents/" + tokens[3] + "/memories/extract", j);
+                        auto r = self.post("/v1/users/" + tokens[3] + "/memories/extract", j);
                         emit_http_result("curation mem extract", r);
                     } catch (const std::exception& e) {
                         printer.line(std::string("error: invalid JSON: ") + e.what());
@@ -1553,7 +1616,7 @@ static void run_control_cli(uint16_t listen_port,
         }
 
         // GET /v1/placements had no CLI reader at all — the one route that says
-        // where every agent actually is.
+        // where every served model actually is.
         if (cmd0 == "placements") {
             emit_http_result("placements", self.get("/v1/placements"));
             continue;
@@ -1573,29 +1636,29 @@ static void run_control_cli(uint16_t listen_port,
             const std::string sub =
                 tokens.size() < 2 ? std::string{} : mm::util::to_lower(tokens[1]);
             if (sub == "show" && tokens.size() > 2) {
-                emit_http_result("voice show", self.get("/v1/agents/" + tokens[2] + "/voice"));
+                emit_http_result("voice show", self.get("/v1/users/" + tokens[2] + "/voice"));
                 continue;
             }
             if (sub == "proposals" && tokens.size() > 2) {
                 emit_http_result("voice proposals",
-                                 self.get("/v1/agents/" + tokens[2] + "/voice/proposals"));
+                                 self.get("/v1/users/" + tokens[2] + "/voice/proposals"));
                 continue;
             }
             if (sub == "propose" && tokens.size() > 2) {
                 emit_http_result("voice propose",
-                                 self.post("/v1/agents/" + tokens[2] + "/voice/proposals",
+                                 self.post("/v1/users/" + tokens[2] + "/voice/proposals",
                                            nlohmann::json::object()));
                 continue;
             }
             if ((sub == "approve" || sub == "reject" || sub == "sample") && tokens.size() > 3) {
                 emit_http_result("voice " + sub,
-                                 self.post("/v1/agents/" + tokens[2] + "/voice/proposals/" +
+                                 self.post("/v1/users/" + tokens[2] + "/voice/proposals/" +
                                                tokens[3] + "/" + sub,
                                            nlohmann::json::object()));
                 continue;
             }
-            printer.line("usage: voice show|proposals|propose <agent_id>  |  "
-                         "voice approve|reject|sample <agent_id> <proposal_id>");
+            printer.line("usage: voice show|proposals|propose <user_id>  |  "
+                         "voice approve|reject|sample <user_id> <proposal_id>");
             continue;
         }
 
@@ -1620,13 +1683,15 @@ static void run_control_cli(uint16_t listen_port,
             }
             if (sub == "create") {
                 if (tokens.size() < 3) {
-                    printer.line("usage: tokens create <label> [read|chat|operator,...]");
+                    printer.line("usage: tokens create <label> [read|chat|operator,...] [user_id]");
                     continue;
                 }
                 nlohmann::json body{{"label", tokens[2]}};
                 // Defaults to `read` rather than to everything: a credential
                 // whose scope nobody chose should be the harmless one.
                 body["scopes"] = tokens.size() > 3 ? tokens[3] : std::string{"read"};
+                // Bound to a user, the token reaches only that user's routes.
+                if (tokens.size() > 4) body["user_id"] = tokens[4];
                 const auto r = self.post("/v1/tokens", body);
                 if (r.ok()) printer.line("  the plaintext token is shown ONCE — store it now");
                 emit_http_result("tokens create", r);
@@ -1759,18 +1824,18 @@ int main(int argc, char** argv) {
     // ── control.db ────────────────────────────────────────────────────────────
     //
     // The first control-wide database in this system. Without an admission
-    // record, select_backend() routes every agent to the fallback — absence of a
-    // record is not evidence of admissibility — so this is what makes Soma
-    // reachable at all.
+    // record, select_backend() routes every served model to the fallback —
+    // absence of a record is not evidence of admissibility — so this is what
+    // makes Soma reachable at all.
     mm::ControlModelRegistry model_registry;
     {
         std::string registry_error;
         if (!model_registry.open(cfg.data_dir, registry_error)) {
             // Non-fatal. A control that cannot open its registry still serves
-            // llama.cpp agents correctly; refusing to start would turn a routing
+            // llama.cpp models correctly; refusing to start would turn a routing
             // limitation into an outage.
-            MM_WARN("Model registry unavailable ({}); every agent will route to the "
-                    "fallback engine", registry_error);
+            MM_WARN("Model registry unavailable ({}); every served model will route to "
+                    "the fallback engine", registry_error);
         } else {
             mm::AdmissionTools tools;
             tools.python = cfg.admission_python;
@@ -1789,13 +1854,13 @@ int main(int argc, char** argv) {
         }
     }
 
-    mm::AgentManager agents(cfg.data_dir);
-    agents.load_all();
+    // Users: data/users/{id}. data/agents/, if present, is never read.
+    mm::UserManager users(cfg.data_dir);
+    users.load_all();
 
     mm::NodeRegistry      registry(cfg.data_dir);
-    mm::AgentScheduler    scheduler(registry, cfg.models_dir);
+    mm::PlacementScheduler scheduler(registry, cfg.models_dir);
     registry.set_offline_after_seconds(static_cast<int>(cfg.node_offline_after_s));
-    mm::AgentQueue        queue;
     // Both sides of the routing decision see the same registry: the scheduler
     // reads it to choose an engine, the API serves and edits it. Two lookups
     // against one table rather than a cached copy that can disagree with itself.
@@ -1807,17 +1872,17 @@ int main(int argc, char** argv) {
     // because the scheduler holds the registry as const on purpose: it reads
     // verdicts and must not be able to write model rows.
     scheduler.set_placement_audit({
-        [&model_registry](const mm::AgentId& agent_id,
+        [&model_registry](const mm::HolderId& holder_id,
                           const mm::NodeId& node_id,
                           const mm::SlotId& slot_id,
                           const std::string& backend,
                           const std::string& backend_reason,
                           const mm::ResourceFootprint& footprint) {
             model_registry.record_placement(
-                agent_id, node_id, slot_id, backend, backend_reason, footprint);
+                holder_id, node_id, slot_id, backend, backend_reason, footprint);
         },
-        [&model_registry](const mm::AgentId& agent_id) {
-            model_registry.mark_placement_released(agent_id);
+        [&model_registry](const mm::HolderId& holder_id) {
+            model_registry.mark_placement_released(holder_id);
         },
     });
 
@@ -1857,36 +1922,31 @@ int main(int argc, char** argv) {
             return engine_config.get();
         });
 
+    // The served-model catalog: the rows an operator wrote plus every admission
+    // Soma can serve. It reads the registry's database, so it lists nothing if
+    // the registry did not open. Declared before the API server so it outlives
+    // the server's threads at shutdown.
+    mm::ServedModelCatalog served_models(model_registry);
+    served_models.set_soma_configured([&engine_config]() {
+        // No engine policy yet: placement refuses everything until one exists,
+        // so there is nothing Soma-specific to hide.
+        if (!engine_config.configured()) return true;
+        const auto required = engine_config.get().required_engines();
+        return std::find(required.begin(), required.end(), "soma") != required.end();
+    });
+
     mm::ControlApiServer  api_server(
-        agents, queue, registry, scheduler,
-        cfg.data_dir, cfg.models_dir, cfg.external_api_token, cfg.tts);
+        users, registry, scheduler,
+        cfg.data_dir, cfg.models_dir, cfg.external_api_token, cfg.tts,
+        static_cast<std::size_t>(std::max(1, cfg.chat_worker_threads)));
     api_server.set_model_registry(&model_registry);
     api_server.set_engine_config_store(&engine_config);
+    api_server.set_served_model_catalog(&served_models);
     api_server.cleanup_expired_tts_cache();
     mm::ControlUI         ui(
         registry,
-        agents,
-        scheduler,
-        cfg.models_dir,
         "http://127.0.0.1:" + std::to_string(cfg.listen_port),
-        cfg.external_api_token,
-        [&api_server](const std::string& agent_id,
-                      const std::string& message,
-                      std::string* out_text,
-                      std::string* out_conv_id,
-                      std::string* out_error) -> bool {
-            auto res = api_server.chat_local(agent_id, message);
-            if (out_text) {
-                std::string text;
-                for (const auto& c : res.chunks) {
-                    if (!c.delta_content.empty()) text += c.delta_content;
-                }
-                *out_text = std::move(text);
-            }
-            if (out_conv_id) *out_conv_id = res.conv_id;
-            if (out_error) *out_error = res.error;
-            return res.success;
-        });
+        cfg.external_api_token);
 
     api_server.set_log_callback([&](int level, const std::string& message) {
         auto ll = level == 2 ? mm::ControlUI::LogLevel::Error
@@ -1925,7 +1985,10 @@ int main(int argc, char** argv) {
 
             if (!stop_housekeeping) {
                 MM_INFO("Running scheduler housekeeping");
-                scheduler.housekeeping(agents.list_agents());
+                // Every holder that still exists: the catalog's models.
+                std::vector<mm::ServedModel> live;
+                for (const auto& entry : served_models.list()) live.push_back(entry.model);
+                scheduler.housekeeping(live);
                 api_server.cleanup_expired_tts_cache();
             }
         }
@@ -1994,7 +2057,6 @@ int main(int argc, char** argv) {
     api_server.stop_openai_compat();
     registry.stop_discovery_listen();
     registry.stop_health_poll();
-    queue.shutdown();
     if (server_thread.joinable()) server_thread.join();
     if (openai_server_thread.joinable()) openai_server_thread.join();
     MM_INFO("mantic-mind-control stopped");

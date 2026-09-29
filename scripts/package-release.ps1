@@ -327,7 +327,7 @@ $Manifest = @(
     "Not included:",
     "- managed inference runtime installs and Python package environments",
     "- model weights and model caches",
-    "- runtime data, logs, and local agent databases"
+    "- runtime data, logs, and local user databases"
 )
 $Manifest | Set-Content -Path (Join-Path $PackageRoot "release-manifest.txt") -Encoding UTF8
 

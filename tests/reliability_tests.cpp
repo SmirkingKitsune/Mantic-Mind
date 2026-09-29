@@ -1,19 +1,15 @@
 #include "common/inference_response_parser.hpp"
-#include "common/agent.hpp"
-#include "common/agent_db.hpp"
 #include "common/config_file.hpp"
-#include "common/conversation_manager.hpp"
 #include "common/http_client.hpp"
 #include "common/runtime_client.hpp"
 #include "common/memory_manager.hpp"
 #include "common/trace_provenance.hpp"
 #include "common/tool_executor.hpp"
 #include "common/util.hpp"
-#include "control/agent_manager.hpp"
-#include "control/agent_queue.hpp"
 #include "common/engine_capabilities.hpp"
 #include "common/engine_client.hpp"
-#include "control/agent_scheduler.hpp"
+#include "control/placement_scheduler.hpp"
+#include "control/served_model_catalog.hpp"
 #include "control/engine_config_store.hpp"
 #include "control/engine_group_planner.hpp"
 #include "node/node_api_server.hpp"
@@ -26,12 +22,16 @@
 #include "common/pairing.hpp"
 #include "control/model_registry.hpp"
 #include "control/route_scope.hpp"
+#include "control/user_manager.hpp"
+#include "control/served_model_catalog.hpp"
+#include "common/user_db.hpp"
+#include "common/conversation_context.hpp"
 #include "control/node_registry.hpp"
 #include "control/performance_tracker.hpp"
 #include "control/tts_service_client.hpp"
 #include "common/gguf_metadata.hpp"
 #include "common/inference_sizing.hpp"
-#include "control/agent_config_validator.hpp"
+#include "control/served_model_validator.hpp"
 // The requantization gate reaches into the ENGINE's types: arch_hash is
 // computed there, and the KV store is what enforces the invalidation.
 #include "soma/arch_ir.hpp"
@@ -54,6 +54,7 @@
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -123,6 +124,11 @@ inline void transport_backoff(int attempt) {
 }
 
 #define CHECK(expr) do { if (!check((expr), #expr, __LINE__)) return false; } while (0)
+
+// What a fake node was told the holder is: the served-model id.
+std::string holder_of(const nlohmann::json& body) {
+    return body.value("holder_id", std::string{});
+}
 
 std::filesystem::path temp_test_dir(const std::string& name) {
     return std::filesystem::temp_directory_path()
@@ -358,188 +364,6 @@ bool test_stream_tool_call_indices() {
     return true;
 }
 
-bool test_agent_queue_survives_throwing_job() {
-    mm::AgentQueue queue;
-    std::mutex mutex;
-    std::condition_variable cv;
-    bool completed = false;
-    bool failure_reported = false;
-
-    mm::InferenceJob failing;
-    failing.job_id = "throwing-job";
-    failing.agent_id = "agent-a";
-    failing.conversation_id = "conv-a";
-    failing.done_cb = [&](const mm::ConvId& conv_id, bool success) {
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            failure_reported = (conv_id == "conv-a" && !success);
-        }
-        cv.notify_one();
-    };
-    failing.process_fn = [] {
-        throw std::runtime_error("intentional test failure");
-    };
-    queue.enqueue(std::move(failing));
-
-    mm::InferenceJob succeeding;
-    succeeding.job_id = "succeeding-job";
-    succeeding.agent_id = "agent-a";
-    succeeding.process_fn = [&] {
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            completed = true;
-        }
-        cv.notify_one();
-    };
-    queue.enqueue(std::move(succeeding));
-
-    std::unique_lock<std::mutex> lock(mutex);
-    CHECK(cv.wait_for(lock, std::chrono::seconds(3), [&] {
-        return completed && failure_reported;
-    }));
-    lock.unlock();
-    queue.shutdown();
-    return true;
-}
-
-bool test_agent_manager_rejects_duplicates_and_defers_cleanup_until_handles_release() {
-    auto dir = temp_test_dir("agents");
-    std::filesystem::create_directories(dir);
-    const auto agent_dir = dir / "agents" / "agent-a";
-
-    mm::AgentManager manager(dir.string());
-    mm::AgentConfig cfg;
-    cfg.id = "agent-a";
-    cfg.name = "Agent A";
-    cfg.model_path = "model.gguf";
-
-    CHECK(manager.create_agent(cfg) == "agent-a");
-    auto held = manager.get_agent("agent-a");
-    CHECK(static_cast<bool>(held));
-
-    bool duplicate_rejected = false;
-    try {
-        manager.create_agent(cfg);
-    } catch (const std::invalid_argument&) {
-        duplicate_rejected = true;
-    }
-    CHECK(duplicate_rejected);
-
-    CHECK(manager.delete_agent("agent-a"));
-    CHECK(held->get_id() == "agent-a");
-    CHECK(std::filesystem::exists(agent_dir));
-
-    held.reset();
-    CHECK(!std::filesystem::exists(agent_dir));
-
-    CHECK(remove_tree(dir));
-    return true;
-}
-
-bool test_agent_api_settings_round_trip_without_key_persistence() {
-    auto dir = temp_test_dir("agent-api-settings");
-    std::filesystem::create_directories(dir);
-
-    {
-        mm::AgentManager manager(dir.string());
-        mm::AgentConfig cfg;
-        cfg.id = "api-agent";
-        cfg.name = "API Agent";
-        cfg.model_path = "frontier-test-model";
-        cfg.inference_backend = "api";
-        cfg.api_settings.base_url = "https://api.openai.com";
-        cfg.api_settings.chat_completions_path = "/v1/chat/completions";
-        cfg.api_settings.api_key = "secret-not-persisted";
-        cfg.api_settings.api_key_env = "MANTIC_TEST_API_KEY";
-        cfg.served_model_name = "api-agent-alias";
-        cfg.runtime_settings.top_k = 20;
-        cfg.runtime_settings.min_p = 0.0f;
-        cfg.runtime_settings.presence_penalty = 1.5f;
-        cfg.runtime_settings.repeat_penalty = 1.0f;
-
-        CHECK(manager.create_agent(cfg) == "api-agent");
-        auto agent = manager.get_agent("api-agent");
-        CHECK(static_cast<bool>(agent));
-
-        auto live = agent->get_config();
-        CHECK(live.inference_backend == "api");
-        CHECK(live.api_settings.api_key == "secret-not-persisted");
-
-        nlohmann::json live_json = live;
-        const std::string live_dump = live_json.dump();
-        CHECK(live_dump.find("secret-not-persisted") == std::string::npos);
-        CHECK(live_json["api_settings"]["api_key_configured"] == true);
-        CHECK(live_json["api_settings"]["api_key_env"] == "MANTIC_TEST_API_KEY");
-
-        mm::AgentDB persisted("api-agent", dir.string());
-        auto loaded = persisted.load_config();
-        CHECK(loaded.inference_backend == "api");
-        CHECK(loaded.model_path == "frontier-test-model");
-        CHECK(loaded.served_model_name == "api-agent-alias");
-        CHECK(loaded.api_settings.base_url == "https://api.openai.com");
-        CHECK(loaded.api_settings.chat_completions_path == "/v1/chat/completions");
-        CHECK(loaded.api_settings.api_key.empty());
-        CHECK(loaded.api_settings.api_key_env == "MANTIC_TEST_API_KEY");
-        CHECK(loaded.runtime_settings.top_k == 20);
-        CHECK(loaded.runtime_settings.min_p == 0.0f);
-        CHECK(loaded.runtime_settings.presence_penalty == 1.5f);
-        CHECK(loaded.runtime_settings.repeat_penalty == 1.0f);
-
-        nlohmann::json loaded_json = loaded;
-        CHECK(loaded_json.dump().find("secret-not-persisted") == std::string::npos);
-        CHECK(loaded_json["api_settings"]["api_key_configured"] == false);
-    }
-
-    CHECK(remove_tree(dir));
-    return true;
-}
-
-bool test_served_model_name_legacy_compatibility() {
-    nlohmann::json legacy_json = {
-        {"id", "legacy-json-agent"},
-        {"name", "Legacy JSON Agent"},
-        {"model_path", "legacy.gguf"},
-        {"vllm_settings", {{"served_model_name", "legacy-json-alias"}}}
-    };
-    const auto from_legacy_json = legacy_json.get<mm::AgentConfig>();
-    CHECK(from_legacy_json.served_model_name == "legacy-json-alias");
-
-    auto dir = temp_test_dir("legacy-model-alias");
-    std::filesystem::create_directories(dir);
-    {
-        mm::AgentDB db("legacy-db-agent", dir.string());
-        mm::AgentConfig cfg;
-        cfg.id = "legacy-db-agent";
-        cfg.name = "Legacy DB Agent";
-        cfg.model_path = "legacy.gguf";
-        cfg.served_model_name = "modern-alias";
-        db.save_config(cfg);
-    }
-
-    const auto db_path = dir / "agents" / "legacy-db-agent" / "agent.db";
-    {
-        SQLite::Database db(db_path.string(), SQLite::OPEN_READWRITE);
-        db.exec(R"sql(
-            UPDATE agent_config
-               SET served_model_name = '',
-                   inference_backend = 'vllm',
-                   vllm_settings_json = '{"served_model_name":"legacy-db-alias"}'
-             WHERE id = 'legacy-db-agent'
-        )sql");
-        db.exec("DELETE FROM schema_migrations WHERE version = 12");
-    }
-    {
-        mm::AgentDB db("legacy-db-agent", dir.string());
-        const auto loaded = db.load_config();
-        CHECK(loaded.served_model_name == "legacy-db-alias");
-        CHECK(loaded.inference_backend == "llama-cpp");
-        CHECK(loaded.backend_override == "auto");
-    }
-
-    CHECK(remove_tree(dir));
-    return true;
-}
-
 bool test_engine_supervisor_not_found_statuses() {
     auto dir = temp_test_dir("slots");
     mm::EngineSupervisor slots(46100, 46101, 1);
@@ -560,7 +384,7 @@ bool test_engine_supervisor_not_found_statuses() {
 bool test_slot_lease_blocks_unload_and_suspend_while_busy() {
     auto dir = temp_test_dir("lease-busy");
     mm::EngineSupervisor slots(46110, 46111, 1);
-    const auto slot_id = slots.add_ready_test_engine("llama-cpp", "test-model.gguf", "agent-a");
+    const auto slot_id = slots.add_ready_test_engine("llama-cpp", "test-model.gguf", "model-a");
 
     {
         auto inference_lease = slots.acquire(slot_id);
@@ -808,7 +632,7 @@ bool test_failed_inference_workers_are_harvested_and_drained() {
     // default-constructed Message — role User, not Assistant. That is exactly
     // the non-stream failure branch, which returned early out of the worker
     // body and jumped over the bookkeeping that retires it.
-    const auto slot = engines.add_ready_test_engine("llama-cpp", "test-model.gguf", "agent-a");
+    const auto slot = engines.add_ready_test_engine("llama-cpp", "test-model.gguf", "model-a");
     CHECK(!slot.empty());
 
     mm::NodeApiServer api(state, engines);
@@ -894,7 +718,7 @@ bool test_crashed_engine_releases_its_slot_and_port() {
     // crash used to brick the node until an operator unloaded the corpse by
     // hand, because the Error record went on counting as a live engine.
     mm::EngineSupervisor slots(46130, 46131, 1);
-    const auto slot_id = slots.add_ready_test_engine("llama-cpp", "test-model.gguf", "agent-a");
+    const auto slot_id = slots.add_ready_test_engine("llama-cpp", "test-model.gguf", "model-a");
     CHECK(slots.available_slot_count() == 0);
 
     slots.crash_test_engine(slot_id, 139, "segmentation fault");
@@ -906,8 +730,8 @@ bool test_crashed_engine_releases_its_slot_and_port() {
     CHECK(info->state == mm::SlotState::Error);
     CHECK(slots.last_error().find("139") != std::string::npos);
 
-    // ...and its agents are detached, so nothing believes it is still placed.
-    CHECK(info->assigned_agent.empty());
+    // ...and its holders are detached, so nothing believes it is still placed.
+    CHECK(info->holder_ids.empty());
 
     // But it no longer holds the node's only slot: a dead process consumes no
     // capacity, and available_slot_count() is what control reads to decide
@@ -923,11 +747,11 @@ bool test_crashed_engine_releases_its_slot_and_port() {
 
     // A checkpoint-suspended engine still frees its slot, and a Ready one still
     // holds it — the pre-existing contract the shared predicate had to preserve.
-    const auto suspended = slots.add_suspended_test_engine("llama-cpp", "other.gguf", "agent-b");
+    const auto suspended = slots.add_suspended_test_engine("llama-cpp", "other.gguf", "model-b");
     CHECK(!suspended.empty());
     CHECK(slots.available_slot_count() == 1);
 
-    const auto replacement = slots.add_ready_test_engine("llama-cpp", "test-model.gguf", "agent-c");
+    const auto replacement = slots.add_ready_test_engine("llama-cpp", "test-model.gguf", "model-c");
     CHECK(!replacement.empty());
     CHECK(slots.available_slot_count() == 0);
 
@@ -1384,7 +1208,7 @@ bool test_vllm_launch_profile_and_environment() {
     const auto descriptor = mm::make_vllm_descriptor("vllm");
     auto alternate_devices = request;
     alternate_devices.gpu_devices = {0, 1};
-    // A new agent may attach to an already-compatible server; the device list
+    // A new holder may attach to an already-compatible server; the device list
     // is a reservation for process creation, not part of the serving API.
     CHECK(descriptor.launch_compatible(request, alternate_devices));
     auto changed = request;
@@ -1651,42 +1475,44 @@ bool test_placement_refused_until_engine_config_exists() {
     std::filesystem::create_directories(dir / "models");
 
     mm::NodeRegistry registry(dir.string());
-    mm::AgentScheduler scheduler(registry, (dir / "models").string());
+    mm::PlacementScheduler scheduler(registry, (dir / "models").string());
     mm::EngineConfigStore store(dir.string());
     std::string err;
     CHECK(store.load(err));
     scheduler.set_engine_config_gate([&store]() { return store.configured(); });
 
-    mm::AgentConfig cfg;
-    cfg.id = "agent-gate";
-    cfg.name = "Gate";
+    mm::ServedModel cfg;
+    cfg.id = "gate-model";
+    cfg.display_name = "Gate";
     cfg.model_path = "Qwen/Qwen3-8B";
 
     // No configuration: refused, and the message names the fix. "No available
     // nodes" would send an operator to inspect nodes that are all healthy.
-    CHECK(!scheduler.ensure_agent_running(cfg).has_value());
-    const std::string refusal = scheduler.last_error();
+    const auto refused = scheduler.ensure_running(cfg);
+    CHECK(!refused.ok());
+    const std::string refusal = refused.error;
     CHECK(refusal.find("engine configuration") != std::string::npos);
     CHECK(refusal.find("/v1/cluster/engines/config") != std::string::npos);
     // Structurally, not by prose. This assertion used to exist only as the
     // string match above, which is the defect D64 names: reword the message and
     // the test still passes while every client breaks.
-    CHECK(scheduler.last_failure() == mm::PlacementFailure::EngineConfigMissing);
+    CHECK(refused.failure == mm::PlacementFailure::EngineConfigMissing);
     // An operator must act. Retrying this forever is the wrong behaviour and a
     // client can now know that without reading English.
-    CHECK(!mm::placement_failure_retryable(scheduler.last_failure()));
+    CHECK(!mm::placement_failure_retryable(refused.failure));
 
     // Configured: the gate opens. It still finds no node — there are none
     // registered — but the refusal is no longer the configuration one, which is
     // the distinction being asserted.
     CHECK(store.save(mm::EngineConfigStore::default_for("llama-cpp"), {}, "test", err));
-    CHECK(!scheduler.ensure_agent_running(cfg).has_value());
-    CHECK(scheduler.last_error().find("engine configuration required") == std::string::npos);
+    const auto unplaced = scheduler.ensure_running(cfg);
+    CHECK(!unplaced.ok());
+    CHECK(unplaced.error.find("engine configuration required") == std::string::npos);
     // The SAME failure the old code called "no capacity: no connected node
     // could load this model" — which conflated an unconfigured cluster with a
     // full one. Nothing is eligible here; nothing is full.
-    CHECK(scheduler.last_failure() == mm::PlacementFailure::NoEligibleNode);
-    CHECK(mm::placement_failure_retryable(scheduler.last_failure()));
+    CHECK(unplaced.failure == mm::PlacementFailure::NoEligibleNode);
+    CHECK(mm::placement_failure_retryable(unplaced.failure));
 
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
@@ -2342,6 +2168,7 @@ bool test_scheduler_skips_failed_node_current_attempt() {
             nlohmann::json body = {
                 {"loaded_model", ""},
                 {"slots", nlohmann::json::array()},
+                {"wire_protocol", mm::kNodeWireProtocol},
                 {"max_slots", 1},
                 {"slot_in_use", 0},
                 {"slot_available", 1},
@@ -2410,29 +2237,29 @@ bool test_scheduler_skips_failed_node_current_attempt() {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
-    mm::AgentScheduler scheduler(registry, (dir / "models").string());
-    mm::AgentConfig cfg;
-    cfg.id = "agent-a";
-    cfg.name = "Agent A";
+    mm::PlacementScheduler scheduler(registry, (dir / "models").string());
+    mm::ServedModel cfg;
+    cfg.id = "model-a";
+    cfg.display_name = "Model A";
     cfg.model_path = "Qwen/Qwen3-8B";
     cfg.preferred_node_id = bad_id;
 
     auto retired = cfg;
-    retired.id = "retired-agent";
+    retired.id = "retired-model";
     retired.inference_backend = "vllm";
-    RECORD(!scheduler.ensure_agent_running(retired).has_value());
-    // Asserted STRUCTURALLY: an agent with no node-local backend resolves to an
+    RECORD(!scheduler.ensure_running(retired).ok());
+    // Asserted STRUCTURALLY: a model with no node-local backend resolves to an
     // empty engine id. The previous version matched the phrase "supports
     // llama-cpp only", which made the test a hostage of the error prose — the
     // same mistake the capacity-pressure substring matcher made.
-    RECORD(mm::AgentScheduler::resolve_backend(retired).engine_id.empty());
+    RECORD(mm::PlacementScheduler::resolve_backend(retired).engine_id.empty());
     RECORD(bad_loads.load() == 0);
     RECORD(good_loads.load() == 0);
 
-    // And the agent that DOES own a slot routes to a real engine. `auto` with no
+    // And the model that DOES own a slot routes to a real engine. `auto` with no
     // admission record is the fallback, which is policy rather than a placeholder:
     // absence of a record is not evidence of admissibility.
-    RECORD(mm::AgentScheduler::resolve_backend(cfg).engine_id == "llama-cpp");
+    RECORD(mm::PlacementScheduler::resolve_backend(cfg).engine_id == "llama-cpp");
 
     // An operator override to Soma is REFUSED while no record admits these
     // weights — forcing the streaming engine onto a model nothing has passed
@@ -2441,19 +2268,19 @@ bool test_scheduler_skips_failed_node_current_attempt() {
     // a stream verdict is what makes this resolve to "soma".
     auto forced = cfg;
     forced.backend_override = "soma";
-    RECORD(mm::AgentScheduler::resolve_backend(forced).engine_id == "llama-cpp");
-    RECORD(mm::AgentScheduler::resolve_backend(forced).reason.find("override_refused") !=
+    RECORD(mm::PlacementScheduler::resolve_backend(forced).engine_id == "llama-cpp");
+    RECORD(mm::PlacementScheduler::resolve_backend(forced).reason.find("override_refused") !=
            std::string::npos);
 
     auto forced_fallback = cfg;
     forced_fallback.backend_override = "fallback";
-    RECORD(mm::AgentScheduler::resolve_backend(forced_fallback).engine_id == "llama-cpp");
+    RECORD(mm::PlacementScheduler::resolve_backend(forced_fallback).engine_id == "llama-cpp");
 
-    auto scheduled = scheduler.ensure_agent_running(cfg);
-    RECORD(scheduled.has_value());
-    if (scheduled) {
-        RECORD(scheduled->node_id == good_id);
-        RECORD(scheduled->slot_id == "slot-good");
+    auto scheduled = scheduler.ensure_running(cfg);
+    RECORD(scheduled.ok());
+    if (scheduled.ok()) {
+        RECORD(scheduled.node_id == good_id);
+        RECORD(scheduled.slot_id == "slot-good");
     }
     RECORD(bad_loads.load() >= 1);
     RECORD(good_loads.load() >= 1);
@@ -2514,6 +2341,7 @@ bool test_scheduler_exhausts_primary_before_cluster_backup() {
             llama.ready = true;
             res.set_content(nlohmann::json{
                 {"slots", nlohmann::json::array()},
+                {"wire_protocol", mm::kNodeWireProtocol},
                 {"max_slots", 2},
                 {"slot_available", 2},
                 {"disk_free_mb", 131072},
@@ -2583,17 +2411,17 @@ bool test_scheduler_exhausts_primary_before_cluster_backup() {
 
     auto cluster = mm::EngineConfigStore::default_for("vllm");
     cluster.version = 11;
-    mm::AgentScheduler scheduler(registry, (dir / "models").string());
+    mm::PlacementScheduler scheduler(registry, (dir / "models").string());
     scheduler.set_engine_config_provider(
         [&cluster]() -> std::optional<mm::ClusterEngineConfig> { return cluster; });
 
-    mm::AgentConfig agent;
-    agent.id = "cluster-order-agent";
-    agent.name = "Cluster Order Agent";
-    agent.model_path = "org/model";
-    const auto scheduled = scheduler.ensure_agent_running(agent);
-    RECORD(scheduled.has_value());
-    const auto placement = scheduler.get_placement(agent.id);
+    mm::ServedModel model;
+    model.id = "cluster-order-model";
+    model.display_name = "Cluster Order Model";
+    model.model_path = "org/model";
+    const auto scheduled = scheduler.ensure_running(model);
+    RECORD(scheduled.ok());
+    const auto placement = scheduler.get_placement(model.id);
     RECORD(placement.has_value());
     if (placement) RECORD(placement->engine_id == "llama-cpp");
     {
@@ -2607,10 +2435,10 @@ bool test_scheduler_exhausts_primary_before_cluster_backup() {
         }
     }
 
-    auto llama_pin = agent;
+    auto llama_pin = model;
     llama_pin.backend_override = "fallback";
     RECORD(scheduler.resolve_backend_for(llama_pin).engine_id == "llama-cpp");
-    auto unavailable_pin = agent;
+    auto unavailable_pin = model;
     unavailable_pin.backend_override = "soma";
     RECORD(scheduler.resolve_backend_for(unavailable_pin).engine_id.empty());
 
@@ -2661,6 +2489,7 @@ bool test_scheduler_transfers_existing_relative_models_with_unique_cache_ids() {
                                       httplib::Response& res) {
         res.set_content(nlohmann::json{
             {"slots", nlohmann::json::array()},
+            {"wire_protocol", mm::kNodeWireProtocol},
             {"max_slots", 8},
             {"slot_available", 8}
         }.dump(), "application/json");
@@ -2687,13 +2516,13 @@ bool test_scheduler_transfers_existing_relative_models_with_unique_cache_ids() {
     server.Post("/api/node/load-model", [&](const httplib::Request& req,
                                              httplib::Response& res) {
         const auto body = nlohmann::json::parse(req.body);
-        const std::string agent_id = body.value("agent_id", std::string{});
+        const std::string holder = holder_of(body);
         {
             std::lock_guard<std::mutex> lock(requests_mutex);
-            load_bodies[agent_id] = body;
+            load_bodies[holder] = body;
         }
         res.set_content(nlohmann::json{
-            {"status", "loaded"}, {"slot_id", "slot-" + agent_id}
+            {"status", "loaded"}, {"slot_id", "slot-" + holder}
         }.dump(), "application/json");
     });
 
@@ -2714,25 +2543,25 @@ bool test_scheduler_transfers_existing_relative_models_with_unique_cache_ids() {
     registry.start_health_poll(1);
     RECORD(wait_for_registered_node(registry, node_id));
 
-    mm::AgentScheduler scheduler(registry, (dir / "models").string());
+    mm::PlacementScheduler scheduler(registry, (dir / "models").string());
     {
         ScopedCurrentPath current_path(dir);
         RECORD(mm::util::model_ref_is_local_path("a/model.gguf"));
         RECORD(mm::util::model_ref_is_local_path("b/model.gguf"));
         RECORD(mm::util::model_ref_is_local_path("bare.gguf"));
 
-        auto schedule = [&](const std::string& agent_id,
+        auto schedule = [&](const std::string& model_id,
                             const std::string& model_ref) {
-            mm::AgentConfig cfg;
-            cfg.id = agent_id;
-            cfg.name = agent_id;
+            mm::ServedModel cfg;
+            cfg.id = model_id;
+            cfg.display_name = model_id;
             cfg.model_path = model_ref;
             cfg.preferred_node_id = node_id;
-            return scheduler.ensure_agent_running(cfg);
+            return scheduler.ensure_running(cfg);
         };
-        RECORD(schedule("relative-a", "a/model.gguf").has_value());
-        RECORD(schedule("relative-b", "b/model.gguf").has_value());
-        RECORD(schedule("bare", "bare.gguf").has_value());
+        RECORD(schedule("relative-a", "a/model.gguf").ok());
+        RECORD(schedule("relative-b", "b/model.gguf").ok());
+        RECORD(schedule("bare", "bare.gguf").ok());
     }
 
     std::vector<std::string> ids;
@@ -2759,10 +2588,10 @@ bool test_scheduler_transfers_existing_relative_models_with_unique_cache_ids() {
             RECORD(bodies.at("bare").value("model_id", std::string{}) == ids[2]);
         }
     }
-    for (const std::string agent_id : {"relative-a", "relative-b", "bare"}) {
-        RECORD(bodies.count(agent_id) == 1);
-        if (bodies.count(agent_id) == 1) {
-            const auto& body = bodies.at(agent_id);
+    for (const std::string model_id : {"relative-a", "relative-b", "bare"}) {
+        RECORD(bodies.count(model_id) == 1);
+        if (bodies.count(model_id) == 1) {
+            const auto& body = bodies.at(model_id);
             RECORD(body.contains("model_id"));
             RECORD(body.value("model_path", std::string{}).rfind("/node/cache/", 0)
                    == 0);
@@ -2806,6 +2635,7 @@ bool test_scheduler_eviction_skips_unsuspendable_shared_slot() {
         // placement instead of trying the next one.
         res.set_content(nlohmann::json{
             {"slots", nlohmann::json::array()},
+            {"wire_protocol", mm::kNodeWireProtocol},
             {"max_slots", 4},
             {"slot_available", 0}
         }.dump(), "application/json");
@@ -2813,8 +2643,8 @@ bool test_scheduler_eviction_skips_unsuspendable_shared_slot() {
     server.Post("/api/node/load-model", [&](const httplib::Request& req,
                                              httplib::Response& res) {
         const auto body = nlohmann::json::parse(req.body);
-        const std::string agent_id = body.value("agent_id", std::string{});
-        if (agent_id == "new-agent") {
+        const std::string holder = holder_of(body);
+        if (holder == "new-model") {
             ++new_load_calls;
             if (!standalone_suspended.load()) {
                 res.status = 503;
@@ -2829,7 +2659,7 @@ bool test_scheduler_eviction_skips_unsuspendable_shared_slot() {
             return;
         }
 
-        const std::string slot_id = agent_id == "standalone-idle"
+        const std::string slot_id = holder == "standalone-idle"
             ? "slot-standalone"
             : "slot-shared";
         res.set_content(nlohmann::json{
@@ -2860,7 +2690,7 @@ bool test_scheduler_eviction_skips_unsuspendable_shared_slot() {
         res.set_content(nlohmann::json{{"error", "unexpected unload"}}.dump(),
                         "application/json");
     });
-    server.Post("/api/node/detach-agent", [](const httplib::Request&,
+    server.Post("/api/node/detach-holder", [](const httplib::Request&,
                                               httplib::Response& res) {
         res.set_content(nlohmann::json{{"status", "detached"}}.dump(),
                         "application/json");
@@ -2882,28 +2712,30 @@ bool test_scheduler_eviction_skips_unsuspendable_shared_slot() {
     const auto node_id = registry.add_node(url, "eviction-secret", "test");
     registry.start_health_poll(1);
     RECORD(wait_for_registered_node(registry, node_id));
-    mm::AgentScheduler scheduler(registry, (dir / "models").string());
+    mm::PlacementScheduler scheduler(registry, (dir / "models").string());
 
     auto config = [&](const std::string& id) {
-        mm::AgentConfig cfg;
+        mm::ServedModel cfg;
         cfg.id = id;
-        cfg.name = id;
+        cfg.display_name = id;
         cfg.model_path = "org/shared-model";
         cfg.preferred_node_id = node_id;
         return cfg;
     };
 
-    RECORD(scheduler.ensure_agent_running(config("shared-idle")).has_value());
+    RECORD(scheduler.ensure_running(config("shared-idle")).ok());
     std::this_thread::sleep_for(std::chrono::milliseconds(15));
-    RECORD(scheduler.ensure_agent_running(config("shared-active")).has_value());
-    scheduler.mark_agent_active("shared-active");
+    // A request in flight on it, held for the rest of the test: eviction must
+    // leave this placement — and the slot it shares — alone.
+    auto shared_active_request = scheduler.acquire(config("shared-active"));
+    RECORD(shared_active_request.ok());
     std::this_thread::sleep_for(std::chrono::milliseconds(15));
-    RECORD(scheduler.ensure_agent_running(config("standalone-idle")).has_value());
+    RECORD(scheduler.ensure_running(config("standalone-idle")).ok());
     std::this_thread::sleep_for(std::chrono::milliseconds(15));
 
-    const auto scheduled = scheduler.ensure_agent_running(config("new-agent"));
-    RECORD(scheduled.has_value());
-    if (scheduled) RECORD(scheduled->slot_id == "slot-new");
+    const auto scheduled = scheduler.ensure_running(config("new-model"));
+    RECORD(scheduled.ok());
+    if (scheduled.ok()) RECORD(scheduled.slot_id == "slot-new");
     RECORD(new_load_calls.load() >= 2);
     RECORD(shared_suspend_calls.load() == 0);
     RECORD(standalone_suspend_calls.load() == 1);
@@ -2983,6 +2815,7 @@ bool test_container_directory_transfers_to_a_node() {
     });
     server.Get("/api/node/status", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(nlohmann::json{{"slots", nlohmann::json::array()},
+                                       {"wire_protocol", mm::kNodeWireProtocol},
                                        {"max_slots", 2},
                                        {"slot_available", 2}}
                             .dump(),
@@ -3032,10 +2865,10 @@ bool test_container_directory_transfers_to_a_node() {
     const auto node_id = registry.add_node(url, "container-secret", "test");
     registry.start_health_poll(1);
     RECORD(wait_for_registered_node(registry, node_id));
-    mm::AgentScheduler scheduler(registry, models.string());
+    mm::PlacementScheduler scheduler(registry, models.string());
 
-    mm::AgentConfig cfg;
-    cfg.id = "container-agent";
+    mm::ServedModel cfg;
+    cfg.id = "container-model";
     cfg.model_path = container.string();
 
     // The cache id is derivable for a directory, which is what lets residency
@@ -3044,10 +2877,10 @@ bool test_container_directory_transfers_to_a_node() {
 
     // And the bytes actually move — driven through REAL placement rather than the
     // transfer helper, because "the directory reaches the streaming branch when
-    // an agent is placed" is the claim, and calling the helper directly would
+    // a model is placed" is the claim, and calling the helper directly would
     // assert it about a path placement might not take.
     cfg.preferred_node_id = node_id;
-    RECORD(scheduler.ensure_agent_running(cfg).has_value());
+    RECORD(scheduler.ensure_running(cfg).ok());
     {
         std::lock_guard<std::mutex> lk(received_mutex);
         RECORD(received_paths.size() == 3);
@@ -3118,10 +2951,10 @@ bool test_disk_is_charged_only_to_nodes_lacking_the_model() {
     }
 
     mm::NodeRegistry registry((dir / "registry").string());
-    mm::AgentScheduler scheduler(registry, models.string());
+    mm::PlacementScheduler scheduler(registry, models.string());
 
-    mm::AgentConfig cfg;
-    cfg.id = "disk-agent";
+    mm::ServedModel cfg;
+    cfg.id = "disk-model";
     cfg.model_path = model_file.string();
 
     const std::string cache_id = scheduler.model_cache_id(cfg);
@@ -3154,7 +2987,7 @@ bool test_disk_is_charged_only_to_nodes_lacking_the_model() {
 
     // A ref control cannot resolve locally is one no node will be sent, so it
     // costs no disk anywhere — the same rule prepare_model_for_node() follows.
-    mm::AgentConfig remote = cfg;
+    mm::ServedModel remote = cfg;
     remote.model_path = "org/never-fetched";
     CHECK(scheduler.model_cache_id(remote).empty());
     CHECK(scheduler.footprint_for_node(remote, base, without).disk_mb == 0);
@@ -3175,7 +3008,7 @@ bool test_soma_footprint_is_ram_shaped_not_vram_shaped() {
     // D62: every demand figure was VRAM, produced by llama.cpp's estimator, for
     // BOTH engines. Soma v1 is CPU-only, and evaluate_fit() refuses to offload
     // against a host with less than min_gpu_for_offload_mb (8 GiB) of GPU — so a
-    // Soma agent could not be placed on a GPU-less node at all, for VRAM it
+    // A Soma-routed model could not be placed on a GPU-less node at all, for VRAM it
     // would never have touched. That is a rejection, not merely a bad estimate.
     mm::ResourceFootprint soma;
     soma.ram_mb = 8192; // a resident half, no VRAM — the shape soma_footprint returns
@@ -3211,14 +3044,14 @@ bool test_soma_footprint_is_ram_shaped_not_vram_shaped() {
 
     // And the producer, not just the rule it feeds. Whatever the registry knows
     // or does not know about a model, the Soma footprint never asks for VRAM —
-    // that is the invariant, and the one the old code broke for every agent.
+    // that is the invariant, and the one the old code broke for every model.
     const auto dir = temp_test_dir("soma-footprint");
     std::filesystem::create_directories(dir / "models");
     {
         mm::NodeRegistry registry((dir / "registry").string());
-        mm::AgentScheduler scheduler(registry, (dir / "models").string());
-        mm::AgentConfig cfg;
-        cfg.id = "soma-agent";
+        mm::PlacementScheduler scheduler(registry, (dir / "models").string());
+        mm::ServedModel cfg;
+        cfg.id = "soma-routed-model";
         cfg.model_path = "org/model";
         const auto fp = scheduler.soma_footprint(cfg);
         CHECK(fp.vram_mb == 0);
@@ -3261,6 +3094,7 @@ bool test_placement_failure_codes_separate_eligibility_from_capacity() {
     });
     server.Get("/api/node/status", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(nlohmann::json{{"slots", nlohmann::json::array()},
+                                       {"wire_protocol", mm::kNodeWireProtocol},
                                        {"max_slots", 1},
                                        {"slot_available", 1}}
                             .dump(),
@@ -3281,22 +3115,24 @@ bool test_placement_failure_codes_separate_eligibility_from_capacity() {
     const auto node_id = registry.add_node(url, "codes-secret", "test");
     registry.start_health_poll(1);
     RECORD(wait_for_registered_node(registry, node_id));
-    mm::AgentScheduler scheduler(registry, (dir / "models").string());
+    mm::PlacementScheduler scheduler(registry, (dir / "models").string());
 
-    mm::AgentConfig cfg;
-    cfg.id = "no-room-agent";
-    cfg.name = "No Room";
+    mm::ServedModel cfg;
+    cfg.id = "no-room-model";
+    cfg.display_name = "No Room";
     cfg.model_path = "org/model";
 
-    RECORD(!scheduler.ensure_agent_running(cfg).has_value());
+    const auto refused = scheduler.ensure_running(cfg);
+    RECORD(!refused.ok());
     // A node IS eligible — it is connected and no engine-config gate is set —
     // so this must not report NoEligibleNode.
     RECORD(!registry.available_nodes().empty());
-    RECORD(scheduler.last_failure() == mm::PlacementFailure::NoCapacity);
-    RECORD(mm::placement_failure_retryable(scheduler.last_failure()));
+    RECORD(refused.failure == mm::PlacementFailure::NoCapacity);
+    RECORD(mm::placement_failure_retryable(refused.failure));
+    RECORD(mm::placement_failure_transient(refused.failure));
     // The prose is still there and still useful; it is simply no longer the
     // only thing carrying the answer.
-    RECORD(scheduler.last_error().find("no capacity") != std::string::npos);
+    RECORD(refused.error.find("no capacity") != std::string::npos);
 
     // The wire spellings are part of the contract: clients branch on these, so
     // renaming one is an API change and should break a test.
@@ -3340,6 +3176,7 @@ bool test_scheduler_audits_placement_and_release() {
     });
     server.Get("/api/node/status", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(nlohmann::json{{"slots", nlohmann::json::array()},
+                                       {"wire_protocol", mm::kNodeWireProtocol},
                                        {"max_slots", 2},
                                        {"slot_available", 2}}
                             .dump(),
@@ -3349,7 +3186,7 @@ bool test_scheduler_audits_placement_and_release() {
         res.set_content(nlohmann::json{{"status", "loaded"}, {"slot_id", "slot-audit"}}.dump(),
                         "application/json");
     });
-    server.Post("/api/node/detach-agent", [](const httplib::Request&, httplib::Response& res) {
+    server.Post("/api/node/detach-holder", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(nlohmann::json{{"status", "detached"}}.dump(), "application/json");
     });
 
@@ -3367,10 +3204,10 @@ bool test_scheduler_audits_placement_and_release() {
     const auto node_id = registry.add_node(url, "audit-secret", "test");
     registry.start_health_poll(1);
     RECORD(wait_for_registered_node(registry, node_id));
-    mm::AgentScheduler scheduler(registry, (dir / "models").string());
+    mm::PlacementScheduler scheduler(registry, (dir / "models").string());
 
     struct Placed {
-        mm::AgentId agent_id;
+        mm::HolderId holder_id;
         mm::NodeId node_id;
         mm::SlotId slot_id;
         std::string backend;
@@ -3379,8 +3216,8 @@ bool test_scheduler_audits_placement_and_release() {
 
     std::mutex audit_mutex;
     std::vector<Placed> placed;
-    std::vector<mm::AgentId> released;
-    scheduler.set_placement_audit({[&](const mm::AgentId& a,
+    std::vector<mm::HolderId> released;
+    scheduler.set_placement_audit({[&](const mm::HolderId& a,
                                        const mm::NodeId& n,
                                        const mm::SlotId& sl,
                                        const std::string& backend,
@@ -3389,23 +3226,23 @@ bool test_scheduler_audits_placement_and_release() {
                                        std::lock_guard<std::mutex> lk(audit_mutex);
                                        placed.push_back({a, n, sl, backend, reason});
                                    },
-                                   [&](const mm::AgentId& a) {
+                                   [&](const mm::HolderId& a) {
                                        std::lock_guard<std::mutex> lk(audit_mutex);
                                        released.push_back(a);
                                    }});
 
-    mm::AgentConfig cfg;
-    cfg.id = "audited-agent";
-    cfg.name = "Audited";
+    mm::ServedModel cfg;
+    cfg.id = "audited-model";
+    cfg.display_name = "Audited";
     cfg.model_path = "org/model";
     cfg.preferred_node_id = node_id;
 
-    RECORD(scheduler.ensure_agent_running(cfg).has_value());
+    RECORD(scheduler.ensure_running(cfg).ok());
     {
         std::lock_guard<std::mutex> lk(audit_mutex);
         RECORD(placed.size() == 1);
         if (placed.size() == 1) {
-            RECORD(placed[0].agent_id == cfg.id);
+            RECORD(placed[0].holder_id == cfg.id);
             RECORD(placed[0].node_id == node_id);
             RECORD(placed[0].slot_id == "slot-audit");
             // The engine the scheduler ACTED on, and its reason string — not a
@@ -3420,13 +3257,14 @@ bool test_scheduler_audits_placement_and_release() {
     // A second ensure on an UNCHANGED placement is a refresh, not a placement.
     // store_placement() is called on that path too, which is exactly why the
     // audit hangs off the two publish sites rather than off the store.
-    RECORD(scheduler.ensure_agent_running(cfg).has_value());
+    RECORD(scheduler.ensure_running(cfg).ok());
     {
         std::lock_guard<std::mutex> lk(audit_mutex);
         RECORD(placed.size() == 1);
     }
 
-    scheduler.release_agent(cfg.id);
+    RECORD(scheduler.release(cfg.id) ==
+           mm::PlacementScheduler::ReleaseResult::Released);
     {
         std::lock_guard<std::mutex> lk(audit_mutex);
         RECORD(released.size() == 1);
@@ -3445,9 +3283,9 @@ bool test_scheduler_audits_placement_and_release() {
 
 bool test_placement_history_records_and_closes_rows() {
     // D60: the table, its index and record_placement() all shipped with no
-    // caller and no query. The subtle half is the CLOSE rule — an agent that was
+    // caller and no query. The subtle half is the CLOSE rule — a model that was
     // placed, released, and placed again has two rows, and stamping "the row for
-    // this agent" would close the older one a second time and lose the first
+    // this model" would close the older one a second time and lose the first
     // placement's duration entirely.
     auto dir = temp_test_dir("placement-history");
     // Scoped so the SQLite handle is closed before the directory is removed —
@@ -3458,14 +3296,14 @@ bool test_placement_history_records_and_closes_rows() {
         std::string err;
         CHECK(reg.open(dir.string(), err));
 
-        CHECK(reg.placement_history("agent-1").empty());
+        CHECK(reg.placement_history("model-1").empty());
 
         mm::ResourceFootprint first;
         first.vram_mb = 4096;
         reg.record_placement(
-            "agent-1", "node-a", "slot-1", "llama-cpp", "llama-cpp (no_admission_record)", first);
+            "model-1", "node-a", "slot-1", "llama-cpp", "llama-cpp (no_admission_record)", first);
 
-        auto rows = reg.placement_history("agent-1");
+        auto rows = reg.placement_history("model-1");
         CHECK(rows.size() == 1);
         CHECK(rows[0].node_id == "node-a");
         CHECK(rows[0].backend == "llama-cpp");
@@ -3476,8 +3314,8 @@ bool test_placement_history_records_and_closes_rows() {
         CHECK(rows[0].open());
         CHECK(rows[0].released_at_ms == 0);
 
-        reg.mark_placement_released("agent-1");
-        rows = reg.placement_history("agent-1");
+        reg.mark_placement_released("model-1");
+        rows = reg.placement_history("model-1");
         CHECK(rows.size() == 1);
         CHECK(!rows[0].open());
         const std::int64_t first_released = rows[0].released_at_ms;
@@ -3488,8 +3326,8 @@ bool test_placement_history_records_and_closes_rows() {
         second.ram_mb = 19840;
         second.disk_mb = 14848;
         reg.record_placement(
-            "agent-1", "node-b", "slot-7", "soma", "soma (verdict=stream)", second);
-        rows = reg.placement_history("agent-1");
+            "model-1", "node-b", "slot-7", "soma", "soma (verdict=stream)", second);
+        rows = reg.placement_history("model-1");
         CHECK(rows.size() == 2);
         CHECK(rows[0].backend == "soma"); // newest first
         CHECK(rows[0].ram_mb == 19840);
@@ -3500,24 +3338,24 @@ bool test_placement_history_records_and_closes_rows() {
 
         // THE RULE: closing again must close the NEW row and leave the old one's
         // timestamp untouched.
-        reg.mark_placement_released("agent-1");
-        rows = reg.placement_history("agent-1");
+        reg.mark_placement_released("model-1");
+        rows = reg.placement_history("model-1");
         CHECK(rows.size() == 2);
         CHECK(!rows[0].open());
         CHECK(rows[1].released_at_ms == first_released);
 
-        // Idempotent: a release for an agent with no open row is a no-op, because a
+        // Idempotent: a release for a model with no open row is a no-op, because a
         // release can legitimately arrive for a placement this process never saw.
-        reg.mark_placement_released("agent-1");
-        reg.mark_placement_released("agent-never-placed");
-        rows = reg.placement_history("agent-1");
+        reg.mark_placement_released("model-1");
+        reg.mark_placement_released("model-never-placed");
+        rows = reg.placement_history("model-1");
         CHECK(rows.size() == 2);
         CHECK(rows[1].released_at_ms == first_released);
 
-        // Other agents are not touched, and the limit is honoured.
-        CHECK(reg.placement_history("agent-2").empty());
-        CHECK(reg.placement_history("agent-1", 1).size() == 1);
-        CHECK(reg.placement_history("agent-1", 0).empty());
+        // Other models are not touched, and the limit is honoured.
+        CHECK(reg.placement_history("model-2").empty());
+        CHECK(reg.placement_history("model-1", 1).size() == 1);
+        CHECK(reg.placement_history("model-1", 0).empty());
     }
 
     CHECK(remove_tree(dir));
@@ -3546,6 +3384,7 @@ bool test_scheduler_backend_change_releases_local_placement() {
                                       httplib::Response& res) {
         res.set_content(nlohmann::json{
             {"slots", nlohmann::json::array()},
+            {"wire_protocol", mm::kNodeWireProtocol},
             {"max_slots", 2},
             {"slot_available", 2}
         }.dump(), "application/json");
@@ -3556,7 +3395,7 @@ bool test_scheduler_backend_change_releases_local_placement() {
             {"status", "loaded"}, {"slot_id", "slot-local"}
         }.dump(), "application/json");
     });
-    server.Post("/api/node/detach-agent", [&](const httplib::Request& req,
+    server.Post("/api/node/detach-holder", [&](const httplib::Request& req,
                                                httplib::Response& res) {
         ++detach_calls;
         {
@@ -3583,31 +3422,33 @@ bool test_scheduler_backend_change_releases_local_placement() {
     const auto node_id = registry.add_node(url, "backend-change-secret", "test");
     registry.start_health_poll(1);
     RECORD(wait_for_registered_node(registry, node_id));
-    mm::AgentScheduler scheduler(registry, (dir / "models").string());
+    mm::PlacementScheduler scheduler(registry, (dir / "models").string());
 
-    mm::AgentConfig cfg;
-    cfg.id = "backend-agent";
-    cfg.name = "Backend Agent";
+    mm::ServedModel cfg;
+    cfg.id = "backend-model";
+    cfg.display_name = "Backend Model";
     cfg.model_path = "org/model";
     cfg.preferred_node_id = node_id;
-    RECORD(scheduler.ensure_agent_running(cfg).has_value());
+    RECORD(scheduler.ensure_running(cfg).ok());
     RECORD(scheduler.get_placement(cfg.id).has_value());
 
     auto api_cfg = cfg;
     api_cfg.inference_backend = "api";
-    RECORD(!scheduler.ensure_agent_running(api_cfg).has_value());
+    const auto api_outcome = scheduler.ensure_running(api_cfg);
+    RECORD(!api_outcome.ok());
     RECORD(!scheduler.get_placement(cfg.id).has_value());
     RECORD(detach_calls.load() == 1);
     {
         std::lock_guard<std::mutex> lock(detach_mutex);
         RECORD(detach_body.value("slot_id", std::string{}) == "slot-local");
-        RECORD(detach_body.value("agent_id", std::string{}) == cfg.id);
+        RECORD(holder_of(detach_body) == cfg.id);
     }
-    // Structural again: an "api" agent owns no node-local slot, so it resolves
+    // Structural again: an "api" model owns no node-local slot, so it resolves
     // to no engine at all — which is a different statement from "this branch
     // only supports llama-cpp", and the one that stays true now that it does not.
-    RECORD(mm::AgentScheduler::resolve_backend(api_cfg).engine_id.empty());
-    RECORD(scheduler.last_error().find("no node-local backend") != std::string::npos);
+    RECORD(mm::PlacementScheduler::resolve_backend(api_cfg).engine_id.empty());
+    RECORD(api_outcome.failure == mm::PlacementFailure::NoLocalBackend);
+    RECORD(api_outcome.error.find("no node-local backend") != std::string::npos);
 
     registry.stop_health_poll();
     server.stop();
@@ -3656,8 +3497,7 @@ bool test_scheduler_reconciles_ready_absent_and_suspended_snapshots() {
             mm::SlotInfo slot;
             slot.id = phase == 1 ? "slot-initial" : "slot-rescheduled";
             slot.model_path = "org/model";
-            slot.assigned_agent = "reconcile-agent";
-            slot.agent_ids = {"reconcile-agent"};
+            slot.holder_ids = {"reconcile-model"};
             slot.state = phase == 1 ? mm::SlotState::Ready
                                     : mm::SlotState::Suspended;
             if (phase == 3) slot.kv_cache_path = "reported-cache.kvbin";
@@ -3665,6 +3505,7 @@ bool test_scheduler_reconciles_ready_absent_and_suspended_snapshots() {
         }
         res.set_content(nlohmann::json{
             {"slots", std::move(slots)},
+            {"wire_protocol", mm::kNodeWireProtocol},
             {"max_slots", 2},
             {"slot_available", phase == 1 ? 1 : 2}
         }.dump(), "application/json");
@@ -3678,7 +3519,7 @@ bool test_scheduler_reconciles_ready_absent_and_suspended_snapshots() {
             {"status", "loaded"}, {"slot_id", slot_id}
         }.dump(), "application/json");
     });
-    server.Post("/api/node/detach-agent", [&](const httplib::Request& req,
+    server.Post("/api/node/detach-holder", [&](const httplib::Request& req,
                                                httplib::Response& res) {
         ++detach_calls;
         {
@@ -3716,17 +3557,17 @@ bool test_scheduler_reconciles_ready_absent_and_suspended_snapshots() {
     const auto node_id = registry.add_node(url, "reconcile-secret", "test");
     registry.start_health_poll(1);
     RECORD(wait_for_registered_node(registry, node_id));
-    mm::AgentScheduler scheduler(registry, (dir / "models").string());
+    mm::PlacementScheduler scheduler(registry, (dir / "models").string());
 
-    mm::AgentConfig cfg;
-    cfg.id = "reconcile-agent";
-    cfg.name = "Reconcile Agent";
+    mm::ServedModel cfg;
+    cfg.id = "reconcile-model";
+    cfg.display_name = "Reconcile Model";
     cfg.model_path = "org/model";
     cfg.preferred_node_id = node_id;
 
-    const auto initial = scheduler.ensure_agent_running(cfg);
-    RECORD(initial.has_value());
-    if (initial) RECORD(initial->slot_id == "slot-initial");
+    const auto initial = scheduler.ensure_running(cfg);
+    RECORD(initial.ok());
+    if (initial.ok()) RECORD(initial.slot_id == "slot-initial");
     RECORD(load_calls.load() == 1);
     const auto initial_placement = scheduler.get_placement(cfg.id);
     RECORD(initial_placement.has_value());
@@ -3744,9 +3585,9 @@ bool test_scheduler_reconciles_ready_absent_and_suspended_snapshots() {
             return node.last_seen_ms > initial_placed_at &&
                    node.slot_snapshot_at_ms == initial_slot_snapshot;
         }));
-    const auto health_only = scheduler.ensure_agent_running(cfg);
-    RECORD(health_only.has_value());
-    if (health_only) RECORD(health_only->slot_id == "slot-initial");
+    const auto health_only = scheduler.ensure_running(cfg);
+    RECORD(health_only.ok());
+    if (health_only.ok()) RECORD(health_only.slot_id == "slot-initial");
     RECORD(load_calls.load() == 1);
     RECORD(detach_calls.load() == 0);
 
@@ -3762,9 +3603,9 @@ bool test_scheduler_reconciles_ready_absent_and_suspended_snapshots() {
                    node.slots[0].state == mm::SlotState::Ready;
         }));
     const auto ready_snapshot_seen = registry.get_node(node_id).last_seen_ms;
-    const auto still_ready = scheduler.ensure_agent_running(cfg);
-    RECORD(still_ready.has_value());
-    if (still_ready) RECORD(still_ready->slot_id == "slot-initial");
+    const auto still_ready = scheduler.ensure_running(cfg);
+    RECORD(still_ready.ok());
+    if (still_ready.ok()) RECORD(still_ready.slot_id == "slot-initial");
     RECORD(load_calls.load() == 1);
     RECORD(detach_calls.load() == 0);
     RECORD(restore_calls.load() == 0);
@@ -3776,9 +3617,9 @@ bool test_scheduler_reconciles_ready_absent_and_suspended_snapshots() {
         registry, node_id, ready_snapshot_seen + 1,
         [](const mm::NodeInfo& node) { return node.slots.empty(); }));
     const auto absent_snapshot_seen = registry.get_node(node_id).last_seen_ms;
-    const auto rescheduled = scheduler.ensure_agent_running(cfg);
-    RECORD(rescheduled.has_value());
-    if (rescheduled) RECORD(rescheduled->slot_id == "slot-rescheduled");
+    const auto rescheduled = scheduler.ensure_running(cfg);
+    RECORD(rescheduled.ok());
+    if (rescheduled.ok()) RECORD(rescheduled.slot_id == "slot-rescheduled");
     RECORD(load_calls.load() == 2);
     RECORD(detach_calls.load() == 1);
     const auto rescheduled_placement = scheduler.get_placement(cfg.id);
@@ -3789,7 +3630,7 @@ bool test_scheduler_reconciles_ready_absent_and_suspended_snapshots() {
         if (detach_bodies.size() == 1) {
             RECORD(detach_bodies[0].value("slot_id", std::string{}) ==
                    "slot-initial");
-            RECORD(detach_bodies[0].value("agent_id", std::string{}) == cfg.id);
+            RECORD(holder_of(detach_bodies[0]) == cfg.id);
         }
     }
 
@@ -3807,9 +3648,9 @@ bool test_scheduler_reconciles_ready_absent_and_suspended_snapshots() {
                    node.slots[0].state == mm::SlotState::Suspended &&
                    node.slots[0].kv_cache_path == "reported-cache.kvbin";
         }));
-    const auto restored = scheduler.ensure_agent_running(cfg);
-    RECORD(restored.has_value());
-    if (restored) RECORD(restored->slot_id == "slot-restored");
+    const auto restored = scheduler.ensure_running(cfg);
+    RECORD(restored.ok());
+    if (restored.ok()) RECORD(restored.slot_id == "slot-restored");
     RECORD(load_calls.load() == 2);
     RECORD(detach_calls.load() == 1);
     RECORD(restore_calls.load() == 1);
@@ -3817,7 +3658,7 @@ bool test_scheduler_reconciles_ready_absent_and_suspended_snapshots() {
         std::lock_guard<std::mutex> lock(requests_mutex);
         RECORD(restore_body.value("kv_cache_path", std::string{}) ==
                "reported-cache.kvbin");
-        RECORD(restore_body.value("agent_id", std::string{}) == cfg.id);
+        RECORD(holder_of(restore_body) == cfg.id);
     }
     const auto final_placement = scheduler.get_placement(cfg.id);
     RECORD(final_placement.has_value());
@@ -3849,19 +3690,36 @@ bool test_control_api_external_token_gate() {
 #define RECORD(expr) record((expr), #expr, __LINE__)
 
     {
-        mm::AgentManager agents(dir.string());
-        mm::AgentConfig cfg;
-        cfg.id = "agent-a";
-        cfg.name = "Agent A";
-        cfg.model_path = "model.gguf";
-        agents.create_agent(cfg);
+        mm::UserManager users(dir.string());
+        {
+            mm::UserProfile profile;
+            profile.id = "user-a";
+            std::string create_error;
+            users.create_user(profile, create_error);
+        }
 
-        mm::AgentQueue queue;
         mm::NodeRegistry registry(dir.string());
-        mm::AgentScheduler scheduler(registry, (dir / "models").string());
-        mm::ControlApiServer api(
-            agents, queue, registry, scheduler,
+        mm::PlacementScheduler scheduler(registry, (dir / "models").string());
+        mm::ControlModelRegistry model_registry;
+        std::string registry_error;
+        RECORD(model_registry.open(dir.string(), registry_error));
+        mm::ServedModelCatalog catalog(model_registry);
+        {
+            // Text only: an image sent to it is refused before anything runs.
+            mm::ServedModel text_model;
+            text_model.id = "text-only";
+            text_model.model_path = "text-model";
+            text_model.inference_backend = "api";
+            text_model.api_settings.base_url = "http://127.0.0.1:1";
+            std::string create_error;
+            catalog.create(text_model, create_error);
+            auto profile = users.get_user("user-a")->profile();
+            profile.default_model = "text-only";
+            users.update_profile("user-a", profile);
+        }
+        mm::ControlApiServer api(users, registry, scheduler,
             dir.string(), (dir / "models").string(), "control-secret");
+        api.set_served_model_catalog(&catalog);
 
         const uint16_t port = find_free_test_port();
         CHECK(port != 0);
@@ -3959,17 +3817,17 @@ bool test_control_api_external_token_gate() {
         client.set_bearer_token("control-secret");
         auto valid = with_retry([&] { return client.get("/v1/nodes"); });
         RECORD(valid.status == 200);
-        // /v1/models is the ADMISSION REGISTRY now, not agents wearing model
-        // costumes — the agents catalog lives on the :9091 OpenAI-compat
-        // listener where it belongs. This server has no registry attached, so
-        // the route answers 503; that still proves the token gate let it
+        // /v1/models is the ADMISSION REGISTRY, not agents wearing model
+        // costumes — the catalog a client picks from is /v1/served-models, and
+        // its OpenAI spelling is on :9091. This server has no registry attached,
+        // so the route answers 503; that still proves the token gate let it
         // through, which is what this test is about. The old assertion (that the
-        // body contained "agent:agent-a") is the behaviour being retired.
+        // body named a holder) is the behaviour being retired.
         auto valid_models = with_retry([&] { return client.get("/v1/models"); });
         RECORD(valid_models.status == 503);
         RECORD(valid_models.body.find("registry") != std::string::npos);
-        RECORD(valid_models.body.find("agent:agent-a") == std::string::npos);
-        auto valid_voice = with_retry([&] { return client.get("/v1/agents/agent-a/voice"); });
+        RECORD(valid_models.body.find("user:user-a") == std::string::npos);
+        auto valid_voice = with_retry([&] { return client.get("/v1/users/user-a/voice"); });
         RECORD(valid_voice.status == 200);
 
         const auto png_path = dir / "attachment-test.png";
@@ -3983,21 +3841,21 @@ bool test_control_api_external_token_gate() {
         mm::HttpClient missing_attachment_client(base_url);
         auto missing_upload = with_retry([&] {
             return missing_attachment_client.post_file(
-                "/v1/agents/agent-a/attachments", png_path.string(),
+                "/v1/users/user-a/attachments", png_path.string(),
                 {{"X-Filename", "test.png"}}, "image/png");
         });
         EXPECT_ERROR(missing_upload, 401, "missing bearer token");
 
         auto mismatched_upload = with_retry([&] {
             return client.post_file(
-                "/v1/agents/agent-a/attachments", png_path.string(),
+                "/v1/users/user-a/attachments", png_path.string(),
                 {{"X-Filename", "test.jpg"}}, "image/jpeg");
         });
         EXPECT_ERROR(mismatched_upload, 415, "signature does not match");
 
         auto upload = with_retry([&] {
             return client.post_file(
-                "/v1/agents/agent-a/attachments", png_path.string(),
+                "/v1/users/user-a/attachments", png_path.string(),
                 {{"X-Filename", "../test.png"}}, "image/png");
         });
         RECORD(upload.status == 201);
@@ -4008,14 +3866,14 @@ bool test_control_api_external_token_gate() {
             uploaded_attachment["id"].get<std::string>();
 
         auto download = with_retry([&] {
-            return client.get("/v1/agents/agent-a/attachments/" + uploaded_attachment_id);
+            return client.get("/v1/users/user-a/attachments/" + uploaded_attachment_id);
         });
         RECORD(download.status == 200);
         RECORD(download.body.size() == 8);
 
         mm::HttpClient missing_voice_client(base_url);
         auto missing_voice = with_retry(
-            [&] { return missing_voice_client.get("/v1/agents/agent-a/voice"); });
+            [&] { return missing_voice_client.get("/v1/users/user-a/voice"); });
         EXPECT_ERROR(missing_voice, 401, "missing bearer token");
 
         struct StreamAttempt {
@@ -4034,7 +3892,7 @@ bool test_control_api_external_token_gate() {
                 attempt = StreamAttempt{};
                 attempt.retries = retry;
                 attempt.ok = stream_client.stream_post(
-                    "/v1/agents/agent-a/chat",
+                    "/v1/users/user-a/chat",
                     body,
                     [&](const std::string& event) {
                         attempt.events.push_back(event);
@@ -4104,7 +3962,7 @@ bool test_control_api_external_token_gate() {
                std::string::npos);
 
         auto delete_pending_attachment = with_retry([&] {
-            return client.del("/v1/agents/agent-a/attachments/" +
+            return client.del("/v1/users/user-a/attachments/" +
                               uploaded_attachment_id);
         });
         RECORD(delete_pending_attachment.status == 204);
@@ -4112,7 +3970,7 @@ bool test_control_api_external_token_gate() {
         mm::HttpClient missing_mutator(base_url);
         auto missing_create_conversation = with_retry([&] {
             return missing_mutator.post(
-                "/v1/agents/agent-a/conversations",
+                "/v1/users/user-a/conversations",
                 nlohmann::json{{"title", "Blocked"}, {"set_active", true}});
         });
         EXPECT_ERROR(missing_create_conversation, 401, "missing bearer token");
@@ -4121,14 +3979,14 @@ bool test_control_api_external_token_gate() {
         node_mutator.set_bearer_token("node-secret");
         auto node_create_conversation = with_retry([&] {
             return node_mutator.post(
-                "/v1/agents/agent-a/conversations",
+                "/v1/users/user-a/conversations",
                 nlohmann::json{{"title", "Blocked"}, {"set_active", true}});
         });
         EXPECT_ERROR(node_create_conversation, 403, "invalid bearer token");
 
         auto create_conversation = with_retry([&] {
             return client.post(
-                "/v1/agents/agent-a/conversations",
+                "/v1/users/user-a/conversations",
                 nlohmann::json{{"title", "Original title"}, {"set_active", true}});
         });
         RECORD(create_conversation.status == 201);
@@ -4138,7 +3996,7 @@ bool test_control_api_external_token_gate() {
 
         auto referenced_upload = with_retry([&] {
             return client.post_file(
-                "/v1/agents/agent-a/attachments", png_path.string(),
+                "/v1/users/user-a/attachments", png_path.string(),
                 {{"X-Filename", "referenced.png"}}, "image/png");
         });
         RECORD(referenced_upload.status == 201);
@@ -4152,9 +4010,9 @@ bool test_control_api_external_token_gate() {
         RECORD(!too_many_images.ok);
         RECORD(too_many_images.status == 400);
         RECORD(too_many_images.body.find("at most 8 images") != std::string::npos);
-        auto agent_for_attachment = agents.get_agent("agent-a");
-        RECORD(agent_for_attachment != nullptr);
-        if (agent_for_attachment) {
+        auto user_for_attachment = users.get_user("user-a");
+        RECORD(user_for_attachment != nullptr);
+        if (user_for_attachment) {
             mm::Message image_message;
             image_message.role = mm::MessageRole::User;
             image_message.content = "persist this image";
@@ -4163,10 +4021,10 @@ bool test_control_api_external_token_gate() {
                 mm::MessageContentPart{"image_attachment", {},
                                        referenced_attachment_id, {}, "image/png"}
             };
-            agent_for_attachment->db().append_message(conversation_id, image_message, 0);
+            user_for_attachment->db().append_message(conversation_id, image_message);
         }
         auto delete_referenced_attachment = with_retry([&] {
-            return client.del("/v1/agents/agent-a/attachments/" +
+            return client.del("/v1/users/user-a/attachments/" +
                               referenced_attachment_id);
         });
         EXPECT_ERROR(delete_referenced_attachment, 409, "referenced by a message");
@@ -4174,14 +4032,14 @@ bool test_control_api_external_token_gate() {
         mm::HttpClient missing_put(base_url);
         auto missing_rename = with_retry([&] {
             return missing_put.put(
-                "/v1/agents/agent-a/conversations/" + conversation_id,
+                "/v1/users/user-a/conversations/" + conversation_id,
                 nlohmann::json{{"title", "Blocked rename"}});
         });
         EXPECT_ERROR(missing_rename, 401, "missing bearer token");
 
         auto rename = with_retry([&] {
             return client.put(
-                "/v1/agents/agent-a/conversations/" + conversation_id,
+                "/v1/users/user-a/conversations/" + conversation_id,
                 nlohmann::json{{"title", "Renamed by authorized client"}});
         });
         RECORD(rename.status == 200);
@@ -4192,14 +4050,14 @@ bool test_control_api_external_token_gate() {
         invalid_memory_client.set_bearer_token("wrong-secret");
         auto invalid_create_memory = with_retry([&] {
             return invalid_memory_client.post(
-                "/v1/agents/agent-a/memories",
+                "/v1/users/user-a/memories",
                 nlohmann::json{{"content", "Blocked memory"}, {"source_conv_id", conversation_id}});
         });
         EXPECT_ERROR(invalid_create_memory, 403, "invalid bearer token");
 
         auto create_memory = with_retry([&] {
             return client.post(
-                "/v1/agents/agent-a/memories",
+                "/v1/users/user-a/memories",
                 nlohmann::json{{"content", "Authorized memory"}, {"source_conv_id", conversation_id}});
         });
         RECORD(create_memory.status == 201);
@@ -4208,18 +4066,18 @@ bool test_control_api_external_token_gate() {
 
         mm::HttpClient missing_delete(base_url);
         auto missing_delete_memory = with_retry(
-            [&] { return missing_delete.del("/v1/agents/agent-a/memories/" + memory_id); });
+            [&] { return missing_delete.del("/v1/users/user-a/memories/" + memory_id); });
         EXPECT_ERROR(missing_delete_memory, 401, "missing bearer token");
 
         auto delete_memory = with_retry(
-            [&] { return client.del("/v1/agents/agent-a/memories/" + memory_id); });
+            [&] { return client.del("/v1/users/user-a/memories/" + memory_id); });
         RECORD(delete_memory.status == 200);
 
-        if (agent_for_attachment) {
-            agent_for_attachment->db().delete_conversation(conversation_id);
+        if (user_for_attachment) {
+            user_for_attachment->db().delete_conversation(conversation_id);
         }
         auto attachment_after_conversation_delete = with_retry([&] {
-            return client.get("/v1/agents/agent-a/attachments/" +
+            return client.get("/v1/users/user-a/attachments/" +
                               referenced_attachment_id);
         });
         EXPECT_ERROR(attachment_after_conversation_delete, 404, "attachment not found");
@@ -4228,7 +4086,6 @@ bool test_control_api_external_token_gate() {
         if (server_thread.joinable()) server_thread.join();
         RECORD(listen_ok);
         RECORD(listen_returned);
-        queue.shutdown();
     }
     RECORD(remove_tree(dir));
 #undef EXPECT_ERROR
@@ -4236,476 +4093,20 @@ bool test_control_api_external_token_gate() {
     return ok;
 }
 
-bool test_openai_compat_api_listener_and_model_catalog() {
-    auto dir = temp_test_dir("openai-compat");
-    std::filesystem::create_directories(dir);
-    std::filesystem::create_directories(dir / "models");
-
-    bool ok = true;
-    auto record = [&](bool condition, const char* expression, int line) {
-        if (!check(condition, expression, line)) ok = false;
-    };
-#define RECORD(expr) record((expr), #expr, __LINE__)
-
-    {
-        mm::AgentManager agents(dir.string());
-        mm::AgentConfig cfg;
-        cfg.id = "agent-a";
-        cfg.name = "agent-a-name";
-        cfg.model_path = "model-a.gguf";
-        cfg.served_model_name = "served-agent-a";
-        agents.create_agent(cfg);
-
-        mm::AgentQueue queue;
-        mm::NodeRegistry registry(dir.string());
-        mm::AgentScheduler scheduler(registry, (dir / "models").string());
-        mm::ControlApiServer api(
-            agents, queue, registry, scheduler,
-            dir.string(), (dir / "models").string(), "control-secret");
-
-        const uint16_t port = find_free_test_port();
-        CHECK(port != 0);
-        const std::string base_url = "http://127.0.0.1:" + std::to_string(port);
-        std::atomic<bool> listen_returned{false};
-        std::atomic<bool> listen_ok{false};
-        std::thread server_thread([&] {
-            listen_ok = api.listen_openai_compat(port);
-            listen_returned = true;
-        });
-
-        mm::HttpClient client(base_url);
-        auto with_retry = [](auto&& request) {
-            mm::HttpResponse resp;
-            for (int attempt = 0; attempt < kTransportRetries; ++attempt) {
-                resp = request();
-                if (resp.status != 0) break;
-                transport_backoff(attempt);
-            }
-            return resp;
-        };
-
-        bool server_ready = false;
-        for (int i = 0; i < 50; ++i) {
-            auto resp = client.get("/v1/models");
-            if (resp.status != 0) {
-                server_ready = true;
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-        RECORD(server_ready);
-
-        auto missing = with_retry([&] { return client.get("/v1/models"); });
-        RECORD(missing.status == 401);
-        RECORD(missing.body.find("missing bearer token") != std::string::npos);
-        RECORD(missing.body.find("\"type\":\"authentication_error\"") != std::string::npos);
-
-        client.set_bearer_token("control-secret");
-        auto models = with_retry([&] { return client.get("/v1/models"); });
-        RECORD(models.status == 200);
-        auto models_body = nlohmann::json::parse(models.body);
-        RECORD(models_body["object"] == "list");
-        RECORD(models_body["data"].size() == 1);
-        RECORD(models_body["data"][0]["id"] == "agent:agent-a");
-        RECORD(models_body["data"][0]["metadata"]["vision_enabled"] == false);
-
-        auto model = with_retry([&] { return client.get("/v1/models/served-agent-a"); });
-        RECORD(model.status == 200);
-        auto model_body = nlohmann::json::parse(model.body);
-        RECORD(model_body["id"] == "agent:agent-a");
-        RECORD(model_body["metadata"]["agent_id"] == "agent-a");
-
-        auto missing_model = with_retry([&] {
-            return client.post(
-                "/v1/chat/completions",
-                nlohmann::json{
-                    {"model", "missing-model"},
-                    {"messages", nlohmann::json::array({{
-                        {"role", "user"},
-                        {"content", "hello"}
-                    }})}
-                });
-        });
-        RECORD(missing_model.status == 404);
-        RECORD(missing_model.body.find("use agent:{agent_id}") != std::string::npos);
-
-        auto invalid_messages = with_retry([&] {
-            return client.post(
-                "/v1/chat/completions",
-                nlohmann::json{
-                    {"model", "agent:agent-a"},
-                    {"messages", nlohmann::json::array()}
-                });
-        });
-        RECORD(invalid_messages.status == 400);
-        RECORD(invalid_messages.body.find("messages must not be empty") != std::string::npos);
-
-        auto remote_image = with_retry([&] {
-            return client.post(
-                "/v1/chat/completions",
-                nlohmann::json{
-                    {"model", "agent:agent-a"},
-                    {"messages", nlohmann::json::array({{
-                        {"role", "user"},
-                        {"content", nlohmann::json::array({
-                            {{"type", "text"}, {"text", "describe"}},
-                            {{"type", "image_url"},
-                             {"image_url", {{"url", "https://example.test/image.png"}}}}
-                        })}
-                    }})}
-                });
-        });
-        RECORD(remote_image.status == 400);
-        RECORD(remote_image.body.find("not supported") != std::string::npos);
-
-        auto non_user_image = with_retry([&] {
-            return client.post(
-                "/v1/chat/completions",
-                nlohmann::json{
-                    {"model", "agent:agent-a"},
-                    {"messages", nlohmann::json::array({{
-                        {"role", "assistant"},
-                        {"content", nlohmann::json::array({
-                            {{"type", "image_url"},
-                             {"image_url", {{"url", "data:image/png;base64,iVBORw0KGgo="}}}}
-                        })}
-                    }})}
-                });
-        });
-        RECORD(non_user_image.status == 400);
-        RECORD(non_user_image.body.find("only on user messages") != std::string::npos);
-
-        auto disabled_image = with_retry([&] {
-            return client.post(
-                "/v1/chat/completions",
-                nlohmann::json{
-                    {"model", "agent:agent-a"},
-                    {"messages", nlohmann::json::array({{
-                        {"role", "user"},
-                        {"content", nlohmann::json::array({
-                            {{"type", "text"}, {"text", "describe"}},
-                            {{"type", "image_url"},
-                             {"image_url", {{"url", "data:image/png;base64,iVBORw0KGgo="}}}}
-                        })}
-                    }})}
-                });
-        });
-        RECORD(disabled_image.status == 422);
-        RECORD(disabled_image.body.find("does not accept images") != std::string::npos);
-
-        api.stop_openai_compat();
-        if (server_thread.joinable()) server_thread.join();
-        RECORD(listen_ok);
-        RECORD(listen_returned);
-        queue.shutdown();
-    }
-    RECORD(remove_tree(dir));
-#undef RECORD
-    return ok;
-}
-
-bool test_control_api_agent_api_mode_chat() {
-    auto dir = temp_test_dir("control-api-agent-mode");
-    std::filesystem::create_directories(dir);
-    std::filesystem::create_directories(dir / "models");
-
-    bool ok = true;
-    auto record = [&](bool condition, const char* expression, int line) {
-        if (!check(condition, expression, line)) ok = false;
-    };
-#define RECORD(expr) record((expr), #expr, __LINE__)
-
-    const uint16_t backend_port = find_free_test_port();
-    CHECK(backend_port != 0);
-    const std::string backend_url = "http://127.0.0.1:" + std::to_string(backend_port);
-
-    httplib::Server backend;
-    std::mutex captured_mx;
-    std::string captured_auth;
-    nlohmann::json captured_body;
-    int captured_requests = 0;
-
-    backend.Get("/health", [](const httplib::Request&, httplib::Response& res) {
-        res.set_content(nlohmann::json{{"ok", true}}.dump(), "application/json");
-    });
-    backend.Post("/v1/chat/completions",
-        [&](const httplib::Request& req, httplib::Response& res) {
-            {
-                std::lock_guard<std::mutex> lock(captured_mx);
-                captured_auth = req.get_header_value("Authorization");
-                captured_body = nlohmann::json::parse(req.body);
-                ++captured_requests;
-            }
-            const std::string body =
-                "data: {\"choices\":[{\"delta\":{\"content\":\"frontier \"}}]}\n\n"
-                "data: {\"choices\":[{\"delta\":{\"content\":\"reply\"}}]}\n\n"
-                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],"
-                "\"usage\":{\"completion_tokens\":2}}\n\n"
-                "data: [DONE]\n\n";
-            res.set_content(body, "text/event-stream");
-        });
-
-    std::atomic<bool> backend_listen_returned{false};
-    std::atomic<bool> backend_listen_ok{false};
-    std::thread backend_thread([&] {
-        backend_listen_ok = backend.listen("127.0.0.1", backend_port);
-        backend_listen_returned = true;
-    });
-
-    mm::HttpClient backend_client(backend_url);
-    bool backend_ready = false;
-    for (int i = 0; i < 50; ++i) {
-        auto resp = backend_client.get("/health");
-        if (resp.status == 200) {
-            backend_ready = true;
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-    RECORD(backend_ready);
-
-    {
-        mm::AgentManager agents(dir.string());
-        mm::AgentQueue queue;
-        mm::NodeRegistry registry(dir.string());
-        mm::AgentScheduler scheduler(registry, (dir / "models").string());
-        mm::ControlApiServer api(
-            agents, queue, registry, scheduler,
-            dir.string(), (dir / "models").string(), "");
-
-        const uint16_t port = find_free_test_port();
-        CHECK(port != 0);
-        const std::string base_url = "http://127.0.0.1:" + std::to_string(port);
-        std::atomic<bool> listen_returned{false};
-        std::atomic<bool> listen_ok{false};
-        std::thread server_thread([&] {
-            listen_ok = api.listen(port);
-            listen_returned = true;
-        });
-
-        mm::HttpClient client(base_url);
-        bool server_ready = false;
-        for (int i = 0; i < 50; ++i) {
-            auto resp = client.get("/v1/agents");
-            if (resp.status != 0) {
-                server_ready = true;
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-        RECORD(server_ready);
-
-        auto with_retry = [](auto&& request) {
-            mm::HttpResponse resp;
-            for (int attempt = 0; attempt < kTransportRetries; ++attempt) {
-                resp = request();
-                if (resp.status != 0) break;
-                transport_backoff(attempt);
-            }
-            return resp;
-        };
-
-        auto create = with_retry([&] {
-            return client.post(
-                "/v1/agents",
-                nlohmann::json{
-                    {"id", "api-agent"},
-                    {"name", "API Agent"},
-                    {"inference_backend", "api"},
-                    {"model_path", "frontier-test-model"},
-                    {"vision_settings", {{"enabled", true}, {"mmproj_path", ""}}},
-                    {"memories_enabled", false},
-                    {"tools_enabled", false},
-                    {"runtime_settings", {
-                        {"top_k", 20},
-                        {"min_p", 0.0},
-                        {"presence_penalty", 1.5},
-                        {"repeat_penalty", 1.0}
-                    }},
-                    {"api_settings", {
-                        {"base_url", backend_url},
-                        {"chat_completions_path", "/v1/chat/completions"},
-                        {"api_key", "test-secret"},
-                        {"api_key_env", ""}
-                    }}
-                });
-        });
-        RECORD(create.status == 201);
-        RECORD(create.body.find("test-secret") == std::string::npos);
-        if (create.status == 201) {
-            auto body = nlohmann::json::parse(create.body);
-            RECORD(body["inference_backend"] == "api");
-            RECORD(body["api_settings"]["api_key_configured"] == true);
-            RECORD(body["node_compatibility"]["backend"] == "api");
-            RECORD(body["node_compatibility"]["requires_node"] == false);
-        }
-
-        auto agent_resp = with_retry([&] { return client.get("/v1/agents/api-agent"); });
-        RECORD(agent_resp.status == 200);
-        RECORD(agent_resp.body.find("test-secret") == std::string::npos);
-        if (agent_resp.status == 200) {
-            auto body = nlohmann::json::parse(agent_resp.body);
-            RECORD(body["status"] == "api");
-            RECORD(body["inference_backend"] == "api");
-            RECORD(body["node_compatibility"]["backend"] == "api");
-            RECORD(body["node_compatibility"]["requires_node"] == false);
-        }
-
-        struct StreamAttempt {
-            bool ok = false;
-            int status = 0;
-            std::string body;
-            std::vector<std::string> events;
-        };
-        auto stream_chat = [&](const nlohmann::json& request_body) {
-            StreamAttempt attempt;
-            // Same budget as everywhere else; see kTransportRetries. This loop
-            // was the third copy of the policy and the second one with 3.
-            for (int retry = 0; retry < kTransportRetries; ++retry) {
-                attempt = StreamAttempt{};
-                attempt.ok = client.stream_post(
-                    "/v1/agents/api-agent/chat",
-                    request_body,
-                    [&](const std::string& event) {
-                        attempt.events.push_back(event);
-                        return true;
-                    },
-                    &attempt.status,
-                    &attempt.body);
-                if (attempt.ok || attempt.status != 0) break;
-                transport_backoff(retry);
-            }
-            return attempt;
-        };
-
-        auto chat = stream_chat(nlohmann::json{{"message", "hello from test"}});
-        RECORD(chat.ok);
-        RECORD(chat.status == 200);
-
-        std::string combined_delta;
-        bool saw_done = false;
-        for (const auto& event : chat.events) {
-            if (event == "[DONE]") continue;
-            auto j = nlohmann::json::parse(event);
-            const std::string type = j.value("type", std::string{});
-            if (type == "delta") {
-                combined_delta += j.value("content", std::string{});
-            } else if (type == "done") {
-                saw_done = j.value("success", false);
-            }
-        }
-        RECORD(combined_delta == "frontier reply");
-        RECORD(saw_done);
-
-        std::string auth;
-        nlohmann::json sent;
-        int request_count = 0;
-        {
-            std::lock_guard<std::mutex> lock(captured_mx);
-            auth = captured_auth;
-            sent = captured_body;
-            request_count = captured_requests;
-        }
-        RECORD(request_count == 1);
-        RECORD(auth == "Bearer test-secret");
-        RECORD(sent["model"] == "frontier-test-model");
-        RECORD(sent["stream"] == true);
-        RECORD(sent["top_k"] == 20);
-        RECORD(sent["min_p"] == 0.0);
-        RECORD(sent["presence_penalty"] == 1.5);
-        RECORD(sent["repeat_penalty"] == 1.0);
-        RECORD(sent.dump().find("hello from test") != std::string::npos);
-
-        const auto image_path = dir / "api-vision.png";
-        {
-            std::ofstream image(image_path, std::ios::binary);
-            const unsigned char signature[] =
-                {0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
-            image.write(reinterpret_cast<const char*>(signature), sizeof(signature));
-        }
-        const auto upload = with_retry([&] {
-            return client.post_file(
-                "/v1/agents/api-agent/attachments", image_path.string(),
-                {{"X-Filename", "api-vision.png"}}, "image/png");
-        });
-        RECORD(upload.status == 201);
-        const std::string attachment_id =
-            nlohmann::json::parse(upload.body)["id"].get<std::string>();
-
-        auto vision_chat = stream_chat(
-            nlohmann::json{{"message", "describe this image"},
-                           {"attachment_ids", {attachment_id}}});
-        RECORD(vision_chat.ok);
-        RECORD(vision_chat.status == 200);
-        {
-            std::lock_guard<std::mutex> lock(captured_mx);
-            sent = captured_body;
-            request_count = captured_requests;
-        }
-        RECORD(request_count == 2);
-        const auto image_parts = sent["messages"].back()["content"];
-        RECORD(image_parts.is_array());
-        RECORD(image_parts.size() == 2);
-        RECORD(image_parts[0]["type"] == "text");
-        RECORD(image_parts[0]["text"] == "describe this image");
-        RECORD(image_parts[1]["type"] == "image_url");
-        RECORD(image_parts[1]["image_url"]["url"] ==
-               "data:image/png;base64,iVBORw0KGgo=");
-
-        auto followup = stream_chat(
-            nlohmann::json{{"message", "what image did I send?"}});
-        RECORD(followup.ok);
-        RECORD(followup.status == 200);
-        {
-            std::lock_guard<std::mutex> lock(captured_mx);
-            sent = captured_body;
-            request_count = captured_requests;
-        }
-        RECORD(request_count == 3);
-        bool retained_image = false;
-        for (const auto& request_message : sent["messages"]) {
-            if (!request_message.contains("content") ||
-                !request_message["content"].is_array()) continue;
-            for (const auto& part : request_message["content"]) {
-                if (part.value("type", std::string{}) == "image_url" &&
-                    part["image_url"].value("url", std::string{}) ==
-                        "data:image/png;base64,iVBORw0KGgo=") {
-                    retained_image = true;
-                }
-            }
-        }
-        RECORD(retained_image);
-
-        api.stop();
-        if (server_thread.joinable()) server_thread.join();
-        RECORD(listen_ok);
-        RECORD(listen_returned);
-        queue.shutdown();
-    }
-
-    backend.stop();
-    if (backend_thread.joinable()) backend_thread.join();
-    RECORD(backend_listen_ok);
-    RECORD(backend_listen_returned);
-    RECORD(remove_tree(dir));
-#undef RECORD
-    return ok;
-}
-
-bool test_agent_voice_db_and_cache_lifecycle() {
-    auto dir = temp_test_dir("agent-voice-db");
+bool test_user_voice_db_and_cache_lifecycle() {
+    auto dir = temp_test_dir("user-voice-db");
     std::filesystem::create_directories(dir);
     {
-        mm::AgentDB db("agent-a", dir.string());
+        mm::UserDB db("voice-user", dir.string());
 
         mm::VoiceDesignProposal proposal;
         proposal.id = "proposal-a";
-        proposal.agent_id = "agent-a";
+        proposal.user_id = "voice-user";
         proposal.display_name = "Analyst Voice";
         proposal.language = "English";
         proposal.voice_description = "Clear, calm, original synthetic narrator voice.";
         proposal.sample_text = "Here is a concise operational update.";
-        proposal.rationale = "Fits the agent role.";
+        proposal.rationale = "Fits the assistant role.";
         proposal.status = "pending";
         db.save_voice_proposal(proposal);
 
@@ -4718,9 +4119,9 @@ bool test_agent_voice_db_and_cache_lifecycle() {
         CHECK(loaded.has_value());
         CHECK(loaded->status == "sampled");
 
-        mm::AgentVoiceProfile profile_a;
+        mm::VoiceProfile profile_a;
         profile_a.id = "profile-a";
-        profile_a.agent_id = "agent-a";
+        profile_a.user_id = "voice-user";
         profile_a.display_name = "Voice A";
         profile_a.voice_description = "First voice.";
         profile_a.sample_text = "Sample A";
@@ -4731,7 +4132,7 @@ bool test_agent_voice_db_and_cache_lifecycle() {
         CHECK(active.has_value());
         CHECK(active->id == "profile-a");
 
-        mm::AgentVoiceProfile profile_b = profile_a;
+        mm::VoiceProfile profile_b = profile_a;
         profile_b.id = "profile-b";
         profile_b.display_name = "Voice B";
         db.save_voice_profile(profile_b);
@@ -4744,7 +4145,7 @@ bool test_agent_voice_db_and_cache_lifecycle() {
 
         mm::TtsSynthesisResult cache;
         cache.cache_id = "cache-a";
-        cache.agent_id = "agent-a";
+        cache.user_id = "voice-user";
         cache.voice_profile_id = "profile-b";
         cache.conversation_id = "conv-a";
         cache.message_index = 3;
@@ -4848,7 +4249,7 @@ bool test_tts_service_client_fake_sidecar_paths() {
     RECORD(sample.voice_clone_prompt_path == "prompt.pkl");
     RECORD(sample.sample_rate == 24000);
 
-    mm::AgentVoiceProfile profile;
+    mm::VoiceProfile profile;
     profile.id = "profile-a";
     profile.language = "English";
     profile.voice_clone_prompt_path = "prompt.pkl";
@@ -4887,18 +4288,17 @@ bool test_control_api_tts_routes_disabled() {
 #define RECORD(expr) record((expr), #expr, __LINE__)
 
     {
-        mm::AgentManager agents(dir.string());
-        mm::AgentConfig cfg;
-        cfg.id = "agent-a";
-        cfg.name = "Agent A";
-        cfg.model_path = "model.gguf";
-        agents.create_agent(cfg);
+        mm::UserManager users(dir.string());
+        {
+            mm::UserProfile profile;
+            profile.id = "user-a";
+            std::string create_error;
+            users.create_user(profile, create_error);
+        }
 
-        mm::AgentQueue queue;
         mm::NodeRegistry registry(dir.string());
-        mm::AgentScheduler scheduler(registry, (dir / "models").string());
-        mm::ControlApiServer api(
-            agents, queue, registry, scheduler,
+        mm::PlacementScheduler scheduler(registry, (dir / "models").string());
+        mm::ControlApiServer api(users, registry, scheduler,
             dir.string(), (dir / "models").string());
 
         const uint16_t port = find_free_test_port();
@@ -4923,9 +4323,9 @@ bool test_control_api_tts_routes_disabled() {
         RECORD(server_ready);
 
     auto create = client.post(
-        "/v1/agents/agent-a/voice/proposals",
+        "/v1/users/user-a/voice/proposals",
         nlohmann::json{
-            {"display_name", "Agent A Voice"},
+            {"display_name", "Voice A"},
             {"language", "English"},
             {"voice_description", "A clear original synthetic assistant voice."},
             {"sample_text", "This is a local voice preview."},
@@ -4935,27 +4335,27 @@ bool test_control_api_tts_routes_disabled() {
     auto create_body = nlohmann::json::parse(create.body);
     const std::string proposal_id = create_body["proposal"]["id"].get<std::string>();
 
-    auto state = client.get("/v1/agents/agent-a/voice");
+    auto state = client.get("/v1/users/user-a/voice");
     RECORD(state.status == 200);
     auto state_body = nlohmann::json::parse(state.body);
     RECORD(state_body["tts_enabled"] == false);
     RECORD(state_body["proposals"].size() == 1);
 
     auto sample = client.post(
-        "/v1/agents/agent-a/voice/proposals/" + proposal_id + "/sample",
+        "/v1/users/user-a/voice/proposals/" + proposal_id + "/sample",
         nlohmann::json::object());
     RECORD(sample.status == 503);
     RECORD(sample.body.find("disabled") != std::string::npos);
 
     auto speech = client.post(
-        "/v1/agents/agent-a/speech",
+        "/v1/users/user-a/speech",
         nlohmann::json{{"text", "Speak this message."}});
     RECORD(speech.status == 503);
     RECORD(speech.body.find("disabled") != std::string::npos);
 
     auto compat = client.post(
         "/v1/audio/speech",
-        nlohmann::json{{"voice", "agent:agent-a"}, {"input", "Speak this message."}});
+        nlohmann::json{{"voice", "user:user-a"}, {"input", "Speak this message."}});
     RECORD(compat.status == 503);
     RECORD(compat.body.find("disabled") != std::string::npos);
 
@@ -4963,7 +4363,6 @@ bool test_control_api_tts_routes_disabled() {
         if (server_thread.joinable()) server_thread.join();
         RECORD(listen_ok);
         RECORD(listen_returned);
-        queue.shutdown();
     }
     RECORD(remove_tree(dir));
 #undef RECORD
@@ -4975,18 +4374,17 @@ bool test_control_api_curation_routes() {
     std::filesystem::create_directories(dir);
     std::filesystem::create_directories(dir / "models");
 
-    mm::AgentManager agents(dir.string());
-    mm::AgentConfig cfg;
-    cfg.id = "agent-a";
-    cfg.name = "Agent A";
-    cfg.model_path = "model.gguf";
-    agents.create_agent(cfg);
+    mm::UserManager users(dir.string());
+    {
+        mm::UserProfile profile;
+        profile.id = "user-a";
+        std::string create_error;
+        users.create_user(profile, create_error);
+    }
 
-    mm::AgentQueue queue;
     mm::NodeRegistry registry(dir.string());
-    mm::AgentScheduler scheduler(registry, (dir / "models").string());
-    mm::ControlApiServer api(
-        agents, queue, registry, scheduler,
+    mm::PlacementScheduler scheduler(registry, (dir / "models").string());
+    mm::ControlApiServer api(users, registry, scheduler,
         dir.string(), (dir / "models").string());
 
     const uint16_t port = find_free_test_port();
@@ -5017,7 +4415,7 @@ bool test_control_api_curation_routes() {
     RECORD(server_ready);
 
     auto create_active = client.post(
-        "/v1/agents/agent-a/conversations",
+        "/v1/users/user-a/conversations",
         nlohmann::json{{"title", "Original title"}, {"set_active", true}});
     RECORD(create_active.status == 201);
     auto active_body = nlohmann::json::parse(create_active.body);
@@ -5025,14 +4423,14 @@ bool test_control_api_curation_routes() {
     RECORD(active_body["conversation"]["is_active"].get<bool>());
 
     auto rename = client.put(
-        "/v1/agents/agent-a/conversations/" + active_id,
+        "/v1/users/user-a/conversations/" + active_id,
         nlohmann::json{{"title", "Renamed curation title"}});
     RECORD(rename.status == 200);
     auto renamed_body = nlohmann::json::parse(rename.body);
     RECORD(renamed_body["title"] == "Renamed curation title");
 
     auto create_global = client.post(
-        "/v1/agents/agent-a/memories",
+        "/v1/users/user-a/memories",
         nlohmann::json{
             {"content", "  Durable global summary  "},
             {"source_conv_id", active_id},
@@ -5045,7 +4443,7 @@ bool test_control_api_curation_routes() {
     RECORD(global_body["source_conv_id"] == active_id);
 
     auto create_global_delete = client.post(
-        "/v1/agents/agent-a/memories",
+        "/v1/users/user-a/memories",
         nlohmann::json{
             {"content", "Temporary global summary"},
             {"source_conv_id", active_id},
@@ -5056,7 +4454,7 @@ bool test_control_api_curation_routes() {
     const std::string global_delete_id = global_delete_body["id"].get<std::string>();
 
     auto create_local = client.post(
-        "/v1/agents/agent-a/conversations/" + active_id + "/local-memories",
+        "/v1/users/user-a/conversations/" + active_id + "/local-memories",
         nlohmann::json{{"content", "Local note"}});
     RECORD(create_local.status == 201);
     auto local_body = nlohmann::json::parse(create_local.body);
@@ -5064,28 +4462,28 @@ bool test_control_api_curation_routes() {
     RECORD(local_body["conversation_id"] == active_id);
 
     auto update_local = client.put(
-        "/v1/agents/agent-a/conversations/" + active_id + "/local-memories/" + local_id,
+        "/v1/users/user-a/conversations/" + active_id + "/local-memories/" + local_id,
         nlohmann::json{{"content", "Updated local note"}});
     RECORD(update_local.status == 200);
     auto updated_local_body = nlohmann::json::parse(update_local.body);
     RECORD(updated_local_body["content"] == "Updated local note");
 
     auto create_local_delete = client.post(
-        "/v1/agents/agent-a/conversations/" + active_id + "/local-memories",
+        "/v1/users/user-a/conversations/" + active_id + "/local-memories",
         nlohmann::json{{"content", "Temporary local note"}});
     RECORD(create_local_delete.status == 201);
     auto local_delete_body = nlohmann::json::parse(create_local_delete.body);
     const std::string local_delete_id = local_delete_body["id"].get<std::string>();
 
     auto proposals = client.post(
-        "/v1/agents/agent-a/curation/proposals",
+        "/v1/users/user-a/curation/proposals",
         nlohmann::json{{"conversation_id", active_id}});
     RECORD(proposals.status == 200);
     auto proposals_body = nlohmann::json::parse(proposals.body);
     RECORD(proposals_body.contains("proposals"));
 
     auto create_batch_delete_conv = client.post(
-        "/v1/agents/agent-a/conversations",
+        "/v1/users/user-a/conversations",
         nlohmann::json{{"title", "Batch delete conversation"}, {"set_active", false}});
     RECORD(create_batch_delete_conv.status == 201);
     auto batch_delete_conv_body = nlohmann::json::parse(create_batch_delete_conv.body);
@@ -5166,7 +4564,7 @@ bool test_control_api_curation_routes() {
     });
 
     auto apply = client.post(
-        "/v1/agents/agent-a/curation/proposals/apply",
+        "/v1/users/user-a/curation/apply",
         nlohmann::json{{"proposals", apply_proposals}});
     RECORD(apply.status == 200);
     auto apply_body = nlohmann::json::parse(apply.body);
@@ -5175,15 +4573,15 @@ bool test_control_api_curation_routes() {
     RECORD(apply_body["results"].is_array());
     RECORD(apply_body["results"].size() == 8);
 
-    auto applied_conversation = client.get("/v1/agents/agent-a/conversations/" + active_id);
+    auto applied_conversation = client.get("/v1/users/user-a/conversations/" + active_id);
     RECORD(applied_conversation.status == 200);
     auto applied_conversation_body = nlohmann::json::parse(applied_conversation.body);
     RECORD(applied_conversation_body["title"] == "Batch applied title");
 
     auto applied_local = client.get(
-        "/v1/agents/agent-a/conversations/" + active_id + "/local-memories");
+        "/v1/users/user-a/conversations/" + active_id + "/local-memories");
     RECORD(applied_local.status == 200);
-    auto applied_local_body = nlohmann::json::parse(applied_local.body);
+    auto applied_local_body = nlohmann::json::parse(applied_local.body)["data"];
     bool saw_updated_local = false;
     bool saw_created_local = false;
     bool saw_deleted_local = false;
@@ -5204,9 +4602,9 @@ bool test_control_api_curation_routes() {
     RECORD(saw_created_local);
     RECORD(!saw_deleted_local);
 
-    auto applied_global = client.get("/v1/agents/agent-a/memories");
+    auto applied_global = client.get("/v1/users/user-a/memories");
     RECORD(applied_global.status == 200);
-    auto applied_global_body = nlohmann::json::parse(applied_global.body);
+    auto applied_global_body = nlohmann::json::parse(applied_global.body)["data"];
     bool saw_updated_global = false;
     bool saw_created_global = false;
     bool saw_deleted_global = false;
@@ -5230,11 +4628,11 @@ bool test_control_api_curation_routes() {
     RECORD(!saw_deleted_global);
 
     auto deleted_batch_conv = client.get(
-        "/v1/agents/agent-a/conversations/" + batch_delete_conv_id);
+        "/v1/users/user-a/conversations/" + batch_delete_conv_id);
     RECORD(deleted_batch_conv.status == 404);
 
     auto create_invalid_target_conv = client.post(
-        "/v1/agents/agent-a/conversations",
+        "/v1/users/user-a/conversations",
         nlohmann::json{{"title", "Invalid target container"}, {"set_active", false}});
     RECORD(create_invalid_target_conv.status == 201);
     auto invalid_target_conv_body = nlohmann::json::parse(create_invalid_target_conv.body);
@@ -5260,7 +4658,7 @@ bool test_control_api_curation_routes() {
             nlohmann::json{{"content", "Should not apply"}})
     });
     auto invalid_apply = client.post(
-        "/v1/agents/agent-a/curation/apply",
+        "/v1/users/user-a/curation/apply",
         nlohmann::json{{"proposals", invalid_apply_proposals}});
     RECORD(invalid_apply.status == 400);
     auto invalid_apply_body = nlohmann::json::parse(invalid_apply.body);
@@ -5271,16 +4669,16 @@ bool test_control_api_curation_routes() {
            std::string::npos);
 
     auto conversation_after_invalid =
-        client.get("/v1/agents/agent-a/conversations/" + active_id);
+        client.get("/v1/users/user-a/conversations/" + active_id);
     RECORD(conversation_after_invalid.status == 200);
     auto conversation_after_invalid_body =
         nlohmann::json::parse(conversation_after_invalid.body);
     RECORD(conversation_after_invalid_body["title"] == "Batch applied title");
 
     auto local_after_invalid = client.get(
-        "/v1/agents/agent-a/conversations/" + active_id + "/local-memories");
+        "/v1/users/user-a/conversations/" + active_id + "/local-memories");
     RECORD(local_after_invalid.status == 200);
-    auto local_after_invalid_body = nlohmann::json::parse(local_after_invalid.body);
+    auto local_after_invalid_body = nlohmann::json::parse(local_after_invalid.body)["data"];
     bool local_preserved_after_invalid = false;
     for (const auto& item : local_after_invalid_body) {
         if (item["id"].get<std::string>() == local_id &&
@@ -5291,32 +4689,31 @@ bool test_control_api_curation_routes() {
     RECORD(local_preserved_after_invalid);
 
     auto delete_invalid_target_conv =
-        client.del("/v1/agents/agent-a/conversations/" + invalid_target_conv_id);
+        client.del("/v1/users/user-a/conversations/" + invalid_target_conv_id);
     RECORD(delete_invalid_target_conv.status == 200);
 
-    auto delete_active = client.del("/v1/agents/agent-a/conversations/" + active_id);
+    auto delete_active = client.del("/v1/users/user-a/conversations/" + active_id);
     RECORD(delete_active.status == 409);
 
     auto create_inactive = client.post(
-        "/v1/agents/agent-a/conversations",
+        "/v1/users/user-a/conversations",
         nlohmann::json{{"title", "Inactive cleanup"}, {"set_active", false}});
     RECORD(create_inactive.status == 201);
     auto inactive_body = nlohmann::json::parse(create_inactive.body);
     const std::string inactive_id = inactive_body["conversation"]["id"].get<std::string>();
 
-    auto delete_inactive = client.del("/v1/agents/agent-a/conversations/" + inactive_id);
+    auto delete_inactive = client.del("/v1/users/user-a/conversations/" + inactive_id);
     RECORD(delete_inactive.status == 200);
 
     auto delete_local = client.del(
-        "/v1/agents/agent-a/conversations/" + active_id + "/local-memories/" + local_id);
+        "/v1/users/user-a/conversations/" + active_id + "/local-memories/" + local_id);
     RECORD(delete_local.status == 200);
 
     api.stop();
     if (server_thread.joinable()) server_thread.join();
     RECORD(listen_ok);
     RECORD(listen_returned);
-    queue.shutdown();
-    RECORD(agents.delete_agent("agent-a"));
+    RECORD(users.delete_user("user-a"));
     RECORD(remove_tree(dir));
 #undef RECORD
     return ok;
@@ -5327,14 +4724,16 @@ bool test_global_memory_origin_tool_and_context_metadata() {
     std::filesystem::create_directories(dir);
 
     {
-        mm::AgentDB db(dir.string());
-        mm::ConvId conv_id = db.create_conversation("Origin chain");
+        mm::UserDB db("origin-user", dir.string());
+        mm::NewConversation origin_spec;
+        origin_spec.title = "Origin chain";
+        const mm::ConvId conv_id = db.create_conversation(origin_spec);
 
         mm::Message user_msg;
         user_msg.role = mm::MessageRole::User;
         user_msg.content = "We decided the launch checklist needs a thermal review.";
         user_msg.timestamp_ms = mm::util::now_ms();
-        db.append_message(conv_id, user_msg, 0);
+        db.append_message(conv_id, user_msg);
 
         mm::LocalMemory local;
         local.id = "local-1";
@@ -5350,9 +4749,13 @@ bool test_global_memory_origin_tool_and_context_metadata() {
         global.created_at_ms = mm::util::now_ms();
         db.add_memory(global);
 
-        const std::string formatted = mm::MemoryManager::format_memories_for_context({global});
-        CHECK(formatted.find("global-1") != std::string::npos);
-        CHECK(formatted.find(conv_id) != std::string::npos);
+        // With tools offered, the context names each memory by id and says how
+        // to reach the conversation it came from.
+        mm::UserProfile profile;
+        profile.id = "origin-user";
+        const std::string formatted =
+            mm::build_system_text(profile, mm::Conversation{}, {global}, {}, true);
+        CHECK(formatted.find("[global-1]") != std::string::npos);
         CHECK(formatted.find("get_global_memory_origin") != std::string::npos);
 
         mm::ToolExecutor tools(db);
@@ -5382,8 +4785,10 @@ bool test_message_trace_events_round_trip() {
     std::filesystem::create_directories(dir);
 
     {
-        mm::AgentDB db("agent-a", dir.string());
-        mm::ConvId conv_id = db.create_conversation("Trace events");
+        mm::UserDB db("trace-user", dir.string());
+        mm::NewConversation trace_spec;
+        trace_spec.title = "Trace events";
+        const mm::ConvId conv_id = db.create_conversation(trace_spec);
 
         mm::TraceEvent event;
         event.id = "trace-1";
@@ -5401,7 +4806,7 @@ bool test_message_trace_events_round_trip() {
         msg.content = "I inspected the existing UI.";
         msg.timestamp_ms = mm::util::now_ms();
         msg.trace_events.push_back(event);
-        db.append_message(conv_id, msg, 0);
+        db.append_message(conv_id, msg);
 
         auto loaded = db.load_conversation(conv_id);
         CHECK(loaded.has_value());
@@ -5419,169 +4824,120 @@ bool test_message_trace_events_round_trip() {
     return true;
 }
 
-bool test_compaction_followup_trace_provenance_survives() {
+bool test_compaction_trace_provenance_survives() {
     auto dir = temp_test_dir("compaction-trace-provenance");
     std::filesystem::create_directories(dir);
 
     {
-        mm::AgentDB db("agent-a", dir.string());
-        mm::AgentConfig cfg;
-        cfg.id = "agent-a";
-        cfg.name = "Agent A";
-        cfg.model_path = "model.gguf";
-        cfg.system_prompt = "Use memory provenance carefully.";
-        cfg.memories_enabled = true;
-        cfg.runtime_settings.ctx_size = 128;
-
-        const mm::ConvId source_conv_id = db.create_conversation("Launch review");
-        db.set_active_conversation(source_conv_id);
+        mm::UserDB db("provenance-user", dir.string());
+        mm::NewConversation spec;
+        spec.title = "Launch review";
+        spec.set_active = true;
+        const mm::ConvId conv_id = db.create_conversation(spec);
 
         for (int i = 0; i < 6; ++i) {
             mm::Message msg;
             msg.role = (i % 2 == 0) ? mm::MessageRole::User : mm::MessageRole::Assistant;
             msg.content = i == 0
-                ? "The source conversation decided the launch checklist needs a thermal review."
+                ? "The conversation decided the launch checklist needs a thermal review."
                 : "Conversation turn " + std::to_string(i);
             msg.token_count = 18;
             msg.timestamp_ms = mm::util::now_ms();
-            db.append_message(source_conv_id, msg, i);
+            db.append_message(conv_id, msg);
         }
 
         mm::LocalMemory local;
         local.id = "local-launch-review";
-        local.conversation_id = source_conv_id;
+        local.conversation_id = conv_id;
         local.content = "Thermal review remains the local follow-up detail.";
         db.add_local_memory(local);
 
         mm::Memory global;
         global.id = "global-launch-review";
         global.content = "Launch review origin covers the thermal checklist decision.";
-        global.source_conv_id = source_conv_id;
+        global.source_conv_id = conv_id;
         global.importance = 0.95f;
         global.created_at_ms = mm::util::now_ms();
         db.add_memory(global);
 
-        FixedSummaryRuntimeClient runtime;
-        mm::ConversationManager conv_mgr(db, runtime);
-        const mm::ConvId continued_conv_id = conv_mgr.force_compact(source_conv_id, cfg);
-        CHECK(!continued_conv_id.empty());
-        CHECK(continued_conv_id != source_conv_id);
-        CHECK(runtime.last_model == "model.gguf");
+        // Fold everything before the latest turn, in place.
+        mm::CompactionRequest request;
+        request.messages = db.load_messages(conv_id);
+        request.budget = 3072;
+        request.force = true;
+        const mm::RollingCompactor compactor(
+            [](const std::vector<mm::Message>&, int) -> std::optional<std::string> {
+                return std::string("Summary: the launch checklist needs a thermal review.");
+            },
+            [&](const std::string& summary, int through) {
+                return db.save_summary(conv_id, summary, through, "summary-model");
+            });
+        const auto folded = compactor.run(request);
+        CHECK(folded.status == mm::CompactionResult::Status::Compacted);
+        CHECK(folded.summary_through_seq == 3);
 
-        auto source = db.load_conversation(source_conv_id);
-        auto continued = db.load_conversation(continued_conv_id);
-        CHECK(source.has_value());
-        CHECK(continued.has_value());
-        CHECK(!source->is_active);
-        CHECK(continued->is_active);
-        CHECK(continued->parent_conv_id == source_conv_id);
-        CHECK(continued->compaction_summary.find("thermal review") != std::string::npos);
+        // What the next turn is shown is traceable: the summary to the
+        // conversation it summarizes, each memory to where it came from.
+        const auto events = mm::build_context_trace_events(db, conv_id, {global});
+        const mm::TraceEvent* summary_event = find_trace_event(events, "Rolling summary reviewed");
+        CHECK(summary_event != nullptr);
+        CHECK(summary_event->source_id == conv_id);
+        CHECK(summary_event->metadata["summary_through_seq"] == 3);
+        CHECK(summary_event->metadata["summary_model_id"] == "summary-model");
+        const mm::TraceEvent* local_event =
+            find_trace_event(events, "Conversation-local memory reviewed");
+        CHECK(local_event != nullptr);
+        CHECK(local_event->source_id == "local-launch-review");
+        const mm::TraceEvent* global_event = find_trace_event(events, "Global memory reviewed");
+        CHECK(global_event != nullptr);
+        CHECK(global_event->source_id == "global-launch-review");
+        CHECK(global_event->metadata["source_conv_id"] == conv_id);
 
-        CHECK(db.list_local_memories(source_conv_id).empty());
-        auto continued_local = db.list_local_memories(continued_conv_id);
-        CHECK(continued_local.size() == 1);
-        CHECK(continued_local[0].id == "local-launch-review");
-        CHECK(continued_local[0].conversation_id == continued_conv_id);
-
-        std::vector<mm::TraceEvent> trace_events =
-            mm::build_context_trace_events(db, continued_conv_id, db.list_memories());
-        CHECK(trace_events.size() == 4);
-
-        const mm::TraceEvent* parent_trace =
-            find_trace_event(trace_events, "Parent conversation accessed");
-        CHECK(parent_trace != nullptr);
-        CHECK(parent_trace->source_id == source_conv_id);
-        CHECK(parent_trace->metadata["conversation_id"] == continued_conv_id);
-
-        const mm::TraceEvent* summary_trace =
-            find_trace_event(trace_events, "Compaction summary reviewed");
-        CHECK(summary_trace != nullptr);
-        CHECK(summary_trace->source_id == source_conv_id);
-        CHECK(summary_trace->metadata["conversation_id"] == continued_conv_id);
-        CHECK(summary_trace->metadata["parent_conv_id"] == source_conv_id);
-
-        const mm::TraceEvent* local_trace =
-            find_trace_event(trace_events, "Conversation-local memory reviewed");
-        CHECK(local_trace != nullptr);
-        CHECK(local_trace->source_id == "local-launch-review");
-        CHECK(local_trace->metadata["conversation_id"] == continued_conv_id);
-
-        const mm::TraceEvent* global_trace =
-            find_trace_event(trace_events, "Global memory reviewed");
-        CHECK(global_trace != nullptr);
-        CHECK(global_trace->source_id == "global-launch-review");
-        CHECK(global_trace->metadata["source_conv_id"] == source_conv_id);
-
+        // The follow-up turn records what it was shown, and each tool it ran.
         mm::Message followup;
         followup.role = mm::MessageRole::Assistant;
-        followup.content = "The thermal review context is still available.";
+        followup.content = "Checking the thermal review.";
         followup.timestamp_ms = mm::util::now_ms();
-        followup.trace_events = trace_events;
-        db.append_message(continued_conv_id, followup, 4);
+        followup.trace_events = events;
+        db.append_message(conv_id, followup);
 
         mm::ToolExecutor tools(db);
-        mm::ToolCall local_call;
-        local_call.id = "call-local";
-        local_call.function_name = "list_local_memories";
-        local_call.arguments_json = "{}";
-        mm::Message local_result = tools.execute_tool(local_call, continued_conv_id);
-        auto local_result_json = nlohmann::json::parse(local_result.content);
-        CHECK(local_result_json["count"] == 1);
-        CHECK(local_result_json["memories"][0]["id"] == "local-launch-review");
-        auto local_tool_trace = mm::build_tool_access_trace(
-            local_call, local_result, continued_conv_id);
-        CHECK(local_tool_trace.has_value());
-        local_result.trace_events.push_back(*local_tool_trace);
-        db.append_message(continued_conv_id, local_result, 5);
+        mm::ToolCall list_call;
+        list_call.id = "call-list";
+        list_call.function_name = "list_local_memories";
+        list_call.arguments_json = "{}";
+        mm::Message list_result = tools.execute_tool(list_call, conv_id);
+        const auto list_trace = mm::build_tool_access_trace(list_call, list_result, conv_id);
+        CHECK(list_trace.has_value());
+        list_result.trace_events.push_back(*list_trace);
+        db.append_message(conv_id, list_result);
 
         mm::ToolCall origin_call;
         origin_call.id = "call-origin";
         origin_call.function_name = "get_global_memory_origin";
         origin_call.arguments_json = R"({"memory_id":"global-launch-review"})";
-        mm::Message origin_result = tools.execute_tool(origin_call, continued_conv_id);
+        mm::Message origin_result = tools.execute_tool(origin_call, conv_id);
         auto origin_json = nlohmann::json::parse(origin_result.content);
-        CHECK(origin_json["memory"]["source_conv_id"] == source_conv_id);
-        CHECK(origin_json["origin"]["conversation_id"] == source_conv_id);
-        auto origin_tool_trace = mm::build_tool_access_trace(
-            origin_call, origin_result, continued_conv_id);
-        CHECK(origin_tool_trace.has_value());
-        CHECK(origin_tool_trace->source_id == "global-launch-review");
-        origin_result.trace_events.push_back(*origin_tool_trace);
-        db.append_message(continued_conv_id, origin_result, 6);
+        CHECK(origin_json["memory"]["source_conv_id"] == conv_id);
+        CHECK(origin_json["origin"]["conversation_id"] == conv_id);
+        CHECK(origin_json["origin"]["summary"] ==
+              "Summary: the launch checklist needs a thermal review.");
+        const auto origin_trace = mm::build_tool_access_trace(origin_call, origin_result, conv_id);
+        CHECK(origin_trace.has_value());
+        CHECK(origin_trace->source_id == "global-launch-review");
+        origin_result.trace_events.push_back(*origin_trace);
+        db.append_message(conv_id, origin_result);
 
-        auto reloaded = db.load_conversation(continued_conv_id);
+        auto reloaded = db.load_conversation(conv_id);
         CHECK(reloaded.has_value());
-        CHECK(reloaded->messages.size() == 7);
-        CHECK(reloaded->messages[4].trace_events.size() == 4);
-
-        const auto& persisted_followup_traces = reloaded->messages[4].trace_events;
-        const mm::TraceEvent* persisted_summary =
-            find_trace_event(persisted_followup_traces, "Compaction summary reviewed");
-        CHECK(persisted_summary != nullptr);
-        CHECK(persisted_summary->source_id == source_conv_id);
-        CHECK(persisted_summary->metadata["conversation_id"] == continued_conv_id);
-
-        const mm::TraceEvent* persisted_local =
-            find_trace_event(persisted_followup_traces, "Conversation-local memory reviewed");
-        CHECK(persisted_local != nullptr);
-        CHECK(persisted_local->source_id == "local-launch-review");
-        CHECK(persisted_local->metadata["conversation_id"] == continued_conv_id);
-
-        const mm::TraceEvent* persisted_global =
-            find_trace_event(persisted_followup_traces, "Global memory reviewed");
-        CHECK(persisted_global != nullptr);
-        CHECK(persisted_global->source_id == "global-launch-review");
-        CHECK(persisted_global->metadata["source_conv_id"] == source_conv_id);
-
-        CHECK(reloaded->messages[5].trace_events.size() == 1);
-        CHECK(reloaded->messages[5].trace_events[0].title ==
-              "Conversation-local memories listed");
-        CHECK(reloaded->messages[5].trace_events[0].source_id == continued_conv_id);
-
-        CHECK(reloaded->messages[6].trace_events.size() == 1);
-        CHECK(reloaded->messages[6].trace_events[0].title ==
-              "Global memory origin accessed");
-        CHECK(reloaded->messages[6].trace_events[0].source_id == "global-launch-review");
+        CHECK(reloaded->messages.size() == 9);
+        CHECK(reloaded->messages[6].trace_events.size() == events.size());
+        CHECK(find_trace_event(reloaded->messages[6].trace_events, "Rolling summary reviewed") !=
+              nullptr);
+        CHECK(reloaded->messages[7].trace_events.size() == 1);
+        CHECK(reloaded->messages[7].trace_events[0].title == "Conversation-local memories listed");
+        CHECK(reloaded->messages[8].trace_events.size() == 1);
+        CHECK(reloaded->messages[8].trace_events[0].title == "Global memory origin accessed");
     }
 
     CHECK(remove_tree(dir));
@@ -5618,6 +4974,852 @@ bool test_config_and_url_parsing_edge_cases() {
 
     CHECK(remove_tree(dir));
     return true;
+}
+
+// ── leases ────────────────────────────────────────────────────────────────────
+//
+// Placement is keyed by served model now, and many users share one placement.
+// These pin what that changes: a count of requests in flight instead of a flag,
+// claims that cannot land on a replacement placement, failures that belong to
+// the call that produced them, and a settings change that waits for the old
+// placement to drain instead of detaching it under its requests.
+//
+// Each test runs its own fake node — health, status, load, suspend, detach —
+// that REPORTS the slots it loaded, so a placement stays valid across the
+// registry's once-a-second status poll rather than being discarded as stale.
+
+struct LeaseFakeNode {
+    httplib::Server server;
+    std::thread thread;
+    uint16_t port = 0;
+    std::string url;
+    std::atomic<int> wire_protocol{mm::kNodeWireProtocol};
+    std::atomic<int> loads{0};
+    std::atomic<int> suspends{0};
+    std::atomic<int> detaches{0};
+
+    std::mutex mu;
+    std::map<std::string, std::string> slots;     ///< slot id -> holder id
+    std::set<std::string> suspended;              ///< slot ids
+    std::set<std::string> refuse_holders;         ///< loads answered with capacity pressure
+    std::vector<nlohmann::json> passthrough_bodies; ///< what /engines/:slot/chat/completions got
+
+    /// While set, /api/node/infer waits (20 s at most) before it answers, so a
+    /// test can look at a placement while turns are in flight on it.
+    std::atomic<bool> hold_infer{false};
+    int infers_waiting = 0; ///< guarded by mu
+    std::condition_variable infer_cv;
+
+    bool start() {
+        port = find_free_test_port();
+        if (port == 0) return false;
+        url = "http://127.0.0.1:" + std::to_string(port);
+        server.Get("/api/node/health", [](const httplib::Request&, httplib::Response& res) {
+            mm::NodeHealthMetrics health;
+            health.ram_total_mb = 65536;
+            health.disk_free_mb = 500000;
+            res.set_content(nlohmann::json(health).dump(), "application/json");
+        });
+        server.Get("/api/node/status", [this](const httplib::Request&, httplib::Response& res) {
+            nlohmann::json list = nlohmann::json::array();
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                for (const auto& [slot_id, holder] : slots) {
+                    mm::SlotInfo slot;
+                    slot.id = slot_id;
+                    slot.model_path = "org/" + holder;
+                    slot.backend = "llama-cpp";
+                    slot.state = suspended.count(slot_id) ? mm::SlotState::Suspended
+                                                          : mm::SlotState::Ready;
+                    slot.holder_ids = {holder};
+                    list.push_back(slot);
+                }
+            }
+            res.set_content(nlohmann::json{{"slots", list},
+                                           {"wire_protocol", wire_protocol.load()},
+                                           {"max_slots", 4},
+                                           {"slot_available", 4}}
+                                .dump(),
+                            "application/json");
+        });
+        server.Post("/api/node/load-model", [this](const httplib::Request& req,
+                                                   httplib::Response& res) {
+            const auto body = nlohmann::json::parse(req.body);
+            const std::string holder = body.value("holder_id", std::string{});
+            std::lock_guard<std::mutex> lk(mu);
+            if (refuse_holders.count(holder)) {
+                res.status = 503;
+                res.set_content(nlohmann::json{{"error", "max slots reached"},
+                                               {"code", "capacity_pressure"}}
+                                    .dump(),
+                                "application/json");
+                return;
+            }
+            const std::string slot_id = "slot-" + std::to_string(++loads);
+            slots[slot_id] = holder;
+            res.set_content(nlohmann::json{{"status", "loaded"}, {"slot_id", slot_id}}.dump(),
+                            "application/json");
+        });
+        server.Post("/api/node/suspend-slot", [this](const httplib::Request& req,
+                                                     httplib::Response& res) {
+            const auto body = nlohmann::json::parse(req.body);
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                suspended.insert(body.value("slot_id", std::string{}));
+            }
+            ++suspends;
+            res.set_content(nlohmann::json{{"status", "suspended"},
+                                           {"kv_cache_path", "lease.kvbin"}}
+                                .dump(),
+                            "application/json");
+        });
+        server.Post("/api/node/detach-holder", [this](const httplib::Request& req,
+                                                      httplib::Response& res) {
+            const auto body = nlohmann::json::parse(req.body);
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                slots.erase(body.value("slot_id", std::string{}));
+            }
+            ++detaches;
+            res.set_content(nlohmann::json{{"status", "detached"}}.dump(), "application/json");
+        });
+        server.Post("/api/node/engines/:slot/chat/completions",
+                    [this](const httplib::Request& req, httplib::Response& res) {
+            const auto body = nlohmann::json::parse(req.body);
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                passthrough_bodies.push_back(body);
+            }
+            res.set_content(nlohmann::json{{"object", "chat.completion"},
+                                           {"model", body.value("model", std::string{})},
+                                           {"choices",
+                                            {{{"index", 0},
+                                              {"message", {{"role", "assistant"}, {"content", "ok"}}},
+                                              {"finish_reason", "stop"}}}}}
+                                .dump(),
+                            "application/json");
+        });
+        server.Post("/api/node/infer", [this](const httplib::Request&, httplib::Response& res) {
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                ++infers_waiting;
+                infer_cv.wait_for(lk, std::chrono::seconds(20), [this] { return !hold_infer.load(); });
+                --infers_waiting;
+            }
+            const std::string sse =
+                "data: " + nlohmann::json{{"type", "delta"}, {"content", "from the node"}}.dump() + "\n\n" +
+                "data: " + nlohmann::json{{"type", "done"}, {"tokens_used", 3}, {"finish_reason", "stop"}}.dump() +
+                "\n\n";
+            res.set_content(sse, "text/event-stream");
+        });
+        thread = std::thread([this] { server.listen("127.0.0.1", port); });
+        return wait_for_test_server(url);
+    }
+
+    ~LeaseFakeNode() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            hold_infer = false;
+        }
+        infer_cv.notify_all();
+        server.stop();
+        if (thread.joinable()) thread.join();
+    }
+};
+
+mm::ServedModel lease_model(const std::string& id, const mm::NodeId& node_id) {
+    mm::ServedModel m;
+    m.id = id;
+    m.model_path = "org/" + id;
+    m.preferred_node_id = node_id;
+    return m;
+}
+
+int lease_in_flight(const mm::PlacementScheduler& scheduler, const std::string& holder) {
+    const auto placement = scheduler.get_placement(holder);
+    return placement ? placement->in_flight : -1;
+}
+
+bool test_lease_two_holders_share_placement_blocks_eviction() {
+    const auto dir = temp_test_dir("lease-share");
+    std::filesystem::create_directories(dir / "models");
+    LeaseFakeNode node;
+    CHECK(node.start());
+    {
+        mm::NodeRegistry registry((dir / "registry").string());
+        const auto node_id = registry.add_node(node.url, "lease-secret", "test");
+        registry.start_health_poll(1);
+        CHECK(wait_for_registered_node(registry, node_id));
+        mm::PlacementScheduler scheduler(registry, (dir / "models").string());
+        const auto a = lease_model("model-a", node_id);
+
+        // Two users of one served model: ONE placement, claimed twice.
+        auto first = scheduler.acquire(a);
+        auto second = scheduler.acquire(a);
+        CHECK(first.ok() && second.ok());
+        CHECK(first.slot_id == second.slot_id);
+        CHECK(node.loads.load() == 1);
+        CHECK(lease_in_flight(scheduler, "model-a") == 2);
+        CHECK(first.lease->request_model() == "org/model-a");
+
+        // Busy is busy, whoever asks: no suspend, no release, and no eviction
+        // for another model that needs the node while A is serving.
+        CHECK(scheduler.suspend("model-a") == mm::PlacementScheduler::SuspendResult::Busy);
+        CHECK(scheduler.release("model-a") == mm::PlacementScheduler::ReleaseResult::Busy);
+        {
+            std::lock_guard<std::mutex> lk(node.mu);
+            node.refuse_holders.insert("model-b");
+        }
+        const auto refused = scheduler.acquire(lease_model("model-b", node_id));
+        CHECK(!refused.ok());
+        CHECK(node.suspends.load() == 0);
+        CHECK(node.detaches.load() == 0);
+        CHECK(!scheduler.get_placement("model-a")->suspended);
+
+        // The count falls as each user finishes, and only zero is idle.
+        first.lease->release();
+        CHECK(lease_in_flight(scheduler, "model-a") == 1);
+        CHECK(scheduler.suspend("model-a") == mm::PlacementScheduler::SuspendResult::Busy);
+        second.lease.reset();
+        CHECK(lease_in_flight(scheduler, "model-a") == 0);
+        CHECK(scheduler.suspend("model-a") == mm::PlacementScheduler::SuspendResult::Suspended);
+        CHECK(node.suspends.load() == 1);
+        CHECK(scheduler.suspend("model-a") == mm::PlacementScheduler::SuspendResult::NotPlaced);
+        registry.stop_health_poll();
+    }
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_lease_epoch_ignores_replaced_placement() {
+    const auto dir = temp_test_dir("lease-epoch");
+    std::filesystem::create_directories(dir / "models");
+    LeaseFakeNode node;
+    CHECK(node.start());
+    {
+        mm::NodeRegistry registry((dir / "registry").string());
+        const auto node_id = registry.add_node(node.url, "lease-secret", "test");
+        registry.start_health_poll(1);
+        CHECK(wait_for_registered_node(registry, node_id));
+        mm::PlacementScheduler scheduler(registry, (dir / "models").string());
+        const auto a = lease_model("model-a", node_id);
+
+        auto old_claim = scheduler.acquire(a);
+        CHECK(old_claim.ok());
+        const auto old_epoch = scheduler.get_placement("model-a")->epoch;
+
+        // An operator forces the placement away mid-request, and a new request
+        // places it again.
+        CHECK(scheduler.release("model-a", /*force=*/true) ==
+              mm::PlacementScheduler::ReleaseResult::Released);
+        CHECK(!scheduler.get_placement("model-a"));
+        auto new_claim = scheduler.acquire(a);
+        CHECK(new_claim.ok());
+        CHECK(scheduler.get_placement("model-a")->epoch != old_epoch);
+        CHECK(lease_in_flight(scheduler, "model-a") == 1);
+
+        // The old request finishing must not make the NEW placement look idle —
+        // that is what would let it be evicted under the new request.
+        old_claim.lease.reset();
+        CHECK(lease_in_flight(scheduler, "model-a") == 1);
+        new_claim.lease.reset();
+        CHECK(lease_in_flight(scheduler, "model-a") == 0);
+        registry.stop_health_poll();
+    }
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_lease_outcome_is_per_call() {
+    const auto dir = temp_test_dir("lease-outcome");
+    std::filesystem::create_directories(dir / "models");
+    LeaseFakeNode node;
+    CHECK(node.start());
+    {
+        mm::NodeRegistry registry((dir / "registry").string());
+        const auto node_id = registry.add_node(node.url, "lease-secret", "test");
+        registry.start_health_poll(1);
+        CHECK(wait_for_registered_node(registry, node_id));
+        mm::PlacementScheduler scheduler(registry, (dir / "models").string());
+
+        mm::ServedModel remote;
+        remote.id = "remote";
+        remote.model_path = "gpt-x";
+        remote.inference_backend = "api";
+
+        // Each call's answer is its own. With one process-wide last_error, the
+        // success below used to clear the failure above before its caller
+        // could read it.
+        const auto refused = scheduler.ensure_running(remote);
+        const auto placed = scheduler.ensure_running(lease_model("model-a", node_id));
+        CHECK(!refused.ok());
+        CHECK(refused.failure == mm::PlacementFailure::NoLocalBackend);
+        CHECK(refused.error.find("no node-local backend") != std::string::npos);
+        CHECK(placed.ok());
+        CHECK(placed.failure == mm::PlacementFailure::None);
+        CHECK(placed.error.empty());
+        CHECK(!placed.lease.has_value()); // ensure_running claims nothing
+        CHECK(lease_in_flight(scheduler, "model-a") == 0);
+
+        // Waiting is for TRANSIENT failures only: a model with no local backend
+        // will not grow one, so acquire() answers at once however long it may
+        // wait.
+        CHECK(!mm::placement_failure_transient(mm::PlacementFailure::NoLocalBackend));
+        const auto started = std::chrono::steady_clock::now();
+        const auto waited = scheduler.acquire(remote, std::chrono::seconds(30));
+        CHECK(!waited.ok());
+        CHECK(waited.failure == mm::PlacementFailure::NoLocalBackend);
+        CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(5));
+        registry.stop_health_poll();
+    }
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_lease_draining_defers_fingerprint_change() {
+    const auto dir = temp_test_dir("lease-draining");
+    std::filesystem::create_directories(dir / "models");
+    LeaseFakeNode node;
+    CHECK(node.start());
+    {
+        mm::NodeRegistry registry((dir / "registry").string());
+        const auto node_id = registry.add_node(node.url, "lease-secret", "test");
+        registry.start_health_poll(1);
+        CHECK(wait_for_registered_node(registry, node_id));
+        mm::PlacementScheduler scheduler(registry, (dir / "models").string());
+        const auto a = lease_model("model-a", node_id);
+
+        auto held = scheduler.acquire(a);
+        CHECK(held.ok());
+
+        // The operator changes a LAUNCH setting while a request is streaming.
+        // The old code detached the engine under that request; now the change
+        // waits for it.
+        auto changed = a;
+        changed.runtime_settings.ctx_size = 8192;
+        const auto draining = scheduler.acquire(changed);
+        CHECK(!draining.ok());
+        CHECK(draining.failure == mm::PlacementFailure::Draining);
+        CHECK(mm::placement_failure_transient(draining.failure));
+        CHECK(mm::placement_failure_retryable(draining.failure));
+        CHECK(node.detaches.load() == 0);
+        CHECK(node.loads.load() == 1);
+
+        // Once it drains, the next acquisition replaces it.
+        held.lease.reset();
+        auto replaced = scheduler.acquire(changed);
+        CHECK(replaced.ok());
+        CHECK(node.detaches.load() == 1);
+        CHECK(node.loads.load() == 2);
+
+        // And a caller willing to wait gets there on its own when the old
+        // placement drains during the wait.
+        auto changed_again = changed;
+        changed_again.runtime_settings.ctx_size = 16384;
+        std::thread finisher([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            replaced.lease.reset();
+        });
+        const auto waited = scheduler.acquire(changed_again, std::chrono::seconds(10));
+        finisher.join();
+        CHECK(waited.ok());
+        CHECK(node.loads.load() == 3);
+        registry.stop_health_poll();
+    }
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+bool test_lease_refused_by_wire_protocol_gate() {
+    const auto dir = temp_test_dir("lease-wire");
+    std::filesystem::create_directories(dir / "models");
+    LeaseFakeNode node;
+    node.wire_protocol = 1; // a node that still speaks agent ids
+    CHECK(node.start());
+    {
+        mm::NodeRegistry registry((dir / "registry").string());
+        const auto node_id = registry.add_node(node.url, "lease-secret", "test");
+        registry.start_health_poll(1);
+        CHECK(wait_for_registered_node(registry, node_id));
+        mm::PlacementScheduler scheduler(registry, (dir / "models").string());
+
+        // Connected, healthy, and not a placement target: it would ignore the
+        // holder id, never report the slot as attached, and be re-placed on
+        // every request.
+        CHECK(registry.get_node(node_id).wire_protocol == 1);
+        CHECK(registry.available_nodes().empty());
+        const auto refused = scheduler.ensure_running(lease_model("model-a", node_id));
+        CHECK(!refused.ok());
+        CHECK(refused.failure == mm::PlacementFailure::NoEligibleNode);
+        CHECK(node.loads.load() == 0);
+
+        // Upgraded: eligible on the next poll.
+        node.wire_protocol = mm::kNodeWireProtocol;
+        bool eligible = false;
+        for (int i = 0; i < 160 && !eligible; ++i) {
+            eligible = !registry.available_nodes().empty();
+            if (!eligible) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        CHECK(eligible);
+        CHECK(scheduler.ensure_running(lease_model("model-a", node_id)).ok());
+        CHECK(node.loads.load() == 1);
+        registry.stop_health_poll();
+    }
+    CHECK(remove_tree(dir));
+    return true;
+}
+
+// ── :9091, stateless ──────────────────────────────────────────────────────────
+//
+// A client that owns its conversation sends it whole; the engine (here a fake
+// remote provider, and a fake node's passthrough) receives it UNCHANGED except
+// for the model name, and the answer comes back unchanged except for the model
+// name. Nothing is stored.
+bool test_openai_stateless_passthrough() {
+    auto dir = temp_test_dir("openai-stateless");
+    std::filesystem::create_directories(dir / "models");
+
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    // ── a fake OpenAI-compatible provider ────────────────────────────────────
+    httplib::Server provider;
+    std::mutex seen_mu;
+    std::vector<nlohmann::json> seen_bodies;
+    std::vector<std::string> seen_auth;
+    provider.Post("/v1/chat/completions", [&](const httplib::Request& req, httplib::Response& res) {
+        const auto body = nlohmann::json::parse(req.body);
+        {
+            std::lock_guard<std::mutex> lk(seen_mu);
+            seen_bodies.push_back(body);
+            seen_auth.push_back(req.get_header_value("Authorization"));
+        }
+        if (body["messages"][0].value("content", std::string{}) == "please fail") {
+            res.status = 400;
+            res.set_content(R"({"error":{"message":"upstream says no","type":"invalid_request_error"}})",
+                            "application/json");
+            return;
+        }
+        const nlohmann::json tool_call = {{"id", "call_1"},
+                                          {"type", "function"},
+                                          {"function", {{"name", "lookup"}, {"arguments", "{\"q\":1}"}}}};
+        if (body.value("stream", false)) {
+            const std::string model = body.value("model", std::string{});
+            std::string sse;
+            sse += "data: " + nlohmann::json{{"object", "chat.completion.chunk"}, {"model", model},
+                                              {"choices", {{{"index", 0}, {"delta", {{"content", "hel"}}}}}}}.dump() + "\n\n";
+            sse += "data: " + nlohmann::json{{"object", "chat.completion.chunk"}, {"model", model},
+                                              {"choices", {{{"index", 0}, {"delta", {{"tool_calls", {tool_call}}}}}}}}.dump() + "\n\n";
+            sse += "data: [DONE]\n\n";
+            res.set_content(sse, "text/event-stream");
+            return;
+        }
+        res.set_content(nlohmann::json{{"id", "cmpl-1"},
+                                       {"object", "chat.completion"},
+                                       {"model", body.value("model", std::string{})},
+                                       {"choices",
+                                        {{{"index", 0},
+                                          {"message", {{"role", "assistant"},
+                                                       {"content", nullptr},
+                                                       {"tool_calls", {tool_call}}}},
+                                          {"finish_reason", "tool_calls"}}}}}
+                            .dump(),
+                        "application/json");
+    });
+    const uint16_t provider_port = find_free_test_port();
+    CHECK(provider_port != 0);
+    std::thread provider_thread([&] { provider.listen("127.0.0.1", provider_port); });
+
+    LeaseFakeNode node;
+    CHECK(node.start());
+
+    {
+        mm::ControlModelRegistry reg;
+        std::string err;
+        CHECK(reg.open(dir.string(), err));
+        mm::UserManager users(dir.string());
+        mm::NodeRegistry registry((dir / "registry").string());
+        const auto node_id = registry.add_node(node.url, "openai-secret", "test");
+        registry.start_health_poll(1);
+        RECORD(wait_for_registered_node(registry, node_id));
+        mm::PlacementScheduler scheduler(registry, (dir / "models").string());
+        mm::ServedModelCatalog catalog(reg);
+
+        mm::ServedModel remote;
+        remote.id = "remote";
+        remote.model_path = "remote-gpt-x";
+        remote.inference_backend = "api";
+        remote.api_settings.base_url = "http://127.0.0.1:" + std::to_string(provider_port);
+        remote.api_settings.api_key = "sk-test";
+        RECORD(catalog.create(remote, err) == mm::ServedModelCatalog::PutResult::Created);
+
+        mm::ServedModel text_only;
+        text_only.id = "text-only";
+        text_only.model_path = "/models/text.gguf";
+        text_only.tool_calling = false;
+        RECORD(catalog.create(text_only, err) == mm::ServedModelCatalog::PutResult::Created);
+
+        mm::ServedModel on_node;
+        on_node.id = "on-node";
+        on_node.model_path = "org/on-node";
+        on_node.preferred_node_id = node_id;
+        RECORD(catalog.create(on_node, err) == mm::ServedModelCatalog::PutResult::Created);
+
+        mm::ControlApiServer api(users, registry, scheduler, dir.string(),
+                                 (dir / "models").string(), "control-secret");
+        api.set_model_registry(&reg);
+        api.set_served_model_catalog(&catalog);
+
+        const uint16_t port = find_free_test_port();
+        CHECK(port != 0);
+        std::atomic<bool> listen_ok{false};
+        std::thread server_thread([&] { listen_ok = api.listen_openai_compat(port); });
+        mm::HttpClient client("http://127.0.0.1:" + std::to_string(port));
+        bool ready = false;
+        for (int i = 0; i < 50 && !ready; ++i) {
+            ready = client.get("/v1/models").status != 0;
+            if (!ready) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        RECORD(ready);
+
+        // ── the same authorizer as the main port, in OpenAI's envelope ───────
+        auto unauthenticated = client.get("/v1/models");
+        RECORD(unauthenticated.status == 401);
+        RECORD(unauthenticated.body.find("\"type\":\"authentication_error\"") != std::string::npos);
+        client.set_bearer_token("control-secret");
+
+        // Scope as well as identity: a read-only token lists the models but
+        // cannot send a completion.
+        const auto reader =
+            reg.create_api_token("reader", static_cast<mm::ScopeSet>(mm::Scope::Read), err);
+        RECORD(!reader.empty());
+        mm::HttpClient reader_client("http://127.0.0.1:" + std::to_string(port));
+        reader_client.set_bearer_token(reader);
+        RECORD(reader_client.get("/v1/models").status == 200);
+        const auto read_only_chat = reader_client.post(
+            "/v1/chat/completions",
+            nlohmann::json{{"model", "remote"},
+                           {"messages", {{{"role", "user"}, {"content", "x"}}}}});
+        RECORD(read_only_chat.status == 403);
+        RECORD(read_only_chat.body.find("insufficient_scope") != std::string::npos);
+
+        // ── the catalog, as OpenAI models ────────────────────────────────────
+        auto models = client.get("/v1/models");
+        RECORD(models.status == 200);
+        const auto models_body = nlohmann::json::parse(models.body);
+        RECORD(models_body["object"] == "list");
+        RECORD(models_body["data"].size() == 3);
+        RECORD(client.get("/v1/models/remote").status == 200);
+        const auto missing_model = client.get("/v1/models/nope");
+        RECORD(missing_model.status == 404);
+        RECORD(missing_model.body.find("model_not_found") != std::string::npos);
+
+        // ── a whole conversation, with tools and history, passes through ─────
+        const nlohmann::json history = nlohmann::json::array({
+            {{"role", "system"}, {"content", "be terse"}},
+            {{"role", "user"}, {"content", "look it up"}},
+            {{"role", "assistant"},
+             {"content", nullptr},
+             {"tool_calls",
+              {{{"id", "call_0"},
+                {"type", "function"},
+                {"function", {{"name", "lookup"}, {"arguments", "{}"}}}}}}},
+            {{"role", "tool"}, {"tool_call_id", "call_0"}, {"content", "42"}},
+        });
+        const nlohmann::json tools = nlohmann::json::array(
+            {{{"type", "function"},
+              {"function", {{"name", "lookup"}, {"parameters", {{"type", "object"}}}}}}});
+        auto completion = client.post("/v1/chat/completions",
+                                      nlohmann::json{{"model", "remote"},
+                                                     {"messages", history},
+                                                     {"tools", tools},
+                                                     {"temperature", 0.25}});
+        RECORD(completion.status == 200);
+        const auto completion_body = nlohmann::json::parse(completion.body);
+        RECORD(completion_body.value("model", std::string{}) == "remote"); // rewritten back
+        RECORD(completion_body["choices"][0]["message"].contains("tool_calls"));
+        {
+            std::lock_guard<std::mutex> lk(seen_mu);
+            RECORD(seen_bodies.size() == 1);
+            if (!seen_bodies.empty()) {
+                const auto& sent = seen_bodies.back();
+                RECORD(sent.value("model", std::string{}) == "remote-gpt-x"); // the provider's name
+                RECORD(sent["messages"] == history); // unchanged: no history, no memories added
+                RECORD(sent["tools"] == tools);
+                RECORD(sent.value("temperature", 0.0) == 0.25);
+                RECORD(seen_auth.back() == "Bearer sk-test");
+            }
+        }
+
+        // ── streaming relays every frame, tool calls included ────────────────
+        std::vector<std::string> frames;
+        int stream_status = 0;
+        client.stream_post("/v1/chat/completions",
+                           nlohmann::json{{"model", "remote"},
+                                          {"stream", true},
+                                          {"messages", {{{"role", "user"}, {"content", "hi"}}}}},
+                           [&](const std::string& payload) {
+                               frames.push_back(payload);
+                               return true;
+                           },
+                           &stream_status);
+        RECORD(stream_status == 200);
+        RECORD(frames.size() == 3);
+        if (frames.size() == 3) {
+            RECORD(nlohmann::json::parse(frames[0]).value("model", std::string{}) == "remote");
+            RECORD(frames[1].find("tool_calls") != std::string::npos);
+            RECORD(frames[2] == "[DONE]"); // exactly one: the provider's own
+        }
+
+        // ── the provider's refusal is the client's, status and all ───────────
+        auto refused = client.post("/v1/chat/completions",
+                                   nlohmann::json{{"model", "remote"},
+                                                  {"messages", {{{"role", "user"}, {"content", "please fail"}}}}});
+        RECORD(refused.status == 400);
+        RECORD(refused.body.find("upstream says no") != std::string::npos);
+
+        // ── refused before anything is sent ──────────────────────────────────
+        const nlohmann::json image_message = {
+            {{"role", "user"},
+             {"content", {{{"type", "text"}, {"text", "what is this"}},
+                          {{"type", "image_url"}, {"image_url", {{"url", "data:image/png;base64,AA=="}}}}}}}};
+        auto no_vision = client.post("/v1/chat/completions",
+                                     nlohmann::json{{"model", "text-only"}, {"messages", image_message}});
+        RECORD(no_vision.status == 422);
+        RECORD(no_vision.body.find("does not accept images") != std::string::npos);
+        auto no_tools = client.post("/v1/chat/completions",
+                                    nlohmann::json{{"model", "text-only"},
+                                                   {"messages", {{{"role", "user"}, {"content", "x"}}}},
+                                                   {"tools", tools}});
+        RECORD(no_tools.status == 422);
+        RECORD(no_tools.body.find("call tools") != std::string::npos);
+        RECORD(client.post("/v1/chat/completions",
+                           nlohmann::json{{"model", "remote"}, {"n", 2},
+                                          {"messages", {{{"role", "user"}, {"content", "x"}}}}})
+                   .status == 400);
+        RECORD(client.post("/v1/chat/completions",
+                           nlohmann::json{{"model", "nope"},
+                                          {"messages", {{{"role", "user"}, {"content", "x"}}}}})
+                   .status == 404);
+        RECORD(client.post("/v1/chat/completions",
+                           nlohmann::json{{"model", "remote"}, {"messages", nlohmann::json::array()}})
+                   .status == 400);
+        {
+            std::lock_guard<std::mutex> lk(seen_mu);
+            RECORD(seen_bodies.size() == 3); // the three that were meant to reach it
+        }
+
+        // ── a node-served model goes through the node's passthrough ──────────
+        auto on_node_completion = client.post(
+            "/v1/chat/completions",
+            nlohmann::json{{"model", "on-node"}, {"messages", {{{"role", "user"}, {"content", "hi"}}}}});
+        RECORD(on_node_completion.status == 200);
+        RECORD(nlohmann::json::parse(on_node_completion.body).value("model", std::string{}) ==
+               "on-node");
+        {
+            std::lock_guard<std::mutex> lk(node.mu);
+            RECORD(node.passthrough_bodies.size() == 1);
+            if (!node.passthrough_bodies.empty())
+                RECORD(node.passthrough_bodies.back().value("model", std::string{}) == "org/on-node");
+        }
+        // The request's claim was given back.
+        const auto placement = scheduler.get_placement("on-node");
+        RECORD(placement.has_value() && placement->in_flight == 0);
+
+        // ── nothing was stored ───────────────────────────────────────────────
+        bool stored_anything = false;
+        std::error_code ec;
+        for (auto it = std::filesystem::recursive_directory_iterator(dir, ec);
+             !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+            const auto name = it->path().filename().string();
+            if (name == "user.db" || name == "attachments") stored_anything = true;
+        }
+        RECORD(!stored_anything);
+
+        api.stop();
+        if (server_thread.joinable()) server_thread.join();
+        RECORD(listen_ok);
+        registry.stop_health_poll();
+        reg.close();
+    }
+    provider.stop();
+    if (provider_thread.joinable()) provider_thread.join();
+    RECORD(remove_tree(dir));
+#undef RECORD
+    return ok;
+}
+
+// ── /v1/served-models over HTTP ───────────────────────────────────────────────
+//
+// The catalog end to end: an admitted model listed without being created, an
+// operator's GGUF and API entries, the override-by-PUT of an admitted entry,
+// and the refusals that keep the catalog honest.
+bool test_served_models_http_crud() {
+    auto dir = temp_test_dir("served-models-http");
+    std::filesystem::create_directories(dir / "models");
+
+    bool ok = true;
+    auto record = [&](bool condition, const char* expression, int line) {
+        if (!check(condition, expression, line)) ok = false;
+    };
+#define RECORD(expr) record((expr), #expr, __LINE__)
+
+    {
+        mm::ControlModelRegistry reg;
+        std::string err;
+        CHECK(reg.open(dir.string(), err));
+        mm::AdmittedModel qwen;
+        qwen.arch_hash = "hash-qwen";
+        qwen.name = "Qwen3-30B-A3B";
+        qwen.model_dir = (dir / "containers" / "Qwen3-30B-A3B-q4_g-q6_g-g128").string();
+        qwen.attention_family = "gqa";
+        qwen.verdict = mm::ModelVerdict::Stream;
+        qwen.verdict_basis = "{}";
+        qwen.admitted_at_ms = 1000;
+        CHECK(reg.upsert(qwen, err));
+        const std::string admitted_id = "qwen3-30b-a3b-q4_g-q6_g-g128";
+
+        mm::UserManager users(dir.string());
+        mm::NodeRegistry registry(dir.string());
+        mm::PlacementScheduler scheduler(registry, (dir / "models").string());
+        scheduler.set_model_registry(&reg);
+        mm::ServedModelCatalog catalog(reg);
+        mm::ControlApiServer api(users, registry, scheduler, dir.string(),
+                                 (dir / "models").string());
+        api.set_model_registry(&reg);
+        api.set_served_model_catalog(&catalog);
+
+        const uint16_t port = find_free_test_port();
+        CHECK(port != 0);
+        std::atomic<bool> listen_ok{false};
+        std::thread server_thread([&] { listen_ok = api.listen(port); });
+        mm::HttpClient client("http://127.0.0.1:" + std::to_string(port));
+        bool ready = false;
+        for (int i = 0; i < 50 && !ready; ++i) {
+            ready = client.get("/v1/nodes").status != 0;
+            if (!ready) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        RECORD(ready);
+
+        const auto find = [](const nlohmann::json& list, const std::string& id) {
+            for (const auto& m : list.value("data", nlohmann::json::array()))
+                if (m.value("id", std::string{}) == id) return m;
+            return nlohmann::json();
+        };
+
+        // ── the admitted model is listed without anyone creating it ─────────
+        auto listed = client.get("/v1/served-models");
+        RECORD(listed.status == 200);
+        auto entry = find(nlohmann::json::parse(listed.body), admitted_id);
+        RECORD(entry.is_object());
+        RECORD(entry.value("source", std::string{}) == "admitted");
+        RECORD(entry.value("model_path", std::string{}) == "hash-qwen");
+        RECORD(entry.value("backend", std::string{}) == "soma");
+        RECORD(entry.value("status", std::string{}) == "unplaced");
+        RECORD(!entry.value("tool_calling", true));
+
+        // ── an operator's GGUF entry, id derived from its name ───────────────
+        auto created = client.post("/v1/served-models",
+                                   nlohmann::json{{"display_name", "Llama 3 8B"},
+                                                  {"model_path", "/models/llama-3-8b.gguf"}});
+        RECORD(created.status == 201);
+        const auto created_body = nlohmann::json::parse(created.body);
+        RECORD(created_body.value("id", std::string{}) == "llama-3-8b");
+        RECORD(created_body.value("source", std::string{}) == "explicit");
+        RECORD(created_body.value("backend", std::string{}) == "llama-cpp");
+        // The same name again gets a free id rather than a collision.
+        auto again = client.post("/v1/served-models",
+                                 nlohmann::json{{"display_name", "Llama 3 8B"},
+                                                {"model_path", "/models/other.gguf"}});
+        RECORD(again.status == 201);
+        RECORD(nlohmann::json::parse(again.body).value("id", std::string{}) == "llama-3-8b-2");
+        // An explicit id that is taken — by anything, admitted included — is 409.
+        RECORD(client.post("/v1/served-models",
+                           nlohmann::json{{"id", admitted_id}, {"model_path", "/m.gguf"}})
+                   .status == 409);
+        // The agent spelling of the backend is refused, with the field named.
+        auto invalid = client.post("/v1/served-models",
+                                   nlohmann::json{{"id", "bad"},
+                                                  {"model_path", "/m.gguf"},
+                                                  {"inference_backend", "llama-cpp"}});
+        RECORD(invalid.status == 400);
+        RECORD(invalid.body.find("inference_backend") != std::string::npos);
+
+        // ── an API model: its key never comes back ───────────────────────────
+        auto remote = client.post("/v1/served-models",
+                                  nlohmann::json{{"id", "remote"},
+                                                 {"model_path", "gpt-x"},
+                                                 {"inference_backend", "api"},
+                                                 {"api_settings",
+                                                  {{"base_url", "https://example.test"},
+                                                   {"api_key", "sk-never-shown"}}}});
+        RECORD(remote.status == 201);
+        RECORD(remote.body.find("sk-never-shown") == std::string::npos);
+        RECORD(nlohmann::json::parse(remote.body)["api_settings"].value("api_key_configured",
+                                                                         false));
+        RECORD(client.get("/v1/served-models").body.find("sk-never-shown") == std::string::npos);
+        // It owns no node slot, and says so with a code.
+        auto restore_api = client.post("/v1/served-models/remote/restore", nlohmann::json::object());
+        RECORD(restore_api.status == 409);
+        RECORD(restore_api.body.find("no_local_backend") != std::string::npos);
+
+        // ── overriding an admitted entry keeps its id ────────────────────────
+        auto override_body = entry;
+        override_body["runtime_settings"]["ctx_size"] = 32768;
+        auto put = client.put("/v1/served-models/" + admitted_id, override_body);
+        RECORD(put.status == 200);
+        entry = find(nlohmann::json::parse(client.get("/v1/served-models").body), admitted_id);
+        RECORD(entry.value("source", std::string{}) == "explicit");
+        RECORD(entry["runtime_settings"].value("ctx_size", 0) == 32768);
+        // Ids are immutable.
+        auto renamed = override_body;
+        renamed["id"] = "something-else";
+        RECORD(client.put("/v1/served-models/" + admitted_id, renamed).status == 400);
+        // Deleting the override brings the admitted entry back; the admitted
+        // entry itself cannot be deleted.
+        RECORD(client.del("/v1/served-models/" + admitted_id).status == 200);
+        entry = find(nlohmann::json::parse(client.get("/v1/served-models").body), admitted_id);
+        RECORD(entry.value("source", std::string{}) == "admitted");
+        RECORD(client.del("/v1/served-models/" + admitted_id).status == 409);
+
+        // ── the engine override returns the decision ─────────────────────────
+        auto backend = client.put("/v1/served-models/llama-3-8b/backend",
+                                  nlohmann::json{{"backend_override", "fallback"}});
+        RECORD(backend.status == 200);
+        const auto backend_body = nlohmann::json::parse(backend.body);
+        RECORD(backend_body.value("backend", std::string{}) == "llama-cpp");
+        RECORD(backend_body.value("backend_reason", std::string{}).find("operator_override") !=
+               std::string::npos);
+        RECORD(client.put("/v1/served-models/llama-3-8b/backend",
+                          nlohmann::json{{"backend_override", "sometimes"}})
+                   .status == 400);
+
+        // ── lifecycle on something not placed ────────────────────────────────
+        RECORD(client.post("/v1/served-models/llama-3-8b/suspend", nlohmann::json::object())
+                   .status == 409);
+        RECORD(client.post("/v1/served-models/llama-3-8b/release", nlohmann::json::object())
+                   .status == 200); // idempotent
+
+        // ── one entry, in full ───────────────────────────────────────────────
+        auto one = client.get("/v1/served-models/llama-3-8b");
+        RECORD(one.status == 200);
+        const auto one_body = nlohmann::json::parse(one.body);
+        RECORD(one_body.contains("placement_history") && one_body["placement_history"].is_array());
+        RECORD(one_body.contains("node_compatibility"));
+        RECORD(client.get("/v1/served-models/nope").status == 404);
+        RECORD(client.del("/v1/served-models/nope").status == 404);
+
+        api.stop();
+        if (server_thread.joinable()) server_thread.join();
+        RECORD(listen_ok);
+        reg.close();
+    }
+    RECORD(remove_tree(dir));
+#undef RECORD
+    return ok;
 }
 
 } // namespace
@@ -5679,18 +5881,7 @@ bool test_llama_server_args() {
 bool test_vision_config_attachment_and_message_round_trip() {
     const auto dir = temp_test_dir("vision-db");
     {
-        mm::AgentDB db("vision-agent", dir.string());
-
-        mm::AgentConfig cfg;
-        cfg.id = "vision-agent";
-        cfg.name = "Vision Agent";
-        cfg.model_path = "model.gguf";
-        cfg.vision_settings.enabled = true;
-        cfg.vision_settings.mmproj_path = "mmproj-model.gguf";
-        db.save_config(cfg);
-        const auto loaded_cfg = db.load_config();
-        CHECK(loaded_cfg.vision_settings.enabled);
-        CHECK(loaded_cfg.vision_settings.mmproj_path == "mmproj-model.gguf");
+        mm::UserDB db("vision-user", dir.string());
 
         mm::ImageAttachment attachment;
         attachment.id = "image-one";
@@ -5724,33 +5915,35 @@ bool test_vision_config_attachment_and_message_round_trip() {
         }
         CHECK(rejected_traversal);
 
-        const auto conv_id = db.create_conversation("vision ordering");
+        mm::NewConversation spec;
+        spec.title = "vision ordering";
+        const auto conv_id = db.create_conversation(spec);
         mm::Message old_user;
         old_user.role = mm::MessageRole::User;
         old_user.content = "older context that should be summarized";
         old_user.token_count = 3000;
-        db.append_message(conv_id, old_user, 0);
+        db.append_message(conv_id, old_user);
         mm::Message old_assistant;
         old_assistant.role = mm::MessageRole::Assistant;
         old_assistant.content = "older response";
         old_assistant.token_count = 10;
-        db.append_message(conv_id, old_assistant, 1);
+        db.append_message(conv_id, old_assistant);
 
         mm::Message message;
         message.role = mm::MessageRole::User;
         message.content = "before after";
-        message.token_count = 2 + 2048;
+        message.token_count = 2;
         message.content_parts = {
             mm::MessageContentPart{"text", "before", {}, {}, {}},
             mm::MessageContentPart{"image_attachment", {}, attachment.id, {}, "image/png"},
             mm::MessageContentPart{"text", "after", {}, {}, {}}
         };
-        db.append_message(conv_id, message, 2);
+        db.append_message(conv_id, message);
         mm::Message recent_assistant;
         recent_assistant.role = mm::MessageRole::Assistant;
         recent_assistant.content = "recent response";
         recent_assistant.token_count = 10;
-        db.append_message(conv_id, recent_assistant, 3);
+        db.append_message(conv_id, recent_assistant);
 
         const auto messages = db.load_messages(conv_id);
         CHECK(messages.size() == 4);
@@ -5766,21 +5959,36 @@ bool test_vision_config_attachment_and_message_round_trip() {
         CHECK(!db.delete_attachment(attachment.id, &referenced));
         CHECK(referenced);
 
-        FixedSummaryRuntimeClient summary_runtime;
-        mm::ConversationManager conversation_manager(db, summary_runtime);
-        cfg.runtime_settings.ctx_size = 4096;
-        cfg.runtime_settings.max_tokens = 1024;
-        const auto compacted_id = conversation_manager.force_compact(conv_id, cfg);
-        CHECK(compacted_id != conv_id);
-        const auto compacted_messages = db.load_messages(compacted_id);
-        CHECK(compacted_messages.size() == 2);
-        CHECK(compacted_messages[0].content_parts.size() == 3);
-        CHECK(compacted_messages[0].content_parts[1].attachment_id == attachment.id);
+        // Compaction folds the older turn IN PLACE: the conversation keeps its
+        // id, and the image turn — in the kept tail — keeps its attachment.
+        mm::CompactionRequest request;
+        request.messages = messages;
+        request.budget = 3072;
+        request.vision = true;
+        request.force = true;
+        const mm::RollingCompactor compactor(
+            [](const std::vector<mm::Message>&, int) -> std::optional<std::string> {
+                return std::string("Summary: older context.");
+            },
+            [&](const std::string& summary, int through) {
+                return db.save_summary(conv_id, summary, through, "vision-model");
+            });
+        const auto folded = compactor.run(request);
+        CHECK(folded.status == mm::CompactionResult::Status::Compacted);
+        CHECK(folded.summary_through_seq == 1);
+        const auto conv = db.get_conversation(conv_id);
+        CHECK(conv.has_value());
+        CHECK(conv->summary == "Summary: older context.");
+        CHECK(conv->summary_through_seq == 1);
+        CHECK(conv->summary_model_id == "vision-model");
+        const auto tail = db.load_messages(conv_id, conv->summary_through_seq);
+        CHECK(tail.size() == 2);
+        CHECK(tail[0].content_parts.size() == 3);
+        CHECK(tail[0].content_parts[1].attachment_id == attachment.id);
+        CHECK(db.load_messages(conv_id).size() == 4); // folded, not deleted
 
-        db.delete_conversation(conv_id);
-        CHECK(db.get_attachment(attachment.id).has_value());
-        CHECK(std::filesystem::exists(attachment_path));
-        db.delete_conversation(compacted_id);
+        // Deleting the conversation takes the attachment only it referenced.
+        CHECK(db.delete_conversation(conv_id));
         CHECK(!db.get_attachment(attachment.id).has_value());
         CHECK(!std::filesystem::exists(attachment_path));
 
@@ -5825,22 +6033,22 @@ bool test_vision_profile_validation_and_suggestions() {
     CHECK(suggestions.size() == 1);
     CHECK(std::filesystem::path(suggestions[0]).filename() == projector_path.filename());
 
-    mm::AgentConfig cfg;
-    cfg.name = "Vision";
+    mm::ServedModel cfg;
+    cfg.display_name = "Vision";
     cfg.model_path = model_path.string();
-    cfg.inference_backend = "llama-cpp";
+    cfg.inference_backend = "node";
     cfg.vision_settings.enabled = true;
-    CHECK(!mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
+    CHECK(!mm::validate_served_model(cfg, nullptr, "", nullptr).ok());
 
     cfg.vision_settings.mmproj_path = projector_path.string();
-    CHECK(mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
+    CHECK(mm::validate_served_model(cfg, nullptr, "", nullptr).ok());
 
     cfg.runtime_settings.extra_args = {"--mmproj-url=https://invalid.example/mmproj"};
-    CHECK(!mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
+    CHECK(!mm::validate_served_model(cfg, nullptr, "", nullptr).ok());
     cfg.runtime_settings.extra_args.clear();
 
     cfg.vision_settings.mmproj_path = (dir / "projector.gguf").string();
-    const auto unconventional = mm::validate_agent_config(cfg, nullptr, "", nullptr);
+    const auto unconventional = mm::validate_served_model(cfg, nullptr, "", nullptr);
     CHECK(unconventional.ok());
     CHECK(std::any_of(unconventional.issues.begin(), unconventional.issues.end(),
                       [](const mm::ValidationIssue& issue) {
@@ -5849,7 +6057,7 @@ bool test_vision_profile_validation_and_suggestions() {
                       }));
 
     cfg.inference_backend = "vllm";
-    const auto retired_backend = mm::validate_agent_config(cfg, nullptr, "", nullptr);
+    const auto retired_backend = mm::validate_served_model(cfg, nullptr, "", nullptr);
     CHECK(!retired_backend.ok());
     CHECK(std::any_of(retired_backend.issues.begin(), retired_backend.issues.end(),
                       [](const mm::ValidationIssue& issue) {
@@ -5861,9 +6069,9 @@ bool test_vision_profile_validation_and_suggestions() {
     cfg.api_settings.base_url = "https://example.test";
     cfg.api_settings.chat_completions_path = "/v1/chat/completions";
     cfg.vision_settings.mmproj_path = projector_path.string();
-    CHECK(!mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
+    CHECK(!mm::validate_served_model(cfg, nullptr, "", nullptr).ok());
     cfg.vision_settings.mmproj_path.clear();
-    CHECK(mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
+    CHECK(mm::validate_served_model(cfg, nullptr, "", nullptr).ok());
 
     CHECK(remove_tree(dir));
     return true;
@@ -5880,29 +6088,29 @@ bool test_vision_slot_projector_isolation_and_json() {
     slots.set_models_dir("missing-llama-server");
     mm::RuntimeSettings settings;
     const auto first = slots.add_ready_test_engine("llama-cpp",
-        "model.gguf", "agent-a", settings, "mmproj-a.gguf");
+        "model.gguf", "model-a", settings, "mmproj-a.gguf");
     CHECK(!first.empty());
 
     mm::EngineLoadRequest same_req;
     same_req.model_path = "model.gguf";
     same_req.mmproj_path = "mmproj-a.gguf";
     same_req.settings = settings;
-    const auto shared = slots.load("llama-cpp", same_req, "agent-b");
+    const auto shared = slots.load("llama-cpp", same_req, "model-b");
     CHECK(shared == first);
 
     mm::EngineLoadRequest other_req = same_req;
     other_req.mmproj_path = "mmproj-b.gguf";
-    const auto different = slots.load("llama-cpp", other_req, "agent-c");
+    const auto different = slots.load("llama-cpp", other_req, "model-c");
     CHECK(different.empty());
     const auto info = slots.find(first);
     CHECK(info.has_value());
     CHECK(info->backend == "llama-cpp");
     CHECK(info->vision_enabled);
     CHECK(info->mmproj_path == "mmproj-a.gguf");
-    CHECK(std::find(info->agent_ids.begin(), info->agent_ids.end(), "agent-b") !=
-          info->agent_ids.end());
-    CHECK(std::find(info->agent_ids.begin(), info->agent_ids.end(), "agent-c") ==
-          info->agent_ids.end());
+    CHECK(std::find(info->holder_ids.begin(), info->holder_ids.end(), "model-b") !=
+          info->holder_ids.end());
+    CHECK(std::find(info->holder_ids.begin(), info->holder_ids.end(), "model-c") ==
+          info->holder_ids.end());
 
     const auto slot_json = nlohmann::json(*info);
     CHECK(slot_json["vision_enabled"] == true);
@@ -5957,47 +6165,38 @@ bool test_llama_launch_compatible() {
     return true;
 }
 
-bool test_llama_backend_validation_and_gguf_routing() {
-    mm::AgentConfig cfg;
-    cfg.name = "a";
+bool test_served_model_backend_validation_and_gguf_warnings() {
+    mm::ServedModel cfg;
+    cfg.display_name = "a";
     cfg.model_path = "/models/m.gguf";
-    cfg.inference_backend = "llama-cpp";
-    auto r = mm::validate_agent_config(cfg, nullptr, "", nullptr);
+    auto r = mm::validate_served_model(cfg, nullptr, "");
     CHECK(r.ok());
 
-    // Legacy vLLM profiles must fail explicitly instead of silently routing to
-    // llama.cpp with incompatible model/settings semantics.
-    mm::AgentConfig retired = cfg;
-    retired.inference_backend = "vllm";
-    const auto retired_result =
-        mm::validate_agent_config(retired, nullptr, "", nullptr);
-    CHECK(!retired_result.ok());
-    CHECK(std::any_of(retired_result.issues.begin(), retired_result.issues.end(),
-                      [](const mm::ValidationIssue& issue) {
-                          return issue.field == "inference_backend" &&
-                                 issue.severity == mm::ValidationSeverity::Error &&
-                                 issue.message.find("not available") != std::string::npos;
-                      }));
+    // `node` and `api` are the backends. The agent-era spellings and retired
+    // engines are refused with the field named rather than reinterpreted: a
+    // value nothing validated must not be placed on a guess.
+    for (const char* backend : {"vllm", "llama-cpp", "llama.cpp", "tensorrt"}) {
+        mm::ServedModel bad = cfg;
+        bad.inference_backend = backend;
+        const auto result = mm::validate_served_model(bad, nullptr, "");
+        CHECK(!result.ok());
+        CHECK(std::any_of(result.issues.begin(), result.issues.end(),
+                          [](const mm::ValidationIssue& issue) {
+                              return issue.field == "inference_backend" &&
+                                     issue.severity == mm::ValidationSeverity::Error;
+                          }));
+    }
 
-    // llama-cpp with an HF repo id warns (needs a local GGUF).
-    mm::AgentConfig h = cfg;
+    // A node model named by HF repo id warns: llama.cpp needs a local GGUF,
+    // and nothing admitted resolves the name.
+    mm::ServedModel h = cfg;
     h.model_path = "Qwen/Qwen3-8B";
-    auto rh = mm::validate_agent_config(h, nullptr, "", nullptr);
+    auto rh = mm::validate_served_model(h, nullptr, "");
     bool hf_warn = false;
     for (const auto& i : rh.issues)
         if (i.field == "model_path" && i.severity == mm::ValidationSeverity::Warning)
             hf_warn = true;
     CHECK(hf_warn);
-
-    // An unknown backend is a hard error.
-    mm::AgentConfig bad = cfg;
-    bad.inference_backend = "tensorrt";
-    CHECK(!mm::validate_agent_config(bad, nullptr, "", nullptr).ok());
-
-    // The legacy "llama.cpp"/"llama" spellings normalize to the llama backend.
-    mm::AgentConfig legacy = cfg;
-    legacy.inference_backend = "llama.cpp";
-    CHECK(mm::validate_agent_config(legacy, nullptr, "", nullptr).ok());
     return true;
 }
 
@@ -6873,7 +7072,7 @@ bool test_llama_slot_info_backend_and_suspend() {
     mm::RuntimeSettings s;
     s.ctx_size = 2048;
     s.parallel = 1;
-    const auto id = slots.add_ready_test_engine("llama-cpp", "m.gguf", "agent-l", s);
+    const auto id = slots.add_ready_test_engine("llama-cpp", "m.gguf", "model-l", s);
 
     auto info = slots.find(id);
     CHECK(info.has_value());
@@ -6932,28 +7131,11 @@ bool test_runtime_client_health_empty_body_ok() {
 }
 
 bool test_llama_default_backend_and_slot_sharing() {
-    // llama.cpp is the default runtime on this branch.
-    mm::AgentConfig fresh;
-    CHECK(fresh.inference_backend == "llama-cpp");
-    CHECK(mm::is_llama_backend(""));
-    CHECK(mm::is_llama_backend("llama-cpp"));
-    CHECK(mm::is_llama_backend("llama.cpp"));
-    CHECK(mm::is_llama_backend("llama"));
-    CHECK(!mm::is_llama_backend("vllm"));
-    CHECK(!mm::is_llama_backend("api"));
-
     // A slot payload without a backend field parses as the default runtime.
     auto parsed = nlohmann::json{{"id", "s1"}}.get<mm::SlotInfo>();
     CHECK(parsed.backend == "llama-cpp");
 
-    // An unspecified agent backend validates as llama.cpp.
-    mm::AgentConfig cfg;
-    cfg.name = "d";
-    cfg.model_path = "/models/m.gguf";
-    cfg.inference_backend = "";
-    CHECK(mm::validate_agent_config(cfg, nullptr, "", nullptr).ok());
-
-    // Compatible agents share one ready process. A launch-setting mismatch
+    // Compatible holders share one ready process. A launch-setting mismatch
     // cannot attach; the attempted new process then fails on the fake path.
     auto dir = temp_test_dir("llama-sharing");
     mm::EngineSupervisor slots(46180, 46183, 4);
@@ -6962,35 +7144,35 @@ bool test_llama_default_backend_and_slot_sharing() {
     settings.ctx_size = 4096;
     mm::EngineRegistry::instance().register_engine(
         mm::make_llama_descriptor("missing-llama"));
-    const auto llama_id = slots.add_ready_test_engine("llama-cpp", "m.gguf", "agent-a", settings);
+    const auto llama_id = slots.add_ready_test_engine("llama-cpp", "m.gguf", "model-a", settings);
     mm::EngineLoadRequest compat_req;
     compat_req.model_path = "m.gguf";
     compat_req.settings = settings;
-    CHECK(slots.load("llama-cpp", compat_req, "agent-b") == llama_id);
+    CHECK(slots.load("llama-cpp", compat_req, "model-b") == llama_id);
     auto llama_info = slots.find(llama_id);
     CHECK(llama_info.has_value());
     CHECK(llama_info->backend == "llama-cpp");
-    CHECK(llama_info->assigned_agent == "agent-a");
-    CHECK(llama_info->agent_ids.size() == 2);
-    CHECK(std::find(llama_info->agent_ids.begin(), llama_info->agent_ids.end(),
-                    "agent-b") != llama_info->agent_ids.end());
+    CHECK(llama_info->holder_ids.size() == 2);
+    CHECK(llama_info->holder_ids.front() == "model-a");
+    CHECK(std::find(llama_info->holder_ids.begin(), llama_info->holder_ids.end(),
+                    "model-b") != llama_info->holder_ids.end());
 
     auto incompatible = settings;
     incompatible.ctx_size = 8192;
     mm::EngineLoadRequest incompat_req;
     incompat_req.model_path = "m.gguf";
     incompat_req.settings = incompatible;
-    CHECK(slots.load("llama-cpp", incompat_req, "agent-c").empty());
+    CHECK(slots.load("llama-cpp", incompat_req, "model-c").empty());
     llama_info = slots.find(llama_id);
     CHECK(llama_info.has_value());
-    CHECK(std::find(llama_info->agent_ids.begin(), llama_info->agent_ids.end(),
-                    "agent-c") == llama_info->agent_ids.end());
+    CHECK(std::find(llama_info->holder_ids.begin(), llama_info->holder_ids.end(),
+                    "model-c") == llama_info->holder_ids.end());
 
-    const auto first_detach = slots.detach_agent(llama_id, "agent-b");
+    const auto first_detach = slots.detach_holder(llama_id, "model-b");
     CHECK(first_detach.ok());
-    CHECK(first_detach.remaining_agents == 1);
+    CHECK(first_detach.remaining_holders == 1);
     CHECK(!first_detach.unloaded);
-    const auto last_detach = slots.detach_agent(llama_id, "agent-a");
+    const auto last_detach = slots.detach_holder(llama_id, "model-a");
     CHECK(last_detach.ok());
     CHECK(last_detach.unloaded);
     CHECK(!slots.find(llama_id).has_value());
@@ -7009,21 +7191,21 @@ bool test_llama_restore_attaches_and_cleans_suspended_record() {
     // process, so its KV save fails and the suspend is correctly refused. What
     // this test is about is what RESTORE does with a suspended record.
     const auto suspended_id =
-        slots.add_suspended_test_engine("llama-cpp", "m.gguf", "agent-b", settings);
+        slots.add_suspended_test_engine("llama-cpp", "m.gguf", "model-b", settings);
     CHECK(slots.find(suspended_id)->state == mm::SlotState::Suspended);
 
-    const auto ready_id = slots.add_ready_test_engine("llama-cpp", "m.gguf", "agent-a", settings);
+    const auto ready_id = slots.add_ready_test_engine("llama-cpp", "m.gguf", "model-a", settings);
     mm::EngineLoadRequest restore_req;
     restore_req.model_path = "m.gguf";
     restore_req.settings = settings;
-    const auto restored = slots.restore("llama-cpp", restore_req, "", "agent-b");
+    const auto restored = slots.restore("llama-cpp", restore_req, "", "model-b");
     CHECK(restored == ready_id);
     CHECK(!slots.find(suspended_id).has_value());
-    CHECK(slots.find_by_agent("agent-b") == ready_id);
+    CHECK(slots.find_by_holder("model-b") == ready_id);
 
     const auto ready = slots.find(ready_id);
     CHECK(ready.has_value());
-    CHECK(ready->agent_ids.size() == 2);
+    CHECK(ready->holder_ids.size() == 2);
     CHECK(ready->backend == "llama-cpp");
 
     CHECK(remove_tree(dir));
@@ -7190,26 +7372,28 @@ bool test_model_registry_makes_soma_routable() {
     std::string err;
     CHECK(reg.open(dir.string(), err));
     // v2 added the conformance table's third state; v3 added the `chat_template`
-    // stage to its name allow-list. Asserted rather than ranged: a migration
-    // that did not run is the failure this catches — and for v3 specifically,
-    // the failure it catches is silent, because the ladder is written in one
-    // transaction and a rejected stage name rolls back every row with it.
-    CHECK(reg.schema_version() == 3);
+    // stage to its name allow-list; v4 added the served-model catalog, token
+    // binding, and holder-keyed placement history. Asserted rather than ranged:
+    // a migration that did not run is the failure this catches — and for v3
+    // specifically, the failure it catches is silent, because the ladder is
+    // written in one transaction and a rejected stage name rolls back every row
+    // with it.
+    CHECK(reg.schema_version() == 4);
     CHECK(reg.list().empty());
     CHECK(std::filesystem::exists(dir / "control.db"));
 
     mm::NodeRegistry nodes((dir / "nodes").string());
-    mm::AgentScheduler scheduler(nodes, (dir / "models").string());
+    mm::PlacementScheduler scheduler(nodes, (dir / "models").string());
 
-    mm::AgentConfig cfg;
-    cfg.id = "agent-soma";
-    cfg.name = "Soma Agent";
+    mm::ServedModel cfg;
+    cfg.id = "soma-model";
+    cfg.display_name = "Soma Model";
     cfg.model_path = "Qwen/Qwen3-30B-A3B";
 
     // ── before: nothing admitted it, so nothing routes to Soma ───────────────
     scheduler.set_model_registry(&reg);
     CHECK(scheduler.resolve_backend_for(cfg).engine_id == "llama-cpp");
-    // And with no record, the agent's own path IS the location — this is the
+    // And with no record, the model's own path IS the location — this is the
     // fallback's GGUF, and it must keep passing through untouched.
     CHECK(scheduler.model_location(cfg) == cfg.model_path);
     auto forced = cfg;
@@ -7221,7 +7405,7 @@ bool test_model_registry_makes_soma_routable() {
     m.arch_hash = std::string(64, 'a');
     m.name = "Qwen3-30B-A3B";
     // The quantization suffix is the POINT, not decoration. With
-    // `model_dir == "/containers/" + name` the record's location and the agent's
+    // `model_dir == "/containers/" + name` the record's location and the model's
     // model_path are the same string, and every assertion below passes whichever
     // one the scheduler happens to use — which is exactly how defect D7 hid.
     m.model_dir = "/containers/Qwen3-30B-A3B-q4_g-q6_g-g128";
@@ -7234,18 +7418,18 @@ bool test_model_registry_makes_soma_routable() {
     CHECK(reg.upsert(m, err));
     CHECK(m.id > 0);
 
-    // The agent's model_path is "Qwen/Qwen3-30B-A3B" and the record's name is
-    // "Qwen3-30B-A3B": resolution compares the trailing component, so an agent
+    // The model_path is "Qwen/Qwen3-30B-A3B" and the record's name is
+    // "Qwen3-30B-A3B": resolution compares the trailing component, so an entry
     // configured with an HF-style ref matches a record admitted from a directory.
     CHECK(reg.resolve("Qwen/Qwen3-30B-A3B").has_value());
     CHECK(reg.resolve("/some/where/qwen3-30b-a3b/").has_value());   // case + trailing slash
     CHECK(!reg.resolve("Mistral-7B").has_value());
     CHECK(!reg.resolve("").has_value());
 
-    // ── the model's LOCATION comes from the record, not the agent ────────────
+    // ── the model's LOCATION comes from the record, not the entry ────────────
     //
     // Defect D7: placement resolved the record for `arch_hash` and `verdict` and
-    // threw `model_dir` away, then handed the node the agent's model_path. The
+    // threw `model_dir` away, then handed the node the entry's model_path. The
     // node resolves what it is handed against its own models_dir and found no
     // such directory — `model file not found on this node: OLMoE-1B-7B-0924`
     // while `OLMoE-1B-7B-0924-q4_g-q6_g-g128` sat right there.
@@ -7257,7 +7441,7 @@ bool test_model_registry_makes_soma_routable() {
     unknown.model_path = "/models/mixtral-8x7b-q4.gguf";
     CHECK(scheduler.model_location(unknown) == "/models/mixtral-8x7b-q4.gguf");
 
-    // ── after: the SAME agent config now routes to Soma, unprompted ──────────
+    // ── after: the SAME served model now routes to Soma, unprompted ──────────
     CHECK(scheduler.resolve_backend_for(cfg).engine_id == "soma");
     CHECK(scheduler.resolve_backend_for(cfg).reason.find("verdict") != std::string::npos);
 
@@ -7309,7 +7493,7 @@ bool test_model_registry_makes_soma_routable() {
     CHECK(reopened.list().empty());
     CHECK(!reopened.remove(rows[0].id, err));   // gone stays gone, and says so
 
-    mm::AgentScheduler bare(nodes, (dir / "models").string());
+    mm::PlacementScheduler bare(nodes, (dir / "models").string());
     CHECK(bare.resolve_backend_for(cfg).engine_id == "llama-cpp");
 
     reopened.close();
@@ -8083,7 +8267,7 @@ bool test_requantization_is_a_new_admission() {
         CHECK(reg.list().size() == 2);
     }
 
-    // ── which one an agent gets ──────────────────────────────────────────────
+    // ── which one a served model gets ────────────────────────────────────────
     //
     // Two rows now match the same name, so "the first row the scan reaches" is
     // not an answer — it is whichever the b-tree yielded, and it would change
@@ -8123,16 +8307,16 @@ bool test_scope_negatives_over_http() {
 #define RECORD(expr) record((expr), #expr, __LINE__)
 
     {
-        mm::AgentManager agents(dir.string());
-        mm::AgentConfig cfg;
-        cfg.id = "agent-a";
-        cfg.name = "Agent A";
-        cfg.model_path = "model.gguf";
-        agents.create_agent(cfg);
+        mm::UserManager users(dir.string());
+        {
+            mm::UserProfile profile;
+            profile.id = "user-a";
+            std::string create_error;
+            users.create_user(profile, create_error);
+        }
 
-        mm::AgentQueue queue;
         mm::NodeRegistry registry(dir.string());
-        mm::AgentScheduler scheduler(registry, (dir / "models").string());
+        mm::PlacementScheduler scheduler(registry, (dir / "models").string());
 
         // The registry has to be attached: without one, has_api_tokens() is
         // false and — with no legacy token either — auth is off entirely, so
@@ -8151,7 +8335,7 @@ bool test_scope_negatives_over_http() {
         RECORD(!read_token.empty() && !chat_token.empty() && !op_token.empty());
 
         // No legacy token: auth is on purely because api_token has rows.
-        mm::ControlApiServer api(agents, queue, registry, scheduler, dir.string(),
+        mm::ControlApiServer api(users, registry, scheduler, dir.string(),
                                  (dir / "models").string(), /*external_api_token=*/"");
         api.set_model_registry(&models);
 
@@ -8187,7 +8371,7 @@ bool test_scope_negatives_over_http() {
         // ── read: GETs yes, everything else no ───────────────────────────────
         auto reader = as(read_token);
         RECORD(with_retry([&] { return reader->get("/v1/nodes"); }).status == 200);
-        RECORD(with_retry([&] { return reader->get("/v1/agents"); }).status == 200);
+        RECORD(with_retry([&] { return reader->get("/v1/users"); }).status == 200);
         RECORD(with_retry([&] { return reader->get("/v1/models"); }).status == 200);
 
         auto reader_admits = with_retry([&] {
@@ -8201,20 +8385,20 @@ bool test_scope_negatives_over_http() {
         RECORD(reader_admits.body.find("operator") != std::string::npos);
         RECORD(reader_admits.body.find("read") != std::string::npos);
 
-        RECORD(with_retry([&] { return reader->del("/v1/agents/agent-a"); }).status == 403);
+        RECORD(with_retry([&] { return reader->del("/v1/users/user-a"); }).status == 403);
         RECORD(with_retry([&] {
-                   return reader->post("/v1/agents/agent-a/conversations",
+                   return reader->post("/v1/users/user-a/conversations",
                                        nlohmann::json{{"title", "nope"}});
                }).status == 403);
         // Still there: the refusal was a refusal, not a 403 after the fact.
-        RECORD(agents.get_agent("agent-a") != nullptr);
+        RECORD(users.get_user("user-a") != nullptr);
 
         // ── chat: conversations yes, admission and deletes no ────────────────
         auto chatter = as(chat_token);
         // chat implies read.
-        RECORD(with_retry([&] { return chatter->get("/v1/agents"); }).status == 200);
+        RECORD(with_retry([&] { return chatter->get("/v1/users"); }).status == 200);
         auto chat_creates = with_retry([&] {
-            return chatter->post("/v1/agents/agent-a/conversations",
+            return chatter->post("/v1/users/user-a/conversations",
                                  nlohmann::json{{"title", "Allowed"}, {"set_active", true}});
         });
         RECORD(chat_creates.status == 200 || chat_creates.status == 201);
@@ -8224,12 +8408,12 @@ bool test_scope_negatives_over_http() {
         });
         RECORD(chat_admits.status == 403);
         RECORD(chat_admits.body.find("insufficient scope") != std::string::npos);
-        RECORD(with_retry([&] { return chatter->del("/v1/agents/agent-a"); }).status == 403);
+        RECORD(with_retry([&] { return chatter->del("/v1/users/user-a"); }).status == 403);
         RECORD(with_retry([&] { return chatter->get("/v1/tokens"); }).status == 403);
 
         // ── operator: everything, including the things that refused above ────
         auto op = as(op_token);
-        RECORD(with_retry([&] { return op->get("/v1/agents"); }).status == 200);
+        RECORD(with_retry([&] { return op->get("/v1/users"); }).status == 200);
         RECORD(with_retry([&] { return op->get("/v1/tokens"); }).status == 200);
         auto op_admits = with_retry([&] {
             return op->post("/v1/models/admit", nlohmann::json{{"source", "/nope"}});
@@ -8248,18 +8432,18 @@ bool test_scope_negatives_over_http() {
         }
         RECORD(chat_id != 0);
         RECORD(models.revoke_api_token(chat_id, err));
-        auto revoked = with_retry([&] { return chatter->get("/v1/agents"); });
+        auto revoked = with_retry([&] { return chatter->get("/v1/users"); });
         RECORD(revoked.status == 403);
         RECORD(revoked.body.find("invalid bearer token") != std::string::npos);
 
         // ── an unknown token is 403, a missing one is 401 ────────────────────
-        RECORD(with_retry([&] { return as("never-minted")->get("/v1/agents"); }).status == 403);
-        RECORD(with_retry([&] { return probe.get("/v1/agents"); }).status == 401);
+        RECORD(with_retry([&] { return as("never-minted")->get("/v1/users"); }).status == 403);
+        RECORD(with_retry([&] { return probe.get("/v1/users"); }).status == 401);
 
-        // Deleting the agent as operator — the mutation the reader and chatter
+        // Deleting the user as operator — the mutation the reader and chatter
         // were both refused — proves the route works and the refusals were about
         // the credential rather than the request.
-        RECORD(with_retry([&] { return op->del("/v1/agents/agent-a"); }).status == 200);
+        RECORD(with_retry([&] { return op->del("/v1/users/user-a"); }).status == 200);
 
         api.stop();
         if (server_thread.joinable()) server_thread.join();
@@ -8287,13 +8471,13 @@ bool test_scope_negatives_over_http() {
 // the shapes you would guess. See below.
 // ─────────────────────────────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
-// Images are refused by the ENGINE's capability, not only the agent's profile.
+// Images are refused by the ENGINE's capability, not only the model's profile.
 //
 // The G8 criterion is "image content parts return 422, not a dropped part", and
 // it was half-implemented in a way that read as done: all four gates tested
 // `vision_settings.enabled` — the operator's INTENT — and none tested whether
-// the engine on the far end could accept an image at all. So an agent with
-// vision switched on, serving a model that earned a streamable verdict, sent
+// the engine on the far end could accept an image at all. So a profile with
+// vision switched on, over weights that earned a streamable verdict, sent
 // image parts to Soma, which is text-only by construction (roadmap D12).
 //
 // That failure is the bad kind: not a crash, a silently text-only answer to a
@@ -8315,6 +8499,19 @@ bool test_images_refused_by_engine_capability() {
     RECORD(!mm::engine_supports_vision("vllm"));
     RECORD(!mm::engine_supports_vision(""));
 
+    // Tools, stated beside vision because a model switch consults both. Soma
+    // 422s on `tools` and on any history with `tool_calls`, so answering true
+    // there would turn every tool-enabled turn into a refusal. vLLM parses tool
+    // calls only when launched with --enable-auto-tool-choice, which is cluster
+    // configuration the caller passes in.
+    RECORD(mm::engine_supports_tools("llama-cpp"));
+    RECORD(!mm::engine_supports_tools("soma"));
+    RECORD(!mm::engine_supports_tools("soma", true));
+    RECORD(!mm::engine_supports_tools("vllm"));
+    RECORD(mm::engine_supports_tools("vllm", true));
+    RECORD(!mm::engine_supports_tools(""));
+    RECORD(!mm::engine_supports_tools("some-future-engine", true));
+
     // ── the rule ─────────────────────────────────────────────────────────────
     const auto refusal = [](bool enabled, const char* engine, const char* why = "") {
         return mm::image_refusal_for(enabled, engine, why);
@@ -8322,8 +8519,10 @@ bool test_images_refused_by_engine_capability() {
 
     // Profile off is the whole answer, whatever the engine. Naming an engine
     // here would misdirect: the operator's own setting is what to change.
-    RECORD(refusal(false, "llama-cpp") == "this agent profile does not accept images");
-    RECORD(refusal(false, "soma") == "this agent profile does not accept images");
+    RECORD(refusal(false, "llama-cpp") ==
+           "this model does not accept images: vision is not enabled in its configuration");
+    RECORD(refusal(false, "soma") ==
+           "this model does not accept images: vision is not enabled in its configuration");
 
     // Profile on + an engine that can: allowed. This is the case that must keep
     // working — a capability check that refuses everything would also "fix" D12.
@@ -8349,7 +8548,7 @@ bool test_images_refused_by_engine_capability() {
     // An unknown engine is refused on the same rule, not a separate branch.
     RECORD(!refusal(true, "vllm").empty());
 
-    // API-backed agents own no node-local engine; the remote provider's own
+    // API-backed models own no node-local engine; the remote provider's own
     // capabilities govern and control has no business refusing on its behalf.
     RECORD(refusal(true, "").empty());
 
@@ -8374,7 +8573,7 @@ bool test_capacity_pressure_is_structured() {
     };
 #define RECORD(expr) record((expr), #expr, __LINE__)
 
-    const auto pressure = &mm::AgentScheduler::response_indicates_capacity_pressure;
+    const auto pressure = &mm::PlacementScheduler::response_indicates_capacity_pressure;
 
     // ── 1. the two structured shapes, because there are two producers ────────
     // `soma serve` and the node's inference proxy nest it under `error`.
@@ -8389,7 +8588,7 @@ bool test_capacity_pressure_is_structured() {
     // ── 2. a structured code is AUTHORITATIVE ────────────────────────────────
     // The whole point of the rewrite. The engine has decided this is not
     // capacity; reading its prose for a contradicting hint would undo that, and
-    // an evict-and-retry here would destroy a healthy resident agent to make
+    // an evict-and-retry here would destroy a healthy resident placement to make
     // room for a model that is never going to be found.
     RECORD(!pressure(
         R"({"error":{"code":"model_not_found","message":"ran out of memory looking"}})"));
@@ -8446,7 +8645,7 @@ bool test_capacity_pressure_is_structured() {
     RECORD(through_client(500, R"({"error":{"code":"capacity_pressure"}})")
                .is_capacity_pressure());
     // 500 with no code is internal, not capacity: retrying it evicts a live
-    // agent to re-run a request that will fail again the same way.
+    // holder to re-run a request that will fail again the same way.
     RECORD(!through_client(500, R"({"error":"segfault in expert routing"})")
                 .is_capacity_pressure());
     RECORD(!through_client(404, R"({"error":"no such model"})").is_capacity_pressure());
@@ -8530,13 +8729,14 @@ bool test_engine_telemetry_republication() {
                                         {"state", "ready"},
                                         {"model_path", "container/Qwen3-30B-A3B"},
                                         {"vram_usage_mb", 512},
-                                        {"agent_ids", nlohmann::json::array()}};
+                                        {"holder_ids", nlohmann::json::array()}};
             nlohmann::json llama_slot = {{"id", "no-telemetry"},
                                          {"backend", "llama-cpp"},
                                          {"state", "ready"},
                                          {"model_path", "m.gguf"},
-                                         {"agent_ids", nlohmann::json::array()}};
+                                         {"holder_ids", nlohmann::json::array()}};
             res.set_content(nlohmann::json{{"slots", {soma_slot, llama_slot}},
+                                           {"wire_protocol", mm::kNodeWireProtocol},
                                            {"max_slots", 4},
                                            {"slot_available", 2},
                                            {"disk_free_mb", 100000}}
@@ -8551,11 +8751,10 @@ bool test_engine_telemetry_republication() {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
 
-        mm::AgentManager agents(dir.string());
-        mm::AgentQueue queue;
+        mm::UserManager users(dir.string());
         mm::NodeRegistry registry(dir.string());
-        mm::AgentScheduler scheduler(registry, (dir / "models").string());
-        mm::ControlApiServer api(agents, queue, registry, scheduler, dir.string(),
+        mm::PlacementScheduler scheduler(registry, (dir / "models").string());
+        mm::ControlApiServer api(users, registry, scheduler, dir.string(),
                                  (dir / "models").string(), "");
 
         const auto node_url = "http://127.0.0.1:" + std::to_string(node_port);
@@ -8670,12 +8869,12 @@ bool test_route_scopes_and_token_store() {
     // absent from it is reported rather than defaulted.
     std::vector<std::string> missing;
     CHECK(mm::require_complete_coverage(
-        {"GET /v1/agents", "POST /v1/agents/:id/chat", "POST /v1/models/admit",
-         "PUT /v1/agents/:id/backend", "DELETE /v1/models/:id", "GET /v1/tokens"},
+        {"GET /v1/users", "POST /v1/users/:id/chat", "POST /v1/models/admit",
+         "PUT /v1/served-models/:id/backend", "DELETE /v1/models/:id", "GET /v1/tokens"},
         missing));
     CHECK(missing.empty());
 
-    CHECK(!mm::require_complete_coverage({"GET /v1/agents", "POST /v1/not/in/the/table"},
+    CHECK(!mm::require_complete_coverage({"GET /v1/users", "POST /v1/not/in/the/table"},
                                          missing));
     CHECK(missing.size() == 1);
     CHECK(missing[0] == "POST /v1/not/in/the/table");
@@ -8759,6 +8958,27 @@ bool test_route_scopes_and_token_store() {
     CHECK(!reg.revoke_api_token(reader_id, err));       // already revoked
     CHECK(reg.has_api_tokens());                        // the operator token remains
 
+    // ── binding (v4) ─────────────────────────────────────────────────────────
+    // Unbound is the default and reads back empty: every token minted before
+    // binding existed meant "any user", and still does.
+    CHECK(reg.find_api_token(mm::pairing::sha256_hex(admin), row));
+    CHECK(row.user_id.empty());
+    const auto alice = reg.create_api_token("alice-phone", chat, err, "alice");
+    CHECK(!alice.empty());
+    CHECK(reg.find_api_token(mm::pairing::sha256_hex(alice), row));
+    CHECK(row.user_id == "alice");
+    bool listed_bound = false;
+    for (const auto& t : reg.list_api_tokens())
+        if (t.label == "alice-phone") listed_bound = t.user_id == "alice";
+    CHECK(listed_bound);
+    // Deleting a user revokes its bound tokens — and ONLY its bound tokens. A
+    // later user created under the same id must not inherit the credential.
+    CHECK(reg.revoke_tokens_for_user("alice") == 1);
+    CHECK(!reg.find_api_token(mm::pairing::sha256_hex(alice), row));
+    CHECK(reg.find_api_token(mm::pairing::sha256_hex(admin), row));
+    CHECK(reg.revoke_tokens_for_user("alice") == 0);    // idempotent
+    CHECK(reg.revoke_tokens_for_user("") == 0);         // empty never matches unbound
+
     reg.close();
     CHECK(remove_tree(dir));
     return true;
@@ -8832,6 +9052,1101 @@ bool test_capacity_fit_across_three_axes() {
     return true;
 }
 
+// ── /v1/users over HTTP ───────────────────────────────────────────────────────
+//
+// Users end to end: a real control API, a real catalog, and a fake
+// OpenAI-compatible provider standing in for every model, so a turn runs the
+// whole way — model choice, strand, compaction, tools, recall — against a
+// server that records every request it is sent.
+
+namespace {
+
+// Records the failure and carries on, so a test that owns threads and servers
+// still reaches the code that joins and stops them. Variadic because braced
+// JSON literals carry commas the preprocessor would split on.
+#define UCHECK(...) do { if (!check((__VA_ARGS__), #__VA_ARGS__, __LINE__)) ok = false; } while (0)
+
+using PutResult = mm::ServedModelCatalog::PutResult;
+
+nlohmann::json json_of(const mm::HttpResponse& response) {
+    auto parsed = nlohmann::json::parse(response.body, nullptr, false);
+    return parsed.is_discarded() ? nlohmann::json::object() : parsed;
+}
+
+/// An mm::HttpClient whose every request retries the Windows-loopback flake
+/// (see kTransportRetries).
+class RetryingClient {
+public:
+    RetryingClient(const std::string& base_url, const std::string& token) : client_(base_url) {
+        if (!token.empty()) client_.set_bearer_token(token);
+    }
+    mm::HttpResponse get(const std::string& path) {
+        return retry([&] { return client_.get(path); });
+    }
+    mm::HttpResponse post(const std::string& path, const nlohmann::json& body) {
+        return retry([&] { return client_.post(path, body); });
+    }
+    mm::HttpResponse put(const std::string& path, const nlohmann::json& body) {
+        return retry([&] { return client_.put(path, body); });
+    }
+    mm::HttpResponse del(const std::string& path) {
+        return retry([&] { return client_.del(path); });
+    }
+    mm::HttpResponse upload(const std::string& path, const std::string& file,
+                            const std::string& filename, const std::string& content_type) {
+        return retry([&] { return client_.post_file(path, file, {{"X-Filename", filename}}, content_type); });
+    }
+
+private:
+    template <typename Request>
+    static mm::HttpResponse retry(Request&& request) {
+        mm::HttpResponse response;
+        for (int attempt = 0; attempt < kTransportRetries; ++attempt) {
+            response = request();
+            if (response.status != 0) break;
+            transport_backoff(attempt);
+        }
+        return response;
+    }
+    mm::HttpClient client_;
+};
+
+/// Everything control needs to serve /v1/users, listening on a free port.
+/// Declared in destruction order: the server goes before what it references.
+struct UserApiHarness {
+    std::filesystem::path dir;
+    mm::ControlModelRegistry reg;
+    std::unique_ptr<mm::UserManager> users;
+    std::unique_ptr<mm::NodeRegistry> registry;
+    std::unique_ptr<mm::PlacementScheduler> scheduler;
+    std::unique_ptr<mm::ServedModelCatalog> catalog;
+    std::unique_ptr<mm::ControlApiServer> api;
+    std::thread server_thread;
+    std::atomic<bool> listen_ok{false};
+    std::atomic<bool> listen_returned{false};
+    std::string base_url;
+    bool health_polling = false;
+
+    explicit UserApiHarness(const std::string& name) : dir(temp_test_dir(name)) {}
+
+    bool start() {
+        std::filesystem::create_directories(dir / "models");
+        std::string error;
+        if (!reg.open(dir.string(), error)) {
+            std::cerr << "model registry: " << error << "\n";
+            return false;
+        }
+        users = std::make_unique<mm::UserManager>(dir.string());
+        registry = std::make_unique<mm::NodeRegistry>((dir / "registry").string());
+        scheduler = std::make_unique<mm::PlacementScheduler>(*registry, (dir / "models").string());
+        catalog = std::make_unique<mm::ServedModelCatalog>(reg);
+        api = std::make_unique<mm::ControlApiServer>(*users, *registry, *scheduler, dir.string(),
+                                                     (dir / "models").string(), "control-secret");
+        api->set_model_registry(&reg);
+        api->set_served_model_catalog(catalog.get());
+        const uint16_t port = find_free_test_port();
+        if (port == 0) return false;
+        base_url = "http://127.0.0.1:" + std::to_string(port);
+        server_thread = std::thread([this, port] {
+            listen_ok = api->listen(port);
+            listen_returned = true;
+        });
+        mm::HttpClient probe(base_url);
+        for (int i = 0; i < 100; ++i) {
+            // A listen() that returned FAILED: whoever answered is not ours.
+            if (probe.get("/v1/users").status != 0) return !listen_returned.load();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return false;
+    }
+
+    ~UserApiHarness() {
+        if (api) api->stop();
+        if (server_thread.joinable()) server_thread.join();
+        if (registry && health_polling) registry->stop_health_poll();
+        api.reset();
+        catalog.reset();
+        scheduler.reset();
+        registry.reset();
+        users.reset();
+        reg.close();
+    }
+};
+
+/// A remote model served by `base_url`, known upstream as `<id>-upstream`.
+mm::ServedModel api_model(const std::string& id, const std::string& base_url) {
+    mm::ServedModel model;
+    model.id = id;
+    model.display_name = id;
+    model.model_path = id + "-upstream";
+    model.inference_backend = "api";
+    model.api_settings.base_url = base_url;
+    return model;
+}
+
+std::string conv_id_of(const mm::HttpResponse& created) {
+    return json_of(created).value("conversation", nlohmann::json::object()).value("id", std::string{});
+}
+
+std::string mint_token(RetryingClient& op, const std::string& label, const std::string& scopes,
+                       const std::string& user_id) {
+    nlohmann::json body = {{"label", label}, {"scopes", scopes}};
+    if (!user_id.empty()) body["user_id"] = user_id;
+    return json_of(op.post("/v1/tokens", body)).value("token", std::string{});
+}
+
+void write_png_signature(const std::filesystem::path& path) {
+    std::ofstream png(path, std::ios::binary);
+    const unsigned char signature[] = {0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
+    png.write(reinterpret_cast<const char*>(signature), sizeof(signature));
+}
+
+struct ChatReply {
+    int status = 0;
+    std::string body;                   ///< the refusal, when refused before the stream
+    std::vector<nlohmann::json> events; ///< every data frame but [DONE]
+    std::string text;                   ///< the deltas, joined
+    nlohmann::json done = nlohmann::json::object();
+};
+
+ChatReply chat_as(const std::string& base_url, const std::string& token, const std::string& user_id,
+                  const nlohmann::json& body) {
+    mm::HttpClient client(base_url);
+    if (!token.empty()) client.set_bearer_token(token);
+    ChatReply reply;
+    for (int attempt = 0; attempt < kTransportRetries; ++attempt) {
+        reply = ChatReply{};
+        client.stream_post(
+            "/v1/users/" + user_id + "/chat", body,
+            [&](const std::string& payload) {
+                if (payload == "[DONE]") return true;
+                auto event = nlohmann::json::parse(payload, nullptr, false);
+                if (event.is_discarded() || !event.is_object()) return true;
+                const std::string type = event.value("type", std::string{});
+                if (type == "delta") reply.text += event.value("content", std::string{});
+                if (type == "done") reply.done = event;
+                reply.events.push_back(std::move(event));
+                return true;
+            },
+            &reply.status, &reply.body);
+        if (reply.status != 0) break;
+        transport_backoff(attempt);
+    }
+    return reply;
+}
+
+bool has_event(const ChatReply& reply, const std::string& type) {
+    return std::any_of(reply.events.begin(), reply.events.end(), [&](const nlohmann::json& e) {
+        return e.value("type", std::string{}) == type;
+    });
+}
+
+/// An OpenAI-compatible provider for every model in these tests. It answers
+/// by what it is asked:
+///
+///   summary     a summarizer call (the fold or condense instructions)
+///   recall      a global-recall review; JSON when it was offered no tools
+///   relevance   memory selection
+///   chat        a turn: "answer from <model>" — or, when the latest message
+///               is the user's and says "remember this", a save_local_memory
+///               call, whether or not tools were offered, because a model that
+///               calls a tool it was never given is exactly what the pipeline
+///               must not obey
+struct FakeOpenAiProvider {
+    struct Call {
+        std::string kind;
+        std::string model;
+        nlohmann::json body;
+        std::int64_t started_ms = 0;
+        std::int64_t ended_ms = 0;
+    };
+
+    httplib::Server server;
+    std::thread thread;
+    uint16_t port = 0;
+    std::string url;
+
+    std::mutex mu;
+    std::condition_variable cv;
+    std::vector<Call> calls;
+    int in_flight = 0;
+    int peak_in_flight = 0;
+    int chat_delay_ms = 0;
+    /// Hold a chat until a second is in flight, five seconds at most: two
+    /// chats overlap only if they ran side by side.
+    bool pair_chats = false;
+
+    static std::int64_t now_ms() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
+
+    static std::string text_of(const nlohmann::json& message) {
+        const auto content = message.value("content", nlohmann::json());
+        if (content.is_string()) return content.get<std::string>();
+        std::string text;
+        if (content.is_array())
+            for (const auto& part : content)
+                if (part.is_object() && part.value("type", std::string{}) == "text")
+                    text += part.value("text", std::string{});
+        return text;
+    }
+
+    static std::string kind_of(const nlohmann::json& body) {
+        const std::string all = body.at("messages").dump();
+        if (all.find("running summary") != std::string::npos ||
+            all.find("Shorten this summary") != std::string::npos)
+            return "summary";
+        if (all.find("maintain global summaries") != std::string::npos) return "recall";
+        if (all.find("decide which stored global memories") != std::string::npos) return "relevance";
+        return "chat";
+    }
+
+    void handle(const httplib::Request& req, httplib::Response& res) {
+        const nlohmann::json body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.is_object() || !body.contains("messages") ||
+            !body.at("messages").is_array() || body.at("messages").empty()) {
+            res.status = 400;
+            res.set_content(R"({"error":{"message":"bad request"}})", "application/json");
+            return;
+        }
+        const std::string kind = kind_of(body);
+        const std::string model = body.value("model", std::string{});
+        std::size_t index = 0;
+        int delay_ms = 0;
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            index = calls.size();
+            calls.push_back(Call{kind, model, body, now_ms(), 0});
+            ++in_flight;
+            peak_in_flight = std::max(peak_in_flight, in_flight);
+            cv.notify_all();
+            if (kind == "chat") {
+                delay_ms = chat_delay_ms;
+                if (pair_chats)
+                    cv.wait_for(lk, std::chrono::seconds(5),
+                                [this] { return in_flight >= 2 || !pair_chats; });
+            }
+        }
+        if (delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+
+        std::string content;
+        bool tool_call = false;
+        if (kind == "summary") {
+            content = "Summary of the earlier turns.";
+        } else if (kind == "recall") {
+            content = body.contains("tools")
+                          ? std::string("Nothing worth saving.")
+                          : std::string(R"({"memories":[{"content":"The user likes green tea.","importance":0.7}]})");
+        } else if (kind == "relevance") {
+            content = R"({"memory_ids":[]})";
+        } else {
+            const auto& last = body.at("messages").back();
+            tool_call = last.value("role", std::string{}) == "user" &&
+                        text_of(last).find("remember this") != std::string::npos;
+            if (!tool_call) content = "answer from " + model;
+        }
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            calls[index].ended_ms = now_ms();
+            --in_flight;
+        }
+
+        const nlohmann::json call = {
+            {"index", 0},
+            {"id", "call_note"},
+            {"type", "function"},
+            {"function",
+             {{"name", "save_local_memory"},
+              {"arguments", R"({"content":"the user asked me to remember this"})"}}}};
+        if (body.value("stream", false)) {
+            std::string sse;
+            const auto frame = [&](const nlohmann::json& delta, const char* finish) {
+                nlohmann::json choice = {{"index", 0}, {"delta", delta}};
+                if (finish != nullptr) choice["finish_reason"] = finish;
+                sse += "data: " +
+                       nlohmann::json{{"object", "chat.completion.chunk"},
+                                      {"model", model},
+                                      {"choices", nlohmann::json::array({choice})}}
+                           .dump() +
+                       "\n\n";
+            };
+            if (tool_call) {
+                frame(nlohmann::json{{"tool_calls", nlohmann::json::array({call})}}, nullptr);
+                frame(nlohmann::json::object(), "tool_calls");
+            } else {
+                frame(nlohmann::json{{"content", content}}, nullptr);
+                frame(nlohmann::json::object(), "stop");
+            }
+            sse += "data: [DONE]\n\n";
+            res.set_content(sse, "text/event-stream");
+            return;
+        }
+        nlohmann::json message = {{"role", "assistant"}, {"content", content}};
+        if (tool_call) {
+            message["content"] = nullptr;
+            message["tool_calls"] = nlohmann::json::array({call});
+        }
+        const nlohmann::json choice = {{"index", 0},
+                                       {"message", message},
+                                       {"finish_reason", tool_call ? "tool_calls" : "stop"}};
+        res.set_content(nlohmann::json{{"id", "cmpl-fake"},
+                                       {"object", "chat.completion"},
+                                       {"model", model},
+                                       {"choices", nlohmann::json::array({choice})}}
+                            .dump(),
+                        "application/json");
+    }
+
+    bool start() {
+        port = find_free_test_port();
+        if (port == 0) return false;
+        url = "http://127.0.0.1:" + std::to_string(port);
+        server.Post("/v1/chat/completions",
+                    [this](const httplib::Request& req, httplib::Response& res) { handle(req, res); });
+        server.Get("/health", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content("{}", "application/json");
+        });
+        thread = std::thread([this] { server.listen("127.0.0.1", port); });
+        mm::HttpClient probe(url);
+        for (int i = 0; i < 80; ++i) {
+            if (probe.get("/health").status == 200) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        return false;
+    }
+
+    ~FakeOpenAiProvider() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            pair_chats = false;
+        }
+        cv.notify_all();
+        server.stop();
+        if (thread.joinable()) thread.join();
+    }
+
+    std::vector<Call> calls_of(const std::string& kind) {
+        std::lock_guard<std::mutex> lk(mu);
+        std::vector<Call> out;
+        for (const auto& c : calls)
+            if (c.kind == kind) out.push_back(c);
+        return out;
+    }
+    void set_chat_delay(int ms) {
+        std::lock_guard<std::mutex> lk(mu);
+        chat_delay_ms = ms;
+    }
+    void set_pair_chats(bool on) {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            pair_chats = on;
+        }
+        cv.notify_all();
+    }
+    void reset_peak() {
+        std::lock_guard<std::mutex> lk(mu);
+        peak_in_flight = in_flight;
+    }
+    int peak() {
+        std::lock_guard<std::mutex> lk(mu);
+        return peak_in_flight;
+    }
+};
+
+/// A request's prompt, estimated the way compaction estimates it: a quarter of
+/// the bytes of its text.
+int prompt_tokens_of(const nlohmann::json& body) {
+    std::size_t chars = 0;
+    for (const auto& message : body.value("messages", nlohmann::json::array()))
+        chars += FakeOpenAiProvider::text_of(message).size();
+    return static_cast<int>((chars + 3) / 4);
+}
+
+} // namespace
+
+bool test_users_http_crud_and_scopes() {
+    bool ok = true;
+    std::filesystem::path dir;
+    {
+        UserApiHarness h("users-http-crud");
+        dir = h.dir;
+        CHECK(h.start());
+        std::string err;
+        CHECK(h.catalog->create(api_model("alpha", "http://127.0.0.1:1"), err) == PutResult::Created);
+        RetryingClient op(h.base_url, "control-secret");
+
+        // ── users ────────────────────────────────────────────────────────────
+        const auto created =
+            op.post("/v1/users", {{"id", "alice"}, {"display_name", "Alice"}, {"default_model", "alpha"}});
+        UCHECK(created.status == 201);
+        const auto alice = json_of(created);
+        UCHECK(alice.value("id", std::string{}) == "alice");
+        UCHECK(alice.value("default_model", std::string{}) == "alpha");
+        UCHECK(alice.contains("active_conversation_id") && alice.at("active_conversation_id").is_null());
+
+        // An id cannot change, so it must already be in its final form.
+        UCHECK(op.post("/v1/users", {{"id", "Alice"}}).status == 400);
+        UCHECK(op.post("/v1/users", {{"id", "con"}}).status == 400); // reserved on Windows
+        const auto duplicate = op.post("/v1/users", {{"id", "alice"}});
+        UCHECK(duplicate.status == 409);
+        UCHECK(duplicate.body.find("user_exists") != std::string::npos);
+        // No id: one is made from the display name.
+        const auto bob = op.post("/v1/users", {{"display_name", "Bob Smith"}});
+        UCHECK(bob.status == 201);
+        UCHECK(json_of(bob).value("id", std::string{}) == "bob-smith");
+        // A default the catalog lacks, and a field no profile has, are refused
+        // rather than stored or dropped.
+        UCHECK(op.post("/v1/users", {{"id", "carol"}, {"default_model", "nope"}}).status == 400);
+        UCHECK(op.post("/v1/users", {{"id", "dave"}, {"colour", "blue"}}).status == 400);
+
+        const auto listed = json_of(op.get("/v1/users")).value("data", nlohmann::json::array());
+        UCHECK(listed.size() == 2);
+        if (listed.size() == 2) {
+            UCHECK(listed[0].value("id", std::string{}) == "alice");
+            UCHECK(listed[1].value("id", std::string{}) == "bob-smith");
+        }
+        UCHECK(op.get("/v1/users/alice").status == 200);
+        const auto nobody = op.get("/v1/users/nobody");
+        UCHECK(nobody.status == 404);
+        UCHECK(nobody.body.find("user_not_found") != std::string::npos);
+
+        const auto updated =
+            op.put("/v1/users/alice", {{"custom_instructions", "Be brief."}, {"tools_enabled", true}});
+        UCHECK(updated.status == 200);
+        UCHECK(json_of(updated).value("custom_instructions", std::string{}) == "Be brief.");
+        UCHECK(json_of(updated).value("tools_enabled", false));
+        UCHECK(op.put("/v1/users/alice", {{"id", "mallory"}}).status == 400);
+        UCHECK(op.put("/v1/users/alice", {{"default_model", "nope"}}).status == 400);
+
+        // ── conversations ────────────────────────────────────────────────────
+        const auto first =
+            op.post("/v1/users/alice/conversations", {{"title", "First"}, {"model", "alpha"}, {"set_active", true}});
+        UCHECK(first.status == 201);
+        const auto first_conv = json_of(first).value("conversation", nlohmann::json::object());
+        const std::string first_id = first_conv.value("id", std::string{});
+        UCHECK(!first_id.empty());
+        UCHECK(first_conv.value("model_id", std::string{}) == "alpha");
+        UCHECK(first_conv.value("is_active", false));
+        const auto unknown_model = op.post("/v1/users/alice/conversations", {{"title", "Nope"}, {"model", "nope"}});
+        UCHECK(unknown_model.status == 404);
+        UCHECK(unknown_model.body.find("model_not_found") != std::string::npos);
+        // No model: every turn falls back to the user's default.
+        const auto second = op.post("/v1/users/alice/conversations", {{"title", "Second"}});
+        UCHECK(second.status == 201);
+        const std::string second_id = conv_id_of(second);
+        UCHECK(json_of(second).value("conversation", nlohmann::json::object()).value("model_id", std::string{"x"}).empty());
+
+        const auto renamed = op.put("/v1/users/alice/conversations/" + second_id,
+                                    {{"title", "Renamed"}, {"model", "alpha"}, {"settings", {{"temperature", 0.3}}}});
+        UCHECK(renamed.status == 200);
+        UCHECK(json_of(renamed).value("title", std::string{}) == "Renamed");
+        UCHECK(json_of(renamed).value("model_id", std::string{}) == "alpha");
+        UCHECK(op.put("/v1/users/alice/conversations/" + second_id, {{"colour", "blue"}}).status == 400);
+        UCHECK(op.put("/v1/users/alice/conversations/" + second_id, {{"model", "nope"}}).status == 404);
+        UCHECK(op.put("/v1/users/alice/conversations/" + second_id, {{"settings", {{"top_p", 1.5}}}}).status == 400);
+
+        // One conversation is active; activating another moves it.
+        const auto activated =
+            op.post("/v1/users/alice/conversations/" + second_id + "/activate", nlohmann::json::object());
+        UCHECK(activated.status == 200);
+        UCHECK(json_of(op.get("/v1/users/alice")).value("active_conversation_id", nlohmann::json()) ==
+               nlohmann::json(second_id));
+
+        // The active conversation cannot be deleted; another can.
+        UCHECK(op.del("/v1/users/alice/conversations/" + second_id).status == 409);
+        UCHECK(op.del("/v1/users/alice/conversations/" + first_id).status == 200);
+        UCHECK(op.get("/v1/users/alice/conversations/" + first_id).status == 404);
+        UCHECK(json_of(op.get("/v1/users/alice/conversations")).value("data", nlohmann::json::array()).size() == 1);
+
+        // ── memories ─────────────────────────────────────────────────────────
+        UCHECK(op.post("/v1/users/alice/conversations/" + second_id + "/local-memories", {{"content", "a note"}})
+                   .status == 201);
+        UCHECK(json_of(op.get("/v1/users/alice/conversations/" + second_id + "/local-memories"))
+                   .value("data", nlohmann::json::array())
+                   .size() == 1);
+        const auto memory = op.post("/v1/users/alice/memories", {{"content", "likes tea"}, {"source_conv_id", second_id}});
+        UCHECK(memory.status == 201);
+        const std::string memory_id = json_of(memory).value("id", std::string{});
+        UCHECK(json_of(op.get("/v1/users/alice/memories")).value("data", nlohmann::json::array()).size() == 1);
+        // Another user's store is theirs alone.
+        UCHECK(json_of(op.get("/v1/users/bob-smith/memories")).value("data", nlohmann::json::array()).empty());
+        UCHECK(op.get("/v1/users/bob-smith/conversations/" + second_id).status == 404);
+
+        // ── scopes ───────────────────────────────────────────────────────────
+        const std::string reader = mint_token(op, "reader", "read", "");
+        const std::string chatter = mint_token(op, "chatter", "read,chat", "");
+        UCHECK(!reader.empty());
+        UCHECK(!chatter.empty());
+        RetryingClient as_reader(h.base_url, reader);
+        RetryingClient as_chatter(h.base_url, chatter);
+        UCHECK(as_reader.get("/v1/users").status == 200);
+        UCHECK(as_reader.get("/v1/users/alice/conversations").status == 200);
+        const auto reader_write = as_reader.post("/v1/users/alice/conversations", {{"title", "no"}});
+        UCHECK(reader_write.status == 403);
+        UCHECK(reader_write.body.find("insufficient scope") != std::string::npos);
+        UCHECK(as_chatter.post("/v1/users/alice/conversations", {{"title", "yes"}}).status == 201);
+        UCHECK(as_chatter.put("/v1/users/alice", {{"display_name", "Alice A."}}).status == 200);
+        // Creating and deleting users, and deleting anything at all, are the
+        // operator's.
+        UCHECK(as_chatter.post("/v1/users", {{"id", "erin"}}).status == 403);
+        UCHECK(as_chatter.del("/v1/users/bob-smith").status == 403);
+        UCHECK(as_chatter.del("/v1/users/alice/memories/" + memory_id).status == 403);
+
+        // Deleting a user takes their store with them.
+        const auto deleted = op.del("/v1/users/bob-smith");
+        UCHECK(deleted.status == 200);
+        UCHECK(op.get("/v1/users/bob-smith").status == 404);
+        UCHECK(!std::filesystem::exists(h.dir / "users" / "bob-smith"));
+        UCHECK(op.get("/v1/users/alice").status == 200);
+    }
+    UCHECK(remove_tree(dir));
+    return ok;
+}
+
+// One conversation, two models: the choice sticks, every answer says who wrote
+// it, and the history is rewritten for whichever model reads it next.
+bool test_users_http_chat_model_switch_mid_conversation() {
+    bool ok = true;
+    std::filesystem::path dir;
+    FakeOpenAiProvider provider;
+    CHECK(provider.start());
+    {
+        UserApiHarness h("users-http-switch");
+        dir = h.dir;
+        CHECK(h.start());
+        std::string err;
+        auto seeing = api_model("seeing", provider.url);
+        seeing.vision_settings.enabled = true;
+        auto plain = api_model("plain", provider.url);
+        plain.tool_calling = false;
+        CHECK(h.catalog->create(seeing, err) == PutResult::Created);
+        CHECK(h.catalog->create(plain, err) == PutResult::Created);
+
+        RetryingClient op(h.base_url, "control-secret");
+        UCHECK(op.post("/v1/users", {{"id", "alice"}, {"default_model", "plain"}, {"tools_enabled", true}}).status ==
+               201);
+        const std::string cid =
+            conv_id_of(op.post("/v1/users/alice/conversations", {{"title", "switching"}, {"set_active", true}}));
+        UCHECK(!cid.empty());
+        const auto conversation_model = [&] {
+            return json_of(op.get("/v1/users/alice/conversations/" + cid)).value("model_id", std::string{});
+        };
+        const auto local_notes = [&] {
+            return json_of(op.get("/v1/users/alice/conversations/" + cid + "/local-memories"))
+                .value("data", nlohmann::json::array())
+                .size();
+        };
+
+        const auto png = h.dir / "picture.png";
+        write_png_signature(png);
+        const auto upload = op.upload("/v1/users/alice/attachments", png.string(), "picture.png", "image/png");
+        UCHECK(upload.status == 201);
+        const std::string image_id = json_of(upload).value("id", std::string{});
+
+        // 1. A model that can see, named by the turn: it answers, and it sticks.
+        const auto first = chat_as(h.base_url, "control-secret", "alice",
+                                   {{"message", "what is in this picture?"},
+                                    {"conversation_id", cid},
+                                    {"model", "seeing"},
+                                    {"attachment_ids", nlohmann::json::array({image_id})}});
+        UCHECK(first.status == 200);
+        UCHECK(first.done.value("success", false));
+        UCHECK(first.done.value("model_id", std::string{}) == "seeing");
+        UCHECK(first.text == "answer from seeing-upstream");
+        {
+            const auto chats = provider.calls_of("chat");
+            UCHECK(chats.size() == 1);
+            if (!chats.empty()) {
+                UCHECK(chats.back().model == "seeing-upstream");
+                UCHECK(chats.back().body.dump().find("data:image/png;base64,") != std::string::npos);
+                // Memories on, tools on, and a model that can call them.
+                UCHECK(chats.back().body.contains("tools"));
+            }
+        }
+        UCHECK(conversation_model() == "seeing");
+
+        // 2. No model named: the conversation's answers. It calls a memory tool,
+        //    which runs, because the tools were offered.
+        const auto second = chat_as(h.base_url, "control-secret", "alice",
+                                    {{"message", "remember this, please"}, {"conversation_id", cid}});
+        UCHECK(second.done.value("success", false));
+        UCHECK(second.done.value("model_id", std::string{}) == "seeing");
+        UCHECK(second.text == "answer from seeing-upstream");
+        UCHECK(has_event(second, "tool_result"));
+        UCHECK(local_notes() == 1);
+
+        // 3. Switch to a model that can neither see nor call tools. The history
+        //    it is sent has the image as a placeholder and the tool round as
+        //    text — and the tool call it makes anyway is not run.
+        const auto third = chat_as(h.base_url, "control-secret", "alice",
+                                   {{"message", "remember this too"}, {"conversation_id", cid}, {"model", "plain"}});
+        UCHECK(third.done.value("success", false));
+        UCHECK(third.done.value("model_id", std::string{}) == "plain");
+        {
+            const auto chats = provider.calls_of("chat");
+            UCHECK(chats.size() == 4); // turn 2 took two rounds
+            if (!chats.empty()) {
+                const auto& last = chats.back();
+                const std::string sent = last.body.dump();
+                UCHECK(last.model == "plain-upstream");
+                UCHECK(!last.body.contains("tools"));
+                UCHECK(sent.find("image_url") == std::string::npos);
+                UCHECK(sent.find("[image omitted: picture.png]") != std::string::npos);
+                UCHECK(sent.find("\"role\":\"tool\"") == std::string::npos);
+                UCHECK(sent.find("[called save_local_memory") != std::string::npos);
+            }
+        }
+        UCHECK(!has_event(third, "tool_result"));
+        UCHECK(local_notes() == 1);
+        UCHECK(conversation_model() == "plain");
+
+        // 4. An image for the model that cannot see is refused before the
+        //    stream opens, and nothing is stored.
+        const auto refused = chat_as(h.base_url, "control-secret", "alice",
+                                     {{"message", "and this?"},
+                                      {"conversation_id", cid},
+                                      {"attachment_ids", nlohmann::json::array({image_id})}});
+        UCHECK(refused.status == 422);
+        UCHECK(refused.body.find("images_unsupported") != std::string::npos);
+        UCHECK(refused.events.empty());
+
+        // Every answer says which model wrote it.
+        const auto messages = json_of(op.get("/v1/users/alice/conversations/" + cid))
+                                  .value("messages", nlohmann::json::array());
+        std::vector<std::string> answered_by;
+        int tool_results = 0;
+        for (const auto& m : messages) {
+            const std::string role = m.value("role", std::string{});
+            if (role == "assistant") answered_by.push_back(m.value("model_id", std::string{}));
+            if (role == "tool") ++tool_results;
+        }
+        const std::vector<std::string> expected = {"seeing", "seeing", "seeing", "plain"};
+        UCHECK(answered_by == expected);
+        UCHECK(tool_results == 1);
+        UCHECK(messages.size() == 8); // u a | u a(call) tool a | u a
+    }
+    UCHECK(remove_tree(dir));
+    return ok;
+}
+
+// A token bound to a user reaches that user and nobody else, whatever its
+// scopes — and goes when the user does.
+bool test_users_http_bound_token_403() {
+    bool ok = true;
+    std::filesystem::path dir;
+    FakeOpenAiProvider provider;
+    CHECK(provider.start());
+    {
+        UserApiHarness h("users-http-bound");
+        dir = h.dir;
+        CHECK(h.start());
+        std::string err;
+        CHECK(h.catalog->create(api_model("alpha", provider.url), err) == PutResult::Created);
+        RetryingClient op(h.base_url, "control-secret");
+        UCHECK(op.post("/v1/users", {{"id", "alice"}, {"default_model", "alpha"}, {"memories_enabled", false}})
+                   .status == 201);
+        UCHECK(op.post("/v1/users", {{"id", "bob"}, {"default_model", "alpha"}}).status == 201);
+        const std::string bob_conv = conv_id_of(op.post("/v1/users/bob/conversations", {{"title", "Bob's"}}));
+        UCHECK(!bob_conv.empty());
+
+        // A binding must name a user who exists.
+        UCHECK(op.post("/v1/tokens", {{"label", "ghost"}, {"scopes", "read"}, {"user_id", "ghost"}}).status == 400);
+        const std::string alice_chat = mint_token(op, "alice-chat", "read,chat", "alice");
+        const std::string alice_all = mint_token(op, "alice-operator", "read,chat,operator", "alice");
+        UCHECK(!alice_chat.empty());
+        UCHECK(!alice_all.empty());
+        int bound_to_alice = 0;
+        for (const auto& t : json_of(op.get("/v1/tokens")).value("data", nlohmann::json::array()))
+            if (t.value("user_id", nlohmann::json()) == nlohmann::json("alice")) ++bound_to_alice;
+        UCHECK(bound_to_alice == 2);
+
+        const auto user_binding = [](const mm::HttpResponse& r) {
+            return r.status == 403 && r.body.find("user_binding") != std::string::npos;
+        };
+
+        // Its own user: whatever its scopes allow.
+        RetryingClient as_alice(h.base_url, alice_chat);
+        const auto visible = json_of(as_alice.get("/v1/users")).value("data", nlohmann::json::array());
+        UCHECK(visible.size() == 1);
+        if (visible.size() == 1) UCHECK(visible[0].value("id", std::string{}) == "alice");
+        UCHECK(as_alice.get("/v1/users/alice").status == 200);
+        const auto own = as_alice.post("/v1/users/alice/conversations", {{"title", "mine"}});
+        UCHECK(own.status == 201);
+        const std::string own_conv = conv_id_of(own);
+        const auto own_chat = chat_as(h.base_url, alice_chat, "alice", {{"message", "hello"}});
+        UCHECK(own_chat.status == 200);
+        UCHECK(own_chat.done.value("success", false));
+        UCHECK(own_chat.text == "answer from alpha-upstream");
+
+        // Another user's: refused whatever the method, before anything runs.
+        UCHECK(user_binding(as_alice.get("/v1/users/bob")));
+        UCHECK(user_binding(as_alice.get("/v1/users/bob/conversations")));
+        UCHECK(user_binding(as_alice.get("/v1/users/bob/conversations/" + bob_conv)));
+        UCHECK(user_binding(as_alice.post("/v1/users/bob/conversations", {{"title", "theirs"}})));
+        UCHECK(user_binding(as_alice.put("/v1/users/bob", {{"display_name", "pwned"}})));
+        const auto bob_chat = chat_as(h.base_url, alice_chat, "bob", {{"message", "hello"}});
+        UCHECK(bob_chat.status == 403);
+        UCHECK(bob_chat.body.find("user_binding") != std::string::npos);
+        UCHECK(bob_chat.events.empty());
+        UCHECK(provider.calls_of("chat").size() == 1); // only alice's turn ran
+
+        // Outside /v1/users: read-only, and nothing that spans users.
+        UCHECK(as_alice.get("/v1/served-models").status == 200);
+        UCHECK(user_binding(as_alice.get("/v1/performance")));
+        UCHECK(user_binding(as_alice.get("/v1/activity")));
+
+        // Operator scope does not widen a binding.
+        RetryingClient as_alice_op(h.base_url, alice_all);
+        UCHECK(user_binding(as_alice_op.post("/v1/users", {{"id", "mallory"}})));
+        UCHECK(user_binding(as_alice_op.del("/v1/users/bob")));
+        UCHECK(user_binding(as_alice_op.get("/v1/tokens")));
+        UCHECK(user_binding(as_alice_op.post("/v1/tokens", {{"label", "x"}, {"scopes", "read"}})));
+        UCHECK(user_binding(as_alice_op.put("/v1/served-models/alpha", {{"display_name", "pwned"}})));
+        UCHECK(as_alice_op.del("/v1/users/alice/conversations/" + own_conv).status == 200);
+        UCHECK(op.get("/v1/users/bob/conversations/" + bob_conv).status == 200);
+
+        // Deleting the user revokes every token bound to them.
+        const auto deleted = op.del("/v1/users/alice");
+        UCHECK(deleted.status == 200);
+        UCHECK(json_of(deleted).value("tokens_revoked", 0) == 2);
+        const auto after = as_alice.get("/v1/served-models");
+        UCHECK(after.status == 403);
+        UCHECK(after.body.find("invalid bearer token") != std::string::npos);
+    }
+    UCHECK(remove_tree(dir));
+    return ok;
+}
+
+// A conversation's turns run one at a time, in order; different
+// conversations' run side by side.
+bool test_users_http_per_conversation_ordering() {
+    bool ok = true;
+    std::filesystem::path dir;
+    FakeOpenAiProvider provider;
+    CHECK(provider.start());
+    {
+        UserApiHarness h("users-http-order");
+        dir = h.dir;
+        CHECK(h.start());
+        std::string err;
+        CHECK(h.catalog->create(api_model("alpha", provider.url), err) == PutResult::Created);
+        RetryingClient op(h.base_url, "control-secret");
+        UCHECK(op.post("/v1/users", {{"id", "alice"}, {"default_model", "alpha"}, {"memories_enabled", false}})
+                   .status == 201);
+        const std::string c1 =
+            conv_id_of(op.post("/v1/users/alice/conversations", {{"title", "one"}, {"set_active", true}}));
+        const std::string c2 = conv_id_of(op.post("/v1/users/alice/conversations", {{"title", "two"}}));
+        UCHECK(!c1.empty());
+        UCHECK(!c2.empty());
+
+        // Two turns of ONE conversation, sent together. The second waits for the
+        // first: its message follows the first's answer instead of landing
+        // between the first's message and its answer, and the model sees it.
+        provider.set_chat_delay(300);
+        ChatReply a_reply, b_reply;
+        {
+            std::thread a([&] {
+                a_reply = chat_as(h.base_url, "control-secret", "alice", {{"message", "first"}, {"conversation_id", c1}});
+            });
+            std::thread b([&] {
+                b_reply = chat_as(h.base_url, "control-secret", "alice", {{"message", "second"}, {"conversation_id", c1}});
+            });
+            a.join();
+            b.join();
+        }
+        UCHECK(a_reply.done.value("success", false));
+        UCHECK(b_reply.done.value("success", false));
+        {
+            const auto chats = provider.calls_of("chat");
+            UCHECK(chats.size() == 2);
+            if (chats.size() == 2) {
+                UCHECK(chats[0].ended_ms <= chats[1].started_ms);
+                UCHECK(chats[1].body.dump().find("answer from alpha-upstream") != std::string::npos);
+            }
+        }
+        const auto messages = json_of(op.get("/v1/users/alice/conversations/" + c1))
+                                  .value("messages", nlohmann::json::array());
+        UCHECK(messages.size() == 4);
+        if (messages.size() == 4) {
+            UCHECK(messages[0].value("role", std::string{}) == "user");
+            UCHECK(messages[1].value("role", std::string{}) == "assistant");
+            UCHECK(messages[2].value("role", std::string{}) == "user");
+            UCHECK(messages[3].value("role", std::string{}) == "assistant");
+            std::set<std::string> said = {messages[0].value("content", std::string{}),
+                                          messages[2].value("content", std::string{})};
+            UCHECK(said == std::set<std::string>({"first", "second"}));
+        }
+
+        // Two conversations: the provider holds each chat until a second is in
+        // flight, which happens only if they run side by side.
+        provider.set_chat_delay(0);
+        provider.reset_peak();
+        provider.set_pair_chats(true);
+        ChatReply one, two;
+        {
+            std::thread a([&] {
+                one = chat_as(h.base_url, "control-secret", "alice", {{"message", "in one"}, {"conversation_id", c1}});
+            });
+            std::thread b([&] {
+                two = chat_as(h.base_url, "control-secret", "alice", {{"message", "in two"}, {"conversation_id", c2}});
+            });
+            a.join();
+            b.join();
+        }
+        provider.set_pair_chats(false);
+        UCHECK(one.done.value("success", false));
+        UCHECK(two.done.value("success", false));
+        UCHECK(provider.peak() == 2);
+    }
+    UCHECK(remove_tree(dir));
+    return ok;
+}
+
+// Moving a long conversation to a small model folds its history into the
+// rolling summary IN PLACE: same conversation, every message kept, and each
+// summarizer call sized for the small model.
+bool test_users_http_compaction_in_place() {
+    bool ok = true;
+    std::filesystem::path dir;
+    FakeOpenAiProvider provider;
+    CHECK(provider.start());
+    {
+        UserApiHarness h("users-http-compact");
+        dir = h.dir;
+        CHECK(h.start());
+        std::string err;
+        auto big = api_model("big", provider.url);
+        big.runtime_settings.ctx_size = 32768;
+        big.runtime_settings.max_tokens = 256;
+        auto small = api_model("small", provider.url);
+        small.runtime_settings.ctx_size = 1536;
+        small.runtime_settings.max_tokens = 256;
+        CHECK(h.catalog->create(big, err) == PutResult::Created);
+        CHECK(h.catalog->create(small, err) == PutResult::Created);
+        RetryingClient op(h.base_url, "control-secret");
+        UCHECK(op.post("/v1/users", {{"id", "alice"}, {"default_model", "big"}, {"memories_enabled", false}})
+                   .status == 201);
+        const std::string cid =
+            conv_id_of(op.post("/v1/users/alice/conversations", {{"title", "long"}, {"set_active", true}}));
+        UCHECK(!cid.empty());
+
+        // Four long turns on the big model: nothing needs folding there.
+        for (int turn = 1; turn <= 4; ++turn) {
+            const std::string text = "turn-" + std::to_string(turn) + "-marker " +
+                                     std::string(1200, static_cast<char>('a' + turn));
+            const auto reply =
+                chat_as(h.base_url, "control-secret", "alice", {{"message", text}, {"conversation_id", cid}});
+            UCHECK(reply.done.value("success", false));
+        }
+        UCHECK(provider.calls_of("summary").empty());
+
+        // The same conversation, on a model whose window it no longer fits.
+        const auto switched = chat_as(h.base_url, "control-secret", "alice",
+                                      {{"message", "short question"}, {"conversation_id", cid}, {"model", "small"}});
+        UCHECK(switched.done.value("success", false));
+        UCHECK(switched.done.value("model_id", std::string{}) == "small");
+        const auto summaries = provider.calls_of("summary");
+        UCHECK(!summaries.empty());
+        for (const auto& call : summaries) {
+            // Folded by the model that needed it, in calls that fit its window.
+            UCHECK(call.model == "small-upstream");
+            UCHECK(prompt_tokens_of(call.body) + call.body.value("max_tokens", 0) <= 1536);
+        }
+        {
+            // Answered from the summary and the recent tail, not the oldest turn.
+            const auto chats = provider.calls_of("chat");
+            UCHECK(!chats.empty());
+            if (!chats.empty()) {
+                const std::string sent = chats.back().body.dump();
+                UCHECK(chats.back().model == "small-upstream");
+                UCHECK(sent.find("turn-1-marker") == std::string::npos);
+                UCHECK(sent.find("Summary of the earlier turns.") != std::string::npos);
+                UCHECK(sent.find("short question") != std::string::npos);
+            }
+        }
+
+        // In place: one conversation, all of its history, and a watermark.
+        const auto conv = json_of(op.get("/v1/users/alice/conversations/" + cid));
+        UCHECK(conv.value("id", std::string{}) == cid);
+        UCHECK(conv.value("messages", nlohmann::json::array()).size() == 10);
+        const int through = conv.value("summary_through_seq", -1);
+        UCHECK(through >= 1);
+        UCHECK(through < 8); // the latest user turn (seq 8) is never folded
+        UCHECK(conv.value("summary", std::string{}) == "Summary of the earlier turns.");
+        UCHECK(conv.value("summary_model_id", std::string{}) == "small");
+        UCHECK(json_of(op.get("/v1/users/alice/conversations")).value("data", nlohmann::json::array()).size() == 1);
+
+        // A manual compaction folds everything before the latest turn.
+        const auto compacted =
+            op.post("/v1/users/alice/conversations/" + cid + "/compact", nlohmann::json::object());
+        UCHECK(compacted.status == 200);
+        const auto body = json_of(compacted);
+        UCHECK(body.value("conversation_id", std::string{}) == cid);
+        UCHECK(body.value("status", std::string{}) == "compacted");
+        UCHECK(body.value("summary_through_seq", -1) == 7);
+        UCHECK(body.value("summary_model_id", std::string{}) == "small");
+        UCHECK(json_of(op.get("/v1/users/alice/conversations/" + cid)).value("messages", nlohmann::json::array()).size() ==
+               10);
+    }
+    UCHECK(remove_tree(dir));
+    return ok;
+}
+
+// A conversation that stops being active is reviewed for global memories by
+// the model that last answered it — here one that cannot call tools, so it
+// answers in JSON and control saves what it names.
+bool test_users_http_recall_tool_less_model() {
+    bool ok = true;
+    std::filesystem::path dir;
+    FakeOpenAiProvider provider;
+    CHECK(provider.start());
+    {
+        UserApiHarness h("users-http-recall");
+        dir = h.dir;
+        CHECK(h.start());
+        std::string err;
+        auto plain = api_model("plain", provider.url);
+        plain.tool_calling = false;
+        CHECK(h.catalog->create(plain, err) == PutResult::Created);
+        RetryingClient op(h.base_url, "control-secret");
+        UCHECK(op.post("/v1/users", {{"id", "alice"}, {"default_model", "plain"}, {"tools_enabled", true}}).status ==
+               201);
+        const std::string first =
+            conv_id_of(op.post("/v1/users/alice/conversations", {{"title", "tea"}, {"set_active", true}}));
+        UCHECK(!first.empty());
+        const auto reply =
+            chat_as(h.base_url, "control-secret", "alice", {{"message", "I like green tea."}, {"conversation_id", first}});
+        UCHECK(reply.done.value("success", false));
+        {
+            const auto chats = provider.calls_of("chat");
+            UCHECK(chats.size() == 1);
+            if (!chats.empty()) UCHECK(!chats.back().body.contains("tools")); // it cannot call them
+        }
+
+        // Moving on reviews the conversation left behind.
+        const std::string second =
+            conv_id_of(op.post("/v1/users/alice/conversations", {{"title", "next"}, {"set_active", true}}));
+        UCHECK(!second.empty());
+        nlohmann::json memories = nlohmann::json::array();
+        for (int i = 0; i < 200 && memories.empty(); ++i) {
+            memories = json_of(op.get("/v1/users/alice/memories")).value("data", nlohmann::json::array());
+            if (memories.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        UCHECK(memories.size() == 1);
+        if (memories.size() == 1) {
+            UCHECK(memories[0].value("content", std::string{}) == "The user likes green tea.");
+            UCHECK(memories[0].value("source_conv_id", std::string{}) == first);
+        }
+        const auto recalls = provider.calls_of("recall");
+        UCHECK(recalls.size() == 1);
+        if (!recalls.empty()) {
+            const auto& call = recalls.front();
+            const std::string sent = call.body.dump();
+            UCHECK(call.model == "plain-upstream");
+            UCHECK(!call.body.contains("tools"));
+            UCHECK(sent.find("Answer ONLY with a JSON object") != std::string::npos);
+            UCHECK(sent.find("I like green tea.") != std::string::npos);
+        }
+    }
+    UCHECK(remove_tree(dir));
+    return ok;
+}
+
+// Two users, one node model: ONE placement, claimed by both turns at once, and
+// not suspendable under them.
+bool test_users_http_two_users_share_placement() {
+    bool ok = true;
+    std::filesystem::path dir;
+    LeaseFakeNode node;
+    CHECK(node.start());
+    {
+        UserApiHarness h("users-http-share");
+        dir = h.dir;
+        CHECK(h.start());
+        const auto node_id = h.registry->add_node(node.url, "lease-secret", "test");
+        h.registry->start_health_poll(1);
+        h.health_polling = true;
+        CHECK(wait_for_registered_node(*h.registry, node_id));
+        std::string err;
+        CHECK(h.catalog->create(lease_model("shared", node_id), err) == PutResult::Created);
+        RetryingClient op(h.base_url, "control-secret");
+        for (const char* id : {"alice", "bob"})
+            UCHECK(op.post("/v1/users", {{"id", id}, {"default_model", "shared"}, {"memories_enabled", false}})
+                       .status == 201);
+
+        // Both turns reach the node, and wait there.
+        {
+            std::lock_guard<std::mutex> lk(node.mu);
+            node.hold_infer = true;
+        }
+        ChatReply alice_reply, bob_reply;
+        std::thread alice([&] {
+            alice_reply = chat_as(h.base_url, "control-secret", "alice", {{"message", "hello from alice"}});
+        });
+        std::thread bob([&] {
+            bob_reply = chat_as(h.base_url, "control-secret", "bob", {{"message", "hello from bob"}});
+        });
+        bool both_waiting = false;
+        for (int i = 0; i < 400 && !both_waiting; ++i) {
+            {
+                std::lock_guard<std::mutex> lk(node.mu);
+                both_waiting = node.infers_waiting == 2;
+            }
+            if (!both_waiting) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        UCHECK(both_waiting);
+
+        const auto placements = json_of(op.get("/v1/placements"));
+        UCHECK(placements.is_array() && placements.size() == 1);
+        if (placements.is_array() && placements.size() == 1) {
+            UCHECK(placements[0].value("served_model_id", std::string{}) == "shared");
+            UCHECK(placements[0].value("in_flight", -1) == 2);
+        }
+        const auto busy = op.post("/v1/served-models/shared/suspend", nlohmann::json::object());
+        UCHECK(busy.status == 409);
+        UCHECK(busy.body.find("busy") != std::string::npos);
+        UCHECK(node.suspends.load() == 0);
+
+        {
+            std::lock_guard<std::mutex> lk(node.mu);
+            node.hold_infer = false;
+        }
+        node.infer_cv.notify_all();
+        alice.join();
+        bob.join();
+        UCHECK(alice_reply.done.value("success", false));
+        UCHECK(bob_reply.done.value("success", false));
+        UCHECK(alice_reply.done.value("model_id", std::string{}) == "shared");
+        UCHECK(alice_reply.text == "from the node");
+        UCHECK(bob_reply.text == "from the node");
+        UCHECK(node.loads.load() == 1);
+        UCHECK(lease_in_flight(*h.scheduler, "shared") == 0);
+
+        // Idle, it can be suspended.
+        UCHECK(op.post("/v1/served-models/shared/suspend", nlohmann::json::object()).status == 200);
+        UCHECK(node.suspends.load() == 1);
+
+        // Each user's conversation holds their own turn and nobody else's.
+        for (const std::string id : {"alice", "bob"}) {
+            const auto convs =
+                json_of(op.get("/v1/users/" + id + "/conversations")).value("data", nlohmann::json::array());
+            UCHECK(convs.size() == 1);
+            if (convs.size() != 1) continue;
+            const auto messages =
+                json_of(op.get("/v1/users/" + id + "/conversations/" + convs[0].value("id", std::string{})))
+                    .value("messages", nlohmann::json::array());
+            UCHECK(messages.size() == 2);
+            if (messages.size() == 2) UCHECK(messages[0].value("content", std::string{}) == "hello from " + id);
+        }
+    }
+    UCHECK(remove_tree(dir));
+    return ok;
+}
+
+#undef UCHECK
+
 int main(int argc, char** argv) {
     struct TestCase {
         const char* name;
@@ -8842,13 +10157,6 @@ int main(int argc, char** argv) {
         {"non_stream_parser_preserves_text", test_non_stream_parser_preserves_text},
         {"non_stream_parser_extracts_thinking", test_non_stream_parser_extracts_thinking},
         {"stream_tool_call_indices", test_stream_tool_call_indices},
-        {"agent_queue_survives_throwing_job", test_agent_queue_survives_throwing_job},
-        {"agent_manager_rejects_duplicates_and_defers_cleanup_until_handles_release",
-         test_agent_manager_rejects_duplicates_and_defers_cleanup_until_handles_release},
-        {"agent_api_settings_round_trip_without_key_persistence",
-         test_agent_api_settings_round_trip_without_key_persistence},
-        {"served_model_name_legacy_compatibility",
-         test_served_model_name_legacy_compatibility},
         {"engine_supervisor_not_found_statuses", test_engine_supervisor_not_found_statuses},
         {"slot_lease_blocks_unload_and_suspend_while_busy",
          test_slot_lease_blocks_unload_and_suspend_while_busy},
@@ -8924,12 +10232,7 @@ int main(int argc, char** argv) {
         {"scheduler_reconciles_ready_absent_and_suspended_snapshots",
          test_scheduler_reconciles_ready_absent_and_suspended_snapshots},
         {"control_api_external_token_gate", test_control_api_external_token_gate},
-        {"openai_compat_api_listener_and_model_catalog",
-         test_openai_compat_api_listener_and_model_catalog},
-        {"control_api_agent_api_mode_chat",
-         test_control_api_agent_api_mode_chat},
-        {"agent_voice_db_and_cache_lifecycle",
-         test_agent_voice_db_and_cache_lifecycle},
+        {"user_voice_db_and_cache_lifecycle", test_user_voice_db_and_cache_lifecycle},
         {"tts_service_client_fake_sidecar_paths",
          test_tts_service_client_fake_sidecar_paths},
         {"control_api_tts_routes_disabled", test_control_api_tts_routes_disabled},
@@ -8937,8 +10240,7 @@ int main(int argc, char** argv) {
         {"global_memory_origin_tool_and_context_metadata",
          test_global_memory_origin_tool_and_context_metadata},
         {"message_trace_events_round_trip", test_message_trace_events_round_trip},
-        {"compaction_followup_trace_provenance_survives",
-         test_compaction_followup_trace_provenance_survives},
+        {"compaction_trace_provenance_survives", test_compaction_trace_provenance_survives},
         {"config_and_url_parsing_edge_cases", test_config_and_url_parsing_edge_cases},
         {"llama_server_args", test_llama_server_args},
         {"vision_config_attachment_and_message_round_trip",
@@ -8950,8 +10252,7 @@ int main(int argc, char** argv) {
         {"llama_model_path_normalization", test_llama_model_path_normalization},
         {"llama_accelerator_detection", test_llama_accelerator_detection},
         {"llama_launch_compatible", test_llama_launch_compatible},
-        {"llama_backend_validation_and_gguf_routing",
-         test_llama_backend_validation_and_gguf_routing},
+        {"served_model_backend_validation_and_gguf_warnings", test_served_model_backend_validation_and_gguf_warnings},
         {"llama_install_plan_and_method", test_llama_install_plan_and_method},
         {"llama_provisioner_disabled_and_cancel",
          test_llama_provisioner_disabled_and_cancel},
@@ -8991,6 +10292,24 @@ int main(int argc, char** argv) {
         {"images_refused_by_engine_capability", test_images_refused_by_engine_capability},
         {"capacity_pressure_is_structured", test_capacity_pressure_is_structured},
         {"engine_telemetry_republication", test_engine_telemetry_republication},
+        // Registered after admission_fetch_stage, which always fails under WSL,
+        // so the filtered ctest entry `mm_lease_tests` is what runs them there.
+        {"lease_two_holders_share_placement_blocks_eviction",
+         test_lease_two_holders_share_placement_blocks_eviction},
+        {"lease_epoch_ignores_replaced_placement", test_lease_epoch_ignores_replaced_placement},
+        {"lease_outcome_is_per_call", test_lease_outcome_is_per_call},
+        {"lease_draining_defers_fingerprint_change", test_lease_draining_defers_fingerprint_change},
+        {"lease_refused_by_wire_protocol_gate", test_lease_refused_by_wire_protocol_gate},
+        {"served_models_http_crud", test_served_models_http_crud},
+        {"openai_stateless_passthrough", test_openai_stateless_passthrough},
+        {"users_http_crud_and_scopes", test_users_http_crud_and_scopes},
+        {"users_http_chat_model_switch_mid_conversation",
+         test_users_http_chat_model_switch_mid_conversation},
+        {"users_http_bound_token_403", test_users_http_bound_token_403},
+        {"users_http_per_conversation_ordering", test_users_http_per_conversation_ordering},
+        {"users_http_compaction_in_place", test_users_http_compaction_in_place},
+        {"users_http_recall_tool_less_model", test_users_http_recall_tool_less_model},
+        {"users_http_two_users_share_placement", test_users_http_two_users_share_placement},
     };
 
     const std::string filter = argc > 1 ? argv[1] : std::string{};

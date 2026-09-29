@@ -12,11 +12,29 @@ std::string generate_uuid();          // UUID v4
 std::string generate_api_key(size_t length = 32);
 std::string hostname();
 
-// Returns true iff id is a valid agent/resource identifier:
+// Returns true iff id is a valid served-model identifier — the string clients
+// send as `model`:
 //   - 1–128 characters
-//   - Only [a-zA-Z0-9_-]
-//   - First character must be alphanumeric
-bool is_valid_agent_id(const std::string& id);
+//   - Only [a-z0-9._-]; LOWERCASE, so two spellings cannot name one model
+//   - First character must be a lowercase letter or digit
+// Dots are allowed because model names carry versions ("qwen2.5-7b").
+bool is_valid_served_model_id(const std::string& id);
+
+// Returns true iff id is a valid user identifier. A user id names a directory
+// (data/users/{id}), so on top of the served-model charset:
+//   - 1–64 characters, [a-z0-9._-], LOWERCASE: Windows paths ignore case, so
+//     "Alice" and "alice" would be one directory there
+//   - first AND last character a lowercase letter or digit: Windows drops a
+//     trailing '.', which would make "alice." the directory "alice"
+//   - not a Windows device name (con, prn, aux, nul, com0-9, lpt0-9), with or
+//     without an extension: no directory may be called that
+bool is_valid_user_id(const std::string& id);
+
+// A best-effort served-model id from free text: lowercased, every run of
+// characters outside [a-z0-9._] collapsed to one '-', leading/trailing
+// separators stripped, capped at `max_len`. May return "" (nothing usable);
+// callers must check with is_valid_served_model_id before relying on it.
+std::string slugify(const std::string& text, std::size_t max_len = 128);
 
 // Directory holding the RUNNING executable, or "" if it cannot be determined.
 //

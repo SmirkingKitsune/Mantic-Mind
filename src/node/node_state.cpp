@@ -46,11 +46,9 @@ bool NodeState::has_recent_control_contact(int64_t max_age_ms) const {
     return (mm::util::now_ms() - last_control_contact_ms_) <= max_age_ms;
 }
 
-// ── Model / agent ──────────────────────────────────────────────────────────────
+// ── Model ──────────────────────────────────────────────────────────────────────
 std::string NodeState::get_loaded_model() const { std::lock_guard<std::mutex> g(mutex_); return loaded_model_; }
-std::string NodeState::get_active_agent() const { std::lock_guard<std::mutex> g(mutex_); return active_agent_; }
 void NodeState::set_loaded_model(const std::string& m) { std::lock_guard<std::mutex> g(mutex_); loaded_model_ = m; }
-void NodeState::set_active_agent(const std::string& a) { std::lock_guard<std::mutex> g(mutex_); active_agent_ = a; }
 
 // ── Multi-slot tracking ──────────────────────────────────────────────────────
 std::vector<SlotInfo> NodeState::get_slots() const { std::lock_guard<std::mutex> g(mutex_); return slots_; }
@@ -58,14 +56,12 @@ void NodeState::set_slots(const std::vector<SlotInfo>& slots) {
     std::lock_guard<std::mutex> g(mutex_);
     slots_ = slots;
 
-    // Keep legacy single-model/agent fields aligned with multi-slot state.
+    // Keep the legacy single-model field aligned with multi-slot state.
     loaded_model_.clear();
-    active_agent_.clear();
     for (const auto& s : slots_) {
         if (s.state != SlotState::Ready) continue;
-        if (loaded_model_.empty()) loaded_model_ = s.model_path;
-        if (active_agent_.empty()) active_agent_ = s.assigned_agent;
-        if (!loaded_model_.empty() && !active_agent_.empty()) break;
+        loaded_model_ = s.model_path;
+        break;
     }
 }
 
@@ -93,11 +89,11 @@ StreamingTextState NodeState::get_streaming_text() const {
     return streaming_text_;
 }
 
-void NodeState::start_streaming_text(const SlotId& slot_id, const AgentId& agent_id) {
+void NodeState::start_streaming_text(const SlotId& slot_id, const HolderId& holder_id) {
     std::lock_guard<std::mutex> g(mutex_);
     streaming_text_ = {};
     streaming_text_.slot_id    = slot_id;
-    streaming_text_.agent_id   = agent_id;
+    streaming_text_.holder_id  = holder_id;
     streaming_text_.active     = true;
     streaming_text_.started_ms = mm::util::now_ms();
     streaming_text_.updated_ms = streaming_text_.started_ms;

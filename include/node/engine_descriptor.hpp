@@ -82,7 +82,7 @@ struct EngineDescriptor {
     std::function<bool(const EngineLoadRequest&, ResourceFootprint&, std::string& error)>
         estimate_footprint;
 
-    /// Whether two agents may share one live engine process.
+    /// Whether two holders (served models) may share one live engine process.
     std::function<bool(const EngineLoadRequest& a, const EngineLoadRequest& b)> launch_compatible;
 
     /// Is this model reference loadable by THIS engine, on THIS node?
@@ -117,7 +117,7 @@ struct EngineDescriptor {
     /// Live per-sequence state as JSON, for GET /v1/engines/{id}/slots.
     ///
     /// Optional; absent means the engine cannot report it, and the supervisor
-    /// returns an empty list rather than synthesising one row per attached agent.
+    /// returns an empty list rather than synthesising one row per attached holder.
     /// A fabricated row looks like per-sequence data while carrying none, which
     /// is the confusion a bare request counter already causes.
     std::function<bool(const std::string& base_url, std::string& out_json)> fetch_sequences;

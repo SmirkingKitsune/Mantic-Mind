@@ -26,7 +26,7 @@ parallel universe, and the existing machinery is closer to generic than it looks
   in this codebase**, so the Windows fragility the design brief warns about is not being carried
   forward. `ReadinessProbe::StdoutJsonLine` is declared because it costs nothing, not because
   `HttpHealth` is suspect.
-- Multi-agent engine sharing, RAII request leases, port allocation with a bind probe, and
+- Multi-holder engine sharing, RAII request leases, port allocation with a bind probe, and
   suspended-engines-don't-consume-capacity all survive intact.
 
 ### Soma's `serve` mode
@@ -114,17 +114,18 @@ One format serves warm reopen, scheduler preemption, and cluster slot suspend/re
 
 ---
 
-## 2. Verdict-driven routing in `AgentScheduler`
+## 2. Verdict-driven routing in `PlacementScheduler`
 
 > Written when this was going to be a new class called `PlacementEngine`. It never was: the header
 > was declared, implemented by nothing, and deleted (roadmap D46). **Most** of what follows shipped
-> into `AgentScheduler` itself — see [architecture.md §8.0](architecture.md) for the mapping — with
+> into the existing scheduler — `AgentScheduler`, since renamed `PlacementScheduler` because it places
+> served models rather than agents — see [architecture.md §8.0](architecture.md) for the mapping — with
 > two exceptions flagged inline below, because a note saying "everything below shipped" over a
 > section where two things did not would be the same kind of claim this deletion exists to remove.
 
 ### The algorithm is preserved
 
-`AgentScheduler`'s placement sequence was arrived at by fixing real problems and survives intact:
+Its placement sequence was arrived at by fixing real problems and survives intact:
 
 ```
 existing placement → suspended restore → preferred node → shared engine
@@ -133,7 +134,7 @@ existing placement → suspended restore → preferred node → shared engine
 
 So does the **two-mutex split**, which is load-bearing: `schedule_mutex_` serializes whole scheduling
 operations including multi-GB model transfers, while `state_mutex_` guards only the placement map — so
-`GET /v1/placements` and `GET /v1/agents` never block behind an in-flight transfer.
+`GET /v1/placements` and `GET /v1/served-models` never block behind an in-flight transfer.
 
 ### What changes around it
 
@@ -146,14 +147,15 @@ if (!is_llama_backend(cfg.inference_backend)) { release_agent(cfg.id); return nu
 ```
 
 ```cpp
-// now — the check survives, meaning something else entirely: node-local vs API-backed.
-// Soma passes through it and `soma::select_backend` picks.
-AgentScheduler::BackendRouting AgentScheduler::resolve_backend(
-    const AgentConfig& cfg, const soma::AdmissionRecord& record);   // {engine_id, reason}
+// now — the check survives as ServedModel::node_local(), meaning something else
+// entirely: node-served vs API-backed. Soma passes through it and
+// `soma::select_backend` picks.
+PlacementScheduler::BackendRouting PlacementScheduler::resolve_backend(
+    const ServedModel& model, const soma::AdmissionRecord& record);   // {engine_id, reason}
 ```
 
-`resolve_backend(cfg, record)` is **pure** given `(config, record)` and is `static` — it deserves to
-be tested without a node in the loop — with `resolve_backend_for(cfg)` doing the registry lookup for
+`resolve_backend(model, record)` is **pure** given `(model, record)` and is `static` — it deserves to
+be tested without a node in the loop — with `resolve_backend_for(model)` doing the registry lookup for
 callers that have one. The reason string travels with the decision, so a client can see it without
 causing a placement.
 
@@ -165,9 +167,9 @@ the same engine, so a backend change forces a reload. Live: `engine_fingerprint(
 > container directory walks it recursively and records every file's relative path, size and mtime.
 > A requantization written into the SAME directory therefore changes the fingerprint already, without
 > anyone naming `arch_hash`. What is NOT traced here is the cross-directory case — a re-admission at a
-> different quantization lands in its own container (`<name>-q4_g-q6_g-g128`), and whether the agent's
-> `model_path` then resolves to the new one is a question about ref resolution, not about this
-> fingerprint. Stated as an open question because that is what it is; no defect is claimed.
+> different quantization lands in its own container (`<name>-q4_g-q6_g-g128`), and whether the served
+> model's `model_path` then resolves to the new one is a question about ref resolution, not about this
+> fingerprint. An admitted catalog entry addresses itself by `arch_hash` for exactly this reason. Stated as an open question because that is what it is; no defect is claimed.
 
 ### The placement estimate is re-shaped, not re-tuned
 
@@ -194,27 +196,28 @@ nothing, so it is safe to compute for a node that could not host the model. `foo
 
 ### Capacity pressure becomes a code
 
-`response_indicates_capacity_pressure` ([agent_scheduler.cpp:904](../src/control/agent_scheduler.cpp:904))
+`response_indicates_capacity_pressure` ([placement_scheduler.cpp:1979](../src/control/placement_scheduler.cpp:1979))
 substring-matches six English phrases against the node's error body. A new engine would have had to
 reproduce those literals verbatim to earn an evict-and-retry. Both engines emit
 `{"error":{"code":"capacity_pressure"}}` instead.
 
 ### Shared engines are multi-sequence concurrency
 
-Multiple agents on one Soma process via `kv_slots` / `max_batch`, with per-slot state on
+Multiple conversations on one Soma process via `kv_slots` / `max_batch`, with per-slot state on
 `GET /v1/engines/{id}/slots`. This is the concurrency design viewed from the cluster side, not a
 separate feature.
 
-**`AgentQueue` stays, and the layering is deliberate.** It looks like the FIFO-in-front-of-a-single-
-sequence-engine that the step-major scheduler exists to replace. It is not:
+**The conversation queue stays, and the layering is deliberate.** It looks like the
+FIFO-in-front-of-a-single-sequence-engine that the step-major scheduler exists to replace. It is not:
 
-- `AgentQueue` serializes **one agent's own turns**. An agent is a conversation with mutable state; two
-  simultaneous turns on one agent is a semantic error regardless of engine capability.
-- Soma's `max_batch` is **intra-engine concurrency across different agents**.
+- `ConversationQueue` serializes **one conversation's own turns**. A conversation is state a turn
+  reads and writes, so two simultaneous turns on one conversation is a semantic error regardless of
+  engine capability.
+- Soma's `max_batch` is **intra-engine concurrency across different conversations**.
 
-They compose exactly: N agents with in-flight turns produce N rows in one union forward. What is being
-removed is the assumption that the engine below can only do one sequence — not the per-agent ordering
-guarantee above.
+They compose exactly: N conversations with in-flight turns produce N rows in one union forward. What
+is being removed is the assumption that the engine below can only do one sequence — not the
+per-conversation ordering guarantee above.
 
 ---
 
@@ -223,10 +226,15 @@ guarantee above.
 The control TUI is **one client of `/v1/*`**, not a privileged inspector. No panel reaches into
 in-process engine state.
 
-This is a real change of habit. `ControlUI` today is a hybrid: writes and streaming go over loopback
-HTTP (`cli.stream_post`, `/v1/performance`, `/compact`), but most reads reach directly into
-`registry_.list_nodes()`, `agents_.list_agents()`, and `AgentDB` — the latter *on every frame*, with a
-source comment already noting the cost. New Soma panels do not extend that pattern.
+This was a real change of habit. `ControlUI` was a hybrid: writes and streaming went over loopback
+HTTP (`cli.stream_post`, `/v1/performance`, `/compact`), but most reads reached directly into
+`registry_.list_nodes()`, `agents_.list_agents()` and the agent's own store — the last *on every
+frame*, with a source comment already noting the cost.
+
+The Soma panels did not extend that pattern, and the tabs written since have followed them: models,
+users, chat and voice are HTTP clients in their own translation units, guarded by
+`tools/ci/check_ui_api.py`. What is left in `control_ui.cpp` is the Nodes tab, which still holds
+`NodeRegistry&`, and the Activity tab, which reads the in-process log.
 
 | Panel | Route | Notes |
 |---|---|---|
@@ -236,7 +244,7 @@ source comment already noting the cost. New Soma panels do not extend that patte
 | **Concurrency** | `GET /v1/engines/{id}/slots` | Batch size, `effective_max_batch`, `max_batch_limited_by`, per-sequence rows. |
 | **Registry** | `GET /v1/models` | Verdict per model, with reason. |
 | **Admission** | `POST /v1/models/admit` (SSE) | Progress stages; cancel. Reuses the existing `NodeActionProgress` shape. |
-| **Placement** | `GET /v1/placements` | Engine + `backend_reason` per agent. |
+| **Placement** | `GET /v1/placements` | Engine + `backend_reason` per served model, with the in-flight count that keeps it from being evicted. |
 
 **No second UI framework.** FTXUI is this project's only UI. Richer external visualization — anything
 resembling an admission-pipeline inspector — belongs to the separate SvelteKit stack consuming these

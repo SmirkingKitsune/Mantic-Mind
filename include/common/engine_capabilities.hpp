@@ -38,19 +38,45 @@ namespace mm {
 /// and answers as though it had been read, which is the defect this closes.
 bool engine_supports_vision(const std::string& engine_id) noexcept;
 
-/// Why an image may not be sent to an agent, or empty if it may. PURE.
+/// What a request to a model may carry. Computed per request from the model's
+/// settings and the engine serving it (capabilities_for, common/served_model.hpp),
+/// because the same conversation can be answered by models that differ in both.
+struct ModelCapabilities {
+    bool vision = false;
+    bool tools = false;
+};
+
+/// Can this engine accept a request that carries `tools`, and re-render a
+/// history containing assistant `tool_calls`?
+///
+/// Soma cannot: its compiled chat template covers conversation framing, not
+/// tool-call encoding, so it refuses both with a 422 (soma/serve.cpp,
+/// build_chat_prompt) rather than letting a model answer in prose about
+/// functions it never saw. llama.cpp renders tools through the model's own Jinja
+/// template. vLLM parses tool calls only when it was launched with
+/// `--enable-auto-tool-choice`, which is cluster engine configuration, so the
+/// caller passes that flag in rather than this function reading a config it
+/// does not own.
+///
+/// An UNKNOWN engine id answers false, for the same reason as vision: a clear
+/// refusal is recoverable, silently ignored tools are not.
+bool engine_supports_tools(const std::string& engine_id,
+                           bool vllm_auto_tool_choice = false) noexcept;
+
+/// Why an image may not be sent to a model, or empty if it may. PURE.
 ///
 /// Split out from ControlApiServer::image_refusal so the RULE can be asserted
 /// without standing up a server, a model registry and an admitted record just to
 /// discover what a two-condition predicate does. The server method is then only
-/// the lookup — which engine serves this agent — and that half is covered by the
+/// the lookup — which engine serves this model — and that half is covered by the
 /// existing HTTP negatives.
 ///
-/// `engine_id` empty means the agent is API-backed and owns no node-local
+/// `profile_vision_enabled` is the operator's own vision setting for the model.
+/// `engine_id` empty means the model is API-backed and owns no node-local
 /// engine; the remote provider's capabilities govern and this returns empty.
 /// `routing_reason` is appended so the message says WHY that engine was chosen,
-/// because "does not accept images" alone reads as a profile problem and sends
-/// the operator to switch on a setting that is already on.
+/// because "does not accept images" alone reads as a configuration problem and
+/// sends the operator to switch on a setting that is already on.
 std::string image_refusal_for(bool profile_vision_enabled,
                               const std::string& engine_id,
                               const std::string& routing_reason);

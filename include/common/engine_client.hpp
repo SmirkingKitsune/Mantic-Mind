@@ -27,10 +27,10 @@ namespace mm {
 
 /// Structured refusal from an engine.
 ///
-/// AgentScheduler::response_indicates_capacity_pressure currently substring-
-/// matches six English phrases ("max slots reached", "out of memory", …) against
-/// the node's error body. A new engine would have to reproduce those literals
-/// verbatim to earn an evict-and-retry. Both engines emit codes instead.
+/// The scheduler's response_indicates_capacity_pressure used to substring-match
+/// six English phrases ("max slots reached", "out of memory", …) against the
+/// node's error body, so a new engine had to reproduce those literals verbatim to
+/// earn an evict-and-retry. Both engines emit codes instead.
 struct EngineError {
     std::string code; ///< capacity_pressure | model_not_found | unsupported_content | internal
     std::string message;

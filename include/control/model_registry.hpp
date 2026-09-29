@@ -3,16 +3,18 @@
 // Mantic-Mind — control-side model registry and admission orchestration.
 //
 // Owns {data_dir}/control.db, the FIRST control-wide database in this system.
-// Until now the only SQLite was per-agent (data/agents/{id}/agent.db), with
-// remembered nodes in nodes.json and node model state in a JSON journal.
+// Every other SQLite here belongs to one holder — today a user
+// (data/users/{id}/user.db), before that an agent — with remembered nodes in
+// nodes.json and node model state in a JSON journal.
 //
 // Schema: schemas/registry/001_init.sql
-// Migrations follow AgentDB::run_migrations() exactly — schema_migrations table,
+// Migrations follow UserDB::run_migrations() exactly — schema_migrations table,
 // one `if (!has_version(N)) { Transaction; DDL; INSERT N; commit; }` block per
 // version. That pattern works and there is no reason to invent a second one.
 
 #include "common/footprint.hpp"
 #include "common/models.hpp"
+#include "common/served_model.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -182,9 +184,13 @@ struct ApiToken {
     std::int64_t created_at_ms = 0;
     std::int64_t last_used_at_ms = 0;
     bool revoked = false;
+    /// Empty = unbound (acts on any user, as every token did before binding).
+    /// Non-empty = this credential reaches only that user's namespace.
+    std::string user_id;
 };
 
-/// One row of `placement_history` — where an agent ran, on what engine, and why.
+/// One row of `placement_history` — where a holder (a served model) ran, on
+/// what engine, and why.
 ///
 /// The reason is the same composed string the scheduler acted on
 /// (`BackendDecision::explain()`), not a reconstruction, which is the whole
@@ -321,6 +327,23 @@ public:
     /// `model.id` is filled in on success.
     bool upsert(AdmittedModel& model, std::string& out_error);
 
+    // ── served models (the operator's explicit catalog rows) ─────────────────
+    //
+    // Only rows an operator WROTE. Admitted models Soma can serve are listed by
+    // ServedModelCatalog without a row here; see served_model_catalog.hpp.
+    // `api_settings.api_key` is never written, and never read back.
+
+    std::vector<ServedModel> list_served_models() const;
+    std::optional<ServedModel> find_served_model(const std::string& id) const;
+
+    /// Insert or replace the row `model.id`. `created_at_ms` is kept from an
+    /// existing row (a replace is an edit, not a new model); `updated_at_ms` is
+    /// stamped here.
+    bool upsert_served_model(const ServedModel& model, std::string& out_error);
+
+    /// False with `out_error` when there is no such row.
+    bool delete_served_model(const std::string& id, std::string& out_error);
+
     // ── api tokens ───────────────────────────────────────────────────────────
     //
     // Admission is why scopes exist: hours of CPU and tens of GB of disk must not
@@ -328,8 +351,14 @@ public:
 
     /// Mint a token. Returns the SECRET, which is shown once and never stored —
     /// only its hash is. A caller that loses it mints another.
-    std::string
-    create_api_token(const std::string& label, std::uint8_t scopes, std::string& out_error);
+    ///
+    /// `user_id` non-empty binds the token to that user (token binding, see
+    /// docs/external-api.md). The id is not checked here: users live in
+    /// per-user databases this registry does not open.
+    std::string create_api_token(const std::string& label,
+                                 std::uint8_t scopes,
+                                 std::string& out_error,
+                                 const std::string& user_id = {});
 
     /// By hash, and only if not revoked. Touches last_used_at.
     bool find_api_token(const std::string& token_sha256, ApiToken& out) const;
@@ -337,27 +366,32 @@ public:
     std::vector<ApiToken> list_api_tokens() const;
     bool revoke_api_token(std::int64_t id, std::string& out_error);
 
+    /// Revoke every active token bound to `user_id`. Returns how many. Called
+    /// when a user is deleted, so a later user created under the same id does
+    /// not inherit its predecessor's credentials.
+    int revoke_tokens_for_user(const std::string& user_id);
+
     /// Whether ANY usable token exists. Together with the legacy config token,
     /// this is what decides whether auth is on at all.
     bool has_api_tokens() const;
 
-    /// Record which backend an agent actually got, and why.
+    /// Record which backend a holder actually got, and why.
     ///
     /// Rare, causally interesting, and otherwise unrecoverable after the fact.
     /// Never fatal: losing an audit row must not fail a placement that worked.
-    void record_placement(const AgentId& agent_id,
+    void record_placement(const std::string& holder_id,
                           const NodeId& node_id,
                           const SlotId& slot_id,
                           const std::string& backend,
                           const std::string& backend_reason,
                           const ResourceFootprint& footprint);
 
-    /// Close the agent's most recent open row. Idempotent: an agent with no open
-    /// row is a no-op, not an error, because a release can legitimately arrive
-    /// for a placement this process never recorded (control restarted).
-    void mark_placement_released(const AgentId& agent_id);
+    /// Close the holder's most recent open row. Idempotent: a holder with no
+    /// open row is a no-op, not an error, because a release can legitimately
+    /// arrive for a placement this process never recorded (control restarted).
+    void mark_placement_released(const std::string& holder_id);
 
-    /// The agent's placement history, newest first, at most `limit` rows.
+    /// The holder's placement history, newest first, at most `limit` rows.
     ///
     /// A READER is what makes the writer worth having. The table, its index and
     /// `record_placement()` all shipped with no caller and no query — a schema
@@ -365,7 +399,7 @@ public:
     /// read (roadmap D60). Wiring only the writer would have been worse: an
     /// unbounded write-only table is a capability with no way to reach it, which
     /// is the thing P1 exists to forbid.
-    std::vector<PlacementHistoryEntry> placement_history(const AgentId& agent_id,
+    std::vector<PlacementHistoryEntry> placement_history(const std::string& holder_id,
                                                          int limit = 20) const;
 
     std::string reprofile(std::int64_t id, AdmissionProgressSink sink, std::string& out_error);

@@ -46,7 +46,7 @@ public:
                                              const std::string& output_prompt_path) const;
 
     TtsServiceResponse synthesize(const TtsSynthesisRequest& request,
-                                  const AgentVoiceProfile& profile,
+                                  const VoiceProfile& profile,
                                   const std::string& output_audio_path) const;
 
 private:

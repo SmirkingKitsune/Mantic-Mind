@@ -1,7 +1,8 @@
 #include "common/memory_manager.hpp"
-#include "common/agent_db.hpp"
-#include "common/runtime_client.hpp"
+#include "common/conversation_context.hpp"
 #include "common/logger.hpp"
+#include "common/runtime_client.hpp"
+#include "common/user_db.hpp"
 #include "common/util.hpp"
 
 #include <nlohmann/json.hpp>
@@ -20,6 +21,7 @@ static constexpr double kBaseWeight = 0.7;
 static constexpr double kRecencyWeight = 0.3;
 static constexpr int kContextPreviewMessages = 8;
 static constexpr int kFallbackSelectedMemories = 3;
+static constexpr int kExtractionMaxTokens = 512;
 
 namespace {
 
@@ -32,13 +34,24 @@ std::string role_label(MessageRole role) {
     }
     return "Unknown";
 }
-std::string build_transcript(const std::vector<Message>& messages) {
-    std::ostringstream transcript;
-    for (const auto& m : messages) {
-        if (m.role == MessageRole::System) continue;
-        transcript << role_label(m.role) << ": " << m.content << "\n";
+
+/// The most recent messages that fit `max_tokens`, oldest first. A transcript
+/// that no longer fits the model is cut from the front: the latest exchange is
+/// what an extraction or a relevance check is about.
+std::string build_transcript(const std::vector<Message>& messages, int max_tokens) {
+    std::vector<std::string> lines;
+    int used = 0;
+    for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
+        if (it->role == MessageRole::System) continue;
+        std::string line = role_label(it->role) + ": " + it->content + "\n";
+        const int cost = estimate_tokens(line);
+        if (!lines.empty() && used + cost > max_tokens) break;
+        used += cost;
+        lines.push_back(std::move(line));
     }
-    return transcript.str();
+    std::string transcript;
+    for (auto it = lines.rbegin(); it != lines.rend(); ++it) transcript += *it;
+    return transcript;
 }
 
 double rank_score(const Memory& memory, int64_t now_ms) {
@@ -49,20 +62,17 @@ double rank_score(const Memory& memory, int64_t now_ms) {
 
 std::vector<Memory> rank_candidate_memories(std::vector<Memory> memories, int max_candidates) {
     const int64_t now_ms = util::now_ms();
-    std::stable_sort(memories.begin(), memories.end(),
-        [now_ms](const Memory& lhs, const Memory& rhs) {
-            return rank_score(lhs, now_ms) > rank_score(rhs, now_ms);
-        });
-
-    if (max_candidates > 0 && static_cast<int>(memories.size()) > max_candidates) {
+    std::stable_sort(memories.begin(), memories.end(), [now_ms](const Memory& lhs, const Memory& rhs) {
+        return rank_score(lhs, now_ms) > rank_score(rhs, now_ms);
+    });
+    if (max_candidates > 0 && static_cast<int>(memories.size()) > max_candidates)
         memories.resize(static_cast<size_t>(max_candidates));
-    }
     return memories;
 }
 
-std::string build_relevance_prompt(AgentDB& db,
+std::string build_relevance_prompt(UserDB& db,
                                    const ConvId& conv_id,
-                                   const AgentConfig& cfg,
+                                   const std::string& instructions,
                                    const std::vector<Memory>& candidates,
                                    int max_selected) {
     std::ostringstream prompt;
@@ -74,35 +84,27 @@ std::string build_relevance_prompt(AgentDB& db,
               "{\"memory_ids\": [\"id-1\", \"id-2\"]}\n"
               "Use an empty array if none are relevant. Do not return more than "
            << max_selected << " ids.\n\n"
-              "## System prompt\n"
-           << (cfg.system_prompt.empty() ? "(empty)" : cfg.system_prompt) << "\n\n";
+           << "## Instructions the reply is written under\n"
+           << (util::trim(instructions).empty() ? std::string("(none)") : instructions) << "\n\n";
 
-    auto conv = db.load_conversation(conv_id);
+    const auto conv = db.get_conversation(conv_id);
+    prompt << "## Active conversation context\n";
     if (!conv) {
-        prompt << "## Active conversation context\n(conversation not found)\n\n";
+        prompt << "(conversation not found)\n\n";
     } else {
-        prompt << "## Active conversation context\n";
-        if (!conv->compaction_summary.empty()) {
-            prompt << "[Previous conversation summary]\n"
-                   << conv->compaction_summary << "\n\n";
-        }
-
-        std::vector<Message> recent_messages;
-        for (const auto& message : conv->messages) {
-            if (message.role == MessageRole::System) continue;
-            recent_messages.push_back(message);
-        }
-        if (static_cast<int>(recent_messages.size()) > kContextPreviewMessages) {
-            recent_messages.erase(recent_messages.begin(),
-                                  recent_messages.end() - kContextPreviewMessages);
-        }
-
-        if (recent_messages.empty()) {
+        if (!util::trim(conv->summary).empty())
+            prompt << "[Summary of earlier messages]\n" << conv->summary << "\n\n";
+        auto recent = db.load_messages(conv_id, conv->summary_through_seq);
+        recent.erase(std::remove_if(recent.begin(), recent.end(),
+                                    [](const Message& m) { return m.role == MessageRole::System; }),
+                     recent.end());
+        if (static_cast<int>(recent.size()) > kContextPreviewMessages)
+            recent.erase(recent.begin(), recent.end() - kContextPreviewMessages);
+        if (recent.empty()) {
             prompt << "(no messages yet)\n\n";
         } else {
-            for (const auto& message : recent_messages) {
+            for (const auto& message : recent)
                 prompt << role_label(message.role) << ": " << message.content << "\n";
-            }
             prompt << "\n";
         }
     }
@@ -118,7 +120,6 @@ std::string build_relevance_prompt(AgentDB& db,
 std::optional<std::vector<std::string>> parse_selected_memory_ids(const std::string& response_text) {
     const auto object_pos = response_text.find('{');
     if (object_pos == std::string::npos) return std::nullopt;
-
     std::string json_text = response_text.substr(object_pos);
     const auto object_end = json_text.rfind('}');
     if (object_end == std::string::npos) return std::nullopt;
@@ -126,49 +127,34 @@ std::optional<std::vector<std::string>> parse_selected_memory_ids(const std::str
 
     auto parsed = nlohmann::json::parse(json_text, nullptr, false);
     if (parsed.is_discarded() || !parsed.is_object()) return std::nullopt;
-
     const auto ids_it = parsed.find("memory_ids");
     if (ids_it == parsed.end() || !ids_it->is_array()) return std::nullopt;
 
     std::vector<std::string> ids;
-    for (const auto& item : *ids_it) {
-        if (!item.is_string()) continue;
-        ids.push_back(item.get<std::string>());
-    }
+    for (const auto& item : *ids_it)
+        if (item.is_string()) ids.push_back(item.get<std::string>());
     return ids;
 }
 
-std::vector<Memory> fallback_selected_memories(const std::vector<Memory>& candidates,
-                                               int max_selected) {
-    const int fallback_count = std::min({static_cast<int>(candidates.size()),
-                                         max_selected,
-                                         kFallbackSelectedMemories});
+std::vector<Memory> fallback_selected_memories(const std::vector<Memory>& candidates, int max_selected) {
+    const int fallback_count =
+        std::min({static_cast<int>(candidates.size()), max_selected, kFallbackSelectedMemories});
     return std::vector<Memory>(candidates.begin(), candidates.begin() + fallback_count);
 }
 
 } // namespace
 
-MemoryManager::MemoryManager(AgentDB& db, RuntimeClient& runtime)
-    : db_(db), runtime_(runtime) {}
+MemoryManager::MemoryManager(UserDB& db,
+                             RuntimeClient& runtime,
+                             std::string request_model,
+                             RuntimeSettings settings)
+    : db_(db), runtime_(runtime), request_model_(std::move(request_model)), settings_(std::move(settings)) {}
 
-void MemoryManager::extract_and_store_memories(const ConvId& conv_id,
-                                               const AgentConfig& cfg) {
-    if (!cfg.memories_enabled) return;
+int MemoryManager::extract_and_store_memories_from_messages(const ConvId& conv_id,
+                                                            const std::vector<Message>& messages) {
+    if (messages.empty()) return 0;
 
-    auto messages = db_.load_messages(conv_id);
-    extract_and_store_memories_from_messages(conv_id, messages, cfg);
-}
-
-void MemoryManager::extract_and_store_memories_from_messages(
-    const ConvId& conv_id,
-    const std::vector<Message>& messages,
-    const AgentConfig& cfg) {
-    if (messages.empty()) return;
-
-    const std::string transcript = build_transcript(messages);
-    if (transcript.empty()) return;
-
-    const std::string extraction_prompt =
+    static const std::string kInstructions =
         "Analyze the conversation below and create concise global conversation-chain "
         "summaries for future conversations. Each memory should summarize what this "
         "conversation chain contains and why it may matter later. Do not copy short-lived "
@@ -178,45 +164,52 @@ void MemoryManager::extract_and_store_memories_from_messages(
         "  \"content\"    (string)  a concise source-grounded summary\n"
         "  \"importance\" (number)  0.0 (trivial) to 1.0 (critical)\n\n"
         "If there is nothing worth remembering, return an empty array [].\n\n"
-        "Conversation:\n" + transcript + "\n\nJSON:";
+        "Conversation:\n";
+
+    RuntimeSettings settings = settings_;
+    settings.max_tokens = kExtractionMaxTokens;
+    settings.temperature = 0.2f;
+    // Sized for the model doing the extracting: a transcript that fits a large
+    // model is cut, not sent whole, when a small one is asked.
+    const int room = prompt_budget(settings) - estimate_tokens(kInstructions) - 64;
+    const std::string transcript = build_transcript(messages, std::max(room, 64));
+    if (transcript.empty()) return 0;
 
     InferenceRequest req;
-    req.model = cfg.model_path;
-    req.settings = cfg.runtime_settings;
-    req.settings.max_tokens = 512;
-    req.settings.temperature = 0.2f;
-    req.messages = {{.role = MessageRole::User, .content = extraction_prompt}};
+    req.model = request_model_;
+    req.settings = settings;
+    req.messages = {{.role = MessageRole::User, .content = kInstructions + transcript + "\n\nJSON:"}};
 
-    Message resp = runtime_.complete(req);
-    if (resp.content.empty()) {
-        MM_WARN("Memory extraction returned empty response for conv {}", conv_id);
-        return;
+    const Message resp = runtime_.complete(req);
+    if (resp.role != MessageRole::Assistant || resp.content.empty()) {
+        MM_WARN("Memory extraction failed for conv {}", conv_id);
+        return -1;
     }
 
-    auto pos = resp.content.find('[');
+    const auto pos = resp.content.find('[');
     if (pos == std::string::npos) {
         MM_WARN("Memory extraction: no JSON array found in response");
-        return;
+        return -1;
     }
     std::string json_str = resp.content.substr(pos);
-    auto end = json_str.rfind(']');
+    const auto end = json_str.rfind(']');
     if (end != std::string::npos) json_str = json_str.substr(0, end + 1);
 
     try {
-        auto arr = nlohmann::json::parse(json_str);
-        if (!arr.is_array()) return;
-
+        const auto arr = nlohmann::json::parse(json_str);
+        if (!arr.is_array()) return -1;
         int stored = 0;
         for (const auto& item : arr) {
-            if (!item.contains("content")) continue;
-            const std::string content = item["content"].get<std::string>();
+            if (!item.is_object() || !item.contains("content") || !item["content"].is_string()) continue;
+            const std::string content = util::trim(item["content"].get<std::string>());
             if (content.empty()) continue;
-            float importance = item.value("importance", 0.5f);
+            float importance = item.contains("importance") && item["importance"].is_number()
+                                   ? item["importance"].get<float>()
+                                   : 0.5f;
             importance = std::clamp(importance, 0.0f, 1.0f);
 
             Memory mem;
             mem.id = util::generate_uuid();
-            mem.agent_id = cfg.id;
             mem.content = content;
             mem.source_conv_id = conv_id;
             mem.importance = importance;
@@ -224,42 +217,45 @@ void MemoryManager::extract_and_store_memories_from_messages(
             db_.add_memory(mem);
             ++stored;
         }
-        MM_INFO("Extracted {} memories from selected messages in conv {}", stored, conv_id);
+        MM_INFO("Extracted {} memories from conversation {}", stored, conv_id);
+        return stored;
     } catch (const std::exception& e) {
         MM_WARN("Memory extraction JSON parse error: {}", e.what());
+        return -1;
     }
 }
 
 std::vector<Memory> MemoryManager::get_relevant_memories(const ConvId& conv_id,
-                                                         const AgentConfig& cfg,
+                                                         const std::string& instructions,
                                                          int max_candidates,
                                                          int max_selected) const {
-    if (!cfg.memories_enabled || max_candidates <= 0 || max_selected <= 0) return {};
+    if (max_candidates <= 0 || max_selected <= 0) return {};
 
-    auto candidates = rank_candidate_memories(db_.list_memories(), max_candidates);
+    const auto candidates = rank_candidate_memories(db_.list_memories(), max_candidates);
     if (candidates.empty()) return {};
 
     InferenceRequest req;
-    req.model = cfg.model_path;
-    req.settings = cfg.runtime_settings;
+    req.model = request_model_;
+    req.settings = settings_;
     req.settings.max_tokens = 256;
     req.settings.temperature = 0.1f;
     req.messages = {{.role = MessageRole::User,
-                     .content = build_relevance_prompt(db_, conv_id, cfg, candidates, max_selected)}};
+                     .content = build_relevance_prompt(db_, conv_id, instructions, candidates,
+                                                       max_selected)}};
 
-    Message response = runtime_.complete(req);
-    if (response.content.empty()) {
-        MM_WARN("Relevant memory selection returned empty response for conv {}", conv_id);
+    const Message response = runtime_.complete(req);
+    if (response.role != MessageRole::Assistant || response.content.empty()) {
+        MM_WARN("Relevant memory selection failed for conv {}", conv_id);
         return fallback_selected_memories(candidates, max_selected);
     }
 
-    auto selected_ids = parse_selected_memory_ids(response.content);
+    const auto selected_ids = parse_selected_memory_ids(response.content);
     if (!selected_ids) {
         MM_WARN("Relevant memory selection returned invalid JSON for conv {}", conv_id);
         return fallback_selected_memories(candidates, max_selected);
     }
 
-    std::unordered_set<std::string> selected_id_set(selected_ids->begin(), selected_ids->end());
+    const std::unordered_set<std::string> selected_id_set(selected_ids->begin(), selected_ids->end());
     std::vector<Memory> selected;
     selected.reserve(static_cast<size_t>(max_selected));
     for (const auto& memory : candidates) {
@@ -267,28 +263,7 @@ std::vector<Memory> MemoryManager::get_relevant_memories(const ConvId& conv_id,
         selected.push_back(memory);
         if (static_cast<int>(selected.size()) >= max_selected) break;
     }
-
     return selected;
-}
-
-std::string MemoryManager::format_memories_for_context(const std::vector<Memory>& memories) {
-    if (memories.empty()) return {};
-
-    std::ostringstream oss;
-    oss << "## Global conversation-chain summaries\n";
-    oss << "These are summaries from prior conversation chains. Each item includes a "
-           "global memory id and, when available, its source conversation id. If a "
-           "summary is relevant but incomplete, call get_global_memory_origin with "
-           "the memory id to inspect its source conversation before relying on it.\n";
-    for (const auto& memory : memories) {
-        oss << "- [" << memory.id << "]";
-        if (!memory.source_conv_id.empty()) {
-            oss << " source_conversation=" << memory.source_conv_id;
-        }
-        oss << " importance=" << memory.importance << ": "
-            << memory.content << "\n";
-    }
-    return oss.str();
 }
 
 } // namespace mm

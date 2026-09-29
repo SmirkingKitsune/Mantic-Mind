@@ -7,20 +7,31 @@
 listen_port = 9090
 
 # Port for OpenAI-compatible text clients. Set to 0 to disable.
-# Exposes GET /v1/models and POST /v1/chat/completions.
-# Models are Mantic agents; use model id agent:{agent_id}.
+# Exposes GET /v1/models and POST /v1/chat/completions, statelessly: the model
+# is a served-model id from /v1/served-models, and requests pass through to its
+# engine unchanged.
 openai_compat_port = 9091
 
 # Optional bearer token for external /v1 and /v1/* API clients such as Yappy-Agent.
-# Applies to streaming chat and mutating agent routes. Internal /api/control/*
+# Applies to streaming chat and every mutating route. Internal /api/control/*
 # node routes keep using registered node api keys.
 # If set, external clients must send: Authorization: Bearer <token>
+# Scoped tokens (read / chat / operator), optionally bound to one user, are
+# minted with POST /v1/tokens and stored hashed; this one grants every scope.
 # external_api_token = ""
 
 # ── Storage ────────────────────────────────────────────────────────────────────
-# Root data directory — agent databases live under {data_dir}/agents/{uuid}/agent.db
+# Root data directory — each user's store lives under {data_dir}/users/{id}/user.db
 # and remembered paired nodes live in {data_dir}/nodes.json.
+# A pre-users {data_dir}/agents/ is never read; it is left untouched on disk.
 data_dir = "data"
+
+# ── Conversations ──────────────────────────────────────────────────────────────
+# Threads running conversation work: turns, compaction, memory extraction and
+# recall. Each conversation keeps its own order on one of them, and different
+# conversations run in parallel, so this bounds concurrency, not ordering.
+# Environment: MM_CHAT_WORKER_THREADS.
+chat_worker_threads = 16
 
 # ── Node Health Polling ────────────────────────────────────────────────────────
 # How often (seconds) to poll registered nodes for health metrics.
@@ -41,7 +52,7 @@ tts_enabled = false
 # The local sidecar is tools/qwen_tts_service.py.
 tts_service_url = "http://127.0.0.1:9188"
 # tts_service_command = "python tools/qwen_tts_service.py --host 127.0.0.1 --port 9188"
-# Empty uses {data_dir}/agents/{agent_id}/tts/cache.
+# Empty uses {data_dir}/users/{user_id}/tts/cache.
 # tts_cache_dir = ""
 tts_voice_design_model_id = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
 tts_clone_model_id = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"

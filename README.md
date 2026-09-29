@@ -3,7 +3,7 @@
 Distributed LLM inference cluster — two executables that turn any collection of machines into a coordinated AI backend.
 
 - **mantic-mind** — cluster node; spawns and manages `llama-server` inference subprocesses; FTXUI status TUI
-- **mantic-mind-control** — cluster head; manages nodes, agents, conversations, memories; FTXUI management TUI
+- **mantic-mind-control** — cluster head; manages nodes, served models, users, conversations, memories; FTXUI management TUI
 
 > **Branch note:** `main` is the llama.cpp runtime line. The alternative runtime
 > implementation is maintained separately on the `vLLM-runtime` branch.
@@ -29,9 +29,9 @@ Distributed LLM inference cluster — two executables that turn any collection o
 > | [docs/repo-layout.md](docs/repo-layout.md) | Tree, seam boundary, where new code goes |
 > | [schemas/arch-ir.md](schemas/arch-ir.md) | `arch.json` and the verdict function |
 >
-> Note that the API section below documents the **current** routes. The design reclaims
-> `GET /v1/models` for the admission registry and moves the agents-as-models catalog to the
-> OpenAI-compat listener on `:9091`; that has not happened yet.
+> Note that the API section below documents the **current** routes. `GET /v1/models` on `:9090` is
+> the admission registry; the catalog users and OpenAI clients pick a model from is
+> `/v1/served-models` (and `GET /v1/models` on the `:9091` OpenAI-compat listener).
 
 ## Prerequisites
 
@@ -185,14 +185,16 @@ matching `-symbols.zip` when PDBs are available, and `dist/checksums.txt`.
 The runtime archive includes `bin/`, default root config files, `tools/`,
 `README.md`, `LICENSE`, and a release manifest. It does not bundle managed
 llama.cpp runtime installs, Python environments, model weights, runtime data,
-logs, or local agent databases.
+logs, or local user databases.
 
 ## llama.cpp Runtime
 
-Each node manages one or more `llama-server` subprocesses. Agent configs use
-`inference_backend = "llama-cpp"`, a local GGUF `model_path`, and a
+Each node manages one or more `llama-server` subprocesses. A served model with
+`inference_backend = "node"` names a local GGUF `model_path` and a
 `runtime_settings` block for context size, GPU layers, threads, parallel slots,
-batch sizes, sampling defaults, and additional llama-server arguments.
+batch sizes, sampling defaults, and additional llama-server arguments; which
+engine actually serves it — llama.cpp, Soma, vLLM — is the cluster's routing
+decision, not the model's.
 
 The node resolves an explicit `llama_server_path` when configured. Otherwise it
 can install an environment-matched managed runtime: official release assets are
@@ -200,8 +202,9 @@ preferred, with a source build as the fallback when no compatible accelerated
 asset exists. Managed installation and updates run in the background and expose
 live progress and troubleshooting details through the node API and TUI.
 
-- **Shared engines.** Agents with the same model and compatible launch settings
-  attach to one llama-server process.
+- **Shared engines.** Served models with the same weights and compatible launch
+  settings attach to one llama-server process, and every user chatting on a model
+  shares its placement.
 - **Resource-aware placement.** GGUF metadata and launch settings provide a VRAM
   estimate used to choose a suitable node and protect active slots from eviction.
 - **Suspend and restore.** A suspended slot saves its llama.cpp KV cache, stops
@@ -211,18 +214,19 @@ live progress and troubleshooting details through the node API and TUI.
 
 Optional Qwen3-TTS support uses the bundled `tools/qwen_tts_service.py` sidecar.
 
-## Agent API Mode
+## Remote API Models
 
-Agents can also run against an OpenAI-compatible chat completions API instead of
-a local node engine. Set `inference_backend` to `api`, keep `model_path` as the
+A served model can run against an OpenAI-compatible chat completions API instead
+of a cluster node. Set `inference_backend` to `api`, keep `model_path` as the
 remote model id, and configure `api_settings` with the provider base URL and
 chat route:
 
 ```sh
-curl -X POST http://localhost:9090/v1/agents \
+curl -X POST http://localhost:9090/v1/served-models \
   -H "Content-Type: application/json" \
   -d '{
-    "name": "frontier-assistant",
+    "id": "frontier",
+    "display_name": "Frontier",
     "inference_backend": "api",
     "model_path": "gpt-4.1",
     "api_settings": {
@@ -236,19 +240,18 @@ curl -X POST http://localhost:9090/v1/agents \
 `api_settings.api_key` may be supplied in a create/update request for the
 current control process, but it is not serialized in API responses and is not
 persisted to SQLite. Prefer `api_key_env` for restart-safe deployments. API
-agents bypass node placement, but they still use the normal Mantic-Mind agent
-harness: conversations, streaming chat, memory extraction, compaction, and tool
-rounds.
+models bypass node placement, but a turn on one is the same turn as any other:
+conversations, streaming chat, memory extraction, compaction, and tool rounds.
 
-## Vision Agents
+## Vision Models
 
-Image input is opt-in per agent. A llama.cpp profile names both the model GGUF
+Image input is opt-in per served model. A node profile names both the model GGUF
 and its matching projector explicitly:
 
 ```json
 {
-  "name": "local-vision",
-  "inference_backend": "llama-cpp",
+  "id": "local-vision",
+  "inference_backend": "node",
   "model_path": "D:/models/vision-model.gguf",
   "vision_settings": {
     "enabled": true,
@@ -259,28 +262,32 @@ and its matching projector explicitly:
 
 The projector is launched through llama.cpp's authoritative `--mmproj`
 argument. Do not repeat `--mmproj`, `-mm`, or `--mmproj-url` in
-`runtime_settings.extra_args`. For API-backed profiles, set
+`runtime_settings.extra_args`. For API-backed models, set
 `vision_settings.enabled` to declare that the remote model accepts images and
-leave `mmproj_path` empty. Image requests sent to a profile without vision
-enabled fail with HTTP 422; Mantic-Mind never drops the images or delegates the
-turn to another agent.
+leave `mmproj_path` empty. Image requests sent to a model without vision enabled
+fail with HTTP 422; Mantic-Mind never drops the images or answers as though they
+were not there.
 
-The profile editor exposes a Vision toggle and projector picker. Adjacent
+A conversation may move to a model that cannot see. Its stored images stay where
+they are; what the text-only model is SENT has each image replaced by
+`[image omitted: <file>]`, so the turn succeeds and the history still says an
+image was there.
+
+The Models tab exposes a Vision toggle and projector picker. Adjacent
 case-insensitive `mmproj-*.gguf` files are shown as suggestions but are never
-selected automatically. The Chat tab can stage up to eight JPEG/PNG files,
-shows their sizes, uploads them through the same managed attachment API used by
-other clients, and clears the staged list after the request is queued.
+selected automatically. The Chat tab attaches a JPEG/PNG through the same managed
+attachment API used by other clients.
 
-Managed images live beneath the owning agent directory. SQLite stores generated
+Managed images live beneath the owning user's directory. SQLite stores generated
 attachment IDs, relative managed paths, and ordered message parts; neither
 base64 data nor absolute attachment paths appear in persisted messages or API
 responses. Pending uploads expire after 24 hours, and unreferenced managed files
 are reconciled at startup. Limits are 50 MiB per image, eight images per turn or
 hydrated context, and 400 MiB decoded image data per turn or context.
 
-With control and a node running, the opt-in real-model smoke test creates a
-temporary agent, loads a vision GGUF/projector pair, uploads a small PNG, and
-checks a text-only follow-up against the persisted visual turn:
+With control and a node running, the opt-in real-model smoke test adds a vision
+served model and a temporary user, uploads a small PNG, and checks a text-only
+follow-up against the persisted visual turn:
 
 ```sh
 python tests/vision_smoke.py \
@@ -317,16 +324,25 @@ MM_LLAMA_PATH=/opt/llama.cpp/llama-server \
 
 The node TUI shows the generated API key. In the control TUI, press **`[+] Add Node`**, paste the URL and key — the node joins the cluster.
 
-### 3. Create an agent and chat
+### 3. Add a model, create a user, and chat
+
+A model is served for everyone; a user owns the conversations. An admitted model
+is already in the catalog — `GET /v1/served-models` lists what a client may pick.
 
 ```sh
-# Create an agent for a GGUF already visible to control or the selected node.
-curl -X POST http://localhost:9090/v1/agents \
+# Add a GGUF already visible to control or the selected node.
+curl -X POST http://localhost:9090/v1/served-models \
   -H "Content-Type: application/json" \
-  -d '{"name":"assistant","inference_backend":"llama-cpp","model_path":"models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"}' | jq
+  -d '{"id":"qwen-0.5b","model_path":"models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"}' | jq
 
-# Chat (streaming SSE)
-curl -N -X POST http://localhost:9090/v1/agents/<id>/chat \
+# Create a user, with that model as their default.
+curl -X POST http://localhost:9090/v1/users \
+  -H "Content-Type: application/json" \
+  -d '{"id":"alice","display_name":"Alice","default_model":"qwen-0.5b"}' | jq
+
+# Chat (streaming SSE). `model` is optional; naming one switches this
+# conversation to it from now on.
+curl -N -X POST http://localhost:9090/v1/users/alice/chat \
   -H "Content-Type: application/json" \
   -d '{"message":"Hello!"}'
 ```
@@ -368,9 +384,11 @@ Example control CLI session:
 mm-control> nodes discovered
 mm-control> nodes pair psk http://127.0.0.1:7070 my-shared-key
 mm-control> models list
-mm-control> agents create {"name":"assistant","inference_backend":"llama-cpp","model_path":"models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"}
-mm-control> agents list
-mm-control> chat send <agent_id> "Hello from CLI mode"
+mm-control> catalog create {"id":"qwen-0.5b","model_path":"models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"}
+mm-control> catalog list
+mm-control> users create {"id":"alice","default_model":"qwen-0.5b"}
+mm-control> chat send alice "Hello from CLI mode"
+mm-control> chat send alice "And now on another model" "" --model frontier
 mm-control> activity tail 50
 ```
 
@@ -527,13 +545,14 @@ retained, and the latest path is shown in the wizard and exposed as
 |---|---|---|---|
 | `listen_port` | `MM_CONTROL_PORT` | `9090` | API server port |
 | `openai_compat_port` | `MM_OPENAI_COMPAT_PORT` | `9091` | OpenAI-compatible text API port; set `0` to disable |
-| `data_dir` | `MM_DATA_DIR` | `data` | Agent database root; remembered nodes are stored in `nodes.json` |
+| `data_dir` | `MM_DATA_DIR` | `data` | User database root (`data/users/{id}/user.db`); remembered nodes are stored in `nodes.json` |
 | `models_dir` | `MM_MODELS_DIR` | `models` | Optional local model directory root |
 | `node_health_poll_interval_s` | `MM_POLL_INTERVAL_S` | `30` | Health/metrics poll interval |
 | `node_offline_after_s` | `MM_NODE_OFFLINE_AFTER_S` | `90` | Time without a successful poll before an unreachable node is labeled offline |
 | `external_api_token` | `MM_CONTROL_EXTERNAL_API_TOKEN` | *(empty)* | When set, required as `Authorization: Bearer` on all external `/v1/*` routes |
 | `pairing_key` | `MM_PAIRING_KEY` | *(empty)* | PSK for automatic node/control pairing |
 | `discovery_port` | `MM_DISCOVERY_PORT` | `7072` | UDP discovery port |
+| `chat_worker_threads` | `MM_CHAT_WORKER_THREADS` | `16` | Threads running conversation work; each conversation keeps its own order |
 | `log_file` | `MM_LOG_FILE` | `logs/mantic-mind-control.log` | Log file |
 
 Text-to-speech is configured through the `tts_*` keys (`tts_enabled`,
@@ -550,25 +569,31 @@ Additional env-only settings:
 
 ### Model reference contract
 
-For `inference_backend = "llama-cpp"`, `agent.model_path` identifies a GGUF
-file. It may be an absolute/local node path or a model transferred into the
-node's managed `models_dir`. A vision agent additionally supplies a matching
-GGUF projector in `vision_settings.mmproj_path`.
+For `inference_backend = "node"`, a served model's `model_path` identifies the
+WEIGHTS: a GGUF file — an absolute/local node path, or a model transferred into
+the node's managed `models_dir` — or the `arch_hash` of an admitted container,
+which is how an admitted entry addresses itself, because a name is ambiguous
+across quantizations. A vision model additionally supplies a matching GGUF
+projector in `vision_settings.mmproj_path`.
 
-For `inference_backend = "api"`, `agent.model_path` is the served model ID sent
-to the configured remote OpenAI-compatible endpoint. API agents are not placed
-on a Mantic-Mind node.
+For `inference_backend = "api"`, `model_path` is the model id sent to the
+configured remote OpenAI-compatible endpoint. API models are not placed on a
+Mantic-Mind node.
 
 ## REST API
 
 ### Node API (`Authorization: Bearer <node-api-key>`)
 
+A **holder** is the label that keeps an engine loaded: control sends the served-model id.
+Control and nodes must speak the same `wire_protocol`
+(currently 2, which introduced holder ids); control places nothing on a node that reports another.
+
 ```
-POST   /api/node/load-model     { model_path, mmproj_path?, vision_enabled?, runtime_settings?, agent_id? }
+POST   /api/node/load-model     { model_path, mmproj_path?, vision_enabled?, runtime_settings?, holder_id? }
 POST   /api/node/unload-model   { slot_id? }            (omit slot_id to unload all)
-POST   /api/node/detach-agent   { slot_id, agent_id }   (unloads engine when its last agent leaves)
+POST   /api/node/detach-holder  { slot_id, holder_id }  (unloads engine when its last holder leaves)
 POST   /api/node/suspend-slot   { slot_id }             (save KV cache, then stop)
-POST   /api/node/restore-slot   { model_path, mmproj_path?, vision_enabled?, runtime_settings?, kv_cache_path?, agent_id? }
+POST   /api/node/restore-slot   { model_path, mmproj_path?, vision_enabled?, runtime_settings?, kv_cache_path?, holder_id? }
 POST   /api/node/infer          { InferenceRequest, slot_id? }  -> SSE
 GET    /api/node/runtime/llama  -> { llama_runtime }
 POST   /api/node/runtime/llama/provision { update?, accelerator? } -> { llama_runtime }
@@ -577,7 +602,7 @@ POST   /api/node/runtime/llama/check-update -> { llama_runtime }
 POST   /api/node/runtime/llama/diagnose -> { llama_runtime.troubleshooting }
 POST   /api/node/runtime/llama/recover { action: "retry"|"target"|"compile-anyway"|"release", variant? } -> { llama_runtime }
 GET    /api/node/health         -> NodeHealthMetrics
-GET    /api/node/status         -> { node_id, slots, managed_models, capabilities, llama_runtime, ... }
+GET    /api/node/status         -> { node_id, slots, managed_models, capabilities, llama_runtime, wire_protocol, ... }
 GET    /api/node/logs?tail=n    -> { lines: [...] }
 GET    /api/node/api-keys       -> { keys: [...] }
 POST   /api/node/api-keys       { key }
@@ -603,32 +628,37 @@ internal `/api/control/*` routes; they are not accepted for external `/v1/*`
 clients.
 
 ```
-GET/POST       /v1/agents
-GET/PUT/DELETE /v1/agents/{id}
-POST           /v1/agents/{id}/attachments                (stream JPEG/PNG body) -> 201 metadata
-GET/DELETE     /v1/agents/{id}/attachments/{attachment_id}
-POST           /v1/agents/{id}/chat                       { message?, attachment_ids?, conversation_id?, max_tokens? } -> SSE
-GET/POST       /v1/agents/{id}/conversations
-GET/DELETE     /v1/agents/{id}/conversations/{cid}
-PUT            /v1/agents/{id}/conversations/{cid}
-POST           /v1/agents/{id}/conversations/{cid}/activate
-POST           /v1/agents/{id}/conversations/{cid}/compact
-GET/POST       /v1/agents/{id}/conversations/{cid}/local-memories
-PUT/DELETE     /v1/agents/{id}/conversations/{cid}/local-memories/{mid}
-GET            /v1/agents/{id}/memories
-PUT/DELETE     /v1/agents/{id}/memories/{mid}
-POST           /v1/agents/{id}/memories                   (create)
-POST           /v1/agents/{id}/memories/extract           { conversation_id, start_index, end_index, context_before? }
-POST           /v1/agents/{id}/curation/proposals
-POST           /v1/agents/{id}/curation/proposals/apply
-POST           /v1/agents/{id}/curation/apply
-GET            /v1/agents/{id}/voice
-GET/POST       /v1/agents/{id}/voice/proposals
-POST           /v1/agents/{id}/voice/proposals/{pid}/approve | reject | sample
-GET            /v1/agents/{id}/voice/proposals/{pid}/sample
-POST           /v1/agents/{id}/speech                     (synthesize)
-GET            /v1/agents/{id}/speech/cache/{cache_id}
-POST           /v1/audio/speech                           (OpenAI-compatible speech)
+GET/POST       /v1/users
+GET/PUT/DELETE /v1/users/{id}
+POST           /v1/users/{id}/chat                        { message?, model?, attachment_ids?, conversation_id?, max_tokens?, settings? } -> SSE
+POST           /v1/users/{id}/attachments                 (stream JPEG/PNG body) -> 201 metadata
+GET/DELETE     /v1/users/{id}/attachments/{attachment_id}
+GET/POST       /v1/users/{id}/conversations               { title?, model?, system_prompt?, settings?, set_active? }
+GET/DELETE     /v1/users/{id}/conversations/{cid}
+PUT            /v1/users/{id}/conversations/{cid}         { title?, model?, system_prompt?, settings? }
+POST           /v1/users/{id}/conversations/{cid}/activate
+POST           /v1/users/{id}/conversations/{cid}/compact  { model? }  (folds in place; same conversation id)
+GET/POST       /v1/users/{id}/conversations/{cid}/local-memories
+PUT/DELETE     /v1/users/{id}/conversations/{cid}/local-memories/{mid}
+GET            /v1/users/{id}/memories
+PUT/DELETE     /v1/users/{id}/memories/{mid}
+POST           /v1/users/{id}/memories                    (create)
+POST           /v1/users/{id}/memories/extract            { conversation_id, start_index, end_index, context_before?, model? }
+POST           /v1/users/{id}/curation/proposals
+POST           /v1/users/{id}/curation/apply
+GET            /v1/users/{id}/voice
+GET/POST       /v1/users/{id}/voice/proposals
+POST           /v1/users/{id}/voice/proposals/{pid}/approve | reject | sample
+GET            /v1/users/{id}/voice/proposals/{pid}/sample
+POST           /v1/users/{id}/speech                      (synthesize)
+GET            /v1/users/{id}/speech/cache/{cache_id}
+POST           /v1/audio/speech                           (OpenAI-compatible speech; voice "user:{id}")
+GET/POST       /v1/served-models                          (the catalog; POST adds a GGUF or remote-API entry)
+GET/PUT/DELETE /v1/served-models/{id}
+PUT            /v1/served-models/{id}/backend             { backend_override: auto|soma|fallback }
+POST           /v1/served-models/{id}/suspend | restore | release
+GET/POST       /v1/tokens                                 { label, scopes, user_id? }  (a bound token reaches one user)
+DELETE         /v1/tokens/{id}
 GET            /v1/nodes
 POST           /v1/nodes                                  { url, api_key, platform?, remember? }
 DELETE         /v1/nodes/{id}
@@ -637,36 +667,34 @@ GET            /v1/nodes/discovered
 POST           /v1/nodes/pair/start                       { url }
 POST           /v1/nodes/pair/complete                    { url, nonce, pin_or_psk, remember? }
 POST           /v1/nodes/pair/psk                         { url, psk?, remember? }   (falls back to MM_PAIRING_KEY)
-GET            /v1/placements                             -> current agent → node/slot placements
+GET            /v1/placements                             -> served model → node/slot, with in-flight counts
 GET            /v1/activity?tail=n&level=info|warn|error|0|1|2
-GET            /v1/models                                 -> agent model catalog for compatibility clients
+GET            /v1/models                                 -> the admission registry
 ```
+
+Full reference, including scopes, token binding and the SSE contract:
+[docs/external-api.md](docs/external-api.md).
 
 ### OpenAI-Compatible API (`openai_compat_port`, default `:9091`)
 
-This listener is intentionally separate from the Mantic API port. It is for
-clients that support an OpenAI-compatible custom base URL, while richer app
-integrations should keep using the Mantic `/v1/agents`, `/v1/nodes`, and
-conversation/memory routes on `listen_port`.
+This listener is intentionally separate from the Mantic API port. It is
+**stateless**: a client that owns its own conversation sends it whole, names a
+served model, and the request reaches that model's engine unchanged except for
+the model name. Nothing is stored. Richer integrations that want server-side
+conversations and memories use the Mantic routes on `listen_port`.
 
 ```
-GET  /v1/models
-GET  /v1/models/{model}
-POST /v1/chat/completions
+GET  /v1/models           the available served models
+GET  /v1/models/{id}
+POST /v1/chat/completions passed through; streaming relays every frame
 ```
 
-`/v1/models` exposes agents as model IDs in the form `agent:{agent_id}`. The
-chat-completions route also accepts a bare agent ID, unique agent name, unique
-`model_path`, or unique `served_model_name`, but `agent:{agent_id}` is the
-stable form to configure in external clients. When `external_api_token` is set,
-the compatibility port uses the same `Authorization: Bearer <token>` gate.
-
-Vision-capable agents accept standard ordered user content arrays containing
-`text` and `image_url` parts. Image URLs must be JPEG or PNG base64 `data:` URLs;
-HTTP(S), `file:`, unsupported MIME types, and image parts on non-user roles are
-rejected. The images are converted to managed attachments before the stateful
-Mantic conversation turn is persisted. Both streaming and non-streaming
-completions use the same conversation and hydration pipeline.
+`model` is a served-model id from `GET /v1/models` (or `/v1/served-models` on
+`listen_port`). Tools, tool-call history, images and sampling parameters pass
+through as sent; a request the model or its engine cannot honour (images
+without vision, tools on an engine that cannot render them, `n > 1`) is refused
+with 422/400 before anything is sent. Authorization uses the same scoped tokens
+as `listen_port`, answered in OpenAI's error envelope.
 
 ### SSE Chat Events
 
@@ -685,11 +713,14 @@ External Client
       │  REST + SSE
       ▼
 mantic-mind-control  (:9090)
-  ├─ AgentManager      — per-agent SQLite  (data/agents/{uuid}/agent.db)
+  ├─ UserManager       — per-user SQLite   (data/users/{id}/user.db)
+  ├─ ServedModelCatalog— what users may pick: admitted models, plus the
+  │                       operator's own GGUF and remote-API entries
   ├─ NodeRegistry      — node list + health/metrics polling, capabilities
-  ├─ AgentScheduler    — placement: existing/suspended → shared engine →
+  ├─ PlacementScheduler— placement per served model, leased while in flight:
+  │                       existing/suspended → shared engine →
   │                       VRAM-suitable node → suspend/evict + retry
-  ├─ AgentQueue        — per-agent FIFO worker threads
+  ├─ ConversationQueue — one strand per conversation, on a bounded pool
   └─ ControlApiServer  — REST endpoints + SSE chat proxy
          │  REST + SSE
          ▼
@@ -710,7 +741,7 @@ mantic-mind  (:7070)
 
 | Key | Action |
 |---|---|
-| `1` / `2` / `3` / `4` / `5` / `6` / `7` | Switch control tabs (Nodes / Agents / Activity / Chat / Curation / Performance / Voice) |
+| `1` … `9`, `0` | Switch control tabs (Nodes / Models / Activity / Chat / Users / Performance / Voice / Soma / Engines / Admissions) |
 | `q` | Quit |
 | `Esc` | Close modal / editor, or quit |
 

@@ -10,42 +10,31 @@
 namespace mm {
 
 class NodeRegistry;
-class AgentManager;
-class AgentScheduler;
 
 // FTXUI-based terminal UI for mantic-mind-control.
 //
-// Eight tabs (keyboard 1-8):
-//   Tab 1 — Nodes:    list + health metrics + add/remove actions
-//   Tab 2 — Agents:   list + full config editor + memories + conversations
-//   Tab 3 — Activity: scrollable system event log with level filter
-//   Tab 4 — Chat:     in-app agent chat for troubleshooting model behavior
-//   Tab 5 — Curation: conversation trees and memory management actions
+// Ten tabs (keyboard 1-9, 0):
+//   1 Nodes        list + health metrics + add/remove actions
+//   2 Models       the served-model catalog users pick from
+//   3 Activity     scrollable system event log with level filter
+//   4 Chat         chat as a user, with any model, switchable per turn
+//   5 Users        users, their conversations and memories, curation
+//   6 Performance  rolling request latency and throughput metrics
+//   7 Voice        a user's voice: proposals, synthesis, local playback
+//   8 Soma         engines, the expert-heat brain grid, memory tiers
+//   9 Engines      cluster engine policy and per-node conformance
+//   0 Admissions   admitting models into the registry
 //
-//   Tab 6 - Performance: rolling request latency and throughput metrics
-//   Tab 7 - Voice: proposal review, synthesis, and local playback
-//   Tab 8 - Soma: engines, the expert-heat brain grid, memory tiers
-//
-// Tab 8 is fed ENTIRELY by /v1/*, in its own translation unit that cannot
-// reach the three references this class holds. See control/soma_panels.hpp.
-// All state mutations come from a thread-safe event queue drained on the
-// FTXUI loop tick to avoid locking inside the renderer.
+// Every tab but Nodes, Activity and Performance is fed ENTIRELY by /v1/*, in its
+// own translation unit that cannot reach the references this class holds —
+// tools/ci/check_ui_api.py enforces that. All state mutations come from a
+// thread-safe event queue drained on the FTXUI loop tick to avoid locking inside
+// the renderer.
 class ControlUI {
 public:
-    using LocalChatFallback = std::function<bool(
-        const std::string& agent_id,
-        const std::string& message,
-        std::string* out_text,
-        std::string* out_conv_id,
-        std::string* out_error)>;
-
     ControlUI(NodeRegistry& registry,
-              AgentManager& agents,
-              AgentScheduler& scheduler,
-              std::string models_dir,
               std::string control_base_url,
-              std::string control_api_token,
-              LocalChatFallback local_chat_fallback = {});
+              std::string control_api_token);
     ~ControlUI();
 
     // Append a log entry (thread-safe).
@@ -66,11 +55,7 @@ public:
 private:
     NodeRegistry& registry_;
     std::string   control_api_token_;
-    AgentManager& agents_;
-    AgentScheduler& scheduler_;
-    std::string   models_dir_;
     std::string   control_base_url_;
-    LocalChatFallback local_chat_fallback_;
 
     struct LogEntry { LogLevel level; std::string message; int64_t timestamp_ms = 0; };
     std::mutex             log_mutex_;

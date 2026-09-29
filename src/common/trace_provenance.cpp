@@ -1,6 +1,6 @@
 #include "common/trace_provenance.hpp"
 
-#include "common/agent_db.hpp"
+#include "common/user_db.hpp"
 #include "common/util.hpp"
 
 namespace mm {
@@ -29,12 +29,12 @@ void assign_trace_sequences(std::vector<TraceEvent>& events) {
     }
 }
 
-std::vector<TraceEvent> build_context_trace_events(AgentDB& db,
+std::vector<TraceEvent> build_context_trace_events(UserDB& db,
                                                    const ConvId& conv_id,
                                                    const std::vector<Memory>& memories) {
     std::vector<TraceEvent> events;
 
-    auto conv = db.load_conversation(conv_id);
+    auto conv = db.get_conversation(conv_id);
     if (conv) {
         if (!conv->parent_conv_id.empty()) {
             events.push_back(make_trace_event(
@@ -44,17 +44,16 @@ std::vector<TraceEvent> build_context_trace_events(AgentDB& db,
                 conv->parent_conv_id,
                 {{"conversation_id", conv->id}}));
         }
-        if (!conv->compaction_summary.empty()) {
-            const std::string source_conv_id =
-                conv->parent_conv_id.empty() ? conv->id : conv->parent_conv_id;
+        if (!conv->summary.empty()) {
             events.push_back(make_trace_event(
                 "conversation",
-                "Compaction summary reviewed",
-                conv->compaction_summary,
-                source_conv_id,
+                "Rolling summary reviewed",
+                conv->summary,
+                conv->id,
                 {
                     {"conversation_id", conv->id},
-                    {"parent_conv_id", conv->parent_conv_id}
+                    {"summary_through_seq", conv->summary_through_seq},
+                    {"summary_model_id", conv->summary_model_id}
                 }));
         }
     }

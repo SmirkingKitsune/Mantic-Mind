@@ -88,7 +88,7 @@ int preview() {
     a.node_id = "node-alpha";
     a.vram_usage_mb = 0;
     a.effective_ctx_size = 8192;
-    a.agent_ids = {"agent-1", "agent-2"};
+    a.served_model_ids = {"model-1", "model-2"};
     mm::SomaEngineView b;
     b.id = "eng-fea80c20";
     b.backend = "llama-cpp";
@@ -97,7 +97,7 @@ int preview() {
     b.node_id = "node-beta";
     b.vram_usage_mb = 22400;
     b.effective_ctx_size = 4096;
-    b.agent_ids = {"agent-3"};
+    b.served_model_ids = {"model-3"};
     snap.engines = {a, b};
     snap.tiers.engines = 2;
     snap.tiers.vram_mb = 22400;
@@ -445,14 +445,14 @@ int main(int argc, char** argv) {
         snap.sequences_at_ms = 100000;
         mm::SomaSequenceView sequence;
         sequence.index = 2;
-        sequence.agent_id = "agent-alpha";
+        sequence.conversation = "conv-alpha";
         sequence.position = 1536;
         sequence.kv_tokens = 1500;
         sequence.prefilling = true;
         sequence.determinism = "strict";
         snap.sequences.push_back(sequence);
         const auto sequences = draw(mm::render_sequences(snap), 70, 7);
-        check(has(sequences, "agent-alpha") && has(sequences, "prefill"),
+        check(has(sequences, "conv-alpha") && has(sequences, "prefill"),
               "live sequence identity and phase are visible");
         check(has(sequences, "1536") && has(sequences, "1500") && has(sequences, "strict"),
               "sequence position, KV occupancy, and determinism are visible");

@@ -9,7 +9,8 @@ namespace mm {
 void to_json(nlohmann::json& json, const PerformanceSample& sample) {
     json = {
         {"request_id", sample.request_id},
-        {"agent_id", sample.agent_id},
+        {"served_model_id", sample.served_model_id},
+        {"user_id", sample.user_id},
         {"node_id", sample.node_id},
         {"backend", sample.backend},
         {"model", sample.model},

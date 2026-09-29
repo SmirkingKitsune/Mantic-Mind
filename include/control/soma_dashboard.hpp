@@ -3,7 +3,7 @@
 // Mantic-Mind — the Soma dashboard's data source and layout.
 //
 // THE RULE THIS FILE EXISTS TO ENFORCE: every number a Soma panel shows arrives
-// over `/v1/*`. No panel reaches into NodeRegistry, AgentScheduler,
+// over `/v1/*`. No panel reaches into NodeRegistry, PlacementScheduler,
 // ControlModelRegistry, or an EngineSupervisor — not because in-process access
 // would be slower, but because a TUI that reads private state is a second client
 // with privileges no other client has, and it stops being evidence that the API
@@ -40,7 +40,7 @@ struct SomaEngineView {
     std::string backend; ///< "soma" | "llama-cpp"
     std::string state;   ///< Idle | Loading | Ready | Suspended | Error | ...
     std::string model_path;
-    std::vector<std::string> agent_ids;
+    std::vector<std::string> served_model_ids; ///< the holders attached to the engine
     std::uint64_t vram_usage_mb = 0;
     std::uint32_t effective_ctx_size = 0;
 
@@ -84,11 +84,11 @@ struct SomaHeatView {
 /// The per-sequence view an engine can report about itself, as distinct from
 /// the (node, slot) rows `GET /v1/engines` returns. Soma tracks real
 /// per-sequence state; llama.cpp does not, and the supervisor returns an empty
-/// list rather than synthesising one row per attached agent — a fabricated row
+/// list rather than synthesising one row per attached holder — a fabricated row
 /// looks like per-sequence data while carrying none.
 struct SomaSequenceView {
     std::uint32_t index = 0;
-    std::string agent_id;
+    std::string conversation; ///< the engine's session key; empty when none was sent
     std::uint32_t position = 0;
     std::uint32_t kv_tokens = 0;
     bool prefilling = false;

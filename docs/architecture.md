@@ -394,30 +394,31 @@ the default and adds `StdoutJsonLine` only because it costs nothing to declare.
 
 | Before | After | Why |
 |---|---|---|
-| `AgentScheduler` — *"VRAM-aware scheduler for llama.cpp agents"*, hard `is_llama_backend` gate that released the agent and returned `nullopt` | **`AgentScheduler`, rewritten in place** — backend-agnostic, verdict-driven, `ResourceFootprint{vram_mb, ram_mb, disk_mb}`. `resolve_backend()` returns `BackendRouting{engine_id, reason}`; the surviving `is_llama_backend` check now only separates node-local agents from API-backed ones, and Soma passes straight through it. | The gate was the first thing a Soma agent hit. Placement must select a backend, not assume one. **This row shipped into the existing class, not a new one** — see the note below. |
+| `AgentScheduler` — *"VRAM-aware scheduler for llama.cpp agents"*, hard `is_llama_backend` gate that released the agent and returned `nullopt` | **Rewritten in place, and since renamed `PlacementScheduler`** — backend-agnostic, verdict-driven, `ResourceFootprint{vram_mb, ram_mb, disk_mb}`. `resolve_backend()` returns `BackendRouting{engine_id, reason}`; the llama.cpp gate became `ServedModel::node_local()`, which separates node-served models from API-backed ones and nothing else, and Soma passes straight through it. | The gate was the first thing a Soma model hit. Placement must select a backend, not assume one. **This row shipped into the existing class, not a new one** — see the note below. |
 | `estimate_inference_vram_mb` — single-file `fs::file_size`, **2048 MB flat fallback for any directory** ([inference_sizing.cpp:87](../src/common/inference_sizing.cpp:87)) | `FootprintEstimator` — recursive directory sizing for the fallback path; for Soma the footprint is **read from `plan --json`, never estimated** | Every converted Soma model dir would otherwise size identically. This is also a live bug on the fallback path, since multi-shard HF dirs hit it. |
 | `nodes_with_available_vram(int64_t)` — ignores `disk_free_mb` despite the health poll collecting it | `nodes_with_capacity(ResourceFootprint)` — all three axes | Soma's footprint is RAM + disk + optional VRAM. A different shape, not a different number. |
 | `response_indicates_capacity_pressure` — substring-matches six English phrases against the node's error body | Structured `{"error":{"code":"capacity_pressure"}}` from both engines; the same function now reads the code as authoritative and keeps the six phrases only as a rolling-upgrade fallback | A new engine would otherwise have to reproduce those literals verbatim to get evict-and-retry. |
 | **No control-side database.** Only per-agent `agent.db`. | `control.db` — model registry, API tokens + scopes, placement history | The registry is the source of truth for the verdict, and the verdict drives everything. |
 | Flat bearer token, one `SetPreRoutingHandler`, no scope mechanism at all | Scope-annotated route table + `RouteScope` middleware: `read` / `chat` / `operator` | Admission kicks off hours-long, resource-consuming work. It must not sit behind the same token that lets a client send a chat message. Telemetry gets read-only. |
 | `SseEmitter` — dead code, zero call sites | **Deleted.** `SseInferCtx` for chat; new `TelemetryFeed` (coalescing, rate-limited) for tier/heat | |
-| `ModelRouter` — documented in `CLAUDE.md`, **does not exist** | Removed from the docs; `AgentScheduler::resolve_backend()` owns backend selection | Zero hits repo-wide. Routing actually lives in `resolve_openai_agent_model()`, `ensure_agent_running()`, and an anonymous-namespace `NodeProxyRuntimeClient`. |
-| `AgentQueue` — per-agent FIFO worker thread | **Retained, unchanged.** | See below. |
+| `ModelRouter` — documented in `CLAUDE.md`, **does not exist** | Removed from the docs; `PlacementScheduler::resolve_backend()` owns backend selection | Zero hits repo-wide. Routing lived, at the time, in `resolve_openai_agent_model()`, `ensure_agent_running()` and an anonymous-namespace `NodeProxyRuntimeClient` — none of which is a router anyone could find. |
+| `AgentQueue` — per-agent FIFO worker thread | **`ConversationQueue`** — one strand per conversation on a bounded pool. | The ordering guarantee is the same one, moved to what actually has mutable state now that a user has many conversations and a conversation has no fixed model. See below. |
 
-### 8.0 The "After" column landed in `AgentScheduler`, and `PlacementEngine` never existed
+### 8.0 The "After" column landed in the existing scheduler, and `PlacementEngine` never existed
 
 This table was written against a planned class called `PlacementEngine`, declared in
 `include/control/placement_engine.hpp`. **That header was never implemented, never included, and
 never named by any CMakeLists** — `grep -rn PlacementEngine --include=*.cpp` returned zero hits for
-its whole life. Every idea in it shipped anyway, into `AgentScheduler`:
+its whole life. Every idea in it shipped anyway, into the scheduler that already existed —
+`AgentScheduler`, since renamed `PlacementScheduler` because it places served models, not agents:
 
 | The header proposed | Where it actually lives |
 |---|---|
-| backend selection first, recorded with a reason | `AgentScheduler::BackendRouting{engine_id, reason}`, `resolve_backend()` / `resolve_backend_for()`, delegating to `soma::select_backend()` and keeping its `explain()` |
-| `ResourceFootprint{vram, ram, disk}`, disk a real constraint | `common/footprint.hpp`; `NodeRegistry::nodes_with_capacity(const ResourceFootprint&)`; disk headroom checked on every placement. Demand is now engine-shaped: `AgentScheduler::soma_footprint()` asks for RAM and no VRAM, so a CPU-only engine is placeable on a GPU-less node (D62). `disk_mb` is charged per node — the container's measured size, only to candidates whose reported `local_model_ids` lack it, via `nodes_with_capacity_for()` (D65) |
+| backend selection first, recorded with a reason | `PlacementScheduler::BackendRouting{engine_id, reason}`, `resolve_backend()` / `resolve_backend_for()`, delegating to `soma::select_backend()` and keeping its `explain()` |
+| `ResourceFootprint{vram, ram, disk}`, disk a real constraint | `common/footprint.hpp`; `NodeRegistry::nodes_with_capacity(const ResourceFootprint&)`; disk headroom checked on every placement. Demand is now engine-shaped: `PlacementScheduler::soma_footprint()` asks for RAM and no VRAM, so a CPU-only engine is placeable on a GPU-less node (D62). `disk_mb` is charged per node — the container's measured size, only to candidates whose reported `local_model_ids` lack it, via `nodes_with_capacity_for()` (D65) |
 | structured capacity pressure, not six English substrings | `{"error":{"code":"capacity_pressure"}}` from both engines, with the substring match kept only as a rolling-upgrade fallback for a pre-code node |
 | the two-mutex split, kept | `schedule_mutex_` / `state_mutex_`, unchanged |
-| suspend/restore promoted to `/v1` | `POST /v1/agents/{id}/{suspend,restore,release}` (roadmap D51) |
+| suspend/restore promoted to `/v1` | `POST /v1/served-models/{id}/{suspend,restore,release}` (roadmap D51) |
 
 So the header was deleted (roadmap D46) rather than implemented: it described the current design in
 the future tense, quoted a gate that no longer does what it said, and named a class that would have
@@ -426,18 +427,23 @@ design written only in a header that nothing compiles cannot be contradicted by 
 plausible indefinitely — and the suspend/restore gap it correctly identified sat open for exactly
 that reason, because being right in an uncompiled file fails nothing.
 
-### 8.1 `AgentQueue` stays, and the layering is deliberate
+### 8.1 The conversation queue stays, and the layering is deliberate
 
 It looks like the FIFO-in-front-of-a-single-sequence-engine that §4 exists to replace. It is not, and
 the distinction is worth stating once so it is not re-litigated:
 
-- `AgentQueue` serializes **one agent's own turns**. An agent is a conversation with mutable state;
-  two simultaneous turns on one agent is a semantic error regardless of engine capability.
-- Soma's `max_batch` is **intra-engine concurrency across different agents**.
+- `ConversationQueue` serializes **one conversation's own turns**. A conversation is state a turn
+  reads and writes — its history, its summary watermark, its notes — so two simultaneous turns on one
+  conversation is a semantic error regardless of engine capability.
+- Soma's `max_batch` is **intra-engine concurrency across different conversations**.
 
-They compose exactly: N agents with in-flight turns produce N rows in one union forward. The thing being
-removed is the assumption that the engine below can only do one sequence — not the per-agent ordering
-guarantee above.
+They compose exactly: N conversations with in-flight turns produce N rows in one union forward. The
+thing being removed is the assumption that the engine below can only do one sequence — not the
+per-conversation ordering guarantee above.
+
+It is keyed per CONVERSATION rather than per user, and that is the whole difference from `AgentQueue`:
+one user talking in two conversations is two independent streams of work, and serializing them behind
+one queue would have made a user a bottleneck the engine never asked for.
 
 ### 8.2 Verdict-driven backend selection
 
@@ -451,7 +457,8 @@ The registry `verdict` column is the source of truth:
 | `reject` | **Fallback** | Failed conformance stage 1 or 2 |
 | *no record* | **Fallback** | Absence of a record is not evidence of admissibility |
 
-Operator override is `backend_override: auto | soma | fallback`, **persistent on the agent**. A
+Operator override is `backend_override: auto | soma | fallback`, **persistent on the served
+model**. A
 per-placement override would evaporate on the next eviction cycle and read as a flapping bug. The
 decision and its reason are visible on `GET /v1/placements`.
 
@@ -516,7 +523,7 @@ The policy is both halves of the choice, because they answer different questions
 - **Default: accept and document.** Batching on, tokens vary with batch composition.
 - **`determinism: "strict"`** pins a sequence to a serialized single-row path with the single-row kernel
   family. Available as a **per-request field** on chat *and* as a `runtime_settings` field so a specific
-  agent can demand it permanently.
+  served model can demand it permanently.
 
 Per-request is what makes the tradeoff visible in the API surface rather than only in this document —
 which was the actual requirement.

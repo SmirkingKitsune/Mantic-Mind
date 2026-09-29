@@ -140,7 +140,12 @@ std::vector<NodeInfo> NodeRegistry::nodes_with_model(const std::string& model) c
 }
 
 bool NodeRegistry::placement_allowed_locked(const NodeInfo& n) const {
-    // The gate applies only when something is MANAGING engine conformance.
+    // Wire protocol first, and unconditionally: it is not engine policy but
+    // whether this node understands what control will send it. See
+    // kNodeWireProtocol.
+    if (!node_wire_compatible(n)) return false;
+
+    // The engine gate applies only when something is MANAGING engine conformance.
     //
     // Without an engine-config provider nothing ever pushes a configuration, so
     // no node can ever report `conforming` — gating anyway would mean a registry
@@ -277,6 +282,7 @@ bool engine_ready_for_placement(const NodeInfo& node,
                                 const std::string& engine_id,
                                 std::uint32_t config_version) {
     if (!node.connected || node.engine_config_version != config_version) return false;
+    if (!node_wire_compatible(node)) return false;
     const auto it = std::find_if(node.engines.begin(), node.engines.end(),
                                  [&](const RuntimeStatus& runtime) {
                                      return runtime.engine_id == engine_id;
@@ -713,6 +719,8 @@ bool NodeRegistry::ping_node(NodeInfo& info) {
                 info.conformance = sj["engine_conformance"].get<EngineConformance>();
             if (sj.contains("engine_config_version"))
                 info.engine_config_version = sj["engine_config_version"].get<std::uint32_t>();
+            // Absent means a node older than holder ids: protocol 1.
+            info.wire_protocol = sj.value("wire_protocol", 1);
 
             // Backfill occupancy counts when a node returns only raw slots.
             if (!sj.contains("slot_in_use")) {
@@ -804,6 +812,14 @@ void NodeRegistry::poll_all_nodes() {
                 it->second.engines = info.engines;
                 it->second.conformance = info.conformance;
                 it->second.engine_config_version = info.engine_config_version;
+                if (it->second.wire_protocol != info.wire_protocol &&
+                    !node_wire_compatible(info)) {
+                    // Said once, when it changes, rather than on every poll.
+                    MM_WARN("Node {} speaks wire protocol {} but this control speaks {}; "
+                            "nothing will be placed on it until both are upgraded",
+                            id, info.wire_protocol, kNodeWireProtocol);
+                }
+                it->second.wire_protocol = info.wire_protocol;
             }
             cb = update_cb_;
             provider = engine_config_provider_;

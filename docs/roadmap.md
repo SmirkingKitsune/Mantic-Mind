@@ -4518,6 +4518,111 @@ thin one: JSON parsing, role mapping, and turning a refusal into a 422.
 
 ---
 
+## Users replace agents, and a model stops being someone's property
+
+An **agent** was one record holding three unrelated things: how a model is served (weights, engine
+override, launch settings, API endpoint, node pin), a persona (name, system prompt, memory and tool
+toggles), and a private store (conversations, local memories, "global" memories that were really
+per-agent, attachments, voice). Changing which model answered meant editing the agent — so the
+conversations and the memories were tied to whichever weights happened to be answering, and one
+conversation could never use two models.
+
+The coupling was not confined to that record. The agent id was also the placement key, the KV suspend
+key, the request queue key, the placement-history key, the TTS voice key, and the model name `:9091`
+advertised. It reached the node wire: `load-model` took an `agent_id`. A design that started as "a
+persona owns its model" had become the cluster's primary key.
+
+**What replaced it.** Users own conversations, the notes taken in them, global memories and a voice.
+Served models are an operator's catalog, and a user picks one per turn — the request's model, else the
+conversation's, else the user's default. A model named by the request STICKS: it is saved on the
+conversation, so switching is one request rather than an update and a turn. Every assistant message
+records the model that wrote it.
+
+Four decisions were made before any code moved, and each closed off a large amount of plausible work:
+
+| Decision | Instead of |
+|---|---|
+| Admitted models appear automatically; the operator adds GGUF and remote-API entries on top | A catalog somebody has to populate to match the registry, and keep matching |
+| Start fresh; `data/agents/` is never read and is left on disk | An importer with a data model on each side of it |
+| Token binding is optional and narrowing only | Users as an auth system, with passwords and per-user model lists |
+| All five REST clients migrate | A compatibility shim that would have kept the agent shape alive in five codebases |
+
+**Done in three phases, on one branch.** Models first — the catalog, the scheduler rekeyed to holder
+ids, the node wire bumped to `wire_protocol: 2`, and `:9091` rewritten — with agents still working
+through a temporary adapter that made an agent look like a served model. Then the user layer, built
+and tested while nothing called it. Then the switch, which deleted the agent files and every
+`/v1/agents` route in one change, because a half-switched control plane has two answers for every
+question.
+
+### What the rewrite fixed on the way past
+
+- **Compaction by forking is gone.** It sent every old message to the summarizer in ONE prompt — which
+  overflows the moment a conversation moves to a model with a smaller window, and moving between models
+  is now the point — and then seeded a NEW conversation, leaving the id every client held pointing at a
+  dead end. Compaction is now rolling and in place: the longest recent tail that starts at a user turn
+  is kept, everything older is folded chunk by chunk with each call sized to fit the model doing the
+  folding, and the watermark is saved after every chunk so a failure part-way resumes.
+- **History is rewritten for the model about to read it.** Without vision, image parts become
+  `[image omitted: <file>]`; without tools, tool rounds fold into text. Nothing needed this while an
+  agent had one model for life. With switching, its absence would have made a conversation
+  unrecoverable the first time it touched a text-only model or Soma, which refuses a history carrying
+  `tool_calls` outright.
+- **Tools are offered and executed by the same rule.** Previously a model could emit a call to a tool
+  it was never given, and control would run it.
+- **Global recall works on Soma for the first time.** It always offered tools; Soma cannot take them,
+  so the feature had never once run there. It now has a JSON path for models that cannot call tools.
+- **`in_flight` is a count, incremented under the schedule lock.** Placements are shared by every user
+  on a model, so "busy" has to stay true until the last request finishes. The old code marked an agent
+  active AFTER `ensure_agent_running` returned, leaving a window in which the placement it had just
+  taken could be evicted. An epoch guard stops a released lease from decrementing its replacement, and
+  a changed launch setting now answers `draining` rather than detaching an engine under live requests.
+- **`:9091` is a passthrough.** It used to flatten a client's whole message array into one user turn in
+  an agent's own conversation, prepend that agent's history and memories, and drop `thinking` and
+  `tool_call` deltas — while advertising agents as models named `agent:{id}`. A client that owns its
+  conversation now gets the engine's answer, unchanged but for the model name, and nothing is stored.
+
+### What it turned up that nobody planned for
+
+**A refusal could be lost to a TCP reset.** `mm_openai_stateless` failed intermittently with status 0 —
+the signature of a request that never arrived. It arrived. The pre-routing handler refused it and
+closed the socket while the client was still writing the body, and the RST discarded the response the
+client had not read yet. Small refusals of a body already in flight are now deferred to the
+pre-request handler, which reads the body first. Verified with 12 consecutive clean runs; the flake
+had been read as a Windows loopback transport quirk, which is a real phenomenon in this suite and was
+the wrong explanation here.
+
+**GCC found dead code MSVC did not.** `control_ui.cpp` kept a `DragDivider` class — a local duplicate
+of `tui::resizable_divider` — that nothing used once the tabs moved into their own translation units.
+`-Werror=unused-function` named it; `/W4 /WX` did not. The same build also proved the shell had been
+holding a `PlacementScheduler&` and a `models_dir_` it never read.
+
+**`check_surface_parity.py` caught a capability being dropped, which is what it is for.** The old
+Curation tab could list, add, edit and delete a conversation's local memories and run memory
+extraction. The first cut of the Users tab had none of them, and the check said so, route by route,
+before anything shipped. The TUI mutation map shrank to the Nodes tab in the same change — users,
+chat, voice and models are HTTP clients in guarded translation units now — and both parity directions
+finished at **zero gaps**: 82 routes CLI-reachable with 8 exempt by reason, 78 TUI-reachable with 12.
+
+**A documented route survives a rewrite if nothing reads the docs.** `check_api_docs.py` refused the
+first version of the doc rewrite: the agent-era `POST /v1/agents/{id}/{suspend,restore,release}` and
+`GET /v1/agents/{id}` were still described, and so were the served-model routes that replaced them —
+the document had both, for routes that could not both exist. 71 routes are documented now, none of
+them a promise.
+
+### Where it stands
+
+Both toolchains build clean. The reliability suite is **98 tests**, up from 96 after deleting five
+agent-only tests and adding seven `users_http_*` ones: model switching mid-conversation with the
+placeholder and the tool gate, a bound token refused on another user, per-conversation ordering
+against a provider that holds each request until a second arrives, in-place compaction on a model a
+quarter the size, recall on a tool-less model, and two users sharing one placement with `in_flight: 2`
+and a 409 on suspend. Under WSL the suite still stops at `admission_fetch_stage` — the admission venv
+is Windows-only — so `mm_users_http` is registered as its own filtered ctest entry, the same way the
+lease tests are: a test that never runs on one toolchain is not covered there, whatever the summary
+line says.
+
+---
+
 ## Cross-cutting: CI from day one
 
 Established at G0, extended each gate. Current CI is 3 Release jobs invoking raw `cmake`, one CTest

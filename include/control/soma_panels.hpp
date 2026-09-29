@@ -4,8 +4,8 @@
 //
 // Separate from soma_dashboard.hpp so that FTXUI is not forced on everything that
 // wants the data types, and separate from control_ui.cpp because that file holds
-// `NodeRegistry&`, `AgentManager&` and `AgentScheduler&`. A panel written there
-// could read any of them without anyone noticing; a panel written here cannot,
+// `NodeRegistry&`. A panel written there could read it without anyone noticing;
+// a panel written here cannot,
 // and tools/ci/check_ui_api.py guards both this header and its .cpp.
 //
 // Everything below takes a SNAPSHOT rather than the dashboard, so each renderer
@@ -50,7 +50,7 @@ render_brain_grid(const SomaSnapshot& snap, std::uint32_t max_rows, std::uint32_
 /// declared and stubbed. Visible-and-zero is the honest rendering of that.
 ftxui::Element render_tier_bar(const SomaSnapshot& snap);
 
-/// Live sequences on the selected engine: agent, phase, KV occupancy, and
+/// Live sequences on the selected engine: conversation, phase, KV occupancy, and
 /// determinism. An engine with no sequence telemetry says so explicitly.
 ftxui::Element render_sequences(const SomaSnapshot& snap);
 

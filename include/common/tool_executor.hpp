@@ -6,13 +6,14 @@
 
 namespace mm {
 
-class AgentDB;
+class UserDB;
 
-// Server-side executor for agent memory tool calls.
-// Provides local tools (per-conversation) and global tools (cross-conversation).
+// Server-side executor for the memory tools of one user's conversations.
+// Local tools act on the current conversation's notes and nothing else; global
+// tools act on the user's memories.
 class ToolExecutor {
 public:
-    explicit ToolExecutor(AgentDB& db);
+    explicit ToolExecutor(UserDB& db);
 
     // Tool descriptions available to the model/UI when local tools are enabled.
     static std::vector<ToolDefinition> local_tool_catalog();
@@ -33,12 +34,12 @@ public:
     bool is_memory_tool(const std::string& function_name) const;
 
 private:
-    AgentDB& db_;
+    UserDB& db_;
 
     // Individual tool handlers — return JSON result string
     std::string handle_save_local_memory(const nlohmann::json& args, const ConvId& conv_id);
-    std::string handle_update_local_memory(const nlohmann::json& args);
-    std::string handle_delete_local_memory(const nlohmann::json& args);
+    std::string handle_update_local_memory(const nlohmann::json& args, const ConvId& conv_id);
+    std::string handle_delete_local_memory(const nlohmann::json& args, const ConvId& conv_id);
     std::string handle_list_local_memories(const ConvId& conv_id);
 
     std::string handle_save_global_memory(const nlohmann::json& args, const ConvId& conv_id);

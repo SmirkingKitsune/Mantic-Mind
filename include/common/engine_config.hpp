@@ -57,9 +57,9 @@ inline constexpr const char* kDefaultBackupEngine = "llama-cpp";
 ///
 /// Sampling remains per request in RuntimeSettings.  These values instead
 /// describe the process that must exist before a request can be served, which
-/// is why they belong beside the engine acquisition policy rather than on an
-/// agent.  `served_model_name` is intentionally absent: that is the existing
-/// AgentConfig alias and travels with the load request.
+/// is why they belong beside the engine acquisition policy rather than on a
+/// served model.  `served_model_name` is intentionally absent: that is the
+/// served model's engine_model_name and travels with the load request.
 struct VllmEngineConfig {
     int max_model_len = 4096;
     int max_num_seqs = 16;

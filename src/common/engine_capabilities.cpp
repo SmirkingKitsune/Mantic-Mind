@@ -13,13 +13,21 @@ bool engine_supports_vision(const std::string& engine_id) noexcept {
     return false; // unknown: refuse, see the header
 }
 
+bool engine_supports_tools(const std::string& engine_id, bool vllm_auto_tool_choice) noexcept {
+    // Closed list, for the reason engine_supports_vision gives.
+    if (engine_id == "llama-cpp") return true;
+    if (engine_id == "vllm") return vllm_auto_tool_choice;
+    if (engine_id == "soma") return false;
+    return false; // unknown: refuse, see the header
+}
+
 std::string image_refusal_for(bool profile_vision_enabled,
                               const std::string& engine_id,
                               const std::string& routing_reason) {
     // Profile first: it is the operator's own setting, so when it is off that is
     // the whole answer and naming an engine would only confuse it.
     if (!profile_vision_enabled) {
-        return "this agent profile does not accept images";
+        return "this model does not accept images: vision is not enabled in its configuration";
     }
     if (engine_id.empty()) {
         return {}; // API-backed; not ours to refuse
@@ -30,8 +38,8 @@ std::string image_refusal_for(bool profile_vision_enabled,
         // "soma" twice inside nested parentheses. Colon form, and let the reason
         // carry the name; the id is still there for anyone scanning.
         return routing_reason.empty()
-                   ? "the '" + engine_id + "' engine serving this agent does not accept images"
-                   : "the engine serving this agent does not accept images: " + routing_reason;
+                   ? "the '" + engine_id + "' engine serving this model does not accept images"
+                   : "the engine serving this model does not accept images: " + routing_reason;
     }
     return {};
 }

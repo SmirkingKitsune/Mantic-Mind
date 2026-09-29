@@ -711,8 +711,19 @@ void NodeUI::run() {
         show_node_tabs    = registered;
         auto metrics      = state_.get_metrics();
         auto loaded_model = state_.get_loaded_model();
-        auto active_agent = state_.get_active_agent();
         auto slots        = state_.get_slots();
+        // Who is holding this node's engines — served-model ids chosen by
+        // control. Several users share one holder, so this says which MODELS
+        // are in use here, not who is using them.
+        std::string holders_summary;
+        for (const auto& slot : slots) {
+            if (slot.state != SlotState::Ready) continue;
+            for (const auto& holder : slot.holder_ids) {
+                if (holders_summary.find(holder) != std::string::npos) continue;
+                if (!holders_summary.empty()) holders_summary += ", ";
+                holders_summary += holder;
+            }
+        }
         auto llama_rt     = state_.get_llama_runtime();
         slot_entries.clear();
         for (const auto& slot : slots)
@@ -963,7 +974,7 @@ void NodeUI::run() {
         });
         Elements status_rows = {
             field("model", text(loaded_model.empty() ? "(none)" : loaded_model) | bold),
-            field("agent", text(active_agent.empty() ? "(none)" : active_agent) | bold),
+            field("held by", text(holders_summary.empty() ? "(none)" : holders_summary) | bold),
             field("slots", std::move(slots_summary)),
             field("runtime", text(runtime_summary) | color(runtime_color)),
         };
@@ -1236,7 +1247,7 @@ void NodeUI::run() {
                                    color(Color::Yellow));
         if (!conformance_permits_placement(ev.conformance))
             cluster_rows.push_back(
-                text("Control will not place agents here until this node conforms.") |
+                text("Control will not place models here until this node conforms.") |
                 color(Color::Yellow));
 
         // Every engine this node can provision, including ones the cluster did
@@ -1355,7 +1366,7 @@ void NodeUI::run() {
             panel("LOCAL MODELS", vbox(std::move(local_model_rows))),
             panel("SLOTS", vbox({
                 slot_menu->Render() | yframe | flex,
-                text("Slot lifecycle is managed by Mantic-Mind-Control's agent scheduler.") | dim,
+                text("Slot lifecycle is managed by Mantic-Mind-Control's placement scheduler.") | dim,
             })) | flex,
         });
         Element overview_page = vbox({top_region, row_divider->Render(), log_panel});

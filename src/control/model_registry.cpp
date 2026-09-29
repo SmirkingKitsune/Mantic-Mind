@@ -9,7 +9,7 @@
 // evidence of admissibility. This table is what lets a model be evidence.
 //
 // Schema in schemas/registry/001_init.sql. Migrations follow
-// AgentDB::run_migrations() exactly — a schema_migrations table and one
+// UserDB::run_migrations() exactly — a schema_migrations table and one
 // `if (!has_version(N)) { Transaction; DDL; INSERT N; commit; }` block per
 // version. That pattern works; there was no reason to invent a second one.
 
@@ -493,6 +493,76 @@ struct ControlModelRegistry::Impl {
             db->exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (3)");
             tx.commit();
         }
+
+        if (!has_version(4)) {
+            SQLite::Transaction tx(*db);
+            // Models stop belonging to agents.
+            //
+            // `served_model` is the operator's catalog: what a user may pick, and
+            // how it is served. It holds only the rows an operator WROTE. The
+            // admitted models Soma can serve are computed from `model` at read
+            // time (ServedModelCatalog) and never copied here, so the two cannot
+            // drift and deleting an admission cannot leave a phantom entry.
+            //
+            // `api_key` is deliberately absent from api_json, as it was from
+            // agent_config: a secret is process memory or an environment
+            // variable, never a row in a database that gets backed up.
+            //
+            // Code-only, like v2 and v3. A lone 004_*.sql beside 001_init.sql
+            // would fail the soma.yml schema check, which requires the .sql
+            // files to number contiguously from 1.
+            db->exec(R"(
+                CREATE TABLE IF NOT EXISTS served_model (
+                    id                TEXT    NOT NULL PRIMARY KEY,
+                    display_name      TEXT    NOT NULL DEFAULT '',
+                    model_path        TEXT    NOT NULL,
+                    inference_backend TEXT    NOT NULL DEFAULT 'node'
+                                      CHECK (inference_backend IN ('node', 'api')),
+                    backend_override  TEXT    NOT NULL DEFAULT 'auto'
+                                      CHECK (backend_override IN ('auto', 'soma', 'fallback')),
+                    engine_model_name TEXT    NOT NULL DEFAULT '',
+                    runtime_json      TEXT    NOT NULL DEFAULT '{}',
+                    api_json          TEXT    NOT NULL DEFAULT '{}',
+                    vision_json       TEXT    NOT NULL DEFAULT '{}',
+                    tool_calling      INTEGER NOT NULL DEFAULT 1,
+                    preferred_node_id TEXT    NOT NULL DEFAULT '',
+                    enabled           INTEGER NOT NULL DEFAULT 1,
+                    created_at        INTEGER NOT NULL,
+                    updated_at        INTEGER NOT NULL
+                ))");
+
+            // A token may be bound to one user. NULL is unbound, which is every
+            // token minted before this migration and exactly what they meant.
+            // No foreign key is possible: users live in per-user databases,
+            // not here, so deleting a user revokes its tokens explicitly.
+            db->exec("ALTER TABLE api_token ADD COLUMN user_id TEXT");
+            db->exec("CREATE INDEX IF NOT EXISTS idx_token_user "
+                     "ON api_token(user_id) WHERE user_id IS NOT NULL");
+
+            // Placements are now keyed by HOLDER (a served-model id), not by
+            // agent. The agent-era rows are renamed aside rather than
+            // reinterpreted or dropped: an agent id is not a served-model id,
+            // and existing data is left untouched rather than migrated.
+            db->exec("ALTER TABLE placement_history RENAME TO placement_history_agents_v1");
+            db->exec(R"(
+                CREATE TABLE IF NOT EXISTS placement_history (
+                    id              INTEGER PRIMARY KEY,
+                    served_model_id TEXT    NOT NULL,
+                    node_id         TEXT    NOT NULL,
+                    slot_id         TEXT    NOT NULL,
+                    model_id        INTEGER REFERENCES model(id) ON DELETE SET NULL,
+                    backend         TEXT    NOT NULL,
+                    backend_reason  TEXT    NOT NULL,
+                    footprint_json  TEXT    NOT NULL,
+                    placed_at       INTEGER NOT NULL,
+                    released_at     INTEGER
+                ))");
+            db->exec("CREATE INDEX IF NOT EXISTS idx_placement_holder "
+                     "ON placement_history(served_model_id, placed_at DESC)");
+
+            db->exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (4)");
+            tx.commit();
+        }
     }
 
     static AdmittedModel read_row(SQLite::Statement& q) {
@@ -936,7 +1006,7 @@ bool ControlModelRegistry::remove(std::int64_t id, std::string& out_error) {
     }
 }
 
-void ControlModelRegistry::record_placement(const AgentId& agent_id,
+void ControlModelRegistry::record_placement(const std::string& holder_id,
                                             const NodeId& node_id,
                                             const SlotId& slot_id,
                                             const std::string& backend,
@@ -947,11 +1017,11 @@ void ControlModelRegistry::record_placement(const AgentId& agent_id,
     try {
         SQLite::Statement q(*impl_->db, R"(
             INSERT INTO placement_history
-                (agent_id, node_id, slot_id, backend, backend_reason,
+                (served_model_id, node_id, slot_id, backend, backend_reason,
                  footprint_json, placed_at)
             VALUES (?,?,?,?,?,?,?)
         )");
-        q.bind(1, agent_id);
+        q.bind(1, holder_id);
         q.bind(2, node_id);
         q.bind(3, slot_id);
         q.bind(4, backend);
@@ -970,21 +1040,21 @@ void ControlModelRegistry::record_placement(const AgentId& agent_id,
     }
 }
 
-void ControlModelRegistry::mark_placement_released(const AgentId& agent_id) {
+void ControlModelRegistry::mark_placement_released(const std::string& holder_id) {
     std::lock_guard<std::mutex> lk(impl_->mu);
     if (!impl_->db) return;
     try {
-        // The most recent OPEN row only. An agent placed, released, and placed
-        // again has two rows; stamping by agent alone would close the older one
+        // The most recent OPEN row only. A holder placed, released, and placed
+        // again has two rows; stamping by holder alone would close the older one
         // a second time and lose the first placement's duration.
         SQLite::Statement q(*impl_->db, R"(
             UPDATE placement_history SET released_at = ?
              WHERE id = (SELECT id FROM placement_history
-                          WHERE agent_id = ? AND released_at IS NULL
+                          WHERE served_model_id = ? AND released_at IS NULL
                           ORDER BY placed_at DESC LIMIT 1)
         )");
         q.bind(1, util::now_ms());
-        q.bind(2, agent_id);
+        q.bind(2, holder_id);
         q.exec();
     } catch (const std::exception& e) {
         // Same rule as the insert: an audit row must never fail the operation
@@ -993,8 +1063,8 @@ void ControlModelRegistry::mark_placement_released(const AgentId& agent_id) {
     }
 }
 
-std::vector<PlacementHistoryEntry> ControlModelRegistry::placement_history(const AgentId& agent_id,
-                                                                           int limit) const {
+std::vector<PlacementHistoryEntry> ControlModelRegistry::placement_history(
+    const std::string& holder_id, int limit) const {
     std::vector<PlacementHistoryEntry> out;
     std::lock_guard<std::mutex> lk(impl_->mu);
     if (!impl_->db) return out;
@@ -1004,11 +1074,11 @@ std::vector<PlacementHistoryEntry> ControlModelRegistry::placement_history(const
             SELECT node_id, slot_id, backend, backend_reason, footprint_json,
                    placed_at, released_at
               FROM placement_history
-             WHERE agent_id = ?
+             WHERE served_model_id = ?
              ORDER BY placed_at DESC
              LIMIT ?
         )");
-        q.bind(1, agent_id);
+        q.bind(1, holder_id);
         q.bind(2, limit);
         while (q.executeStep()) {
             PlacementHistoryEntry e;
@@ -1039,11 +1109,163 @@ std::vector<PlacementHistoryEntry> ControlModelRegistry::placement_history(const
     return out;
 }
 
+// ── served models ─────────────────────────────────────────────────────────────
+
+namespace {
+
+ServedModel read_served_model(SQLite::Statement& q) {
+    ServedModel m;
+    m.id = q.getColumn(0).getString();
+    m.display_name = q.getColumn(1).getString();
+    m.model_path = q.getColumn(2).getString();
+    m.inference_backend = q.getColumn(3).getString();
+    m.backend_override = q.getColumn(4).getString();
+    m.engine_model_name = q.getColumn(5).getString();
+    // A malformed blob keeps the defaults for that block rather than failing
+    // the whole catalog: one bad row must not hide every other model.
+    const auto parse = [](const std::string& text) {
+        return nlohmann::json::parse(text, nullptr, /*allow_exceptions=*/false);
+    };
+    try {
+        if (const auto j = parse(q.getColumn(6).getString()); j.is_object())
+            j.get_to(m.runtime_settings);
+        if (const auto j = parse(q.getColumn(7).getString()); j.is_object())
+            j.get_to(m.api_settings);
+        if (const auto j = parse(q.getColumn(8).getString()); j.is_object())
+            j.get_to(m.vision_settings);
+    } catch (const std::exception& e) {
+        MM_WARN("served_model '{}': unreadable settings block: {}", m.id, e.what());
+    }
+    m.api_settings.api_key.clear(); // never stored; belt and braces on the way out
+    m.tool_calling = q.getColumn(9).getInt() != 0;
+    m.preferred_node_id = q.getColumn(10).getString();
+    m.enabled = q.getColumn(11).getInt() != 0;
+    m.created_at_ms = q.getColumn(12).getInt64();
+    m.updated_at_ms = q.getColumn(13).getInt64();
+    return m;
+}
+
+constexpr const char* kServedModelColumns =
+    "id, display_name, model_path, inference_backend, backend_override, "
+    "engine_model_name, runtime_json, api_json, vision_json, tool_calling, "
+    "preferred_node_id, enabled, created_at, updated_at";
+
+} // namespace
+
+std::vector<ServedModel> ControlModelRegistry::list_served_models() const {
+    std::vector<ServedModel> out;
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    if (!impl_->db) return out;
+    try {
+        SQLite::Statement q(*impl_->db, std::string("SELECT ") + kServedModelColumns +
+                                            " FROM served_model ORDER BY id");
+        while (q.executeStep()) out.push_back(read_served_model(q));
+    } catch (const std::exception& e) {
+        MM_WARN("ControlModelRegistry::list_served_models: {}", e.what());
+    }
+    return out;
+}
+
+std::optional<ServedModel> ControlModelRegistry::find_served_model(const std::string& id) const {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    if (!impl_->db || id.empty()) return std::nullopt;
+    try {
+        SQLite::Statement q(*impl_->db, std::string("SELECT ") + kServedModelColumns +
+                                            " FROM served_model WHERE id = ?");
+        q.bind(1, id);
+        if (q.executeStep()) return read_served_model(q);
+    } catch (const std::exception& e) {
+        MM_WARN("ControlModelRegistry::find_served_model: {}", e.what());
+    }
+    return std::nullopt;
+}
+
+bool ControlModelRegistry::upsert_served_model(const ServedModel& model, std::string& out_error) {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    if (!impl_->db) {
+        out_error = "registry is not open";
+        return false;
+    }
+    if (model.id.empty()) {
+        out_error = "a served model needs an id";
+        return false;
+    }
+    try {
+        // The key is omitted by construction: ApiSettings serializes only
+        // whether one is configured, and that flag is meaningless at rest.
+        nlohmann::json api = model.api_settings;
+        api.erase("api_key_configured");
+        const auto now = util::now_ms();
+        SQLite::Statement q(*impl_->db, R"(
+            INSERT INTO served_model
+                (id, display_name, model_path, inference_backend, backend_override,
+                 engine_model_name, runtime_json, api_json, vision_json, tool_calling,
+                 preferred_node_id, enabled, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET
+                display_name      = excluded.display_name,
+                model_path        = excluded.model_path,
+                inference_backend = excluded.inference_backend,
+                backend_override  = excluded.backend_override,
+                engine_model_name = excluded.engine_model_name,
+                runtime_json      = excluded.runtime_json,
+                api_json          = excluded.api_json,
+                vision_json       = excluded.vision_json,
+                tool_calling      = excluded.tool_calling,
+                preferred_node_id = excluded.preferred_node_id,
+                enabled           = excluded.enabled,
+                updated_at        = excluded.updated_at
+        )");
+        q.bind(1, model.id);
+        q.bind(2, model.display_name);
+        q.bind(3, model.model_path);
+        q.bind(4, model.inference_backend);
+        q.bind(5, model.backend_override);
+        q.bind(6, model.engine_model_name);
+        q.bind(7, nlohmann::json(model.runtime_settings).dump());
+        q.bind(8, api.dump());
+        q.bind(9, nlohmann::json(model.vision_settings).dump());
+        q.bind(10, model.tool_calling ? 1 : 0);
+        q.bind(11, model.preferred_node_id);
+        q.bind(12, model.enabled ? 1 : 0);
+        q.bind(13, model.created_at_ms > 0 ? model.created_at_ms : now);
+        q.bind(14, now);
+        q.exec();
+        return true;
+    } catch (const std::exception& e) {
+        // The CHECK constraints are the last line: a backend or override the
+        // validator did not catch is refused here rather than stored.
+        out_error = e.what();
+        return false;
+    }
+}
+
+bool ControlModelRegistry::delete_served_model(const std::string& id, std::string& out_error) {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    if (!impl_->db) {
+        out_error = "registry is not open";
+        return false;
+    }
+    try {
+        SQLite::Statement q(*impl_->db, "DELETE FROM served_model WHERE id = ?");
+        q.bind(1, id);
+        if (q.exec() == 0) {
+            out_error = "no served model with id '" + id + "'";
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        out_error = e.what();
+        return false;
+    }
+}
+
 // ── api tokens ────────────────────────────────────────────────────────────────
 
 std::string ControlModelRegistry::create_api_token(const std::string& label,
                                                    std::uint8_t scopes,
-                                                   std::string& out_error) {
+                                                   std::string& out_error,
+                                                   const std::string& user_id) {
     if (scopes == 0) {
         out_error = "a token with no scopes can do nothing; refusing to mint one";
         return {};
@@ -1059,19 +1281,22 @@ std::string ControlModelRegistry::create_api_token(const std::string& label,
     const auto secret = pairing::generate_nonce(32);
     try {
         SQLite::Statement q(*impl_->db,
-                            "INSERT INTO api_token(token_sha256, label, scopes, created_at) "
-                            "VALUES (?,?,?,?)");
+                            "INSERT INTO api_token(token_sha256, label, scopes, created_at, "
+                            "user_id) VALUES (?,?,?,?,?)");
         q.bind(1, pairing::sha256_hex(secret));
         q.bind(2, label.empty() ? std::string("unnamed") : label);
         q.bind(3, format_scopes(scopes));
         q.bind(4, util::now_ms());
+        if (user_id.empty()) q.bind(5); // NULL: unbound
+        else q.bind(5, user_id);
         q.exec();
     } catch (const std::exception& e) {
         out_error = e.what();
         return {};
     }
-    MM_INFO("ControlModelRegistry: minted api token '{}' with scopes [{}]",
-            label, format_scopes(scopes));
+    MM_INFO("ControlModelRegistry: minted api token '{}' with scopes [{}]{}",
+            label, format_scopes(scopes),
+            user_id.empty() ? std::string{} : " bound to user '" + user_id + "'");
     return secret;
 }
 
@@ -1080,9 +1305,9 @@ bool ControlModelRegistry::find_api_token(const std::string& token_sha256, ApiTo
     if (!impl_->db || token_sha256.empty()) return false;
     try {
         SQLite::Statement q(*impl_->db,
-                            "SELECT id, token_sha256, label, scopes, created_at, last_used_at "
-                            "FROM api_token WHERE token_sha256 = ? AND revoked_at IS NULL "
-                            "LIMIT 1");
+                            "SELECT id, token_sha256, label, scopes, created_at, last_used_at, "
+                            "user_id FROM api_token WHERE token_sha256 = ? AND "
+                            "revoked_at IS NULL LIMIT 1");
         q.bind(1, token_sha256);
         if (!q.executeStep()) return false;
         out.id = q.getColumn(0).getInt64();
@@ -1091,6 +1316,7 @@ bool ControlModelRegistry::find_api_token(const std::string& token_sha256, ApiTo
         (void)parse_scopes(q.getColumn(3).getText(), out.scopes);
         out.created_at_ms = q.getColumn(4).getInt64();
         out.last_used_at_ms = q.getColumn(5).getInt64();
+        out.user_id = q.getColumn(6).isNull() ? std::string{} : q.getColumn(6).getString();
         out.revoked = false;
 
         // Best-effort: a failed last_used update must not fail the request that
@@ -1116,7 +1342,7 @@ std::vector<ApiToken> ControlModelRegistry::list_api_tokens() const {
     try {
         SQLite::Statement q(*impl_->db,
                             "SELECT id, token_sha256, label, scopes, created_at, last_used_at, "
-                            "revoked_at FROM api_token ORDER BY id");
+                            "revoked_at, user_id FROM api_token ORDER BY id");
         while (q.executeStep()) {
             ApiToken t;
             t.id = q.getColumn(0).getInt64();
@@ -1128,6 +1354,7 @@ std::vector<ApiToken> ControlModelRegistry::list_api_tokens() const {
             t.created_at_ms = q.getColumn(4).getInt64();
             t.last_used_at_ms = q.getColumn(5).getInt64();
             t.revoked = !q.getColumn(6).isNull();
+            t.user_id = q.getColumn(7).isNull() ? std::string{} : q.getColumn(7).getString();
             out.push_back(std::move(t));
         }
     } catch (const std::exception& e) {
@@ -1158,6 +1385,25 @@ bool ControlModelRegistry::revoke_api_token(std::int64_t id, std::string& out_er
     } catch (const std::exception& e) {
         out_error = e.what();
         return false;
+    }
+}
+
+int ControlModelRegistry::revoke_tokens_for_user(const std::string& user_id) {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    if (!impl_->db || user_id.empty()) return 0;
+    try {
+        // A deleted user's bound tokens would otherwise keep authorizing against
+        // a namespace that no longer exists — and against a NEW user created
+        // later under the same id, which is worse.
+        SQLite::Statement q(*impl_->db,
+                            "UPDATE api_token SET revoked_at = ? WHERE user_id = ? AND "
+                            "revoked_at IS NULL");
+        q.bind(1, util::now_ms());
+        q.bind(2, user_id);
+        return q.exec();
+    } catch (const std::exception& e) {
+        MM_WARN("ControlModelRegistry::revoke_tokens_for_user: {}", e.what());
+        return 0;
     }
 }
 

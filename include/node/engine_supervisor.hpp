@@ -10,7 +10,7 @@
 // KV backend, and capability probe from it.
 //
 // What is deliberately KEPT from SlotManager, because it was right:
-//   * multi-agent sharing of one live process, gated on launch compatibility
+//   * several holders sharing one live process, gated on launch compatibility
 //   * RAII request leases (active_requests, so a busy engine is not evicted)
 //   * port allocation with a bind probe
 //   * suspended engines not counting against capacity
@@ -52,7 +52,7 @@ struct EngineOpResult {
 struct DetachResult {
     EngineOpStatus status = EngineOpStatus::Failed;
     std::string message;
-    int remaining_agents = 0;
+    int remaining_holders = 0;
     bool unloaded = false;
 
     bool ok() const { return status == EngineOpStatus::Ok; }
@@ -66,7 +66,9 @@ struct DetachResult {
 /// a saturated batch look identical from a request counter.
 struct SequenceInfo {
     std::uint32_t index = 0;
-    std::string agent_id;
+    /// The engine's session key. Soma keys sessions by the client's
+    /// conversation; nothing sends one yet, so this is usually empty.
+    std::string conversation;
     std::uint32_t position = 0;
     std::uint32_t kv_tokens = 0;
     bool prefilling = false;
@@ -117,10 +119,10 @@ public:
     /// replaces.
     SlotId load(const std::string& engine_id,
                 const EngineLoadRequest& request,
-                const AgentId& agent_id = {});
+                const HolderId& holder_id = {});
 
     EngineOpResult unload(const SlotId& slot_id);
-    DetachResult detach_agent(const SlotId& slot_id, const AgentId& agent_id);
+    DetachResult detach_holder(const SlotId& slot_id, const HolderId& holder_id);
     EngineOpResult unload_all(bool force = true);
 
     /// Stop every child process, keeping the records and their clients.
@@ -147,11 +149,11 @@ public:
     SlotId restore(const std::string& engine_id,
                    const EngineLoadRequest& request,
                    const std::string& kv_checkpoint_path,
-                   const AgentId& agent_id = {});
+                   const HolderId& holder_id = {});
 
     Lease acquire(const SlotId& slot_id);
     bool touch(const SlotId& slot_id);
-    std::optional<SlotId> find_by_agent(const AgentId& agent_id) const;
+    std::optional<SlotId> find_by_holder(const HolderId& holder_id) const;
 
     std::vector<SlotInfo> slots() const;
     std::optional<SlotInfo> find(const SlotId& slot_id) const;
@@ -187,7 +189,7 @@ public:
     /// have nothing to do with inference.
     SlotId add_ready_test_engine(const std::string& engine_id = "llama-cpp",
                                  std::string model_path = "model.gguf",
-                                 AgentId agent_id = {},
+                                 HolderId holder_id = {},
                                  RuntimeSettings settings = {},
                                  std::string mmproj_path = {});
 
@@ -199,7 +201,7 @@ public:
     /// suspend() succeed without a checkpoint would not be.
     SlotId add_suspended_test_engine(const std::string& engine_id = "llama-cpp",
                                      std::string model_path = "model.gguf",
-                                     AgentId agent_id = {},
+                                     HolderId holder_id = {},
                                      RuntimeSettings settings = {});
 
     /// Drive a record through the real crash path.
@@ -224,7 +226,7 @@ private:
 
         std::string model_path;
         std::string mmproj_path;
-        std::vector<AgentId> agents;
+        std::vector<HolderId> holders;
         RuntimeSettings launch_settings;
         EngineLoadRequest launch_request;
         std::string kv_checkpoint_path;
@@ -283,7 +285,7 @@ private:
     void on_engine_crash(const SlotId& slot_id, int exit_code, const std::string& detail);
     std::optional<SlotId> try_attach(const std::string& engine_id,
                                      const EngineLoadRequest& request,
-                                     const AgentId& agent_id);
+                                     const HolderId& holder_id);
     std::optional<std::uint16_t> allocate_port();
     void release_port(std::uint16_t port);
     SlotInfo make_slot_info(const Engine& engine) const;

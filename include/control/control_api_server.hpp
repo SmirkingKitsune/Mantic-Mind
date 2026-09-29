@@ -1,9 +1,11 @@
 #pragma once
 
 #include "common/models.hpp"
+#include "common/served_model.hpp"
 #include "control/route_scope.hpp"
 #include "control/performance_tracker.hpp"
 #include "control/tts_service_client.hpp"
+#include <chrono>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -16,34 +18,44 @@ namespace httplib { struct Request; struct Response; }
 
 namespace mm {
 
-class AgentManager;
-class AgentQueue;
+class UserManager;
 class NodeRegistry;
-class AgentScheduler;
+class PlacementScheduler;
 class HttpServer;
 class EngineConfigStore;
-
-// Hosts the external REST + SSE API for mantic-mind-control (see plan §REST API).
-// Also hosts the node registration endpoint (/api/control/register-node).
 class ControlModelRegistry;
+class ServedModelCatalog;
+class ConversationQueue;
 
+// Hosts the external REST + SSE API for mantic-mind-control (see
+// docs/external-api.md), and the node registration endpoint
+// (/api/control/register-node).
+//
+// Its member functions live in several translation units, by surface:
+//   control_api_server.cpp   nodes, cluster, admissions, tokens, telemetry
+//   served_model_routes.cpp  /v1/served-models
+//   user_routes.cpp          /v1/users/…, /v1/audio/speech
+//   chat_pipeline.cpp        one user turn, recall, extraction, compaction
+//   openai_compat.cpp        the stateless :9091 listener
 class ControlApiServer {
 public:
     struct LocalChatResult {
         bool                     success = false;
         std::string              conv_id;
+        std::string              model_id;
         std::string              error;
+        std::string              code;
         std::vector<InferenceChunk> chunks;
     };
 
-    ControlApiServer(AgentManager& agents,
-                     AgentQueue& queue,
+    ControlApiServer(UserManager& users,
                      NodeRegistry& registry,
-                     AgentScheduler& scheduler,
+                     PlacementScheduler& scheduler,
                      std::string data_dir,
                      std::string models_dir,
                      std::string external_api_token = {},
-                     TtsServiceConfig tts_config = {});
+                     TtsServiceConfig tts_config = {},
+                     std::size_t chat_workers = 16);
     ~ControlApiServer();
 
     bool listen(uint16_t port);
@@ -57,11 +69,15 @@ public:
     void set_log_callback(LogCallback cb);
     void publish_activity(int level, const std::string& message);
 
-    // In-process chat path for local tooling when loopback HTTP is unavailable.
-    // max_tokens_override != 0 replaces the agent's configured max_tokens for this request.
-    LocalChatResult chat_local(const AgentId& agent_id,
+    /// In-process chat for local tooling (the CLI and the TUI): the same turn
+    /// as POST /v1/users/:id/chat, on the same per-conversation queue, so a
+    /// local turn cannot overlap an HTTP one on the same conversation.
+    /// `model` empty: the conversation's, else the user's default.
+    /// `max_tokens_override` != 0 replaces the model's max_tokens for this turn.
+    LocalChatResult chat_local(const UserId& user_id,
                                const std::string& message,
-                               const ConvId& conv_id_hint = {},
+                               const ConvId& conv_id = {},
+                               const std::string& model = {},
                                int max_tokens_override = 0,
                                const std::vector<std::string>& attachment_ids = {});
 
@@ -80,30 +96,109 @@ public:
     /// build has no configurator" are different facts.
     void set_engine_config_store(EngineConfigStore* store) { engine_config_ = store; }
 
-private:
-    /// Why this agent cannot be sent an image, or empty if it can.
-    ///
-    /// TWO conditions, and only one of them used to be checked. The profile's
-    /// `vision_settings.enabled` is the operator's intent; whether the ENGINE
-    /// that will serve the agent can accept an image is a separate fact, and an
-    /// agent with vision switched on whose model earned a streamable verdict
-    /// routes to Soma, which is text-only. Nothing caught that, so the image
-    /// part travelled to an engine that would never look at it (roadmap D12).
-    ///
-    /// One function because there are four call sites — the OpenAI-compat route,
-    /// the SSE chat route, its attachment path, and the local chat helper — and
-    /// four copies of a two-part rule is how the first part came to be checked
-    /// everywhere and the second part nowhere.
-    std::string image_refusal(const AgentConfig& cfg) const;
+    /// The served-model catalog backing /v1/served-models and every user turn.
+    /// Optional; when unset those routes answer 503 and a turn fails with
+    /// `catalog_unavailable`.
+    void set_served_model_catalog(ServedModelCatalog* catalog) { served_models_ = catalog; }
 
-    AgentManager&   agents_;
-    AgentQueue&     queue_;
+private:
+    /// A served model bound for one piece of work: the placement it holds (for
+    /// a node model), a client to call it through, the name its engine knows it
+    /// by, and what the engine it landed on can take. Defined in
+    /// chat_pipeline.cpp; only the pipeline binds.
+    struct BoundModel;
+
+    /// Place (node) or connect (API) a served model. The lease the result holds
+    /// keeps the placement from being evicted until the result is destroyed.
+    /// Waits up to `wait` for capacity that is only temporarily missing. On
+    /// failure, `error` says why and `code` is the placement failure (or
+    /// `node_unavailable`).
+    std::unique_ptr<BoundModel> bind_model(const ServedModel& model,
+                                           std::chrono::milliseconds wait,
+                                           std::string& error,
+                                           std::string& code);
+
+    /// One user turn, as the chat route and chat_local submit it. The
+    /// conversation is resolved (or created) BEFORE the turn is queued, so the
+    /// queue key is known and two first turns cannot create two conversations.
+    struct ChatTurnRequest {
+        UserId user_id;
+        ConvId conv_id;
+        std::string message;
+        std::vector<MessageContentPart> parts;
+        std::string model;            ///< the request's; empty defers
+        SamplingOverrides settings;   ///< the request's; over the conversation's
+        int max_tokens_override = 0;
+    };
+    struct TurnOutcome {
+        bool ok = false;
+        std::string error;
+        std::string code;     ///< machine-readable, on failure
+        std::string model_id; ///< the model that answered (or would have)
+    };
+    using ChunkCb = std::function<void(const InferenceChunk&)>;
+    using TurnDoneCb = std::function<void(const ConvId&, const TurnOutcome&)>;
+
+    /// Runs on the conversation's strand of `conversations_`.
+    void run_chat_turn(const ChatTurnRequest& turn, ChunkCb chunk_cb, TurnDoneCb done_cb);
+
+    /// The strand a conversation's work runs on.
+    static std::string queue_key(const UserId& user_id, const ConvId& conv_id);
+
+    /// Run `fn` on the conversation's strand and wait for it. False when the
+    /// queue is shutting down and `fn` never ran.
+    bool run_on_conversation(const UserId& user_id,
+                             const ConvId& conv_id,
+                             std::function<void()> fn);
+
+    /// Review a conversation that stopped being active for global memories, on
+    /// its own strand. With a model that can call tools the memory tools do the
+    /// work; with one that cannot (Soma), the model answers in JSON instead.
+    void queue_global_recall(const UserId& user_id, const ConvId& conv_id);
+    void run_global_recall(const UserId& user_id, const ConvId& conv_id);
+
+    /// Extract global memories from messages [begin_seq, end_seq] of a
+    /// conversation with `model`, on the conversation's strand.
+    void queue_extraction(const UserId& user_id,
+                          const ConvId& conv_id,
+                          int begin_seq,
+                          int end_seq,
+                          const ServedModel& model);
+
+    struct CompactOutcome {
+        int status = 200;
+        std::string state;  ///< CompactionResult status, or the failure
+        std::string error;
+        std::string code;
+        std::string model_id;
+    };
+    /// A forced fold of one conversation, on its strand. `model` empty: the
+    /// conversation's, else the user's default.
+    CompactOutcome compact_now(const UserId& user_id,
+                               const ConvId& conv_id,
+                               const std::string& model);
+
+    /// Model-designed voice proposal for a user. `model` empty: the user's
+    /// default. nullopt with `error` on failure.
+    std::optional<VoiceDesignProposal> infer_voice_design(const UserId& user_id,
+                                                          const std::string& model,
+                                                          std::string& error);
+
+    /// The catalog entry a model id resolves to, for a turn or a background job.
+    std::optional<ServedModel> available_model(const std::string& id, std::string& error,
+                                               std::string& code) const;
+
+    /// The served model a placement holder stands for, when it still exists.
+    std::optional<ServedModel> served_model_for_holder(const HolderId& holder_id) const;
+
+    UserManager&    users_;
     NodeRegistry&   registry_;
-    AgentScheduler& scheduler_;
+    PlacementScheduler& scheduler_;
     /// Optional. When absent every /v1/models route answers 503 rather than
     /// pretending an empty registry, because "no models admitted" and "the
     /// registry never opened" are different facts and only one is actionable.
     ControlModelRegistry* models_ = nullptr;
+    ServedModelCatalog*   served_models_ = nullptr;
     EngineConfigStore*    engine_config_ = nullptr;
     /// Scoped authorization for /v1/*. Replaces the flat-token comparison that
     /// used to live in authorize_external_request().
@@ -115,20 +210,40 @@ private:
     std::unique_ptr<HttpServer> server_;
     PerformanceTracker performance_;
     std::unique_ptr<HttpServer> openai_server_;
+    /// Every user's work: turns, recall, extraction, compaction, deletes.
+    /// One strand per conversation on a bounded pool (chat_worker_threads).
+    std::unique_ptr<ConversationQueue> conversations_;
     LogCallback     log_cb_;
     mutable std::mutex activity_mutex_;
     std::deque<nlohmann::json> activity_entries_;
     static constexpr std::size_t kMaxActivityEntries = 4000;
 
-    using ChunkCb = std::function<void(const InferenceChunk&)>;
-    using DoneCb  = std::function<void(const ConvId&, bool, const std::string&)>;
-
     void register_routes();
-    void register_openai_compat_routes();
+    void register_served_model_routes(); ///< served_model_routes.cpp
+    void register_user_routes();         ///< user_routes.cpp
+    void register_openai_compat_routes(); ///< openai_compat.cpp
+
+    /// How long a request waits for placement capacity that is only
+    /// temporarily missing. MM_CHAT_QUEUE_WAIT_MS overrides three minutes.
+    static std::chrono::milliseconds chat_queue_wait();
+
+    /// Whether the cluster's vLLM launches with auto tool choice — the one
+    /// engine where tool support is configuration rather than software.
+    bool vllm_tool_choice() const;
+
+    /// The pool :9091's streaming completions run on, created on first use.
+    ConversationQueue& openai_queue();
+    std::once_flag openai_queue_once_;
+    std::unique_ptr<ConversationQueue> openai_queue_;
+    std::size_t openai_workers_ = 16;
     bool authorize_external_request(const httplib::Request& req,
                                     httplib::Response& res) const;
     bool authorize_openai_compat_request(const httplib::Request& req,
                                          httplib::Response& res) const;
+
+    /// The user a request's token is bound to; empty for an unbound token, the
+    /// legacy token, or auth-off.
+    std::string bound_user_of(const httplib::Request& req) const;
 
     /// Which node holds an engine (slot). Discovered rather than supplied,
     /// because the answer changes on every eviction and a client should not have
@@ -161,21 +276,6 @@ private:
                                   const std::string& action,
                                   const std::string& body,
                                   httplib::Response& res) const;
-
-    // Runs on the AgentQueue worker thread: builds context, routes to node,
-    // proxies SSE, persists messages, fires callbacks.
-    void handle_chat(const AgentId& agent_id,
-                     const std::string& message,
-                     const ConvId& conv_id_hint,
-                     ChunkCb chunk_cb,
-                     DoneCb done_cb,
-                     int max_tokens_override = 0,
-                     std::vector<MessageContentPart> content_parts = {});
-
-    // Queue a global recall job for a conversation being deactivated.
-    // Runs as an internal inference round where the agent reviews local
-    // memories and decides what to persist as global memories.
-    void queue_global_recall(const AgentId& agent_id, const ConvId& conv_id);
 
     void activity_log(int level, const std::string& message);
 };

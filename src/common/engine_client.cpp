@@ -12,10 +12,10 @@
 //   * a VIRTUAL stream_complete. Non-virtual today, which is why control gives
 //     up on the abstraction and calls node_cli.stream_post("/api/node/infer")
 //     inline at control_api_server.cpp:1949 with its own retry loop.
-//   * a STRUCTURED error. AgentScheduler currently substring-matches six English
+//   * a STRUCTURED error. The scheduler used to substring-match six English
 //     phrases against the node's error body to decide whether to evict and
-//     retry; a new engine would have to emit those literals verbatim to earn the
-//     same treatment.
+//     retry; a new engine would have had to emit those literals verbatim to earn
+//     the same treatment.
 
 #include "common/engine_client.hpp"
 

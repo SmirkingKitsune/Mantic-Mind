@@ -1,8 +1,31 @@
 #include "common/http_server.hpp"
 #include <httplib.h>
+#include <cstdlib>
 #include <memory>
 
 namespace mm {
+
+namespace {
+
+/// The largest request body a refusal waits to read; see SetPreRoutingHandler.
+constexpr std::size_t kDeferredRefusalBodyLimit = 1024 * 1024;
+
+/// A refusal decided before routing, to be delivered after the body is read.
+/// Per thread: httplib runs a request's pre-routing, body read and pre-request
+/// steps on one worker, and the owning server is recorded so two servers in
+/// one process cannot deliver each other's refusals.
+thread_local const void* t_refusal_deferred_by = nullptr;
+
+/// A body the client has already sent — no `Expect: 100-continue` to hold it
+/// back — of a known length small enough to read.
+bool body_in_flight(const httplib::Request& req) {
+    if (req.has_header("Expect")) return false;
+    if (!req.has_header("Content-Length")) return false;
+    const auto length = std::strtoull(req.get_header_value("Content-Length").c_str(), nullptr, 10);
+    return length > 0 && length <= kDeferredRefusalBodyLimit;
+}
+
+} // namespace
 
 struct HttpServer::Impl {
     httplib::Server srv;
@@ -31,11 +54,31 @@ void HttpServer::SetPreRoutingHandler(PreRoutingHandler h) {
                        ? res.status
                        : static_cast<int>(httplib::StatusCode::ExpectationFailed_417);
         });
+    // A refusal must not be sent while the request's body is still unread.
+    // httplib's client sends `Connection: close`, and closing a socket with
+    // unread bytes makes the OS reset the connection — a reset that can reach
+    // the client before the refusal does, so a wrong or under-scoped token saw
+    // a dropped connection instead of its 401/403. A small body already on its
+    // way is therefore read first: the refusal is kept in `res`, routing goes on
+    // to read the body, and the pre-request step delivers the refusal before
+    // any handler runs. (An unmatched route gets the refusal too, since `res`
+    // already carries it.) A large body, or one of unknown length, is refused
+    // unread as before, rather than read in full for a client that may not be
+    // allowed to send it.
+    const void* owner = impl_.get();
     impl_->srv.set_pre_routing_handler(
-        [handler](const httplib::Request& req, httplib::Response& res) {
-            return (*handler)(req, res)
-                ? httplib::Server::HandlerResponse::Unhandled
-                : httplib::Server::HandlerResponse::Handled;
+        [handler, owner](const httplib::Request& req, httplib::Response& res) {
+            t_refusal_deferred_by = nullptr;
+            if ((*handler)(req, res)) return httplib::Server::HandlerResponse::Unhandled;
+            if (!body_in_flight(req)) return httplib::Server::HandlerResponse::Handled;
+            t_refusal_deferred_by = owner;
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
+    impl_->srv.set_pre_request_handler(
+        [owner](const httplib::Request&, httplib::Response&) {
+            if (t_refusal_deferred_by != owner) return httplib::Server::HandlerResponse::Unhandled;
+            t_refusal_deferred_by = nullptr;
+            return httplib::Server::HandlerResponse::Handled; // `res` holds the refusal
         });
 }
 

@@ -53,8 +53,8 @@ max_slots = 4
 # node_gpu_count = 0
 
 # -- llama.cpp runtime ---------------------------------------------------------
-# Agents serve local GGUF models through llama-server. An explicit executable
-# path overrides managed runtime selection.
+# Node-served models with a local GGUF run through llama-server. An explicit
+# executable path overrides managed runtime selection.
 # llama_server_path = "llama-server"        # or MM_LLAMA_PATH
 
 # A bare PATH llama-server is accepted for CPU, for normal Metal-enabled macOS,

@@ -16,9 +16,12 @@
 // Three scopes, and the split is by BLAST RADIUS rather than by resource:
 //
 //   read      every GET, every telemetry SSE stream        no side effects
-//   chat      agent chat, conversations, memories, uploads  bounded, per-agent
+//   chat      user chat, conversations, memories, uploads   bounded, per-user
 //   operator  admit, reprofile, delete, verdict override,   unbounded or
-//             backend override, suspend/restore             destructive
+//             served models, users, suspend/restore         destructive
+//
+// A token may also be BOUND to a user (control/token_binding.hpp), which
+// narrows whatever its scopes grant to that user's own routes.
 
 #include <cstdint>
 #include <memory>
@@ -49,7 +52,7 @@ inline constexpr ScopeSet kScopeAll = static_cast<ScopeSet>(Scope::Read) |
 /// see require_complete_coverage().
 struct RouteScope {
     const char* method = nullptr;  ///< "GET" | "POST" | "PUT" | "DELETE"
-    const char* pattern = nullptr; ///< "/v1/agents/:id/chat"
+    const char* pattern = nullptr; ///< "/v1/users/:id/chat"
     Scope required = Scope::Read;
 };
 
@@ -58,6 +61,9 @@ struct AuthResult {
     ScopeSet granted = kScopeNone;
     std::string token_label;
     std::int64_t token_id = 0;
+    /// The user a token is bound to; empty for an unbound token, the legacy
+    /// token, and auth-off.
+    std::string bound_user_id;
     int status = 200; ///< 401 missing, 403 insufficient
     std::string error;
 };

@@ -12,7 +12,10 @@
 namespace mm {
 
 // ── Type aliases ──────────────────────────────────────────────────────────────
-using AgentId  = std::string;
+/// Who is asking: a user, whose store is data/users/{id} (common/user.hpp).
+using UserId   = std::string;
+/// An opaque label that holds a node engine open: a served-model id.
+using HolderId = std::string;
 using ConvId   = std::string;
 using MemoryId = std::string;
 using NodeId   = std::string;
@@ -32,14 +35,6 @@ enum class NodeHealthStatus { Unknown, Healthy, Degraded, Unhealthy };
 enum class NodeConnectionStatus { Unknown, Online, Unreachable, Offline };
 
 enum class SlotState { Empty, Loading, Ready, Suspending, Suspended, Error };
-
-// Local inference on this branch is always llama.cpp. Keep backend parsing at
-// API/config boundaries so legacy vLLM agents fail explicitly instead of being
-// silently reinterpreted as llama.cpp agents.
-inline bool is_llama_backend(const std::string& backend) {
-    return backend.empty() || backend == "llama-cpp" || backend == "llama.cpp" ||
-           backend == "llama";
-}
 
 // ── ToolCall ──────────────────────────────────────────────────────────────────
 struct ToolCall {
@@ -100,6 +95,13 @@ struct Message {
     std::vector<TraceEvent> trace_events;
     std::vector<MessageContentPart> content_parts;
     int64_t              storage_id = 0; // internal SQLite row id; not serialized
+    /// The served model that wrote this message. Empty on user and tool
+    /// messages: a conversation may be answered by several models, and this is
+    /// how a reader tells which one said what.
+    std::string          model_id;
+    /// Position in its conversation, 0-based, assigned by the store on append.
+    /// -1 on a message that has not been stored.
+    int                  sequence_num = -1;
 };
 
 // ── RuntimeSettings ─────────────────────────────────────────────────────────────
@@ -120,6 +122,28 @@ struct RuntimeSettings {
     int   max_tokens   = 1024;
     bool  flash_attn   = true;
     std::vector<std::string> extra_args;  // additional runtime CLI flags
+};
+
+/// Optional overrides of a served model's default sampling, set per
+/// conversation and per request. Launch settings are deliberately absent: they
+/// decide which engine process serves a request, and no conversation may pick
+/// that.
+///
+/// Here rather than beside its helpers in common/served_model.hpp because a
+/// Conversation carries one, and served_model.hpp includes this header.
+struct SamplingOverrides {
+    std::optional<float> temperature;
+    std::optional<float> top_p;
+    std::optional<int> top_k;
+    std::optional<float> min_p;
+    std::optional<float> presence_penalty;
+    std::optional<float> repeat_penalty;
+    std::optional<int> max_tokens;
+
+    bool empty() const noexcept {
+        return !temperature && !top_p && !top_k && !min_p && !presence_penalty &&
+               !repeat_penalty && !max_tokens;
+    }
 };
 
 // OpenAI-compatible remote API settings for agents whose inference_backend is
@@ -155,39 +179,11 @@ inline bool llama_launch_compatible(const RuntimeSettings& a, const RuntimeSetti
         && a.extra_args      == b.extra_args;
 }
 
-// ── AgentConfig ───────────────────────────────────────────────────────────────
-struct AgentConfig {
-    AgentId       id;
-    std::string   name;
-    std::string   model_path;
-    std::string   system_prompt;
-    std::string   inference_backend = "llama-cpp"; // llama-cpp (default) | api
-
-    // Which local engine serves this agent: auto | soma | fallback.
-    //
-    // PERSISTENT and on the agent, not per placement. Placement is recomputed on
-    // every ensure_agent_running(), so a per-placement override would evaporate
-    // on the next eviction cycle and read as a flapping bug rather than as a
-    // setting that stopped applying.
-    //
-    // `auto` defers to the admission verdict. Absence of a verdict routes to the
-    // fallback — absence of a record is not evidence of admissibility.
-    std::string   backend_override = "auto";
-    // Public alias advertised by the control server's OpenAI-compatible model
-    // catalog. Older profiles stored this inside their backend-specific block.
-    std::string   served_model_name;
-    RuntimeSettings runtime_settings;
-    ApiSettings   api_settings;
-    VisionSettings vision_settings;
-    bool          reasoning_enabled = false;
-    bool          memories_enabled  = true;
-    bool          tools_enabled     = false;
-    NodeId        preferred_node_id;
-};
-
-struct AgentVoiceProfile {
+/// A voice a user approved for their speech. Owned by the user; at most one is
+/// active.
+struct VoiceProfile {
     VoiceProfileId id;
-    AgentId        agent_id;
+    UserId         user_id;
     std::string    display_name;
     std::string    language = "Auto";
     std::string    voice_description;
@@ -206,7 +202,7 @@ struct AgentVoiceProfile {
 
 struct VoiceDesignProposal {
     VoiceProposalId id;
-    AgentId         agent_id;
+    UserId          user_id;
     std::string     display_name;
     std::string     language = "Auto";
     std::string     voice_description;
@@ -224,7 +220,7 @@ struct VoiceDesignProposal {
 };
 
 struct TtsSynthesisRequest {
-    AgentId        agent_id;
+    UserId         user_id;
     std::string    text;
     VoiceProfileId voice_profile_id;
     ConvId         conversation_id;
@@ -236,7 +232,7 @@ struct TtsSynthesisRequest {
 
 struct TtsSynthesisResult {
     TtsCacheId     cache_id;
-    AgentId        agent_id;
+    UserId         user_id;
     VoiceProfileId voice_profile_id;
     ConvId         conversation_id;
     int            message_index = -1;
@@ -280,7 +276,7 @@ struct ValidationIssue {
     std::string        message;
 };
 
-struct AgentValidationResult {
+struct ValidationResult {
     std::vector<ValidationIssue> issues;
     std::optional<ModelCapabilityInfo> model_info;
 
@@ -295,21 +291,33 @@ struct AgentValidationResult {
 // ── Conversation ──────────────────────────────────────────────────────────────
 struct Conversation {
     ConvId               id;
-    AgentId              agent_id;
     std::string          title;
     std::vector<Message> messages;
     int                  total_tokens       = 0;
     bool                 is_active          = true;
-    std::string          compaction_summary;
     ConvId               parent_conv_id;
     int64_t              created_at_ms = 0;
     int64_t              updated_at_ms = 0;
+
+    /// The served model this conversation uses until told otherwise. A turn
+    /// that names another switches it, and the switch sticks.
+    std::string          model_id;
+    /// Follows the user's custom instructions in the system message.
+    std::string          system_prompt;
+    /// Over the model's default sampling; a request's own overrides win.
+    SamplingOverrides    settings;
+    /// The rolling summary. Every message with a sequence number up to and
+    /// including summary_through_seq is folded into it, in place: compaction
+    /// never starts a new conversation. -1 while nothing is folded.
+    std::string          summary;
+    int                  summary_through_seq = -1;
+    /// Which model wrote the summary, which need not be the one answering now.
+    std::string          summary_model_id;
 };
 
 // ── Memory (global) ──────────────────────────────────────────────────────────
 struct Memory {
     MemoryId    id;
-    AgentId     agent_id;
     std::string content;
     ConvId      source_conv_id;
     float       importance    = 0.5f;
@@ -348,8 +356,10 @@ struct SlotInfo {
     bool        vision_enabled  = false;
     std::string projector_identity;      // stable basename/manifest identity, never a managed attachment path
     std::string backend         = "llama-cpp"; // retained on the wire for compatibility
-    AgentId     assigned_agent;          // first attached agent (legacy display)
-    std::vector<AgentId> agent_ids;      // all agents attached to this slot
+    /// Every holder attached to this slot. A holder is an opaque label chosen
+    /// by control — a served-model id — and the node's only use for it is to
+    /// know when the last one has gone and the engine can be unloaded.
+    std::vector<std::string> holder_ids;
     SlotState   state           = SlotState::Empty;
     std::vector<int> gpu_devices;        // explicit vLLM device reservation
     int64_t     vram_usage_mb   = 0;
@@ -358,13 +368,21 @@ struct SlotInfo {
     int         effective_ctx_size = 0;
 };
 
-// ── AgentPlacement ───────────────────────────────────────────────────────────
-struct AgentPlacement {
-    AgentId     agent_id;
+// ── Placement ────────────────────────────────────────────────────────────────
+/// Where a holder (a served model) is running. Keyed by holder, so every user
+/// who picks a served model shares its one placement.
+struct Placement {
+    std::string holder_id;
     NodeId      node_id;
     SlotId      slot_id;
     bool        suspended       = false;
-    bool        is_active       = false;  // true while inference/memory-extraction is in-flight
+    /// Requests currently using this placement. A COUNT, not a flag: many users
+    /// share one placement, and "active" must stay true until the LAST of them
+    /// finishes. Eviction, suspend and release all require zero.
+    int         in_flight       = 0;
+    /// Bumped whenever the placement is replaced, so a lease taken on an older
+    /// placement cannot decrement the count of the one that replaced it.
+    std::uint64_t epoch         = 0;
     std::string kv_cache_node_path;
     std::string engine_fingerprint;
     std::string engine_id;
@@ -396,7 +414,7 @@ struct NodeCapabilities {
 struct RayRuntimeStatus {
     std::string state = "inactive"; ///< inactive|starting|active|error
     std::string group_id;
-    std::string agent_id;
+    std::string holder_id; ///< the placement that owns this group
     std::string role; ///< head|worker
     std::string head_address;
     std::string transport;
@@ -608,7 +626,25 @@ struct NodeInfo {
     // Last config version this node applied. Compared against the store's on
     // every health poll; a mismatch is what triggers a push.
     std::uint32_t              engine_config_version = 0;
+
+    /// The control<->node wire protocol this node speaks. A node that does not
+    /// report one is protocol 1 (agent ids on the wire).
+    int                        wire_protocol = 1;
 };
+
+/// The wire protocol this build speaks. 2 renamed every agent id on the
+/// control<->node wire to an opaque holder id (served models replaced agents).
+///
+/// Control refuses to PLACE on a node that speaks anything else rather than
+/// discovering the mismatch as a reload loop: a protocol-1 node ignores
+/// `holder_id`, so control never sees its slot as attached and re-places it on
+/// every request. Checked, not assumed, because control and nodes upgrade
+/// separately.
+inline constexpr int kNodeWireProtocol = 2;
+
+inline bool node_wire_compatible(const NodeInfo& node) noexcept {
+    return node.wire_protocol == kNodeWireProtocol;
+}
 
 // ── ToolDefinition ────────────────────────────────────────────────────────────
 struct ToolDefinition {
@@ -799,6 +835,8 @@ inline void to_json(nlohmann::json& j, const Message& m) {
           {"timestamp_ms", m.timestamp_ms},
           {"trace_events", m.trace_events} };
     if (!m.content_parts.empty()) j["content_parts"] = m.content_parts;
+    if (!m.model_id.empty()) j["model_id"] = m.model_id;
+    if (m.sequence_num >= 0) j["sequence_num"] = m.sequence_num;
 }
 inline void from_json(const nlohmann::json& j, Message& m) {
     m.role = message_role_from_string(j.at("role").get<std::string>());
@@ -810,6 +848,40 @@ inline void from_json(const nlohmann::json& j, Message& m) {
     if (j.contains("timestamp_ms")) j.at("timestamp_ms").get_to(m.timestamp_ms);
     if (j.contains("trace_events")) j.at("trace_events").get_to(m.trace_events);
     if (j.contains("content_parts"))j.at("content_parts").get_to(m.content_parts);
+    if (j.contains("model_id"))     j.at("model_id").get_to(m.model_id);
+    if (j.contains("sequence_num")) j.at("sequence_num").get_to(m.sequence_num);
+}
+
+// ─── SamplingOverrides ────────────────────────────────────────────────────────
+// Only the fields that are set. Lenient on the way in: this reads what the store
+// or the API wrote. Input from a client goes through parse_sampling_overrides
+// (common/served_model.hpp), which names what it rejects.
+inline void to_json(nlohmann::json& j, const SamplingOverrides& o) {
+    j = nlohmann::json::object();
+    if (o.temperature) j["temperature"] = *o.temperature;
+    if (o.top_p) j["top_p"] = *o.top_p;
+    if (o.top_k) j["top_k"] = *o.top_k;
+    if (o.min_p) j["min_p"] = *o.min_p;
+    if (o.presence_penalty) j["presence_penalty"] = *o.presence_penalty;
+    if (o.repeat_penalty) j["repeat_penalty"] = *o.repeat_penalty;
+    if (o.max_tokens) j["max_tokens"] = *o.max_tokens;
+}
+inline void from_json(const nlohmann::json& j, SamplingOverrides& o) {
+    o = {};
+    if (!j.is_object()) return;
+    const auto real = [&](const char* key, std::optional<float>& dst) {
+        if (j.contains(key) && j.at(key).is_number()) dst = j.at(key).get<float>();
+    };
+    const auto integer = [&](const char* key, std::optional<int>& dst) {
+        if (j.contains(key) && j.at(key).is_number_integer()) dst = j.at(key).get<int>();
+    };
+    real("temperature", o.temperature);
+    real("top_p", o.top_p);
+    integer("top_k", o.top_k);
+    real("min_p", o.min_p);
+    real("presence_penalty", o.presence_penalty);
+    real("repeat_penalty", o.repeat_penalty);
+    integer("max_tokens", o.max_tokens);
 }
 
 // ─── RuntimeSettings ───────────────────────────────────────────────────────────
@@ -871,48 +943,9 @@ inline void from_json(const nlohmann::json& j, VisionSettings& s) {
     if (j.contains("mmproj_path")) j.at("mmproj_path").get_to(s.mmproj_path);
 }
 
-// ─── AgentConfig ─────────────────────────────────────────────────────────────
-inline void to_json(nlohmann::json& j, const AgentConfig& a) {
-    j = { {"id",                a.id},
-          {"name",              a.name},
-          {"model_path",        a.model_path},
-          {"system_prompt",     a.system_prompt},
-          {"inference_backend", a.inference_backend},
-          {"backend_override",  a.backend_override},
-          {"served_model_name", a.served_model_name},
-          {"runtime_settings",  a.runtime_settings},
-          {"api_settings",      a.api_settings},
-          {"vision_settings",   a.vision_settings},
-          {"reasoning_enabled", a.reasoning_enabled},
-          {"memories_enabled",  a.memories_enabled},
-          {"tools_enabled",     a.tools_enabled},
-          {"preferred_node_id", a.preferred_node_id} };
-}
-inline void from_json(const nlohmann::json& j, AgentConfig& a) {
-    if (j.contains("id"))   j.at("id").get_to(a.id);
-    j.at("name").get_to(a.name);
-    if (j.contains("model_path"))        j.at("model_path").get_to(a.model_path);
-    if (j.contains("system_prompt"))     j.at("system_prompt").get_to(a.system_prompt);
-    if (j.contains("inference_backend")) j.at("inference_backend").get_to(a.inference_backend);
-    if (j.contains("backend_override"))  j.at("backend_override").get_to(a.backend_override);
-    if (j.contains("served_model_name")) j.at("served_model_name").get_to(a.served_model_name);
-    if (j.contains("runtime_settings"))  j.at("runtime_settings").get_to(a.runtime_settings);
-    // Compatibility reader for agents serialized before the runtime split.
-    if (a.served_model_name.empty() && j.contains("vllm_settings") &&
-        j.at("vllm_settings").is_object()) {
-        a.served_model_name = j.at("vllm_settings").value("served_model_name", "");
-    }
-    if (j.contains("api_settings"))      j.at("api_settings").get_to(a.api_settings);
-    if (j.contains("vision_settings"))   j.at("vision_settings").get_to(a.vision_settings);
-    if (j.contains("reasoning_enabled")) j.at("reasoning_enabled").get_to(a.reasoning_enabled);
-    if (j.contains("memories_enabled"))  j.at("memories_enabled").get_to(a.memories_enabled);
-    if (j.contains("tools_enabled"))     j.at("tools_enabled").get_to(a.tools_enabled);
-    if (j.contains("preferred_node_id")) j.at("preferred_node_id").get_to(a.preferred_node_id);
-}
-
-inline void to_json(nlohmann::json& j, const AgentVoiceProfile& p) {
+inline void to_json(nlohmann::json& j, const VoiceProfile& p) {
     j = { {"id", p.id},
-          {"agent_id", p.agent_id},
+          {"user_id", p.user_id},
           {"display_name", p.display_name},
           {"language", p.language},
           {"voice_description", p.voice_description},
@@ -929,9 +962,9 @@ inline void to_json(nlohmann::json& j, const AgentVoiceProfile& p) {
           {"updated_at_ms", p.updated_at_ms} };
 }
 
-inline void from_json(const nlohmann::json& j, AgentVoiceProfile& p) {
+inline void from_json(const nlohmann::json& j, VoiceProfile& p) {
     if (j.contains("id")) j.at("id").get_to(p.id);
-    if (j.contains("agent_id")) j.at("agent_id").get_to(p.agent_id);
+    if (j.contains("user_id")) j.at("user_id").get_to(p.user_id);
     if (j.contains("display_name")) j.at("display_name").get_to(p.display_name);
     if (j.contains("language")) j.at("language").get_to(p.language);
     if (j.contains("voice_description")) j.at("voice_description").get_to(p.voice_description);
@@ -950,7 +983,7 @@ inline void from_json(const nlohmann::json& j, AgentVoiceProfile& p) {
 
 inline void to_json(nlohmann::json& j, const VoiceDesignProposal& p) {
     j = { {"id", p.id},
-          {"agent_id", p.agent_id},
+          {"user_id", p.user_id},
           {"display_name", p.display_name},
           {"language", p.language},
           {"voice_description", p.voice_description},
@@ -969,7 +1002,7 @@ inline void to_json(nlohmann::json& j, const VoiceDesignProposal& p) {
 
 inline void from_json(const nlohmann::json& j, VoiceDesignProposal& p) {
     if (j.contains("id")) j.at("id").get_to(p.id);
-    if (j.contains("agent_id")) j.at("agent_id").get_to(p.agent_id);
+    if (j.contains("user_id")) j.at("user_id").get_to(p.user_id);
     if (j.contains("display_name")) j.at("display_name").get_to(p.display_name);
     if (j.contains("language")) j.at("language").get_to(p.language);
     if (j.contains("voice_description")) j.at("voice_description").get_to(p.voice_description);
@@ -987,7 +1020,7 @@ inline void from_json(const nlohmann::json& j, VoiceDesignProposal& p) {
 }
 
 inline void to_json(nlohmann::json& j, const TtsSynthesisRequest& r) {
-    j = { {"agent_id", r.agent_id},
+    j = { {"user_id", r.user_id},
           {"text", r.text},
           {"voice_profile_id", r.voice_profile_id},
           {"conversation_id", r.conversation_id},
@@ -998,7 +1031,7 @@ inline void to_json(nlohmann::json& j, const TtsSynthesisRequest& r) {
 }
 
 inline void from_json(const nlohmann::json& j, TtsSynthesisRequest& r) {
-    if (j.contains("agent_id")) j.at("agent_id").get_to(r.agent_id);
+    if (j.contains("user_id")) j.at("user_id").get_to(r.user_id);
     if (j.contains("text")) j.at("text").get_to(r.text);
     if (j.contains("input")) j.at("input").get_to(r.text);
     if (j.contains("voice_profile_id")) j.at("voice_profile_id").get_to(r.voice_profile_id);
@@ -1012,7 +1045,7 @@ inline void from_json(const nlohmann::json& j, TtsSynthesisRequest& r) {
 
 inline void to_json(nlohmann::json& j, const TtsSynthesisResult& r) {
     j = { {"cache_id", r.cache_id},
-          {"agent_id", r.agent_id},
+          {"user_id", r.user_id},
           {"voice_profile_id", r.voice_profile_id},
           {"conversation_id", r.conversation_id},
           {"message_index", r.message_index},
@@ -1029,7 +1062,7 @@ inline void to_json(nlohmann::json& j, const TtsSynthesisResult& r) {
 
 inline void from_json(const nlohmann::json& j, TtsSynthesisResult& r) {
     if (j.contains("cache_id")) j.at("cache_id").get_to(r.cache_id);
-    if (j.contains("agent_id")) j.at("agent_id").get_to(r.agent_id);
+    if (j.contains("user_id")) j.at("user_id").get_to(r.user_id);
     if (j.contains("voice_profile_id")) j.at("voice_profile_id").get_to(r.voice_profile_id);
     if (j.contains("conversation_id")) j.at("conversation_id").get_to(r.conversation_id);
     if (j.contains("message_index")) j.at("message_index").get_to(r.message_index);
@@ -1088,12 +1121,12 @@ inline void from_json(const nlohmann::json& j, ValidationIssue& issue) {
     if (j.contains("message")) j.at("message").get_to(issue.message);
 }
 
-// ─── AgentValidationResult ──────────────────────────────────────────────────
-inline void to_json(nlohmann::json& j, const AgentValidationResult& result) {
+// ─── ValidationResult ──────────────────────────────────────────────────
+inline void to_json(nlohmann::json& j, const ValidationResult& result) {
     j = {{"issues", result.issues}};
     if (result.model_info) j["model_info"] = *result.model_info;
 }
-inline void from_json(const nlohmann::json& j, AgentValidationResult& result) {
+inline void from_json(const nlohmann::json& j, ValidationResult& result) {
     if (j.contains("issues")) j.at("issues").get_to(result.issues);
     if (j.contains("model_info")) result.model_info = j.at("model_info").get<ModelCapabilityInfo>();
 }
@@ -1101,33 +1134,40 @@ inline void from_json(const nlohmann::json& j, AgentValidationResult& result) {
 // ─── Conversation ─────────────────────────────────────────────────────────────
 inline void to_json(nlohmann::json& j, const Conversation& c) {
     j = { {"id",                 c.id},
-          {"agent_id",           c.agent_id},
           {"title",              c.title},
           {"messages",           c.messages},
           {"total_tokens",       c.total_tokens},
           {"is_active",          c.is_active},
-          {"compaction_summary", c.compaction_summary},
           {"parent_conv_id",     c.parent_conv_id},
           {"created_at_ms",      c.created_at_ms},
-          {"updated_at_ms",      c.updated_at_ms} };
+          {"updated_at_ms",      c.updated_at_ms},
+          {"model_id",           c.model_id},
+          {"system_prompt",      c.system_prompt},
+          {"settings",           c.settings},
+          {"summary",            c.summary},
+          {"summary_through_seq", c.summary_through_seq},
+          {"summary_model_id",   c.summary_model_id} };
 }
 inline void from_json(const nlohmann::json& j, Conversation& c) {
     j.at("id").get_to(c.id);
-    if (j.contains("agent_id"))           j.at("agent_id").get_to(c.agent_id);
     if (j.contains("title"))              j.at("title").get_to(c.title);
     if (j.contains("messages"))           j.at("messages").get_to(c.messages);
     if (j.contains("total_tokens"))       j.at("total_tokens").get_to(c.total_tokens);
     if (j.contains("is_active"))          j.at("is_active").get_to(c.is_active);
-    if (j.contains("compaction_summary")) j.at("compaction_summary").get_to(c.compaction_summary);
     if (j.contains("parent_conv_id"))     j.at("parent_conv_id").get_to(c.parent_conv_id);
     if (j.contains("created_at_ms"))      j.at("created_at_ms").get_to(c.created_at_ms);
     if (j.contains("updated_at_ms"))      j.at("updated_at_ms").get_to(c.updated_at_ms);
+    if (j.contains("model_id"))           j.at("model_id").get_to(c.model_id);
+    if (j.contains("system_prompt"))      j.at("system_prompt").get_to(c.system_prompt);
+    if (j.contains("settings"))           j.at("settings").get_to(c.settings);
+    if (j.contains("summary"))            j.at("summary").get_to(c.summary);
+    if (j.contains("summary_through_seq")) j.at("summary_through_seq").get_to(c.summary_through_seq);
+    if (j.contains("summary_model_id"))   j.at("summary_model_id").get_to(c.summary_model_id);
 }
 
 // ─── Memory (global) ──────────────────────────────────────────────────────────
 inline void to_json(nlohmann::json& j, const Memory& m) {
     j = { {"id",             m.id},
-          {"agent_id",       m.agent_id},
           {"content",        m.content},
           {"source_conv_id", m.source_conv_id},
           {"importance",     m.importance},
@@ -1136,7 +1176,6 @@ inline void to_json(nlohmann::json& j, const Memory& m) {
 }
 inline void from_json(const nlohmann::json& j, Memory& m) {
     j.at("id").get_to(m.id);
-    if (j.contains("agent_id"))       j.at("agent_id").get_to(m.agent_id);
     j.at("content").get_to(m.content);
     if (j.contains("source_conv_id")) j.at("source_conv_id").get_to(m.source_conv_id);
     if (j.contains("importance"))     j.at("importance").get_to(m.importance);
@@ -1193,8 +1232,7 @@ inline void to_json(nlohmann::json& j, const SlotInfo& s) {
           {"vision_enabled",  s.vision_enabled},
           {"projector_identity", s.projector_identity},
           {"backend",         s.backend},
-          {"assigned_agent",  s.assigned_agent},
-          {"agent_ids",       s.agent_ids},
+          {"holder_ids",      s.holder_ids},
           {"state",           to_string(s.state)},
           {"gpu_devices",     s.gpu_devices},
           {"vram_usage_mb",   s.vram_usage_mb},
@@ -1210,11 +1248,7 @@ inline void from_json(const nlohmann::json& j, SlotInfo& s) {
     if (j.contains("vision_enabled")) j.at("vision_enabled").get_to(s.vision_enabled);
     if (j.contains("projector_identity")) j.at("projector_identity").get_to(s.projector_identity);
     if (j.contains("backend"))        j.at("backend").get_to(s.backend);
-    if (j.contains("assigned_agent")) j.at("assigned_agent").get_to(s.assigned_agent);
-    if (j.contains("agent_ids"))      j.at("agent_ids").get_to(s.agent_ids);
-    // Older nodes only report assigned_agent.
-    if (s.agent_ids.empty() && !s.assigned_agent.empty())
-        s.agent_ids.push_back(s.assigned_agent);
+    if (j.contains("holder_ids"))     j.at("holder_ids").get_to(s.holder_ids);
     if (j.contains("state"))          s.state = slot_state_from_string(j.at("state").get<std::string>());
     if (j.contains("gpu_devices"))    j.at("gpu_devices").get_to(s.gpu_devices);
     if (j.contains("vram_usage_mb"))  j.at("vram_usage_mb").get_to(s.vram_usage_mb);
@@ -1223,13 +1257,15 @@ inline void from_json(const nlohmann::json& j, SlotInfo& s) {
     if (j.contains("effective_ctx_size")) j.at("effective_ctx_size").get_to(s.effective_ctx_size);
 }
 
-// ─── AgentPlacement ──────────────────────────────────────────────────────────
-inline void to_json(nlohmann::json& j, const AgentPlacement& p) {
-    j = { {"agent_id",           p.agent_id},
+// ─── Placement ───────────────────────────────────────────────────────────────
+// `served_model_id` on the API: that is what a holder IS, and what a client
+// looks a placement up by.
+inline void to_json(nlohmann::json& j, const Placement& p) {
+    j = { {"served_model_id",    p.holder_id},
           {"node_id",            p.node_id},
           {"slot_id",            p.slot_id},
           {"suspended",          p.suspended},
-          {"is_active",          p.is_active},
+          {"in_flight",          p.in_flight},
           {"kv_cache_node_path", p.kv_cache_node_path},
           {"engine_fingerprint", p.engine_fingerprint},
           {"engine_id",          p.engine_id},
@@ -1241,12 +1277,12 @@ inline void to_json(nlohmann::json& j, const AgentPlacement& p) {
           {"placed_at_ms",       p.placed_at_ms},
           {"last_active_ms",     p.last_active_ms} };
 }
-inline void from_json(const nlohmann::json& j, AgentPlacement& p) {
-    j.at("agent_id").get_to(p.agent_id);
+inline void from_json(const nlohmann::json& j, Placement& p) {
+    j.at("served_model_id").get_to(p.holder_id);
     if (j.contains("node_id"))            j.at("node_id").get_to(p.node_id);
     if (j.contains("slot_id"))            j.at("slot_id").get_to(p.slot_id);
     if (j.contains("suspended"))          j.at("suspended").get_to(p.suspended);
-    if (j.contains("is_active"))          j.at("is_active").get_to(p.is_active);
+    if (j.contains("in_flight"))          j.at("in_flight").get_to(p.in_flight);
     if (j.contains("kv_cache_node_path")) j.at("kv_cache_node_path").get_to(p.kv_cache_node_path);
     if (j.contains("engine_fingerprint")) j.at("engine_fingerprint").get_to(p.engine_fingerprint);
     if (j.contains("engine_id"))          j.at("engine_id").get_to(p.engine_id);
@@ -1281,7 +1317,7 @@ inline void from_json(const nlohmann::json& j, NodeCapabilities& c) {
 }
 
 inline void to_json(nlohmann::json& j, const RayRuntimeStatus& r) {
-    j = {{"state", r.state}, {"group_id", r.group_id}, {"agent_id", r.agent_id},
+    j = {{"state", r.state}, {"group_id", r.group_id}, {"holder_id", r.holder_id},
          {"role", r.role}, {"head_address", r.head_address},
          {"transport", r.transport}, {"reserved_gpus", r.reserved_gpus},
          {"last_error", r.last_error}};
@@ -1289,7 +1325,7 @@ inline void to_json(nlohmann::json& j, const RayRuntimeStatus& r) {
 inline void from_json(const nlohmann::json& j, RayRuntimeStatus& r) {
     if (j.contains("state")) j.at("state").get_to(r.state);
     if (j.contains("group_id")) j.at("group_id").get_to(r.group_id);
-    if (j.contains("agent_id")) j.at("agent_id").get_to(r.agent_id);
+    if (j.contains("holder_id")) j.at("holder_id").get_to(r.holder_id);
     if (j.contains("role")) j.at("role").get_to(r.role);
     if (j.contains("head_address")) j.at("head_address").get_to(r.head_address);
     if (j.contains("transport")) j.at("transport").get_to(r.transport);
@@ -1517,7 +1553,8 @@ inline void to_json(nlohmann::json& j, const NodeInfo& n) {
           {"action_progress",          n.action_progress},
           {"engines",                  n.engines},
           {"conformance",              n.conformance},
-          {"engine_config_version",    n.engine_config_version} };
+          {"engine_config_version",    n.engine_config_version},
+          {"wire_protocol",            n.wire_protocol} };
 }
 inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     j.at("id").get_to(n.id);
@@ -1559,6 +1596,7 @@ inline void from_json(const nlohmann::json& j, NodeInfo& n) {
     if (j.contains("conformance")) j.at("conformance").get_to(n.conformance);
     if (j.contains("engine_config_version"))
         j.at("engine_config_version").get_to(n.engine_config_version);
+    if (j.contains("wire_protocol")) j.at("wire_protocol").get_to(n.wire_protocol);
 }
 
 // ─── ToolDefinition ───────────────────────────────────────────────────────────

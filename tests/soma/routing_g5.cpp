@@ -38,9 +38,9 @@ soma::AdmissionRecord rec(soma::Verdict v, const std::string& hash = "H") {
     return r;
 }
 
-soma::AgentBackendConfig cfg(soma::BackendOverride o = soma::BackendOverride::Auto,
-                             const std::string& hash = "H") {
-    soma::AgentBackendConfig c;
+soma::BackendRequest cfg(soma::BackendOverride o = soma::BackendOverride::Auto,
+                         const std::string& hash = "H") {
+    soma::BackendRequest c;
     c.override = o;
     c.arch_hash = hash;
     return c;
@@ -79,8 +79,8 @@ int main() {
                   d.explain());
         }
 
-        // explain() is USER-VISIBLE — it is the `reason` on GET /v1/agents/{id}
-        // and it is quoted verbatim inside the 422 that refuses an image to a
+        // explain() is USER-VISIBLE — it is the `backend_reason` on
+        // GET /v1/served-models/{id} and it is quoted verbatim inside the 422 that refuses an image to a
         // text-only engine. Until now nothing asserted its text, which is how it
         // shipped reading `soma (verdict, verdict=hybrid)`: the reason name and
         // the field name are the same word (D15).
@@ -101,7 +101,7 @@ int main() {
               refused.explain());
 
         // "fallback", not "llama-cpp": explain() names the ROLE, and
-        // AgentScheduler::resolve_backend maps that role to an engine id one
+        // PlacementScheduler::resolve_backend maps that role to an engine id one
         // layer up. Asserting the engine id here would bake a mapping this
         // function does not own.
         soma::AdmissionRecord absent;

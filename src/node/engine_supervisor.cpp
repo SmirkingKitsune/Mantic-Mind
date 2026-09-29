@@ -14,7 +14,7 @@
 //
 // 2. THE WATCHDOG. Nothing polled the child after it reached Ready, so a crashed
 //    engine advertised SlotState::Ready until an inference request happened to
-//    fail. Now the crash promotes the engine to Error and detaches its agents,
+//    fail. Now the crash promotes the engine to Error and detaches its holders,
 //    so control's next placement decision sees the truth.
 //
 // 3. ENGINES ARE DESCRIPTORS. There is no `if (backend == "llama-cpp")` in this
@@ -171,7 +171,7 @@ bool EngineSupervisor::occupies_slot(const Engine& engine) {
 
 std::optional<SlotId> EngineSupervisor::try_attach(const std::string& engine_id,
                                                    const EngineLoadRequest& request,
-                                                   const AgentId& agent_id) {
+                                                   const HolderId& holder_id) {
     // Caller holds mutex_.
     for (auto& e : engines_) {
         if (e->state != SlotState::Ready) continue;
@@ -184,9 +184,9 @@ std::optional<SlotId> EngineSupervisor::try_attach(const std::string& engine_id,
         if (!e->descriptor->launch_compatible) continue;
         if (!e->descriptor->launch_compatible(e->launch_request, request)) continue;
 
-        if (!agent_id.empty() &&
-            std::find(e->agents.begin(), e->agents.end(), agent_id) == e->agents.end()) {
-            e->agents.push_back(agent_id);
+        if (!holder_id.empty() &&
+            std::find(e->holders.begin(), e->holders.end(), holder_id) == e->holders.end()) {
+            e->holders.push_back(holder_id);
         }
         e->last_active_ms = util::now_ms();
         return e->id;
@@ -196,7 +196,7 @@ std::optional<SlotId> EngineSupervisor::try_attach(const std::string& engine_id,
 
 SlotId EngineSupervisor::load(const std::string& engine_id,
                               const EngineLoadRequest& request,
-                              const AgentId& agent_id) {
+                              const HolderId& holder_id) {
     const EngineDescriptor* descriptor = EngineRegistry::instance().find(engine_id);
     if (descriptor == nullptr) {
         std::lock_guard<std::mutex> lk(mutex_);
@@ -210,9 +210,9 @@ SlotId EngineSupervisor::load(const std::string& engine_id,
     std::string kv_dir;
     {
         std::lock_guard<std::mutex> lk(mutex_);
-        if (auto existing = try_attach(engine_id, request, agent_id)) {
+        if (auto existing = try_attach(engine_id, request, holder_id)) {
             MM_INFO(
-                "EngineSupervisor: attached agent to existing {} engine {}", engine_id, *existing);
+                "EngineSupervisor: attached holder to existing {} engine {}", engine_id, *existing);
             return *existing;
         }
 
@@ -271,7 +271,7 @@ SlotId EngineSupervisor::load(const std::string& engine_id,
     engine->state = SlotState::Loading;
     engine->last_active_ms = util::now_ms();
     engine->effective_ctx_size = request.settings.ctx_size;
-    if (!agent_id.empty()) engine->agents.push_back(agent_id);
+    if (!holder_id.empty()) engine->holders.push_back(holder_id);
 
     EngineLoadRequest spawn_request = request;
     spawn_request.port = port;
@@ -354,7 +354,7 @@ SlotId EngineSupervisor::load(const std::string& engine_id,
 void EngineSupervisor::on_engine_crash(const SlotId& slot_id,
                                        int exit_code,
                                        const std::string& detail) {
-    std::vector<AgentId> orphaned;
+    std::vector<HolderId> orphaned;
     {
         std::lock_guard<std::mutex> lk(mutex_);
         for (auto& e : engines_) {
@@ -363,8 +363,8 @@ void EngineSupervisor::on_engine_crash(const SlotId& slot_id,
             // placement died. Deleting the record here would present a crash as
             // an engine that was never there.
             e->state = SlotState::Error;
-            orphaned = e->agents;
-            e->agents.clear();
+            orphaned = e->holders;
+            e->holders.clear();
             e->client.reset();
             // The dead child is not listening any more, so the reservation is
             // fiction. Freeing the slot without freeing the port would move the
@@ -379,7 +379,7 @@ void EngineSupervisor::on_engine_crash(const SlotId& slot_id,
             break;
         }
     }
-    MM_ERROR("EngineSupervisor: engine {} crashed with code {} ({}); {} agent(s) detached",
+    MM_ERROR("EngineSupervisor: engine {} crashed with code {} ({}); {} holder(s) detached",
              slot_id,
              exit_code,
              detail,
@@ -414,7 +414,7 @@ EngineOpResult EngineSupervisor::unload(const SlotId& slot_id) {
     return {EngineOpStatus::Ok, "unloaded", "", victim->kv_checkpoint_path};
 }
 
-DetachResult EngineSupervisor::detach_agent(const SlotId& slot_id, const AgentId& agent_id) {
+DetachResult EngineSupervisor::detach_holder(const SlotId& slot_id, const HolderId& holder_id) {
     bool unload_now = false;
     {
         std::lock_guard<std::mutex> lk(mutex_);
@@ -423,18 +423,18 @@ DetachResult EngineSupervisor::detach_agent(const SlotId& slot_id, const AgentId
                                [&](const std::unique_ptr<Engine>& e) { return e->id == slot_id; });
         if (it == engines_.end()) return {EngineOpStatus::NotFound, "no such engine", 0, false};
 
-        auto& agents = (*it)->agents;
-        agents.erase(std::remove(agents.begin(), agents.end(), agent_id), agents.end());
-        if (!agents.empty()) {
-            return {EngineOpStatus::Ok, "detached", static_cast<int>(agents.size()), false};
+        auto& holders = (*it)->holders;
+        holders.erase(std::remove(holders.begin(), holders.end(), holder_id), holders.end());
+        if (!holders.empty()) {
+            return {EngineOpStatus::Ok, "detached", static_cast<int>(holders.size()), false};
         }
         unload_now = (*it)->active_requests == 0;
         if (!unload_now) {
-            // Last agent gone but a request is still streaming. Leaving the
+            // Last holder gone but a request is still streaming. Leaving the
             // engine up is correct: the response belongs to a request that was
             // accepted, and killing it mid-stream to reclaim a slot is a worse
             // failure than holding the slot a few seconds longer.
-            return {EngineOpStatus::Busy, "last agent detached but requests in flight", 0, false};
+            return {EngineOpStatus::Busy, "last holder detached but requests in flight", 0, false};
         }
     }
 
@@ -552,11 +552,11 @@ EngineOpResult EngineSupervisor::suspend(const SlotId& slot_id) {
                     "unsupported_content",
                     {}};
         }
-        sequence_count = (*it)->agents.size();
+        sequence_count = (*it)->holders.size();
         if (sequence_count > 1 && !kv->supports_multi_sequence()) {
             // The bug this refuses to repeat: the current path saves sequence 0
             // and silently discards the rest, so a resumed slot comes back with
-            // one agent's context and several agents' expectations.
+            // one holder's context and several holders' expectations.
             return {EngineOpStatus::Unsupported,
                     "engine holds " + std::to_string(sequence_count) +
                         " sequences but its KV backend can only checkpoint sequence 0",
@@ -625,7 +625,7 @@ EngineOpResult EngineSupervisor::suspend(const SlotId& slot_id) {
 SlotId EngineSupervisor::restore(const std::string& engine_id,
                                  const EngineLoadRequest& request,
                                  const std::string& kv_checkpoint_path,
-                                 const AgentId& agent_id) {
+                                 const HolderId& holder_id) {
     const EngineDescriptor* descriptor = EngineRegistry::instance().find(engine_id);
     if (descriptor == nullptr) {
         std::lock_guard<std::mutex> lk(mutex_);
@@ -666,10 +666,10 @@ SlotId EngineSupervisor::restore(const std::string& engine_id,
         for (auto& engine : engines_) {
             if (engine->id != sleeping_vllm) continue;
             engine->state = woke ? SlotState::Ready : SlotState::Suspended;
-            if (woke && !agent_id.empty() &&
-                std::find(engine->agents.begin(), engine->agents.end(), agent_id) ==
-                    engine->agents.end()) {
-                engine->agents.push_back(agent_id);
+            if (woke && !holder_id.empty() &&
+                std::find(engine->holders.begin(), engine->holders.end(), holder_id) ==
+                    engine->holders.end()) {
+                engine->holders.push_back(holder_id);
             }
             if (!woke) last_error_ = "vLLM wake failed: " + error;
             break;
@@ -704,7 +704,7 @@ SlotId EngineSupervisor::restore(const std::string& engine_id,
                        engines_.end());
     }
 
-    const SlotId slot_id = load(engine_id, request, agent_id);
+    const SlotId slot_id = load(engine_id, request, holder_id);
     if (slot_id.empty()) return {};
 
     if (descriptor->kv == nullptr || kv_checkpoint_path.empty()) return slot_id;
@@ -768,10 +768,10 @@ bool EngineSupervisor::touch(const SlotId& slot_id) {
     return false;
 }
 
-std::optional<SlotId> EngineSupervisor::find_by_agent(const AgentId& agent_id) const {
+std::optional<SlotId> EngineSupervisor::find_by_holder(const HolderId& holder_id) const {
     std::lock_guard<std::mutex> lk(mutex_);
     for (const auto& e : engines_) {
-        if (std::find(e->agents.begin(), e->agents.end(), agent_id) != e->agents.end()) {
+        if (std::find(e->holders.begin(), e->holders.end(), holder_id) != e->holders.end()) {
             return e->id;
         }
     }
@@ -791,8 +791,7 @@ SlotInfo EngineSupervisor::make_slot_info(const Engine& engine) const {
     // to hardcode it, so every slot reported the same backend regardless.
     info.backend =
         engine.descriptor != nullptr ? engine.descriptor->id : engine.fallback_backend_id;
-    info.assigned_agent = engine.agents.empty() ? AgentId{} : engine.agents.front();
-    info.agent_ids = engine.agents;
+    info.holder_ids = engine.holders;
     info.state = engine.state;
     info.gpu_devices = engine.launch_request.gpu_devices;
     // The single-scalar view, for the wire field that still expects one. Reported
@@ -825,7 +824,7 @@ std::optional<SlotInfo> EngineSupervisor::find(const SlotId& slot_id) const {
 std::vector<SequenceInfo> EngineSupervisor::sequences(const SlotId& slot_id) const {
     // Per-sequence state is the engine's to report, and the route that exposes it
     // lands with the telemetry gate. Returning an empty list is the honest answer
-    // until then: synthesising one row per attached agent would look like real
+    // until then: synthesising one row per attached holder would look like real
     // per-sequence data while carrying none of it — precisely the confusion a
     // request counter already causes. So it is asked of the ENGINE; an engine
     // with no such route (llama.cpp) reports nothing, and nothing is the truth
@@ -852,7 +851,7 @@ std::vector<SequenceInfo> EngineSupervisor::sequences(const SlotId& slot_id) con
         for (const auto& s : j.value("sessions", nlohmann::json::array())) {
             SequenceInfo info;
             info.index = index++;
-            info.agent_id = s.value("conversation", std::string{});
+            info.conversation = s.value("conversation", std::string{});
             info.kv_tokens = s.value("kv_tokens", 0u);
             info.position = info.kv_tokens;
             info.determinism = "batched";
@@ -949,7 +948,7 @@ void EngineSupervisor::crash_test_engine(const SlotId& slot_id,
 
 SlotId EngineSupervisor::add_ready_test_engine(const std::string& engine_id,
                                                std::string model_path,
-                                               AgentId agent_id,
+                                               HolderId holder_id,
                                                RuntimeSettings settings,
                                                std::string mmproj_path) {
     // The descriptor may be absent in a test that never registered one; the
@@ -962,7 +961,7 @@ SlotId EngineSupervisor::add_ready_test_engine(const std::string& engine_id,
     engine->descriptor = descriptor;
     engine->model_path = std::move(model_path);
     engine->mmproj_path = std::move(mmproj_path);
-    if (!agent_id.empty()) engine->agents.push_back(std::move(agent_id));
+    if (!holder_id.empty()) engine->holders.push_back(std::move(holder_id));
     engine->launch_settings = std::move(settings);
     engine->launch_request.model_path = engine->model_path;
     engine->launch_request.mmproj_path = engine->mmproj_path;
@@ -981,10 +980,10 @@ SlotId EngineSupervisor::add_ready_test_engine(const std::string& engine_id,
 
 SlotId EngineSupervisor::add_suspended_test_engine(const std::string& engine_id,
                                                    std::string model_path,
-                                                   AgentId agent_id,
+                                                   HolderId holder_id,
                                                    RuntimeSettings settings) {
     const SlotId id = add_ready_test_engine(
-        engine_id, std::move(model_path), std::move(agent_id), std::move(settings));
+        engine_id, std::move(model_path), std::move(holder_id), std::move(settings));
     std::lock_guard<std::mutex> lk(mutex_);
     for (auto& e : engines_) {
         if (e->id != id) continue;

@@ -7,13 +7,14 @@
 // That was untenable once admission existed. `POST /v1/models/admit` starts
 // hours of conversion and consumes tens of GB; it must not sit behind the same
 // credential that lets a client send a chat message. And a telemetry dashboard —
-// which only ever reads — should not hold a token that can delete an agent.
+// which only ever reads — should not hold a token that can delete a user.
 //
 // The split is by BLAST RADIUS, not by resource. That is why `GET
-// /v1/agents/{id}/memories` is `read` while `POST .../memories` is `chat`: they
+// /v1/users/{id}/memories` is `read` while `POST .../memories` is `chat`: they
 // touch the same rows, and only one of them can change anything.
 
 #include "control/route_scope.hpp"
+#include "control/token_binding.hpp"
 
 #include "common/logger.hpp"
 #include "common/pairing.hpp"
@@ -92,64 +93,80 @@ std::vector<RouteScope> route_scope_table() {
     // silently under-protect a new mutation, and defaulting to `operator` would
     // silently break a new GET. Both are worse than refusing to start.
     return {
-        // ── agents: read ─────────────────────────────────────────────────────
-        {"GET", "/v1/agents", Scope::Read},
-        {"GET", "/v1/agents/:id", Scope::Read},
-        {"GET", "/v1/agents/:id/conversations", Scope::Read},
-        {"GET", "/v1/agents/:id/conversations/:cid", Scope::Read},
-        {"GET", "/v1/agents/:id/conversations/:cid/local-memories", Scope::Read},
-        {"GET", "/v1/agents/:id/memories", Scope::Read},
-        {"GET", "/v1/agents/:id/attachments/:attachment_id", Scope::Read},
-        {"GET", "/v1/agents/:id/voice", Scope::Read},
-        {"GET", "/v1/agents/:id/voice/proposals", Scope::Read},
-        {"GET", "/v1/agents/:id/voice/proposals/:proposal_id/sample", Scope::Read},
-        {"GET", "/v1/agents/:id/speech/cache/:cache_id", Scope::Read},
+        // ── users: read ──────────────────────────────────────────────────────
+        {"GET", "/v1/users", Scope::Read},
+        {"GET", "/v1/users/:id", Scope::Read},
+        {"GET", "/v1/users/:id/conversations", Scope::Read},
+        {"GET", "/v1/users/:id/conversations/:cid", Scope::Read},
+        {"GET", "/v1/users/:id/conversations/:cid/local-memories", Scope::Read},
+        {"GET", "/v1/users/:id/memories", Scope::Read},
+        {"GET", "/v1/users/:id/attachments/:attachment_id", Scope::Read},
+        {"GET", "/v1/users/:id/voice", Scope::Read},
+        {"GET", "/v1/users/:id/voice/proposals", Scope::Read},
+        {"GET", "/v1/users/:id/voice/proposals/:proposal_id/sample", Scope::Read},
+        {"GET", "/v1/users/:id/speech/cache/:cache_id", Scope::Read},
 
-        // ── agents: chat ─────────────────────────────────────────────────────
+        // ── users: chat ──────────────────────────────────────────────────────
         //
-        // Bounded and per-agent. Everything here changes one agent's own
-        // conversational state and nothing else's.
-        {"POST", "/v1/agents/:id/chat", Scope::Chat},
-        {"POST", "/v1/agents/:id/conversations", Scope::Chat},
-        {"PUT", "/v1/agents/:id/conversations/:cid", Scope::Chat},
-        {"POST", "/v1/agents/:id/conversations/:cid/activate", Scope::Chat},
-        {"POST", "/v1/agents/:id/conversations/:cid/compact", Scope::Chat},
-        {"POST", "/v1/agents/:id/conversations/:cid/local-memories", Scope::Chat},
-        {"PUT", "/v1/agents/:id/conversations/:cid/local-memories/:mid", Scope::Chat},
-        {"POST", "/v1/agents/:id/memories", Scope::Chat},
-        {"PUT", "/v1/agents/:id/memories/:mid", Scope::Chat},
-        {"POST", "/v1/agents/:id/memories/extract", Scope::Chat},
-        {"POST", "/v1/agents/:id/curation/proposals", Scope::Chat},
-        {"POST", "/v1/agents/:id/curation/proposals/apply", Scope::Chat},
-        {"POST", "/v1/agents/:id/curation/apply", Scope::Chat},
-        {"POST", "/v1/agents/:id/speech", Scope::Chat},
+        // Bounded and per-user. Everything here changes one user's own
+        // conversational state and nothing else's — and a token bound to a user
+        // reaches only that user's (control/token_binding.hpp).
+        {"PUT", "/v1/users/:id", Scope::Chat},
+        {"POST", "/v1/users/:id/chat", Scope::Chat},
+        {"POST", "/v1/users/:id/conversations", Scope::Chat},
+        {"PUT", "/v1/users/:id/conversations/:cid", Scope::Chat},
+        {"POST", "/v1/users/:id/conversations/:cid/activate", Scope::Chat},
+        {"POST", "/v1/users/:id/conversations/:cid/compact", Scope::Chat},
+        {"POST", "/v1/users/:id/conversations/:cid/local-memories", Scope::Chat},
+        {"PUT", "/v1/users/:id/conversations/:cid/local-memories/:mid", Scope::Chat},
+        {"POST", "/v1/users/:id/memories", Scope::Chat},
+        {"PUT", "/v1/users/:id/memories/:mid", Scope::Chat},
+        {"POST", "/v1/users/:id/memories/extract", Scope::Chat},
+        {"POST", "/v1/users/:id/curation/proposals", Scope::Chat},
+        {"POST", "/v1/users/:id/curation/apply", Scope::Chat},
+        {"POST", "/v1/users/:id/speech", Scope::Chat},
         // Registered through PostUpload rather than Post, which is exactly why
         // the coverage check reads the SERVER's registrations instead of a list
-        // someone greps for: this one was missed on the first pass and the check
-        // refused to start until it was added.
-        {"POST", "/v1/agents/:id/attachments", Scope::Chat},
+        // someone greps for: its agent-era twin was missed on the first pass and
+        // the check refused to start until it was added.
+        {"POST", "/v1/users/:id/attachments", Scope::Chat},
         {"POST", "/v1/audio/speech", Scope::Chat},
         {"POST", "/v1/chat/completions", Scope::Chat},
-        {"POST", "/v1/agents/:id/voice/proposals", Scope::Chat},
-        {"POST", "/v1/agents/:id/voice/proposals/:proposal_id/sample", Scope::Chat},
+        {"POST", "/v1/users/:id/voice/proposals", Scope::Chat},
+        {"POST", "/v1/users/:id/voice/proposals/:proposal_id/sample", Scope::Chat},
 
-        // DELETEs are operator even when they are per-agent and small. Losing a
+        // DELETEs are operator even when they are per-user and small. Losing a
         // conversation is not recoverable from the API, and "bounded" is about
         // what a mistake costs, not how many rows it touches.
-        {"DELETE", "/v1/agents/:id/conversations/:cid", Scope::Operator},
-        {"DELETE", "/v1/agents/:id/conversations/:cid/local-memories/:mid", Scope::Operator},
-        {"DELETE", "/v1/agents/:id/memories/:mid", Scope::Operator},
-        {"DELETE", "/v1/agents/:id/attachments/:attachment_id", Scope::Operator},
+        {"DELETE", "/v1/users/:id/conversations/:cid", Scope::Operator},
+        {"DELETE", "/v1/users/:id/conversations/:cid/local-memories/:mid", Scope::Operator},
+        {"DELETE", "/v1/users/:id/memories/:mid", Scope::Operator},
+        {"DELETE", "/v1/users/:id/attachments/:attachment_id", Scope::Operator},
 
-        // ── agents: operator ─────────────────────────────────────────────────
-        {"POST", "/v1/agents", Scope::Operator},
-        {"PUT", "/v1/agents/:id", Scope::Operator},
-        {"DELETE", "/v1/agents/:id", Scope::Operator},
-        // Which ENGINE serves an agent. A performance and correctness decision,
-        // and the one place an operator can overrule a verdict.
-        {"PUT", "/v1/agents/:id/backend", Scope::Operator},
-        {"POST", "/v1/agents/:id/voice/proposals/:proposal_id/approve", Scope::Operator},
-        {"POST", "/v1/agents/:id/voice/proposals/:proposal_id/reject", Scope::Operator},
+        // ── users: operator ──────────────────────────────────────────────────
+        //
+        // Creating a user makes a store and an identity tokens can be bound to;
+        // deleting one takes every conversation and memory with it.
+        {"POST", "/v1/users", Scope::Operator},
+        {"DELETE", "/v1/users/:id", Scope::Operator},
+        {"POST", "/v1/users/:id/voice/proposals/:proposal_id/approve", Scope::Operator},
+        {"POST", "/v1/users/:id/voice/proposals/:proposal_id/reject", Scope::Operator},
+
+        // ── served models: the catalog users pick from ───────────────────────
+        //
+        // Reading it is observation; every write is operator. A served model is
+        // shared by every user who picks it, so changing one changes what all of
+        // them get — and suspend/restore/release move a live model in or out of
+        // a node slot under whoever is using it.
+        {"GET", "/v1/served-models", Scope::Read},
+        {"GET", "/v1/served-models/:id", Scope::Read},
+        {"POST", "/v1/served-models", Scope::Operator},
+        {"PUT", "/v1/served-models/:id", Scope::Operator},
+        {"DELETE", "/v1/served-models/:id", Scope::Operator},
+        {"PUT", "/v1/served-models/:id/backend", Scope::Operator},
+        {"POST", "/v1/served-models/:id/suspend", Scope::Operator},
+        {"POST", "/v1/served-models/:id/restore", Scope::Operator},
+        {"POST", "/v1/served-models/:id/release", Scope::Operator},
 
         // ── models ───────────────────────────────────────────────────────────
         {"GET", "/v1/models", Scope::Read},
@@ -170,7 +187,7 @@ std::vector<RouteScope> route_scope_table() {
         // ── engines ──────────────────────────────────────────────────────────
         //
         // All read: telemetry is observation. The routes that CHANGE an engine —
-        // suspend, restore, unload — go through the agent and model surfaces and
+        // suspend, restore, release — go through the served-model surface and
         // are operator there.
         {"GET", "/v1/engines", Scope::Read},
         {"GET", "/v1/engines/:id/telemetry", Scope::Read},
@@ -210,17 +227,6 @@ std::vector<RouteScope> route_scope_table() {
         {"GET", "/v1/nodes/discovered", Scope::Read},
         {"GET", "/v1/placements", Scope::Read},
 
-        // ── placement lifecycle ──────────────────────────────────────────────
-        //
-        // Operator, all three: each moves a live model in or out of a node slot
-        // and can take a running agent offline. Read-only /v1/placements above
-        // was the ONLY placement surface — the verbs existed inside the
-        // scheduler and on the node API, and no /v1 route could reach them,
-        // which is the "no internal-only capabilities" half of P1 going
-        // unenforced.
-        {"POST", "/v1/agents/:id/suspend", Scope::Operator},
-        {"POST", "/v1/agents/:id/restore", Scope::Operator},
-        {"POST", "/v1/agents/:id/release", Scope::Operator},
         {"GET", "/v1/performance", Scope::Read},
         {"GET", "/v1/activity", Scope::Read},
         {"POST", "/v1/nodes", Scope::Operator},
@@ -387,6 +393,7 @@ AuthResult ScopeAuthorizer::authorize(const httplib::Request& req) const {
             result.granted = row.scopes;
             result.token_label = row.label;
             result.token_id = row.id;
+            result.bound_user_id = row.user_id;
             return result;
         }
     }
@@ -414,6 +421,15 @@ bool ScopeAuthorizer::authorize_or_reject(const httplib::Request& req,
                                        {"required", to_string(required)},
                                        {"granted", format_scopes(auth.granted)}}
                             .dump(),
+                        "application/json");
+        return false;
+    }
+
+    // Binding only ever narrows what the scope granted.
+    const auto binding = binding_permits(auth.bound_user_id, req.method, req.path);
+    if (!binding.allowed) {
+        res.status = 403;
+        res.set_content(nlohmann::json{{"error", binding.error}, {"code", "user_binding"}}.dump(),
                         "application/json");
         return false;
     }

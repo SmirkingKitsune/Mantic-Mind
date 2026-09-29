@@ -665,7 +665,9 @@ static void run_node_cli(uint16_t listen_port,
                     " state=" + s.value("state", std::string{}) +
                     " port=" + std::to_string(s.value("port", 0)) +
                     " model=" + (s.value("model_path", std::string{}).empty() ? "-" : s.value("model_path", std::string{})) +
-                    " agent=" + (s.value("assigned_agent", std::string{}).empty() ? "-" : s.value("assigned_agent", std::string{})) +
+                    " holders=" + (s.value("holder_ids", nlohmann::json::array()).empty()
+                                       ? std::string("-")
+                                       : mm::util::join(s.value("holder_ids", std::vector<std::string>{}), ",")) +
                     " vram_mb=" + std::to_string(s.value("vram_usage_mb", 0LL)));
             }
             continue;

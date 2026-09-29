@@ -268,8 +268,8 @@ inline std::string short_model(const std::string& path, size_t max = 26) {
 
 // KV-cache usage cell: small gauge + percentage.
 // ── Slot table ────────────────────────────────────────────────────────────────
-// SLOT | STATE | MODEL | [AGENTS] | PORT | CTX | VRAM. `wide` adds the AGENTS
-// column and roomier widths for the control node-detail; the narrow form is for
+// SLOT | STATE | MODEL | [HELD BY] | PORT | CTX | VRAM. `wide` adds the HELD BY
+// column (the served models attached to the slot) and roomier widths for the control node-detail; the narrow form is for
 // the node console's SLOTS panel.
 inline ftxui::Element slot_table(const std::vector<SlotInfo>& slots, bool wide) {
     using namespace ftxui;
@@ -278,19 +278,19 @@ inline ftxui::Element slot_table(const std::vector<SlotInfo>& slots, bool wide) 
     const int wSlot = 6;
     const int wState = wide ? 13 : 11;
     const int wModel = wide ? 26 : 15;
-    const int wAgents = 14;
+    const int wHolders = 14;
     const int wPort = 6;
     const int wCtx = 8;
     const int wVram = 6;
     auto sep = [] { return text(" │ ") | dim; };
 
-    auto make_row = [&](Element slot, Element state, Element model, Element agents,
+    auto make_row = [&](Element slot, Element state, Element model, Element holders,
                         Element port, Element context, Element vram) -> Element {
         Elements cells = {col(std::move(slot), wSlot), sep(),
                           col(std::move(state), wState), sep(),
                           col(std::move(model), wModel), sep()};
         if (wide) {
-            cells.push_back(col(std::move(agents), wAgents));
+            cells.push_back(col(std::move(holders), wHolders));
             cells.push_back(sep());
         }
         cells.push_back(col_right(std::move(port), wPort));
@@ -303,13 +303,13 @@ inline ftxui::Element slot_table(const std::vector<SlotInfo>& slots, bool wide) 
 
     Elements rows;
     rows.push_back(make_row(text("SLOT") | dim, text("STATE") | dim, text("MODEL") | dim,
-                            text("AGENTS") | dim, text("PORT") | dim, text("CTX") | dim,
+                            text("HELD BY") | dim, text("PORT") | dim, text("CTX") | dim,
                             text("VRAM") | dim));
     rows.push_back(separator());
     for (const auto& s : slots) {
         std::string slot_id = s.id;
         if (slot_id.rfind("slot-", 0) == 0) slot_id = "s" + slot_id.substr(5);
-        const std::string agents = s.agent_ids.empty() ? "—" : mm::util::join(s.agent_ids, ",");
+        const std::string holders = s.holder_ids.empty() ? "—" : mm::util::join(s.holder_ids, ",");
         Element port = s.port > 0 ? text(std::to_string(s.port)) : (text("-") | dim);
         Element context = s.effective_ctx_size > 0
             ? text(std::to_string(s.effective_ctx_size))
@@ -318,7 +318,7 @@ inline ftxui::Element slot_table(const std::vector<SlotInfo>& slots, bool wide) 
         Element model = s.state == SlotState::Empty ? (text(short_model(s.model_path)) | dim)
                                                     : text(short_model(s.model_path));
         rows.push_back(make_row(text(slot_id) | dim, slot_state_el(s.state), std::move(model),
-                                text(agents) | color(Color::Cyan), std::move(port),
+                                text(holders) | color(Color::Cyan), std::move(port),
                                 std::move(context), std::move(vram)));
     }
     return vbox(std::move(rows));

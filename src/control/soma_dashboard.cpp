@@ -39,8 +39,8 @@ void parse_engines(const nlohmann::json& j,
         v.model_path = e.value("model_path", std::string{});
         v.vram_usage_mb = e.value("vram_usage_mb", std::uint64_t{0});
         v.effective_ctx_size = e.value("effective_ctx_size", std::uint32_t{0});
-        for (const auto& a : e.value("agent_ids", nlohmann::json::array())) {
-            if (a.is_string()) v.agent_ids.push_back(a.get<std::string>());
+        for (const auto& a : e.value("served_model_ids", nlohmann::json::array())) {
+            if (a.is_string()) v.served_model_ids.push_back(a.get<std::string>());
         }
         out.push_back(std::move(v));
     }
@@ -314,7 +314,7 @@ void SomaDashboard::poll_once() {
                     for (const auto& s : arr) {
                         SomaSequenceView v;
                         v.index = s.value("index", 0u);
-                        v.agent_id = s.value("agent_id", std::string{});
+                        v.conversation = s.value("conversation", std::string{});
                         v.position = s.value("position", 0u);
                         v.kv_tokens = s.value("kv_tokens", 0u);
                         v.prefilling = s.value("prefilling", false);

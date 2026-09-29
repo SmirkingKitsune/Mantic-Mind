@@ -320,14 +320,65 @@ std::string model_id_from_ref(const std::string& ref) {
     return id;
 }
 
-// ── Agent ID validation ───────────────────────────────────────────────────────
-bool is_valid_agent_id(const std::string& id) {
+bool is_valid_served_model_id(const std::string& id) {
     if (id.empty() || id.size() > 128) return false;
-    if (!std::isalnum(static_cast<unsigned char>(id[0]))) return false;
+    const auto lower_alnum = [](unsigned char c) {
+        return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+    };
+    if (!lower_alnum(static_cast<unsigned char>(id[0]))) return false;
     for (unsigned char c : id) {
-        if (!std::isalnum(c) && c != '-' && c != '_') return false;
+        if (!lower_alnum(c) && c != '-' && c != '_' && c != '.') return false;
     }
     return true;
+}
+
+bool is_valid_user_id(const std::string& id) {
+    if (id.empty() || id.size() > 64) return false;
+    const auto lower_alnum = [](unsigned char c) {
+        return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+    };
+    if (!lower_alnum(static_cast<unsigned char>(id.front())) ||
+        !lower_alnum(static_cast<unsigned char>(id.back())))
+        return false;
+    for (unsigned char c : id) {
+        if (!lower_alnum(c) && c != '-' && c != '_' && c != '.') return false;
+    }
+    // "con.txt" is as reserved as "con": Windows matches the part before the dot.
+    const std::string stem = id.substr(0, id.find('.'));
+    if (stem == "con" || stem == "prn" || stem == "aux" || stem == "nul") return false;
+    if (stem.size() == 4 && (stem.compare(0, 3, "com") == 0 || stem.compare(0, 3, "lpt") == 0) &&
+        stem[3] >= '0' && stem[3] <= '9')
+        return false;
+    return true;
+}
+
+std::string slugify(const std::string& text, std::size_t max_len) {
+    std::string out;
+    out.reserve(text.size());
+    bool pending_dash = false;
+    for (unsigned char c : text) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<unsigned char>(c - 'A' + 'a');
+        const bool keep = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' ||
+                          c == '_';
+        if (!keep) {
+            pending_dash = !out.empty();
+            continue;
+        }
+        if (pending_dash) out.push_back('-');
+        pending_dash = false;
+        out.push_back(static_cast<char>(c));
+    }
+    // A leading separator is impossible by construction; trailing '.' and '_'
+    // are not, and an id must start AND end on something a reader can see.
+    while (!out.empty() && (out.back() == '.' || out.back() == '_' || out.back() == '-'))
+        out.pop_back();
+    while (!out.empty() && (out.front() == '.' || out.front() == '_')) out.erase(out.begin());
+    if (out.size() > max_len) {
+        out.resize(max_len);
+        while (!out.empty() && (out.back() == '.' || out.back() == '_' || out.back() == '-'))
+            out.pop_back();
+    }
+    return out;
 }
 
 // ── API key generation ────────────────────────────────────────────────────────

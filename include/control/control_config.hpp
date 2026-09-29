@@ -10,6 +10,9 @@ namespace mm {
 struct ControlConfig {
     uint16_t    listen_port = 9090;
     uint16_t    openai_compat_port = 9091; // 0 disables the compatibility listener
+    /// Threads running users' work (turns, recall, extraction, compaction):
+    /// one strand per conversation on this many workers.
+    int         chat_worker_threads = 16;
     std::string data_dir    = "data";
     std::string log_file    = "logs/mantic-mind-control.log";
     uint32_t    node_health_poll_interval_s = 30;

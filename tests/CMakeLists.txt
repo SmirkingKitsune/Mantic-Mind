@@ -7,17 +7,73 @@ target_include_directories(mm_process_exec_tests PRIVATE
 )
 add_test(NAME mm_process_exec_tests COMMAND mm_process_exec_tests)
 
+# The served-model catalog, checked without a server: pure rules plus SQLite.
+# Its own executable because mm_reliability_tests stops at its first failure,
+# and under WSL that is always admission_fetch_stage (the admission venv is
+# Windows-only) — so anything registered after it never runs on GCC.
+add_executable(mm_models_tests
+    models_tests.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/served_model_catalog.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/served_model_validator.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/model_registry.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/route_scope.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/token_binding.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/node_registry.cpp
+)
+target_include_directories(mm_models_tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(mm_models_tests PRIVATE mm_common ${MM_PLATFORM_LIBS})
+if(WIN32)
+    add_custom_command(TARGET mm_models_tests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_RUNTIME_DLLS:mm_models_tests>"
+                "$<TARGET_FILE_DIR:mm_models_tests>"
+        COMMAND_EXPAND_LISTS)
+endif()
+add_test(NAME mm_models_tests COMMAND mm_models_tests)
+
+# The user layer — store, manager, queue, context and compaction, binding —
+# checked without a server, on both toolchains, for the same reason.
+add_executable(mm_users_tests
+    users_tests.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/user_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/token_binding.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/curation.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/conversation_queue.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/served_model_catalog.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/model_registry.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/route_scope.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/node_registry.cpp
+)
+target_include_directories(mm_users_tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(mm_users_tests PRIVATE mm_common ${MM_PLATFORM_LIBS})
+if(WIN32)
+    add_custom_command(TARGET mm_users_tests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_RUNTIME_DLLS:mm_users_tests>"
+                "$<TARGET_FILE_DIR:mm_users_tests>"
+        COMMAND_EXPAND_LISTS)
+endif()
+add_test(NAME mm_users_tests COMMAND mm_users_tests)
+
 add_executable(mm_reliability_tests
     reliability_tests.cpp
-    ${CMAKE_SOURCE_DIR}/src/control/agent_queue.cpp
-    ${CMAKE_SOURCE_DIR}/src/control/agent_manager.cpp
-    ${CMAKE_SOURCE_DIR}/src/control/agent_config_validator.cpp
-    ${CMAKE_SOURCE_DIR}/src/control/agent_scheduler.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/user_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/token_binding.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/api_support.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/curation.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/chat_pipeline.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/user_routes.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/served_model_validator.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/served_model_catalog.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/placement_scheduler.cpp
     ${CMAKE_SOURCE_DIR}/src/control/engine_config_store.cpp
     ${CMAKE_SOURCE_DIR}/src/control/engine_group_planner.cpp
     ${CMAKE_SOURCE_DIR}/src/control/model_registry.cpp
     ${CMAKE_SOURCE_DIR}/src/control/route_scope.cpp
     ${CMAKE_SOURCE_DIR}/src/control/control_api_server.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/served_model_routes.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/openai_compat.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/conversation_queue.cpp
     ${CMAKE_SOURCE_DIR}/src/control/performance_tracker.cpp
     ${CMAKE_SOURCE_DIR}/src/control/tts_service_client.cpp
     ${CMAKE_SOURCE_DIR}/src/control/node_registry.cpp
@@ -51,8 +107,8 @@ target_link_libraries(mm_reliability_tests PRIVATE
     # add_ready_test_engine(), so it compiles those sources itself — the same
     # reason it compiles control's. Linking the library too would give one binary
     # two definitions of every symbol in it.
-    # Same reason the control target links it: agent_scheduler.cpp resolves an
-    # agent's engine through soma::select_backend(), so the policy has one
+    # Same reason the control target links it: placement_scheduler.cpp resolves
+    # a model's engine through soma::select_backend(), so the policy has one
     # implementation rather than a control-side copy that drifts from the engine.
     mm_soma
     ${MM_PLATFORM_LIBS}
@@ -81,6 +137,15 @@ if(WIN32)
 endif()
 
 add_test(NAME mm_reliability_tests COMMAND mm_reliability_tests)
+
+# The placement-lease tests, by name. They are registered after
+# admission_fetch_stage, which fails under WSL for environment reasons (the
+# admission venv is Windows-only) and stops the runner — so without this entry
+# they would never run on GCC.
+add_test(NAME mm_lease_tests COMMAND mm_reliability_tests lease_)
+add_test(NAME mm_served_models_http COMMAND mm_reliability_tests served_models_http_)
+add_test(NAME mm_openai_stateless COMMAND mm_reliability_tests openai_stateless_)
+add_test(NAME mm_users_http COMMAND mm_reliability_tests users_http_)
 
 # The admission test drives the REAL `soma plan --json` rather than a mock, so it
 # needs the binary and a model. Passed as environment rather than argv because
@@ -134,9 +199,9 @@ if(Python3_Interpreter_FOUND)
     # walks panel includes; neither asks whether a capability the TUI or CLI can
     # reach is reachable through /v1 at all.
     #
-    # It was not: AgentScheduler::suspend_agent was private, the node API had
+    # It was not: the scheduler's suspend was private, the node API had
     # /api/node/suspend-slot, and no /v1 route could reach either — so an
-    # operator holding the whole control API could not suspend an agent while
+    # operator holding the whole control API could not suspend a placement while
     # the scheduler did it on its own under capacity pressure.
     # A design header said exactly that in a comment and was compiled by
     # nothing (roadmap D46), so nothing failed. This check is the answer to
@@ -282,7 +347,7 @@ if(Python3_Interpreter_FOUND)
                      "${CMAKE_CURRENT_BINARY_DIR}/kimi_dialect_tmp")
 
     # Opt-in release smoke for a real Linux multi-node vLLM/Ray deployment.
-    # The script skips unless its control URL and agent ID are supplied.
+    # The script skips unless its control URLs and served-model id are supplied.
     add_test(NAME mm_vllm_ray_smoke
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_SOURCE_DIR}/tests/vllm_ray_smoke.py")

@@ -30,7 +30,7 @@ struct NodeConfig {
     int         llama_update_check_interval_hours = 24;
 
     // Soma — the MoE streaming engine, a PEER of the llama.cpp fallback rather
-    // than a replacement for it. Both are registered at startup and an agent's
+    // than a replacement for it. Both are registered at startup and a model's
     // verdict decides which one runs it.
     std::string soma_path = "soma";     // soma executable  MM_SOMA_PATH
 

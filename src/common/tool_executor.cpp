@@ -1,5 +1,5 @@
 #include "common/tool_executor.hpp"
-#include "common/agent_db.hpp"
+#include "common/user_db.hpp"
 #include "common/util.hpp"
 #include "common/logger.hpp"
 
@@ -9,7 +9,11 @@ namespace mm {
 
 namespace {
 
-nlohmann::json build_conversation_summary_json(AgentDB& db, const ConvId& conv_id) {
+/// Messages a conversation summary previews, newest last. A long conversation
+/// would otherwise answer one tool call with its whole history.
+constexpr std::size_t kSummaryPreviewMessages = 40;
+
+nlohmann::json build_conversation_summary_json(UserDB& db, const ConvId& conv_id) {
     auto conv = db.load_conversation(conv_id);
     if (!conv) {
         return nlohmann::json{{"error", "conversation not found: " + conv_id}};
@@ -27,7 +31,11 @@ nlohmann::json build_conversation_summary_json(AgentDB& db, const ConvId& conv_i
     }
 
     nlohmann::json msg_summary = nlohmann::json::array();
-    for (const auto& m : conv->messages) {
+    const std::size_t skip = conv->messages.size() > kSummaryPreviewMessages
+                                 ? conv->messages.size() - kSummaryPreviewMessages
+                                 : 0;
+    for (std::size_t i = skip; i < conv->messages.size(); ++i) {
+        const auto& m = conv->messages[i];
         nlohmann::json entry = {
             {"role", to_string(m.role)},
             {"content_preview", m.content.substr(0, 500)}
@@ -44,15 +52,16 @@ nlohmann::json build_conversation_summary_json(AgentDB& db, const ConvId& conv_i
         {"parent_conv_id", conv->parent_conv_id},
         {"total_tokens", conv->total_tokens},
         {"message_count", conv->messages.size()},
+        {"messages_omitted", skip},
         {"messages", msg_summary},
-        {"compaction_summary", conv->compaction_summary},
+        {"summary", conv->summary},
         {"local_memories", mems_arr}
     };
 }
 
 } // namespace
 
-ToolExecutor::ToolExecutor(AgentDB& db) : db_(db) {}
+ToolExecutor::ToolExecutor(UserDB& db) : db_(db) {}
 
 // ── Tool definitions ──────────────────────────────────────────────────────────
 
@@ -208,9 +217,9 @@ Message ToolExecutor::execute_tool(const ToolCall& call, const ConvId& conv_id) 
         if (call.function_name == "save_local_memory") {
             output = handle_save_local_memory(args, conv_id);
         } else if (call.function_name == "update_local_memory") {
-            output = handle_update_local_memory(args);
+            output = handle_update_local_memory(args, conv_id);
         } else if (call.function_name == "delete_local_memory") {
-            output = handle_delete_local_memory(args);
+            output = handle_delete_local_memory(args, conv_id);
         } else if (call.function_name == "list_local_memories") {
             output = handle_list_local_memories(conv_id);
         } else if (call.function_name == "save_global_memory") {
@@ -251,12 +260,15 @@ std::string ToolExecutor::handle_save_local_memory(const nlohmann::json& args,
     return nlohmann::json{{"status", "saved"}, {"id", mem.id}}.dump();
 }
 
-std::string ToolExecutor::handle_update_local_memory(const nlohmann::json& args) {
+std::string ToolExecutor::handle_update_local_memory(const nlohmann::json& args,
+                                                      const ConvId& conv_id) {
     std::string id      = args.at("id").get<std::string>();
     std::string content = args.at("content").get<std::string>();
 
+    // Local means this conversation's: another conversation's note is not
+    // reachable by id, even one of the same user's.
     auto existing = db_.get_local_memory(id);
-    if (!existing) {
+    if (!existing || existing->conversation_id != conv_id) {
         return nlohmann::json{{"error", "local memory not found: " + id}}.dump();
     }
 
@@ -266,8 +278,13 @@ std::string ToolExecutor::handle_update_local_memory(const nlohmann::json& args)
     return nlohmann::json{{"status", "updated"}, {"id", id}}.dump();
 }
 
-std::string ToolExecutor::handle_delete_local_memory(const nlohmann::json& args) {
+std::string ToolExecutor::handle_delete_local_memory(const nlohmann::json& args,
+                                                      const ConvId& conv_id) {
     std::string id = args.at("id").get<std::string>();
+    auto existing = db_.get_local_memory(id);
+    if (!existing || existing->conversation_id != conv_id) {
+        return nlohmann::json{{"error", "local memory not found: " + id}}.dump();
+    }
     db_.delete_local_memory(id);
     return nlohmann::json{{"status", "deleted"}, {"id", id}}.dump();
 }
@@ -364,7 +381,8 @@ std::string ToolExecutor::handle_list_conversations(const nlohmann::json& args) 
             {"is_active", c.is_active},
             {"total_tokens", c.total_tokens},
             {"created_at_ms", c.created_at_ms},
-            {"has_compaction_summary", !c.compaction_summary.empty()}
+            {"model_id", c.model_id},
+            {"has_summary", !c.summary.empty()}
         });
         ++count;
     }

@@ -20,7 +20,7 @@ cluster it could not repair. Watching control alone and calling that "every
 in-process mutation" is the same shape of mistake as watching three references
 and calling that every channel.
 
-The gap it closes, concretely: `AgentScheduler::suspend_agent` was PRIVATE, the
+The gap it closes, concretely: the scheduler's suspend was PRIVATE, the
 node API had `/api/node/suspend-slot`, and no `/v1/*` route could reach either.
 An operator holding the entire control API could not suspend an agent, while the
 scheduler did it on its own under capacity pressure. A design header said so in a
@@ -54,16 +54,18 @@ SCOPE_TABLE = "src/control/route_scope.cpp"
 CLI = "src/control/main.cpp"
 TUI = "src/control/control_ui.cpp"
 
-# The TUI is not one file. control_ui.cpp holds the tabs that reach NodeRegistry,
-# AgentManager and AgentScheduler in-process; the guarded panels are HTTP clients
-# of /v1 like any other. Coverage has to read both, or the Soma, Engines and
-# Admissions tabs look like they do nothing.
+# The TUI is not one file. control_ui.cpp holds the tabs that reach NodeRegistry
+# in-process; the guarded panels are HTTP clients of /v1 like any other. Coverage
+# has to read both, or the Users, Chat, Models, Soma, Engines and Admissions tabs
+# look like they do nothing.
 TUI_FILES = [
     "src/control/control_ui.cpp",
     "src/control/soma_dashboard.cpp",
     "src/control/soma_panels.cpp",
     "src/control/engine_panels.cpp",
     "src/control/admission_panels.cpp",
+    "src/control/model_panels.cpp",
+    "src/control/user_panels.cpp",
 ]
 
 # {"GET", "/v1/agents/:id", Scope::Read},
@@ -71,7 +73,7 @@ ROUTE_RE = re.compile(r'\{"(GET|POST|PUT|DELETE|PATCH)",\s*"([^"]+)"')
 
 # self.get("/v1/..."), self.post("/v1/..." , ...), self.stream_post("/v1/...", ...
 CLI_CALL_RE = re.compile(r'self\.(get|post|put|del|stream_post)\(\s*"([^"]+)"')
-# Paths the CLI builds by concatenation: "/v1/agents/" + tokens[2] + "/suspend"
+# Paths the CLI builds by concatenation: "/v1/users/" + tokens[2] + "/chat"
 CLI_CONCAT_RE = re.compile(r'self\.(get|post|put|del|stream_post)\(\s*"(/v1/[^"]*)"\s*\+')
 # Every /v1 literal ANYWHERE in the CLI, verb unknown.
 #
@@ -97,71 +99,71 @@ CLI_COVERAGE_EXEMPT = {
     ("POST", "/v1/audio/speech"):
         "returns binary audio; `curation`/`chat` cover the text path and a REPL "
         "cannot usefully render a WAV",
-    ("POST", "/v1/agents/:id/attachments"):
+    ("POST", "/v1/users/:id/attachments"):
         "multipart upload of an image; covered by `chat send` for text",
-    ("GET", "/v1/agents/:id/attachments/:attachment_id"):
+    ("GET", "/v1/users/:id/attachments/:attachment_id"):
         "returns binary image bytes",
-    ("DELETE", "/v1/agents/:id/attachments/:attachment_id"):
+    ("DELETE", "/v1/users/:id/attachments/:attachment_id"):
         "attachment lifecycle follows its conversation",
-    ("GET", "/v1/agents/:id/speech/cache/:cache_id"):
+    ("GET", "/v1/users/:id/speech/cache/:cache_id"):
         "returns binary audio",
-    ("POST", "/v1/agents/:id/speech"):
+    ("POST", "/v1/users/:id/speech"):
         "returns binary audio",
 }
 
 VERB = {"get": "GET", "post": "POST", "put": "PUT", "del": "DELETE",
         "stream_post": "POST"}
 
-# control_ui.cpp reaches these three references directly. MUTATIONS through them
-# bypass the API handler; reads do not carry the same risk, because the handler
-# for a read has no side effect the TUI could skip.
-# Listed exhaustively rather than only the ones in use: a mutator that appears
-# in the TUI later is caught by the "no route mapped" branch instead of passing
-# silently because nobody thought to add it here.
+# In-process mutations control_ui.cpp could perform. MUTATIONS through a held
+# reference bypass the API handler; reads do not carry the same risk, because the
+# handler for a read has no side effect the TUI could skip.
+#
+# Listed exhaustively rather than only the ones in use: a mutator that appears in
+# the TUI later is caught by the "no route mapped" branch instead of passing
+# silently because nobody thought to add it here. Most of this list names things
+# the TUI shell cannot currently reach at all — the users, chat, voice and models
+# tabs are HTTP clients in guarded translation units (check_ui_api.py), and
+# ControlUI no longer holds a UserManager or a PlacementScheduler. That is the
+# point: the day one of them comes back, the entry is already here.
 MUTATORS = [
-    "agents_.create_agent", "agents_.update_agent", "agents_.delete_agent",
+    "users_.create_user", "users_.update_profile", "users_.delete_user",
     "registry_.add_node", "registry_.remove_node", "registry_.forget_node",
     "registry_.start_pair", "registry_.complete_pair", "registry_.pair_node",
-    "scheduler_.release_agent", "scheduler_.suspend_agent",
-    "scheduler_.ensure_agent_running",
+    "scheduler_.release", "scheduler_.suspend", "scheduler_.ensure_running",
+    "scheduler_.acquire",
     # A FOURTH channel, and the one this check originally missed entirely.
     #
-    # The Curation tab does not go through AgentManager — it takes an agent
-    # handle and reaches `a->db()`, the raw AgentDB. So `set_active_conversation`,
+    # The old Curation tab did not go through AgentManager — it took an agent
+    # handle and reached `a->db()`, the raw store. So `set_active_conversation`,
     # `create_conversation`, `delete_conversation` and `delete_memory` were
     # mutations the TUI performed that check 2 never watched, because it only
     # knew about agents_/registry_/scheduler_. Watching three references and
     # calling that "every in-process mutation" is the same shape of mistake as
     # a gate registered for one architecture.
     #
-    # These bypass ConversationManager and MemoryManager as well as the API
-    # handler, so the drift risk is two layers deep rather than one.
+    # A store reached this way bypasses the per-conversation strand as well as
+    # the API handler, so a TUI write could interleave with a turn in flight.
     "db().set_active_conversation", "db().create_conversation",
-    "db().delete_conversation", "db().delete_memory",
+    "db().update_conversation", "db().delete_conversation",
+    "db().add_memory", "db().update_memory", "db().delete_memory",
+    "db().add_local_memory", "db().delete_local_memory", "db().save_summary",
 ]
 
 # Each TUI mutation must name the route that does the same job. This is the
 # curated residue: the TUI still calls in-process, but the capability is proven
-# reachable through /v1, which is what P1 actually requires. Shrinking this list
-# by making the TUI an HTTP client is a separate, larger change.
+# reachable through /v1, which is what P1 actually requires.
+#
+# Only the Nodes tab is left in it. Users, chat, voice, models, engines, soma and
+# admissions are HTTP clients in guarded translation units, so their mutations
+# need no entry — which is what shrinking this list looks like when it works.
+# Anything in MUTATORS that appears in control_ui.cpp without an entry here is a
+# failure, not a default, so the next in-process mutation has to be decided on.
 TUI_MUTATION_ROUTES = {
-    "agents_.create_agent":          ("POST", "/v1/agents"),
-    "agents_.update_agent":          ("PUT", "/v1/agents/:id"),
-    "agents_.delete_agent":          ("DELETE", "/v1/agents/:id"),
     "registry_.remove_node":         ("DELETE", "/v1/nodes/:id"),
     "registry_.forget_node":         ("POST", "/v1/nodes/:id/forget"),
     "registry_.start_pair":          ("POST", "/v1/nodes/pair/start"),
     "registry_.complete_pair":       ("POST", "/v1/nodes/pair/complete"),
     "registry_.pair_node":           ("POST", "/v1/nodes/pair/psk"),
-    "scheduler_.release_agent":      ("POST", "/v1/agents/:id/release"),
-    "scheduler_.suspend_agent":      ("POST", "/v1/agents/:id/suspend"),
-    # restore IS ensure_agent_running — its first step is existing/suspended
-    # placement, so the Restore button and POST .../restore make the same call.
-    "scheduler_.ensure_agent_running": ("POST", "/v1/agents/:id/restore"),
-    "db().set_active_conversation":  ("POST", "/v1/agents/:id/conversations/:cid/activate"),
-    "db().create_conversation":      ("POST", "/v1/agents/:id/conversations"),
-    "db().delete_conversation":      ("DELETE", "/v1/agents/:id/conversations/:cid"),
-    "db().delete_memory":            ("DELETE", "/v1/agents/:id/memories/:mid"),
 }
 
 
@@ -170,11 +172,9 @@ TUI_MUTATION_ROUTES = {
 # reference directly. Listed so the coverage count reflects what an operator can
 # see, without pretending an HTTP call happened.
 TUI_INPROCESS_READS = {
-    "/v1/agents",            # Agents tab list          — agents_.list_agents()
     "/v1/nodes",             # Nodes tab                — registry_.list_nodes()
     "/v1/nodes/discovered",  # Nodes tab, discovery     — get_discovered_nodes()
     "/v1/activity",          # Activity tab             — the in-process log deque
-    "/v1/placements",        # Nodes/Agents slot columns
 }
 
 # Routes with no TUI form ON PURPOSE, each with a reason. Kept short and
@@ -189,11 +189,14 @@ TUI_COVERAGE_EXEMPT = {
     ("POST", "/v1/models"): "registering a pre-converted container is a scripted deploy step",
     ("GET", "/v1/engines/:id/telemetry"):
         "consumed as a live SSE stream by the Soma tab's dashboard, not as a route it names",
-    ("GET", "/v1/agents/:id/attachments/:attachment_id"): "binary image bytes",
-    ("DELETE", "/v1/agents/:id/attachments/:attachment_id"):
+    ("GET", "/v1/users/:id/attachments/:attachment_id"): "binary image bytes",
+    ("DELETE", "/v1/users/:id/attachments/:attachment_id"):
         "attachment lifecycle follows its conversation",
-    ("POST", "/v1/agents/:id/attachments"): "multipart upload; the Chat tab covers text",
-    ("GET", "/v1/agents/:id/speech/cache/:cache_id"): "binary audio, fetched by the player",
+    ("GET", "/v1/users/:id/speech/cache/:cache_id"): "binary audio, fetched by the player",
+    ("GET", "/v1/placements"):
+        "the Models tab shows each model's placement, node and in-flight count from "
+        "GET /v1/served-models/:id — the same rows, keyed by the model an operator "
+        "is looking at rather than by holder",
     ("POST", "/v1/audio/speech"): "OpenAI-compat spelling of the Voice tab's synthesis",
     ("POST", "/v1/cluster/engines/nodes/:node_id/switch"):
         "picking a build variant needs that node's troubleshooting report — release "
@@ -246,9 +249,9 @@ NODE_TUI_MUTATION_ROUTES = {
 def normalize(path: str) -> str:
     """A CLI path prefix -> the scope table's pattern.
 
-    The CLI builds `/v1/agents/` + id + `/suspend`; the table holds
-    `/v1/agents/:id/suspend`. Compare on the literal prefix before the first
-    interpolation, which is what the CLI source actually contains.
+    The CLI builds `/v1/served-models/` + id + `/suspend`; the table holds
+    `/v1/served-models/:id/suspend`. Compare on the literal prefix before the
+    first interpolation, which is what the CLI source actually contains.
     """
     return path.rstrip("/")
 
@@ -297,7 +300,7 @@ def main() -> int:
     cli_paths = {p.split("?")[0] for p in CLI_ANY_PATH_RE.findall(cli_src)}
     # Every string literal in the CLI, because a path suffix is frequently a
     # COMMAND WORD rather than part of the URL literal:
-    #     self.post("/v1/agents/" + tokens[2] + "/" + sub, ...)   // sub=="suspend"
+    #     self.post("/v1/served-models/" + tokens[2] + "/" + sub, ...)  // sub=="suspend"
     # There is no "/suspend" literal anywhere; there is a `sub == "suspend"`.
     # Matching only URL literals reported routes as uncovered that the CLI had
     # reached since the previous commit.
@@ -374,7 +377,9 @@ def main() -> int:
     # Pairing" and the matcher wanted a lowercase "forget" segment. A check that
     # doubts its own evidence produces noise, and noise is what gets a check
     # switched off.
-    tui_direct = {mapped for mapped in TUI_MUTATION_ROUTES.values()}
+    tui_src = (root / TUI).read_text(encoding="utf-8", errors="replace")
+    tui_direct = {mapped for mutator, mapped in TUI_MUTATION_ROUTES.items()
+                  if mutator + "(" in tui_src}
     # Reads the TUI performs in-process, mapped to the route that serves them.
     for path in TUI_INPROCESS_READS:
         tui_paths.add(path)
@@ -409,7 +414,6 @@ def main() -> int:
             tui_uncovered.append((verb, path))
 
     # ── 2. every TUI in-process mutation has an equivalent route ──────────────
-    tui_src = (root / TUI).read_text(encoding="utf-8", errors="replace")
     for mutator in MUTATORS:
         if mutator + "(" not in tui_src:
             continue

@@ -1,27 +1,37 @@
 add_executable(mantic-mind-control
     main.cpp
     node_registry.cpp
-    agent_scheduler.cpp
+    placement_scheduler.cpp
     engine_config_store.cpp
     engine_group_planner.cpp
     model_registry.cpp
     route_scope.cpp
-    agent_queue.cpp
-    agent_manager.cpp
-    agent_config_validator.cpp
+    served_model_validator.cpp
+    served_model_catalog.cpp
+    served_model_routes.cpp
+    openai_compat.cpp
+    conversation_queue.cpp
+    user_manager.cpp
+    token_binding.cpp
+    api_support.cpp
+    curation.cpp
+    chat_pipeline.cpp
+    user_routes.cpp
     control_api_server.cpp
     performance_tracker.cpp
     audio_player.cpp
     tts_service_client.cpp
     control_ui.cpp
     admission_panels.cpp
+    model_panels.cpp
+    user_panels.cpp
     engine_panels.cpp
     soma_dashboard.cpp
     soma_panels.cpp
 )
 
 # mm_soma is here for the ROUTING decision — select_backend() and its verdict
-# types. Control does not run the engine; it decides which engine an agent gets,
+# types. Control does not run the engine; it decides which engine a model gets,
 # and that policy has one implementation shared with the engine rather than a
 # reimplementation that drifts. src/soma/routing.cpp depends only on
 # soma/types.hpp, so static linkage pulls two small objects.
@@ -64,6 +74,17 @@ if(BUILD_TESTING)
     target_include_directories(mm_admission_panels PRIVATE ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME mm_admission_panels COMMAND mm_admission_panels)
 
+    # The Models tab's renderers, drawn off-screen and asserted as text — same
+    # shape as the Admissions test, for the same reason: the states worth
+    # checking (unreachable, empty, unavailable) are the ones nobody opens.
+    add_executable(mm_model_panels
+        ${CMAKE_CURRENT_SOURCE_DIR}/model_panels.cpp
+        ${CMAKE_SOURCE_DIR}/tests/control/model_panels_test.cpp)
+    target_link_libraries(mm_model_panels PRIVATE
+        mm_common ftxui::screen ftxui::dom ftxui::component ${MM_PLATFORM_LIBS})
+    target_include_directories(mm_model_panels PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME mm_model_panels COMMAND mm_model_panels)
+
     add_executable(mm_dashboard_g7
         ${CMAKE_CURRENT_SOURCE_DIR}/soma_dashboard.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/soma_panels.cpp
@@ -75,9 +96,9 @@ if(BUILD_TESTING)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
-        # "Grep-verifiable" as a test rather than a promise. The existing TUI
-        # already holds NodeRegistry&, AgentManager& and AgentScheduler&, so a
-        # panel needing one number is four keystrokes from taking it directly.
+        # "Grep-verifiable" as a test rather than a promise. The TUI shell
+        # still holds NodeRegistry&, so a panel needing one number is four
+        # keystrokes from taking it directly.
         add_test(NAME mm_ui_api_check
                  COMMAND "${Python3_EXECUTABLE}"
                          "${CMAKE_SOURCE_DIR}/tools/ci/check_ui_api.py"

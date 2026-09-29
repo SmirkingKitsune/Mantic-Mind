@@ -146,7 +146,7 @@ EngineDescriptor make_soma_descriptor(const std::string& executable) {
     d.supports_vision = engine_supports_vision(d.id);
     d.supports_suspend = true;
     // The one capability that distinguishes it from the fallback at this layer:
-    // real per-sequence state, so several agents share one engine rather than
+    // real per-sequence state, so several holders share one engine rather than
     // one process each.
     d.supports_multi_seq = true;
 
@@ -225,15 +225,15 @@ EngineDescriptor make_soma_descriptor(const std::string& executable) {
             return true;
         };
 
-    // Two agents may share one Soma process: per-sequence KV is the entire point
+    // Two holders may share one Soma process: per-sequence KV is the entire point
     // of the scheduler. The fallback cannot, which is why this is a descriptor
     // field rather than a global policy.
     //
     // Note what is ABSENT versus llama_launch_compatible(): ctx_size. In
-    // llama-server ctx_size is carved per slot at launch, so two agents wanting
+    // llama-server ctx_size is carved per slot at launch, so two holders wanting
     // different context lengths need different processes. In Soma the KV slot is
     // per-sequence and sized on admission, so ctx_size rides the request. That
-    // single omission is what lets agents co-locate — and it is also why this is
+    // single omission is what lets holders co-locate — and it is also why this is
     // a per-descriptor predicate rather than one shared function.
     //
     // The model itself is not compared here: it is not in RuntimeSettings, and
@@ -281,7 +281,7 @@ EngineDescriptor make_llama_descriptor(const std::string& executable) {
     // llama-server's slot state is per-process in practice; the existing
     // checkpoint path hardcodes sequence 0, so a --parallel > 1 slot only ever
     // saves its first sequence. Reporting false here is what stops the scheduler
-    // from co-locating agents on that assumption.
+    // from co-locating holders on that assumption.
     d.supports_multi_seq = false;
 
     d.readiness.kind = ReadinessProbe::Kind::HttpHealth;
@@ -334,8 +334,8 @@ EngineDescriptor make_llama_descriptor(const std::string& executable) {
         };
 
     // The existing, unit-tested predicate from common/models.hpp — not `false`.
-    // llama.cpp agents already share processes today, and answering "never" here
-    // would silently spawn one llama-server per agent.
+    // llama.cpp holders already share processes today, and answering "never"
+    // here would silently spawn one llama-server per holder.
     d.launch_compatible = [](const EngineLoadRequest& a, const EngineLoadRequest& b) {
         return llama_launch_compatible(a.settings, b.settings);
     };

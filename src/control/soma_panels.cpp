@@ -93,7 +93,7 @@ Element render_engine_list(const SomaSnapshot& snap, int selected) {
                        tui::col(text("NODE"), 14),
                        tui::col_right(text("VRAM"), 9),
                        tui::col_right(text("CTX"), 8),
-                       tui::col_right(text("AGENTS"), 8),
+                       tui::col_right(text("MODELS"), 8),
                    }) |
                    dim);
 
@@ -114,7 +114,7 @@ Element render_engine_list(const SomaSnapshot& snap, int selected) {
             tui::col_right(text(tui::mb_str(static_cast<std::int64_t>(e.vram_usage_mb))), 9),
             tui::col_right(
                 text(e.effective_ctx_size > 0 ? std::to_string(e.effective_ctx_size) : "-"), 8),
-            tui::col_right(text(std::to_string(e.agent_ids.size())), 8),
+            tui::col_right(text(std::to_string(e.served_model_ids.size())), 8),
         });
         if (i == selected) row = std::move(row) | inverted;
         rows.push_back(std::move(row));
@@ -288,7 +288,7 @@ Element render_sequences(const SomaSnapshot& snap) {
 
     Elements rows;
     rows.push_back(hbox({tui::col(text("SEQ"), 5),
-                         tui::col(text("AGENT"), 14),
+                         tui::col(text("CONV"), 14),
                          tui::col(text("PHASE"), 10),
                          tui::col_right(text("POS"), 7),
                          tui::col_right(text("KV"), 7)}) |
@@ -297,7 +297,7 @@ Element render_sequences(const SomaSnapshot& snap) {
         const std::string phase = s.suspended ? "suspended" : s.prefilling ? "prefill" : "decode";
         rows.push_back(hbox({
             tui::col(text(std::to_string(s.index)), 5),
-            tui::col(text(s.agent_id.empty() ? "-" : s.agent_id.substr(0, 12)), 14),
+            tui::col(text(s.conversation.empty() ? "-" : s.conversation.substr(0, 12)), 14),
             tui::col(text(phase), 10),
             tui::col_right(text(std::to_string(s.position)), 7),
             tui::col_right(text(std::to_string(s.kv_tokens)), 7),

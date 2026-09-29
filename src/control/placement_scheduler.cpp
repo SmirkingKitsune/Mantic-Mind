@@ -1,4 +1,4 @@
-#include "control/agent_scheduler.hpp"
+#include "control/placement_scheduler.hpp"
 
 #include "soma/routing.hpp"
 
@@ -19,6 +19,7 @@
 #include <optional>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
@@ -240,14 +241,14 @@ std::string resolved_manifest_identity(const std::string& ref,
     return file_manifest_identity(ref);
 }
 
-std::string engine_fingerprint(const AgentConfig& cfg,
+std::string engine_fingerprint(const ServedModel& cfg,
                                const std::string& models_dir,
                                const std::string& engine_id,
                                const std::optional<VllmEngineConfig>& vllm = std::nullopt) {
     const auto& runtime = cfg.runtime_settings;
     nlohmann::json identity = {
         // The RESOLVED engine, passed IN. The fingerprint decides whether an
-        // existing placement still describes this agent, so an agent whose
+        // existing placement still describes this model, so a model whose
         // routing changed from fallback to Soma must not keep a slot running the
         // other engine — with a literal here, it would. Threaded through rather
         // than looked up again, so it cannot disagree with the decision the
@@ -275,7 +276,7 @@ std::string engine_fingerprint(const AgentConfig& cfg,
         "mantic-engine-placement-v1", identity.dump());
 }
 
-int64_t projector_file_mb(const AgentConfig& cfg,
+int64_t projector_file_mb(const ServedModel& cfg,
                           const std::string& models_dir) {
     if (!cfg.vision_settings.enabled || cfg.vision_settings.mmproj_path.empty()) {
         return 0;
@@ -297,13 +298,13 @@ struct PreparedModel {
     std::string mmproj_model_id;
 };
 
-/// `model_ref` is WHERE the weights are; `cfg.model_path` is what the agent calls
-/// them. They are not the same string and conflating them is defect D7.
+/// `model_ref` is WHERE the weights are; `cfg.model_path` is what the model is
+/// called. They are not the same string and conflating them is defect D7.
 ///
 /// An admitted model lives at the registry's `model_dir` — since the container
 /// directory carries its quantization, `containers/<name>-q4_g-q6_g-g128`, and
-/// the agent asks for `<name>`. The node resolves whatever it is handed against
-/// its OWN models_dir, so handing it the agent's name means handing it a
+/// the served model asks for `<name>`. The node resolves whatever it is handed
+/// against its OWN models_dir, so handing it the model's name means handing it a
 /// directory that does not exist. It used to work because containers were
 /// written to `containers/<name>` and the two strings coincided; the coincidence
 /// was the only thing making it work, and it is gone.
@@ -311,7 +312,7 @@ struct PreparedModel {
 /// A model with no registry record passes its own path through unchanged, which
 /// is the fallback's GGUF path and must keep working.
 std::optional<PreparedModel> prepare_model_for_node(const NodeInfo& node,
-                                                    const AgentConfig& cfg,
+                                                    const ServedModel& cfg,
                                                     const std::string& model_ref,
                                                     const std::string& models_dir,
                                                     bool pin,
@@ -394,19 +395,19 @@ std::vector<int> select_vllm_gpu_devices(const NodeInfo& node, int wanted) {
 
 } // namespace
 
-AgentScheduler::AgentScheduler(NodeRegistry& registry, std::string models_dir)
+PlacementScheduler::PlacementScheduler(NodeRegistry& registry, std::string models_dir)
     : registry_(registry)
     , models_dir_(std::move(models_dir)) {}
 
-AgentScheduler::BackendRouting AgentScheduler::resolve_backend(
-    const AgentConfig& cfg, const soma::AdmissionRecord& record) {
-    if (!is_llama_backend(cfg.inference_backend)) {
-        // API-backed (and unsupported legacy) agents own no node slot at all.
+PlacementScheduler::BackendRouting PlacementScheduler::resolve_backend(
+    const ServedModel& cfg, const soma::AdmissionRecord& record) {
+    if (!cfg.node_local()) {
+        // API-backed models own no node slot at all.
         // This is a different question from which local engine to use.
         return {{}, "inference_backend '" + cfg.inference_backend + "' is not node-local"};
     }
 
-    soma::AgentBackendConfig rc;
+    soma::BackendRequest rc;
     if (cfg.backend_override == "soma") rc.override = soma::BackendOverride::Soma;
     else if (cfg.backend_override == "fallback") rc.override = soma::BackendOverride::Fallback;
     rc.arch_hash = record.arch_hash;
@@ -416,39 +417,39 @@ AgentScheduler::BackendRouting AgentScheduler::resolve_backend(
             decision.explain()};
 }
 
-void AgentScheduler::set_placement_audit(PlacementAudit audit) {
+void PlacementScheduler::set_placement_audit(PlacementAudit audit) {
     audit_ = std::move(audit);
 }
 
-void AgentScheduler::flush_audit(std::vector<PendingAudit>& pending) const {
+void PlacementScheduler::flush_audit(std::vector<PendingAudit>& pending) const {
     for (const auto& e : pending) {
         if (e.placed) {
             if (audit_.placed)
                 audit_.placed(
-                    e.agent_id, e.node_id, e.slot_id, e.backend, e.backend_reason, e.footprint);
+                    e.holder_id, e.node_id, e.slot_id, e.backend, e.backend_reason, e.footprint);
         } else if (audit_.released) {
-            audit_.released(e.agent_id);
+            audit_.released(e.holder_id);
         }
     }
     pending.clear();
 }
 
-void AgentScheduler::set_model_registry(const ControlModelRegistry* registry) {
+void PlacementScheduler::set_model_registry(const ControlModelRegistry* registry) {
     models_ = registry;
 }
 
-void AgentScheduler::set_engine_config_gate(EngineConfigReadyFn ready) {
+void PlacementScheduler::set_engine_config_gate(EngineConfigReadyFn ready) {
     engine_config_ready_ = std::move(ready);
     engine_config_required_ = static_cast<bool>(engine_config_ready_);
 }
 
-void AgentScheduler::set_engine_config_provider(EngineConfigProvider provider) {
+void PlacementScheduler::set_engine_config_provider(EngineConfigProvider provider) {
     engine_config_provider_ = std::move(provider);
 }
 
-std::vector<AgentScheduler::BackendRouting>
-AgentScheduler::routing_candidates(const AgentConfig& cfg) const {
-    if (!is_llama_backend(cfg.inference_backend)) {
+std::vector<PlacementScheduler::BackendRouting>
+PlacementScheduler::routing_candidates(const ServedModel& cfg) const {
+    if (!cfg.node_local()) {
         return {{{}, "inference_backend '" + cfg.inference_backend +
                          "' is not node-local"}};
     }
@@ -507,7 +508,7 @@ AgentScheduler::routing_candidates(const AgentConfig& cfg) const {
     return out;
 }
 
-std::string AgentScheduler::model_cache_id(const AgentConfig& cfg) const {
+std::string PlacementScheduler::model_cache_id(const ServedModel& cfg) const {
     // The SAME derivation prepare_model_for_node() uses to name the transfer, so
     // "does this node hold it" is asked in the node's own vocabulary. Two
     // derivations would drift, and the failure would be silent: every node would
@@ -518,7 +519,7 @@ std::string AgentScheduler::model_cache_id(const AgentConfig& cfg) const {
     return manifest_cache_id(*local);
 }
 
-ResourceFootprint AgentScheduler::footprint_for_node(const AgentConfig& cfg,
+ResourceFootprint PlacementScheduler::footprint_for_node(const ServedModel& cfg,
                                                      const ResourceFootprint& base,
                                                      const NodeInfo& node) const {
     ResourceFootprint out = base;
@@ -550,7 +551,7 @@ ResourceFootprint AgentScheduler::footprint_for_node(const AgentConfig& cfg,
     return out;
 }
 
-ResourceFootprint AgentScheduler::soma_footprint(const AgentConfig& cfg) const {
+ResourceFootprint PlacementScheduler::soma_footprint(const ServedModel& cfg) const {
     ResourceFootprint out;
 
     // vram_mb stays 0, and that is the fix rather than an omission. Soma v1 is
@@ -588,7 +589,7 @@ ResourceFootprint AgentScheduler::soma_footprint(const AgentConfig& cfg) const {
     return out;
 }
 
-std::string AgentScheduler::model_location(const AgentConfig& cfg) const {
+std::string PlacementScheduler::model_location(const ServedModel& cfg) const {
     // The registry is the AUTHORITY on where an admitted model's bytes are, and
     // until this existed nothing asked it. resolve_backend_for() has always
     // looked the record up — it took `arch_hash` and `verdict` off it and threw
@@ -607,8 +608,17 @@ std::string AgentScheduler::model_location(const AgentConfig& cfg) const {
     return cfg.model_path;
 }
 
-AgentScheduler::BackendRouting
-AgentScheduler::resolve_backend_for(const AgentConfig& cfg) const {
+std::string PlacementScheduler::request_model_name(const ServedModel& model,
+                                                   const std::string& engine_id) {
+    // vLLM serves under the name it was LAUNCHED with, which load_on_node sets
+    // to engine_model_name when there is one. Every other engine is sent the
+    // model's identity, which is what it was loaded from.
+    if (engine_id == "vllm" && !model.engine_model_name.empty()) return model.engine_model_name;
+    return model.model_path;
+}
+
+PlacementScheduler::BackendRouting
+PlacementScheduler::resolve_backend_for(const ServedModel& cfg) const {
     if (engine_config_provider_) {
         const auto candidates = routing_candidates(cfg);
         if (!candidates.empty()) return candidates.front();
@@ -634,8 +644,9 @@ AgentScheduler::resolve_backend_for(const AgentConfig& cfg) const {
     return resolve_backend(cfg, record);
 }
 
-std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
-    const AgentConfig& cfg) {
+std::optional<PlacementScheduler::Claimed> PlacementScheduler::place(const ServedModel& cfg,
+                                                                   bool claim,
+                                                                   Attempt& attempt) {
     // The cluster has no engine policy yet. Refusing here rather than placing
     // on whatever a node happened to have is the whole point of the master
     // configurator: an unconfigured cluster serving from an accidental engine
@@ -645,8 +656,8 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     // hits, and "no available nodes" would send the operator to look at nodes
     // that are all healthy.
     if (engine_config_required_ && !engine_config_ready_()) {
-        release_agent(cfg.id);
-        set_failure(PlacementFailure::EngineConfigMissing,
+        release(cfg.id);
+        attempt.fail(PlacementFailure::EngineConfigMissing,
                     "cluster engine configuration required: no primary engine has been set. "
                     "Configure it in the control TUI's Engines tab, with `engines setup` in "
                     "CLI mode, or via PUT /v1/cluster/engines/config");
@@ -656,34 +667,49 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     const auto routings = routing_candidates(cfg);
     if (routings.size() == 1 && routings.front().engine_id.empty()) {
         // Release a prior local placement before reporting the routing result.
-        release_agent(cfg.id);
-        set_failure(PlacementFailure::NoLocalBackend,
-                    "agent has no node-local backend: " + routings.front().reason);
+        release(cfg.id);
+        attempt.fail(PlacementFailure::NoLocalBackend,
+                     "model has no node-local backend: " + routings.front().reason);
         return std::nullopt;
     }
     if (routings.empty()) {
-        release_agent(cfg.id);
-        set_failure(PlacementFailure::NoEligibleNode,
-                    "the agent's explicit engine pin is not configured as the "
-                    "cluster primary or backup, or Soma admission refused it");
+        release(cfg.id);
+        attempt.fail(PlacementFailure::NoEligibleNode,
+                     "the model's explicit engine pin is not configured as the "
+                     "cluster primary or backup, or Soma admission refused it");
         return std::nullopt;
     }
 
+    struct Candidate {
+        BackendRouting routing;
+        std::optional<VllmEngineConfig> vllm;
+        std::uint32_t version = 0;
+        std::string fingerprint;
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(routings.size());
     for (const auto& routing : routings) {
-    std::optional<VllmEngineConfig> vllm;
-    std::uint32_t engine_config_version = 0;
-    if (engine_config_provider_) {
-        if (const auto cluster = engine_config_provider_()) {
-            engine_config_version = cluster->version;
-            if (routing.engine_id == "vllm") {
-                if (const auto* spec = cluster->find("vllm"))
-                    vllm = effective_vllm_config(*spec);
+        Candidate c;
+        c.routing = routing;
+        if (engine_config_provider_) {
+            if (const auto cluster = engine_config_provider_()) {
+                c.version = cluster->version;
+                if (routing.engine_id == "vllm") {
+                    if (const auto* spec = cluster->find("vllm"))
+                        c.vllm = effective_vllm_config(*spec);
+                }
             }
         }
+        c.fingerprint = engine_fingerprint(cfg, models_dir_, routing.engine_id, c.vllm);
+        candidates.push_back(std::move(c));
     }
 
-    const std::string desired_fingerprint =
-        engine_fingerprint(cfg, models_dir_, routing.engine_id, vllm);
+    for (std::size_t candidate_index = 0; candidate_index < candidates.size();
+         ++candidate_index) {
+    const BackendRouting& routing = candidates[candidate_index].routing;
+    const std::optional<VllmEngineConfig>& vllm = candidates[candidate_index].vllm;
+    const std::uint32_t engine_config_version = candidates[candidate_index].version;
+    const std::string& desired_fingerprint = candidates[candidate_index].fingerprint;
 
     // Audit events are QUEUED here and delivered by `audit_guard`'s destructor,
     // which runs after `schedule_lock` is released because destruction order is
@@ -696,7 +722,7 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     std::vector<PendingAudit> pending_audit;
 
     struct AuditGuard {
-        const AgentScheduler& self;
+        const PlacementScheduler& self;
         std::vector<PendingAudit>& pending;
 
         ~AuditGuard() {
@@ -711,11 +737,41 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     } audit_guard{*this, pending_audit};
 
     std::lock_guard schedule_lock(schedule_mutex_);
-    set_last_error({});
+    attempt = {};
+
+    // Reusing a live placement: refresh it and, for acquire(), CLAIM it while
+    // the schedule lock is still held — there is no window between "placed" and
+    // "in use" for an eviction to land in.
+    const auto reuse_existing = [&](const Placement& live) -> std::optional<Claimed> {
+        mutate_placement(cfg.id, [&](Placement& placement) {
+            placement.last_active_ms = util::now_ms();
+            if (claim) ++placement.in_flight;
+        });
+        return Claimed{live.node_id, live.slot_id, live.engine_id, live.epoch};
+    };
 
     auto existing = find_placement_copy(cfg.id);
     if (existing && existing->engine_fingerprint != desired_fingerprint) {
-        MM_INFO("AgentScheduler: engine identity changed for agent {}; "
+        if (existing->in_flight > 0) {
+            // Requests are still using the placement this call would replace.
+            // If a LATER candidate describes it — it runs on the backup engine
+            // while the primary is retried — that iteration reuses it; busy is
+            // no time to move a model back to its preferred engine. Otherwise
+            // its settings really did change, and it is replaced once it
+            // drains rather than detached out from under those requests.
+            const bool later_matches = std::any_of(
+                candidates.begin() + static_cast<std::ptrdiff_t>(candidate_index) + 1,
+                candidates.end(), [&](const Candidate& c) {
+                    return c.fingerprint == existing->engine_fingerprint;
+                });
+            if (later_matches) continue;
+            attempt.fail(PlacementFailure::Draining,
+                         "the model's launch settings changed; its current placement is "
+                         "replaced once the " + std::to_string(existing->in_flight) +
+                         " request(s) using it finish");
+            return std::nullopt;
+        }
+        MM_INFO("PlacementScheduler: engine identity changed for {}; "
                 "releasing stale placement", cfg.id);
         erase_placement_entry(cfg.id);
         pending_audit.push_back({false, cfg.id, {}, {}, {}, {}, {}});
@@ -735,10 +791,7 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         // attached slot so direct lifecycle calls cannot leave stale routing.
         if (node_it != nodes.end() && node_it->connected
             && node_it->slot_snapshot_at_ms <= existing->placed_at_ms) {
-            mutate_placement(cfg.id, [](AgentPlacement& placement) {
-                placement.last_active_ms = util::now_ms();
-            });
-            return ScheduleResult{existing->node_id, existing->slot_id};
+            return reuse_existing(*existing);
         }
 
         const SlotInfo* reported_slot = nullptr;
@@ -749,23 +802,19 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
             if (slot_it != node_it->slots.end()) reported_slot = &*slot_it;
         }
         const bool attached = reported_slot
-            && (reported_slot->assigned_agent == cfg.id
-                || std::find(reported_slot->agent_ids.begin(),
-                             reported_slot->agent_ids.end(), cfg.id)
-                       != reported_slot->agent_ids.end());
+            && std::find(reported_slot->holder_ids.begin(),
+                         reported_slot->holder_ids.end(), cfg.id)
+                   != reported_slot->holder_ids.end();
 
         if (attached && reported_slot->state == SlotState::Ready) {
-            mutate_placement(cfg.id, [](AgentPlacement& placement) {
-                placement.last_active_ms = util::now_ms();
-            });
-            return ScheduleResult{existing->node_id, existing->slot_id};
+            return reuse_existing(*existing);
         }
         if (attached && reported_slot->state == SlotState::Suspended) {
             existing->suspended = true;
             existing->kv_cache_node_path = reported_slot->kv_cache_path;
             store_placement(*existing);
         } else {
-            MM_WARN("AgentScheduler: discarding stale placement for agent {} "
+            MM_WARN("PlacementScheduler: discarding stale placement for {} "
                     "on node {} slot {}", cfg.id, existing->node_id,
                     existing->slot_id);
             erase_placement_entry(cfg.id);
@@ -785,7 +834,7 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     //
     // Soma is the opposite shape: no VRAM at all in v1, and a resident half that
     // is genuinely RAM. Both used to go through the llama estimator, which meant
-    // a Soma agent was charged VRAM it would never touch — and since
+    // a Soma model was charged VRAM it would never touch — and since
     // evaluate_fit() will not offload against a host below
     // `min_gpu_for_offload_mb`, a GPU-less node was rejected outright for a
     // CPU-only engine (D62).
@@ -803,7 +852,7 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     }
 
     if (existing && existing->suspended) {
-        AgentPlacement placement = *existing;
+        Placement placement = *existing;
         auto publish_restored = [&](const NodeId& node_id, const SlotId& slot_id) {
             if (node_id != placement.node_id) {
                 try {
@@ -811,11 +860,11 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
                     HttpClient old_client(old_node.url);
                     old_client.set_bearer_token(old_node.api_key);
                     static_cast<void>(old_client.post(
-                        "/api/node/detach-agent",
+                        "/api/node/detach-holder",
                         nlohmann::json{{"slot_id", placement.slot_id},
-                                       {"agent_id", cfg.id}}));
+                                       {"holder_id", cfg.id}}));
                 } catch (const std::exception& e) {
-                    MM_WARN("AgentScheduler: restored agent {} on node {} but could "
+                    MM_WARN("PlacementScheduler: restored {} on node {} but could "
                             "not remove its suspended record from node {}: {}",
                             cfg.id, node_id, placement.node_id, e.what());
                 }
@@ -830,16 +879,17 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
             placement.reservation_state = routing.engine_id == "vllm"
                 ? "exclusive" : std::string{};
             placement.kv_cache_node_path.clear();
-            store_placement(placement);
+            placement.in_flight = claim ? 1 : 0;
+            const auto epoch = store_new_placement(placement);
             pending_audit.push_back(
                 {true, cfg.id, node_id, slot_id, routing.engine_id, routing.reason, needed});
-            return ScheduleResult{node_id, slot_id};
+            return Claimed{node_id, slot_id, routing.engine_id, epoch};
         };
 
-        auto slot_id = restore_agent_on_node(
-            placement, cfg, placement.node_id, routing, vllm);
+        auto slot_id = restore_on_node(
+            placement, cfg, placement.node_id, routing, vllm, attempt);
         if (slot_id) {
-            MM_INFO("AgentScheduler: restored agent {} on original node {}",
+            MM_INFO("PlacementScheduler: restored {} on original node {}",
                     cfg.id, placement.node_id);
             return publish_restored(placement.node_id, *slot_id);
         }
@@ -857,11 +907,11 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
                 placement, cfg.id, "distributed vLLM wake failed");
             existing.reset();
         } else {
-            for (const auto& candidate_id : lru_idle_agents(placement.node_id)) {
+            for (const auto& candidate_id : lru_idle_holders(placement.node_id)) {
                 if (candidate_id == cfg.id ||
-                    !evict_agent_for_capacity(candidate_id)) continue;
-                slot_id = restore_agent_on_node(
-                    placement, cfg, placement.node_id, routing, vllm);
+                    !evict_holder_for_capacity(candidate_id)) continue;
+                slot_id = restore_on_node(
+                    placement, cfg, placement.node_id, routing, vllm, attempt);
                 if (slot_id) {
                     return publish_restored(placement.node_id, *slot_id);
                 }
@@ -874,16 +924,17 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
                 : registry_.nodes_with_capacity(needed);
             for (const auto& node : restore_candidates) {
                 if (node.id == placement.node_id) continue;
-                slot_id = restore_agent_on_node(
-                    placement, cfg, node.id, routing, vllm);
+                slot_id = restore_on_node(
+                    placement, cfg, node.id, routing, vllm, attempt);
                 if (slot_id) return publish_restored(node.id, *slot_id);
             }
         }
     }
 
     auto publish_new = [&](const NodeId& node_id, const SlotId& slot_id) {
-        AgentPlacement placement;
-        placement.agent_id = cfg.id;
+        Placement placement;
+        placement.holder_id = cfg.id;
+        placement.in_flight = claim ? 1 : 0;
         placement.node_id = node_id;
         placement.slot_id = slot_id;
         placement.placed_at_ms = util::now_ms();
@@ -892,10 +943,10 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         placement.engine_id = routing.engine_id;
         placement.reservation_state = routing.engine_id == "vllm"
             ? "exclusive" : std::string{};
-        store_placement(placement);
+        const auto epoch = store_new_placement(placement);
         pending_audit.push_back(
             {true, cfg.id, node_id, slot_id, routing.engine_id, routing.reason, needed});
-        return ScheduleResult{node_id, slot_id};
+        return Claimed{node_id, slot_id, routing.engine_id, epoch};
     };
 
     if (routing.engine_id == "vllm" && vllm &&
@@ -910,9 +961,9 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         if (group_candidates.empty()) {
             std::string detail;
             if (!distributed_vllm_model_ref_supported(request.model_ref, detail)) {
-                set_failure(PlacementFailure::NoEligibleNode, detail);
+                attempt.fail(PlacementFailure::NoEligibleNode, detail);
             } else {
-                set_failure(PlacementFailure::NoEligibleNode,
+                attempt.fail(PlacementFailure::NoEligibleNode,
                             "no exclusive Ray group satisfies the configured vLLM "
                             "TP/PP topology and runtime compatibility");
             }
@@ -938,7 +989,7 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
                     nlohmann::json{{"model_path", request.model_ref}});
                 if (!response.ok()) {
                     preflight_ok = false;
-                    set_failure(PlacementFailure::NodeRejected,
+                    attempt.fail(PlacementFailure::NodeRejected,
                                 "vLLM model preflight failed on Ray member " +
                                     member.id + " (HTTP " +
                                     std::to_string(response.status) + "): " +
@@ -947,7 +998,7 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
                 }
             } catch (const std::exception& e) {
                 preflight_ok = false;
-                set_failure(PlacementFailure::NodeUnreachable,
+                attempt.fail(PlacementFailure::NodeUnreachable,
                             "vLLM model preflight could not reach Ray member " +
                                 member.id + ": " + e.what());
                 break;
@@ -968,14 +1019,14 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
                 const auto response = client.post(
                     "/api/node/ray/start",
                     nlohmann::json{{"group_id", group_id},
-                                   {"agent_id", cfg.id},
+                                   {"holder_id", cfg.id},
                                    {"role", role},
                                    {"head_address", head_address},
                                    {"node_ip", node_ip},
                                    {"transport", group->transport},
                                    {"num_gpus", vllm->tensor_parallel_size}});
                 if (!response.ok()) {
-                    set_failure(PlacementFailure::NodeRejected,
+                    attempt.fail(PlacementFailure::NodeRejected,
                                 "Ray " + role + " start failed on node " + member.id +
                                     " (HTTP " + std::to_string(response.status) +
                                     "): " + response.body);
@@ -986,7 +1037,7 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
                                         .get<RayRuntimeStatus>();
                 if (!status.active() || status.group_id != group_id ||
                     status.reserved_gpus != vllm->tensor_parallel_size) {
-                    set_failure(PlacementFailure::NodeProtocolError,
+                    attempt.fail(PlacementFailure::NodeProtocolError,
                                 "Ray member " + member.id +
                                     " did not confirm the requested group/GPU reservation");
                     group_started = false;
@@ -995,7 +1046,7 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
                 if (index == 0) head_address = status.head_address;
                 started.push_back(member);
             } catch (const std::exception& e) {
-                set_failure(PlacementFailure::NodeUnreachable,
+                attempt.fail(PlacementFailure::NodeUnreachable,
                             "Ray " + role + " start failed on node " + member.id +
                                 ": " + e.what());
                 group_started = false;
@@ -1023,16 +1074,16 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         for (int index = 0; index < vllm->tensor_parallel_size; ++index)
             gpu_devices.push_back(index);
         const NodeInfo& head = members.front();
-        const auto slot_id = load_agent_on_node(
-            cfg, head.id, routing, vllm, head_address,
+        const auto slot_id = load_on_node(
+            cfg, head.id, routing, vllm, attempt, head_address,
             host_from_node_url(head.url), gpu_devices);
         if (!slot_id) {
             rollback();
             continue;
         }
 
-        AgentPlacement placement;
-        placement.agent_id = cfg.id;
+        Placement placement;
+        placement.holder_id = cfg.id;
         placement.node_id = head.id;
         placement.slot_id = *slot_id;
         placement.engine_fingerprint = desired_fingerprint;
@@ -1044,11 +1095,12 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         placement.reservation_state = "exclusive";
         placement.placed_at_ms = util::now_ms();
         placement.last_active_ms = placement.placed_at_ms;
-        store_placement(placement);
+        placement.in_flight = claim ? 1 : 0;
+        const auto epoch = store_new_placement(placement);
         pending_audit.push_back(
             {true, cfg.id, head.id, *slot_id, routing.engine_id,
              routing.reason, needed});
-        return ScheduleResult{head.id, *slot_id};
+        return Claimed{head.id, *slot_id, routing.engine_id, epoch};
         }
         continue;
     }
@@ -1087,10 +1139,10 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
             selected_gpu_devices = select_vllm_gpu_devices(
                 *node, vllm->tensor_parallel_size);
         }
-        auto slot_id = load_agent_on_node(
-            cfg, node_id, routing, vllm, {}, {}, selected_gpu_devices);
+        auto slot_id = load_on_node(
+            cfg, node_id, routing, vllm, attempt, {}, {}, selected_gpu_devices);
         if (!slot_id) {
-            MM_WARN("AgentScheduler: node {} could not run agent {}; "
+            MM_WARN("PlacementScheduler: node {} could not run {}; "
                     "trying another candidate", node_id, cfg.id);
         }
         return slot_id;
@@ -1104,7 +1156,7 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
 
     struct SharedCandidate {
         NodeId node_id;
-        size_t attached_agents = 0;
+        size_t attached_holders = 0;
         int64_t last_active_ms = 0;
     };
     std::vector<SharedCandidate> shared_candidates;
@@ -1112,8 +1164,8 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         if (attempted_nodes.count(node.id)) continue;
         std::optional<SharedCandidate> best;
         for (const auto& slot : node.slots) {
-            // Match the agent's RESOLVED engine, not "llama-cpp". Sharing a slot
-            // running a different engine would attach the agent to a process
+            // Match the model's RESOLVED engine, not "llama-cpp". Sharing a slot
+            // running a different engine would attach the model to a process
             // that cannot serve it.
             if (slot.state != SlotState::Ready || slot.backend != routing.engine_id) continue;
             if (!same_model_reference(slot.model_path, cfg.model_path)) continue;
@@ -1127,10 +1179,10 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
                 if (requested.empty() || requested != loaded) continue;
             }
             SharedCandidate candidate{
-                node.id, slot.agent_ids.size(), slot.last_active_ms};
+                node.id, slot.holder_ids.size(), slot.last_active_ms};
             if (!best ||
-                std::tie(candidate.attached_agents, candidate.last_active_ms)
-                    < std::tie(best->attached_agents, best->last_active_ms)) {
+                std::tie(candidate.attached_holders, candidate.last_active_ms)
+                    < std::tie(best->attached_holders, best->last_active_ms)) {
                 best = candidate;
             }
         }
@@ -1138,12 +1190,12 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     }
     std::sort(shared_candidates.begin(), shared_candidates.end(),
               [](const SharedCandidate& lhs, const SharedCandidate& rhs) {
-                  return std::tie(lhs.attached_agents, lhs.last_active_ms)
-                       < std::tie(rhs.attached_agents, rhs.last_active_ms);
+                  return std::tie(lhs.attached_holders, lhs.last_active_ms)
+                       < std::tie(rhs.attached_holders, rhs.last_active_ms);
               });
     for (const auto& candidate : shared_candidates) {
         if (const auto slot_id = try_load(candidate.node_id)) {
-            MM_INFO("AgentScheduler: agent {} joined a compatible llama.cpp "
+            MM_INFO("PlacementScheduler: {} joined a compatible "
                     "engine for {} on node {}", cfg.id, cfg.model_path,
                     candidate.node_id);
             return publish_new(candidate.node_id, *slot_id);
@@ -1164,13 +1216,13 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         }
     }
 
-    for (const auto& candidate_id : lru_idle_agents()) {
+    for (const auto& candidate_id : lru_idle_holders()) {
         if (candidate_id == cfg.id) continue;
         const auto candidate = find_placement_copy(candidate_id);
         if (!candidate ||
             (candidate->suspended && candidate->engine_id != "vllm") ||
-            candidate->is_active
-            || !evict_agent_for_capacity(candidate_id)) {
+            candidate->in_flight > 0
+            || !evict_holder_for_capacity(candidate_id)) {
             continue;
         }
         std::vector<int> selected_gpu_devices;
@@ -1184,22 +1236,21 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
                 selected_gpu_devices = select_vllm_gpu_devices(
                     *node, vllm->tensor_parallel_size);
         }
-        if (const auto slot_id = load_agent_on_node(
-                cfg, candidate->node_id, routing, vllm, {}, {},
+        if (const auto slot_id = load_on_node(
+                cfg, candidate->node_id, routing, vllm, attempt, {}, {},
                 selected_gpu_devices)) {
             return publish_new(candidate->node_id, *slot_id);
         }
     }
 
-    MM_WARN("AgentScheduler: no capacity for agent {} (model={})",
+    MM_WARN("PlacementScheduler: no capacity for {} (model={})",
             cfg.id, cfg.model_path);
 
-    // `last_failure()`, not `last_error().empty()`. The old check asked "did a
-    // load attempt already record something" by testing a STRING for emptiness,
-    // which is the same defect one layer down from the one this fixes: the
-    // control flow depended on prose. A code answers it directly, and cannot be
-    // broken by rewording a message.
-    if (last_failure() == PlacementFailure::None) {
+    // The failure CODE, not the message. An older check asked "did a load
+    // attempt already record something" by testing a STRING for emptiness,
+    // which is the same defect one layer down from the one codes fix: control
+    // flow depending on prose.
+    if (attempt.failure == PlacementFailure::None) {
         // THE distinction D64 exists for. Both of these used to read "no
         // capacity: no connected node could load this model", and they call for
         // opposite actions: one means fix the cluster, the other means wait or
@@ -1207,11 +1258,11 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
         // filter, so an empty list means nothing was ELIGIBLE — every node is
         // offline, unconfigured, or not conforming to the engine policy.
         if (available_for_engine.empty()) {
-            set_failure(PlacementFailure::NoEligibleNode,
+            attempt.fail(PlacementFailure::NoEligibleNode,
                         "no eligible node: none is connected and conforming to the "
                         "cluster engine configuration");
         } else {
-            set_failure(PlacementFailure::NoCapacity,
+            attempt.fail(PlacementFailure::NoCapacity,
                         "no capacity: eligible nodes are connected, but none could "
                         "load this model");
         }
@@ -1219,73 +1270,174 @@ std::optional<ScheduleResult> AgentScheduler::ensure_agent_running(
     // A placement/startup failure is the only point at which routing moves to
     // the next engine. Inference has not begun yet, so this can never replay a
     // request on a different backend.
-    MM_WARN("AgentScheduler: exhausted engine {} for agent {}; trying backup",
+    MM_WARN("PlacementScheduler: exhausted engine {} for {}; trying backup",
             routing.engine_id, cfg.id);
     }
     return std::nullopt;
 }
 
-void AgentScheduler::release_agent(const AgentId& agent_id) {
-    std::optional<AgentPlacement> placement;
+PlacementScheduler::Outcome PlacementScheduler::acquire(const ServedModel& model,
+                                                         std::chrono::milliseconds wait) {
+    const auto deadline = std::chrono::steady_clock::now() + wait;
+    for (;;) {
+        Attempt attempt;
+        if (auto claimed = place(model, /*claim=*/true, attempt)) {
+            Outcome out;
+            out.node_id = claimed->node_id;
+            out.slot_id = claimed->slot_id;
+            out.engine_id = claimed->engine_id;
+            Lease lease;
+            lease.owner_ = this;
+            lease.holder_id_ = model.id;
+            lease.epoch_ = claimed->epoch;
+            lease.node_id_ = claimed->node_id;
+            lease.slot_id_ = claimed->slot_id;
+            lease.engine_id_ = claimed->engine_id;
+            lease.request_model_ = request_model_name(model, claimed->engine_id);
+            out.lease = std::move(lease);
+            return out;
+        }
+        if (attempt.failure == PlacementFailure::None) {
+            // Every return path above records why. A path that does not is a
+            // bug, but the caller still deserves a code rather than silence.
+            attempt.fail(PlacementFailure::NoCapacity, "placement failed without a recorded reason");
+        }
+        if (!placement_failure_transient(attempt.failure) ||
+            std::chrono::steady_clock::now() >= deadline) {
+            Outcome out;
+            out.failure = attempt.failure;
+            out.error = attempt.error;
+            return out;
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+}
+
+PlacementScheduler::Outcome PlacementScheduler::ensure_running(const ServedModel& model) {
+    Attempt attempt;
+    Outcome out;
+    if (auto claimed = place(model, /*claim=*/false, attempt)) {
+        out.node_id = claimed->node_id;
+        out.slot_id = claimed->slot_id;
+        out.engine_id = claimed->engine_id;
+        return out;
+    }
+    out.failure = attempt.failure == PlacementFailure::None ? PlacementFailure::NoCapacity
+                                                            : attempt.failure;
+    out.error = attempt.error.empty() ? "placement failed without a recorded reason"
+                                      : attempt.error;
+    return out;
+}
+
+// ── leases ────────────────────────────────────────────────────────────────────
+
+PlacementScheduler::Lease::Lease(Lease&& other) noexcept
+    : owner_(other.owner_),
+      holder_id_(std::move(other.holder_id_)),
+      epoch_(other.epoch_),
+      node_id_(std::move(other.node_id_)),
+      slot_id_(std::move(other.slot_id_)),
+      engine_id_(std::move(other.engine_id_)),
+      request_model_(std::move(other.request_model_)) {
+    other.owner_ = nullptr;
+}
+
+PlacementScheduler::Lease& PlacementScheduler::Lease::operator=(Lease&& other) noexcept {
+    if (this != &other) {
+        release();
+        owner_ = other.owner_;
+        holder_id_ = std::move(other.holder_id_);
+        epoch_ = other.epoch_;
+        node_id_ = std::move(other.node_id_);
+        slot_id_ = std::move(other.slot_id_);
+        engine_id_ = std::move(other.engine_id_);
+        request_model_ = std::move(other.request_model_);
+        other.owner_ = nullptr;
+    }
+    return *this;
+}
+
+PlacementScheduler::Lease::~Lease() {
+    release();
+}
+
+void PlacementScheduler::Lease::release() noexcept {
+    if (owner_ == nullptr) return;
+    owner_->release_claim(holder_id_, epoch_);
+    owner_ = nullptr;
+}
+
+void PlacementScheduler::release_claim(const HolderId& holder_id, std::uint64_t epoch) noexcept {
+    try {
+        std::lock_guard state_lock(state_mutex_);
+        const auto it = placements_.find(holder_id);
+        // A different epoch means the placement this claim was taken on has
+        // since been replaced; decrementing the replacement would let it be
+        // evicted while its own requests were still running.
+        if (it == placements_.end() || it->second.epoch != epoch) return;
+        if (it->second.in_flight > 0) --it->second.in_flight;
+        it->second.last_active_ms = util::now_ms();
+    } catch (...) {
+        // Locking a std::mutex does not throw in practice; a destructor must not.
+    }
+}
+
+// ── release ───────────────────────────────────────────────────────────────────
+
+PlacementScheduler::ReleaseResult PlacementScheduler::release(const HolderId& holder_id,
+                                                              bool force) {
+    std::optional<Placement> placement;
     {
         std::lock_guard schedule_lock(schedule_mutex_);
-        placement = find_placement_copy(agent_id);
-        if (!placement) return;
-        erase_placement_entry(agent_id);
+        placement = find_placement_copy(holder_id);
+        if (!placement) return ReleaseResult::NotPlaced;
+        if (placement->in_flight > 0 && !force) return ReleaseResult::Busy;
+        erase_placement_entry(holder_id);
     }
 
     // Outside the lock, like every other audit call — see PlacementAudit.
-    if (audit_.released) audit_.released(agent_id);
-    detach_placement_best_effort(*placement, agent_id, "placement released");
-    MM_INFO("AgentScheduler: released agent {}", agent_id);
+    if (audit_.released) audit_.released(holder_id);
+    detach_placement_best_effort(*placement, holder_id,
+                                 placement->in_flight > 0
+                                     ? "placement released while requests were in flight"
+                                     : "placement released");
+    MM_INFO("PlacementScheduler: released {}", holder_id);
+    return ReleaseResult::Released;
 }
 
-void AgentScheduler::mark_agent_idle(const AgentId& agent_id) {
-    mutate_placement(agent_id, [](AgentPlacement& placement) {
-        placement.is_active = false;
-        placement.last_active_ms = util::now_ms();
-    });
+std::optional<Placement> PlacementScheduler::get_placement(const HolderId& holder_id) const {
+    return find_placement_copy(holder_id);
 }
 
-void AgentScheduler::mark_agent_active(const AgentId& agent_id) {
-    mutate_placement(agent_id, [](AgentPlacement& placement) {
-        placement.is_active = true;
-        placement.last_active_ms = util::now_ms();
-    });
-}
-
-std::optional<AgentPlacement> AgentScheduler::get_placement(
-    const AgentId& agent_id) const {
-    return find_placement_copy(agent_id);
-}
-
-std::vector<AgentPlacement> AgentScheduler::list_placements() const {
+std::vector<Placement> PlacementScheduler::list_placements() const {
     std::lock_guard state_lock(state_mutex_);
-    std::vector<AgentPlacement> result;
+    std::vector<Placement> result;
     result.reserve(placements_.size());
     for (const auto& [_, placement] : placements_) result.push_back(placement);
     return result;
 }
 
-std::string AgentScheduler::last_error() const {
-    std::lock_guard state_lock(state_mutex_);
-    return last_error_;
-}
-
-std::optional<AgentPlacement> AgentScheduler::find_placement_copy(
-    const AgentId& id) const {
+std::optional<Placement> PlacementScheduler::find_placement_copy(const HolderId& id) const {
     std::lock_guard state_lock(state_mutex_);
     const auto it = placements_.find(id);
     if (it == placements_.end()) return std::nullopt;
     return it->second;
 }
 
-void AgentScheduler::store_placement(const AgentPlacement& placement) {
+std::uint64_t PlacementScheduler::store_new_placement(Placement placement) {
     std::lock_guard state_lock(state_mutex_);
-    placements_[placement.agent_id] = placement;
+    placement.epoch = next_epoch_++;
+    const auto epoch = placement.epoch;
+    placements_[placement.holder_id] = std::move(placement);
+    return epoch;
 }
 
-bool AgentScheduler::erase_placement_entry(const AgentId& id) {
+void PlacementScheduler::store_placement(const Placement& placement) {
+    std::lock_guard state_lock(state_mutex_);
+    placements_[placement.holder_id] = placement;
+}
+
+bool PlacementScheduler::erase_placement_entry(const HolderId& id) {
     std::lock_guard state_lock(state_mutex_);
     return placements_.erase(id) > 0;
 }
@@ -1310,6 +1462,8 @@ const char* to_string(PlacementFailure failure) noexcept {
         return "node_unreachable";
     case PlacementFailure::NodeProtocolError:
         return "node_protocol_error";
+    case PlacementFailure::Draining:
+        return "draining";
     }
     return "unknown";
 }
@@ -1317,58 +1471,50 @@ const char* to_string(PlacementFailure failure) noexcept {
 bool placement_failure_retryable(PlacementFailure failure) noexcept {
     switch (failure) {
     case PlacementFailure::EngineConfigMissing: // an operator must set a policy
-    case PlacementFailure::NoLocalBackend:      // the agent owns no slot by design
+    case PlacementFailure::NoLocalBackend:      // the model owns no slot by design
         return false;
     default:
         return true;
     }
 }
 
-void AgentScheduler::set_failure(PlacementFailure failure, const std::string& error) {
-    std::lock_guard state_lock(state_mutex_);
-    last_failure_ = failure;
-    last_error_ = error;
+bool placement_failure_transient(PlacementFailure failure) noexcept {
+    switch (failure) {
+    case PlacementFailure::NoCapacity:     // something else finishes and is evicted
+    case PlacementFailure::NoEligibleNode: // a node finishes converging or rejoins
+    case PlacementFailure::Draining:       // the old placement's requests finish
+        return true;
+    default:
+        return false;
+    }
 }
 
-void AgentScheduler::set_last_error(const std::string& error) {
-    std::lock_guard state_lock(state_mutex_);
-    last_error_ = error;
-    // Cleared together. A stale code beside a fresh empty message would say a
-    // placement failed when the caller had just recorded that it did not.
-    if (error.empty()) last_failure_ = PlacementFailure::None;
-}
-
-PlacementFailure AgentScheduler::last_failure() const {
-    std::lock_guard state_lock(state_mutex_);
-    return last_failure_;
-}
-
-void AgentScheduler::detach_placement_best_effort(
-    const AgentPlacement& placement,
-    const AgentId& agent_id,
+void PlacementScheduler::detach_placement_best_effort(
+    const Placement& placement,
+    const HolderId& holder_id,
     const std::string& reason) {
     try {
         const auto node = registry_.get_node(placement.node_id);
         HttpClient client(node.url);
         client.set_bearer_token(node.api_key);
         const auto response = client.post(
-            "/api/node/detach-agent",
+            "/api/node/detach-holder",
             nlohmann::json{{"slot_id", placement.slot_id},
-                           {"agent_id", agent_id}});
+                           {"holder_id", holder_id}});
         if (!response.ok()) {
-            MM_WARN("AgentScheduler: node {} rejected detach for agent {} "
-                    "({}; HTTP {})", placement.node_id, agent_id, reason,
+            MM_WARN("PlacementScheduler: node {} rejected detach for {} "
+                    "({}; HTTP {})", placement.node_id, holder_id, reason,
                     response.status);
         }
     } catch (const std::exception& e) {
-        MM_WARN("AgentScheduler: failed to detach slot for agent {} ({}): {}",
-                agent_id, reason, e.what());
+        MM_WARN("PlacementScheduler: failed to detach slot for {} ({}): {}",
+                holder_id, reason, e.what());
     }
     stop_ray_group_best_effort(placement, reason);
 }
 
-void AgentScheduler::stop_ray_group_best_effort(
-    const AgentPlacement& placement, const std::string& reason) const {
+void PlacementScheduler::stop_ray_group_best_effort(
+    const Placement& placement, const std::string& reason) const {
     if (placement.ray_group_id.empty()) return;
     for (auto it = placement.member_node_ids.rbegin();
          it != placement.member_node_ids.rend(); ++it) {
@@ -1380,52 +1526,57 @@ void AgentScheduler::stop_ray_group_best_effort(
                 "/api/node/ray/stop",
                 nlohmann::json{{"group_id", placement.ray_group_id}});
             if (!response.ok()) {
-                MM_WARN("AgentScheduler: Ray cleanup for group {} on node {} "
+                MM_WARN("PlacementScheduler: Ray cleanup for group {} on node {} "
                         "failed ({}; HTTP {})", placement.ray_group_id, *it,
                         reason, response.status);
             }
         } catch (const std::exception& e) {
-            MM_WARN("AgentScheduler: Ray cleanup for group {} on node {} "
+            MM_WARN("PlacementScheduler: Ray cleanup for group {} on node {} "
                     "failed ({}): {}", placement.ray_group_id, *it, reason,
                     e.what());
         }
     }
 }
 
-void AgentScheduler::housekeeping(const std::vector<AgentConfig>& active_agents) {
-    std::vector<AgentPlacement> detaches;
+void PlacementScheduler::housekeeping(const std::vector<ServedModel>& live) {
+    std::vector<Placement> detaches;
 
     {
         std::lock_guard schedule_lock(schedule_mutex_);
         std::lock_guard state_lock(state_mutex_);
 
-        std::unordered_set<AgentId> active_ids;
-        active_ids.reserve(active_agents.size());
-        for (const auto& agent : active_agents) active_ids.insert(agent.id);
+        std::unordered_set<HolderId> live_ids;
+        live_ids.reserve(live.size());
+        for (const auto& model : live) live_ids.insert(model.id);
 
         for (auto it = placements_.begin(); it != placements_.end();) {
-            if (active_ids.count(it->first)) {
+            // A holder deleted while a request is still finishing on it is left
+            // for the next pass: detaching now would kill the response.
+            if (live_ids.count(it->first) || it->second.in_flight > 0) {
                 ++it;
                 continue;
             }
             detaches.push_back(it->second);
-            MM_INFO("AgentScheduler: housekeeping removed placement for deleted agent {}",
+            MM_INFO("PlacementScheduler: housekeeping removed placement for deleted holder {}",
                     it->first);
             it = placements_.erase(it);
         }
     }
 
     for (const auto& detach : detaches) {
+        if (audit_.released) {
+            try { audit_.released(detach.holder_id); } catch (...) {}
+        }
         detach_placement_best_effort(
-            detach, detach.agent_id, "agent deleted during housekeeping");
+            detach, detach.holder_id, "holder deleted during housekeeping");
     }
 
     // Control placements are intentionally in-memory, while node-owned Ray
     // daemons survive a control restart. Reconstruct only a complete group
-    // whose head still advertises the agent's ready vLLM slot; anything else is
+    // whose head still advertises the holder's ready vLLM slot; anything else is
     // incomplete, conflicting, or orphaned and must release its reservations.
-    std::unordered_set<AgentId> active_ids;
-    for (const auto& agent : active_agents) active_ids.insert(agent.id);
+    std::unordered_set<HolderId> active_ids;
+    for (const auto& model : live) active_ids.insert(model.id);
     std::unordered_map<std::string, std::vector<NodeInfo>> ray_groups;
     for (const auto& node : registry_.list_nodes()) {
         if (!node.ray.group_id.empty())
@@ -1443,7 +1594,7 @@ void AgentScheduler::housekeeping(const std::vector<AgentConfig>& active_agents)
         }
     }
     for (const auto& [group_id, members] : ray_groups) {
-        AgentPlacement recovered;
+        Placement recovered;
         recovered.ray_group_id = group_id;
         bool valid = expected_profile.has_value() &&
                      static_cast<int>(members.size()) ==
@@ -1452,7 +1603,7 @@ void AgentScheduler::housekeeping(const std::vector<AgentConfig>& active_agents)
         std::string runtime_fingerprint;
         for (const auto& member : members) {
             recovered.member_node_ids.push_back(member.id);
-            if (recovered.agent_id.empty()) recovered.agent_id = member.ray.agent_id;
+            if (recovered.holder_id.empty()) recovered.holder_id = member.ray.holder_id;
             if (recovered.ray_transport.empty())
                 recovered.ray_transport = member.ray.transport;
             const auto runtime = std::find_if(
@@ -1481,7 +1632,7 @@ void AgentScheduler::housekeeping(const std::vector<AgentConfig>& active_agents)
                     member_fingerprint == runtime_fingerprint && transport_available &&
                     member.capabilities.gpu_count >=
                         expected_profile->tensor_parallel_size && member.ray.active() &&
-                    member.ray.agent_id == recovered.agent_id &&
+                    member.ray.holder_id == recovered.holder_id &&
                     member.ray.transport == recovered.ray_transport &&
                     member.ray.reserved_gpus == expected_profile->tensor_parallel_size &&
                     member.engine_config_version == expected_version;
@@ -1489,9 +1640,9 @@ void AgentScheduler::housekeeping(const std::vector<AgentConfig>& active_agents)
                 ++heads;
                 recovered.node_id = member.id;
                 for (const auto& slot : member.slots) {
-                    const bool attached = slot.assigned_agent == recovered.agent_id ||
-                        std::find(slot.agent_ids.begin(), slot.agent_ids.end(),
-                                  recovered.agent_id) != slot.agent_ids.end();
+                    const bool attached =
+                        std::find(slot.holder_ids.begin(), slot.holder_ids.end(),
+                                  recovered.holder_id) != slot.holder_ids.end();
                     if (slot.backend == "vllm" &&
                         (slot.state == SlotState::Ready ||
                          slot.state == SlotState::Suspended) && attached) {
@@ -1501,16 +1652,16 @@ void AgentScheduler::housekeeping(const std::vector<AgentConfig>& active_agents)
                 }
             }
         }
-        valid = valid && heads == 1 && !recovered.agent_id.empty() &&
-                active_ids.count(recovered.agent_id) > 0 && !recovered.slot_id.empty();
+        valid = valid && heads == 1 && !recovered.holder_id.empty() &&
+                active_ids.count(recovered.holder_id) > 0 && !recovered.slot_id.empty();
         const auto recovered_cfg = std::find_if(
-            active_agents.begin(), active_agents.end(), [&](const AgentConfig& cfg) {
-                return cfg.id == recovered.agent_id;
+            live.begin(), live.end(), [&](const ServedModel& cfg) {
+                return cfg.id == recovered.holder_id;
             });
-        valid = valid && recovered_cfg != active_agents.end();
-        const auto existing = recovered.agent_id.empty()
-            ? std::optional<AgentPlacement>{}
-            : find_placement_copy(recovered.agent_id);
+        valid = valid && recovered_cfg != live.end();
+        const auto existing = recovered.holder_id.empty()
+            ? std::optional<Placement>{}
+            : find_placement_copy(recovered.holder_id);
         if (existing && existing->ray_group_id != group_id) valid = false;
         if (valid) {
             if (!existing) {
@@ -1522,26 +1673,26 @@ void AgentScheduler::housekeeping(const std::vector<AgentConfig>& active_agents)
                     *recovered_cfg, models_dir_, "vllm", expected_profile);
                 recovered.placed_at_ms = util::now_ms();
                 recovered.last_active_ms = recovered.placed_at_ms;
-                store_placement(recovered);
-                MM_INFO("AgentScheduler: reconciled surviving Ray group {} for agent {}",
-                        group_id, recovered.agent_id);
+                store_new_placement(recovered);
+                MM_INFO("PlacementScheduler: reconciled surviving Ray group {} for {}",
+                        group_id, recovered.holder_id);
             }
             continue;
         }
         // detach_placement_best_effort enforces the required ordering: the
         // head server is stopped first, followed by owned Ray members.
         detach_placement_best_effort(
-            recovered, recovered.agent_id,
+            recovered, recovered.holder_id,
             "incomplete, conflicting, or orphaned Ray group during reconciliation");
     }
 }
 
-std::vector<AgentId> AgentScheduler::lru_idle_agents(const NodeId& on_node) const {
+std::vector<HolderId> PlacementScheduler::lru_idle_holders(const NodeId& on_node) const {
     std::lock_guard state_lock(state_mutex_);
-    std::vector<std::pair<AgentId, int64_t>> candidates;
+    std::vector<std::pair<HolderId, int64_t>> candidates;
     for (const auto& [id, placement] : placements_) {
         if ((placement.suspended && placement.engine_id != "vllm") ||
-            placement.is_active) continue;
+            placement.in_flight > 0) continue;
         if (!on_node.empty() && placement.node_id != on_node) continue;
         candidates.emplace_back(id, placement.last_active_ms);
     }
@@ -1549,30 +1700,47 @@ std::vector<AgentId> AgentScheduler::lru_idle_agents(const NodeId& on_node) cons
         return std::tie(lhs.second, lhs.first) < std::tie(rhs.second, rhs.first);
     });
 
-    std::vector<AgentId> result;
+    std::vector<HolderId> result;
     result.reserve(candidates.size());
     for (auto& [id, _] : candidates) result.push_back(std::move(id));
     return result;
 }
 
-bool AgentScheduler::suspend_agent(const AgentId& agent_id) {
-    const auto placement = find_placement_copy(agent_id);
-    if (!placement || placement->suspended) return false;
+PlacementScheduler::SuspendResult PlacementScheduler::suspend(const HolderId& holder_id) {
+    // Under the schedule lock, like every other change to a placement: without
+    // it a concurrent acquire() could claim the placement between the in-flight
+    // check below and the node actually suspending it.
+    std::lock_guard schedule_lock(schedule_mutex_);
+    return suspend_locked(holder_id);
+}
 
-    std::vector<AgentId> cohort{agent_id};
+PlacementScheduler::SuspendResult PlacementScheduler::suspend_locked(const HolderId& holder_id) {
+    const auto placement = find_placement_copy(holder_id);
+    if (!placement || placement->suspended) return SuspendResult::NotPlaced;
+
+    std::vector<HolderId> cohort{holder_id};
     {
         std::lock_guard state_lock(state_mutex_);
+        // Its OWN requests first. The old check looked only at co-holders on
+        // the slot, so a placement could be suspended in the middle of a
+        // response it was itself producing.
+        const auto self = placements_.find(holder_id);
+        if (self != placements_.end() && self->second.in_flight > 0) {
+            MM_INFO("PlacementScheduler: not suspending {}; {} request(s) in flight",
+                    holder_id, self->second.in_flight);
+            return SuspendResult::Busy;
+        }
         for (const auto& [id, candidate] : placements_) {
-            if (id == agent_id || candidate.suspended) continue;
+            if (id == holder_id || candidate.suspended) continue;
             if (candidate.node_id != placement->node_id
                 || candidate.slot_id != placement->slot_id) {
                 continue;
             }
-            if (candidate.is_active) {
-                MM_INFO("AgentScheduler: not suspending agent {}; slot {} is "
-                        "shared with active agent {}", agent_id,
+            if (candidate.in_flight > 0) {
+                MM_INFO("PlacementScheduler: not suspending {}; slot {} is "
+                        "shared with busy holder {}", holder_id,
                         placement->slot_id, id);
-                return false;
+                return SuspendResult::Busy;
             }
             cohort.push_back(id);
         }
@@ -1589,41 +1757,42 @@ bool AgentScheduler::suspend_agent(const AgentId& agent_id) {
         if (!response.ok()) {
             std::string preview = response.body;
             if (preview.size() > 300) preview = preview.substr(0, 300) + "...";
-            MM_WARN("AgentScheduler: suspend failed for agent {} on node {} "
-                    "(HTTP {}): {}", agent_id, placement->node_id,
+            MM_WARN("PlacementScheduler: suspend failed for {} on node {} "
+                    "(HTTP {}): {}", holder_id, placement->node_id,
                     response.status, preview);
-            return false;
+            return SuspendResult::Failed;
         }
         kv_cache_path = nlohmann::json::parse(response.body)
                             .value("kv_cache_path", std::string{});
     } catch (const std::exception& e) {
-        MM_WARN("AgentScheduler: suspend failed for agent {}: {}", agent_id, e.what());
-        return false;
+        MM_WARN("PlacementScheduler: suspend failed for {}: {}", holder_id, e.what());
+        return SuspendResult::Failed;
     }
 
     bool updated = false;
     for (const auto& id : cohort) {
-        const bool changed = mutate_placement(id, [&](AgentPlacement& candidate) {
+        const bool changed = mutate_placement(id, [&](Placement& candidate) {
             candidate.suspended = true;
             candidate.kv_cache_node_path = kv_cache_path;
             if (candidate.engine_id == "vllm")
                 candidate.reservation_state = "sleeping";
         });
-        if (id == agent_id) updated = changed;
+        if (id == holder_id) updated = changed;
     }
-    if (!updated) return false;
+    if (!updated) return SuspendResult::Failed;
 
-    MM_INFO("AgentScheduler: suspended agent {} on node {} (cache={})",
-            agent_id, placement->node_id, kv_cache_path);
-    return true;
+    MM_INFO("PlacementScheduler: suspended {} on node {} (cache={})",
+            holder_id, placement->node_id, kv_cache_path);
+    return SuspendResult::Suspended;
 }
 
-std::optional<SlotId> AgentScheduler::restore_agent_on_node(
-    const AgentPlacement& placement,
-    const AgentConfig& cfg,
+std::optional<SlotId> PlacementScheduler::restore_on_node(
+    const Placement& placement,
+    const ServedModel& cfg,
     const NodeId& node_id,
     const BackendRouting& routing,
-    const std::optional<VllmEngineConfig>& vllm) {
+    const std::optional<VllmEngineConfig>& vllm,
+    Attempt& attempt) {
     try {
         const auto node = registry_.get_node(node_id);
         HttpClient client(node.url);
@@ -1634,13 +1803,13 @@ std::optional<SlotId> AgentScheduler::restore_agent_on_node(
         const auto prepared = prepare_model_for_node(
             node, cfg, model_location(cfg), models_dir_, pin, false, &prepare_error);
         if (!prepared) {
-            set_failure(PlacementFailure::ModelTransferFailed,
+            attempt.fail(PlacementFailure::ModelTransferFailed,
                         "failed to prepare model for restore on node " + node_id + ": " +
                             prepare_error);
             return std::nullopt;
         }
 
-        for (int attempt = 0; attempt < 3; ++attempt) {
+        for (int try_index = 0; try_index < 3; ++try_index) {
             nlohmann::json body = {
                 {"model_path", prepared->model_path},
                 {"mmproj_path", prepared->mmproj_path},
@@ -1649,11 +1818,11 @@ std::optional<SlotId> AgentScheduler::restore_agent_on_node(
                 {"kv_cache_path", node_id == placement.node_id
                     ? placement.kv_cache_node_path : std::string{}},
                 // The RESOLVED engine id. Hardcoding "llama-cpp" here is what
-                // made a Soma agent unplaceable regardless of its verdict.
+                // made a Soma model unplaceable regardless of its verdict.
                 {"backend", routing.engine_id},
-                {"served_model_name", cfg.served_model_name.empty()
-                    ? cfg.model_path : cfg.served_model_name},
-                {"agent_id", cfg.id},
+                {"served_model_name", cfg.engine_model_name.empty()
+                    ? cfg.model_path : cfg.engine_model_name},
+                {"holder_id", cfg.id},
             };
             if (vllm) body["vllm"] = *vllm;
             if (!prepared->model_id.empty()) {
@@ -1669,36 +1838,37 @@ std::optional<SlotId> AgentScheduler::restore_agent_on_node(
                 const auto slot_id = nlohmann::json::parse(response.body)
                                          .value("slot_id", std::string{});
                 if (!slot_id.empty()) return slot_id;
-                set_failure(PlacementFailure::NodeProtocolError,
+                attempt.fail(PlacementFailure::NodeProtocolError,
                             "restore-slot returned an empty slot_id on node " + node_id);
                 return std::nullopt;
             }
 
             if (response_indicates_capacity_pressure(response.body)) {
-                if (attempt == 0 && evict_slots_on_node(node_id, cfg.id, 1)) continue;
-                if (attempt == 1 && evict_slots_on_node(node_id, cfg.id, -1)) continue;
+                if (try_index == 0 && evict_slots_on_node(node_id, cfg.id, 1)) continue;
+                if (try_index == 1 && evict_slots_on_node(node_id, cfg.id, -1)) continue;
             }
 
             std::string preview = response.body;
             if (preview.size() > 300) preview = preview.substr(0, 300) + "...";
-            set_failure(PlacementFailure::NodeRejected,
+            attempt.fail(PlacementFailure::NodeRejected,
                         "restore-slot failed on node " + node_id + " (HTTP " +
                             std::to_string(response.status) + "): " + preview);
             return std::nullopt;
         }
     } catch (const std::exception& e) {
-        MM_WARN("AgentScheduler: restore failed on node {}: {}", node_id, e.what());
-        set_failure(PlacementFailure::NodeUnreachable,
+        MM_WARN("PlacementScheduler: restore failed on node {}: {}", node_id, e.what());
+        attempt.fail(PlacementFailure::NodeUnreachable,
                     "restore-slot exception on node " + node_id + ": " + e.what());
     }
     return std::nullopt;
 }
 
-std::optional<SlotId> AgentScheduler::load_agent_on_node(
-    const AgentConfig& cfg,
+std::optional<SlotId> PlacementScheduler::load_on_node(
+    const ServedModel& cfg,
     const NodeId& node_id,
     const BackendRouting& routing,
     const std::optional<VllmEngineConfig>& vllm,
+    Attempt& attempt,
     const std::string& ray_address,
     const std::string& host_ip,
     const std::vector<int>& gpu_devices) {
@@ -1724,24 +1894,24 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
                 node, cfg, model_location(cfg), models_dir_, pin, false, &prepare_error);
         }
         if (!prepared) {
-            set_failure(PlacementFailure::ModelTransferFailed,
+            attempt.fail(PlacementFailure::ModelTransferFailed,
                         "failed to prepare model for node " + node_id + ": " + prepare_error);
             return std::nullopt;
         }
 
         bool retried_transfer = false;
-        for (int attempt = 0; attempt < 3; ++attempt) {
+        for (int try_index = 0; try_index < 3; ++try_index) {
             nlohmann::json body = {
                 {"model_path", prepared->model_path},
                 {"mmproj_path", prepared->mmproj_path},
                 {"vision_enabled", cfg.vision_settings.enabled},
                 {"runtime_settings", cfg.runtime_settings},
                 // The RESOLVED engine id. Hardcoding "llama-cpp" here is what
-                // made a Soma agent unplaceable regardless of its verdict.
+                // made a Soma model unplaceable regardless of its verdict.
                 {"backend", routing.engine_id},
-                {"served_model_name", cfg.served_model_name.empty()
-                    ? cfg.model_path : cfg.served_model_name},
-                {"agent_id", cfg.id},
+                {"served_model_name", cfg.engine_model_name.empty()
+                    ? cfg.model_path : cfg.engine_model_name},
+                {"holder_id", cfg.id},
             };
             if (vllm) body["vllm"] = *vllm;
             if (!ray_address.empty()) body["ray_address"] = ray_address;
@@ -1760,18 +1930,18 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
                 const auto slot_id = nlohmann::json::parse(response.body)
                                          .value("slot_id", std::string{});
                 if (!slot_id.empty()) {
-                    MM_INFO("AgentScheduler: loaded agent {} on node {} (slot={})",
+                    MM_INFO("PlacementScheduler: loaded {} on node {} (slot={})",
                             cfg.id, node_id, slot_id);
                     return slot_id;
                 }
-                set_failure(PlacementFailure::NodeProtocolError,
+                attempt.fail(PlacementFailure::NodeProtocolError,
                             "load-model returned an empty slot_id on node " + node_id);
                 return std::nullopt;
             }
 
             if (response_indicates_capacity_pressure(response.body)) {
-                if (attempt == 0 && evict_slots_on_node(node_id, cfg.id, 1)) continue;
-                if (attempt == 1 && evict_slots_on_node(node_id, cfg.id, -1)) continue;
+                if (try_index == 0 && evict_slots_on_node(node_id, cfg.id, 1)) continue;
+                if (try_index == 1 && evict_slots_on_node(node_id, cfg.id, -1)) continue;
             }
 
             const std::string lower_body = util::to_lower(response.body);
@@ -1793,20 +1963,20 @@ std::optional<SlotId> AgentScheduler::load_agent_on_node(
 
             std::string preview = response.body;
             if (preview.size() > 300) preview = preview.substr(0, 300) + "...";
-            set_failure(PlacementFailure::NodeRejected,
+            attempt.fail(PlacementFailure::NodeRejected,
                         "load-model failed on node " + node_id + " (HTTP " +
                             std::to_string(response.status) + "): " + preview);
             return std::nullopt;
         }
     } catch (const std::exception& e) {
-        MM_WARN("AgentScheduler: load failed on node {}: {}", node_id, e.what());
-        set_failure(PlacementFailure::NodeUnreachable,
+        MM_WARN("PlacementScheduler: load failed on node {}: {}", node_id, e.what());
+        attempt.fail(PlacementFailure::NodeUnreachable,
                     "load-model exception on node " + node_id + ": " + e.what());
     }
     return std::nullopt;
 }
 
-bool AgentScheduler::response_indicates_capacity_pressure(const std::string& body) {
+bool PlacementScheduler::response_indicates_capacity_pressure(const std::string& body) {
     // A STRUCTURED code, with the six-phrase substring match retained only as a
     // fallback for engines that have not been updated.
     //
@@ -1855,20 +2025,20 @@ bool AgentScheduler::response_indicates_capacity_pressure(const std::string& bod
         || lower.find("insufficient vram") != std::string::npos;
 }
 
-bool AgentScheduler::evict_slots_on_node(const NodeId& node_id,
-                                         const AgentId& preserve_agent,
-                                         int max_to_evict) {
+bool PlacementScheduler::evict_slots_on_node(const NodeId& node_id,
+                                             const HolderId& preserve_holder,
+                                             int max_to_evict) {
     int evicted = 0;
     const auto can_evict_more = [&] {
         return max_to_evict < 0 || evicted < max_to_evict;
     };
 
-    for (const auto& candidate_id : lru_idle_agents(node_id)) {
+    for (const auto& candidate_id : lru_idle_holders(node_id)) {
         if (!can_evict_more()) break;
-        if (candidate_id == preserve_agent) continue;
+        if (candidate_id == preserve_holder) continue;
         const auto placement = find_placement_copy(candidate_id);
-        if (!placement || placement->suspended || placement->is_active) continue;
-        if (!evict_agent_for_capacity(candidate_id)) continue;
+        if (!placement || placement->suspended || placement->in_flight > 0) continue;
+        if (!evict_holder_for_capacity(candidate_id)) continue;
         ++evicted;
     }
     if (!can_evict_more()) return evicted > 0;
@@ -1887,7 +2057,7 @@ bool AgentScheduler::evict_slots_on_node(const NodeId& node_id,
                     slots = body["slots"].get<std::vector<SlotInfo>>();
                 }
             } catch (const std::exception& e) {
-                MM_WARN("AgentScheduler: failed to parse node status while evicting "
+                MM_WARN("PlacementScheduler: failed to parse node status while evicting "
                         "on {}: {}", node_id, e.what());
             }
         }
@@ -1895,10 +2065,10 @@ bool AgentScheduler::evict_slots_on_node(const NodeId& node_id,
         std::unordered_set<SlotId> protected_slots;
         {
             std::lock_guard state_lock(state_mutex_);
-            for (const auto& [agent_id, placement] : placements_) {
+            for (const auto& [holder_id, placement] : placements_) {
                 if (placement.node_id != node_id) continue;
-                if (placement.is_active
-                    || (!preserve_agent.empty() && agent_id == preserve_agent)) {
+                if (placement.in_flight > 0
+                    || (!preserve_holder.empty() && holder_id == preserve_holder)) {
                     if (!placement.slot_id.empty()) {
                         protected_slots.insert(placement.slot_id);
                     }
@@ -1912,10 +2082,9 @@ bool AgentScheduler::evict_slots_on_node(const NodeId& node_id,
                 || slot.state == SlotState::Empty) {
                 continue;
             }
-            if (!preserve_agent.empty()
-                && (slot.assigned_agent == preserve_agent
-                    || std::find(slot.agent_ids.begin(), slot.agent_ids.end(),
-                                 preserve_agent) != slot.agent_ids.end())) {
+            if (!preserve_holder.empty()
+                && std::find(slot.holder_ids.begin(), slot.holder_ids.end(),
+                             preserve_holder) != slot.holder_ids.end()) {
                 continue;
             }
             if (protected_slots.count(slot.id)) continue;
@@ -1932,7 +2101,7 @@ bool AgentScheduler::evict_slots_on_node(const NodeId& node_id,
                 "/api/node/unload-model",
                 nlohmann::json{{"slot_id", candidate.id}});
             if (!response.ok()) {
-                MM_WARN("AgentScheduler: failed to unload slot {} on node {} "
+                MM_WARN("PlacementScheduler: failed to unload slot {} on node {} "
                         "during eviction (HTTP {})", candidate.id, node_id,
                         response.status);
                 continue;
@@ -1950,31 +2119,33 @@ bool AgentScheduler::evict_slots_on_node(const NodeId& node_id,
                 }
             }
             ++evicted;
-            MM_INFO("AgentScheduler: directly unloaded slot {} on node {} "
+            MM_INFO("PlacementScheduler: directly unloaded slot {} on node {} "
                     "to free capacity", candidate.id, node_id);
         }
 
         return evicted > 0;
     } catch (const std::exception& e) {
-        MM_WARN("AgentScheduler: eviction fallback failed on node {}: {}",
+        MM_WARN("PlacementScheduler: eviction fallback failed on node {}: {}",
                 node_id, e.what());
         return evicted > 0;
     }
 }
 
-bool AgentScheduler::evict_agent_for_capacity(const AgentId& agent_id) {
-    const auto placement = find_placement_copy(agent_id);
+bool PlacementScheduler::evict_holder_for_capacity(const HolderId& holder_id) {
+    // Called only from inside place(), which holds the schedule lock.
+    const auto placement = find_placement_copy(holder_id);
     if (!placement) return false;
-    if (placement->engine_id != "vllm") return suspend_agent(agent_id);
+    if (placement->engine_id != "vllm")
+        return suspend_locked(holder_id) == SuspendResult::Suspended;
 
     // vLLM sleep deliberately keeps its GPU/Ray reservation. Under capacity
     // pressure that cannot help the pending load, so unload the placement and
     // release the owned group instead of pretending its GPUs became reusable.
-    if (!erase_placement_entry(agent_id)) return false;
+    if (!erase_placement_entry(holder_id)) return false;
     detach_placement_best_effort(
-        *placement, agent_id, "vLLM placement evicted under capacity pressure");
+        *placement, holder_id, "vLLM placement evicted under capacity pressure");
     if (audit_.released) {
-        try { audit_.released(agent_id); } catch (...) {}
+        try { audit_.released(holder_id); } catch (...) {}
     }
     return true;
 }
