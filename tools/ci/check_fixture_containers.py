@@ -70,7 +70,7 @@ SOMA = Path()  # set from argv in main(), before any conversion runs
 
 def convert(root: Path, family: str, out: Path, extra: list) -> None:
     # The source path is RELATIVE and the converter runs from the repo root:
-    # container_meta.json records it verbatim, and an absolute one would pin
+    # container_meta.json records it with forward slashes, and an absolute path would pin
     # every fixture to the machine that regenerated it.
     #
     # --soma, because conversion asks the engine for the container's identity

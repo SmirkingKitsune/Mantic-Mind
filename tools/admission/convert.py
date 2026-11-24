@@ -1507,7 +1507,7 @@ def main(argv: list[str]) -> int:
     # why absence is never expressed by leaving a key out.
     meta = record.build(
         container_version=FORMAT_VERSION,
-        source=str(src),
+        source=src.as_posix(),
         source_repo=args.source_repo or "",
         source_revision=args.source_revision or "",
         config_sha256=hashlib.sha256((src / "config.json").read_bytes()).hexdigest(),
