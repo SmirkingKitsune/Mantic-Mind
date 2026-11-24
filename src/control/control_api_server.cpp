@@ -277,11 +277,8 @@ bool ControlApiServer::listen(uint16_t port) {
         }
     }
 
-    if (!scopes_.auth_enabled()) {
-        // Said out loud, once. A system that is open because nobody configured a
-        // token should announce it rather than look configured.
-        MM_WARN("API authorization is DISABLED: no external_api_token and no rows in "
-                "api_token. Every /v1/* route is open to anyone who can reach this port.");
+    if (!scopes_.has_active_credentials()) {
+        MM_WARN("No active API tokens. Tokenless /v1 access is limited to loopback peers.");
     }
 
     MM_INFO("ControlApiServer listening on port {}", port);

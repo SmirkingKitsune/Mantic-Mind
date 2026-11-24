@@ -42,7 +42,7 @@ struct ControlConfig {
     // for the same disk rather than going twice as fast.
     int  admission_max_concurrent    = 1;                  // MM_ADMISSION_MAX_CONCURRENT
 
-    // Optional bearer token required by external /v1/* client routes.
+    // Optional all-scopes bearer token for external /v1/* clients.
     std::string external_api_token;
 
     // Optional Qwen3-TTS backend. Disabled by default; when enabled but

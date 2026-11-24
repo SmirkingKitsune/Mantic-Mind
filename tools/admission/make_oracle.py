@@ -859,6 +859,7 @@ def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("source", help="local model dir or HF repo id")
+    ap.add_argument("--source-model-id", help="HF repo id to record for a local source")
     ap.add_argument("--out", default="tests/fixtures/tiny", help="fixture root")
     ap.add_argument("--seed", type=int, default=20260727)
     ap.add_argument("--layers", type=int, default=TARGET_LAYERS)
@@ -894,10 +895,20 @@ def main(argv: list[str]) -> int:
     import numpy as np
     import torch
     import transformers
+    from huggingface_hub.utils import HFValidationError, validate_repo_id
     from transformers import AutoConfig, AutoModelForCausalLM
 
     src = Path(args.source)
     is_local = src.exists()
+    source_model_id = args.source_model_id if is_local else args.source
+    if args.source_model_id is not None and not is_local:
+        ap.error("--source-model-id requires a local source directory")
+    if source_model_id is not None:
+        try:
+            validate_repo_id(source_model_id)
+        except HFValidationError:
+            ap.error("fixture provenance requires a valid Hugging Face repo id")
+
     raw_cfg_path = src / "config.json" if is_local else None
     if is_local and not raw_cfg_path.exists():
         print(f"error: {raw_cfg_path} not found", file=sys.stderr)
@@ -1133,7 +1144,7 @@ def main(argv: list[str]) -> int:
     meta = {
         "fixture_version": 1,
         "slug": slug,
-        "source": str(args.source),
+        "source": source_model_id,
         "source_model_type": raw.get("model_type"),
         "implementation": "native" if native else "remote_code",
         "source_architectures": raw.get("architectures"),

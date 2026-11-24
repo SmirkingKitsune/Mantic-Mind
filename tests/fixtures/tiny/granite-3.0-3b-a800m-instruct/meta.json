@@ -31,7 +31,7 @@
   "positions": 512,
   "seed": 20260727,
   "slug": "granite-3.0-3b-a800m-instruct",
-  "source": "Z:/AI/Ubiquitious-Memories/Mantic-Mind/models/ibm-granite/granite-3.0-3b-a800m-instruct",
+  "source": "ibm-granite/granite-3.0-3b-a800m-instruct",
   "source_architectures": [
     "GraniteMoeForCausalLM"
   ],

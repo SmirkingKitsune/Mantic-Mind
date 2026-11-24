@@ -35,7 +35,7 @@
   "positions": 512,
   "seed": 20260727,
   "slug": "GLM-5.2",
-  "source": "Z:/AI/Ubiquitious-Memories/Mantic-Mind/models/zai-org/GLM-5.2",
+  "source": "zai-org/GLM-5.2",
   "source_architectures": [
     "GlmMoeDsaForCausalLM"
   ],

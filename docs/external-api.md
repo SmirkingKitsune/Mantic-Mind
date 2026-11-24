@@ -28,14 +28,7 @@ Base: `http://<control>:9090`. A separate OpenAI-compatibility listener runs on 
 
 ## 1. Authentication and scopes
 
-### What exists today
-
-One flat bearer token (`ControlConfig::external_api_token`), compared with a plain `!=`, gating every
-`/v1/*` path identically, via a single `SetPreRoutingHandler`. There is **no scope, role, or permission
-concept anywhere in the codebase**. Auth is entirely opt-in: an empty token means the whole surface is
-open.
-
-### What replaces it
+### Token scopes
 
 Three scopes, split by **blast radius** rather than by resource:
 
@@ -57,17 +50,16 @@ user and everything they own.
 Authorization: Bearer <token>
 ```
 
-| Failure | Status | Body |
+| Failure | Status | Control API `error` |
 |---|---|---|
-| No/malformed header | 401 | `{"error":{"code":"missing_bearer_token"}}` |
-| Unknown or revoked token | 403 | `{"error":{"code":"invalid_bearer_token"}}` |
-| Valid token, insufficient scope | 403 | `{"error":{"code":"insufficient_scope","required":"operator","granted":["read","chat"]}}` |
+| No or malformed bearer header when a token is required | 401 | `missing bearer token` |
+| Unknown or revoked token | 403 | `invalid bearer token` |
+| Valid token with insufficient scope | 403 | `insufficient scope`, with `required` and `granted` fields in the response |
 
-**Backwards compatibility.** The existing `external_api_token` is grandfathered as an all-scopes
-credential, matched *before* the database lookup and never inserted as a row — so rotating it in config
-cannot leave a stale grant behind. If it is empty **and** `api_token` has no rows, auth is off exactly
-as today, and control logs that loudly at startup: a system that is open because nobody configured it
-should say so.
+The configured `external_api_token` grants all scopes and is checked before the database lookup.
+Both API listeners require a bearer token from remote clients. A direct loopback client can call
+`POST /v1/tokens` without a bearer token when there are no active credentials. Configure a token
+before exposing either listener through a local reverse proxy.
 
 ### Binding a token to one user
 

@@ -31,7 +31,7 @@
   "positions": 512,
   "seed": 20260727,
   "slug": "DeepSeek-V4-Pro-0813",
-  "source": "C:\\Users\\RyanM\\AppData\\Local\\Temp\\deepseek-v4-pro-0813-meta",
+  "source": "deepseek-ai/DeepSeek-V4-Pro-0813",
   "source_architectures": [
     "DeepseekV4ForCausalLM"
   ],

@@ -10,6 +10,7 @@
 # Local runtime config copies
 /mantic-mind.toml
 /mantic-mind-control.toml
+/wsl_*
 
 # Runtime data
 /data/*

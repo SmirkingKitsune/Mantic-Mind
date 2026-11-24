@@ -2,12 +2,7 @@
 
 // Mantic-Mind — scoped API authorization.
 //
-// Auth today is ONE flat bearer token, compared with a plain != , gating every
-// /v1/* path identically, and entirely opt-in (empty external_api_token means
-// the whole surface is open). There is no scope, role, or permission concept
-// anywhere in the codebase.
-//
-// That is untenable once admission exists. `POST /v1/models/admit` starts hours
+// `POST /v1/models/admit` starts hours
 // of conversion and profiling and consumes tens of GB; it must not sit behind
 // the same credential that lets a client send a chat message. And a telemetry
 // dashboard — which only ever reads — should not hold a token that can delete an
@@ -62,7 +57,7 @@ struct AuthResult {
     std::string token_label;
     std::int64_t token_id = 0;
     /// The user a token is bound to; empty for an unbound token, the legacy
-    /// token, and auth-off.
+    /// token, and local bootstrap requests.
     std::string bound_user_id;
     int status = 200; ///< 401 missing, 403 insufficient
     std::string error;
@@ -87,11 +82,10 @@ public:
     /// rotating it in config cannot leave a stale grant behind.
     void configure(ControlModelRegistry* registry, std::string legacy_token);
 
-    /// Empty legacy token AND no rows in api_token means auth is off, matching
-    /// today's behaviour exactly. Logged loudly at startup — a system that is
-    /// open because nobody configured it should say so.
-    bool auth_enabled() const;
+    /// True when a legacy token or at least one active scoped token exists.
+    bool has_active_credentials() const;
 
+    /// Tokenless access is limited to loopback peers during local bootstrap.
     AuthResult authorize(const httplib::Request& req) const;
 
     /// Convenience for SetPreRoutingHandler; writes the error body on refusal.

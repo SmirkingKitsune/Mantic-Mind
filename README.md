@@ -549,7 +549,7 @@ retained, and the latest path is shown in the wizard and exposed as
 | `models_dir` | `MM_MODELS_DIR` | `models` | Optional local model directory root |
 | `node_health_poll_interval_s` | `MM_POLL_INTERVAL_S` | `30` | Health/metrics poll interval |
 | `node_offline_after_s` | `MM_NODE_OFFLINE_AFTER_S` | `90` | Time without a successful poll before an unreachable node is labeled offline |
-| `external_api_token` | `MM_CONTROL_EXTERNAL_API_TOKEN` | *(empty)* | When set, required as `Authorization: Bearer` on all external `/v1/*` routes |
+| `external_api_token` | `MM_CONTROL_EXTERNAL_API_TOKEN` | *(empty)* | Optional all-scopes bearer token for `/v1/*`. Remote clients need a valid bearer token. |
 | `pairing_key` | `MM_PAIRING_KEY` | *(empty)* | PSK for automatic node/control pairing |
 | `discovery_port` | `MM_DISCOVERY_PORT` | `7072` | UDP discovery port |
 | `chat_worker_threads` | `MM_CHAT_WORKER_THREADS` | `16` | Threads running conversation work; each conversation keeps its own order |
@@ -621,11 +621,12 @@ POST   /api/control/register-node  { node_url, api_key, platform }
 
 ### External Client API
 
-If `external_api_token` is configured on control, every external `/v1` and
-`/v1/*` route requires `Authorization: Bearer <external_api_token>`, including
-SSE chat and mutating routes. Registered node API keys authenticate only the
-internal `/api/control/*` routes; they are not accepted for external `/v1/*`
-clients.
+Remote clients must send `Authorization: Bearer <token>` on both the control
+and OpenAI-compatible APIs. Use an active scoped token or the configured
+`external_api_token`. When neither exists, direct loopback clients can use the
+API to create the first token. Configure a token before exposing either API
+through a local reverse proxy. Registered node API keys apply to the internal
+`/api/control/*` routes.
 
 ```
 GET/POST       /v1/users

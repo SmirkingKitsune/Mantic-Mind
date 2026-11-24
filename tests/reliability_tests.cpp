@@ -3678,6 +3678,36 @@ bool test_scheduler_reconciles_ready_absent_and_suspended_snapshots() {
     return ok;
 }
 
+bool test_control_api_tokenless_loopback() {
+    mm::ScopeAuthorizer authorizer;
+    httplib::Request req;
+    req.method = "POST";
+    req.path = "/v1/tokens";
+
+    for (const auto* peer : {"", "192.0.2.10", "2001:db8::1"}) {
+        req.remote_addr = peer;
+        httplib::Response res;
+        CHECK(!authorizer.authorize_or_reject(req, res));
+        CHECK(res.status == 401);
+    }
+
+    for (const auto* peer : {"127.0.0.1", "::1", "::ffff:127.0.0.1"}) {
+        req.remote_addr = peer;
+        httplib::Response res;
+        CHECK(authorizer.authorize_or_reject(req, res));
+    }
+
+    authorizer.configure(nullptr, "test-control-token");
+    httplib::Response res;
+    CHECK(!authorizer.authorize_or_reject(req, res));
+    CHECK(res.status == 401);
+
+    req.remote_addr = "192.0.2.10";
+    req.set_header("Authorization", "Bearer test-control-token");
+    CHECK(authorizer.authorize_or_reject(req, res));
+    return true;
+}
+
 bool test_control_api_external_token_gate() {
     auto dir = temp_test_dir("control-auth");
     std::filesystem::create_directories(dir);
@@ -10231,6 +10261,7 @@ int main(int argc, char** argv) {
          test_scheduler_backend_change_releases_local_placement},
         {"scheduler_reconciles_ready_absent_and_suspended_snapshots",
          test_scheduler_reconciles_ready_absent_and_suspended_snapshots},
+        {"control_api_tokenless_loopback", test_control_api_tokenless_loopback},
         {"control_api_external_token_gate", test_control_api_external_token_gate},
         {"user_voice_db_and_cache_lifecycle", test_user_voice_db_and_cache_lifecycle},
         {"tts_service_client_fake_sidecar_paths",
