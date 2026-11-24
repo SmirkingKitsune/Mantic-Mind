@@ -24,7 +24,7 @@
   "omitted_tensors": 0,
   "quantized_resident_bytes": 96128,
   "record_version": 1,
-  "source": "tests\\fixtures\\tiny\\DeepSeek-V4-Pro-0813",
+  "source": "tests/fixtures/tiny/DeepSeek-V4-Pro-0813",
   "source_quantization": "none",
   "source_repo": "fixture/DeepSeek-V4-Pro-0813",
   "source_revision": "tiny-fixture",

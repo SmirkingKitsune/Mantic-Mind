@@ -21,7 +21,7 @@
   "omitted_namespaces": [],
   "omitted_tensors": 0,
   "record_version": 1,
-  "source": "tests\\fixtures\\tiny\\Qwen3-30B-A3B",
+  "source": "tests/fixtures/tiny/Qwen3-30B-A3B",
   "source_quantization": "none",
   "source_repo": "",
   "source_revision": "",

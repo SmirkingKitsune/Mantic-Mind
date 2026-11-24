@@ -21,7 +21,7 @@
   "omitted_namespaces": [],
   "omitted_tensors": 0,
   "record_version": 1,
-  "source": "tests\\fixtures\\tiny\\GLM-5.2",
+  "source": "tests/fixtures/tiny/GLM-5.2",
   "source_quantization": "none",
   "source_repo": "",
   "source_revision": "",

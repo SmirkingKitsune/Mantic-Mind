@@ -70,7 +70,7 @@ FIELDS: tuple[tuple, ...] = (
 
     # ── provenance: what this was built FROM ─────────────────────────────────
     ("source", str, "always",
-     "the checkpoint directory this conversion read, as given on the command line"),
+     "the checkpoint directory this conversion read, using forward slashes"),
     ("source_repo", str, "always",
      "upstream repository id, or '' when the source was a local directory with no "
      "recorded origin. Explicitly empty rather than absent"),

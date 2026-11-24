@@ -866,7 +866,7 @@ def run(args) -> int:
     # this family does not have from a field somebody forgot.
     fields = {
         "container_version": FORMAT_VERSION,
-        "source": str(src),
+        "source": src.as_posix(),
         "source_repo": ("fixture/DeepSeek-V4-Pro-0813" if fixture_mode
                         else "deepseek-ai/DeepSeek-V4-Pro-0813"),
         "source_revision": requested,
