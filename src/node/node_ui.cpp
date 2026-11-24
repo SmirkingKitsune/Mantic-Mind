@@ -248,15 +248,6 @@ void NodeUI::run() {
     bool        show_action_modal  = false;
     std::string cur_latest;          // latest_version this frame (for button lambdas)
     std::string modal_ack_version;   // latest_version the user has acted on/dismissed
-    auto high_contrast_button_option = [] {
-        ButtonOption option = ButtonOption::Simple();
-        option.transform = [](const EntryState& state) -> Element {
-            Element label = text(state.label) | color(Color::White);
-            if (state.focused) label = std::move(label) | inverted | bold;
-            return label;
-        };
-        return option;
-    };
     auto request_update = [&] {
         if (request_vllm_update_cb_) request_vllm_update_cb_();
     };
