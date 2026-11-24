@@ -242,8 +242,7 @@ start_runtime(F32Model& model, const std::string& dir, std::uint64_t cache_bytes
     if (p == nullptr) return StatusCode::Internal;
     OpenOptions opts;
     opts.identity = IdentityPolicy::SkipArchHash;
-    if (auto st = p->store.open_indexed(
-            dir, p->draft_arch, "soma.dspark", "dspark-experts-", opts);
+    if (auto st = p->store.open_indexed(dir, p->draft_arch, "soma.dspark", "dspark-experts-", opts);
         !st.ok())
         return st.code();
     MemoryBudget b;

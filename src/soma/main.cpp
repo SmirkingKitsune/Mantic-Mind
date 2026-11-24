@@ -32,8 +32,8 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <set>
 #include <iterator>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -876,7 +876,8 @@ int cmd_serve(int argc, char** argv) {
     }
     if (!server.byte_tokenizer_reason().empty()) {
         std::cout << "\n  WARNING: no tokenizer — encoding one token per byte. Generated "
-                     "text is MEANINGLESS (" << server.byte_tokenizer_reason() << ")";
+                     "text is MEANINGLESS ("
+                  << server.byte_tokenizer_reason() << ")";
     }
     std::cout << std::endl;
 
@@ -886,7 +887,6 @@ int cmd_serve(int argc, char** argv) {
     }
     return 0;
 }
-
 
 // ── arch-hash ────────────────────────────────────────────────────────────────
 //
@@ -943,7 +943,6 @@ int cmd_arch_hash(int argc, char** argv) {
     std::cout << identity << "\n";
     return 0;
 }
-
 
 // ── verify ───────────────────────────────────────────────────────────────────
 //
@@ -1040,7 +1039,6 @@ int cmd_verify(int argc, char** argv) {
     return failures == 0 ? 0 : 1;
 }
 
-
 // -- heat-layout -------------------------------------------------------------
 //
 // Does packing a container in heat order actually buy anything?
@@ -1064,13 +1062,13 @@ int cmd_heat_layout(int argc, char** argv) {
             heat_path = argv[++i];
         else if (a == "--pin" && i + 1 < argc) {
             const std::string value = argv[++i];
-            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), pin_bytes);
+            const auto parsed =
+                std::from_chars(value.data(), value.data() + value.size(), pin_bytes);
             if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size()) {
                 std::cerr << "heat-layout: --pin requires an unsigned byte count\n";
                 return 2;
             }
-        }
-        else if (a == "--json")
+        } else if (a == "--json")
             as_json = true;
         else if (!a.empty() && a.front() != '-' && dir.empty())
             dir = a;
@@ -1123,10 +1121,10 @@ int cmd_heat_layout(int argc, char** argv) {
     ranked.reserve(snap.cells.size());
     for (const auto& c : snap.cells)
         ranked.push_back(&c);
-    std::stable_sort(ranked.begin(), ranked.end(),
-                     [](const soma::HeatCell* a, const soma::HeatCell* b) {
-                         return a->decayed > b->decayed;
-                     });
+    std::stable_sort(
+        ranked.begin(), ranked.end(), [](const soma::HeatCell* a, const soma::HeatCell* b) {
+            return a->decayed > b->decayed;
+        });
 
     struct Range {
         std::uint32_t shard = 0;
@@ -1134,6 +1132,7 @@ int cmd_heat_layout(int argc, char** argv) {
         std::uint32_t length = 0;
         soma::LayerIndex layer = 0;
     };
+
     const auto expert_bytes = store.header().expert_bytes;
     std::vector<Range> pinned;
     std::set<std::pair<soma::LayerIndex, soma::ExpertId>> seen;
@@ -1200,7 +1199,8 @@ int cmd_heat_layout(int argc, char** argv) {
 
     if (as_json) {
         std::cout << nlohmann::json{{"model_dir", dir},
-                                    {"selection", "pin-budget candidates; cache capacity not modeled"},
+                                    {"selection",
+                                     "pin-budget candidates; cache capacity not modeled"},
                                     {"pinned_experts", pinned.size()},
                                     {"pinned_bytes", pinned_bytes},
                                     {"runs", runs},
@@ -1215,8 +1215,8 @@ int cmd_heat_layout(int argc, char** argv) {
     }
 
     const auto mib = [](std::uint64_t b) { return static_cast<double>(b) / (1024.0 * 1024.0); };
-    std::cout << std::fixed << std::setprecision(1)
-              << "pinned        " << pinned.size() << " experts, " << mib(pinned_bytes) << " MiB\n"
+    std::cout << std::fixed << std::setprecision(1) << "pinned        " << pinned.size()
+              << " experts, " << mib(pinned_bytes) << " MiB\n"
               << "runs          " << runs << "   contiguous stretches under the current layout\n"
               << "  heat-order  " << ideal_per_layer << " per-layer, " << ideal_global
               << " global   packing targets with existing shard membership\n"
@@ -1235,13 +1235,13 @@ int cmd_heat_layout(int argc, char** argv) {
     // exactly the case where there is nothing to win.
     std::cout << "\n";
     if (runs <= ideal_per_layer) {
-        std::cout << "no run-count reduction indicated by this per-layer packing estimate: "
-                  << runs << " current, " << ideal_per_layer << " estimated\n";
+        std::cout << "no run-count reduction indicated by this per-layer packing estimate: " << runs
+                  << " current, " << ideal_per_layer << " estimated\n";
     } else {
-        const double collapse =
-            static_cast<double>(runs) / static_cast<double>(std::max<std::uint64_t>(ideal_per_layer, 1));
-        std::cout << "per-layer packing target: " << runs << " runs to " << ideal_per_layer
-                  << " (" << collapse << "x ratio; not a measured speedup)\n";
+        const double collapse = static_cast<double>(runs) /
+                                static_cast<double>(std::max<std::uint64_t>(ideal_per_layer, 1));
+        std::cout << "per-layer packing target: " << runs << " runs to " << ideal_per_layer << " ("
+                  << collapse << "x ratio; not a measured speedup)\n";
     }
     return 0;
 }

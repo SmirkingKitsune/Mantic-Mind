@@ -193,7 +193,7 @@ json telemetry_frame_json(const TelemetryFrame& f) {
 /// What warming the cache from a heat snapshot achieved.
 struct WarmReport {
     std::uint32_t pinned = 0;
-    std::uint32_t resident = 0;   ///< actually read in, not merely marked
+    std::uint32_t resident = 0;     ///< actually read in, not merely marked
     std::uint32_t out_of_range = 0; ///< named an expert this container lacks
     /// Wall time for bootstrap ranking, reads, and integrity verification.
     ///
@@ -202,16 +202,14 @@ struct WarmReport {
     /// find out whether that repack is worth doing. `soma heat-layout` says how
     /// scattered the ranges are; this measures the full bootstrap, not scatter alone.
     double seconds = 0.0;
-    std::string reason;           ///< non-empty when nothing was warmed
+    std::string reason; ///< non-empty when nothing was warmed
 };
 
 /// Pin the hottest experts a snapshot names, and READ them in.
 ///
 /// The existing bootstrap calls pin(), which reads synchronously and only marks
 /// successful reads. Report those pins rather than total cache occupancy.
-WarmReport warm_from_heat(const ServeConfig& config,
-                          const ArchIr& arch,
-                          MemoryHierarchy& memory) {
+WarmReport warm_from_heat(const ServeConfig& config, const ArchIr& arch, MemoryHierarchy& memory) {
     WarmReport out;
     if (config.heat_path.empty()) return out;
 
@@ -245,7 +243,8 @@ WarmReport warm_from_heat(const ServeConfig& config,
     // pin() reads synchronously and marks only successful reads as pinned.
     out.resident = bootstrap.pinned;
     if (out.out_of_range > 0) {
-        out.reason = "skipped " + std::to_string(out.out_of_range) + " invalid or out-of-range heat cells";
+        out.reason =
+            "skipped " + std::to_string(out.out_of_range) + " invalid or out-of-range heat cells";
     }
     return out;
 }
@@ -1263,8 +1262,7 @@ Status ServeServer::open(const ServeConfig& config) {
         }
     } else {
         std::string declared;
-        std::ifstream meta_in(fs::path(config.model_dir) / "container_meta.json",
-                              std::ios::binary);
+        std::ifstream meta_in(fs::path(config.model_dir) / "container_meta.json", std::ios::binary);
         if (meta_in) {
             try {
                 json meta;

@@ -89,9 +89,8 @@ struct Cursor {
     }
 
     bool empty() const noexcept { return ok && p == end; }
-    std::size_t remaining() const noexcept {
-        return ok ? static_cast<std::size_t>(end - p) : 0;
-    }
+
+    std::size_t remaining() const noexcept { return ok ? static_cast<std::size_t>(end - p) : 0; }
 };
 
 } // namespace
@@ -183,8 +182,8 @@ IndexKind kind_for(const std::string& index_file) {
     return index_file == "soma.dspark" ? IndexKind::Auxiliary : IndexKind::Base;
 }
 
-Status parse_index(const std::string& path, std::string_view raw, ParsedIndex& out,
-                   IndexKind expected) {
+Status
+parse_index(const std::string& path, std::string_view raw, ParsedIndex& out, IndexKind expected) {
     if (raw.size() < sizeof(kMagic) || std::memcmp(raw.data(), kMagic, sizeof(kMagic)) != 0) {
         return {StatusCode::InvalidArgument, path + ": bad magic"};
     }
@@ -196,9 +195,9 @@ Status parse_index(const std::string& path, std::string_view raw, ParsedIndex& o
     h.version = c.read<std::uint32_t>();
     if (h.version != kLegacyContainerVersion && h.version != kContainerVersion) {
         return {StatusCode::VersionMismatch,
-                "container version " + std::to_string(h.version) +
-                    " is not supported (expected " + std::to_string(kLegacyContainerVersion) +
-                    " or " + std::to_string(kContainerVersion) + ")"};
+                "container version " + std::to_string(h.version) + " is not supported (expected " +
+                    std::to_string(kLegacyContainerVersion) + " or " +
+                    std::to_string(kContainerVersion) + ")"};
     }
 
     // MUST-UNDERSTAND. An unknown bit means a field this build cannot see sits
@@ -207,25 +206,21 @@ Status parse_index(const std::string& path, std::string_view raw, ParsedIndex& o
     // wrong bytes. Refusing is the only safe reading.
     h.flags = c.read<std::uint32_t>();
     if ((h.flags & ~kKnownContainerFlags) != 0) {
-        return {StatusCode::VersionMismatch,
-                path + ": container sets flags 0x" +
-                    [&] {
-                        char b[16];
-                        std::snprintf(b, sizeof(b), "%08x", h.flags & ~kKnownContainerFlags);
-                        return std::string(b);
-                    }() +
-                    " that this build does not understand; it was written by a newer converter"};
+        return {StatusCode::VersionMismatch, path + ": container sets flags 0x" + [&] {
+                    char b[16];
+                    std::snprintf(b, sizeof(b), "%08x", h.flags & ~kKnownContainerFlags);
+                    return std::string(b);
+                }() + " that this build does not understand; it was written by a newer converter"};
     }
 
     const bool auxiliary = (h.flags & kFlagAuxiliaryIndex) != 0;
     if (auxiliary != (expected == IndexKind::Auxiliary)) {
         return {StatusCode::InvalidArgument,
-                path + (auxiliary
-                            ? " is an AUXILIARY index — its n_layers field counts draft "
-                              "stages and its identity belongs to the container it augments "
-                              "— but it was opened as the model's own"
-                            : " is the model's own index, but it was opened as an auxiliary "
-                              "one")};
+                path + (auxiliary ? " is an AUXILIARY index — its n_layers field counts draft "
+                                    "stages and its identity belongs to the container it augments "
+                                    "— but it was opened as the model's own"
+                                  : " is the model's own index, but it was opened as an auxiliary "
+                                    "one")};
     }
 
     const auto hash_len = c.read<std::uint32_t>();
@@ -310,17 +305,16 @@ Status parse_index(const std::string& path, std::string_view raw, ParsedIndex& o
     out.total_bytes = c.read<std::uint64_t>();
     if (!c.ok) return {StatusCode::InvalidArgument, path + ": truncated header"};
 
-    if (h.n_experts != 0 &&
-        static_cast<std::size_t>(h.n_layers) >
-            std::numeric_limits<std::size_t>::max() / h.n_experts) {
+    if (h.n_experts != 0 && static_cast<std::size_t>(h.n_layers) >
+                                std::numeric_limits<std::size_t>::max() / h.n_experts) {
         return {StatusCode::InvalidArgument, path + ": index dimensions overflow"};
     }
     const std::size_t entries = static_cast<std::size_t>(h.n_layers) * h.n_experts;
     if (h.n_shards > entries || h.n_shards > 100000) {
         return {StatusCode::InvalidArgument, path + ": shard count exceeds index bounds"};
     }
-    constexpr std::size_t kEntryBytes = sizeof(std::uint32_t) + sizeof(std::uint64_t) +
-                                         sizeof(std::uint32_t);
+    constexpr std::size_t kEntryBytes =
+        sizeof(std::uint32_t) + sizeof(std::uint64_t) + sizeof(std::uint32_t);
     if (entries > c.remaining() / kEntryBytes) {
         return {StatusCode::InvalidArgument,
                 path + ": index dimensions exceed the bytes remaining in the file"};
@@ -430,10 +424,10 @@ Status validate_layout(const ParsedIndex& ix, const std::string& dir, const std:
         // O(n log n) over the live entries of one shard. The whole index is
         // ~15k entries for DeepSeek V4, sorted once at open, against a read of
         // the shard files that follows — this is not the expensive part.
-        std::sort(ranges.begin(), ranges.end(),
-                  [](const ExpertLocation* a, const ExpertLocation* b) {
-                      return a->offset < b->offset;
-                  });
+        std::sort(
+            ranges.begin(), ranges.end(), [](const ExpertLocation* a, const ExpertLocation* b) {
+                return a->offset < b->offset;
+            });
         std::uint64_t cursor = 0;
         for (const auto* e : ranges) {
             // Equality in BOTH directions. Less would be an overlap, more would
@@ -460,8 +454,10 @@ Status validate_layout(const ParsedIndex& ix, const std::string& dir, const std:
     return {};
 }
 
-Status validate_ranges(const ParsedIndex& ix, const ArchIr& arch,
-                       const std::string& dir, const std::string& prefix) {
+Status validate_ranges(const ParsedIndex& ix,
+                       const ArchIr& arch,
+                       const std::string& dir,
+                       const std::string& prefix) {
     const auto& h = ix.header;
     const auto d = arch.routed_expert_width();
     const auto fi = arch.ffn.expert_intermediate;
@@ -481,12 +477,12 @@ Status validate_ranges(const ParsedIndex& ix, const ArchIr& arch,
         const auto& e = ix.entries[i];
         const bool moe = arch.is_moe_layer(static_cast<LayerIndex>(i / h.n_experts));
         if ((moe && e.length != expected) || (!moe && e.length != 0)) {
-            return {StatusCode::InvalidArgument, "expert slot presence/length disagrees with layer kind"};
+            return {StatusCode::InvalidArgument,
+                    "expert slot presence/length disagrees with layer kind"};
         }
     }
     return validate_layout(ix, dir, prefix);
 }
-
 
 /// The role's quantization as the IR describes it, reduced to what a row of that
 /// shape would actually have been written at.
@@ -495,7 +491,6 @@ RoleQuant role_from_ir(const ArchIr& arch, TensorRole role, std::uint32_t cols) 
     const auto requested = spec.group ? spec.group : kDefaultGroup;
     return {spec.dtype, effective_group(cols, requested)};
 }
-
 
 } // namespace
 
@@ -590,8 +585,10 @@ public:
 
     bool drop_from_cache(std::uint64_t offset, std::uint64_t len) const noexcept {
 #if defined(POSIX_FADV_DONTNEED)
-        return valid() && ::posix_fadvise(h_, static_cast<off_t>(offset),
-                                          static_cast<off_t>(len), POSIX_FADV_DONTNEED) == 0;
+        return valid() && ::posix_fadvise(h_,
+                                          static_cast<off_t>(offset),
+                                          static_cast<off_t>(len),
+                                          POSIX_FADV_DONTNEED) == 0;
 #else
         (void)offset;
         (void)len;
@@ -656,6 +653,7 @@ public:
     AlignedBuffer() = default;
     AlignedBuffer(const AlignedBuffer&) = delete;
     AlignedBuffer& operator=(const AlignedBuffer&) = delete;
+
     ~AlignedBuffer() { reset(); }
 
     bool allocate(std::size_t bytes) noexcept {
@@ -672,6 +670,7 @@ public:
     }
 
     void* data() const noexcept { return p_; }
+
     std::size_t size() const noexcept { return size_; }
 
 private:
@@ -865,8 +864,7 @@ Status ExpertStore::open_indexed(const std::string& model_dir,
     const std::string raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 
     ParsedIndex parsed;
-    if (auto st = parse_index(index_path.string(), raw, parsed, kind_for(index_file));
-        !st.ok())
+    if (auto st = parse_index(index_path.string(), raw, parsed, kind_for(index_file)); !st.ok())
         return st;
     impl_->header = parsed.header;
     auto& h = impl_->header;
@@ -967,7 +965,9 @@ Status ExpertStore::open_indexed(const std::string& model_dir,
     if (h.has_role_quant && arch.ffn.expert_intermediate > 0 && arch.topology.d_model > 0) {
         const auto fi = arch.ffn.expert_intermediate;
         const auto d = arch.routed_expert_width();
-        const auto check = [&](const char* name, TensorRole role, std::uint32_t cols,
+        const auto check = [&](const char* name,
+                               TensorRole role,
+                               std::uint32_t cols,
                                const RoleQuant& on_disk) -> Status {
             const auto want = role_from_ir(arch, role, cols);
             if (want.dtype != on_disk.dtype) {
@@ -989,8 +989,7 @@ Status ExpertStore::open_indexed(const std::string& model_dir,
         if (auto st = check("gate", TensorRole::ExpertGate, d, h.gate); !st.ok()) return st;
         if (auto st = check("up", TensorRole::ExpertUp, d, h.up); !st.ok()) return st;
         if (auto st = check("down", TensorRole::ExpertDown, fi, h.down); !st.ok()) return st;
-    } else if (!h.has_role_quant && arch.ffn.expert_intermediate > 0 &&
-               arch.topology.d_model > 0) {
+    } else if (!h.has_role_quant && arch.ffn.expert_intermediate > 0 && arch.topology.d_model > 0) {
         // Best-effort guard for the explicit legacy escape. V1 cannot describe
         // all three roles, but its retained pair still claims to describe gate.
         DType legacy_dtype{};
@@ -1109,9 +1108,8 @@ Status ExpertStore::open_indexed(const std::string& model_dir,
         }
         if (h.expert_bytes != 0 && e.length != h.expert_bytes) {
             return {StatusCode::InvalidArgument,
-                    "expert " + std::to_string(i) + " has length " +
-                        std::to_string(e.length) + ", expected " +
-                        std::to_string(h.expert_bytes)};
+                    "expert " + std::to_string(i) + " has length " + std::to_string(e.length) +
+                        ", expected " + std::to_string(h.expert_bytes)};
         }
         if (e.offset > std::numeric_limits<std::uint64_t>::max() - e.length ||
             e.offset + e.length > shard_sizes[e.shard]) {
@@ -1127,13 +1125,13 @@ Status ExpertStore::open_indexed(const std::string& model_dir,
     if (indexed_bytes != parsed.total_bytes) {
         return {StatusCode::InvalidArgument,
                 "index accounts for " + std::to_string(indexed_bytes) +
-                    " expert bytes but the header declares " +
-                    std::to_string(parsed.total_bytes)};
+                    " expert bytes but the header declares " + std::to_string(parsed.total_bytes)};
     }
     return {};
 }
 
-catch (const std::bad_alloc&) {
+catch (const std::bad_alloc&) { // Report allocation failure as a status.
+
     return {StatusCode::IoError, "insufficient memory for container index"};
 }
 
@@ -1165,8 +1163,7 @@ StatusCode ExpertStore::read(LayerIndex layer, ExpertId expert, ByteSpan dst) no
     // and if they did, the next process would catch it.
     if (impl_->payload == PayloadPolicy::VerifyOnFirstRead && impl_->verified != nullptr &&
         loc.length > 0 && impl_->verified[s].load(std::memory_order_relaxed) == 0) {
-        if (expert_digest(layer, expert, CByteSpan(dst.data(), loc.length)) !=
-            impl_->digests[s]) {
+        if (expert_digest(layer, expert, CByteSpan(dst.data(), loc.length)) != impl_->digests[s]) {
             // Deliberately NOT latched into the store. The caller is told this
             // expert is corrupt on every read of it, because a store that answered
             // "corrupt" once and then went quiet would let a retry loop feed the
@@ -1259,7 +1256,8 @@ Status verify_payload(const std::string& model_dir,
                     "; the shards were damaged after they were written"};
     }
     return {};
-} catch (const std::bad_alloc&) {
+} catch (const std::bad_alloc&) { // Report allocation failure as a status.
+
     return {StatusCode::OutOfMemory, "verify_payload ran out of memory"};
 }
 
@@ -1305,9 +1303,10 @@ Status verify_identity(const std::string& model_dir,
     // rewrite this change exists to remove.
     if (ix.header.arch_hash.empty()) {
         return {StatusCode::ArchMismatch,
-                index_path.string() + " carries no arch_hash: it was written by a converter "
-                "that did not stamp it, or with --no-identity. Reconvert it with the current "
-                "converter, which asks the engine for the identity while it writes"};
+                index_path.string() +
+                    " carries no arch_hash: it was written by a converter "
+                    "that did not stamp it, or with --no-identity. Reconvert it with the current "
+                    "converter, which asks the engine for the identity while it writes"};
     }
 
     const auto fi = arch.ffn.expert_intermediate;
@@ -1322,8 +1321,7 @@ Status verify_identity(const std::string& model_dir,
                          expert_bytes_for(arch, d, fi, TensorRole::ExpertDown);
     if (ix.header.expert_bytes > 0 && implied != ix.header.expert_bytes) {
         return {StatusCode::ArchMismatch,
-                "the container's experts are " +
-                    std::to_string(ix.header.expert_bytes) +
+                "the container's experts are " + std::to_string(ix.header.expert_bytes) +
                     " B but the IR's quantization map implies " + std::to_string(implied) +
                     " B. container_meta.json does not describe these shards"};
     }
@@ -1332,16 +1330,14 @@ Status verify_identity(const std::string& model_dir,
     const auto same = [](const RoleQuant& a, const RoleQuant& b) {
         return a.dtype == b.dtype && a.group == b.group;
     };
-    if (!same(ix.header.gate, gate) || !same(ix.header.up, up) ||
-        !same(ix.header.down, down)) {
+    if (!same(ix.header.gate, gate) || !same(ix.header.up, up) || !same(ix.header.down, down)) {
         return {StatusCode::ArchMismatch,
                 "this container describes expert roles as " +
                     std::string(to_string(ix.header.gate.dtype)) + "/" +
                     std::string(to_string(ix.header.up.dtype)) + "/" +
-                    std::string(to_string(ix.header.down.dtype)) +
-                    " and the IR says " + std::string(to_string(gate.dtype)) + "/" +
-                    std::string(to_string(up.dtype)) + "/" +
-                    std::string(to_string(down.dtype)) +
+                    std::string(to_string(ix.header.down.dtype)) + " and the IR says " +
+                    std::string(to_string(gate.dtype)) + "/" + std::string(to_string(up.dtype)) +
+                    "/" + std::string(to_string(down.dtype)) +
                     "; an equal byte total cannot prove those layouts equivalent"};
     }
     if (ix.header.arch_hash != identity) {
@@ -1363,12 +1359,14 @@ Status verify_identity(const std::string& model_dir,
     if (!ix.header.has_digests) {
         return {StatusCode::Unsupported,
                 index_path.string() + " carries no digest table, so its payload cannot be "
-                "checked at all. Reconvert it with the current converter"};
+                                      "checked at all. Reconvert it with the current converter"};
     }
     const auto n_experts = std::max<std::uint32_t>(ix.header.n_experts, 1);
     std::size_t checked = 0;
     Status mismatch;
-    if (auto st = walk_experts(ix, model_dir, index_file,
+    if (auto st = walk_experts(ix,
+                               model_dir,
+                               index_file,
                                [&](std::size_t slot, CByteSpan bytes) {
                                    if (!mismatch.ok()) return;
                                    ++checked;
@@ -1391,7 +1389,8 @@ Status verify_identity(const std::string& model_dir,
     return {};
 }
 
-catch (const std::bad_alloc&) {
+catch (const std::bad_alloc&) { // Report allocation failure as a status.
+
     return {StatusCode::IoError, "insufficient memory to verify container index"};
 }
 
@@ -1454,7 +1453,7 @@ Status ExpertStore::measure_bandwidth(std::uint64_t& bytes_per_second, Bandwidth
     auto method =
         probe_direct_disabled() ? BandwidthMethod::CacheEvicted : BandwidthMethod::Unbuffered;
     std::vector<ShardFile> probe(method == BandwidthMethod::Unbuffered ? impl_->header.n_shards
-                                                                      : 0u);
+                                                                       : 0u);
     const auto& prefix = impl_->shard_prefix;
     for (std::uint32_t i = 0; i < probe.size() && method == BandwidthMethod::Unbuffered; ++i) {
         char name[32];
@@ -1481,11 +1480,12 @@ Status ExpertStore::measure_bandwidth(std::uint64_t& bytes_per_second, Bandwidth
         for (const auto& shard : impl_->shards)
             if (!shard.flush_for_probe()) flushed = false;
         const auto& first = impl_->index[order[0]];
-        method = flushed && impl_->shards[first.shard].drop_from_cache(
-                                first.offset, (first.length + kDirectIoAlign - 1) /
-                                                  kDirectIoAlign * kDirectIoAlign)
-                     ? BandwidthMethod::CacheEvicted
-                     : BandwidthMethod::Buffered;
+        method =
+            flushed && impl_->shards[first.shard].drop_from_cache(
+                           first.offset,
+                           (first.length + kDirectIoAlign - 1) / kDirectIoAlign * kDirectIoAlign)
+                ? BandwidthMethod::CacheEvicted
+                : BandwidthMethod::Buffered;
     }
     if (!buf.allocate(maxlen)) {
         return {StatusCode::OutOfMemory, "cannot allocate the bandwidth probe buffer"};
@@ -1494,8 +1494,8 @@ Status ExpertStore::measure_bandwidth(std::uint64_t& bytes_per_second, Bandwidth
     const auto read_one = [&](const ExpertLocation& loc) noexcept {
         if (loc.shard >= impl_->shards.size()) return false;
         if (!probe.empty()) {
-            const auto padded = static_cast<std::uint32_t>(
-                (loc.length + kDirectIoAlign - 1) / kDirectIoAlign * kDirectIoAlign);
+            const auto padded = static_cast<std::uint32_t>((loc.length + kDirectIoAlign - 1) /
+                                                           kDirectIoAlign * kDirectIoAlign);
             return probe[loc.shard].valid() &&
                    probe[loc.shard].read_at(loc.offset, buf.data(), padded);
         }

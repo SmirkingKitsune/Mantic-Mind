@@ -122,9 +122,11 @@ Status widen_tensor(const TensorView& tv,
     auto& dst = owner->back();
     const auto* src = reinterpret_cast<const std::uint16_t*>(tv.bytes.data());
     if (tv.dtype == DType::BF16) {
-        for (std::size_t i = 0; i < n; ++i) dst[i] = widen_bf16(src[i]);
+        for (std::size_t i = 0; i < n; ++i)
+            dst[i] = widen_bf16(src[i]);
     } else {
-        for (std::size_t i = 0; i < n; ++i) dst[i] = widen_f16(src[i]);
+        for (std::size_t i = 0; i < n; ++i)
+            dst[i] = widen_f16(src[i]);
     }
     out = std::span<const float>(dst.data(), dst.size());
     return {};
@@ -193,8 +195,8 @@ Status bind_weight_view(const TensorView& tv,
     std::span<const float> values;
     if (tv.dtype == DType::F32) {
         values = tv.f32();
-    } else if (auto s = widen_tensor(tv, name,
-                                    is_quantized(spec.dtype) ? &scratch : widened, values);
+    } else if (auto s =
+                   widen_tensor(tv, name, is_quantized(spec.dtype) ? &scratch : widened, values);
                !s.ok()) {
         return s;
     }
@@ -204,12 +206,8 @@ Status bind_weight_view(const TensorView& tv,
         return {};
     }
     owner.emplace_back();
-    if (auto s = quantize_tensor(values,
-                                 rows,
-                                 cols,
-                                 spec.dtype,
-                                 spec.group ? spec.group : kDefaultGroup,
-                                 owner.back());
+    if (auto s = quantize_tensor(
+            values, rows, cols, spec.dtype, spec.group ? spec.group : kDefaultGroup, owner.back());
         !s.ok()) {
         return {s.code(), name + ": " + s.message()};
     }
@@ -225,8 +223,8 @@ Status bind_weight_view(const TensorView& tv,
 Status bind_weight(F32Model& model, const std::string& name, TensorRole role, WeightRef& out) {
     const TensorView* tv = nullptr;
     if (auto s = model.weights.require(name, tv); !s.ok()) return s;
-    return bind_weight_view(*tv, name, model.quant_map.for_role(role), model.quantized,
-                            &model.widened, out);
+    return bind_weight_view(
+        *tv, name, model.quant_map.for_role(role), model.quantized, &model.widened, out);
 }
 
 Status
@@ -314,13 +312,13 @@ Status bind_fused_glu(F32Model& model,
                     std::to_string(d_model) + " d_model"};
     }
 
-    const auto half = static_cast<std::size_t>(inter) * d_model *
-                      (gu->dtype == DType::F32 ? 4 : 2);
+    const auto half = static_cast<std::size_t>(inter) * d_model * (gu->dtype == DType::F32 ? 4 : 2);
     TensorView slice = *gu;
     slice.shape = {inter, d_model};
     slice.bytes = gu->bytes.subspan(0, half);
     const auto& spec = model.quant_map.for_role(role);
-    if (auto s = bind_weight_view(slice, where, spec, model.quantized, &model.widened, gate); !s.ok())
+    if (auto s = bind_weight_view(slice, where, spec, model.quantized, &model.widened, gate);
+        !s.ok())
         return s;
     slice.bytes = gu->bytes.subspan(half, half);
     if (auto s = bind_weight_view(slice, where, spec, model.quantized, &model.widened, up); !s.ok())
@@ -443,8 +441,8 @@ Status bind_model_weight(
     const TensorView* tv = nullptr;
     if (optional && ctx.weights->find(name) == nullptr) return {};
     if (auto s = ctx.weights->require(name, tv); !s.ok()) return s;
-    return bind_weight_view(*tv, std::string(name), ctx.quant->for_role(role), *ctx.owner,
-                            ctx.widened, out);
+    return bind_weight_view(
+        *tv, std::string(name), ctx.quant->for_role(role), *ctx.owner, ctx.widened, out);
 }
 
 void F32Workspace::reserve(const ArchIr& arch, std::uint32_t max_tokens) {
@@ -624,7 +622,8 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
     if (auto s = bind_weight(out, "model.embed_tokens.weight", TensorRole::Embed, out.embed);
         !s.ok())
         return s;
-    if (auto s = bind_tensor(out.weights, &out.widened, "model.norm.weight", out.out_norm); !s.ok()) return s;
+    if (auto s = bind_tensor(out.weights, &out.widened, "model.norm.weight", out.out_norm); !s.ok())
+        return s;
 
     if (auto s = bind_weight_optional(out, "lm_head.weight", TensorRole::Embed, out.out_head);
         !s.ok())
@@ -653,10 +652,14 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
         lw.kind = arch.topology.layer_kinds[l];
         const auto p = layer_prefix(l);
 
-        if (auto s = bind_tensor(out.weights, &out.widened, p + "input_layernorm.weight", lw.input_norm); !s.ok())
-            return s;
         if (auto s =
-                bind_tensor(out.weights, &out.widened, p + "post_attention_layernorm.weight", lw.post_attn_norm);
+                bind_tensor(out.weights, &out.widened, p + "input_layernorm.weight", lw.input_norm);
+            !s.ok())
+            return s;
+        if (auto s = bind_tensor(out.weights,
+                                 &out.widened,
+                                 p + "post_attention_layernorm.weight",
+                                 lw.post_attn_norm);
             !s.ok())
             return s;
 
@@ -676,7 +679,8 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
 
         if (lw.kind == LayerKind::Moe) {
             const auto& nm = arch.naming;
-            if (auto s = bind_tensor(out.weights, &out.widened, p + nm.moe_block + '.' + nm.router, lw.router);
+            if (auto s = bind_tensor(
+                    out.weights, &out.widened, p + nm.moe_block + '.' + nm.router, lw.router);
                 !s.ok())
                 return s;
 
@@ -791,7 +795,8 @@ Status load_f32_model(const std::string& dir, F32Model& out, const QuantMap& qua
                                 "down_proj/up_proj"};
                 }
                 if (arch.ffn.routed_expert_norm) {
-                    if (auto s = bind_tensor(out.weights, &out.widened,
+                    if (auto s = bind_tensor(out.weights,
+                                             &out.widened,
                                              p + blk + ".routed_expert_norm.weight",
                                              lw.latent_norm);
                         !s.ok())

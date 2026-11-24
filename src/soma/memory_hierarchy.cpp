@@ -579,12 +579,10 @@ Status parse_heat_snapshot(const std::string& text,
                    value.get<std::uint64_t>() <= limit;
         };
         if (!cell.contains("layer") || !cell.contains("expert") ||
-            !valid_uint(cell["layer"], UINT32_MAX) ||
-            !valid_uint(cell["expert"], UINT32_MAX) ||
+            !valid_uint(cell["layer"], UINT32_MAX) || !valid_uint(cell["expert"], UINT32_MAX) ||
             (cell.contains("count") && !valid_uint(cell["count"], UINT64_MAX)) ||
             (cell.contains("decayed") &&
-             (!cell["decayed"].is_number() ||
-              !std::isfinite(cell["decayed"].get<double>()) ||
+             (!cell["decayed"].is_number() || !std::isfinite(cell["decayed"].get<double>()) ||
               cell["decayed"].get<double>() < 0 ||
               cell["decayed"].get<double>() > std::numeric_limits<float>::max()))) {
             ++out_of_range;
@@ -631,10 +629,11 @@ Status MemoryHierarchy::apply_heat_bootstrap(const HeatSnapshot& heat, Bootstrap
     std::uint32_t pinned = 0;
     // Leave a pageable slot: pinning the entire cache makes unseen routes fail.
     const auto cache_limit = impl.budget.ram_expert_cache_bytes;
-    const auto warm_limit = cache_limit == 0 ? UINT64_MAX :
-        (cache_limit > impl.expert_bytes ? cache_limit - impl.expert_bytes : 0);
-    const auto pin_limit = impl.budget.pin_bytes == 0 ? warm_limit :
-        std::min(warm_limit, impl.budget.pin_bytes);
+    const auto warm_limit =
+        cache_limit == 0 ? UINT64_MAX
+                         : (cache_limit > impl.expert_bytes ? cache_limit - impl.expert_bytes : 0);
+    const auto pin_limit =
+        impl.budget.pin_bytes == 0 ? warm_limit : std::min(warm_limit, impl.budget.pin_bytes);
     std::vector<bool> seen(impl.slots.size(), false);
     for (const auto* c : ranked) {
         if (c->layer >= impl.n_layers || c->expert >= impl.n_experts) continue;
@@ -662,7 +661,8 @@ Status MemoryHierarchy::apply_heat_bootstrap(const HeatSnapshot& heat, Bootstrap
     }
     if (pinned == 0 && !ranked.empty()) {
         return {StatusCode::CapacityPressure,
-                "heat bootstrap pinned nothing; insufficient pageable/pin capacity or expert read failed"};
+                "heat bootstrap pinned nothing; insufficient pageable/pin capacity or expert read "
+                "failed"};
     }
     return {};
 }

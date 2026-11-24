@@ -1680,8 +1680,8 @@ Status validate_container_record(const nlohmann::json& j) {
             missing += f.name;
         } else if (!required && present) {
             unexpected += (unexpected.empty() ? "" : ", ");
-            unexpected += std::string(f.name) + " (" + f.when_key + " is not \"" +
-                          f.when_value + "\")";
+            unexpected +=
+                std::string(f.name) + " (" + f.when_key + " is not \"" + f.when_value + "\")";
         }
     }
     if (!missing.empty()) {
@@ -1693,7 +1693,8 @@ Status validate_container_record(const nlohmann::json& j) {
     if (!unexpected.empty()) {
         return {StatusCode::InvalidArgument,
                 "container_meta.json carries field(s) its own discriminators say do not "
-                "apply: " + unexpected};
+                "apply: " +
+                    unexpected};
     }
 
     // UNKNOWN FIELDS ARE REFUSED, on the same reasoning as the index's
@@ -1703,7 +1704,8 @@ Status validate_container_record(const nlohmann::json& j) {
     // the two disagree, and the safe reading of a disagreement is to stop.
     std::string unknown;
     for (const auto& [key, _] : j.items()) {
-        const bool declared = std::any_of(std::begin(kRecordFields), std::end(kRecordFields),
+        const bool declared = std::any_of(std::begin(kRecordFields),
+                                          std::end(kRecordFields),
                                           [&](const RecordField& f) { return key == f.name; });
         if (declared) continue;
         unknown += (unknown.empty() ? "" : ", ");
