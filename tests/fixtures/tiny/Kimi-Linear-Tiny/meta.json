@@ -34,7 +34,7 @@
   "positions": 512,
   "seed": 20260727,
   "slug": "Kimi-Linear-Tiny",
-  "source": "C:/Users/RyanM/AppData/Local/Temp/claude/Z--AI-Ubiquitious-Memories-Mantic-Mind/52d6bb7e-84b3-434e-be9c-63170289e96a/scratchpad/kimi-linear-src",
+  "source": null,
   "source_architectures": [
     "KimiLinearForCausalLM"
   ],

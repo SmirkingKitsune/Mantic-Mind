@@ -31,7 +31,7 @@
   "positions": 512,
   "seed": 20260727,
   "slug": "Moonlight-16B-A3B",
-  "source": "Z:/AI/Ubiquitious-Memories/Mantic-Mind/models/moonshotai/Moonlight-16B-A3B",
+  "source": "moonshotai/Moonlight-16B-A3B",
   "source_architectures": [
     "DeepseekV3ForCausalLM"
   ],

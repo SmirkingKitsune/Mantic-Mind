@@ -34,7 +34,7 @@
   "positions": 512,
   "seed": 20260727,
   "slug": "Qwen3.5-MoE-Tiny",
-  "source": "models/Qwen/Qwen3.8-2.4T-A95B",
+  "source": "Qwen/Qwen3.8-2.4T-A95B",
   "source_architectures": [
     "Qwen3_5MoeForCausalLM"
   ],

@@ -531,7 +531,7 @@ retained, and the latest path is shown in the wizard and exposed as
 | `models_dir` | `MM_MODELS_DIR` | `models` | Optional local model directory root |
 | `node_health_poll_interval_s` | `MM_POLL_INTERVAL_S` | `30` | Health/metrics poll interval |
 | `node_offline_after_s` | `MM_NODE_OFFLINE_AFTER_S` | `90` | Time without a successful poll before an unreachable node is labeled offline |
-| `external_api_token` | `MM_CONTROL_EXTERNAL_API_TOKEN` | *(empty)* | When set, required as `Authorization: Bearer` on all external `/v1/*` routes |
+| `external_api_token` | `MM_CONTROL_EXTERNAL_API_TOKEN` | *(empty)* | Optional all-scopes bearer token. Remote clients require a valid bearer token. |
 | `pairing_key` | `MM_PAIRING_KEY` | *(empty)* | PSK for automatic node/control pairing |
 | `discovery_port` | `MM_DISCOVERY_PORT` | `7072` | UDP discovery port |
 | `log_file` | `MM_LOG_FILE` | `logs/mantic-mind-control.log` | Log file |
@@ -596,11 +596,10 @@ POST   /api/control/register-node  { node_url, api_key, platform }
 
 ### External Client API
 
-If `external_api_token` is configured on control, every external `/v1` and
-`/v1/*` route requires `Authorization: Bearer <external_api_token>`, including
-SSE chat and mutating routes. Registered node API keys authenticate only the
-internal `/api/control/*` routes; they are not accepted for external `/v1/*`
-clients.
+Remote clients must send `Authorization: Bearer <token>` using an active scoped token or the configured `external_api_token`.
+Direct loopback clients can connect without a token when no credentials are active.
+Configure a token before exposing either listener through a local reverse proxy.
+Internal `/api/control/*` node routes use registered node API keys.
 
 ```
 GET/POST       /v1/agents
@@ -658,8 +657,8 @@ POST /v1/chat/completions
 `/v1/models` exposes agents as model IDs in the form `agent:{agent_id}`. The
 chat-completions route also accepts a bare agent ID, unique agent name, unique
 `model_path`, or unique `served_model_name`, but `agent:{agent_id}` is the
-stable form to configure in external clients. When `external_api_token` is set,
-the compatibility port uses the same `Authorization: Bearer <token>` gate.
+stable form to configure in external clients. The same bearer-token policy applies
+to the OpenAI-compatible listener.
 
 Vision-capable agents accept standard ordered user content arrays containing
 `text` and `image_url` parts. Image URLs must be JPEG or PNG base64 `data:` URLs;

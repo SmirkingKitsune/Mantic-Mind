@@ -31,7 +31,7 @@
   "positions": 512,
   "seed": 20260727,
   "slug": "OLMoE-1B-7B-0924",
-  "source": "Z:/AI/Ubiquitious-Memories/Mantic-Mind/models/allenai/OLMoE-1B-7B-0924",
+  "source": "allenai/OLMoE-1B-7B-0924",
   "source_architectures": [
     "OlmoeForCausalLM"
   ],

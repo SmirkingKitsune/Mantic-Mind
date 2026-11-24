@@ -31,7 +31,7 @@
   "positions": 512,
   "seed": 20260727,
   "slug": "DeepSeek-V2-Lite",
-  "source": "Z:/AI/Ubiquitious-Memories/Mantic-Mind/models/deepseek-ai/DeepSeek-V2-Lite",
+  "source": "deepseek-ai/DeepSeek-V2-Lite",
   "source_architectures": [
     "DeepseekV2ForCausalLM"
   ],

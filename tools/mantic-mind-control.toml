@@ -11,10 +11,10 @@ listen_port = 9090
 # Models are Mantic agents; use model id agent:{agent_id}.
 openai_compat_port = 9091
 
-# Optional bearer token for external /v1 and /v1/* API clients such as Yappy-Agent.
-# Applies to streaming chat and mutating agent routes. Internal /api/control/*
-# node routes keep using registered node api keys.
-# If set, external clients must send: Authorization: Bearer <token>
+# Optional all-scopes bearer token for the control and OpenAI-compatible APIs.
+# Remote clients require a configured or active scoped bearer token.
+# Direct loopback clients can create the first scoped token with POST /v1/tokens.
+# Internal node routes use registered node API keys.
 # external_api_token = ""
 
 # ── Storage ────────────────────────────────────────────────────────────────────

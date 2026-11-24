@@ -3837,6 +3837,36 @@ bool test_scheduler_reconciles_ready_absent_and_suspended_snapshots() {
     return ok;
 }
 
+bool test_control_api_tokenless_loopback() {
+    mm::ScopeAuthorizer authorizer;
+    httplib::Request req;
+    req.method = "POST";
+    req.path = "/v1/tokens";
+
+    for (const auto* peer : {"", "192.0.2.10", "2001:db8::1"}) {
+        req.remote_addr = peer;
+        httplib::Response res;
+        CHECK(!authorizer.authorize_or_reject(req, res));
+        CHECK(res.status == 401);
+    }
+
+    for (const auto* peer : {"127.0.0.1", "::1", "::ffff:127.0.0.1"}) {
+        req.remote_addr = peer;
+        httplib::Response res;
+        CHECK(authorizer.authorize_or_reject(req, res));
+    }
+
+    authorizer.configure(nullptr, "test-control-token");
+    httplib::Response res;
+    CHECK(!authorizer.authorize_or_reject(req, res));
+    CHECK(res.status == 401);
+
+    req.remote_addr = "192.0.2.10";
+    req.set_header("Authorization", "Bearer test-control-token");
+    CHECK(authorizer.authorize_or_reject(req, res));
+    return true;
+}
+
 bool test_control_api_external_token_gate() {
     auto dir = temp_test_dir("control-auth");
     std::filesystem::create_directories(dir);
@@ -4263,6 +4293,14 @@ bool test_openai_compat_api_listener_and_model_catalog() {
             agents, queue, registry, scheduler,
             dir.string(), (dir / "models").string(), "control-secret");
 
+        mm::ControlModelRegistry model_registry;
+        std::string token_error;
+        CHECK(model_registry.open(dir.string(), token_error));
+        const auto read_token = model_registry.create_api_token(
+            "openai-reader", static_cast<mm::ScopeSet>(mm::Scope::Read), token_error);
+        CHECK(!read_token.empty());
+        api.set_model_registry(&model_registry);
+
         const uint16_t port = find_free_test_port();
         CHECK(port != 0);
         const std::string base_url = "http://127.0.0.1:" + std::to_string(port);
@@ -4299,6 +4337,15 @@ bool test_openai_compat_api_listener_and_model_catalog() {
         RECORD(missing.status == 401);
         RECORD(missing.body.find("missing bearer token") != std::string::npos);
         RECORD(missing.body.find("\"type\":\"authentication_error\"") != std::string::npos);
+
+        client.set_bearer_token(read_token);
+        auto scoped_models = with_retry([&] { return client.get("/v1/models"); });
+        RECORD(scoped_models.status == 200);
+        auto scoped_chat = with_retry([&] {
+            return client.post("/v1/chat/completions", nlohmann::json::object());
+        });
+        RECORD(scoped_chat.status == 403);
+        RECORD(scoped_chat.body.find("insufficient scope") != std::string::npos);
 
         client.set_bearer_token("control-secret");
         auto models = with_retry([&] { return client.get("/v1/models"); });
@@ -8923,6 +8970,7 @@ int main(int argc, char** argv) {
          test_scheduler_backend_change_releases_local_placement},
         {"scheduler_reconciles_ready_absent_and_suspended_snapshots",
          test_scheduler_reconciles_ready_absent_and_suspended_snapshots},
+        {"control_api_tokenless_loopback", test_control_api_tokenless_loopback},
         {"control_api_external_token_gate", test_control_api_external_token_gate},
         {"openai_compat_api_listener_and_model_catalog",
          test_openai_compat_api_listener_and_model_catalog},

@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <mutex>
+#include <string_view>
 
 namespace mm {
 
@@ -271,6 +272,11 @@ bool require_complete_coverage(const std::vector<std::string>& registered_routes
 
 namespace {
 
+bool is_loopback_peer(std::string_view address) {
+    return address.starts_with("127.") || address == "::1" ||
+           address.starts_with("::ffff:127.");
+}
+
 /// Does a concrete path match a route pattern with `:name` segments?
 bool pattern_matches(const std::string& pattern, const std::string& path) {
     const auto pat = util::split(pattern, '/');
@@ -302,7 +308,7 @@ void ScopeAuthorizer::configure(ControlModelRegistry* registry, std::string lega
     impl_->legacy_token = std::move(legacy_token);
 }
 
-bool ScopeAuthorizer::auth_enabled() const {
+bool ScopeAuthorizer::has_active_credentials() const {
     std::lock_guard<std::mutex> lk(impl_->mu);
     if (!impl_->legacy_token.empty()) return true;
     return impl_->registry != nullptr && impl_->registry->has_api_tokens();
@@ -345,14 +351,13 @@ AuthResult ScopeAuthorizer::authorize(const httplib::Request& req) const {
         registry = impl_->registry;
     }
 
-    const bool have_tokens = registry != nullptr && registry->has_api_tokens();
-    if (legacy.empty() && !have_tokens) {
-        // Auth off, matching the previous behaviour exactly. Logged loudly at
-        // startup rather than here: a per-request warning on an open system is
-        // noise that trains people to ignore it.
+    // Keep local setup available while requiring credentials from network peers.
+    // The listeners get remote_addr from the socket, with no trusted proxies.
+    if (legacy.empty() && is_loopback_peer(req.remote_addr) &&
+        (registry == nullptr || !registry->has_api_tokens())) {
         result.allowed = true;
         result.granted = kScopeAll;
-        result.token_label = "unauthenticated";
+        result.token_label = "local-bootstrap";
         return result;
     }
 

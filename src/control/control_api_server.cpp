@@ -1231,11 +1231,8 @@ bool ControlApiServer::listen(uint16_t port) {
         }
     }
 
-    if (!scopes_.auth_enabled()) {
-        // Said out loud, once. A system that is open because nobody configured a
-        // token should announce it rather than look configured.
-        MM_WARN("API authorization is DISABLED: no external_api_token and no rows in "
-                "api_token. Every /v1/* route is open to anyone who can reach this port.");
+    if (!scopes_.has_active_credentials()) {
+        MM_WARN("No active API tokens. Tokenless /v1 access is limited to loopback peers.");
     }
 
     MM_INFO("ControlApiServer listening on port {}", port);
@@ -1402,16 +1399,16 @@ bool ControlApiServer::authorize_external_request(const httplib::Request& req,
 
 bool ControlApiServer::authorize_openai_compat_request(const httplib::Request& req,
                                                        httplib::Response& res) const {
-    if (external_api_token_.empty()) return true;
-
-    static const std::string kBearer = "Bearer ";
-    const std::string auth = req.get_header_value("Authorization");
-    if (auth.rfind(kBearer, 0) != 0) {
-        set_openai_error(res, 401, "missing bearer token", "authentication_error");
+    const auto auth = scopes_.authorize(req);
+    if (!auth.allowed) {
+        set_openai_error(res, auth.status, auth.error, "authentication_error");
         return false;
     }
-    if (auth.substr(kBearer.size()) != external_api_token_) {
-        set_openai_error(res, 403, "invalid bearer token", "authentication_error");
+    const auto required = scopes_.required_scope(req.method, req.path);
+    if (!scope_permits(auth.granted, required)) {
+        set_openai_error(res, 403,
+                         std::string("insufficient scope: requires ") + to_string(required),
+                         "permission_error");
         return false;
     }
     return true;

@@ -34,7 +34,7 @@
   "positions": 512,
   "seed": 20260727,
   "slug": "MiniMax-M3-Tiny",
-  "source": "C:/Users/RyanM/AppData/Local/Temp/claude/Z--AI-Ubiquitious-Memories-Mantic-Mind/2e74aca3-9c42-4c82-a654-404b522c9ca9/scratchpad/m3text",
+  "source": "MiniMaxAI/MiniMax-M3",
   "source_architectures": [
     "MiniMaxM3SparseForCausalLM"
   ],

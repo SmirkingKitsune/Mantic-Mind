@@ -10,6 +10,10 @@ built in CI — that keeps `torch`/`transformers` out of the CI image and makes 
 tools/admission/.venv/Scripts/python tools/admission/make_oracle.py <model_dir> --out tests/fixtures/tiny
 ```
 
+For a local source, pass `--source-model-id <owner/repo>` to record its Hugging Face
+model ID in `meta.json`. The `source` field is `null` when a local source has no
+supplied model ID.
+
 Kimi-Linear needs its own interpreter and two non-default execution choices, all three recorded in
 the fixture's `meta.json`:
 
