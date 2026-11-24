@@ -14,6 +14,7 @@
 #include "control/agent_scheduler.hpp"
 #include "control/engine_group_planner.hpp"
 #include "control/control_api_server.hpp"
+#include "control/external_api_auth.hpp"
 #include "control/node_registry.hpp"
 #include "control/performance_tracker.hpp"
 #include "control/tts_service_client.hpp"
@@ -1539,6 +1540,20 @@ bool test_scheduler_skips_failed_node_current_attempt() {
 
 #undef RECORD
     return ok;
+}
+
+bool test_control_api_tokenless_loopback() {
+    for (const auto* peer : {"", "192.0.2.10", "2001:db8::1"}) {
+        CHECK(mm::authorize_external_api(peer, "", "").status == 401);
+        CHECK(mm::authorize_external_api(peer, "Bearer anything", "").status == 403);
+    }
+    for (const auto* peer : {"127.0.0.1", "::1", "::ffff:127.0.0.1"}) {
+        CHECK(mm::authorize_external_api(peer, "", "").status == 200);
+        CHECK(mm::authorize_external_api(peer, "", "test-control-token").status == 401);
+    }
+    CHECK(mm::authorize_external_api("192.0.2.10", "Bearer test-control-token",
+                                     "test-control-token").status == 200);
+    return true;
 }
 
 bool test_control_api_external_token_gate() {
@@ -3719,6 +3734,7 @@ int main(int argc, char** argv) {
          test_node_action_progress_json_round_trip},
         {"scheduler_skips_failed_node_current_attempt",
          test_scheduler_skips_failed_node_current_attempt},
+        {"control_api_tokenless_loopback", test_control_api_tokenless_loopback},
         {"control_api_external_token_gate", test_control_api_external_token_gate},
         {"openai_compat_api_listener_and_model_catalog",
          test_openai_compat_api_listener_and_model_catalog},

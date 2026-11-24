@@ -1,4 +1,5 @@
 #include "control/control_api_server.hpp"
+#include "control/external_api_auth.hpp"
 #include "control/agent_manager.hpp"
 #include "control/agent_queue.hpp"
 #include "control/node_registry.hpp"
@@ -1197,41 +1198,24 @@ void ControlApiServer::activity_log(int level, const std::string& message) {
 
 bool ControlApiServer::authorize_external_request(const httplib::Request& req,
                                                   httplib::Response& res) const {
-    if (external_api_token_.empty()) return true;
-    // external_api_token_ is only for public control clients. Internal node
-    // routes under /api/control/* keep their separate registered-node auth.
+    // Internal node routes use their registered-node credentials.
     if (req.path.rfind("/v1/", 0) != 0 && req.path != "/v1") return true;
 
-    static const std::string kBearer = "Bearer ";
-    const std::string auth = req.get_header_value("Authorization");
-    if (auth.rfind(kBearer, 0) != 0) {
-        res.status = 401;
-        res.set_content(R"({"error":"missing bearer token"})", "application/json");
-        return false;
-    }
-    if (auth.substr(kBearer.size()) != external_api_token_) {
-        res.status = 403;
-        res.set_content(R"({"error":"invalid bearer token"})", "application/json");
-        return false;
-    }
-    return true;
+    const auto auth = authorize_external_api(
+        req.remote_addr, req.get_header_value("Authorization"), external_api_token_);
+    if (auth.status == 200) return true;
+    res.status = auth.status;
+    res.set_content(nlohmann::json{{"error", auth.error}}.dump(), "application/json");
+    return false;
 }
 
 bool ControlApiServer::authorize_openai_compat_request(const httplib::Request& req,
                                                        httplib::Response& res) const {
-    if (external_api_token_.empty()) return true;
-
-    static const std::string kBearer = "Bearer ";
-    const std::string auth = req.get_header_value("Authorization");
-    if (auth.rfind(kBearer, 0) != 0) {
-        set_openai_error(res, 401, "missing bearer token", "authentication_error");
-        return false;
-    }
-    if (auth.substr(kBearer.size()) != external_api_token_) {
-        set_openai_error(res, 403, "invalid bearer token", "authentication_error");
-        return false;
-    }
-    return true;
+    const auto auth = authorize_external_api(
+        req.remote_addr, req.get_header_value("Authorization"), external_api_token_);
+    if (auth.status == 200) return true;
+    set_openai_error(res, auth.status, auth.error, "authentication_error");
+    return false;
 }
 
 void ControlApiServer::register_openai_compat_routes() {
