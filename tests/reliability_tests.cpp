@@ -880,11 +880,13 @@ bool test_engine_config_pushes_coalesce_and_reject_stale() {
 
     // ── 3. exactly ONE more application runs, and it is the NEWEST ───────────
     gate->open();   // idempotent; the guard above repeats it on the way out
-    for (int i = 0; i < 400 && manager.current_config().version != 20; ++i) {
+    // apply() publishes the config version before calling the provisioner.
+    for (int i = 0; i < 400; ++i) {
+        if (manager.current_config().version == 20 && gate->calls.load() >= 2) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     CHECK(manager.current_config().version == 20);
-    // Two: v1, then v20. Not twenty-one, and not v19 landing on top of v20.
+    // One provisioning call each for v1 and v20.
     CHECK(gate->calls.load() == 2);
 
     manager.shutdown();
