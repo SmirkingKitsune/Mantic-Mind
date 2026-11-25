@@ -1051,7 +1051,7 @@ void ControlModelRegistry::mark_placement_released(const std::string& holder_id)
             UPDATE placement_history SET released_at = ?
              WHERE id = (SELECT id FROM placement_history
                           WHERE served_model_id = ? AND released_at IS NULL
-                          ORDER BY placed_at DESC LIMIT 1)
+                          ORDER BY placed_at DESC, id DESC LIMIT 1)
         )");
         q.bind(1, util::now_ms());
         q.bind(2, holder_id);
@@ -1075,7 +1075,7 @@ std::vector<PlacementHistoryEntry> ControlModelRegistry::placement_history(
                    placed_at, released_at
               FROM placement_history
              WHERE served_model_id = ?
-             ORDER BY placed_at DESC
+             ORDER BY placed_at DESC, id DESC
              LIMIT ?
         )");
         q.bind(1, holder_id);

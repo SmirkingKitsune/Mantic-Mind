@@ -3318,7 +3318,8 @@ bool test_placement_history_records_and_closes_rows() {
         rows = reg.placement_history("model-1");
         CHECK(rows.size() == 1);
         CHECK(!rows[0].open());
-        const std::int64_t first_released = rows[0].released_at_ms;
+        const auto first_placed = rows[0].placed_at_ms;
+        const auto first_released = rows[0].released_at_ms;
         CHECK(first_released > 0);
 
         // Placed again, on a different engine. Two rows now, newest first.
@@ -3327,6 +3328,14 @@ bool test_placement_history_records_and_closes_rows() {
         second.disk_mb = 14848;
         reg.record_placement(
             "model-1", "node-b", "slot-7", "soma", "soma (verdict=stream)", second);
+        // Use the same millisecond for both placements to exercise the tie-break.
+        {
+            SQLite::Database db((dir / "control.db").string(), SQLite::OPEN_READWRITE);
+            SQLite::Statement tie(db, "UPDATE placement_history SET placed_at = ? WHERE slot_id = ?");
+            tie.bind(1, first_placed);
+            tie.bind(2, "slot-7");
+            CHECK(tie.exec() == 1);
+        }
         rows = reg.placement_history("model-1");
         CHECK(rows.size() == 2);
         CHECK(rows[0].backend == "soma"); // newest first
