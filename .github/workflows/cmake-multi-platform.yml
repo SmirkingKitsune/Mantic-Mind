@@ -29,6 +29,8 @@ jobs:
             build_type: Release
             cpp_compiler: g++
             vcpkg_triplet: x64-linux
+            # Bound concurrent GCC compiles on hosted runners.
+            build_jobs: 4
           - name: linux-clang-release
             os: ubuntu-latest
             build_type: Release
@@ -111,7 +113,9 @@ jobs:
           cmake @args
 
       - name: Build
-        run: cmake --build "${{ env.BUILD_DIR }}" --config "${{ matrix.build_type }}" --parallel
+        run: >-
+          cmake --build "${{ env.BUILD_DIR }}" --config "${{ matrix.build_type }}"
+          --parallel ${{ matrix.build_jobs }}
 
       - name: Test
         run: ctest --test-dir "${{ env.BUILD_DIR }}" -C "${{ matrix.build_type }}" --output-on-failure
