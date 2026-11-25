@@ -117,9 +117,7 @@ inline constexpr std::size_t kExpertDigestBytes = 32;
 /// `u64 length`, then the payload. Spelled out because a second implementation in
 /// Python has to reproduce it exactly, and "hash the bytes" left no room to say
 /// which bytes.
-ExpertDigest expert_digest(LayerIndex layer,
-                           ExpertId expert,
-                           CByteSpan bytes) noexcept;
+ExpertDigest expert_digest(LayerIndex layer, ExpertId expert, CByteSpan bytes) noexcept;
 
 /// One expert role's quantization, as the shards were actually written.
 ///

@@ -107,8 +107,7 @@ struct BackendDecision {
 /// which is what the failure is telling you. That is a different action from
 /// flipping a routing switch, and the API should not let one masquerade as the
 /// other.
-BackendDecision select_backend(const BackendRequest& cfg,
-                               const AdmissionRecord& record) noexcept;
+BackendDecision select_backend(const BackendRequest& cfg, const AdmissionRecord& record) noexcept;
 
 const char* to_string(BackendChoice choice) noexcept;
 const char* to_string(BackendOverride override) noexcept;

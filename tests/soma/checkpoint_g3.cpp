@@ -16,6 +16,7 @@
 #include "soma/kv_checkpoint.hpp"
 #include "soma/scheduler.hpp"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -274,8 +275,9 @@ int main(int argc, char** argv) {
             return out;
         };
 
-        for (const auto& form : {std::make_pair(k - 1, "cached prefix exactly"),
-                                 std::make_pair(k, "prompt extends past the cache")}) {
+        const std::array forms{std::make_pair(k - 1, "cached prefix exactly"),
+                               std::make_pair(k, "prompt extends past the cache")};
+        for (const auto& form : forms) {
             const auto got = resume_with(form.first);
             const bool same = (got == expected);
             check(same,
